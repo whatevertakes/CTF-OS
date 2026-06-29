@@ -1,0 +1,63 @@
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+plan_mode_reasoning_effort = "xhigh"
+service_tier = "fast"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[features]
+fast_mode = true
+goals = true
+multi_agent = true
+shell_snapshot = true
+hooks = true
+
+[shell_environment_policy]
+set = { CTF_WORKSPACE_ROOT = "/home/choijiwng/02_ctf_workspace", XDG_CACHE_HOME = "/home/choijiwng/02_ctf_workspace/.cache/xdg", MPLCONFIGDIR = "/home/choijiwng/02_ctf_workspace/.cache/matplotlib", NUMBA_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/numba", PIP_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/pip", UV_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/uv", NPM_CONFIG_CACHE = "/home/choijiwng/02_ctf_workspace/.cache/npm", PYTHONPYCACHEPREFIX = "/home/choijiwng/02_ctf_workspace/.cache/python-pycache" }
+
+[projects."/home/choijiwng/02_ctf_workspace"]
+trust_level = "trusted"
+
+[plugins."google-calendar@openai-curated"]
+enabled = false
+
+[plugins."canva@openai-curated-remote"]
+enabled = false
+
+[plugins."creative-production@openai-curated-remote"]
+enabled = false
+
+[plugins."data-analytics@openai-curated-remote"]
+enabled = false
+
+[plugins."figma@openai-curated-remote"]
+enabled = false
+
+[plugins."google-calendar@openai-curated-remote"]
+enabled = false
+
+[plugins."product-design@openai-curated-remote"]
+enabled = false
+
+[plugins."codex-security@openai-curated-remote"]
+enabled = false
+
+[plugins."github@openai-curated-remote"]
+enabled = false
+
+[plugins."notion@openai-curated"]
+enabled = false
+
+[mcp_servers.angr]
+command = "angr-mcp"
+args = ["--transport", "stdio"]
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["-y", "@playwright/mcp@0.0.75"]
+
+[mcp_servers.radare2]
+command = "/home/choijiwng/02_ctf_workspace/.codex/bin/r2mcp-codex.sh"
+
+[mcp_servers.ghidra]
+command = "/home/choijiwng/02_ctf_workspace/.codex/bin/ghidra-mcp-codex.sh"
