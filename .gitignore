@@ -15,8 +15,10 @@ venv/
 node_modules/
 
 *.log
+!challenges/**/evidence/replay_*.log
 core
 core.*
 *.dmp
 
 .DS_Store
+ghidra-mcp-cache/

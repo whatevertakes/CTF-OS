@@ -1,0 +1,396 @@
+capabilities:
+  - id: intake_challenge
+    type: script
+    category: core
+    status: implemented
+    path: tools/intake_challenge.py
+    dependencies: [python3-stdlib]
+    loads_by_default: true
+    future_agents: [triage, category-router, proof]
+  - id: replay_runner
+    type: script
+    category: core
+    status: implemented
+    path: tools/replay_runner.py
+    dependencies: [python3-stdlib, bash]
+    loads_by_default: true
+    future_agents: [proof, solver, benchmark]
+  - id: proof_validate
+    type: script
+    category: core
+    status: implemented
+    path: tools/proof_validate.py
+    dependencies: [python3-stdlib]
+    loads_by_default: true
+    future_agents: [proof, reviewer, benchmark]
+  - id: challenge_template
+    type: template
+    category: core
+    status: implemented
+    path: templates/challenge
+    dependencies: []
+    loads_by_default: false
+    future_agents: [triage, solver]
+  - id: level2_selftest
+    type: benchmark
+    category: core
+    status: implemented
+    path: benchmarks/level2_selftest.py
+    dependencies: [intake_challenge, replay_runner, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+
+  - id: skill_ctf_triage
+    type: skill
+    category: core
+    status: implemented
+    path: skills/ctf-triage/SKILL.md
+    dependencies: [intake_challenge, challenge_template]
+    loads_by_default: true
+    future_agents: [triage, category-router]
+  - id: skill_ctf_web
+    type: skill
+    category: web
+    status: implemented
+    path: skills/ctf-web/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [web-solver, hybrid-chain]
+  - id: skill_ctf_pwn
+    type: skill
+    category: pwn
+    status: implemented
+    path: skills/ctf-pwn/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [pwn-solver, hybrid-chain]
+  - id: skill_ctf_rev
+    type: skill
+    category: reverse
+    status: implemented
+    path: skills/ctf-rev/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [rev-solver, hybrid-chain]
+  - id: skill_ctf_crypto
+    type: skill
+    category: crypto
+    status: implemented
+    path: skills/ctf-crypto/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [crypto-solver, hybrid-chain]
+  - id: skill_ctf_forensics
+    type: skill
+    category: forensics
+    status: implemented
+    path: skills/ctf-forensics/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [forensics-solver, hybrid-chain]
+  - id: skill_ctf_stego
+    type: skill
+    category: stego
+    status: implemented
+    path: skills/ctf-stego/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [stego-solver]
+  - id: skill_ctf_osint
+    type: skill
+    category: osint
+    status: implemented
+    path: skills/ctf-osint/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [osint-solver]
+  - id: skill_ctf_misc
+    type: skill
+    category: misc
+    status: implemented
+    path: skills/ctf-misc/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [misc-solver, category-router]
+  - id: skill_ctf_programming
+    type: skill
+    category: programming
+    status: implemented
+    path: skills/ctf-programming/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [programming-solver]
+  - id: skill_ctf_jail
+    type: skill
+    category: jail
+    status: implemented
+    path: skills/ctf-jail/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [jail-solver, hybrid-chain]
+  - id: skill_ctf_cloud
+    type: skill
+    category: cloud
+    status: implemented
+    path: skills/ctf-cloud/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [cloud-solver, hybrid-chain]
+  - id: skill_ctf_container
+    type: skill
+    category: container
+    status: implemented
+    path: skills/ctf-container/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [container-solver, hybrid-chain]
+  - id: skill_ctf_web3
+    type: skill
+    category: web3
+    status: implemented
+    path: skills/ctf-web3/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [web3-solver, hybrid-chain]
+  - id: skill_ctf_ai_ml
+    type: skill
+    category: ai-ml
+    status: implemented
+    path: skills/ctf-ai-ml/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [ai-ml-solver, hybrid-chain]
+  - id: skill_ctf_mobile
+    type: skill
+    category: mobile
+    status: implemented
+    path: skills/ctf-mobile/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [mobile-solver]
+  - id: skill_ctf_malware
+    type: skill
+    category: malware
+    status: implemented
+    path: skills/ctf-malware/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [malware-solver, hybrid-chain]
+  - id: skill_ctf_hardware_rf
+    type: skill
+    category: hardware-rf
+    status: implemented
+    path: skills/ctf-hardware-rf/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [hardware-rf-solver]
+  - id: skill_ctf_side_channel
+    type: skill
+    category: side-channel
+    status: implemented
+    path: skills/ctf-side-channel/SKILL.md
+    dependencies: [skill_ctf_triage]
+    loads_by_default: false
+    future_agents: [side-channel-solver]
+  - id: skill_ctf_hybrid_chain
+    type: skill
+    category: hybrid
+    status: implemented
+    path: skills/ctf-hybrid-chain/SKILL.md
+    dependencies: [skill_ctf_triage, replay_runner, proof_validate]
+    loads_by_default: false
+    future_agents: [hybrid-chain, reviewer]
+  - id: skill_proof_validation
+    type: skill
+    category: core
+    status: implemented
+    path: skills/proof-validation/SKILL.md
+    dependencies: [proof_validate]
+    loads_by_default: true
+    future_agents: [proof, reviewer]
+  - id: skill_replay_runner
+    type: skill
+    category: core
+    status: implemented
+    path: skills/replay-runner/SKILL.md
+    dependencies: [replay_runner]
+    loads_by_default: true
+    future_agents: [solver, proof, benchmark]
+  - id: skill_benchmark_runner
+    type: skill
+    category: core
+    status: implemented
+    path: skills/benchmark-runner/SKILL.md
+    dependencies: [level2_selftest]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+
+  - id: mcp_ghidra
+    type: mcp
+    category: reverse
+    status: mcp
+    path: .codex/bin/ghidra-mcp-codex.sh
+    dependencies: [ghidra-mcp-wrapper]
+    loads_by_default: false
+    future_agents: [rev-solver, malware-solver]
+  - id: mcp_radare2
+    type: mcp
+    category: reverse
+    status: mcp
+    path: .codex/bin/r2mcp-codex.sh
+    dependencies: [radare2-mcp-wrapper]
+    loads_by_default: false
+    future_agents: [rev-solver, malware-solver]
+  - id: mcp_angr
+    type: mcp
+    category: reverse
+    status: mcp
+    path: mcp://angr
+    dependencies: [angr-mcp]
+    loads_by_default: false
+    future_agents: [rev-solver, symbolic-execution]
+  - id: mcp_playwright
+    type: mcp
+    category: web
+    status: mcp
+    path: mcp://playwright
+    dependencies: [playwright-mcp]
+    loads_by_default: false
+    future_agents: [web-solver, osint-solver, ai-ml-solver]
+
+  - id: external_ljagiello_ctf_skills
+    type: external
+    category: reference
+    status: external
+    path: https://github.com/ljagiello/ctf-skills
+    dependencies: []
+    loads_by_default: false
+    future_agents: [skill-author, category-router]
+  - id: external_awesome_ctf
+    type: external
+    category: reference
+    status: external
+    path: https://github.com/apsdehal/awesome-ctf
+    dependencies: []
+    loads_by_default: false
+    future_agents: [tool-discovery]
+  - id: external_zardus_ctf_tools
+    type: external
+    category: reference
+    status: external
+    path: https://github.com/zardus/ctf-tools
+    dependencies: []
+    loads_by_default: false
+    future_agents: [tool-discovery]
+  - id: external_pwn_college
+    type: external
+    category: benchmark
+    status: external
+    path: https://pwn.college/
+    dependencies: []
+    loads_by_default: false
+    future_agents: [benchmark, training]
+  - id: external_pwntools
+    type: external
+    category: pwn
+    status: external
+    path: https://github.com/Gallopsled/pwntools
+    dependencies: []
+    loads_by_default: false
+    future_agents: [pwn-solver]
+  - id: external_angr
+    type: external
+    category: reverse
+    status: external
+    path: https://github.com/angr/angr
+    dependencies: []
+    loads_by_default: false
+    future_agents: [rev-solver, symbolic-execution]
+  - id: external_rsactftool
+    type: external
+    category: crypto
+    status: external
+    path: https://github.com/RsaCtfTool/RsaCtfTool
+    dependencies: []
+    loads_by_default: false
+    future_agents: [crypto-solver]
+  - id: external_volatility3
+    type: external
+    category: forensics
+    status: external
+    path: https://github.com/volatilityfoundation/volatility3
+    dependencies: []
+    loads_by_default: false
+    future_agents: [forensics-solver, malware-solver]
+  - id: external_kctf
+    type: external
+    category: cloud
+    status: external
+    path: https://github.com/google/kctf
+    dependencies: []
+    loads_by_default: false
+    future_agents: [cloud-solver, container-solver]
+  - id: external_kubernetes_goat
+    type: external
+    category: container
+    status: external
+    path: https://github.com/madhuakula/kubernetes-goat
+    dependencies: []
+    loads_by_default: false
+    future_agents: [cloud-solver, container-solver]
+  - id: external_foundry
+    type: external
+    category: web3
+    status: external
+    path: https://github.com/foundry-rs/foundry
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web3-solver]
+  - id: external_echidna
+    type: external
+    category: web3
+    status: external
+    path: https://github.com/crytic/echidna
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web3-solver]
+  - id: external_garak
+    type: external
+    category: ai-ml
+    status: external
+    path: https://github.com/NVIDIA/garak
+    dependencies: []
+    loads_by_default: false
+    future_agents: [ai-ml-solver]
+  - id: external_damn_vulnerable_llm_agent
+    type: external
+    category: ai-ml
+    status: external
+    path: https://github.com/WithSecureLabs/damn-vulnerable-llm-agent
+    dependencies: []
+    loads_by_default: false
+    future_agents: [ai-ml-solver]
+  - id: external_chipwhisperer
+    type: external
+    category: hardware-rf
+    status: external
+    path: https://github.com/newaetech/chipwhisperer
+    dependencies: []
+    loads_by_default: false
+    future_agents: [hardware-rf-solver, side-channel-solver]
+  - id: external_sigmf
+    type: external
+    category: hardware-rf
+    status: external
+    path: https://github.com/sigmf/SigMF
+    dependencies: []
+    loads_by_default: false
+    future_agents: [hardware-rf-solver]
+  - id: external_urh
+    type: external
+    category: hardware-rf
+    status: external
+    path: https://github.com/jopohl/urh
+    dependencies: []
+    loads_by_default: false
+    future_agents: [hardware-rf-solver]

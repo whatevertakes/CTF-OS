@@ -1,0 +1,13 @@
+{
+  "event": "",
+  "category": "",
+  "name": "",
+  "status": "new",
+  "created_at": "",
+  "updated_at": "",
+  "final_command": "",
+  "blocker": "",
+  "blockers": [],
+  "evidence": [],
+  "notes": "Use notes.md for human-readable evidence and reasoning."
+}
