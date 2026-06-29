@@ -13,7 +13,7 @@ shell_snapshot = true
 hooks = true
 
 [shell_environment_policy]
-set = { CTF_WORKSPACE_ROOT = "/home/choijiwng/02_ctf_workspace", XDG_CACHE_HOME = "/home/choijiwng/02_ctf_workspace/.cache/xdg", MPLCONFIGDIR = "/home/choijiwng/02_ctf_workspace/.cache/matplotlib", NUMBA_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/numba", PIP_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/pip", UV_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/uv", NPM_CONFIG_CACHE = "/home/choijiwng/02_ctf_workspace/.cache/npm", PYTHONPYCACHEPREFIX = "/home/choijiwng/02_ctf_workspace/.cache/python-pycache" }
+set = { BASH_ENV = "/home/choijiwng/02_ctf_workspace/.codex/env.sh", CTF_WORKSPACE_ROOT = "/home/choijiwng/02_ctf_workspace", XDG_CACHE_HOME = "/home/choijiwng/02_ctf_workspace/.cache/xdg", MPLCONFIGDIR = "/home/choijiwng/02_ctf_workspace/.cache/matplotlib", NUMBA_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/numba", PIP_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/pip", UV_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/uv", NPM_CONFIG_CACHE = "/home/choijiwng/02_ctf_workspace/.cache/npm", PYTHONPYCACHEPREFIX = "/home/choijiwng/02_ctf_workspace/.cache/python-pycache" }
 
 [projects."/home/choijiwng/02_ctf_workspace"]
 trust_level = "trusted"
