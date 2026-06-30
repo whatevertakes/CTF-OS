@@ -1,0 +1,134 @@
+schema_version: 1
+items:
+  - id: pwn_ppp_historical
+    event: historical
+    category: pwn
+    challenge: pwn_ppp
+    path: benchmarks/PWN_PPP_SANITIZED_BENCHMARK_REPORT.md
+    split: regression
+    status: solved
+    difficulty: medium
+    tags:
+      - historical
+      - sanitized-evidence
+      - remote-proof
+      - no-raw-flag
+    expected_artifacts:
+      - benchmarks/PWN_PPP_SANITIZED_BENCHMARK_REPORT.md
+    notes: Historical sanitized remote-solved pwn control. Raw flag and raw replay logs are intentionally not committed.
+  - id: mikuprotect_design
+    event: historical
+    category: pwn
+    challenge: mikuprotect
+    path: challenges/historical/pwn/mikuprotect
+    split: design
+    status: planned
+    difficulty: hard
+    tags:
+      - local-proof
+      - remote-env-mismatch
+      - deadline
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - evidence/replay_*.summary.md
+    notes: Design benchmark for local proof with remote failure modeling.
+  - id: dreamflow_design
+    event: historical
+    category: web
+    challenge: DreamFlow
+    path: challenges/historical/web/DreamFlow
+    split: design
+    status: planned
+    difficulty: hard
+    tags:
+      - stateful-web
+      - negative-probes
+      - mutation-ledger
+    expected_artifacts:
+      - state.json
+      - notes.md
+      - work/LEVEL3_WORKER_TASKS.md
+    notes: Design benchmark for multi-branch web exploration and state tracking.
+  - id: rev_holdout_placeholder
+    event: holdout
+    category: rev
+    challenge: rev-holdout-placeholder
+    path: challenges/holdout/rev/rev-holdout-placeholder
+    split: holdout
+    status: planned
+    difficulty: unknown
+    tags:
+      - holdout
+      - reverse
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+    notes: Placeholder for a future reverse-engineering holdout case.
+  - id: crypto_holdout_placeholder
+    event: holdout
+    category: crypto
+    challenge: crypto-holdout-placeholder
+    path: challenges/holdout/crypto/crypto-holdout-placeholder
+    split: holdout
+    status: planned
+    difficulty: unknown
+    tags:
+      - holdout
+      - crypto
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+    notes: Placeholder for a future crypto holdout case.
+  - id: forensics_regression_placeholder
+    event: regression
+    category: forensics
+    challenge: forensics-regression-placeholder
+    path: challenges/regression/forensics/forensics-regression-placeholder
+    split: regression
+    status: planned
+    difficulty: unknown
+    tags:
+      - regression
+      - forensics
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+    notes: Placeholder for evidence and report regression coverage.
+  - id: misc_programming_holdout_placeholder
+    event: holdout
+    category: misc
+    challenge: programming-holdout-placeholder
+    path: challenges/holdout/misc/programming-holdout-placeholder
+    split: holdout
+    status: planned
+    difficulty: unknown
+    tags:
+      - holdout
+      - programming
+      - misc
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+    notes: Placeholder for programming or misc workflow coverage.
+  - id: hybrid_chain_design_placeholder
+    event: historical
+    category: hybrid
+    challenge: hybrid-chain-placeholder
+    path: challenges/historical/hybrid/hybrid-chain-placeholder
+    split: design
+    status: planned
+    difficulty: unknown
+    tags:
+      - hybrid
+      - handoff
+      - category-boundary
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+    notes: Placeholder for web-to-pwn or rev-to-crypto handoff evaluation.

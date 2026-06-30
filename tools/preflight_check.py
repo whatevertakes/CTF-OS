@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the Level 0-5 workspace contract before benchmark or replay work."""
+"""Check the Level 0-6 workspace contract before benchmark or replay work."""
 
 from __future__ import annotations
 
@@ -31,19 +31,27 @@ REQUIRED_PATHS = (
     "tools/benchmark_runner.py",
     "tools/report_sanitize.py",
     "tools/cleanup_artifacts.py",
+    "tools/evaluate_corpus.py",
+    "tools/failure_taxonomy.py",
+    "tools/regression_check.py",
     "tools/level3_orchestrator.py",
     "tools/level4_interface.py",
     "templates/challenge/state.json",
+    "benchmarks/corpus.yaml",
     "benchmarks/level2_selftest.py",
     "benchmarks/level3_selftest.py",
     "benchmarks/level4_selftest.py",
     "benchmarks/level5_selftest.py",
+    "benchmarks/level6_selftest.py",
     "docs/LEVEL0_INFRASTRUCTURE.md",
     "docs/LEVEL1_CORE_ENGINE.md",
     "docs/LEVEL2_CAPABILITY_MAP.md",
     "docs/LEVEL3_DESIGN_NOTES.md",
     "docs/LEVEL4_INTERFACES.md",
     "docs/LEVEL5_AUTOMATION_POLICY.md",
+    "docs/LEVEL6_EVALUATION_POLICY.md",
+    "docs/LEVEL6_AGENT_DESIGN_INPUTS.md",
+    "docs/FAILURE_TAXONOMY.md",
 )
 
 REQUIRED_COMMANDS = ("bash", "git", "python3")

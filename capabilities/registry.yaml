@@ -143,6 +143,78 @@ capabilities:
     dependencies: [level5_automation_policy, benchmark_runner, report_sanitize, cleanup_artifacts, preflight_check, replay_runner, proof_validate]
     loads_by_default: false
     future_agents: [benchmark, reviewer]
+  - id: benchmark_corpus
+    type: benchmark-registry
+    category: evaluation
+    status: implemented
+    path: benchmarks/corpus.yaml
+    dependencies: [pwn_ppp_sanitized_report, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: evaluate_corpus
+    type: script
+    category: evaluation
+    status: implemented
+    path: tools/evaluate_corpus.py
+    dependencies: [benchmark_corpus, proof_validate, python3-stdlib, PyYAML]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: failure_taxonomy
+    type: script
+    category: evaluation
+    status: implemented
+    path: tools/failure_taxonomy.py
+    dependencies: [failure_taxonomy_doc, python3-stdlib]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: failure_taxonomy_doc
+    type: document
+    category: evaluation
+    status: implemented
+    path: docs/FAILURE_TAXONOMY.md
+    dependencies: []
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: regression_check
+    type: script
+    category: evaluation
+    status: implemented
+    path: tools/regression_check.py
+    dependencies: [preflight_check, evaluate_corpus, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: level6_evaluation_policy
+    type: document
+    category: evaluation
+    status: implemented
+    path: docs/LEVEL6_EVALUATION_POLICY.md
+    dependencies: [benchmark_corpus, evaluate_corpus, regression_check, failure_taxonomy]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: level6_agent_design_inputs
+    type: document
+    category: evaluation
+    status: implemented
+    path: docs/LEVEL6_AGENT_DESIGN_INPUTS.md
+    dependencies: [level6_evaluation_policy, failure_taxonomy, evaluate_corpus]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers]
+  - id: pwn_ppp_sanitized_report
+    type: benchmark-report
+    category: evaluation
+    status: implemented
+    path: benchmarks/PWN_PPP_SANITIZED_BENCHMARK_REPORT.md
+    dependencies: []
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: level6_selftest
+    type: benchmark
+    category: evaluation
+    status: implemented
+    path: benchmarks/level6_selftest.py
+    dependencies: [level6_evaluation_policy, benchmark_corpus, evaluate_corpus, regression_check, failure_taxonomy, preflight_check]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
   - id: strict_tool_profile
     type: script
     category: core
