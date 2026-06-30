@@ -64,7 +64,8 @@ challenges/<event>/<category>/<challenge>/
 - `dist/`: original challenge handouts, binaries, `docker-compose`, and
   provided files.
 - `work/`: scratch scripts, exploit drafts, extracted files, and local
-  analysis. Level 3 and Level 4 generated board/interface files also live here.
+  analysis. Level 3 board files, Level 4 interface files, and Level 5
+  sanitized automation reports also live here.
 
 ## Naming Rules
 
@@ -117,6 +118,9 @@ hybrid
 - Level 4 interface views are generated with `tools/level4_interface.py`; they
   may add `metadata.level4_*` pointers but must not replace proof validation or
   create a separate solve status.
+- Level 5 automation may run preflight, replay, proof validation, report
+  sanitization, and temporary artifact cleanup. It must not mark challenges
+  solved, add solvers, or use `challenges/_selftest` as benchmark input.
 
 ## Git Policy
 

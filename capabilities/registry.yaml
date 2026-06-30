@@ -31,6 +31,38 @@ capabilities:
     dependencies: [python3-stdlib, python-venv, bash, git]
     loads_by_default: true
     future_agents: [triage, solver, proof, benchmark]
+  - id: report_sanitize
+    type: script
+    category: core
+    status: implemented
+    path: tools/report_sanitize.py
+    dependencies: [python3-stdlib]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, proof]
+  - id: cleanup_artifacts
+    type: script
+    category: core
+    status: implemented
+    path: tools/cleanup_artifacts.py
+    dependencies: [python3-stdlib, git]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: benchmark_runner
+    type: script
+    category: core
+    status: implemented
+    path: tools/benchmark_runner.py
+    dependencies: [preflight_check, intake_challenge, replay_runner, proof_validate, report_sanitize]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: level5_automation_policy
+    type: document
+    category: core
+    status: implemented
+    path: docs/LEVEL5_AUTOMATION_POLICY.md
+    dependencies: [benchmark_runner, report_sanitize, cleanup_artifacts, preflight_check]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
   - id: challenge_template
     type: template
     category: core
@@ -101,6 +133,14 @@ capabilities:
     status: implemented
     path: benchmarks/level4_selftest.py
     dependencies: [level4_interface, level3_selftest, preflight_check, intake_challenge, level3_orchestrator, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: level5_selftest
+    type: benchmark
+    category: core
+    status: implemented
+    path: benchmarks/level5_selftest.py
+    dependencies: [level5_automation_policy, benchmark_runner, report_sanitize, cleanup_artifacts, preflight_check, replay_runner, proof_validate]
     loads_by_default: false
     future_agents: [benchmark, reviewer]
   - id: strict_tool_profile
@@ -341,7 +381,7 @@ capabilities:
     category: core
     status: implemented
     path: skills/benchmark-runner/SKILL.md
-    dependencies: [level2_selftest]
+    dependencies: [level2_selftest, level3_selftest, level4_selftest, level5_selftest, benchmark_runner, report_sanitize, cleanup_artifacts, preflight_check]
     loads_by_default: false
     future_agents: [benchmark, reviewer]
 

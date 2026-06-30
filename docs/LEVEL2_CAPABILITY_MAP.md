@@ -15,6 +15,7 @@ Level 2 is a small local capability layer for CTF work in this workspace. It fav
 | Hybrid chains | Describe cross-category workflows where the solve path crosses boundaries. | `skills/ctf-hybrid-chain/SKILL.md`, `docs/LEVEL2_HYBRID_CHAINS.md` |
 | MCP bridges | Record configured local or plugin MCP capabilities without loading them by default. | `.codex/bin/*`, `mcp://*` entries in `capabilities/registry.yaml` |
 | Interface views | Present Level 1 config, Level 2 state/evidence, and Level 3 worker boards through challenge-local CLI/editor/terminal/browser/report surfaces. | `tools/level4_interface.py`, `docs/LEVEL4_INTERFACES.md` |
+| Bounded automation | Wrap existing Level 2 preflight, replay, proof, sanitization, cleanup, and dummy benchmark workflows without adding solve capability. | `tools/benchmark_runner.py`, `tools/report_sanitize.py`, `tools/cleanup_artifacts.py`, `docs/LEVEL5_AUTOMATION_POLICY.md` |
 | External references | Track useful public resources as references only, with import and licensing notes. | `docs/LEVEL2_IMPORT_POLICY.md` |
 | Benchmarks | Keep a lightweight self-test that proves the layer can create, replay, and validate a challenge. | `benchmarks/level2_selftest.py`, `benchmarks/LEVEL2_SELFTEST.md` |
 
@@ -72,7 +73,8 @@ Future agents should use this layer in this order:
 7. Keep replay summaries next to raw logs as `evidence/replay_<timestamp>.summary.md`.
 8. Update `state.json` when status, proof scope, remote status, replay kind, current remote liveness, final command, blockers, or evidence paths change.
 9. Use Level 4 interface views for operator speed, but keep solve status and proof scope in Level 2 state.
-10. When progress stalls, split the hypothesis space instead of repeating disproven payload families.
+10. Use Level 5 automation only for bounded preflight/replay/proof/report/cleanup wrappers.
+11. When progress stalls, split the hypothesis space instead of repeating disproven payload families.
 
 ## State Metadata Contract
 

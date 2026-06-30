@@ -18,6 +18,7 @@ TEMPLATE_DIR = ROOT / "templates" / "challenge"
 CHALLENGES_DIR = ROOT / "challenges"
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 CONTRACT_DIRS = ("evidence", "dist", "work")
+BASH_SHEBANG = re.compile(r"^#!.*\bbash(?:\s|$)")
 
 
 def fail(message: str, code: int = 2) -> None:
@@ -40,6 +41,12 @@ def validate_component(value: str, label: str) -> str:
 def copy_template(destination: Path, force: bool) -> None:
     if not TEMPLATE_DIR.is_dir():
         fail(f"template directory is missing: {TEMPLATE_DIR}")
+    template_replay = TEMPLATE_DIR / "replay.sh"
+    if not template_replay.is_file():
+        fail(f"template replay script is missing: {template_replay}")
+    first_line = template_replay.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    if not first_line or not BASH_SHEBANG.match(first_line[0]):
+        fail(f"template replay script must start with a bash shebang: {template_replay}")
 
     for source in TEMPLATE_DIR.rglob("*"):
         relative = source.relative_to(TEMPLATE_DIR)
@@ -55,9 +62,10 @@ def copy_template(destination: Path, force: bool) -> None:
         shutil.copy2(source, target)
 
     replay = destination / "replay.sh"
-    if replay.exists():
-        mode = replay.stat().st_mode
-        replay.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if not replay.is_file():
+        fail(f"failed to create replay script: {replay}")
+    mode = replay.stat().st_mode
+    replay.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def write_state(destination: Path, event: str, category: str, name: str, force: bool) -> None:

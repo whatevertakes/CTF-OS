@@ -108,6 +108,20 @@ negative evidence, and merge only reproducible facts back into `state.json` and
   boards, and Level 4 makes those surfaces fast to inspect from CLI/editor/
   terminal/browser/report views.
 
+## Level 5 Automation Memory
+
+- Level 5 is bounded automation over existing Level 2 workflows only:
+  preflight, dummy benchmark wrapping, replay/proof orchestration, sanitized
+  reporting, and temporary artifact cleanup.
+- Level 5 must never mark a challenge solved. `tools/proof_validate.py` remains
+  the solved-claim validator.
+- Level 5 benchmark inputs must not live under `challenges/_selftest`; use
+  controlled temporary fixtures such as `challenges/_level5benchmark/...`.
+- Cleanup automation is dry-run by default and must refuse real challenge paths
+  and tracked git files.
+- Sanitized reports may be committed; raw replay logs containing flags,
+  binaries, dumps, secrets, and `_selftest` artifacts must not be committed.
+
 ## Reference-Backed Harness Memory
 
 - OpenAI harness guidance supports making repository-local knowledge, tools,

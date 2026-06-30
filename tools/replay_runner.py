@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import sys
@@ -109,6 +110,24 @@ def metadata_dict(state: dict[str, object]) -> dict[str, object]:
 
 def replay_kind_for(challenge_dir: Path) -> str:
     return str(metadata_dict(load_state(challenge_dir)).get("replay_kind") or "local").strip()
+
+
+def validate_replay_script(challenge_dir: Path) -> Path:
+    replay = challenge_dir / "replay.sh"
+    if not replay.exists():
+        fail(f"missing replay script: {replay}")
+    if not replay.is_file():
+        fail(f"replay script is not a regular file: {replay}")
+    if not os.access(replay, os.X_OK):
+        fail(f"replay script is not executable: {replay}")
+    try:
+        with replay.open("rb") as handle:
+            first_line = handle.readline(256)
+    except OSError as exc:
+        fail(f"cannot read replay script: {replay}: {exc}")
+    if not first_line.startswith(b"#!"):
+        fail(f"replay script lacks a shebang: {replay}")
+    return replay
 
 
 def guard_remote_live_replay(challenge_dir: Path, *, allow_remote_live: bool) -> None:
@@ -268,9 +287,7 @@ def summarize_existing(challenge_dir: Path) -> int:
 
 
 def run_replay(challenge_dir: Path, *, allow_remote_live: bool) -> int:
-    replay = challenge_dir / "replay.sh"
-    if not replay.is_file():
-        fail(f"missing replay script: {replay}")
+    validate_replay_script(challenge_dir)
     guard_remote_live_replay(challenge_dir, allow_remote_live=allow_remote_live)
 
     evidence_dir = challenge_dir / "evidence"
@@ -278,7 +295,7 @@ def run_replay(challenge_dir: Path, *, allow_remote_live: bool) -> int:
 
     timestamp = utc_timestamp()
     log_path = evidence_dir / f"replay_{timestamp}.log"
-    command = ["bash", "replay.sh"]
+    command = ["./replay.sh"]
     result = subprocess.run(
         command,
         cwd=challenge_dir,
@@ -322,6 +339,7 @@ def main() -> int:
         fail(f"challenge directory does not exist: {challenge_dir}")
 
     if args.summarize_existing:
+        validate_replay_script(challenge_dir)
         return summarize_existing(challenge_dir)
     return run_replay(challenge_dir, allow_remote_live=args.allow_remote_live)
 

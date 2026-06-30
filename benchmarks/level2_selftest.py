@@ -274,7 +274,7 @@ def main() -> int:
             fail("solved challenge without final_command failed for the wrong reason")
         run(["python3", "tools/replay_runner.py", str(solved.relative_to(ROOT))])
         solved_state = load_state(solved)
-        solved_state["final_command"] = "bash replay.sh"
+        solved_state["final_command"] = "./replay.sh"
         metadata = solved_state.setdefault("metadata", {})
         if not isinstance(metadata, dict):
             fail("solved-proof metadata is not an object")
