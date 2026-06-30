@@ -11,6 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional pwntools or debugger references when the challenge requires them.
+reference_digest:
+- `docs/reference-digests/pwn.md`
 evidence produced:
 - Binary hashes, check results, crash traces, exploit input, and replay logs.
 failure/blocker classes:

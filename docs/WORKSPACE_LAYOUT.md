@@ -56,8 +56,9 @@ challenges/<event>/<category>/<challenge>/
 
 - `state.json`: machine-readable status, `final_command`, blocker,
   `next_action`, evidence paths, proof scope, remote status, replay kind,
-  remote liveness, evidence sensitivity, and metadata.
-- `notes.md`: human-readable solve log.
+  remote liveness, evidence sensitivity, tool routing decisions, and metadata.
+- `notes.md`: human-readable solve log, including a tool routing decision
+  section for considered, used, skipped, and missing tools.
 - `replay.sh`: reproducible proof or replay entrypoint.
 - `evidence/`: replay logs, redacted replay summaries, screenshots, and final
   proof outputs.
@@ -110,6 +111,9 @@ hybrid
 - A blocked challenge requires a real non-empty textual blocker reason.
 - A partial challenge should preserve evidence or a blocker reason explaining
   why it is not yet solved.
+- Record tool routing decisions in `state.json` and `notes.md` for
+  observability. This records MCP and non-MCP tool selection, non-selection, and
+  missing dependencies; it must not be used to force MCP usage.
 - Raw replay logs that contain flag-like markers must have a matching redacted
   `*.summary.md` file before proof validation succeeds.
 - Live remote exploit replays should set `metadata.replay_kind` to

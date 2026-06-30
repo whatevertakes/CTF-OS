@@ -9,6 +9,8 @@ outputs:
 - Solver script, test cases, final command, and captured output.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
+reference_digest:
+- `docs/reference-digests/programming.md`
 evidence produced:
 - Sample tests, solver source, command output, and replay logs.
 failure/blocker classes:

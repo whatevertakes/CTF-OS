@@ -72,8 +72,21 @@ def corpus_item(
     split: str,
     status: str,
     tags: list[str] | None = None,
+    primary_tools_used: list[object] | None = None,
+    tools_considered: list[object] | None = None,
+    tools_used: list[object] | None = None,
+    tools_skipped: list[object] | None = None,
+    required_tools: list[object] | None = None,
+    missing_tools: list[object] | None = None,
+    dependency_status: str = "unknown",
+    tool_routing_gap: bool | str = False,
+    agent_mode: str | None = None,
+    failure_class: str | None = None,
+    replay_quality: str | None = None,
+    shareability: str | None = None,
+    expected_artifacts: list[str] | None = None,
 ) -> dict[str, object]:
-    return {
+    item: dict[str, object] = {
         "id": item_id,
         "event": "level6-selftest",
         "category": category,
@@ -83,20 +96,52 @@ def corpus_item(
         "status": status,
         "difficulty": "unknown",
         "tags": tags or ["selftest"],
-        "expected_artifacts": ["state.json", "replay.sh", "notes.md"],
+        "primary_tools_used": primary_tools_used or [],
+        "tools_considered": tools_considered or [],
+        "tools_used": tools_used or [],
+        "tools_skipped": tools_skipped or [],
+        "required_tools": required_tools or [],
+        "missing_tools": missing_tools or [],
+        "dependency_status": dependency_status,
+        "tool_routing_gap": tool_routing_gap,
+        "expected_artifacts": expected_artifacts or ["state.json", "replay.sh", "notes.md"],
         "notes": "temporary Level 6 selftest fixture",
     }
+    if agent_mode is not None:
+        item["agent_mode"] = agent_mode
+    if failure_class is not None:
+        item["failure_class"] = failure_class
+    if replay_quality is not None:
+        item["replay_quality"] = replay_quality
+    if shareability is not None:
+        item["shareability"] = shareability
+    return item
 
 
 def assert_evaluate_corpus(temp_root: Path) -> None:
     solved_path = temp_root / "challenges" / "level6-selftest" / "pwn" / "solved-no-evidence"
     blocked_path = temp_root / "challenges" / "level6-selftest" / "web" / "blocked-no-reason"
     planned_path = temp_root / "challenges" / "level6-selftest" / "crypto" / "planned-existing"
+    dependency_path = temp_root / "challenges" / "level6-selftest" / "hardware-rf" / "dependency-missing"
     missing_path = temp_root / "challenges" / "level6-selftest" / "rev" / "missing"
+    mcp_used_path = temp_root / "challenges" / "level6-selftest" / "rev" / "mcp-used"
+    mcp_skipped_path = temp_root / "challenges" / "level6-selftest" / "pwn" / "mcp-skipped"
+    non_mcp_path = temp_root / "challenges" / "level6-selftest" / "misc" / "non-mcp-primary"
+    routing_gap_path = temp_root / "challenges" / "level6-selftest" / "forensics" / "routing-gap"
+    partial_path = temp_root / "challenges" / "level6-selftest" / "misc" / "partial-shareability-gap"
+    report_path = temp_root / "benchmarks" / "HISTORICAL_SANITIZED_BENCHMARK_REPORT.md"
 
     write_state(solved_path, state("solved", final_command="./replay.sh", proof_scope="local"), category="pwn", name="solved-no-evidence")
     write_state(blocked_path, state("blocked"), category="web", name="blocked-no-reason")
     write_state(planned_path, state("new"), category="crypto", name="planned-existing")
+    write_state(dependency_path, state("new"), category="hardware-rf", name="dependency-missing")
+    write_state(mcp_used_path, state("new"), category="rev", name="mcp-used")
+    write_state(mcp_skipped_path, state("new"), category="pwn", name="mcp-skipped")
+    write_state(non_mcp_path, state("new"), category="misc", name="non-mcp-primary")
+    write_state(routing_gap_path, state("new"), category="forensics", name="routing-gap")
+    write_state(partial_path, state("partial"), category="misc", name="partial-shareability-gap")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# Historical Sanitized Benchmark Report\n\nNo raw flags.\n", encoding="utf-8")
 
     corpus_path = temp_root / "corpus.yaml"
     write_corpus(
@@ -125,6 +170,81 @@ def assert_evaluate_corpus(temp_root: Path) -> None:
                 path=planned_path,
                 split="regression",
                 status="planned",
+                agent_mode="none",
+            ),
+            corpus_item(
+                item_id="dependency-missing",
+                category="hardware-rf",
+                challenge="dependency-missing",
+                path=dependency_path,
+                split="regression",
+                status="planned",
+                tags=["selftest", "avr"],
+                required_tools=["ctf-definitely-missing-tool-for-level6-selftest"],
+            ),
+            corpus_item(
+                item_id="mcp-used",
+                category="rev",
+                challenge="mcp-used",
+                path=mcp_used_path,
+                split="design",
+                status="planned",
+                primary_tools_used=[{"tool": "radare2", "kind": "mcp"}],
+                tools_used=[{"tool": "radare2", "kind": "mcp", "reason": "control-flow triage"}],
+            ),
+            corpus_item(
+                item_id="mcp-skipped",
+                category="pwn",
+                challenge="mcp-skipped",
+                path=mcp_skipped_path,
+                split="holdout",
+                status="planned",
+                primary_tools_used=["python3"],
+                tools_considered=[{"tool": "angr", "kind": "mcp"}],
+                tools_skipped=[
+                    {
+                        "tool": "angr",
+                        "kind": "mcp",
+                        "reason": "fixture has no symbolic execution surface",
+                    }
+                ],
+            ),
+            corpus_item(
+                item_id="non-mcp-primary",
+                category="misc",
+                challenge="non-mcp-primary",
+                path=non_mcp_path,
+                split="regression",
+                status="planned",
+                primary_tools_used=["python3", "gdb"],
+                tools_used=["python3", "gdb"],
+            ),
+            corpus_item(
+                item_id="routing-gap",
+                category="forensics",
+                challenge="routing-gap",
+                path=routing_gap_path,
+                split="regression",
+                status="planned",
+            ),
+            corpus_item(
+                item_id="partial-shareability-gap",
+                category="misc",
+                challenge="partial-shareability-gap",
+                path=partial_path,
+                split="design",
+                status="partial",
+                failure_class="shareability_gap",
+                shareability="gap",
+            ),
+            corpus_item(
+                item_id="historical-solved-report",
+                category="pwn",
+                challenge="historical-solved-report",
+                path=report_path,
+                split="holdout",
+                status="solved",
+                expected_artifacts=[report_path.as_posix()],
             ),
             corpus_item(
                 item_id="missing-path",
@@ -142,11 +262,20 @@ def assert_evaluate_corpus(temp_root: Path) -> None:
         fail("evaluate_corpus emitted a raw flag marker")
     metrics = json.loads(result.stdout)
 
-    if metrics["total_challenges"] != 4:
+    if metrics["total_challenges"] != 11:
         fail("evaluate_corpus reported the wrong total challenge count")
-    for category in ("pwn", "web", "crypto", "rev"):
-        if metrics["by_category"].get(category) != 1:
-            fail(f"evaluate_corpus category count missing {category}")
+    expected_categories = {
+        "pwn": 3,
+        "web": 1,
+        "crypto": 1,
+        "hardware-rf": 1,
+        "rev": 2,
+        "misc": 2,
+        "forensics": 1,
+    }
+    for category, count in expected_categories.items():
+        if metrics["by_category"].get(category) != count:
+            fail(f"evaluate_corpus category count wrong for {category}")
     for split in ("design", "holdout", "regression"):
         if split not in metrics["by_split"]:
             fail(f"evaluate_corpus split count missing {split}")
@@ -156,6 +285,71 @@ def assert_evaluate_corpus(temp_root: Path) -> None:
         fail("blocked without blocker reason was not flagged")
     if not any(item["id"] == "missing-path" for item in metrics["missing_challenge_paths"]):
         fail("missing challenge path was not reported")
+    if metrics["dependency_missing_count"] != 1:
+        fail("missing dependency count was not reported")
+    if not any(item["id"] == "dependency-missing" for item in metrics["dependency_missing"]):
+        fail("missing dependency entry was not reported")
+    if not any(item["id"] == "dependency-missing" for item in metrics["entries_with_missing_tools"]):
+        fail("entry with a missing tool was not reported")
+    if any(item["id"] == "dependency-missing" for item in metrics["mcp_skipped_with_reason"]):
+        fail("missing dependency was incorrectly treated as a skipped MCP tool")
+    if not any(item["id"] == "mcp-used" and item["tool"] == "radare2" for item in metrics["mcp_used"]):
+        fail("MCP used fixture was not reported")
+    if not any(item["id"] == "mcp-skipped" and item["tool"] == "angr" for item in metrics["mcp_skipped_with_reason"]):
+        fail("MCP skipped fixture with explicit reason was not reported")
+    if not any(item["id"] == "mcp-skipped" and item["tool"] == "angr" for item in metrics["mcp_considered"]):
+        fail("MCP considered fixture was not reported")
+    if not any(item["id"] == "non-mcp-primary" for item in metrics["mcp_absent_without_decision_recorded"]):
+        fail("primary non-MCP fixture did not report absent MCP decision")
+    if not any(item["id"] == "routing-gap" for item in metrics["tool_routing_gap"]):
+        fail("missing routing data was not reported as tool_routing_gap")
+    if metrics["by_agent_mode"].get("none") != 1:
+        fail("agent_mode none baseline was not counted")
+    if not any(item["id"] == "solved-no-evidence" for item in metrics["entries_missing_agent_mode"]):
+        fail("missing agent_mode entries were not reported")
+    if metrics["failure_taxonomy_counts"].get("shareability_gap") != 1:
+        fail("failure taxonomy count was not reported")
+    if metrics["shareability_summary"].get("gap_count") != 1:
+        fail("shareability gap was not summarized")
+    if not any(
+        item["id"] == "partial-shareability-gap"
+        for item in metrics["shareability_summary"].get("gap_entries", [])
+    ):
+        fail("shareability gap entry was not reported")
+    if not any(
+        item["id"] == "partial-shareability-gap"
+        for item in metrics["entries_missing_sanitized_report"]
+    ):
+        fail("missing sanitized report was not reported")
+    if not any(
+        item["id"] == "historical-solved-report"
+        for item in metrics["historical_solved_without_current_proof_valid_replay"]
+    ):
+        fail("historical solved without current proof-valid replay was not reported")
+    split_warnings = metrics["split_health"].get("warnings", [])
+    if not any("missing challenge paths" in item.get("reason", "") for item in split_warnings):
+        fail("split health missing-path warning was not reported")
+    if not any("only planned" in item.get("reason", "") for item in split_warnings):
+        fail("split health planned-only warning was not reported")
+    if metrics["performance_metrics_availability"]["time_metrics"]["available_count"] != 0:
+        fail("missing time metrics were not reported as unavailable")
+    if metrics["performance_metrics_availability"]["time_metrics"]["unavailable_count"] != metrics["total_challenges"]:
+        fail("time metric unavailable count did not match the fixture corpus")
+    text_result = run(["python3", "tools/evaluate_corpus.py", "--corpus", corpus_path.as_posix()])
+    for expected_text in (
+        "dependency_missing",
+        "tool_routing_gap",
+        "mcp_skipped_with_reason",
+        "by_agent_mode",
+        "failure_taxonomy_counts",
+        "split_health",
+        "shareability_summary",
+        "entries_missing_sanitized_report",
+        "historical_solved_without_current_proof_valid_replay",
+        "performance_metrics_availability",
+    ):
+        if expected_text not in text_result.stdout:
+            fail(f"text evaluate_corpus report did not include {expected_text}")
     if metrics["readiness_verdict"] != "FAIL":
         fail("invalid selftest corpus did not produce a FAIL readiness verdict")
 

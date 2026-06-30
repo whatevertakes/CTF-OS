@@ -13,6 +13,8 @@ outputs:
 dependencies:
 - `tools/intake_challenge.py`
 - `templates/challenge/`
+reference_digest:
+- `docs/reference-digests/common.md`
 evidence produced:
 - Created challenge tree and initial `state.json`.
 failure/blocker classes:

@@ -25,6 +25,8 @@ dependencies:
 - `tools/proof_validate.py`
 - `docs/LEVEL2_TO_LEVEL3_HANDOFF.md`
 - `docs/CTF_SOLVER_MEMORY.md`
+reference_digest:
+- `docs/reference-digests/common.md`
 evidence produced:
 - Worker evidence files.
 - Positive facts and negative results with reproducible commands or saved responses.

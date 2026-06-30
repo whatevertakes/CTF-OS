@@ -13,6 +13,8 @@ dependencies:
 - Optional Playwright MCP for browser interactions.
 - Optional `.codex/bin/tplmap` for SSTI detection and exploitation.
 - Optional `.codex/bin/searchsploit` for CVE and public exploit lookup.
+reference_digest:
+- `docs/reference-digests/web.md`
 evidence produced:
 - Saved request/response pairs, payloads, screenshots when useful, and replay commands.
 failure/blocker classes:

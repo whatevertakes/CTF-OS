@@ -7,7 +7,7 @@ that an agent should be added.
 | Label | Meaning | Typical Evidence |
 | --- | --- | --- |
 | `env_missing` | Required local runtime, service, file, container, or emulator is missing. | Preflight or setup error, missing binary, missing service dependency. |
-| `dependency_missing` | A specific library, package, plugin, or optional tool is missing. | Import failure, tool not found, unavailable solver dependency. |
+| `dependency_missing` | A specific library, package, plugin, or challenge-specific toolchain is missing. | Import failure, tool not found, unavailable solver dependency, AVR firmware challenge missing `avr-gcc`/`avr-objdump`/`avr-objcopy`/`avr-size`. |
 | `wrong_hypothesis` | The current theory of the challenge is contradicted by evidence. | Negative probe, failed decryption model, wrong bug class. |
 | `primitive_gap` | The broad direction is right but a necessary primitive is absent. | No leak, no write primitive, no oracle, missing gadget. |
 | `leak_missing` | Exploitation or recovery needs a leak that has not been obtained. | ASLR/PIE unknown, key material missing, hidden state not recovered. |

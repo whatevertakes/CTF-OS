@@ -1,0 +1,843 @@
+{
+  "generated_at": "2026-06-30T10:46:24Z",
+  "references": [
+    {
+      "category": [
+        "common"
+      ],
+      "commit": "1af14f9030fee9da46014a8a3ed61a555b81ab98",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/common.md",
+      "full_name": "ljagiello/ctf-skills",
+      "id": "upstream_ctf_skills",
+      "materialized_at": "2026-06-30T10:44:42Z",
+      "materialized_commit": "1af14f9030fee9da46014a8a3ed61a555b81ab98",
+      "materialized_path": ".cache/references/ljagiello-ctf-skills@1af14f9030fe",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/ljagiello/ctf-skills: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "github",
+      "url": "https://github.com/ljagiello/ctf-skills"
+    },
+    {
+      "category": [
+        "common"
+      ],
+      "digest_path": "docs/reference-digests/common.md",
+      "id": "cve_mitre",
+      "mode": "reference_digest",
+      "resolution": "non_github_reference",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "official",
+      "url": "https://www.cve.org/"
+    },
+    {
+      "category": [
+        "common"
+      ],
+      "digest_path": "docs/reference-digests/common.md",
+      "id": "nvd_nist",
+      "mode": "reference_digest",
+      "resolution": "non_github_reference",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "official",
+      "url": "https://nvd.nist.gov/vuln/data-feeds"
+    },
+    {
+      "category": [
+        "common"
+      ],
+      "digest_path": "docs/reference-digests/common.md",
+      "id": "cisa_kev",
+      "mode": "reference_digest",
+      "resolution": "non_github_reference",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "official",
+      "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+    },
+    {
+      "category": [
+        "common"
+      ],
+      "digest_path": "docs/reference-digests/common.md",
+      "id": "mitre_cwe_top25",
+      "mode": "reference_digest",
+      "resolution": "non_github_reference",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "official",
+      "url": "https://cwe.mitre.org/top25/"
+    },
+    {
+      "category": [
+        "pwn"
+      ],
+      "commit": "09fbd3a6811b6b3adb1674f12223899741a26504",
+      "default_branch": "dev",
+      "digest_path": "docs/reference-digests/pwn.md",
+      "full_name": "Gallopsled/pwntools",
+      "id": "pwntools",
+      "materialized_at": "2026-06-30T10:44:43Z",
+      "materialized_commit": "09fbd3a6811b6b3adb1674f12223899741a26504",
+      "materialized_path": ".cache/references/Gallopsled-pwntools@09fbd3a6811b",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/Gallopsled/pwntools: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:18Z",
+      "source_type": "github",
+      "url": "https://github.com/Gallopsled/pwntools"
+    },
+    {
+      "category": [
+        "pwn"
+      ],
+      "commit": "60eeb9280006dd665c0d225fa1727e6ce154dace",
+      "default_branch": "dev",
+      "digest_path": "docs/reference-digests/pwn.md",
+      "full_name": "pwndbg/pwndbg",
+      "id": "pwndbg",
+      "materialized_at": "2026-06-30T10:44:48Z",
+      "materialized_commit": "60eeb9280006dd665c0d225fa1727e6ce154dace",
+      "materialized_path": ".cache/references/pwndbg-pwndbg@60eeb9280006",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/pwndbg/pwndbg: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:19Z",
+      "source_type": "github",
+      "url": "https://github.com/pwndbg/pwndbg"
+    },
+    {
+      "category": [
+        "pwn"
+      ],
+      "commit": "b6e3fe31af46d7e045fef99a3ab19ccbcea5c2f6",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/pwn.md",
+      "full_name": "JonathanSalwan/ROPgadget",
+      "id": "ropgadget",
+      "materialized_at": "2026-06-30T10:44:46Z",
+      "materialized_commit": "b6e3fe31af46d7e045fef99a3ab19ccbcea5c2f6",
+      "materialized_path": ".cache/references/JonathanSalwan-ROPgadget@b6e3fe31af46",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/JonathanSalwan/ROPgadget: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:19Z",
+      "source_type": "github",
+      "url": "https://github.com/JonathanSalwan/ROPgadget"
+    },
+    {
+      "category": [
+        "rev",
+        "pwn"
+      ],
+      "commit": "d263ea9cdcf724bc9f4812f4b58f9524974ce25a",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/rev.md",
+      "full_name": "angr/angr",
+      "id": "angr",
+      "materialized_at": "2026-06-30T10:44:46Z",
+      "materialized_commit": "d263ea9cdcf724bc9f4812f4b58f9524974ce25a",
+      "materialized_path": ".cache/references/angr-angr@d263ea9cdcf7",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/angr/angr: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:20Z",
+      "source_type": "github",
+      "url": "https://github.com/angr/angr"
+    },
+    {
+      "category": [
+        "rev"
+      ],
+      "commit": "bf380700f2baa092c2970a2dceb0eb2793bd9837",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/rev.md",
+      "full_name": "angr/angr-doc",
+      "id": "angr_examples",
+      "materialized_at": "2026-06-30T10:44:46Z",
+      "materialized_commit": "bf380700f2baa092c2970a2dceb0eb2793bd9837",
+      "materialized_path": ".cache/references/angr-angr-doc@bf380700f2ba",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/angr/angr-doc: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:20Z",
+      "source_type": "github",
+      "url": "https://github.com/angr/angr-doc/tree/master/examples"
+    },
+    {
+      "category": [
+        "rev",
+        "malware"
+      ],
+      "commit": "654d5474ce947a6ace8f1f94246be64a8ca3bd14",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/rev.md",
+      "full_name": "radareorg/radare2",
+      "id": "radare2",
+      "materialized_at": "2026-06-30T10:44:54Z",
+      "materialized_commit": "654d5474ce947a6ace8f1f94246be64a8ca3bd14",
+      "materialized_path": ".cache/references/radareorg-radare2@654d5474ce94",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/radareorg/radare2: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:20Z",
+      "source_type": "github",
+      "url": "https://github.com/radareorg/radare2"
+    },
+    {
+      "category": [
+        "rev",
+        "malware"
+      ],
+      "commit": "47ae57a4168d8ea72b2110c59d5f10cc36d17355",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/rev.md",
+      "full_name": "NationalSecurityAgency/ghidra",
+      "id": "ghidra",
+      "materialized_at": "2026-06-30T10:45:26Z",
+      "materialized_commit": "47ae57a4168d8ea72b2110c59d5f10cc36d17355",
+      "materialized_path": ".cache/references/NationalSecurityAgency-ghidra@47ae57a4168d",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/NationalSecurityAgency/ghidra: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:21Z",
+      "source_type": "github",
+      "url": "https://github.com/NationalSecurityAgency/ghidra"
+    },
+    {
+      "category": [
+        "web"
+      ],
+      "commit": "67152716ba29d70a6696e4c9e36685d31fc375b9",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web.md",
+      "full_name": "OWASP/wstg",
+      "id": "owasp_wstg",
+      "materialized_at": "2026-06-30T10:44:50Z",
+      "materialized_commit": "67152716ba29d70a6696e4c9e36685d31fc375b9",
+      "materialized_path": ".cache/references/OWASP-wstg@67152716ba29",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/OWASP/wstg: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:21Z",
+      "source_type": "github",
+      "url": "https://github.com/OWASP/wstg"
+    },
+    {
+      "category": [
+        "web",
+        "mobile",
+        "ai-ml"
+      ],
+      "commit": "ca485dc590f92b31f6db336335faa619ba68b112",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web.md",
+      "full_name": "OWASP/CheatSheetSeries",
+      "id": "owasp_cheatsheets",
+      "materialized_at": "2026-06-30T10:44:52Z",
+      "materialized_commit": "ca485dc590f92b31f6db336335faa619ba68b112",
+      "materialized_path": ".cache/references/OWASP-CheatSheetSeries@ca485dc590f9",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/OWASP/CheatSheetSeries: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:23Z",
+      "source_type": "github",
+      "url": "https://github.com/OWASP/CheatSheetSeries"
+    },
+    {
+      "category": [
+        "web"
+      ],
+      "commit": "87ba03815bfddcd2b2d5e1e1a983fc9ebd7ab1cc",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web.md",
+      "full_name": "sqlmapproject/sqlmap",
+      "id": "sqlmap",
+      "materialized_at": "2026-06-30T10:44:54Z",
+      "materialized_commit": "87ba03815bfddcd2b2d5e1e1a983fc9ebd7ab1cc",
+      "materialized_path": ".cache/references/sqlmapproject-sqlmap@87ba03815bfd",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/sqlmapproject/sqlmap: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:23Z",
+      "source_type": "github",
+      "url": "https://github.com/sqlmapproject/sqlmap"
+    },
+    {
+      "category": [
+        "web",
+        "jail"
+      ],
+      "commit": "616b0e527f62dd0930e6346ede6bef79e9bcf717",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web.md",
+      "full_name": "epinna/tplmap",
+      "id": "tplmap",
+      "materialized_at": "2026-06-30T10:44:53Z",
+      "materialized_commit": "616b0e527f62dd0930e6346ede6bef79e9bcf717",
+      "materialized_path": ".cache/references/epinna-tplmap@616b0e527f62",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/epinna/tplmap: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:24Z",
+      "source_type": "github",
+      "url": "https://github.com/epinna/tplmap"
+    },
+    {
+      "category": [
+        "web",
+        "cloud",
+        "container",
+        "mobile"
+      ],
+      "commit": "ebd399434d745a68fb2c873574f44e7b5059dc30",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web.md",
+      "full_name": "HackTricks-wiki/hacktricks",
+      "id": "hacktricks",
+      "materialized_at": "2026-06-30T10:45:35Z",
+      "materialized_commit": "ebd399434d745a68fb2c873574f44e7b5059dc30",
+      "materialized_path": ".cache/references/HackTricks-wiki-hacktricks@ebd399434d74",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/HackTricks-wiki/hacktricks: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:24Z",
+      "source_type": "github",
+      "url": "https://github.com/HackTricks-wiki/hacktricks"
+    },
+    {
+      "category": [
+        "crypto"
+      ],
+      "commit": "7c98848f1945de3e67a420871e8672f5ad9aa5d5",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/crypto.md",
+      "full_name": "RsaCtfTool/RsaCtfTool",
+      "id": "rsactftool",
+      "materialized_at": "2026-06-30T10:44:55Z",
+      "materialized_commit": "7c98848f1945de3e67a420871e8672f5ad9aa5d5",
+      "materialized_path": ".cache/references/RsaCtfTool-RsaCtfTool@7c98848f1945",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/RsaCtfTool/RsaCtfTool: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:25Z",
+      "source_type": "github",
+      "url": "https://github.com/RsaCtfTool/RsaCtfTool"
+    },
+    {
+      "category": [
+        "crypto"
+      ],
+      "commit": "d42a3df980bf029f682f218fa2893ed2d6af98d8",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/crypto.md",
+      "full_name": "jvdsn/crypto-attacks",
+      "id": "crypto_attacks",
+      "materialized_at": "2026-06-30T10:44:55Z",
+      "materialized_commit": "d42a3df980bf029f682f218fa2893ed2d6af98d8",
+      "materialized_path": ".cache/references/jvdsn-crypto-attacks@d42a3df980bf",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/jvdsn/crypto-attacks: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:25Z",
+      "source_type": "github",
+      "url": "https://github.com/jvdsn/crypto-attacks"
+    },
+    {
+      "category": [
+        "crypto"
+      ],
+      "digest_path": "docs/reference-digests/crypto.md",
+      "id": "sage",
+      "mode": "reference_digest",
+      "resolution": "non_github_reference",
+      "resolved_at": "2026-06-30T10:19:26Z",
+      "source_type": "official",
+      "url": "https://www.sagemath.org/"
+    },
+    {
+      "category": [
+        "forensics",
+        "malware"
+      ],
+      "commit": "634774fd0a86f29c58fc7d5c7f8cfbff83dec90c",
+      "default_branch": "develop",
+      "digest_path": "docs/reference-digests/forensics.md",
+      "full_name": "volatilityfoundation/volatility3",
+      "id": "volatility3",
+      "materialized_at": "2026-06-30T10:44:57Z",
+      "materialized_commit": "634774fd0a86f29c58fc7d5c7f8cfbff83dec90c",
+      "materialized_path": ".cache/references/volatilityfoundation-volatility3@634774fd0a86",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/volatilityfoundation/volatility3: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:26Z",
+      "source_type": "github",
+      "url": "https://github.com/volatilityfoundation/volatility3"
+    },
+    {
+      "category": [
+        "forensics"
+      ],
+      "commit": "4936f765d36d523d52a1925fa2f3ed11a5fcae65",
+      "default_branch": "develop-4.1x",
+      "digest_path": "docs/reference-digests/forensics.md",
+      "full_name": "sleuthkit/sleuthkit",
+      "id": "sleuthkit",
+      "materialized_at": "2026-06-30T10:44:59Z",
+      "materialized_commit": "4936f765d36d523d52a1925fa2f3ed11a5fcae65",
+      "materialized_path": ".cache/references/sleuthkit-sleuthkit@4936f765d36d",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/sleuthkit/sleuthkit: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:26Z",
+      "source_type": "github",
+      "url": "https://github.com/sleuthkit/sleuthkit"
+    },
+    {
+      "category": [
+        "forensics",
+        "stego"
+      ],
+      "commit": "704286902ee66922a028551048cc4a1009f46e6a",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/forensics.md",
+      "full_name": "ReFirmLabs/binwalk",
+      "id": "binwalk",
+      "materialized_at": "2026-06-30T10:45:02Z",
+      "materialized_commit": "704286902ee66922a028551048cc4a1009f46e6a",
+      "materialized_path": ".cache/references/ReFirmLabs-binwalk@704286902ee6",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/ReFirmLabs/binwalk: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:27Z",
+      "source_type": "github",
+      "url": "https://github.com/ReFirmLabs/binwalk"
+    },
+    {
+      "category": [
+        "stego"
+      ],
+      "commit": "b75b578ea13ed207561a46b8620b843c0a894422",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/stego.md",
+      "full_name": "zed-0xff/zsteg",
+      "id": "zsteg",
+      "materialized_at": "2026-06-30T10:45:04Z",
+      "materialized_commit": "b75b578ea13ed207561a46b8620b843c0a894422",
+      "materialized_path": ".cache/references/zed-0xff-zsteg@b75b578ea13e",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/zed-0xff/zsteg: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:27Z",
+      "source_type": "github",
+      "url": "https://github.com/zed-0xff/zsteg"
+    },
+    {
+      "category": [
+        "stego"
+      ],
+      "commit": "68e4c11cdfb69a54a34ae0918d85a2791a677c87",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/stego.md",
+      "full_name": "eugenekolo/sec-tools",
+      "id": "stegsolve_reference",
+      "materialized_at": "2026-06-30T10:45:05Z",
+      "materialized_commit": "68e4c11cdfb69a54a34ae0918d85a2791a677c87",
+      "materialized_path": ".cache/references/eugenekolo-sec-tools@68e4c11cdfb6",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/eugenekolo/sec-tools: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:28Z",
+      "source_type": "tool-reference",
+      "url": "https://github.com/eugenekolo/sec-tools/tree/master/stego/stegsolve/stegsolve"
+    },
+    {
+      "category": [
+        "mobile",
+        "rev"
+      ],
+      "commit": "aaec137830f217ab5f69d2b64279433c1775a22a",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/mobile.md",
+      "full_name": "skylot/jadx",
+      "id": "jadx",
+      "materialized_at": "2026-06-30T10:45:08Z",
+      "materialized_commit": "aaec137830f217ab5f69d2b64279433c1775a22a",
+      "materialized_path": ".cache/references/skylot-jadx@aaec137830f2",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/skylot/jadx: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:28Z",
+      "source_type": "github",
+      "url": "https://github.com/skylot/jadx"
+    },
+    {
+      "category": [
+        "mobile"
+      ],
+      "commit": "d6ab7c3a3f202fc6a787177b17b17201dbf2aedb",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/mobile.md",
+      "full_name": "iBotPeaches/Apktool",
+      "id": "apktool",
+      "materialized_at": "2026-06-30T10:45:17Z",
+      "materialized_commit": "d6ab7c3a3f202fc6a787177b17b17201dbf2aedb",
+      "materialized_path": ".cache/references/iBotPeaches-Apktool@d6ab7c3a3f20",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/iBotPeaches/Apktool: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:29Z",
+      "source_type": "github",
+      "url": "https://github.com/iBotPeaches/Apktool"
+    },
+    {
+      "category": [
+        "mobile",
+        "rev"
+      ],
+      "commit": "831acfffc87483c4a1d665b9b6ae89e66bcefaa2",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/mobile.md",
+      "full_name": "frida/frida",
+      "id": "frida",
+      "materialized_at": "2026-06-30T10:45:09Z",
+      "materialized_commit": "831acfffc87483c4a1d665b9b6ae89e66bcefaa2",
+      "materialized_path": ".cache/references/frida-frida@831acfffc874",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/frida/frida: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:29Z",
+      "source_type": "github",
+      "url": "https://github.com/frida/frida"
+    },
+    {
+      "category": [
+        "mobile"
+      ],
+      "commit": "6e875fb77baa9dbe65ff8e7d0344d740e1d6d51e",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/mobile.md",
+      "full_name": "MobSF/Mobile-Security-Framework-MobSF",
+      "id": "mobsf",
+      "materialized_at": "2026-06-30T10:45:38Z",
+      "materialized_commit": "6e875fb77baa9dbe65ff8e7d0344d740e1d6d51e",
+      "materialized_path": ".cache/references/MobSF-Mobile-Security-Framework-MobSF@6e875fb77baa",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/MobSF/Mobile-Security-Framework-MobSF: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:29Z",
+      "source_type": "github",
+      "url": "https://github.com/MobSF/Mobile-Security-Framework-MobSF"
+    },
+    {
+      "category": [
+        "malware"
+      ],
+      "commit": "f850024b5604443170de502ea0a6a598e82fe1c9",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/malware.md",
+      "full_name": "mandiant/capa",
+      "id": "capa",
+      "materialized_at": "2026-06-30T10:45:27Z",
+      "materialized_commit": "f850024b5604443170de502ea0a6a598e82fe1c9",
+      "materialized_path": ".cache/references/mandiant-capa@f850024b5604",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/mandiant/capa: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:30Z",
+      "source_type": "github",
+      "url": "https://github.com/mandiant/capa"
+    },
+    {
+      "category": [
+        "malware"
+      ],
+      "commit": "44a9fa33fbf4049188c35c26b6a18dd62619c060",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/malware.md",
+      "full_name": "VirusTotal/yara",
+      "id": "yara",
+      "materialized_at": "2026-06-30T10:45:28Z",
+      "materialized_commit": "44a9fa33fbf4049188c35c26b6a18dd62619c060",
+      "materialized_path": ".cache/references/VirusTotal-yara@44a9fa33fbf4",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/VirusTotal/yara: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:30Z",
+      "source_type": "github",
+      "url": "https://github.com/VirusTotal/yara"
+    },
+    {
+      "category": [
+        "web3"
+      ],
+      "commit": "937074514d9341cdd4d314f6d026f7c71666402b",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web3.md",
+      "full_name": "foundry-rs/foundry",
+      "id": "foundry",
+      "materialized_at": "2026-06-30T10:45:37Z",
+      "materialized_commit": "937074514d9341cdd4d314f6d026f7c71666402b",
+      "materialized_path": ".cache/references/foundry-rs-foundry@937074514d93",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/foundry-rs/foundry: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:31Z",
+      "source_type": "github",
+      "url": "https://github.com/foundry-rs/foundry"
+    },
+    {
+      "category": [
+        "web3"
+      ],
+      "commit": "5e78b88c0235885aa0a3f0ac3124d5eace3f1c40",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web3.md",
+      "full_name": "crytic/slither",
+      "id": "slither",
+      "materialized_at": "2026-06-30T10:45:38Z",
+      "materialized_commit": "5e78b88c0235885aa0a3f0ac3124d5eace3f1c40",
+      "materialized_path": ".cache/references/crytic-slither@5e78b88c0235",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/crytic/slither: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:31Z",
+      "source_type": "github",
+      "url": "https://github.com/crytic/slither"
+    },
+    {
+      "category": [
+        "web3"
+      ],
+      "commit": "74274d420b3cfd25f6788e1ed1f6e85337093992",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/web3.md",
+      "full_name": "crytic/echidna",
+      "id": "echidna",
+      "materialized_at": "2026-06-30T10:45:36Z",
+      "materialized_commit": "74274d420b3cfd25f6788e1ed1f6e85337093992",
+      "materialized_path": ".cache/references/crytic-echidna@74274d420b3c",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/crytic/echidna: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:32Z",
+      "source_type": "github",
+      "url": "https://github.com/crytic/echidna"
+    },
+    {
+      "category": [
+        "cloud",
+        "container"
+      ],
+      "commit": "01312dc837004c1d40949550037764c44dea9259",
+      "default_branch": "v1",
+      "digest_path": "docs/reference-digests/cloud-container.md",
+      "full_name": "google/kctf",
+      "id": "kctf",
+      "materialized_at": "2026-06-30T10:45:38Z",
+      "materialized_commit": "01312dc837004c1d40949550037764c44dea9259",
+      "materialized_path": ".cache/references/google-kctf@01312dc83700",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/google/kctf: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:32Z",
+      "source_type": "github",
+      "url": "https://github.com/google/kctf"
+    },
+    {
+      "category": [
+        "cloud",
+        "container"
+      ],
+      "commit": "723a0db478f050d173d23b4ce5044b65bce0bdd0",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/cloud-container.md",
+      "full_name": "madhuakula/kubernetes-goat",
+      "id": "kubernetes_goat",
+      "materialized_at": "2026-06-30T10:46:04Z",
+      "materialized_commit": "723a0db478f050d173d23b4ce5044b65bce0bdd0",
+      "materialized_path": ".cache/references/madhuakula-kubernetes-goat@723a0db478f0",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/madhuakula/kubernetes-goat: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:33Z",
+      "source_type": "github",
+      "url": "https://github.com/madhuakula/kubernetes-goat"
+    },
+    {
+      "category": [
+        "cloud",
+        "container"
+      ],
+      "commit": "8a32853686209a428179bb3a1688802b25691564",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/cloud-container.md",
+      "full_name": "aquasecurity/trivy",
+      "id": "trivy",
+      "materialized_at": "2026-06-30T10:45:59Z",
+      "materialized_commit": "8a32853686209a428179bb3a1688802b25691564",
+      "materialized_path": ".cache/references/aquasecurity-trivy@8a3285368620",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/aquasecurity/trivy: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:33Z",
+      "source_type": "github",
+      "url": "https://github.com/aquasecurity/trivy"
+    },
+    {
+      "category": [
+        "ai-ml"
+      ],
+      "commit": "63a840415ea744c6d64f382ca4e8f8fd7ee7b120",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/ai-ml.md",
+      "full_name": "NVIDIA/garak",
+      "id": "garak",
+      "materialized_at": "2026-06-30T10:45:41Z",
+      "materialized_commit": "63a840415ea744c6d64f382ca4e8f8fd7ee7b120",
+      "materialized_path": ".cache/references/NVIDIA-garak@63a840415ea7",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/NVIDIA/garak: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:33Z",
+      "source_type": "github",
+      "url": "https://github.com/NVIDIA/garak"
+    },
+    {
+      "category": [
+        "ai-ml"
+      ],
+      "commit": "c0cf9a14adad76e9d6a53c41741f625334bd9971",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/ai-ml.md",
+      "full_name": "WithSecureLabs/damn-vulnerable-llm-agent",
+      "id": "damn_vulnerable_llm_agent",
+      "materialized_at": "2026-06-30T10:45:40Z",
+      "materialized_commit": "c0cf9a14adad76e9d6a53c41741f625334bd9971",
+      "materialized_path": ".cache/references/WithSecureLabs-damn-vulnerable-llm-agent@c0cf9a14adad",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/WithSecureLabs/damn-vulnerable-llm-agent: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:34Z",
+      "source_type": "github",
+      "url": "https://github.com/WithSecureLabs/damn-vulnerable-llm-agent"
+    },
+    {
+      "category": [
+        "ai-ml"
+      ],
+      "commit": "8b00e6f2dc5d1701ffa1ee5b6f54414eab3fc6a4",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/ai-ml.md",
+      "full_name": "promptfoo/promptfoo",
+      "id": "promptfoo",
+      "materialized_at": "2026-06-30T10:46:24Z",
+      "materialized_commit": "8b00e6f2dc5d1701ffa1ee5b6f54414eab3fc6a4",
+      "materialized_path": ".cache/references/promptfoo-promptfoo@8b00e6f2dc5d",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/promptfoo/promptfoo: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:34Z",
+      "source_type": "github",
+      "url": "https://github.com/promptfoo/promptfoo"
+    },
+    {
+      "category": [
+        "hardware-rf",
+        "side-channel"
+      ],
+      "commit": "3c8e4347507376d88f2e072fd39df28b380dd713",
+      "default_branch": "develop",
+      "digest_path": "docs/reference-digests/hardware-rf-side-channel.md",
+      "full_name": "newaetech/chipwhisperer",
+      "id": "chipwhisperer",
+      "materialized_at": "2026-06-30T10:46:11Z",
+      "materialized_commit": "3c8e4347507376d88f2e072fd39df28b380dd713",
+      "materialized_path": ".cache/references/newaetech-chipwhisperer@3c8e43475073",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/newaetech/chipwhisperer: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:35Z",
+      "source_type": "github",
+      "url": "https://github.com/newaetech/chipwhisperer"
+    },
+    {
+      "category": [
+        "hardware-rf"
+      ],
+      "commit": "60121977f5f8d1145553251a3b3d0dbe2819aa14",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/hardware-rf-side-channel.md",
+      "full_name": "sigmf/SigMF",
+      "id": "sigmf",
+      "materialized_at": "2026-06-30T10:46:00Z",
+      "materialized_commit": "60121977f5f8d1145553251a3b3d0dbe2819aa14",
+      "materialized_path": ".cache/references/sigmf-SigMF@60121977f5f8",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/sigmf/SigMF: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:35Z",
+      "source_type": "github",
+      "url": "https://github.com/sigmf/SigMF"
+    },
+    {
+      "category": [
+        "hardware-rf"
+      ],
+      "commit": "1403d92987cc3d01d41aff64250955ce455dabd2",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/hardware-rf-side-channel.md",
+      "full_name": "jopohl/urh",
+      "id": "urh",
+      "materialized_at": "2026-06-30T10:46:07Z",
+      "materialized_commit": "1403d92987cc3d01d41aff64250955ce455dabd2",
+      "materialized_path": ".cache/references/jopohl-urh@1403d92987cc",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/jopohl/urh: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:36Z",
+      "source_type": "github",
+      "url": "https://github.com/jopohl/urh"
+    },
+    {
+      "category": [
+        "osint"
+      ],
+      "commit": "206068dc7842665130c87e16e1535572d3d1a907",
+      "default_branch": "master",
+      "digest_path": "docs/reference-digests/osint.md",
+      "full_name": "sherlock-project/sherlock",
+      "id": "sherlock",
+      "materialized_at": "2026-06-30T10:46:06Z",
+      "materialized_commit": "206068dc7842665130c87e16e1535572d3d1a907",
+      "materialized_path": ".cache/references/sherlock-project-sherlock@206068dc7842",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/sherlock-project/sherlock: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:36Z",
+      "source_type": "github",
+      "url": "https://github.com/sherlock-project/sherlock"
+    },
+    {
+      "category": [
+        "osint"
+      ],
+      "commit": "af253d7dc3119a7a9da0e951a39aae8640612118",
+      "default_branch": "main",
+      "digest_path": "docs/reference-digests/osint.md",
+      "full_name": "soxoj/maigret",
+      "id": "maigret",
+      "materialized_at": "2026-06-30T10:46:09Z",
+      "materialized_commit": "af253d7dc3119a7a9da0e951a39aae8640612118",
+      "materialized_path": ".cache/references/soxoj-maigret@af253d7dc311",
+      "mode": "reference_digest",
+      "resolution": "github_partial",
+      "resolution_error": "network error fetching https://api.github.com/repos/soxoj/maigret: HTTP Error 403: rate limit exceeded",
+      "resolved_at": "2026-06-30T10:19:36Z",
+      "source_type": "github",
+      "url": "https://github.com/soxoj/maigret"
+    }
+  ],
+  "schema_version": 1
+}

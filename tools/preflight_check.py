@@ -24,10 +24,54 @@ REQUIRED_PATHS = (
     ".codex/bin/searchsploit",
     ".codex/bin/tplmap",
     "capabilities/registry.yaml",
+    "references.yaml",
+    "references.lock.json",
+    "docs/CATEGORY_REFERENCE_MAP.md",
     "docs/CTF_SOLVE_PLAYBOOKS.md",
+    "docs/TOOLCHAIN_MATRIX.md",
+    "docs/reference-digests/common.md",
+    "docs/reference-digests/pwn.md",
+    "docs/reference-digests/web.md",
+    "docs/reference-digests/rev.md",
+    "docs/reference-digests/crypto.md",
+    "docs/reference-digests/forensics.md",
+    "docs/reference-digests/stego.md",
+    "docs/reference-digests/mobile.md",
+    "docs/reference-digests/malware.md",
+    "docs/reference-digests/web3.md",
+    "docs/reference-digests/cloud-container.md",
+    "docs/reference-digests/ai-ml.md",
+    "docs/reference-digests/hardware-rf-side-channel.md",
+    "docs/reference-digests/osint.md",
+    "docs/reference-digests/jail.md",
+    "docs/reference-digests/programming.md",
+    "docs/reference-digests/misc.md",
+    "docs/reference-digests/hybrid.md",
+    "docs/reference-index/common.json",
+    "docs/reference-index/pwn.json",
+    "docs/reference-index/web.json",
+    "docs/reference-index/rev.json",
+    "docs/reference-index/crypto.json",
+    "docs/reference-index/forensics.json",
+    "docs/reference-index/stego.json",
+    "docs/reference-index/mobile.json",
+    "docs/reference-index/malware.json",
+    "docs/reference-index/web3.json",
+    "docs/reference-index/cloud-container.json",
+    "docs/reference-index/ai-ml.json",
+    "docs/reference-index/hardware-rf-side-channel.json",
+    "docs/reference-index/osint.json",
+    "docs/reference-index/jail.json",
+    "docs/reference-index/programming.json",
+    "docs/reference-index/misc.json",
+    "docs/reference-index/hybrid.json",
     "tools/intake_challenge.py",
     "tools/replay_runner.py",
     "tools/proof_validate.py",
+    "tools/reference_refresh.py",
+    "tools/reference_index.py",
+    "tools/reference_query.py",
+    "tools/reference_digest_check.py",
     "tools/benchmark_runner.py",
     "tools/report_sanitize.py",
     "tools/cleanup_artifacts.py",
@@ -55,6 +99,9 @@ REQUIRED_PATHS = (
 )
 
 REQUIRED_COMMANDS = ("bash", "git", "python3")
+AVR_REQUIRED_COMMANDS = ("avr-gcc", "avr-objdump", "avr-objcopy", "avr-size")
+AVR_TRIGGER_CATEGORIES = {"hardware-rf"}
+AVR_TRIGGER_TAGS = {"avr", "firmware", "arduino"}
 OPTIONAL_COMMANDS = (
     "docker",
     "node",
@@ -92,7 +139,12 @@ PYTHON_MODULES = (
     ("unicorn", "unicorn"),
 )
 
-REQUIRED_SKILL_SECTIONS = ("workflow:", "first_commands:", "docs/CTF_SOLVE_PLAYBOOKS.md")
+REQUIRED_SKILL_SECTIONS = (
+    "workflow:",
+    "first_commands:",
+    "reference_digest:",
+    "docs/CTF_SOLVE_PLAYBOOKS.md",
+)
 
 
 class Reporter:
@@ -154,6 +206,20 @@ def check_ctf_skills(reporter: Reporter) -> None:
             reporter.pass_(f"skill contract {relative}")
 
 
+def check_reference_layer(reporter: Reporter) -> None:
+    for name, command in (
+        ("reference manifest", ["python3", "tools/reference_refresh.py"]),
+        ("reference index", ["python3", "tools/reference_index.py", "--check"]),
+        ("reference digest wiring", ["python3", "tools/reference_digest_check.py"]),
+    ):
+        result = run(command)
+        if result.returncode == 0:
+            reporter.pass_(name)
+        else:
+            reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "check failed"
+            reporter.fail(f"{name}: {reason}")
+
+
 def check_commands(reporter: Reporter, *, strict_optional: bool) -> None:
     for command in REQUIRED_COMMANDS:
         if shutil.which(command):
@@ -178,6 +244,25 @@ def check_commands(reporter: Reporter, *, strict_optional: bool) -> None:
             reporter.fail(f"docker daemon unreachable: {reason}")
         else:
             reporter.warn("docker daemon unreachable")
+
+
+def requires_avr_toolchain(category: str | None, tags: list[str]) -> bool:
+    normalized_category = (category or "").strip().lower()
+    normalized_tags = {tag.strip().lower() for tag in tags if tag.strip()}
+    return normalized_category in AVR_TRIGGER_CATEGORIES or bool(normalized_tags & AVR_TRIGGER_TAGS)
+
+
+def check_avr_toolchain(reporter: Reporter) -> None:
+    missing = []
+    for command in AVR_REQUIRED_COMMANDS:
+        if shutil.which(command):
+            reporter.pass_(f"command {command}")
+        else:
+            missing.append(command)
+    if missing:
+        reporter.fail(f"dependency_missing: avr toolchain missing {', '.join(missing)}")
+    else:
+        reporter.pass_("dependency avr toolchain")
 
 
 def check_python_modules(reporter: Reporter) -> None:
@@ -270,6 +355,13 @@ def check_runtime_environment(reporter: Reporter) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--category", help="optional challenge category for category-specific dependency checks")
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        help="optional challenge tag for tag-specific dependency checks; may be repeated",
+    )
     parser.add_argument(
         "--strict-optional",
         action="store_true",
@@ -283,7 +375,10 @@ def main() -> int:
     reporter = Reporter()
     check_paths(reporter)
     check_ctf_skills(reporter)
+    check_reference_layer(reporter)
     check_commands(reporter, strict_optional=args.strict_optional)
+    if requires_avr_toolchain(args.category, args.tag):
+        check_avr_toolchain(reporter)
     check_python_modules(reporter)
     check_config(reporter)
     check_runtime_environment(reporter)

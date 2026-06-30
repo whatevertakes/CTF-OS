@@ -1,4 +1,19 @@
 schema_version: 1
+# Optional dependency metadata per item:
+# - required_tools: list of command/module names needed for the benchmark case
+# - missing_tools: list of required tools known to be unavailable
+# - dependency_status: ok | missing | unknown
+# Optional tool routing observability per item:
+# - primary_tools_used, tools_considered, tools_used, tools_skipped
+# - tool entries may be strings or objects with tool/kind/reason/retrospective
+# - tool_routing_gap: true or a reason string when routing data is missing
+# Optional team/evaluation metadata per item:
+# - agent_mode: none | hermes_readonly | lazycodex_readonly | gajae_bounded | assisted | autonomous
+# - owner, reviewer, failure_class, proof_scope, replay_kind, replay_quality, shareability: optional strings
+# - failure_class values are counted as provided so emerging taxonomy labels can be observed before formalization
+# Optional performance metadata per item:
+# - time_metrics, attempt_metrics, reference_metrics, tool_effectiveness: optional mappings
+# - missing performance mappings are reported as unavailable and do not fail corpus readiness
 items:
   - id: pwn_ppp_historical
     event: historical
@@ -16,6 +31,64 @@ items:
     expected_artifacts:
       - benchmarks/PWN_PPP_SANITIZED_BENCHMARK_REPORT.md
     notes: Historical sanitized remote-solved pwn control. Raw flag and raw replay logs are intentionally not committed.
+  - id: blindtest_pwn_arduino_breakdown
+    event: blindtest
+    category: pwn
+    challenge: Arduino_Breakdown
+    path: challenges/blindtest/pwn/Arduino_Breakdown
+    split: holdout
+    status: blocked
+    difficulty: hard
+    tags:
+      - pwn
+      - simavr
+      - arduino
+      - heap-corruption
+      - aslr
+      - remote-liveness
+      - blocked
+      - no-raw-flag
+    required_tools:
+      - avr-gcc
+      - avr-objdump
+      - avr-objcopy
+      - avr-size
+    missing_tools: []
+    dependency_status: ok
+    primary_tools_used:
+      - docker
+      - gdb
+      - python3
+      - AVR toolchain
+    tools_considered:
+      - tool: radare2
+        kind: mcp
+        retrospective: true
+        reason: "Retrospective inference only: local source, debug info, Docker, and GDB probes gave higher-value evidence for the dynamic heap/ASLR blocker."
+      - tool: angr
+        kind: mcp
+        retrospective: true
+        reason: "Retrospective inference only: symbolic execution was lower-value than source-backed dynamic probes for this simulator heap layout and ASLR blocker."
+    tools_used:
+      - docker
+      - gdb
+      - python3
+      - AVR toolchain
+    tools_skipped:
+      - tool: radare2
+        kind: mcp
+        retrospective: true
+        reason: "Source/debug info plus Docker/GDB probes were higher value than MCP for this dynamic heap/ASLR blocker."
+      - tool: angr
+        kind: mcp
+        retrospective: true
+        reason: "The blocker depends on runtime heap layout, ASLR samples, and callback reachability rather than a static symbolic path."
+    expected_artifacts:
+      - state.json
+      - replay.sh
+      - notes.md
+      - evidence/replay_*.summary.md
+    notes: Blocked holdout for ASLR-stable exploitation of a simulator-host memory corruption; replay evidence covers remote liveness only.
   - id: mikuprotect_design
     event: historical
     category: pwn

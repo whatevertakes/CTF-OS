@@ -23,20 +23,34 @@ reports, and policy documents. It must not modify those inputs.
 
 ## Metrics Tracked
 
-The core metrics are:
+The core inventory metrics are total benchmark corpus entries, counts by
+category, counts by split, outcome counts, agent mode counts, missing agent
+mode entries, repeated failure taxonomy labels, replay quality summaries,
+shareability summaries, and split health warnings.
 
-- total benchmark corpus entries
-- counts by category
-- counts by split: `design`, `holdout`, and `regression`
-- outcome counts: `planned`, `attempted`, `solved`, `partial`, and `blocked`
-- solved entries that pass `tools/proof_validate.py`
+Integrity metrics are:
+
+- proof validity through `tools/proof_validate.py`
 - solved entries missing replay evidence or proof state
 - blocked entries missing a blocker reason
-- missing challenge paths
-- stale corpus entries whose registry metadata disagrees with existing state
-- repeated failure taxonomy labels
-- challenge time, cost, attempt count, retry count, and blocker patterns when
-  those are recorded in state or notes
+- dependency state and missing required tools
+- path and state hygiene, including missing challenge paths and stale corpus
+  entries whose registry metadata disagrees with existing state
+- sanitized benchmark report presence for solved, blocked, and partial entries
+- historical solved entries that do not have current proof-valid replay
+- tool routing gaps, MCP considered, MCP used, MCP skipped with reasons, and
+  MCP absence without a recorded decision
+
+Performance metrics are optional corpus mappings:
+
+- `time_metrics`
+- `attempt_metrics`
+- `reference_metrics`
+- `tool_effectiveness`
+
+Performance metrics are reported as unavailable when solve logs or metadata do
+not exist. Missing performance mappings do not fail readiness; they only limit
+what Level 6 can compare.
 
 Reports must be aggregate and sanitized. They may reference paths, IDs, status,
 split, category, and taxonomy labels. They must not include raw flags, secrets,
@@ -78,6 +92,11 @@ This keeps false-solved detection centralized:
 - blocked requires a blocker reason
 - sensitive replay logs require redacted summaries
 
+Tool routing metrics are observability caveats, not proof claims. A challenge
+may use no MCP tools when CLI tools or local probes produce better evidence.
+Skipped MCP tools are acceptable when the reason is explicit, and missing
+required tools remain dependency findings.
+
 ## Benchmark Splits
 
 `design` entries are used to understand workflow gaps and shape Level 2-5
@@ -90,6 +109,10 @@ results improve without increasing false-solved, leakage, or cleanup risk.
 
 `regression` entries are stable checks for previously fixed behaviors. They are
 used to prevent replay, proof, cleanup, report, and category coverage regressions.
+
+`agent_mode: none` is the no-agent baseline. Future agent A/B evaluation must
+compare each agent mode against that baseline by split and must not grant new
+agent capability from benchmark metadata alone.
 
 ## Overfitting Prevention
 
@@ -106,6 +129,14 @@ Level 6 reports should separate:
 
 Historical sanitized evidence is useful for architecture lessons, but it does
 not replace live proof-valid benchmark evidence.
+
+## Selftest Semantics
+
+`benchmarks/level6_selftest.py` may create intentionally bad fixture corpus
+entries under temporary directories. The selftest passes when those expected
+failures and warnings are detected correctly and the output stays sanitized. A
+passing selftest does not mean the fixture corpus is ready; it means Level 6
+recognized the bad fixtures.
 
 ## Category Coverage Goals
 

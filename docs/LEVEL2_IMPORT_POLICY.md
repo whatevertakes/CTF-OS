@@ -2,6 +2,14 @@
 
 This workspace does not vendor broad CTF repositories or install heavy tools by default. External resources are references unless a specific challenge justifies a narrow, reversible import.
 
+Curated references are tracked in `references.yaml`, resolved in
+`references.lock.json`, and compressed into category digests under
+`docs/reference-digests/`. Materialized references live under
+`.cache/references/<repo>@<commit>` and are indexed under
+`docs/reference-index/`. Level 3 workers should read the category digest and
+query the local index, but they must still prove claims with challenge-local
+evidence.
+
 ## Import Modes
 
 | Mode | Rule |
@@ -13,7 +21,16 @@ This workspace does not vendor broad CTF repositories or install heavy tools by 
 
 ## Default Loading
 
-External resources never load by default. A future agent should first inspect local artifacts, then use references only when the category skill or evidence shows a concrete gap.
+External resources never load by default. A future agent should first inspect
+local artifacts, then use references only when the category skill, category
+digest, or evidence shows a concrete gap.
+
+`tools/reference_refresh.py` validates the manifest, writes the lock file, and
+materializes pinned references with `--materialize`, `--materialize-category`,
+or `--materialize-all`. `tools/reference_index.py` builds local category
+indexes. `tools/reference_query.py` performs evidence-gated lookup without
+network access. `tools/reference_digest_check.py` verifies that installed CTF
+skills, digests, and source anchors point to real local indexes.
 
 ## External Resource Evaluations
 
@@ -32,6 +49,8 @@ External resources never load by default. A future agent should first inspect lo
 | `garak` ([github.com](https://github.com/NVIDIA/garak)) / Damn Vulnerable LLM Agent ([github.com](https://github.com/WithSecureLabs/damn-vulnerable-llm-agent)) | Reference only. | AI/ML security. | Apache-2.0; may require model/API secrets, never default. |
 | ChipWhisperer ([github.com](https://github.com/newaetech/chipwhisperer)) / SigMF ([github.com](https://github.com/sigmf/SigMF)) / URH ([github.com](https://github.com/jopohl/urh)) | Reference only. | Hardware, RF, and side-channel. | Hardware-heavy; URH is archived/GPL, do not vendor. |
 
+See `docs/CATEGORY_REFERENCE_MAP.md` for the current category-to-digest map.
+
 ## Challenge-Local Exceptions
 
 If a challenge needs an external tool, record this in `notes.md`:
@@ -41,3 +60,7 @@ If a challenge needs an external tool, record this in `notes.md`:
 - why local evidence requires it
 - output files produced
 - cleanup notes if the tool creates caches or generated data
+
+Reading `.cache/references/` for hypothesis support does not require a
+challenge-local exception. Copying reference code, running third-party tooling,
+or installing dependencies still requires the notes entry above.

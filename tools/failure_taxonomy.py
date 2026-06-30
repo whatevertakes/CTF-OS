@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TAXONOMY_PATH = ROOT / "docs" / "FAILURE_TAXONOMY.md"
 TAXONOMY = [
     ("env_missing", "Required local runtime, service, file, container, or emulator is missing."),
-    ("dependency_missing", "A specific library, package, plugin, or optional tool is missing."),
+    ("dependency_missing", "A specific library, package, plugin, or challenge-specific toolchain is missing."),
     ("wrong_hypothesis", "The current theory of the challenge is contradicted by evidence."),
     ("primitive_gap", "The broad direction is right but a necessary primitive is absent."),
     ("leak_missing", "Exploitation or recovery needs a leak that has not been obtained."),

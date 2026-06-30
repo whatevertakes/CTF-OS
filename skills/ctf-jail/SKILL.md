@@ -11,6 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional Playwright MCP for browser-based sandboxes.
+reference_digest:
+- `docs/reference-digests/jail.md`
 evidence produced:
 - Payload log, error messages, accepted bypass, and final command output.
 failure/blocker classes:

@@ -11,6 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional Ghidra external tooling, or configured radare2/angr MCP integration.
+reference_digest:
+- `docs/reference-digests/rev.md`
 evidence produced:
 - Hashes, strings, disassembly notes, extracted data, and reproduction commands.
 failure/blocker classes:

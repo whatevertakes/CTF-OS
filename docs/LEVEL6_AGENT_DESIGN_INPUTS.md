@@ -12,7 +12,7 @@ blocker, or evidence gaps. Relevant Level 6 signals include:
 - partial entries with unclear next action
 - stale corpus status versus challenge state
 - proof-invalid solved claims
-- repeated `evidence_gap`, `replay_gap`, or `unknown` taxonomy labels
+- repeated `evidence_gap` or `state_drift` taxonomy labels
 
 Initial Hermes behavior should be read-only: summarize state, classify blockers,
 rank next actions, and point to evidence gaps. It should not edit `state.json` or
@@ -27,7 +27,7 @@ generic cleanup role. Relevant Level 6 signals include:
 - replay summaries not present for sensitive evidence
 - stale corpus entries
 - notes or evidence paths that do not match proof validation
-- repeated `replay_gap`, `evidence_gap`, or `false_success_risk` taxonomy labels
+- repeated `replay_gap`, `report_hygiene`, or `shareability_gap` taxonomy labels
 
 Initial LazyCodex behavior should be read-only or report-only: index evidence,
 summarize hygiene gaps, and produce commit-safe reporting. It should not delete
@@ -39,8 +39,8 @@ files or rewrite challenge state.
 the bottleneck. Relevant Level 6 signals include:
 
 - repeated `search_explosion`
-- repeated `primitive_gap` after the environment and hypothesis are stable
-- repeated `exploit_unstable`
+- repeated `repeated_negative`
+- repeated `mutation-heavy`
 - high retry counts with bounded local-only experiments
 - timeouts in local mutation or parameter search
 
@@ -66,3 +66,6 @@ entry improvement alone is not enough.
 Do not grant permissions because an agent improves one named benchmark. Compare
 design, holdout, and regression splits separately. If a change improves design
 cases but degrades holdout or regression cases, it is not ready.
+
+Do not design or authorize an agent from one benchmark result. Treat one result
+as a prompt for more measurement, not as permission to expand capability.

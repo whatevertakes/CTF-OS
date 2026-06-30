@@ -9,6 +9,8 @@ outputs:
 - Extraction commands, recovered payloads, and evidence-backed interpretation.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
+reference_digest:
+- `docs/reference-digests/stego.md`
 evidence produced:
 - File hashes, metadata output, extraction logs, recovered files, and replay entries.
 failure/blocker classes:

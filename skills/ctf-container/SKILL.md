@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - kCTF and Kubernetes Goat references only.
+reference_digest:
+- `docs/reference-digests/cloud-container.md`
 evidence produced:
 - Image digests, file listings, config extracts, command output, and replay logs.
 failure/blocker classes:

@@ -9,6 +9,14 @@
   "blocker": "",
   "blockers": [],
   "evidence": [],
+  "tool_routing": {
+    "primary_tools_used": [],
+    "considered": [],
+    "used": [],
+    "skipped": [],
+    "missing": [],
+    "decision_summary": ""
+  },
   "notes": "Use notes.md for human-readable evidence and reasoning.",
   "metadata": {
     "proof_scope": "none",

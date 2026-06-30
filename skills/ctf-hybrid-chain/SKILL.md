@@ -12,6 +12,8 @@ dependencies:
 - `skills/ctf-triage/SKILL.md`
 - `tools/replay_runner.py`
 - `tools/proof_validate.py`
+reference_digest:
+- `docs/reference-digests/hybrid.md`
 evidence produced:
 - Boundary transcript, intermediate artifacts, final replay log, and proof validation output.
 failure/blocker classes:

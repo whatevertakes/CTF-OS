@@ -543,6 +543,50 @@ SKILL_FOR_CATEGORY = {
     "hybrid": "skills/ctf-hybrid-chain/SKILL.md",
 }
 
+REFERENCE_DIGEST_FOR_CATEGORY = {
+    "web": "docs/reference-digests/web.md",
+    "pwn": "docs/reference-digests/pwn.md",
+    "rev": "docs/reference-digests/rev.md",
+    "crypto": "docs/reference-digests/crypto.md",
+    "forensics": "docs/reference-digests/forensics.md",
+    "misc": "docs/reference-digests/misc.md",
+    "programming": "docs/reference-digests/programming.md",
+    "jail": "docs/reference-digests/jail.md",
+    "stego": "docs/reference-digests/stego.md",
+    "osint": "docs/reference-digests/osint.md",
+    "mobile": "docs/reference-digests/mobile.md",
+    "malware": "docs/reference-digests/malware.md",
+    "web3": "docs/reference-digests/web3.md",
+    "cloud": "docs/reference-digests/cloud-container.md",
+    "container": "docs/reference-digests/cloud-container.md",
+    "ai-ml": "docs/reference-digests/ai-ml.md",
+    "hardware-rf": "docs/reference-digests/hardware-rf-side-channel.md",
+    "side-channel": "docs/reference-digests/hardware-rf-side-channel.md",
+    "hybrid": "docs/reference-digests/hybrid.md",
+}
+
+REFERENCE_INDEX_FOR_CATEGORY = {
+    "web": "docs/reference-index/web.json",
+    "pwn": "docs/reference-index/pwn.json",
+    "rev": "docs/reference-index/rev.json",
+    "crypto": "docs/reference-index/crypto.json",
+    "forensics": "docs/reference-index/forensics.json",
+    "misc": "docs/reference-index/misc.json",
+    "programming": "docs/reference-index/programming.json",
+    "jail": "docs/reference-index/jail.json",
+    "stego": "docs/reference-index/stego.json",
+    "osint": "docs/reference-index/osint.json",
+    "mobile": "docs/reference-index/mobile.json",
+    "malware": "docs/reference-index/malware.json",
+    "web3": "docs/reference-index/web3.json",
+    "cloud": "docs/reference-index/cloud-container.json",
+    "container": "docs/reference-index/cloud-container.json",
+    "ai-ml": "docs/reference-index/ai-ml.json",
+    "hardware-rf": "docs/reference-index/hardware-rf-side-channel.json",
+    "side-channel": "docs/reference-index/hardware-rf-side-channel.json",
+    "hybrid": "docs/reference-index/hybrid.json",
+}
+
 
 def fail(message: str, code: int = 2) -> None:
     print(f"level3_orchestrator: {message}", file=sys.stderr)
@@ -697,6 +741,39 @@ def strategy_for(category: str, worker: str) -> dict[str, list[str]]:
     return strategy
 
 
+def reference_digest_for(category: str) -> str:
+    return REFERENCE_DIGEST_FOR_CATEGORY.get(category, "docs/reference-digests/common.md")
+
+
+def reference_index_for(category: str) -> str:
+    return REFERENCE_INDEX_FOR_CATEGORY.get(category, "docs/reference-index/common.json")
+
+
+def reference_query_category_for(category: str) -> str:
+    return Path(reference_index_for(category)).stem
+
+
+def digest_pattern_summary(digest_path: str, *, limit: int = 8) -> list[str]:
+    path = ROOT / digest_path
+    if not path.is_file():
+        return [f"missing digest: {digest_path}"]
+    text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    in_patterns = False
+    bullets: list[str] = []
+    for line in text:
+        stripped = line.strip()
+        if stripped == "## CTF-Relevant Patterns":
+            in_patterns = True
+            continue
+        if in_patterns and stripped.startswith("## "):
+            break
+        if in_patterns and stripped.startswith("- "):
+            bullets.append(stripped)
+            if len(bullets) >= limit:
+                break
+    return bullets or [f"read {digest_path} before probing"]
+
+
 def active_worker_count(level3: dict[str, Any]) -> int:
     return sum(
         1
@@ -739,6 +816,10 @@ def command_init(args: argparse.Namespace) -> int:
             "notes": "notes.md",
             "skill": SKILL_FOR_CATEGORY.get(category, "skills/ctf-misc/SKILL.md"),
             "solve_playbook": "docs/CTF_SOLVE_PLAYBOOKS.md",
+            "reference_digest": reference_digest_for(category),
+            "reference_index": reference_index_for(category),
+            "reference_query_category": reference_query_category_for(category),
+            "reference_query_tool": "tools/reference_query.py",
             "memory": "docs/CTF_SOLVER_MEMORY.md",
             "handoff": "docs/LEVEL2_TO_LEVEL3_HANDOFF.md",
         },
@@ -826,6 +907,10 @@ def task_for(
             "notes": "notes.md",
             "skill": SKILL_FOR_CATEGORY.get(category, "skills/ctf-misc/SKILL.md"),
             "solve_playbook": "docs/CTF_SOLVE_PLAYBOOKS.md",
+            "reference_digest": reference_digest_for(category),
+            "reference_index": reference_index_for(category),
+            "reference_query_category": reference_query_category_for(category),
+            "reference_query_tool": "tools/reference_query.py",
             "attempt_matrix": f"work/{ATTEMPT_MATRIX}",
             "mutation_ledger": f"work/{MUTATION_LEDGER}",
             "level3_state": f"work/{STATE_NAME}",
@@ -845,6 +930,15 @@ def task_for(
             "mutations": [],
             "artifacts": [],
             "next_hypotheses": [],
+            "reference_queries": [],
+            "reference_files_consulted": [],
+            "read_receipts": {
+                "skill_read": SKILL_FOR_CATEGORY.get(category, "skills/ctf-misc/SKILL.md"),
+                "solve_playbook_read": "docs/CTF_SOLVE_PLAYBOOKS.md",
+                "reference_digest_read": reference_digest_for(category),
+                "rules_applied": [],
+                "evidence_contract_used": [],
+            },
             "stop_reason": "",
         },
         "evidence_required": strategy.get("evidence_required", []),
@@ -931,15 +1025,36 @@ def find_task(level3: dict[str, Any], worker: str) -> dict[str, Any]:
 
 
 def render_task_packet(task: dict[str, Any]) -> str:
+    inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+    digest = str(inputs.get("reference_digest") or "")
+    index = str(inputs.get("reference_index") or "")
+    query_category = str(inputs.get("reference_query_category") or task.get("category") or "common")
+    query_tool = str(inputs.get("reference_query_tool") or "tools/reference_query.py")
+    digest_lines = digest_pattern_summary(digest) if digest else ["no reference digest configured"]
     return "\n".join(
         [
             f"# Level 3 Worker Packet: {task['worker']}",
             "",
             "You are a bounded CTF Level 3 worker. Work inside the assigned challenge only.",
-            "Before probing, read task.inputs.skill and task.inputs.solve_playbook, then use the embedded strategy profile.",
+            "Before probing, read task.inputs.skill, task.inputs.solve_playbook, task.inputs.reference_digest, and task.inputs.reference_index, then use the embedded strategy profile.",
+            "Use task.inputs.reference_query_tool only after you have challenge evidence text, file names, versions, errors, constants, APIs, opcodes, or transcripts to query against.",
             "Report only evidence-backed facts and negatives.",
             "Do not declare the challenge solved. Return JSON matching expected_output.",
+            "The returned JSON must include read_receipts, reference_queries, and reference_files_consulted.",
             "Do not run remote_live or remote_live_exploit replay without explicit operator approval.",
+            "",
+            "## Reference Digest Summary",
+            "",
+            f"- digest: `{digest or 'none'}`",
+            f"- index: `{index or 'none'}`",
+            f"- query_tool: `{query_tool}`",
+            *digest_lines,
+            "",
+            "## Evidence-Gated Reference Query",
+            "",
+            f"- command: `python3 {query_tool} --category {query_category} --evidence <evidence-file-or-text> --limit 8 --json`",
+            "- consult exact files from the query result only when they match current challenge evidence",
+            "- record every query in `reference_queries` and every opened local reference in `reference_files_consulted`",
             "",
             "```json",
             json.dumps(task, indent=2, sort_keys=True),
@@ -1014,8 +1129,8 @@ def command_dispatch(args: argparse.Namespace) -> int:
                 "spawn_tool": "multi_agent_v1.spawn_agent",
                 "spawn_prompt": (
                     f"Use the Level 3 packet at {packet_rel}. Work only inside "
-                    f"{task['inputs']['challenge_dir']}. Read the packet's skill and solve_playbook inputs "
-                    "before probing. Return a JSON result file under work/."
+                    f"{task['inputs']['challenge_dir']}. Read the packet's skill, solve_playbook, reference_digest, and reference_index inputs "
+                    "before probing. Query local references only after evidence exists. Return a JSON result file under work/."
                 ),
                 "expected_result": task["expected_output"],
             }
@@ -1127,13 +1242,82 @@ def evidence_from_entry(challenge_dir: Path, entry: dict[str, Any]) -> list[str]
     return list(dict.fromkeys(values))
 
 
-def validate_worker_result(challenge_dir: Path, result: dict[str, Any]) -> None:
+def require_receipt_value(receipts: dict[str, Any], key: str, expected: str) -> None:
+    actual = receipts.get(key)
+    if not isinstance(actual, str) or actual.strip() != expected:
+        fail(f"read_receipts.{key} must equal {expected!r}")
+
+
+def validate_reference_queries(task: dict[str, Any], result: dict[str, Any]) -> None:
+    inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+    expected_category = str(inputs.get("reference_query_category") or task.get("category") or "")
+    queries = result.get("reference_queries")
+    if not isinstance(queries, list) or not queries:
+        fail("worker result requires non-empty reference_queries")
+    for query in queries:
+        if not isinstance(query, dict):
+            fail("reference_queries entries must be objects")
+        if not isinstance(query.get("query"), str) or not query.get("query", "").strip():
+            fail("reference_queries entries require query")
+        category = query.get("category")
+        if not isinstance(category, str) or category.strip() != expected_category:
+            fail(f"reference_queries.category must equal {expected_category!r}")
+        status = query.get("status")
+        if not isinstance(status, str) or status.strip() not in {"matched", "no_match", "skipped"}:
+            fail("reference_queries.status must be matched, no_match, or skipped")
+
+
+def validate_reference_files(result: dict[str, Any]) -> None:
+    consulted = result.get("reference_files_consulted")
+    if not isinstance(consulted, list):
+        fail("worker result requires reference_files_consulted list")
+    cache_root = (ROOT / ".cache" / "references").resolve()
+    for item in consulted:
+        if not isinstance(item, dict):
+            fail("reference_files_consulted entries must be objects")
+        for key in ("category", "ref_id", "entry_id", "path", "reason"):
+            if not isinstance(item.get(key), str) or not item.get(key, "").strip():
+                fail(f"reference_files_consulted entries require {key}")
+        path_value = Path(str(item["path"]))
+        if path_value.is_absolute() or ".." in path_value.parts:
+            fail(f"reference file path must be workspace-relative and non-escaping: {item['path']!r}")
+        path = (ROOT / path_value).resolve()
+        try:
+            path.relative_to(cache_root)
+        except ValueError:
+            fail(f"reference file path must stay under .cache/references: {item['path']!r}")
+        if not path.is_file():
+            fail(f"reference file does not exist: {item['path']}")
+        line_start = item.get("line_start")
+        line_end = item.get("line_end")
+        if not isinstance(line_start, int) or not isinstance(line_end, int) or line_start < 1 or line_end < line_start:
+            fail("reference_files_consulted line_start/line_end must be positive integers")
+
+
+def validate_worker_result(challenge_dir: Path, task: dict[str, Any], result: dict[str, Any]) -> None:
     worker = result.get("worker")
     if not isinstance(worker, str) or not worker.strip():
         fail("worker result requires non-empty worker")
     status = result.get("status")
     if status not in ALLOWED_WORKER_STATUSES:
         fail(f"worker status must be one of {', '.join(sorted(ALLOWED_WORKER_STATUSES))}")
+    inputs = task.get("inputs")
+    if not isinstance(inputs, dict):
+        fail("task inputs are missing")
+    receipts = result.get("read_receipts")
+    if not isinstance(receipts, dict):
+        fail("worker result requires read_receipts")
+    require_receipt_value(receipts, "skill_read", str(inputs.get("skill") or ""))
+    require_receipt_value(receipts, "solve_playbook_read", str(inputs.get("solve_playbook") or ""))
+    require_receipt_value(receipts, "reference_digest_read", str(inputs.get("reference_digest") or ""))
+    rules = receipts.get("rules_applied")
+    if not isinstance(rules, list) or not all(isinstance(item, str) and item.strip() for item in rules):
+        fail("read_receipts.rules_applied must be a non-empty list of strings")
+    evidence_contract = receipts.get("evidence_contract_used")
+    if not isinstance(evidence_contract, list) or not all(isinstance(item, str) and item.strip() for item in evidence_contract):
+        fail("read_receipts.evidence_contract_used must be a non-empty list of strings")
+    validate_reference_queries(task, result)
+    validate_reference_files(result)
 
     for fact in result.get("facts", []):
         if not isinstance(fact, dict):
@@ -1177,15 +1361,36 @@ def append_unique_line(path: Path, line: str) -> None:
 
 def write_worker_summary(challenge_dir: Path, result: dict[str, Any]) -> str:
     worker = str(result["worker"])
+    receipts = result.get("read_receipts") if isinstance(result.get("read_receipts"), dict) else {}
     summary_path = challenge_dir / "evidence" / f"level3_worker_{worker}_{utc_stamp()}.md"
     lines = [
         f"# Level 3 Worker Result: {worker}",
         "",
         f"- status: `{result['status']}`",
         f"- stop_reason: `{md_escape(result.get('stop_reason', ''))}`",
+        f"- skill_read: `{md_escape(receipts.get('skill_read', ''))}`",
+        f"- solve_playbook_read: `{md_escape(receipts.get('solve_playbook_read', ''))}`",
+        f"- reference_digest_read: `{md_escape(receipts.get('reference_digest_read', ''))}`",
+        "",
+        "## Reference Queries",
+    ]
+    for query in result.get("reference_queries", []):
+        if isinstance(query, dict):
+            lines.append(
+                f"- {md_escape(query.get('category'))}: {md_escape(query.get('query'))} "
+                f"status={md_escape(query.get('status'))} count={md_escape(query.get('result_count', ''))}"
+            )
+    lines.extend(["", "## Reference Files Consulted"])
+    for item in result.get("reference_files_consulted", []):
+        if isinstance(item, dict):
+            lines.append(
+                f"- {md_escape(item.get('entry_id'))}: `{md_escape(item.get('path'))}` "
+                f"lines={md_escape(item.get('line_start'))}-{md_escape(item.get('line_end'))}"
+            )
+    lines.extend([
         "",
         "## Facts",
-    ]
+    ])
     for fact in result.get("facts", []):
         lines.append(f"- {md_escape(fact.get('claim'))} evidence={', '.join(evidence_from_entry(challenge_dir, fact))}")
     lines.extend(["", "## Negative Results"])
@@ -1256,9 +1461,12 @@ def update_notes(challenge_dir: Path, result: dict[str, Any], summary_rel: str) 
 
 def merge_worker_result(challenge_dir: Path, level3: dict[str, Any], result_path: Path) -> str:
     result = read_json(result_path)
-    validate_worker_result(challenge_dir, result)
-    worker = str(result["worker"])
+    worker_value = result.get("worker")
+    if not isinstance(worker_value, str) or not worker_value.strip():
+        fail("worker result requires non-empty worker")
+    worker = worker_value
     task = find_task(level3, worker)
+    validate_worker_result(challenge_dir, task, result)
     result_rel = relative_to_challenge(challenge_dir, result_path)
     if task.get("status") == "merged":
         if task.get("result") == result_rel and isinstance(task.get("summary"), str):

@@ -11,6 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional Volatility3 or carving references when required.
+reference_digest:
+- `docs/reference-digests/forensics.md`
 evidence produced:
 - Source hashes, extraction logs, recovered paths, and replayable commands.
 failure/blocker classes:

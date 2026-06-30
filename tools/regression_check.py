@@ -83,6 +83,7 @@ def critical_evaluation_findings(metrics: dict[str, object]) -> list[str]:
     for key in (
         "solved_entries_missing_evidence",
         "blocked_entries_missing_blocker_reason",
+        "dependency_missing",
         "proof_invalid_solved",
     ):
         value = metrics.get(key)

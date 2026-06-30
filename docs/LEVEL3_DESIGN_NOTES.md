@@ -25,8 +25,9 @@ inventing parallel state:
 
 - run `tools/preflight_check.py` before benchmark or solve orchestration
 - create challenge workspaces with `tools/intake_challenge.py`
-- read the selected `skills/ctf-*/SKILL.md` and `docs/CTF_SOLVE_PLAYBOOKS.md`
-  before probing
+- read the selected `skills/ctf-*/SKILL.md`, `docs/CTF_SOLVE_PLAYBOOKS.md`,
+  matching category reference digest, and category reference index before
+  probing
 - write replay evidence through `tools/replay_runner.py`
 - validate claims through `tools/proof_validate.py`
 - preserve all machine-readable status in `state.json`
@@ -47,7 +48,8 @@ inventing parallel state:
 - `dispatch`: write `multi_agent_v1.spawn_agent`-ready packet files plus
   `work/LEVEL3_DISPATCH.json` and `work/LEVEL3_DISPATCH.md`
 - `assign`: record the actual spawned agent id/status for a dispatched worker
-- `merge`: validate worker result JSON and merge it into Level 2 artifacts
+- `merge`: validate worker result JSON, including skill/playbook/digest read
+  receipts plus reference query records, and merge it into Level 2 artifacts
 - `collect`: merge one result JSON or a directory of worker result JSON files
 - `status`: report pending, dispatched, assigned, and merged workers
 - `evaluate`: run replay/proof checks and write `metadata.level3_score`
@@ -80,6 +82,13 @@ Every task now carries:
 - `strategy.failure_modes`
 - `inputs.skill`
 - `inputs.solve_playbook`
+- `inputs.reference_digest`
+- `inputs.reference_index`
+- `inputs.reference_query_category`
+- `inputs.reference_query_tool`
+- `expected_output.reference_queries`
+- `expected_output.reference_files_consulted`
+- `expected_output.read_receipts`
 - `multi_agent.spawn_tool=multi_agent_v1.spawn_agent`
 
 Every major state transition appends a JSONL event to
@@ -88,6 +97,13 @@ requiring chat history.
 
 The v3 profiles strengthen the hard categories that produced benchmark misses
 and keep all installed CTF skills on the same worker-packet contract:
+
+Category reference digests compress trusted GitHub, CVE/CWE, and paper
+guidance into hypothesis prompts without loading full external repositories.
+Reference indexes point those digest patterns to pinned local files. Merged
+worker results must prove they read the category skill, solve playbook, and
+digest, must record evidence-gated reference queries, and must name the exact
+local reference files they consulted.
 
 - web: auth/session, source disclosure and XXE, policy oracles, mutation
   ledgers, render/upload behavior, SSRF channels

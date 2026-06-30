@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - ChipWhisperer, SigMF, and URH references only.
+reference_digest:
+- `docs/reference-digests/hardware-rf-side-channel.md`
 evidence produced:
 - Raw trace metadata, decoded outputs, scripts, and replay logs.
 failure/blocker classes:

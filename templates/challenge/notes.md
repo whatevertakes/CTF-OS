@@ -21,6 +21,15 @@
 
 - Keep payloads, commands, and failed assumptions that shaped the solve path.
 
+## Tool Routing Decision
+
+- Primary tools used:
+- Considered:
+- Used:
+- Skipped:
+- Missing:
+- Decision summary:
+
 ## Solve
 
 - Final command:

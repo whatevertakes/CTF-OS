@@ -8,12 +8,17 @@ Level 3 workers before they probe a real challenge.
 
 1. Freeze the prompt, files, endpoints, versions, and current `state.json`.
 2. Copy original handouts into `dist/`; keep generated scripts under `work/`.
-3. Record every material command, transcript, output file, and hash.
-4. Split work by evidence type, not by payload spelling.
-5. Write negative families to `work/ATTEMPT_MATRIX.md`.
-6. Write state-changing remote actions to `work/MUTATION_LEDGER.md`.
-7. Put durable proof output under `evidence/`, then update `replay.sh`.
-8. Claim solved only after `tools/replay_runner.py` and
+3. Read the selected category skill, category reference digest, and category
+   reference index. Treat GitHub, CVE/CWE, and paper references as hypothesis
+   sources, not proof.
+4. Record every material command, transcript, output file, and hash.
+5. Query `tools/reference_query.py` only after evidence exists, then open exact
+   pinned files rather than loading whole repositories.
+6. Split work by evidence type, not by payload spelling.
+7. Write negative families to `work/ATTEMPT_MATRIX.md`.
+8. Write state-changing remote actions to `work/MUTATION_LEDGER.md`.
+9. Put durable proof output under `evidence/`, then update `replay.sh`.
+10. Claim solved only after `tools/replay_runner.py` and
    `tools/proof_validate.py` accept the challenge state.
 
 ## Pwn

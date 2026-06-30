@@ -15,7 +15,6 @@ venv/
 node_modules/
 
 *.log
-!challenges/**/evidence/replay_*.log
 core
 core.*
 *.dmp
@@ -23,3 +22,40 @@ core.*
 
 .DS_Store
 ghidra-mcp-cache/
+
+# Secrets and challenge-private markers.
+flag
+flag.txt
+**/flag
+**/flag.txt
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Challenge handouts may be tracked from dist/, but duplicate top-level
+# archives and scratch archives should stay local.
+challenges/**/*.zip
+challenges/**/*.7z
+challenges/**/*.tar
+challenges/**/*.tar.gz
+!challenges/**/dist/*.zip
+!challenges/**/dist/*.7z
+!challenges/**/dist/*.tar
+!challenges/**/dist/*.tar.gz
+
+# Local dependency checkouts and build output under challenge workspaces.
+challenges/**/work/**
+!challenges/**/work/
+!challenges/**/work/.gitkeep
+challenges/**/work/**/.git/
+challenges/**/work/simavr*/
+challenges/**/work/extracted/
+challenges/**/work/docker_pinned/
+challenges/**/work/pinned_build/
+challenges/**/work/**/*.o
+challenges/**/work/**/*.a
+challenges/**/work/**/*.so
+challenges/**/work/**/*.so.*
+challenges/**/work/**/*.elf
+challenges/**/work/**/*.bin

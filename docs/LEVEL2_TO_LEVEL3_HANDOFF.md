@@ -18,6 +18,9 @@ Level 3 receives:
 
 - challenge root path
 - category skill path
+- category reference digest path
+- category reference index path and query category
+- `tools/reference_query.py` path
 - current `state.json`
 - current `notes.md`
 - replay/proof status
@@ -37,6 +40,8 @@ Level 3 must write:
 - positive and negative evidence under `evidence/`
 - mutation ledger under `work/MUTATION_LEDGER.md` when remote state changes
 - attempt matrix under `work/ATTEMPT_MATRIX.md` for broad search trees
+- read receipts in worker result JSON for the category skill, solve playbook, and reference digest
+- evidence-gated reference query records and consulted pinned reference files
 - updated `state.json`
 - updated `notes.md`
 - replay summary and proof validation result before claiming solved
@@ -80,14 +85,17 @@ places returned worker JSON files under `work/level3_results/` and runs
 `collect`. `merge` remains available for one-off result files.
 
 Worker result JSON must include `worker`, `status`, `facts`,
-`negative_results`, `mutations`, `artifacts`, `next_hypotheses`, and
+`negative_results`, `mutations`, `artifacts`, `next_hypotheses`,
+`reference_queries`, `reference_files_consulted`, `read_receipts`, and
 `stop_reason`.
 
 Each task packet also includes v3 strategy fields: `strategy.playbook`,
 `strategy.tools`, `strategy.evidence_required`, `strategy.failure_modes`, and
-the `multi_agent.spawn_tool` contract. It must also include both
-`inputs.skill` and `inputs.solve_playbook` so workers read the category skill
-and practical solve loop before probing.
+the `multi_agent.spawn_tool` contract. It must also include `inputs.skill`,
+`inputs.solve_playbook`, `inputs.reference_digest`, `inputs.reference_index`,
+`inputs.reference_query_category`, and `inputs.reference_query_tool` so workers
+read the category skill, practical solve loop, and curated reference digest
+before querying exact pinned files.
 
 ## Merge Rule
 

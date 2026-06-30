@@ -9,6 +9,8 @@ outputs:
 - Minimal inventory, hypotheses, and recommended next category.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
+reference_digest:
+- `docs/reference-digests/misc.md`
 evidence produced:
 - Artifact list, command notes, and routing decision.
 failure/blocker classes:

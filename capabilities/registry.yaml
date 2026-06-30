@@ -28,9 +28,73 @@ capabilities:
     category: core
     status: implemented
     path: tools/preflight_check.py
-    dependencies: [python3-stdlib, python-venv, bash, git]
+    dependencies: [python3-stdlib, python-venv, bash, git, reference_index, reference_digest_check]
     loads_by_default: true
     future_agents: [triage, solver, proof, benchmark]
+  - id: reference_manifest
+    type: document
+    category: reference
+    status: implemented
+    path: references.yaml
+    dependencies: []
+    loads_by_default: false
+    future_agents: [category-router, level3-orchestrator, reviewer]
+  - id: reference_lock
+    type: document
+    category: reference
+    status: implemented
+    path: references.lock.json
+    dependencies: [reference_manifest]
+    loads_by_default: false
+    future_agents: [category-router, reviewer]
+  - id: reference_refresh
+    type: script
+    category: reference
+    status: implemented
+    path: tools/reference_refresh.py
+    dependencies: [python3-stdlib, PyYAML, git]
+    loads_by_default: false
+    future_agents: [reference-maintainer, reviewer]
+  - id: reference_digest_check
+    type: script
+    category: reference
+    status: implemented
+    path: tools/reference_digest_check.py
+    dependencies: [python3-stdlib, PyYAML, reference_manifest, reference_index]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: materialized_reference_cache
+    type: cache
+    category: reference
+    status: implemented
+    path: .cache/references
+    dependencies: [reference_manifest, reference_lock, reference_refresh, git]
+    loads_by_default: false
+    future_agents: [reference-maintainer, level3-orchestrator, category-workers]
+  - id: reference_index
+    type: script
+    category: reference
+    status: implemented
+    path: tools/reference_index.py
+    dependencies: [python3-stdlib, PyYAML, reference_manifest, reference_lock, materialized_reference_cache]
+    loads_by_default: false
+    future_agents: [reference-maintainer, level3-orchestrator, category-workers, reviewer]
+  - id: reference_query
+    type: script
+    category: reference
+    status: implemented
+    path: tools/reference_query.py
+    dependencies: [python3-stdlib, reference_index]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers]
+  - id: category_reference_map
+    type: document
+    category: reference
+    status: implemented
+    path: docs/CATEGORY_REFERENCE_MAP.md
+    dependencies: [reference_manifest]
+    loads_by_default: false
+    future_agents: [category-router, level3-orchestrator]
   - id: report_sanitize
     type: script
     category: core
@@ -84,7 +148,7 @@ capabilities:
     category: orchestration
     status: implemented
     path: tools/level3_orchestrator.py
-    dependencies: [preflight_check, replay_runner, proof_validate, ctf_solver_memory, ctf_solve_playbooks, level2_to_level3_handoff]
+    dependencies: [preflight_check, replay_runner, proof_validate, reference_query, ctf_solver_memory, ctf_solve_playbooks, level2_to_level3_handoff]
     loads_by_default: false
     future_agents: [level3-orchestrator, category-workers, proof]
   - id: level3_dispatch_loop
@@ -522,6 +586,22 @@ capabilities:
     dependencies: []
     loads_by_default: false
     future_agents: [pwn-solver]
+  - id: external_pwndbg
+    type: external
+    category: pwn
+    status: external
+    path: https://github.com/pwndbg/pwndbg
+    dependencies: []
+    loads_by_default: false
+    future_agents: [pwn-solver]
+  - id: external_ropgadget
+    type: external
+    category: pwn
+    status: external
+    path: https://github.com/JonathanSalwan/ROPgadget
+    dependencies: []
+    loads_by_default: false
+    future_agents: [pwn-solver]
   - id: external_angr
     type: external
     category: reverse
@@ -530,11 +610,75 @@ capabilities:
     dependencies: []
     loads_by_default: false
     future_agents: [rev-solver, symbolic-execution]
+  - id: external_radare2
+    type: external
+    category: reverse
+    status: external
+    path: https://github.com/radareorg/radare2
+    dependencies: []
+    loads_by_default: false
+    future_agents: [rev-solver, malware-solver]
+  - id: external_ghidra
+    type: external
+    category: reverse
+    status: external
+    path: https://github.com/NationalSecurityAgency/ghidra
+    dependencies: []
+    loads_by_default: false
+    future_agents: [rev-solver, malware-solver]
+  - id: external_owasp_wstg
+    type: external
+    category: web
+    status: external
+    path: https://github.com/OWASP/wstg
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web-solver]
+  - id: external_owasp_cheatsheets
+    type: external
+    category: web
+    status: external
+    path: https://github.com/OWASP/CheatSheetSeries
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web-solver, mobile-solver, ai-ml-solver]
+  - id: external_sqlmap
+    type: external
+    category: web
+    status: external
+    path: https://github.com/sqlmapproject/sqlmap
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web-solver]
+  - id: external_tplmap
+    type: external
+    category: web
+    status: external
+    path: https://github.com/epinna/tplmap
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web-solver, jail-solver]
+  - id: external_hacktricks
+    type: external
+    category: reference
+    status: external
+    path: https://github.com/HackTricks-wiki/hacktricks
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web-solver, cloud-solver, container-solver, mobile-solver]
   - id: external_rsactftool
     type: external
     category: crypto
     status: external
     path: https://github.com/RsaCtfTool/RsaCtfTool
+    dependencies: []
+    loads_by_default: false
+    future_agents: [crypto-solver]
+  - id: external_crypto_attacks
+    type: external
+    category: crypto
+    status: external
+    path: https://github.com/jvdsn/crypto-attacks
     dependencies: []
     loads_by_default: false
     future_agents: [crypto-solver]
@@ -546,6 +690,78 @@ capabilities:
     dependencies: []
     loads_by_default: false
     future_agents: [forensics-solver, malware-solver]
+  - id: external_sleuthkit
+    type: external
+    category: forensics
+    status: external
+    path: https://github.com/sleuthkit/sleuthkit
+    dependencies: []
+    loads_by_default: false
+    future_agents: [forensics-solver]
+  - id: external_binwalk
+    type: external
+    category: forensics
+    status: external
+    path: https://github.com/ReFirmLabs/binwalk
+    dependencies: []
+    loads_by_default: false
+    future_agents: [forensics-solver, stego-solver]
+  - id: external_zsteg
+    type: external
+    category: stego
+    status: external
+    path: https://github.com/zed-0xff/zsteg
+    dependencies: []
+    loads_by_default: false
+    future_agents: [stego-solver]
+  - id: external_jadx
+    type: external
+    category: mobile
+    status: external
+    path: https://github.com/skylot/jadx
+    dependencies: []
+    loads_by_default: false
+    future_agents: [mobile-solver, rev-solver]
+  - id: external_apktool
+    type: external
+    category: mobile
+    status: external
+    path: https://github.com/iBotPeaches/Apktool
+    dependencies: []
+    loads_by_default: false
+    future_agents: [mobile-solver]
+  - id: external_frida
+    type: external
+    category: mobile
+    status: external
+    path: https://github.com/frida/frida
+    dependencies: []
+    loads_by_default: false
+    future_agents: [mobile-solver, rev-solver]
+  - id: external_mobsf
+    type: external
+    category: mobile
+    status: external
+    path: https://github.com/MobSF/Mobile-Security-Framework-MobSF
+    dependencies: []
+    loads_by_default: false
+    future_agents: [mobile-solver]
+  - id: external_capa
+    type: external
+    category: malware
+    status: external
+    path: https://github.com/mandiant/capa
+    dependencies: []
+    loads_by_default: false
+    future_agents: [malware-solver]
+  - id: external_yara
+    type: external
+    category: malware
+    status: external
+    path: https://github.com/VirusTotal/yara
+    dependencies: []
+    loads_by_default: false
+    future_agents: [malware-solver]
   - id: external_kctf
     type: external
     category: cloud
@@ -578,6 +794,22 @@ capabilities:
     dependencies: []
     loads_by_default: false
     future_agents: [web3-solver]
+  - id: external_slither
+    type: external
+    category: web3
+    status: external
+    path: https://github.com/crytic/slither
+    dependencies: []
+    loads_by_default: false
+    future_agents: [web3-solver]
+  - id: external_trivy
+    type: external
+    category: container
+    status: external
+    path: https://github.com/aquasecurity/trivy
+    dependencies: []
+    loads_by_default: false
+    future_agents: [cloud-solver, container-solver]
   - id: external_garak
     type: external
     category: ai-ml
@@ -591,6 +823,14 @@ capabilities:
     category: ai-ml
     status: external
     path: https://github.com/WithSecureLabs/damn-vulnerable-llm-agent
+    dependencies: []
+    loads_by_default: false
+    future_agents: [ai-ml-solver]
+  - id: external_promptfoo
+    type: external
+    category: ai-ml
+    status: external
+    path: https://github.com/promptfoo/promptfoo
     dependencies: []
     loads_by_default: false
     future_agents: [ai-ml-solver]
@@ -618,3 +858,19 @@ capabilities:
     dependencies: []
     loads_by_default: false
     future_agents: [hardware-rf-solver]
+  - id: external_sherlock
+    type: external
+    category: osint
+    status: external
+    path: https://github.com/sherlock-project/sherlock
+    dependencies: []
+    loads_by_default: false
+    future_agents: [osint-solver]
+  - id: external_maigret
+    type: external
+    category: osint
+    status: external
+    path: https://github.com/soxoj/maigret
+    dependencies: []
+    loads_by_default: false
+    future_agents: [osint-solver]

@@ -22,14 +22,17 @@ Expected result:
 - `plan` creates category-specific worker packets in `work/LEVEL3_TASKS.json`
 - each task has v3 `strategy` fields and a `multi_agent_v1.spawn_agent`
   contract
-- each task includes both a category `inputs.skill` and
-  `inputs.solve_playbook=docs/CTF_SOLVE_PLAYBOOKS.md`
-- `packet` emits a self-contained worker prompt packet
+- each task includes category `inputs.skill`,
+  `inputs.solve_playbook=docs/CTF_SOLVE_PLAYBOOKS.md`, and
+  `inputs.reference_digest`, `inputs.reference_index`,
+  `inputs.reference_query_category`, and `inputs.reference_query_tool`
+- `packet` emits a self-contained worker prompt packet that requires
+  skill/playbook/digest read receipts plus evidence-gated reference queries
 - `dispatch` writes `work/LEVEL3_DISPATCH.json`,
   `work/LEVEL3_DISPATCH.md`, and worker packet files
 - `assign` records the spawned-agent id/status for the selected worker
-- `collect` validates worker result JSON from `work/level3_results/`, writes
-  worker evidence, updates
+- `collect` validates worker result JSON from `work/level3_results/`,
+  rejects missing read receipts or reference query records, writes worker evidence, updates
   `ATTEMPT_MATRIX.md`, `MUTATION_LEDGER.md`, `notes.md`, and `state.json`
 - `work/LEVEL3_RUN_LOG.jsonl` records `init`, `plan`, `dispatch`, `assign`,
   `collect`, and `evaluate`

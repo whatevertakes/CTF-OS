@@ -209,6 +209,21 @@ def assert_workers(path: Path, category: str) -> str:
             fail(f"missing category skill input for {category}/{task.get('worker')}")
         if inputs.get("solve_playbook") != "docs/CTF_SOLVE_PLAYBOOKS.md":
             fail(f"missing solve playbook input for {category}/{task.get('worker')}")
+        if not isinstance(inputs.get("reference_digest"), str) or not str(inputs.get("reference_digest")).startswith("docs/reference-digests/"):
+            fail(f"missing reference digest input for {category}/{task.get('worker')}")
+        if not isinstance(inputs.get("reference_index"), str) or not str(inputs.get("reference_index")).startswith("docs/reference-index/"):
+            fail(f"missing reference index input for {category}/{task.get('worker')}")
+        if inputs.get("reference_query_tool") != "tools/reference_query.py":
+            fail(f"missing reference query tool input for {category}/{task.get('worker')}")
+        if not isinstance(inputs.get("reference_query_category"), str) or not str(inputs.get("reference_query_category")):
+            fail(f"missing reference query category input for {category}/{task.get('worker')}")
+        expected = task.get("expected_output")
+        if not isinstance(expected, dict) or not isinstance(expected.get("read_receipts"), dict):
+            fail(f"missing expected read_receipts for {category}/{task.get('worker')}")
+        if not isinstance(expected.get("reference_queries"), list):
+            fail(f"missing expected reference_queries for {category}/{task.get('worker')}")
+        if not isinstance(expected.get("reference_files_consulted"), list):
+            fail(f"missing expected reference_files_consulted for {category}/{task.get('worker')}")
     return CATEGORY_PRIMARY_WORKER[category]
 
 
@@ -230,11 +245,29 @@ def assert_dispatch(path: Path, category: str, worker: str) -> None:
         fail(f"dispatch packet does not embed dispatched status for {category}")
     if '"dispatch": {' not in packet_text or '"spawn_tool": "multi_agent_v1.spawn_agent"' not in packet_text:
         fail(f"dispatch packet does not embed dispatch metadata for {category}")
-    if "read task.inputs.skill and task.inputs.solve_playbook" not in packet_text:
-        fail(f"dispatch packet does not require skill/playbook read for {category}")
+    if "task.inputs.reference_digest" not in packet_text:
+        fail(f"dispatch packet does not require reference digest read for {category}")
+    if "task.inputs.reference_index" not in packet_text:
+        fail(f"dispatch packet does not require reference index read for {category}")
+    if "reference_query_tool" not in packet_text:
+        fail(f"dispatch packet does not expose reference query tool for {category}")
+
+
+def task_inputs(path: Path, worker: str) -> dict[str, object]:
+    tasks = load_json(path / "work" / "LEVEL3_TASKS.json")
+    raw_tasks = tasks.get("tasks")
+    if not isinstance(raw_tasks, list):
+        fail("missing Level 3 tasks")
+    for task in raw_tasks:
+        if isinstance(task, dict) and task.get("worker") == worker:
+            inputs = task.get("inputs")
+            if isinstance(inputs, dict):
+                return inputs
+    fail(f"missing task inputs for worker {worker}")
 
 
 def write_worker_result(path: Path, category: str, worker: str) -> Path:
+    inputs = task_inputs(path, worker)
     evidence_rel = f"evidence/{category}_seed.md"
     evidence_path = path / evidence_rel
     evidence_path.write_text(
@@ -271,6 +304,30 @@ def write_worker_result(path: Path, category: str, worker: str) -> Path:
         ],
         "artifacts": [evidence_rel],
         "next_hypotheses": [f"split {category} blind fixture into a narrower branch"],
+        "reference_queries": [
+            {
+                "category": str(inputs.get("reference_query_category")),
+                "query": f"{category} fixture seed evidence",
+                "status": "no_match",
+                "result_count": 0,
+            }
+        ],
+        "reference_files_consulted": [],
+        "read_receipts": {
+            "skill_read": str(inputs.get("skill")),
+            "solve_playbook_read": str(inputs.get("solve_playbook")),
+            "reference_digest_read": str(inputs.get("reference_digest")),
+            "rules_applied": [
+                "read category skill before probing",
+                "read solve playbook global loop",
+                "read reference digest patterns",
+            ],
+            "evidence_contract_used": [
+                "facts require existing evidence paths",
+                "negative_results require existing evidence paths",
+                "mutations require mutation ledger evidence",
+            ],
+        },
         "stop_reason": "fixture branch exhausted",
     }
     result_dir = path / "work" / "level3_results"
@@ -278,6 +335,75 @@ def write_worker_result(path: Path, category: str, worker: str) -> Path:
     result_path = result_dir / f"{category}_worker_result.json"
     write_json(result_path, result)
     return result_path
+
+
+def assert_missing_receipts_rejected(path: Path, category: str, worker: str) -> None:
+    evidence_rel = f"evidence/{category}_bad_receipt.md"
+    (path / evidence_rel).write_text("# bad receipt fixture\n", encoding="utf-8")
+    result = {
+        "worker": worker,
+        "status": "INCONCLUSIVE",
+        "facts": [
+            {
+                "claim": "this result intentionally lacks read receipts",
+                "target": f"{category}-bad-receipt",
+                "evidence": [evidence_rel],
+            }
+        ],
+        "negative_results": [],
+        "mutations": [],
+        "artifacts": [evidence_rel],
+        "next_hypotheses": [],
+        "stop_reason": "fixture missing read receipts",
+    }
+    result_dir = path / "work" / "level3_bad_results"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"{category}_bad_receipt.json"
+    write_json(result_path, result)
+    rel = path.relative_to(ROOT).as_posix()
+    bad_rel = result_path.relative_to(path).as_posix()
+    failure = run(["python3", "tools/level3_orchestrator.py", "merge", rel, bad_rel], expect_ok=False)
+    if "read_receipts" not in failure.stderr:
+        fail(f"missing-read-receipts rejection used wrong error for {category}")
+
+
+def assert_missing_reference_queries_rejected(path: Path, category: str, worker: str) -> None:
+    inputs = task_inputs(path, worker)
+    evidence_rel = f"evidence/{category}_bad_reference_query.md"
+    (path / evidence_rel).write_text("# bad reference query fixture\n", encoding="utf-8")
+    result = {
+        "worker": worker,
+        "status": "INCONCLUSIVE",
+        "facts": [
+            {
+                "claim": "this result intentionally lacks reference queries",
+                "target": f"{category}-bad-reference-query",
+                "evidence": [evidence_rel],
+            }
+        ],
+        "negative_results": [],
+        "mutations": [],
+        "artifacts": [evidence_rel],
+        "next_hypotheses": [],
+        "reference_files_consulted": [],
+        "read_receipts": {
+            "skill_read": str(inputs.get("skill")),
+            "solve_playbook_read": str(inputs.get("solve_playbook")),
+            "reference_digest_read": str(inputs.get("reference_digest")),
+            "rules_applied": ["read category skill before probing"],
+            "evidence_contract_used": ["facts require existing evidence paths"],
+        },
+        "stop_reason": "fixture missing reference queries",
+    }
+    result_dir = path / "work" / "level3_bad_results"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"{category}_bad_reference_query.json"
+    write_json(result_path, result)
+    rel = path.relative_to(ROOT).as_posix()
+    bad_rel = result_path.relative_to(path).as_posix()
+    failure = run(["python3", "tools/level3_orchestrator.py", "merge", rel, bad_rel], expect_ok=False)
+    if "reference_queries" not in failure.stderr:
+        fail(f"missing-reference-queries rejection used wrong error for {category}")
 
 
 def assert_level3_contract(path: Path, category: str) -> None:
@@ -428,6 +554,8 @@ def main() -> int:
             )
             result_path = write_worker_result(path, category, worker)
             results_dir = result_path.parent.relative_to(path).as_posix()
+            assert_missing_receipts_rejected(path, category, worker)
+            assert_missing_reference_queries_rejected(path, category, worker)
             run(["python3", "tools/level3_orchestrator.py", "collect", rel, results_dir])
             assert_collect_idempotent(path, category, rel, results_dir)
             run(["python3", "tools/level3_orchestrator.py", "evaluate", rel, "--run-replay"])

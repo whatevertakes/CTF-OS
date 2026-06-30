@@ -11,6 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional RsaCtfTool or Sage references when required.
+reference_digest:
+- `docs/reference-digests/crypto.md`
 evidence produced:
 - Parameter dump, solver code, command output, plaintext, and replay log.
 failure/blocker classes:

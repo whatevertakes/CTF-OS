@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional jadx, apktool, or frida references when required.
+reference_digest:
+- `docs/reference-digests/mobile.md`
 evidence produced:
 - Hashes, manifest/resource extracts, decompiled snippets, commands, and replay logs.
 failure/blocker classes:

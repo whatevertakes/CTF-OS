@@ -79,6 +79,15 @@ negative evidence, and merge only reproducible facts back into `state.json` and
 - Worker packets must point to both the category skill and
   `docs/CTF_SOLVE_PLAYBOOKS.md`; otherwise downloaded skills become passive
   inventory instead of active solve guidance.
+- Worker packets must also point to the category reference digest, and merge
+  must reject results that lack read receipts for skill, playbook, digest,
+  applied rules, and evidence contract.
+- Curated GitHub, CVE/CWE, and paper references are stored as manifest and
+  digest data. They guide hypotheses; they are not proof.
+- Pinned reference repos live under `.cache/references/`; category indexes
+  under `docs/reference-index/` and `tools/reference_query.py` provide
+  evidence-gated lookup. Worker results should record both queries and exact
+  files consulted.
 - Deadline-sensitive pwn work needs timing tables, retry budgets, and
   transcript capture. It must not bypass the remote-live replay guard.
 - Rev symbolic work should start from concrete static/dynamic evidence and

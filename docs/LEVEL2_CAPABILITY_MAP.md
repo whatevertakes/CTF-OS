@@ -13,6 +13,7 @@ Level 2 is a small local capability layer for CTF work in this workspace. It fav
 | Solve playbooks | Provide practical first-pass, branch, and stop-condition guidance for real solves. | `docs/CTF_SOLVE_PLAYBOOKS.md` |
 | Web helpers | Provide narrow local wrappers for common web CTF workflows without polluting root `tools/`. | `.codex/bin/tplmap`, `.codex/bin/searchsploit` |
 | Hybrid chains | Describe cross-category workflows where the solve path crosses boundaries. | `skills/ctf-hybrid-chain/SKILL.md`, `docs/LEVEL2_HYBRID_CHAINS.md` |
+| Curated references | Track reputable GitHub, official CVE/CWE, category deep-dive material, pinned local cache, and evidence-gated lookup without default loading. | `references.yaml`, `references.lock.json`, `docs/reference-digests/`, `docs/reference-index/`, `.cache/references/`, `tools/reference_query.py`, `docs/CATEGORY_REFERENCE_MAP.md` |
 | MCP bridges | Record configured local or plugin MCP capabilities without loading them by default. | `.codex/bin/*`, `mcp://*` entries in `capabilities/registry.yaml` |
 | Interface views | Present Level 1 config, Level 2 state/evidence, and Level 3 worker boards through challenge-local CLI/editor/terminal/browser/report surfaces. | `tools/level4_interface.py`, `docs/LEVEL4_INTERFACES.md` |
 | Bounded automation | Wrap existing Level 2 preflight, replay, proof, sanitization, cleanup, and dummy benchmark workflows without adding solve capability. | `tools/benchmark_runner.py`, `tools/report_sanitize.py`, `tools/cleanup_artifacts.py`, `docs/LEVEL5_AUTOMATION_POLICY.md` |
@@ -48,6 +49,7 @@ Each `SKILL.md` in this layer uses the same concise contract fields:
 - `failure/blocker classes`
 - `future agent consumers`
 - `pointers`
+- `reference_digest`
 
 The skeletons are intentionally short. They are routing contracts, not encyclopedias.
 
@@ -68,7 +70,7 @@ Future agents should use this layer in this order:
 2. Fix the prompt, remote endpoints, provided files, and local runtime before exploit work.
 3. Pick exactly one category skill and read `docs/CTF_SOLVE_PLAYBOOKS.md` for the practical solve loop.
 4. Add hybrid-chain guidance only if evidence crosses categories.
-5. Use MCPs and external references only after local files and reproducible commands show a need.
+5. Read the category reference digest and index, then query local references only after local files and reproducible commands show a need.
 6. Keep replay logs and proof validation results under the challenge `evidence/` directory.
 7. Keep replay summaries next to raw logs as `evidence/replay_<timestamp>.summary.md`.
 8. Update `state.json` when status, proof scope, remote status, replay kind, current remote liveness, final command, blockers, or evidence paths change.
@@ -115,3 +117,5 @@ The first three self-test benchmarks established these Level 2 requirements:
 - `state.json` evidence entries must be relative paths that exist inside the challenge directory.
 - `solved` status requires a non-empty `final_command`, replay evidence, and a non-`none` `proof_scope`.
 - Remote live exploit replay requires explicit opt-in.
+- Level 3 worker results must include read receipts for the category skill, solve playbook, and reference digest before merge.
+- Level 3 worker results must include reference query records and consulted local reference files before merge.

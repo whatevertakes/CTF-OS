@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional browser or Playwright MCP when evidence must be captured.
+reference_digest:
+- `docs/reference-digests/osint.md`
 evidence produced:
 - URLs, access dates, screenshots when useful, archived references, and notes.
 failure/blocker classes:

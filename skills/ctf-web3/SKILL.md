@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional Foundry reference; avoid vendoring Echidna.
+reference_digest:
+- `docs/reference-digests/web3.md`
 evidence produced:
 - Addresses, tx data, local chain state, solver script, and replay logs.
 failure/blocker classes:

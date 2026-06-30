@@ -18,6 +18,11 @@ The benchmark checks that:
 - missing challenge paths are reported.
 - category counts work.
 - split counts work.
+- tool routing gaps are reported as `tool_routing_gap`.
+- MCP used, considered, and skipped-with-reason entries are reported.
+- primary non-MCP tool usage is accepted and reported separately from missing
+  MCP decisions.
+- missing required tools remain `dependency_missing`, not skipped tools.
 - `tools/regression_check.py` skips replay by default.
 - generated evaluation output does not contain raw flag markers.
 

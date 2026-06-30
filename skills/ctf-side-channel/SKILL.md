@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - ChipWhisperer references only when useful.
+reference_digest:
+- `docs/reference-digests/hardware-rf-side-channel.md`
 evidence produced:
 - Raw trace references, scripts, plots when necessary, recovered values, and replay logs.
 failure/blocker classes:

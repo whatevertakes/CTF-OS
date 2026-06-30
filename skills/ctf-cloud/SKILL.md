@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - kCTF or provider docs as references only.
+reference_digest:
+- `docs/reference-digests/cloud-container.md`
 evidence produced:
 - Local configs, hashes, command outputs, and proof logs.
 failure/blocker classes:

@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - garak and Damn Vulnerable LLM Agent references only.
+reference_digest:
+- `docs/reference-digests/ai-ml.md`
 evidence produced:
 - Prompt logs, model outputs, sanitized tool traces, and replay notes.
 failure/blocker classes:
