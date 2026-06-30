@@ -4,10 +4,10 @@ This table maps common CTF categories to local skill contracts, optional referen
 
 | Category | Local skill | Optional tools or references | MCP support | Gaps and notes |
 |---|---|---|---|---|
-| Core intake/proof | `skills/ctf-triage`, `skills/replay-runner`, `skills/proof-validation` | `benchmarks/LEVEL2_SELFTEST.md` | None | Keep challenge state and replay evidence current. |
+| Core preflight/intake/proof | `skills/ctf-triage`, `skills/replay-runner`, `skills/proof-validation` | `tools/preflight_check.py`, `benchmarks/LEVEL2_SELFTEST.md` | None | Keep challenge state, replay evidence, redacted summaries, and proof scope current. |
 | Web | `skills/ctf-web` | Browser devtools, curl/httpie-style local commands, public writeups as references | Playwright MCP | No default scanner. Use targeted requests and captured payloads. |
 | Pwn | `skills/ctf-pwn` | `pwntools`, gdb, checksec-style helpers | None | Add tools only when a binary exploit needs them. |
-| Reverse engineering | `skills/ctf-rev` | Local disassemblers, `angr` reference | Ghidra, radare2, angr MCP | Use `.codex/bin/` wrappers for configured local RE MCPs. |
+| Reverse engineering | `skills/ctf-rev` | Local disassemblers, Ghidra as an optional external tool, `angr` reference | radare2, angr MCP | Use `.codex/bin/` wrappers for configured local RE MCPs. |
 | Crypto | `skills/ctf-crypto` | `RsaCtfTool`, Sage references | None | Keep math scripts challenge-local and reproducible. |
 | Forensics | `skills/ctf-forensics` | Volatility3, file carving references | None | No default memory-symbol caches. |
 | Stego | `skills/ctf-stego` | Image/audio metadata and carving references | None | Avoid blind bulk extraction unless evidence points there. |
@@ -20,7 +20,7 @@ This table maps common CTF categories to local skill contracts, optional referen
 | Blockchain/Web3 | `skills/ctf-web3` | Foundry, Echidna references | None | Avoid vendoring AGPL tooling; record chain state and tx hashes. |
 | AI/ML security | `skills/ctf-ai-ml` | garak, Damn Vulnerable LLM Agent references | Playwright MCP for web agents | Never store API secrets in challenge files. |
 | Mobile | `skills/ctf-mobile` | jadx/apktool/frida references | None | Add tooling only for a concrete APK/IPA. |
-| Malware | `skills/ctf-malware` | Volatility3, sandboxing references | Ghidra, radare2, angr MCP | Static-first unless a safe local sandbox is established. |
+| Malware | `skills/ctf-malware` | Ghidra, Volatility3, sandboxing references | radare2, angr MCP | Static-first unless a safe local sandbox is established. |
 | Hardware/RF | `skills/ctf-hardware-rf` | ChipWhisperer, SigMF, URH references | None | Hardware captures and sample rates must be documented. |
 | Side-channel | `skills/ctf-side-channel` | ChipWhisperer and timing-analysis references | None | Preserve raw traces and analysis scripts. |
 

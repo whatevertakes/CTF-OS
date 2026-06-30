@@ -22,7 +22,20 @@ future agent consumers:
 - Crypto solver.
 - Malware solver.
 - Hybrid-chain solver.
+workflow:
+- Put original images, pcaps, memory dumps, logs, archives, and documents in `dist/`.
+- Hash and classify every artifact before carving, extraction, or conversion.
+- Record timestamps, timezone assumptions, packet counts, filesystem details, archive nesting, and tool versions.
+- Preserve extracted files under `work/` with source offsets, commands, and hashes.
+- Split artifact inventory, timeline, carving, memory/network, and crypto bridge work instead of mixing evidence types.
+- Route recovered binaries, keys, ciphertext, scripts, or web traces to the matching category only after preserving boundary evidence.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `tshark -r <pcap> -q -z io,phs` for packet captures.
+- `python3 tools/replay_runner.py <challenge-dir>` after a replay path exists.
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`

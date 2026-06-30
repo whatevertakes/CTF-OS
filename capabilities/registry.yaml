@@ -23,6 +23,14 @@ capabilities:
     dependencies: [python3-stdlib]
     loads_by_default: true
     future_agents: [proof, reviewer, benchmark]
+  - id: preflight_check
+    type: script
+    category: core
+    status: implemented
+    path: tools/preflight_check.py
+    dependencies: [python3-stdlib, python-venv, bash, git]
+    loads_by_default: true
+    future_agents: [triage, solver, proof, benchmark]
   - id: challenge_template
     type: template
     category: core
@@ -36,9 +44,113 @@ capabilities:
     category: core
     status: implemented
     path: benchmarks/level2_selftest.py
-    dependencies: [intake_challenge, replay_runner, proof_validate]
+    dependencies: [intake_challenge, replay_runner, proof_validate, preflight_check]
     loads_by_default: false
     future_agents: [benchmark, reviewer]
+  - id: level3_orchestrator
+    type: script
+    category: orchestration
+    status: implemented
+    path: tools/level3_orchestrator.py
+    dependencies: [preflight_check, replay_runner, proof_validate, ctf_solver_memory, ctf_solve_playbooks, level2_to_level3_handoff]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers, proof]
+  - id: level3_dispatch_loop
+    type: orchestration-contract
+    category: orchestration
+    status: implemented
+    path: tools/level3_orchestrator.py dispatch|assign|collect
+    dependencies: [level3_orchestrator, multi_agent_v1.spawn_agent, proof_validate]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers, proof]
+  - id: level3_strategy_profiles
+    type: orchestration-contract
+    category: orchestration
+    status: implemented
+    path: tools/level3_orchestrator.py plan
+    dependencies: [level3_orchestrator, ctf_solver_memory, ctf_solve_playbooks, level2_to_level3_handoff]
+    loads_by_default: false
+    future_agents: [web-worker, pwn-worker, rev-worker, crypto-worker, forensics-worker, misc-worker, category-workers]
+  - id: level3_selftest
+    type: benchmark
+    category: orchestration
+    status: implemented
+    path: benchmarks/level3_selftest.py
+    dependencies: [level3_orchestrator, level3_dispatch_loop, level3_strategy_profiles, level2_selftest, preflight_check, replay_runner, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer, level3-orchestrator]
+  - id: level4_interface
+    type: script
+    category: interface
+    status: implemented
+    path: tools/level4_interface.py
+    dependencies: [preflight_check, replay_runner, proof_validate, level3_orchestrator, ctf_solver_memory]
+    loads_by_default: false
+    future_agents: [solver, reviewer, benchmark, level3-orchestrator]
+  - id: level4_interface_contract
+    type: document
+    category: interface
+    status: implemented
+    path: docs/LEVEL4_INTERFACES.md
+    dependencies: [level4_interface, level3_orchestrator, replay_runner, proof_validate]
+    loads_by_default: false
+    future_agents: [solver, reviewer, benchmark, level3-orchestrator]
+  - id: level4_selftest
+    type: benchmark
+    category: interface
+    status: implemented
+    path: benchmarks/level4_selftest.py
+    dependencies: [level4_interface, level3_selftest, preflight_check, intake_challenge, level3_orchestrator, proof_validate]
+    loads_by_default: false
+    future_agents: [benchmark, reviewer]
+  - id: strict_tool_profile
+    type: script
+    category: core
+    status: implemented
+    path: tools/preflight_check.py --strict-optional
+    dependencies: [docker, checksec, ROPgadget, one_gadget, ropper, seccomp-tools, jadx, apktool, sage, tshark]
+    loads_by_default: false
+    future_agents: [solver, benchmark, level3-orchestrator]
+  - id: ctf_solver_memory
+    type: document
+    category: core
+    status: implemented
+    path: docs/CTF_SOLVER_MEMORY.md
+    dependencies: []
+    loads_by_default: true
+    future_agents: [triage, solver, benchmark, level3-orchestrator]
+  - id: ctf_solve_playbooks
+    type: document
+    category: core
+    status: implemented
+    path: docs/CTF_SOLVE_PLAYBOOKS.md
+    dependencies: [skill_ctf_web, skill_ctf_pwn, skill_ctf_rev, skill_ctf_crypto, skill_ctf_misc]
+    loads_by_default: true
+    future_agents: [solver, category-workers, level3-orchestrator]
+  - id: level2_to_level3_handoff
+    type: document
+    category: core
+    status: implemented
+    path: docs/LEVEL2_TO_LEVEL3_HANDOFF.md
+    dependencies: [preflight_check, replay_runner, proof_validate, level2_selftest, ctf_solve_playbooks]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, benchmark, reviewer]
+  - id: tool_searchsploit
+    type: script
+    category: web
+    status: implemented
+    path: .codex/bin/searchsploit
+    dependencies: [exploitdb-cache, bash]
+    loads_by_default: false
+    future_agents: [web-solver, cve-triage]
+  - id: tool_tplmap
+    type: script
+    category: web
+    status: implemented
+    path: .codex/bin/tplmap
+    dependencies: [python-venv, tplmap-cache]
+    loads_by_default: false
+    future_agents: [web-solver]
 
   - id: skill_ctf_triage
     type: skill
@@ -53,7 +165,7 @@ capabilities:
     category: web
     status: implemented
     path: skills/ctf-web/SKILL.md
-    dependencies: [skill_ctf_triage]
+    dependencies: [skill_ctf_triage, tool_searchsploit, tool_tplmap]
     loads_by_default: false
     future_agents: [web-solver, hybrid-chain]
   - id: skill_ctf_pwn
@@ -200,6 +312,14 @@ capabilities:
     dependencies: [skill_ctf_triage, replay_runner, proof_validate]
     loads_by_default: false
     future_agents: [hybrid-chain, reviewer]
+  - id: skill_ctf_level3_orchestrator
+    type: skill
+    category: orchestration
+    status: implemented
+    path: skills/ctf-level3-orchestrator/SKILL.md
+    dependencies: [level3_orchestrator, preflight_check, replay_runner, proof_validate, ctf_solver_memory, level2_to_level3_handoff]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers, proof]
   - id: skill_proof_validation
     type: skill
     category: core
@@ -225,14 +345,6 @@ capabilities:
     loads_by_default: false
     future_agents: [benchmark, reviewer]
 
-  - id: mcp_ghidra
-    type: mcp
-    category: reverse
-    status: mcp
-    path: .codex/bin/ghidra-mcp-codex.sh
-    dependencies: [ghidra-mcp-wrapper]
-    loads_by_default: false
-    future_agents: [rev-solver, malware-solver]
   - id: mcp_radare2
     type: mcp
     category: reverse

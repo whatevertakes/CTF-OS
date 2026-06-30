@@ -26,6 +26,7 @@ REQUIRED_ENTRIES = (
     "dist",
     "work",
 )
+FAKE_FLAG = "FLAG{LEVEL2_SELFTEST_REDACTION_MARKER}"
 
 
 def challenge_path(spec: tuple[str, str, str]) -> Path:
@@ -108,6 +109,20 @@ def assert_contract(path: Path) -> None:
             fail(f"{path.relative_to(ROOT)}/state.json missing key: {key}")
     if state["status"] != "new":
         fail(f"{path.relative_to(ROOT)} should start as status=new")
+    metadata = state.get("metadata")
+    if not isinstance(metadata, dict):
+        fail(f"{path.relative_to(ROOT)}/state.json metadata must be an object")
+    required_metadata = (
+        "proof_scope",
+        "remote_status",
+        "remote_solve",
+        "replay_kind",
+        "current_remote_liveness",
+        "evidence_sensitivity",
+    )
+    missing = [key for key in required_metadata if key not in metadata]
+    if missing:
+        fail(f"{path.relative_to(ROOT)}/state.json metadata missing: {', '.join(missing)}")
 
 
 def assert_validation_status(path: Path, expected_status: str) -> None:
@@ -119,6 +134,39 @@ def assert_validation_status(path: Path, expected_status: str) -> None:
         )
     if expected_status != "solved" and "status=solved" in result.stdout:
         fail(f"{path.relative_to(ROOT)} was incorrectly reported as solved")
+
+
+def assert_summary_exists(path: Path) -> None:
+    logs = sorted((path / "evidence").glob("replay_*.log"))
+    if not logs:
+        fail(f"{path.relative_to(ROOT)} has no replay logs")
+    latest = logs[-1]
+    summary = latest.with_name(f"{latest.stem}.summary.md")
+    if not summary.is_file():
+        fail(f"{path.relative_to(ROOT)} replay summary was not created")
+
+    state = load_state(path)
+    evidence = state.get("evidence")
+    if not isinstance(evidence, list):
+        fail(f"{path.relative_to(ROOT)} state evidence is not a list")
+    for required in (latest, summary):
+        rel = required.relative_to(path).as_posix()
+        if rel not in evidence:
+            fail(f"{path.relative_to(ROOT)} state evidence missing {rel}")
+
+
+def assert_sensitive_summary(path: Path) -> None:
+    logs = sorted((path / "evidence").glob("replay_*.log"))
+    latest = logs[-1]
+    summary = latest.with_name(f"{latest.stem}.summary.md")
+    raw = latest.read_text(encoding="utf-8")
+    redacted = summary.read_text(encoding="utf-8")
+    if FAKE_FLAG not in raw:
+        fail("sensitive self-test raw replay does not contain marker")
+    if FAKE_FLAG in redacted:
+        fail("sensitive self-test summary leaked marker")
+    if "<REDACTED_FLAG>" not in redacted:
+        fail("sensitive self-test summary did not include redaction marker")
 
 
 def cleanup(paths: list[Path]) -> None:
@@ -162,8 +210,7 @@ def main() -> int:
 
         dummy = challenge_path(("_selftest", "misc", "dummy"))
         run(["python3", "tools/replay_runner.py", str(dummy.relative_to(ROOT))])
-        if not list((dummy / "evidence").glob("replay_*.log")):
-            fail("replay runner did not preserve replay evidence")
+        assert_summary_exists(dummy)
         assert_validation_status(dummy, "new")
 
         blocked = intake(("_selftest", "misc", "blocked-no-reason"))
@@ -182,8 +229,37 @@ def main() -> int:
         created.append(partial)
         partial_state = load_state(partial)
         partial_state["status"] = "partial"
+        partial_state["blocker"] = "self-test partial progress marker"
         write_state(partial, partial_state)
         assert_validation_status(partial, "partial")
+
+        sensitive = intake(("_selftest", "misc", "sensitive-redaction"))
+        created.append(sensitive)
+        (sensitive / "replay.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"echo '{FAKE_FLAG}'\n",
+            encoding="utf-8",
+        )
+        (sensitive / "replay.sh").chmod(0o755)
+        run(["python3", "tools/replay_runner.py", str(sensitive.relative_to(ROOT))])
+        assert_sensitive_summary(sensitive)
+        assert_validation_status(sensitive, "new")
+
+        remote_guard = intake(("_selftest", "misc", "remote-live-guard"))
+        created.append(remote_guard)
+        remote_guard_state = load_state(remote_guard)
+        metadata = remote_guard_state.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            fail("remote-live-guard metadata is not an object")
+        metadata["replay_kind"] = "remote_live_exploit"
+        write_state(remote_guard, remote_guard_state)
+        result = run(
+            ["python3", "tools/replay_runner.py", str(remote_guard.relative_to(ROOT))],
+            expect_ok=False,
+        )
+        if "refusing to run remote live replay" not in result.stderr:
+            fail("remote live replay guard failed for the wrong reason")
 
         solved = intake(("_selftest", "misc", "solved-proof"))
         created.append(solved)
@@ -199,6 +275,10 @@ def main() -> int:
         run(["python3", "tools/replay_runner.py", str(solved.relative_to(ROOT))])
         solved_state = load_state(solved)
         solved_state["final_command"] = "bash replay.sh"
+        metadata = solved_state.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            fail("solved-proof metadata is not an object")
+        metadata["proof_scope"] = "local"
         write_state(solved, solved_state)
         assert_validation_status(solved, "solved")
     finally:

@@ -20,7 +20,19 @@ future agent consumers:
 - Container solver.
 - Cloud solver.
 - Hybrid-chain solver.
+workflow:
+- Hash images, Dockerfiles, manifests, extracted layers, logs, and filesystem dumps.
+- Record users, capabilities, mounts, sockets, environment, entrypoints, seccomp, AppArmor, and Kubernetes context.
+- Reproduce runtime behavior locally before considering namespace, cgroup, socket, or host interfaces.
+- Preserve extracted filesystem paths under `work/` and durable proof transcripts under `evidence/`.
+- Route recovered services to web, native binaries to pwn/rev, and policies to cloud only after boundary evidence exists.
+first_commands:
+- `docker image inspect <image>` when an image is provided.
+- `docker run --rm ...` only within challenge scope.
+- `find work/rootfs -maxdepth 3 -type f -print`
+- `python3 tools/replay_runner.py <challenge-dir>`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`

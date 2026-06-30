@@ -9,5 +9,13 @@
   "blocker": "",
   "blockers": [],
   "evidence": [],
-  "notes": "Use notes.md for human-readable evidence and reasoning."
+  "notes": "Use notes.md for human-readable evidence and reasoning.",
+  "metadata": {
+    "proof_scope": "none",
+    "remote_status": "not_attempted",
+    "remote_solve": "not_attempted",
+    "replay_kind": "local",
+    "current_remote_liveness": "not_applicable",
+    "evidence_sensitivity": "no_sensitive_markers"
+  }
 }

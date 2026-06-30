@@ -20,6 +20,19 @@ future agent consumers:
 - Mobile solver.
 - Reverse solver.
 - Crypto solver.
+workflow:
+- Hash APK, IPA, source, app data, logs, and traffic artifacts.
+- Extract manifests, resources, signing information, package names, URLs, native libraries, storage paths, and permissions.
+- Use jadx, apktool, strings, and local scripts only when the artifact justifies them.
+- Recover secrets, crypto, API endpoints, feature gates, native checks, and local verifier logic with snippets and commands.
+- Replay API or local verifier behavior outside device-only state when possible.
+- Route reduced web, crypto, rev, or pwn work to the matching category with boundary evidence.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `jadx -d work/jadx <apk>` when APK analysis is justified.
+- `apktool d -o work/apktool <apk>` when resource/smali analysis is justified.
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`

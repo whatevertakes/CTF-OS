@@ -20,7 +20,19 @@ future agent consumers:
 - AI/ML solver.
 - Web solver.
 - Hybrid-chain solver.
+workflow:
+- Freeze prompts, hidden instructions, tool descriptions, datasets, model artifacts, transcripts, retrieval context, and non-determinism settings.
+- Never store real API secrets or credentials in challenge files.
+- Test prompt injection, instruction hierarchy, classifier behavior, embedding retrieval, agent tools, and downstream browser/API effects with transcripts.
+- Sample nondeterministic outputs enough to separate signal from noise.
+- Route concrete web/API/tool effects to the matching category only when evidenced.
+first_commands:
+- Save prompt/input and model output samples under `evidence/`.
+- `python3 work/replay_prompt.py`
+- `python3 work/analyze_outputs.py`
+- `python3 tools/proof_validate.py <challenge-dir>`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`

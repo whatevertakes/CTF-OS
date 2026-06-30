@@ -20,6 +20,18 @@ future agent consumers:
 - Side-channel solver.
 - Crypto solver.
 - Hardware/RF solver.
+workflow:
+- Inventory raw traces, timing logs, oracle behavior, sample counts, metadata, source code, and hypotheses.
+- Preserve raw measurements unchanged; write analysis scripts and derived data under `work/`.
+- Define timing, power, cache, fault, or statistical leakage model with confidence and sample-size notes.
+- Run bounded analysis and avoid claiming recovered secrets without independent deterministic verification.
+- Route recovered parameters or cryptographic material to `ctf-crypto` after preserving trace evidence.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `python3 work/analyze_traces.py`
+- `python3 work/verify_secret.py`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`

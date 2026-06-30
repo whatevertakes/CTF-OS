@@ -19,6 +19,19 @@ future agent consumers:
 - Programming solver.
 - Replay runner.
 - Proof validator.
+workflow:
+- Extract constraints, sample inputs, sample outputs, protocol grammar, time limits, and scoring rules.
+- Write local sample tests before remote automation.
+- Build deterministic solvers under `work/`, with timeouts and explicit failure handling.
+- Capture interactive remote transcripts, generated inputs, and final output when they materially prove the solve.
+- Make `replay.sh` run the solver or a saved transcript verifier.
+- Escalate to crypto, rev, pwn, or web when the hard part becomes category-specific rather than algorithmic.
+first_commands:
+- `python3 work/solve.py < sample.txt`
+- `python3 work/test_solver.py`
+- `timeout 30 python3 work/remote_solve.py`
+- `python3 tools/replay_runner.py <challenge-dir>`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_CAPABILITY_MAP.md`

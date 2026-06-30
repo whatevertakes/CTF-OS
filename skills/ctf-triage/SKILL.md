@@ -22,6 +22,18 @@ failure/blocker classes:
 future agent consumers:
 - Category solvers.
 - Proof and replay agents.
+workflow:
+- Create or normalize every challenge under `challenges/<event>/<category>/<name>/`.
+- Copy original handouts into `dist/` and keep generated scripts under `work/`.
+- Record prompt text, URLs, files, hashes, credentials, and known remote lifetime in `notes.md`.
+- Set the best initial category, but use `misc` only when evidence is genuinely ambiguous.
+- Run category-specific skills and `docs/CTF_SOLVE_PLAYBOOKS.md` before exploit or solver work.
+first_commands:
+- `python3 tools/intake_challenge.py --event <event> --category <category> --name <name>`
+- `file dist/*`
+- `sha256sum dist/*`
+- `python3 tools/proof_validate.py <challenge-dir>`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CAPABILITY_MAP.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`

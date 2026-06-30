@@ -21,7 +21,21 @@ future agent consumers:
 - Crypto solver.
 - Hybrid-chain solver.
 - Proof validator.
+workflow:
+- Extract exact parameters, encodings, ciphertexts, public keys, source code, transcripts, oracle endpoints, and sample pairs.
+- Normalize numeric values and byte encodings in a local script before choosing an attack.
+- Write the attack assumption in `notes.md`, including primitive, weakness, query model, and verification condition.
+- Separate parameter extraction, oracle modeling, attack implementation, and independent verifier artifacts.
+- Use Sage only when the math structure justifies it; keep a deterministic Python verifier when possible.
+- Record oracle input, output, error class, timing, rate limit, and query budget before adaptive exploitation.
+- Save recovered plaintext, key, seed, nonce, or flag proof under `evidence/`, and make `replay.sh` reproduce the final check.
+first_commands:
+- `python3 work/parse_params.py`
+- `sage work/attack.sage` when Sage is justified.
+- `python3 work/solve.py`
+- `python3 work/verify.py`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`

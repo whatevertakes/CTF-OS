@@ -21,7 +21,21 @@ future agent consumers:
 - Pwn solver.
 - Proof validator.
 - Hybrid-chain solver.
+workflow:
+- Put original binaries, libc, loader, docker-compose, wrapper scripts, and source in `dist/`.
+- Start with `file`, `sha256sum`, `checksec`, local run behavior, and Docker/service reproduction.
+- Record architecture, mitigations, libc/loader identity, seccomp, argv/env, and network wrapper assumptions in `notes.md`.
+- Minimize crashes before exploit development; save crash input, signal, offset, controlled bytes, and register/heap context.
+- Promote only evidenced primitives such as leak, write, control-flow, UAF, OOB, format string, sandbox escape, or race.
+- Write exploit drafts under `work/`, and make `replay.sh` run the narrowest local proof command before attempting remote proof.
+- Capture remote attempts as transcripts with timing, retry count, leak values, and exact failure reason; do not rerun remote live exploit replay without explicit opt-in.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `checksec --file <binary>`
+- `python3 work/exploit_*.py LOCAL=1`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`

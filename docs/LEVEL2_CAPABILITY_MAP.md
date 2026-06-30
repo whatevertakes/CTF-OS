@@ -6,11 +6,15 @@ Level 2 is a small local capability layer for CTF work in this workspace. It fav
 
 | Group | Purpose | Local entry points |
 |---|---|---|
+| Preflight | Verify Level 0/1/2 prerequisites before replay or benchmark work. | `tools/preflight_check.py` |
 | Intake and state | Create a challenge workspace with a consistent notes, state, replay, and evidence layout. | `tools/intake_challenge.py`, `templates/challenge/` |
-| Replay and proof | Re-run exact local commands and validate whether a claimed solve is backed by evidence. | `tools/replay_runner.py`, `tools/proof_validate.py` |
-| Category skills | Give future agents compact routing contracts for each CTF category. | `skills/ctf-*/SKILL.md` |
+| Replay and proof | Re-run exact local commands, write raw evidence plus redacted summaries, and validate whether a claimed solve is backed by evidence. | `tools/replay_runner.py`, `tools/proof_validate.py` |
+| Category skills | Give future agents compact routing contracts and category workflows for each CTF category. | `skills/ctf-*/SKILL.md` |
+| Solve playbooks | Provide practical first-pass, branch, and stop-condition guidance for real solves. | `docs/CTF_SOLVE_PLAYBOOKS.md` |
+| Web helpers | Provide narrow local wrappers for common web CTF workflows without polluting root `tools/`. | `.codex/bin/tplmap`, `.codex/bin/searchsploit` |
 | Hybrid chains | Describe cross-category workflows where the solve path crosses boundaries. | `skills/ctf-hybrid-chain/SKILL.md`, `docs/LEVEL2_HYBRID_CHAINS.md` |
 | MCP bridges | Record configured local or plugin MCP capabilities without loading them by default. | `.codex/bin/*`, `mcp://*` entries in `capabilities/registry.yaml` |
+| Interface views | Present Level 1 config, Level 2 state/evidence, and Level 3 worker boards through challenge-local CLI/editor/terminal/browser/report surfaces. | `tools/level4_interface.py`, `docs/LEVEL4_INTERFACES.md` |
 | External references | Track useful public resources as references only, with import and licensing notes. | `docs/LEVEL2_IMPORT_POLICY.md` |
 | Benchmarks | Keep a lightweight self-test that proves the layer can create, replay, and validate a challenge. | `benchmarks/level2_selftest.py`, `benchmarks/LEVEL2_SELFTEST.md` |
 
@@ -21,7 +25,7 @@ Every capability entry in `capabilities/registry.yaml` has these fields:
 | Field | Meaning |
 |---|---|
 | `id` | Stable machine-readable capability id. |
-| `type` | One of `script`, `template`, `skill`, `benchmark`, `external`, or `mcp`. |
+| `type` | One of `script`, `template`, `skill`, `benchmark`, `document`, `external`, or `mcp`. |
 | `category` | Primary CTF or workspace category. |
 | `status` | Current availability status. |
 | `path` | Local path, URL, or MCP identifier. |
@@ -60,7 +64,52 @@ The skeletons are intentionally short. They are routing contracts, not encyclope
 Future agents should use this layer in this order:
 
 1. Start with intake for a new challenge.
-2. Pick exactly one category skill, then add hybrid-chain guidance only if evidence crosses categories.
-3. Use MCPs and external references only after local files and reproducible commands show a need.
-4. Keep replay logs and proof validation results under the challenge `evidence/` directory.
-5. Update `state.json` when status, final command, or blockers change.
+2. Fix the prompt, remote endpoints, provided files, and local runtime before exploit work.
+3. Pick exactly one category skill and read `docs/CTF_SOLVE_PLAYBOOKS.md` for the practical solve loop.
+4. Add hybrid-chain guidance only if evidence crosses categories.
+5. Use MCPs and external references only after local files and reproducible commands show a need.
+6. Keep replay logs and proof validation results under the challenge `evidence/` directory.
+7. Keep replay summaries next to raw logs as `evidence/replay_<timestamp>.summary.md`.
+8. Update `state.json` when status, proof scope, remote status, replay kind, current remote liveness, final command, blockers, or evidence paths change.
+9. Use Level 4 interface views for operator speed, but keep solve status and proof scope in Level 2 state.
+10. When progress stalls, split the hypothesis space instead of repeating disproven payload families.
+
+## State Metadata Contract
+
+`state.json.metadata` must carry these machine-readable fields:
+
+| Field | Purpose |
+|---|---|
+| `proof_scope` | `none`, `local`, `remote`, or a short precise scope such as `local verifier proof for round 01/10`. |
+| `remote_status` | Current remote result, such as `not_attempted`, `solved`, `failed_no_flag`, `expired`, or a challenge-specific failure string. |
+| `remote_solve` | Coarse solve state: `not_attempted`, `attempted`, `failed`, or `solved`. |
+| `replay_kind` | One of `local`, `local_proof`, `remote_liveness`, `remote_live`, `remote_live_exploit`, or `remote_saved_evidence`. |
+| `current_remote_liveness` | One of `not_applicable`, `unknown`, `live`, `partial`, `expired`, or `unavailable`. |
+| `evidence_sensitivity` | One of `no_sensitive_markers`, `contains_flag`, `contains_secret`, or `unknown`. |
+
+`tools/proof_validate.py` enforces these fields. `tools/replay_runner.py`
+updates `current_remote_liveness` when replay output contains a
+`remote_liveness=...` marker.
+
+## Replay Safety
+
+`tools/replay_runner.py` refuses to run `replay_kind=remote_live` or
+`replay_kind=remote_live_exploit` unless `--allow-remote-live` is supplied.
+Use this for saved remote exploits that may print real flags, mutate live
+state, or decay after the CTF service closes. For old evidence, use:
+
+```bash
+python3 tools/replay_runner.py --summarize-existing <challenge-dir>
+```
+
+## Benchmark-Driven Rules
+
+The first three self-test benchmarks established these Level 2 requirements:
+
+- Remote solved proof must be distinguishable from local-only proof.
+- Failed remote attempts must stay valid evidence, not overwrite local proof.
+- Replay logs with flag-like markers require redacted summaries before proof validation passes.
+- `partial` status requires either durable evidence entries or a blocker reason.
+- `state.json` evidence entries must be relative paths that exist inside the challenge directory.
+- `solved` status requires a non-empty `final_command`, replay evidence, and a non-`none` `proof_scope`.
+- Remote live exploit replay requires explicit opt-in.

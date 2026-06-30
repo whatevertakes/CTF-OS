@@ -22,7 +22,20 @@ future agent consumers:
 - Hybrid-chain solver.
 - Reviewer.
 - Proof validator.
+workflow:
+- Name the concrete boundary artifact that justifies every category switch.
+- Keep source category evidence, intermediate artifacts, destination category assumptions, and final proof scope separate.
+- Run one category at a time with explicit stop conditions.
+- Preserve handoff notes and artifacts under `work/` and `evidence/`.
+- Build one integrated replay path only after individual steps have evidence.
+- Validate the final proof through `tools/replay_runner.py` and `tools/proof_validate.py`.
+first_commands:
+- `python3 tools/proof_validate.py <challenge-dir>`
+- `python3 tools/replay_runner.py <challenge-dir>`
+- `python3 tools/level3_orchestrator.py plan <challenge-dir> --category hybrid`
+- `python3 tools/level3_orchestrator.py evaluate <challenge-dir> --run-replay`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_HYBRID_CHAINS.md`
 - `docs/LEVEL2_CAPABILITY_MAP.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`

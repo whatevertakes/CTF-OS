@@ -17,6 +17,20 @@ failure/blocker classes:
 future agent consumers:
 - Category router.
 - Any category solver.
+workflow:
+- Treat misc as a router until evidence proves a narrower domain.
+- Inventory files, prompts, remote protocol samples, constraints, scoring rules, and hidden-state clues.
+- Build a minimal state model before automation: states, tokens, grammar, transitions, and failure responses.
+- Use parser-state probes for serialization, compression, Unicode, archive, image, and encoding ambiguity.
+- Write deterministic automation under `work/`, with samples, timeouts, retries, and saved transcripts.
+- Escalate only when an artifact proves a category change, such as key material for crypto, binary logic for rev, memory corruption for pwn, or HTTP behavior for web.
+- If manual progress matters, convert it into a replayable script or saved transcript before claiming progress.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `python3 work/solve.py`
+- `python3 tools/replay_runner.py <challenge-dir>` after a replay path exists.
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CAPABILITY_MAP.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`

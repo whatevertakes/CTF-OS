@@ -19,6 +19,18 @@ future agent consumers:
 - Stego solver.
 - Forensics solver.
 - Crypto solver.
+workflow:
+- Hash carrier files and record dimensions, codec, channels, frame count, palette, metadata, compression, and chunk structure.
+- Avoid broad blind extraction until a hint or carrier property justifies it.
+- Test metadata, appended data, archive signatures, bit planes, palette changes, frame deltas, transforms, audio channels, and text encodings with provenance.
+- Store recovered payloads under `work/`, rehash them, and route conventional artifacts to forensics, crypto, rev, or misc.
+- Make `replay.sh` reproduce the extraction path or verify the recovered payload.
+first_commands:
+- `file dist/*`
+- `sha256sum dist/*`
+- `exiftool <carrier>` when available and justified.
+- `python3 work/extract.py`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`

@@ -19,6 +19,18 @@ failure/blocker classes:
 future agent consumers:
 - OSINT solver.
 - Proof validator.
+workflow:
+- Confirm challenge scope and avoid private, real-world sensitive, or unrelated targets.
+- Record clue text, names, handles, domains, image metadata, location hints, time windows, and language assumptions.
+- Track every source with URL, access date, archive link when available, and screenshot when useful.
+- Disambiguate identities and locations with multiple independent clues.
+- Tie the final answer to cited evidence rather than memory.
+first_commands:
+- `python3 tools/intake_challenge.py --event <event> --category osint --name <name>`
+- Save source URLs and access dates in `notes.md`.
+- Save screenshots or archived pages under `evidence/` when material.
+- `python3 tools/proof_validate.py <challenge-dir>`
 pointers:
+- `docs/CTF_SOLVE_PLAYBOOKS.md`
 - `docs/LEVEL2_CATEGORY_COVERAGE.md`
 - `docs/LEVEL2_IMPORT_POLICY.md`

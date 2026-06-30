@@ -19,6 +19,7 @@ node_modules/
 core
 core.*
 *.dmp
+*:Zone.Identifier
 
 .DS_Store
 ghidra-mcp-cache/

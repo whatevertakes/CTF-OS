@@ -1,12 +1,10 @@
 model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
 plan_mode_reasoning_effort = "xhigh"
-service_tier = "fast"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 
 [features]
-fast_mode = true
 goals = true
 multi_agent = true
 shell_snapshot = true
@@ -58,6 +56,3 @@ args = ["-y", "@playwright/mcp@0.0.75"]
 
 [mcp_servers.radare2]
 command = "/home/choijiwng/02_ctf_workspace/.codex/bin/r2mcp-codex.sh"
-
-[mcp_servers.ghidra]
-command = "/home/choijiwng/02_ctf_workspace/.codex/bin/ghidra-mcp-codex.sh"
