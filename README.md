@@ -41,6 +41,32 @@ surface, creates `.venv`, installs `requirements.txt`, rewrites local Codex
 absolute paths in `.codex/config.toml`, and runs the strict preflight check. See
 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md) for the detailed team setup flow.
 
+If setup or MCP gets stuck, do not paste long command blocks manually. Run the
+repair script:
+
+```bash
+tools/repair_team_setup.sh
+```
+
+Expected success markers:
+
+```text
+summary failures=0 warnings=0
+team parity summary failures=0
+```
+
+`codex mcp list` should show `angr`, `playwright`, and `radare2`. `Auth
+Unsupported` is normal for these local stdio MCP servers.
+
+For a clean version report:
+
+```bash
+tools/version_report.sh
+```
+
+See [docs/TEAM_SETUP_TROUBLESHOOTING.md](docs/TEAM_SETUP_TROUBLESHOOTING.md)
+for error-specific recovery steps and expected output.
+
 If you need to install pieces manually, use commands and package managers, not
 vendored dependencies:
 
