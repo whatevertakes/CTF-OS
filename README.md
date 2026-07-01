@@ -1,74 +1,75 @@
-# CTF Workspace
+# CTF 워크스페이스
 
-This repository is the canonical CTF execution workspace for the
-`whatevertakes` team project.
+이 저장소는 `whatevertakes` 팀 프로젝트의 표준 CTF 실행 워크스페이스입니다.
 
-The architecture is intentionally fixed. The owner maintains the framework,
-skills, tools, documentation, benchmark definitions, and repository policy.
-Benchmark runners execute assigned CTF cases and submit only sanitized run data.
+아키텍처는 의도적으로 고정되어 있습니다. 소유자는 프레임워크, 스킬, 도구,
+문서, 벤치마크 정의, 저장소 정책을 관리합니다. 벤치마크 러너는 배정된 CTF
+케이스를 실행하고, 정제된 실행 데이터만 제출합니다.
 
-## Roles
+## 역할
 
-- Owner: `jiwoongchoi-norun`
-  - Owns `main`.
-  - Reviews and merges all changes.
-  - May edit framework files, tools, skills, docs, templates, and benchmark
-    definitions.
-- Benchmark runners:
-  - Clone the repository and keep the same workspace layout.
-  - Run assigned benchmark CTF problems.
-  - Submit sanitized benchmark data only.
-  - Do not edit framework architecture, tools, skills, templates, reference
-    indexes, or policy files.
+- 소유자: `jiwoongchoi-norun`
+  - `main`을 소유합니다.
+  - 모든 변경 사항을 검토하고 병합합니다.
+  - 프레임워크 파일, 도구, 스킬, 문서, 템플릿, 벤치마크 정의를 수정할 수
+    있습니다.
+- 벤치마크 러너:
+  - 저장소를 클론하고 동일한 워크스페이스 레이아웃을 유지합니다.
+  - 배정된 벤치마크 CTF 문제를 실행합니다.
+  - 정제된 벤치마크 데이터만 제출합니다.
+  - 프레임워크 아키텍처, 도구, 스킬, 템플릿, 참조 인덱스, 정책 파일을
+    수정하지 않습니다.
 
-## Clone And Setup
+## 클론 및 설정
 
-Use the same repository layout locally:
+로컬에서도 동일한 저장소 레이아웃을 사용합니다.
 
 ```bash
 git clone git@github.com:whatevertakes/ctf_workspace.git
 cd ctf_workspace
 ```
 
-Run the WSL2 bootstrap:
+WSL2 부트스트랩을 실행합니다.
 
 ```bash
 tools/bootstrap_wsl2.sh
 ```
 
-This installs the team-parity Ubuntu, Python, Ruby, MCP, and reversing tool
-surface, creates `.venv`, installs `requirements.txt`, rewrites local Codex
-absolute paths in `.codex/config.toml`, and runs the strict preflight check. See
-[docs/SETUP_WSL2.md](docs/SETUP_WSL2.md) for the detailed team setup flow.
+이 스크립트는 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP, 리버싱 도구 표면을
+설치하고, `.venv`를 생성하며, `requirements.txt`를 설치합니다. 또한
+`.codex/config.toml`의 로컬 Codex 절대 경로를 다시 쓰고 엄격한 사전 점검을
+실행합니다. 자세한 팀 설정 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를
+참조하세요.
 
-If setup or MCP gets stuck, do not paste long command blocks manually. Run the
-repair script:
+설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
+실행하세요.
 
 ```bash
 tools/repair_team_setup.sh
 ```
 
-Expected success markers:
+예상되는 성공 표시:
 
 ```text
 summary failures=0 warnings=0
 team parity summary failures=0
 ```
 
-`codex mcp list` should show `angr`, `playwright`, and `radare2`. `Auth
-Unsupported` is normal for these local stdio MCP servers.
+`codex mcp list`에는 `angr`, `playwright`, `radare2`가 표시되어야 합니다. 이
+로컬 stdio MCP 서버에서 `Auth Unsupported`가 표시되는 것은 정상입니다.
 
-For a clean version report:
+깔끔한 버전 보고서를 보려면 다음을 실행합니다.
 
 ```bash
 tools/version_report.sh
 ```
 
-See [docs/TEAM_SETUP_TROUBLESHOOTING.md](docs/TEAM_SETUP_TROUBLESHOOTING.md)
-for error-specific recovery steps and expected output.
+오류별 복구 절차와 예상 출력은
+[docs/TEAM_SETUP_TROUBLESHOOTING.md](docs/TEAM_SETUP_TROUBLESHOOTING.md)를
+참조하세요.
 
-If you need to install pieces manually, use commands and package managers, not
-vendored dependencies:
+일부 항목을 수동으로 설치해야 한다면 vendored dependency가 아니라 명령어와
+패키지 매니저를 사용하세요.
 
 ```bash
 sudo apt-get update
@@ -79,7 +80,7 @@ python -m pip install -U pip setuptools wheel
 python -m pip install -r requirements.txt
 ```
 
-Validate the workspace:
+워크스페이스를 검증합니다.
 
 ```bash
 python3 tools/preflight_check.py
@@ -88,9 +89,9 @@ python3 tools/check_team_parity.py
 python3 tools/evaluate_corpus.py
 ```
 
-## Workspace Layout
+## 워크스페이스 레이아웃
 
-Keep every challenge under the standard contract:
+모든 챌린지는 표준 계약 아래에 유지합니다.
 
 ```text
 challenges/<event>/<category>/<challenge>/
@@ -102,37 +103,36 @@ challenges/<event>/<category>/<challenge>/
   work/
 ```
 
-- `dist/`: original challenge handouts.
-- `work/`: local scratch files, extracted files, build output, probes, and
-  temporary dependency checkouts. Do not submit broad vendored dependencies or
-  local build trees.
-- `evidence/`: replay summaries and sanitized proof outputs.
-- `state.json`, `notes.md`, `replay.sh`: durable benchmark run metadata.
+- `dist/`: 원본 챌린지 배포 파일.
+- `work/`: 로컬 스크래치 파일, 추출 파일, 빌드 출력, 프로브, 임시 dependency
+  체크아웃. 광범위한 vendored dependency나 로컬 빌드 트리는 제출하지 않습니다.
+- `evidence/`: 리플레이 요약과 정제된 증명 출력.
+- `state.json`, `notes.md`, `replay.sh`: 보존해야 하는 벤치마크 실행 메타데이터.
 
-## Benchmark Runner Workflow
+## 벤치마크 러너 워크플로
 
-Run an assigned challenge:
+배정된 챌린지를 실행합니다.
 
 ```bash
 python3 tools/benchmark_runner.py run challenges/<event>/<category>/<challenge>
 ```
 
-Re-check corpus consistency:
+corpus 일관성을 다시 확인합니다.
 
 ```bash
 python3 tools/evaluate_corpus.py
 ```
 
-If raw logs or outputs contain flags, tokens, keys, or challenge secrets,
-sanitize them before submitting:
+원시 로그나 출력에 플래그, 토큰, 키, 챌린지 시크릿이 포함되어 있다면 제출 전에
+정제합니다.
 
 ```bash
 python3 tools/report_sanitize.py challenges/<event>/<category>/<challenge>/evidence/<raw-log>.log --check
 ```
 
-## Submission Policy
+## 제출 정책
 
-Benchmark runners may submit only data paths:
+벤치마크 러너는 데이터 경로만 제출할 수 있습니다.
 
 ```text
 benchmarks/*_SANITIZED_BENCHMARK_REPORT.md
@@ -142,7 +142,7 @@ challenges/<event>/<category>/<challenge>/replay.sh
 challenges/<event>/<category>/<challenge>/evidence/*.summary.md
 ```
 
-The following paths are owner-only:
+다음 경로는 소유자 전용입니다.
 
 ```text
 AGENTS.md
@@ -158,7 +158,7 @@ references.yaml
 references.lock.json
 ```
 
-Do not submit:
+다음은 제출하지 않습니다.
 
 ```text
 flags, tokens, private keys, .env files
@@ -170,12 +170,11 @@ work/simavr*/
 local virtualenvs, caches, node_modules, or build output
 ```
 
-## Git Workflow
+## Git 워크플로
 
-The canonical repository is owner-controlled. Runners should not push to
-`main`.
+표준 저장소는 소유자가 관리합니다. 러너는 `main`에 push하지 않아야 합니다.
 
-Use a data branch or fork branch:
+데이터 브랜치나 fork 브랜치를 사용합니다.
 
 ```bash
 git switch -c data/<github-user>/<benchmark-id>/<run-id>
@@ -188,15 +187,15 @@ git commit -m "submit benchmark data for <benchmark-id>"
 git push -u origin data/<github-user>/<benchmark-id>/<run-id>
 ```
 
-Open a pull request to `main`, or attach the same sanitized files to a GitHub
-issue when direct branch push is not available. The owner validates and merges
-accepted data.
+`main`으로 pull request를 열거나, 직접 브랜치 push가 불가능한 경우 동일한
+정제 파일을 GitHub issue에 첨부합니다. 소유자가 데이터를 검증하고 승인된
+데이터를 병합합니다.
 
-Before opening a pull request, run:
+pull request를 열기 전에 다음을 실행합니다.
 
 ```bash
 python3 tools/validate_data_submission.py --base origin/main
 ```
 
-See [docs/TEAM_DATA_WORKFLOW.md](docs/TEAM_DATA_WORKFLOW.md) for the full
-data-only submission flow.
+전체 데이터 전용 제출 흐름은
+[docs/TEAM_DATA_WORKFLOW.md](docs/TEAM_DATA_WORKFLOW.md)를 참조하세요.
