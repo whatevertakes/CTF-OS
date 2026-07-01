@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
-export CTF_WORKSPACE_ROOT="/home/choijiwng/02_ctf_workspace"
+if [ -z "${CTF_WORKSPACE_ROOT:-}" ]; then
+  _codex_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  export CTF_WORKSPACE_ROOT="$(cd "$_codex_env_dir/.." && pwd)"
+else
+  export CTF_WORKSPACE_ROOT
+fi
 export XDG_CACHE_HOME="$CTF_WORKSPACE_ROOT/.cache/xdg"
 export MPLCONFIGDIR="$CTF_WORKSPACE_ROOT/.cache/matplotlib"
 export NUMBA_CACHE_DIR="$CTF_WORKSPACE_ROOT/.cache/numba"
@@ -60,5 +65,5 @@ _codex_path_prepend "$HOME/.local/bin"
 _codex_path_append "$HOME/.foundry/bin"
 export PATH
 
-unset _codex_cache_dir _codex_entry _codex_new_path _codex_old_ifs
+unset _codex_cache_dir _codex_entry _codex_env_dir _codex_new_path _codex_old_ifs
 unset -f _codex_path_prepend _codex_path_append

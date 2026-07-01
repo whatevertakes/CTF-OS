@@ -1,0 +1,37 @@
+name: Data submission validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate-data-submission:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate data-only PR paths
+        run: |
+          case "${{ github.head_ref }}" in
+            data/*)
+              python3 tools/validate_data_submission.py \
+                --base "${{ github.event.pull_request.base.sha }}" \
+                --head "${{ github.event.pull_request.head.sha }}"
+              ;;
+            *)
+              echo "Non-data branch; treating this as an owner/framework PR."
+              echo "Team runner submissions must use data/<github-user>/<challenge-or-run-id> branches."
+              ;;
+          esac

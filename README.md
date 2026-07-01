@@ -30,20 +30,27 @@ git clone git@github.com:whatevertakes/ctf_workspace.git
 cd ctf_workspace
 ```
 
-Create a local Python environment:
+Run the WSL2 bootstrap:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install requests httpx aiohttp beautifulsoup4 lxml flask jinja2 pwntools sqlmap defusedxml PyYAML capstone pefile unicorn
+tools/bootstrap_wsl2.sh
 ```
 
-Install system tools with commands, not vendored dependencies:
+This installs the baseline Ubuntu packages, creates `.venv`, installs
+`requirements.txt`, rewrites local Codex absolute paths in `.codex/config.toml`,
+and runs the preflight check. See [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md) for
+the detailed team setup flow.
+
+If you need to install pieces manually, use commands and package managers, not
+vendored dependencies:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git bash python3 python3-venv python3-pip build-essential gdb docker.io gcc-avr binutils-avr avr-libc
+sudo apt-get install -y bash binutils binutils-avr build-essential ca-certificates curl docker.io file gdb gcc-avr git jq libffi-dev libssl-dev netcat-openbsd nodejs npm pkg-config python3 python3-pip python3-venv unzip xz-utils avr-libc
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
 ```
 
 Validate the workspace:
@@ -156,3 +163,12 @@ git push -u origin data/<github-user>/<benchmark-id>/<run-id>
 Open a pull request to `main`, or attach the same sanitized files to a GitHub
 issue when direct branch push is not available. The owner validates and merges
 accepted data.
+
+Before opening a pull request, run:
+
+```bash
+python3 tools/validate_data_submission.py --base origin/main
+```
+
+See [docs/TEAM_DATA_WORKFLOW.md](docs/TEAM_DATA_WORKFLOW.md) for the full
+data-only submission flow.
