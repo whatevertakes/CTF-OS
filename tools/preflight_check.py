@@ -20,6 +20,7 @@ REQUIRED_PATHS = (
     "AGENTS.md",
     ".codex/env.sh",
     ".codex/config.toml",
+    ".codex/config.toml.template",
     ".codex/bin/r2mcp-codex.sh",
     ".codex/bin/searchsploit",
     ".codex/bin/tplmap",
@@ -80,6 +81,8 @@ REQUIRED_PATHS = (
     "tools/regression_check.py",
     "tools/level3_orchestrator.py",
     "tools/level4_interface.py",
+    "tools/team_member_setup.sh",
+    "tools/validate_data_submission.py",
     "templates/challenge/state.json",
     "benchmarks/corpus.yaml",
     "benchmarks/level2_selftest.py",
@@ -121,6 +124,96 @@ OPTIONAL_COMMANDS = (
     "sage",
     "tshark",
 )
+
+DEEP_CATEGORY_COMMANDS = {
+    "crypto": (
+        ("z3", ("z3", "--version")),
+        ("fplll", ("fplll", "--version")),
+        ("pari-gp", ("gp", "--version")),
+    ),
+    "forensics": (
+        ("yara", ("yara", "--version")),
+        ("upx", ("upx", "--version")),
+        ("sleuthkit-fls", ("fls", "-V")),
+        ("volatility3", ("vol", "--help")),
+    ),
+    "malware": (
+        ("yara", ("yara", "--version")),
+        ("upx", ("upx", "--version")),
+        ("volatility3", ("vol", "--help")),
+    ),
+    "mobile": (
+        ("jadx", ("jadx", "--version")),
+        ("apktool", ("apktool", "--version")),
+    ),
+    "pwn": (
+        ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
+        ("qemu-user-aarch64", ("qemu-aarch64", "--version")),
+        ("qemu-system-x86_64", ("qemu-system-x86_64", "--version")),
+        ("qemu-system-arm", ("qemu-system-arm", "--version")),
+        ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
+    ),
+    "rev": (
+        ("yara", ("yara", "--version")),
+        ("upx", ("upx", "--version")),
+        ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
+        ("qemu-user-aarch64", ("qemu-aarch64", "--version")),
+        ("qemu-system-x86_64", ("qemu-system-x86_64", "--version")),
+        ("qemu-system-arm", ("qemu-system-arm", "--version")),
+        ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
+    ),
+    "misc": (
+        ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
+        ("qemu-user-aarch64", ("qemu-aarch64", "--version")),
+        ("qemu-system-x86_64", ("qemu-system-x86_64", "--version")),
+        ("qemu-system-arm", ("qemu-system-arm", "--version")),
+        ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
+    ),
+    "programming": (
+        ("z3", ("z3", "--version")),
+    ),
+    "web3": (
+        ("forge", ("forge", "--version")),
+        ("cast", ("cast", "--version")),
+        ("anvil", ("anvil", "--version")),
+        ("slither", ("slither", "--version")),
+    ),
+    "cloud": (
+        ("trivy", ("trivy", "--version")),
+        ("syft", ("syft", "version")),
+        ("grype", ("grype", "version")),
+        ("crane", ("crane", "version")),
+        ("skopeo", ("skopeo", "--version")),
+    ),
+    "container": (
+        ("trivy", ("trivy", "--version")),
+        ("syft", ("syft", "version")),
+        ("grype", ("grype", "version")),
+        ("crane", ("crane", "version")),
+        ("skopeo", ("skopeo", "--version")),
+    ),
+}
+
+DEEP_CATEGORY_MODULES = {
+    "crypto": (
+        ("z3-solver", "z3"),
+        ("fpylll", "fpylll"),
+    ),
+    "forensics": (
+        ("yara-python", "yara"),
+        ("volatility3", "volatility3"),
+    ),
+    "malware": (
+        ("yara-python", "yara"),
+        ("volatility3", "volatility3"),
+    ),
+    "programming": (
+        ("z3-solver", "z3"),
+    ),
+    "web3": (
+        ("slither-analyzer", "slither"),
+    ),
+}
 
 PYTHON_MODULES = (
     ("requests", "requests"),
@@ -265,6 +358,56 @@ def check_avr_toolchain(reporter: Reporter) -> None:
         reporter.pass_("dependency avr toolchain")
 
 
+def normalize_category(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def command_version_line(command: tuple[str, ...]) -> tuple[bool, str]:
+    result = run(list(command))
+    if result.returncode != 0:
+        reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "version check failed"
+        return False, reason
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return True, lines[0].strip() if lines else "version check passed"
+
+
+def check_deep_category_tools(reporter: Reporter, category: str | None) -> None:
+    normalized = normalize_category(category)
+    if not normalized:
+        reporter.warn("deep category checks skipped: --category is required with --deep")
+        return
+
+    commands = DEEP_CATEGORY_COMMANDS.get(normalized, ())
+    modules = DEEP_CATEGORY_MODULES.get(normalized, ())
+    if not commands and not modules:
+        reporter.warn(f"deep category checks have no configured tool profile for {normalized}")
+        return
+
+    for label, command in commands:
+        executable = command[0]
+        if shutil.which(executable):
+            ok, detail = command_version_line(command)
+            if ok:
+                reporter.pass_(f"deep optional command {label}: {detail}")
+            else:
+                reporter.warn(f"deep optional command check failed {label}: {detail}")
+        else:
+            reporter.warn(f"deep optional command unavailable {label}")
+
+    if not VENV_PYTHON.is_file():
+        if modules:
+            reporter.warn(f"deep python modules skipped for {normalized}: missing virtualenv python")
+        return
+
+    for package, module in modules:
+        result = run([str(VENV_PYTHON), "-c", f"import {module}"])
+        if result.returncode == 0:
+            reporter.pass_(f"deep python module {package}")
+        else:
+            reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "import failed"
+            reporter.warn(f"deep optional python module unavailable {package}: {reason}")
+
+
 def check_python_modules(reporter: Reporter) -> None:
     if not VENV_PYTHON.is_file():
         reporter.fail(f"missing virtualenv python {VENV_PYTHON.relative_to(ROOT)}")
@@ -367,6 +510,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="treat optional command-line tooling as required",
     )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="run opt-in category-specific advanced tool availability checks",
+    )
     return parser.parse_args()
 
 
@@ -379,6 +527,8 @@ def main() -> int:
     check_commands(reporter, strict_optional=args.strict_optional)
     if requires_avr_toolchain(args.category, args.tag):
         check_avr_toolchain(reporter)
+    if args.deep:
+        check_deep_category_tools(reporter, args.category)
     check_python_modules(reporter)
     check_config(reporter)
     check_runtime_environment(reporter)

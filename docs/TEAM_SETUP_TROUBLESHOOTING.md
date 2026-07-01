@@ -19,6 +19,18 @@ tools/repair_team_setup.sh
 - 엄격한 설정 검증을 다시 실행합니다.
 - `codex mcp list`를 출력합니다.
 
+팀원 브랜치에서 처음 설정하거나 전체 검증을 다시 돌릴 때는 다음을 사용합니다.
+
+```bash
+tools/team_member_setup.sh
+```
+
+고급 CTF 도구 프로필까지 확인하려면:
+
+```bash
+tools/team_member_setup.sh --deep
+```
+
 예상 성공 표시:
 
 ```text

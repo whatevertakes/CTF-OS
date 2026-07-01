@@ -21,39 +21,47 @@ git switch --track origin/<github-user>
 
 현재 팀 브랜치는 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`입니다.
 
-## 부트스트랩
+## 팀원용 설정
 
-저장소 루트에서 부트스트랩 스크립트를 실행합니다.
+저장소 루트에서 팀원용 설정 스크립트를 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh
+tools/team_member_setup.sh
 ```
 
-이 스크립트는 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP, 리버싱 도구 표면을
-설치하고, `.venv`를 생성하며, `requirements.txt`를 설치합니다. 또한
+이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP,
+리버싱 도구 표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
 `.codex/config.toml`을 생성하고 다음 검증을 실행합니다.
 
 ```bash
 python3 tools/preflight_check.py --strict-optional
+python3 tools/check_team_parity.py
+codex mcp list
+```
+
+고급 CTF 카테고리별 도구 프로필까지 검수하려면 다음을 사용합니다.
+
+```bash
+tools/team_member_setup.sh --deep
 ```
 
 시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-apt
+tools/team_member_setup.sh --skip-apt
 ```
 
 Python dependency가 이미 설치되어 있다면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-python
+tools/team_member_setup.sh --skip-python
 ```
 
 전체 parity 툴체인 없이 가벼운 baseline만 맞추려면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --minimal
+tools/team_member_setup.sh --minimal
 ```
 
 ## Docker

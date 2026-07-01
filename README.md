@@ -29,16 +29,17 @@ git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
 cd <workspace-dir>
 ```
 
-WSL2 부트스트랩을 실행합니다.
+팀원은 자기 브랜치에서 팀원용 설정 스크립트를 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh
+tools/team_member_setup.sh
 ```
 
-이 스크립트는 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP, 리버싱 도구 표면을
-설치하고, `.venv`를 생성하며, `requirements.txt`를 설치합니다. 또한
+이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP,
+리버싱 도구 표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
-`.codex/config.toml`을 생성하고 엄격한 사전 점검을 실행합니다. 자세한 팀 설정
+`.codex/config.toml`을 생성하고, strict preflight, team parity, `codex mcp
+list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 팀 설정
 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를 참조하세요.
 
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
@@ -188,6 +189,7 @@ jiwoongchoi-norun
 ```bash
 git fetch origin
 git switch --track origin/<github-user>
+tools/team_member_setup.sh
 ```
 
 `main` 업데이트를 자기 브랜치에 반영하려면:

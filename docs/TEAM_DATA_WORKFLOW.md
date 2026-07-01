@@ -20,6 +20,7 @@ jiwoongchoi-norun
 ```bash
 git fetch origin
 git switch --track origin/<github-user>
+tools/team_member_setup.sh
 ```
 
 `main` 업데이트를 자기 브랜치에 반영하려면 다음을 실행합니다.
