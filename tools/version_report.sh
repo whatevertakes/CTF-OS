@@ -93,4 +93,4 @@ codex mcp list
 
 echo "== final checks =="
 python3 tools/preflight_check.py --strict-optional | tail -5
-python3 tools/check_team_parity.py | tail -5
+python3 tools/check_team_parity.py

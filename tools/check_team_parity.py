@@ -68,6 +68,53 @@ def check_command(command: str) -> int:
     return 1
 
 
+def check_docker_runtime() -> int:
+    failures = 0
+    info = subprocess.run(
+        ["docker", "info", "--format", "{{.ServerVersion}}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    if info.returncode == 0:
+        print(f"PASS docker daemon: server {info.stdout.strip()}")
+    else:
+        reason = info.stderr.strip().splitlines()[-1] if info.stderr.strip() else "docker info failed"
+        print(f"FAIL docker daemon: {reason}")
+        return 1
+
+    mounted_file = "tools/version_report.sh"
+    run = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{ROOT}:/workspace:ro",
+            "-w",
+            "/workspace",
+            "busybox:latest",
+            "sh",
+            "-c",
+            f"test -f {mounted_file}",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if run.returncode == 0:
+        print("PASS docker run workspace mount")
+    else:
+        reason = run.stderr.strip().splitlines()[-1] if run.stderr.strip() else "container run failed"
+        print(f"FAIL docker run workspace mount: {reason}")
+        failures += 1
+    return failures
+
+
 def check_r2mcp() -> int:
     for candidate in r2mcp_candidates():
         if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -100,6 +147,8 @@ def main() -> int:
     failures = 0
     for command in COMMANDS:
         failures += check_command(command)
+    if shutil.which("docker"):
+        failures += check_docker_runtime()
     failures += check_r2mcp()
     for package, module in PYTHON_MODULES:
         failures += check_python_module(package, module)
