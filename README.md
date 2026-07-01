@@ -172,24 +172,47 @@ local virtualenvs, caches, node_modules, or build output
 
 ## Git 워크플로
 
-표준 저장소는 소유자가 관리합니다. 러너는 `main`에 push하지 않아야 합니다.
+표준 저장소의 `main`은 소유자 `jiwoongchoi-norun`만 push합니다. 팀원은 자기
+이름의 고정 브랜치에만 commit/push합니다.
 
-데이터 브랜치나 fork 브랜치를 사용합니다.
+팀 브랜치:
+
+```text
+shyunseok1029
+holymo-ly
+jiwoongchoi-norun
+```
+
+처음 클론한 뒤 자기 브랜치를 체크아웃합니다.
 
 ```bash
-git switch -c data/<github-user>/<benchmark-id>/<run-id>
+git fetch origin
+git switch --track origin/<github-user>
+```
+
+`main` 업데이트를 자기 브랜치에 반영하려면:
+
+```bash
+git fetch origin
+git switch <github-user>
+git merge origin/main
+```
+
+제출할 때는 승인된 데이터 파일만 commit하고 자기 브랜치로 push합니다.
+
+```bash
 git add benchmarks/*_SANITIZED_BENCHMARK_REPORT.md \
   challenges/<event>/<category>/<challenge>/state.json \
   challenges/<event>/<category>/<challenge>/notes.md \
   challenges/<event>/<category>/<challenge>/replay.sh \
   challenges/<event>/<category>/<challenge>/evidence/*.summary.md
 git commit -m "submit benchmark data for <benchmark-id>"
-git push -u origin data/<github-user>/<benchmark-id>/<run-id>
+git push origin HEAD:<github-user>
 ```
 
-`main`으로 pull request를 열거나, 직접 브랜치 push가 불가능한 경우 동일한
-정제 파일을 GitHub issue에 첨부합니다. 소유자가 데이터를 검증하고 승인된
-데이터를 병합합니다.
+자기 브랜치에서 `main`으로 pull request를 엽니다. 직접 브랜치 push가
+불가능한 경우 동일한 정제 파일을 GitHub issue에 첨부합니다. 소유자가 데이터를
+검증하고 승인된 데이터만 `main`에 병합합니다.
 
 pull request를 열기 전에 다음을 실행합니다.
 

@@ -11,11 +11,15 @@ git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
 cd <workspace-dir>
 ```
 
-챌린지 출력 작업은 `main`에서 직접 하지 않습니다. 데이터 브랜치를 사용하세요.
+챌린지 출력 작업은 `main`에서 직접 하지 않습니다. 클론 직후 자기 팀 브랜치로
+전환하세요.
 
 ```bash
-git switch -c data/<github-user>/<challenge-or-run-id>
+git fetch origin
+git switch --track origin/<github-user>
 ```
+
+현재 팀 브랜치는 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`입니다.
 
 ## 부트스트랩
 
