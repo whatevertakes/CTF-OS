@@ -237,6 +237,13 @@ text = re.sub(
     text,
     count=1,
 )
+angr_env = 'env = { FASTMCP_SHOW_SERVER_BANNER = "false", FASTMCP_LOG_LEVEL = "ERROR" }'
+if "[mcp_servers.angr]" in text and "FASTMCP_SHOW_SERVER_BANNER" not in text:
+    text = text.replace(
+        'args = ["--transport", "stdio"]\n\n[mcp_servers.playwright]',
+        f'args = ["--transport", "stdio"]\n{angr_env}\n\n[mcp_servers.playwright]',
+        1,
+    )
 config.write_text(text, encoding="utf-8")
 PY
 
