@@ -36,10 +36,10 @@ Run the WSL2 bootstrap:
 tools/bootstrap_wsl2.sh
 ```
 
-This installs the baseline Ubuntu packages, creates `.venv`, installs
-`requirements.txt`, rewrites local Codex absolute paths in `.codex/config.toml`,
-and runs the preflight check. See [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md) for
-the detailed team setup flow.
+This installs the team-parity Ubuntu, Python, Ruby, MCP, and reversing tool
+surface, creates `.venv`, installs `requirements.txt`, rewrites local Codex
+absolute paths in `.codex/config.toml`, and runs the strict preflight check. See
+[docs/SETUP_WSL2.md](docs/SETUP_WSL2.md) for the detailed team setup flow.
 
 If you need to install pieces manually, use commands and package managers, not
 vendored dependencies:
@@ -57,6 +57,8 @@ Validate the workspace:
 
 ```bash
 python3 tools/preflight_check.py
+python3 tools/preflight_check.py --strict-optional
+python3 tools/check_team_parity.py
 python3 tools/evaluate_corpus.py
 ```
 

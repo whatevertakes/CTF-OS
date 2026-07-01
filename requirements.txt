@@ -9,6 +9,8 @@ pwntools
 sqlmap
 defusedxml
 PyYAML
+angr
 capstone
 pefile
+ropper
 unicorn

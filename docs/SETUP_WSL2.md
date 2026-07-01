@@ -25,12 +25,12 @@ Run the bootstrap script from the repository root:
 tools/bootstrap_wsl2.sh
 ```
 
-The script installs baseline Ubuntu packages, creates `.venv`, installs
-`requirements.txt`, rewrites `.codex/config.toml` absolute paths for the local
-clone, and runs:
+The script installs the team-parity Ubuntu, Python, Ruby, MCP, and reversing
+tool surface, creates `.venv`, installs `requirements.txt`, rewrites
+`.codex/config.toml` absolute paths for the local clone, and runs:
 
 ```bash
-python3 tools/preflight_check.py
+python3 tools/preflight_check.py --strict-optional
 ```
 
 If system packages are already managed separately:
@@ -43,6 +43,12 @@ If Python dependencies are already installed:
 
 ```bash
 tools/bootstrap_wsl2.sh --skip-python
+```
+
+For a lightweight baseline only, without the full parity toolchain:
+
+```bash
+tools/bootstrap_wsl2.sh --minimal
 ```
 
 ## Docker
@@ -63,9 +69,12 @@ python3 tools/preflight_check.py
 
 ## Expected Output
 
-`tools/preflight_check.py` should end with zero failures. Warnings for optional
-specialized tools are acceptable during stage 1 unless a specific challenge
-records that dependency as required.
+`tools/preflight_check.py --strict-optional` should end with zero failures. The
+team parity check should also pass:
+
+```bash
+python3 tools/check_team_parity.py
+```
 
 ## Data Goal
 
