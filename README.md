@@ -22,11 +22,11 @@
 
 ## 클론 및 설정
 
-로컬에서도 동일한 저장소 레이아웃을 사용합니다.
+원하는 로컬 경로에 클론하되, 저장소 안의 레이아웃은 동일하게 유지합니다.
 
 ```bash
-git clone git@github.com:whatevertakes/ctf_workspace.git
-cd ctf_workspace
+git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
+cd <workspace-dir>
 ```
 
 WSL2 부트스트랩을 실행합니다.
@@ -37,9 +37,9 @@ tools/bootstrap_wsl2.sh
 
 이 스크립트는 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP, 리버싱 도구 표면을
 설치하고, `.venv`를 생성하며, `requirements.txt`를 설치합니다. 또한
-`.codex/config.toml`의 로컬 Codex 절대 경로를 다시 쓰고 엄격한 사전 점검을
-실행합니다. 자세한 팀 설정 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를
-참조하세요.
+`.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
+`.codex/config.toml`을 생성하고 엄격한 사전 점검을 실행합니다. 자세한 팀 설정
+흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를 참조하세요.
 
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
 실행하세요.

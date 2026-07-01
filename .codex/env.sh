@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 
-if [ -z "${CTF_WORKSPACE_ROOT:-}" ]; then
-  _codex_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  export CTF_WORKSPACE_ROOT="$(cd "$_codex_env_dir/.." && pwd)"
-else
-  export CTF_WORKSPACE_ROOT
-fi
+_codex_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CTF_WORKSPACE_ROOT="$(cd "$_codex_env_dir/.." && pwd)"
 export XDG_CACHE_HOME="$CTF_WORKSPACE_ROOT/.cache/xdg"
 export MPLCONFIGDIR="$CTF_WORKSPACE_ROOT/.cache/matplotlib"
 export NUMBA_CACHE_DIR="$CTF_WORKSPACE_ROOT/.cache/numba"

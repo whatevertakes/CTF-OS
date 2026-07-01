@@ -44,17 +44,17 @@ APKTOOL_VERSION="3.0.2"
 
 usage() {
   cat <<'EOF'
-Usage: tools/bootstrap_wsl2.sh [--minimal] [--skip-apt] [--skip-python] [--skip-preflight]
+사용법: tools/bootstrap_wsl2.sh [--minimal] [--skip-apt] [--skip-python] [--skip-preflight]
 
-Bootstraps a team-parity WSL2 CTF workspace:
-  - installs baseline Ubuntu packages
-  - installs optional CTF parity tools when available
-  - creates .venv
-  - installs requirements.txt
-  - rewrites .codex/config.toml absolute paths for this clone
-  - runs tools/preflight_check.py --strict-optional
+팀 기준 WSL2 CTF 워크스페이스를 설정합니다.
+  - 기본 Ubuntu 패키지 설치
+  - 사용 가능한 CTF parity 도구 설치
+  - .venv 생성
+  - requirements.txt 설치
+  - 현재 클론 경로에 맞는 .codex/config.toml 생성
+  - tools/preflight_check.py --strict-optional 실행
 
-Use --minimal to skip heavyweight parity tools and run the baseline preflight.
+무거운 parity 도구를 건너뛰고 기본 점검만 하려면 --minimal을 사용하세요.
 EOF
 }
 
@@ -73,7 +73,7 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     *)
-      echo "unknown argument: $1" >&2
+      echo "알 수 없는 인자: $1" >&2
       usage >&2
       exit 2
       ;;
@@ -92,7 +92,7 @@ install_available_apt_packages() {
     if apt_package_available "$package"; then
       packages+=("$package")
     else
-      echo "WARN apt package unavailable: $package" >&2
+      echo "WARN apt 패키지를 사용할 수 없습니다: $package" >&2
     fi
   done
   if [ "${#packages[@]}" -gt 0 ]; then
@@ -158,7 +158,7 @@ install_team_parity_tools() {
       sudo gem install seccomp-tools
     fi
   else
-    echo "WARN gem unavailable; one_gadget and seccomp-tools were not installed" >&2
+    echo "WARN gem을 사용할 수 없어 one_gadget과 seccomp-tools를 설치하지 못했습니다." >&2
   fi
 
   install_jadx_fallback
@@ -168,7 +168,7 @@ install_team_parity_tools() {
 
 if [ "$SKIP_APT" -eq 0 ]; then
   if ! command -v apt-get >/dev/null 2>&1; then
-    echo "apt-get is required for the default WSL2 bootstrap; rerun with --skip-apt to manage packages yourself." >&2
+    echo "기본 WSL2 부트스트랩에는 apt-get이 필요합니다. 패키지를 직접 관리하려면 --skip-apt로 다시 실행하세요." >&2
     exit 1
   fi
   sudo apt-get update
@@ -195,57 +195,11 @@ if [ "$TEAM_PARITY" -eq 1 ]; then
   install_team_parity_tools
 fi
 
-"$ROOT/.venv/bin/python" - "$ROOT" <<'PY'
-from __future__ import annotations
-
-import re
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1]).resolve()
-config = root / ".codex" / "config.toml"
-text = config.read_text(encoding="utf-8")
-
-env_values = {
-    "BASH_ENV": root / ".codex" / "env.sh",
-    "CTF_WORKSPACE_ROOT": root,
-    "XDG_CACHE_HOME": root / ".cache" / "xdg",
-    "MPLCONFIGDIR": root / ".cache" / "matplotlib",
-    "NUMBA_CACHE_DIR": root / ".cache" / "numba",
-    "PIP_CACHE_DIR": root / ".cache" / "pip",
-    "UV_CACHE_DIR": root / ".cache" / "uv",
-    "NPM_CONFIG_CACHE": root / ".cache" / "npm",
-    "PYTHONPYCACHEPREFIX": root / ".cache" / "python-pycache",
-}
-env_line = "set = { " + ", ".join(f'{key} = "{value}"' for key, value in env_values.items()) + " }"
-
-text = re.sub(
-    r"(?m)^set = \{ .* \}$",
-    env_line,
-    text,
-    count=1,
-)
-text = re.sub(
-    r'(?m)^\[projects\."[^"]+"\]$',
-    f'[projects."{root}"]',
-    text,
-    count=1,
-)
-text = re.sub(
-    r'(?m)^command = ".*?/\.codex/bin/r2mcp-codex\.sh"$',
-    f'command = "{root / ".codex" / "bin" / "r2mcp-codex.sh"}"',
-    text,
-    count=1,
-)
-angr_env = 'env = { FASTMCP_SHOW_SERVER_BANNER = "false", FASTMCP_LOG_LEVEL = "ERROR" }'
-if "[mcp_servers.angr]" in text and "FASTMCP_SHOW_SERVER_BANNER" not in text:
-    text = text.replace(
-        'args = ["--transport", "stdio"]\n\n[mcp_servers.playwright]',
-        f'args = ["--transport", "stdio"]\n{angr_env}\n\n[mcp_servers.playwright]',
-        1,
-    )
-config.write_text(text, encoding="utf-8")
-PY
+CONFIG_PYTHON="$ROOT/.venv/bin/python"
+if [ ! -x "$CONFIG_PYTHON" ]; then
+  CONFIG_PYTHON="$PYTHON"
+fi
+"$CONFIG_PYTHON" "$ROOT/tools/localize_codex_config.py" --root "$ROOT"
 
 if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
   # shellcheck disable=SC1091
@@ -259,13 +213,13 @@ fi
 
 cat <<EOF
 
-Bootstrap complete.
-Workspace: $ROOT
+부트스트랩 완료.
+워크스페이스: $ROOT
 
-For new shells:
+새 셸에서는 다음을 실행하세요.
   cd "$ROOT"
   . .codex/env.sh
 
-If Docker reports permission errors, add your WSL2 user to the docker group and restart the shell:
+Docker 권한 오류가 나면 WSL2 사용자를 docker 그룹에 추가하고 셸을 다시 시작하세요.
   sudo usermod -aG docker "\$USER"
 EOF

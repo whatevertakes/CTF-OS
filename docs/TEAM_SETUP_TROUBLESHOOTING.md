@@ -1,33 +1,32 @@
-# Team Setup Troubleshooting
+# 팀 설정 문제 해결
 
-Use this page when a team member has already cloned the repo but setup or MCP
-does not behave like the owner environment.
+팀원이 저장소를 이미 클론했지만 설정이나 MCP가 소유자 환경처럼 동작하지 않을
+때 이 문서를 사용합니다.
 
-## One Command Repair
+## 한 번에 복구
 
-From the repo root:
+저장소 루트에서 실행합니다.
 
 ```bash
-cd ~/ctf_workspace
 tools/repair_team_setup.sh
 ```
 
-This command:
+이 명령은 다음 작업을 수행합니다.
 
-- restores local `.codex/config.toml` if a failed MCP experiment changed it
-- pulls the latest `main`
-- rewrites `.codex/config.toml` for the local clone path
-- reruns strict setup checks
-- prints `codex mcp list`
+- 이전 tracked `.codex/config.toml` 변경이 pull을 막는 경우 되돌립니다.
+- 최신 `main`을 가져옵니다.
+- 현재 클론 경로에 맞는 로컬 `.codex/config.toml`을 다시 생성합니다.
+- 엄격한 설정 검증을 다시 실행합니다.
+- `codex mcp list`를 출력합니다.
 
-Expected success markers:
+예상 성공 표시:
 
 ```text
 summary failures=0 warnings=0
 team parity summary failures=0
 ```
 
-`codex mcp list` should include:
+`codex mcp list`에는 다음 서버가 포함되어야 합니다.
 
 ```text
 angr
@@ -35,18 +34,18 @@ playwright
 radare2
 ```
 
-`Auth Unsupported` is normal for these local stdio MCP servers.
+이 로컬 stdio MCP 서버에서 `Auth Unsupported`가 표시되는 것은 정상입니다.
 
-## Version Report
+## 버전 보고서
 
-For a clean version report, do not paste long manual command blocks. Run:
+깔끔한 버전 보고서를 보려면 긴 수동 명령 블록을 붙여넣지 말고 다음을
+실행합니다.
 
 ```bash
-cd ~/ctf_workspace
 tools/version_report.sh
 ```
 
-Expected final section:
+예상되는 마지막 섹션:
 
 ```text
 == final checks ==
@@ -54,23 +53,22 @@ summary failures=0 warnings=0
 team parity summary failures=0
 ```
 
-## Start Codex
+## Codex 시작
 
-After repair succeeds, start a new Codex session from the repo root:
+복구가 성공하면 저장소 루트에서 새 Codex 세션을 시작합니다.
 
 ```bash
-cd ~/ctf_workspace
 . .codex/env.sh
 codex
 ```
 
-Inside Codex, run:
+Codex 안에서 다음을 실행합니다.
 
 ```text
 /mcp
 ```
 
-Expected MCP servers:
+예상 MCP 서버:
 
 ```text
 angr
@@ -78,45 +76,43 @@ playwright
 radare2
 ```
 
-## Common Errors
+## 흔한 오류
 
 ### `.codex/config.toml would be overwritten by merge`
 
-Run:
+다음을 실행합니다.
 
 ```bash
-cd ~/ctf_workspace
 tools/repair_team_setup.sh
 ```
 
-The repair script intentionally restores local `.codex/config.toml` before
-pulling. Challenge data should not be stored in `.codex/config.toml`.
+복구 스크립트는 필요한 경우 pull 전에 이전 tracked `.codex/config.toml` 변경을
+되돌립니다. 챌린지 데이터는 `.codex/config.toml`에 저장하지 않습니다.
 
 ### `MCP client for angr failed to start`
 
-Run:
+다음을 실행합니다.
 
 ```bash
-cd ~/ctf_workspace
 git pull origin main
 tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
 ```
 
-The current `main` suppresses the FastMCP startup banner for `angr-mcp`; without
-that env setting, stdio handshaking can fail.
+현재 `main`은 `angr-mcp`의 FastMCP 시작 배너를 억제합니다. 이 env 설정이
+없으면 stdio handshaking이 실패할 수 있습니다.
 
 ### `. .codex/env.sh` prints nothing
 
-That is normal. The command updates the current shell environment. Confirm with:
+정상입니다. 이 명령은 현재 셸 환경을 갱신합니다. 다음으로 확인하세요.
 
 ```bash
 echo "$CTF_WORKSPACE_ROOT"
 which angr-mcp
 ```
 
-Expected shape:
+예상 형태:
 
 ```text
-/home/<user>/ctf_workspace
-/home/<user>/ctf_workspace/.venv/bin/angr-mcp
+/path/to/<workspace-dir>
+/path/to/<workspace-dir>/.venv/bin/angr-mcp
 ```

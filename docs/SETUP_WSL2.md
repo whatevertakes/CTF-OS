@@ -1,51 +1,52 @@
-# WSL2 Setup
+# WSL2 설정
 
-This is the stage 1 setup path for team members running Codex on Ubuntu WSL2.
-It installs only the baseline dependencies needed to collect reproducible CTF
-solve data for later Level 3 design work.
+이 문서는 Ubuntu WSL2에서 Codex를 실행하는 팀원을 위한 1단계 설정 절차입니다.
+이 단계는 이후 Level 3 설계 작업에 사용할 재현 가능한 CTF 풀이 데이터를
+수집하는 데 필요한 기본 dependency만 설치합니다.
 
-## Clone
+## 클론
 
 ```bash
-git clone git@github.com:whatevertakes/ctf_workspace.git
-cd ctf_workspace
+git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
+cd <workspace-dir>
 ```
 
-Do not work directly on `main`. Use a data branch for challenge outputs:
+챌린지 출력 작업은 `main`에서 직접 하지 않습니다. 데이터 브랜치를 사용하세요.
 
 ```bash
 git switch -c data/<github-user>/<challenge-or-run-id>
 ```
 
-## Bootstrap
+## 부트스트랩
 
-Run the bootstrap script from the repository root:
+저장소 루트에서 부트스트랩 스크립트를 실행합니다.
 
 ```bash
 tools/bootstrap_wsl2.sh
 ```
 
-The script installs the team-parity Ubuntu, Python, Ruby, MCP, and reversing
-tool surface, creates `.venv`, installs `requirements.txt`, rewrites
-`.codex/config.toml` absolute paths for the local clone, and runs:
+이 스크립트는 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP, 리버싱 도구 표면을
+설치하고, `.venv`를 생성하며, `requirements.txt`를 설치합니다. 또한
+`.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
+`.codex/config.toml`을 생성하고 다음 검증을 실행합니다.
 
 ```bash
 python3 tools/preflight_check.py --strict-optional
 ```
 
-If system packages are already managed separately:
+시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
 ```bash
 tools/bootstrap_wsl2.sh --skip-apt
 ```
 
-If Python dependencies are already installed:
+Python dependency가 이미 설치되어 있다면 다음을 사용합니다.
 
 ```bash
 tools/bootstrap_wsl2.sh --skip-python
 ```
 
-For a lightweight baseline only, without the full parity toolchain:
+전체 parity 툴체인 없이 가벼운 baseline만 맞추려면 다음을 사용합니다.
 
 ```bash
 tools/bootstrap_wsl2.sh --minimal
@@ -53,33 +54,33 @@ tools/bootstrap_wsl2.sh --minimal
 
 ## Docker
 
-Docker is part of the baseline because many challenge replays depend on local
-service topology. If `docker info` fails with a permission error after install:
+많은 챌린지 replay가 로컬 서비스 topology에 의존하므로 Docker는 baseline에
+포함됩니다. 설치 후 `docker info`가 권한 오류로 실패하면 다음을 실행합니다.
 
 ```bash
 sudo usermod -aG docker "$USER"
 ```
 
-Then restart the WSL2 shell and rerun:
+이후 WSL2 셸을 다시 시작하고 다음을 다시 실행합니다.
 
 ```bash
 . .codex/env.sh
 python3 tools/preflight_check.py
 ```
 
-## Expected Output
+## 예상 출력
 
-`tools/preflight_check.py --strict-optional` should end with zero failures. The
-team parity check should also pass:
+`tools/preflight_check.py --strict-optional`은 failure 없이 끝나야 합니다. 팀
+parity 검증도 통과해야 합니다.
 
 ```bash
 python3 tools/check_team_parity.py
 ```
 
-## Data Goal
+## 데이터 목표
 
-Stage 1 does not ask runners to change framework files. The goal is only to
-make every runner produce comparable challenge data:
+1단계에서는 러너에게 프레임워크 파일 수정을 요구하지 않습니다. 목표는 모든
+러너가 비교 가능한 챌린지 데이터를 생성하도록 만드는 것입니다.
 
 ```text
 challenges/<event>/<category>/<challenge>/state.json

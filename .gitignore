@@ -1,4 +1,5 @@
 .cache/
+.codex/config.toml
 .codex/tmp/
 .codex/state/
 pyghidra_mcp_projects/

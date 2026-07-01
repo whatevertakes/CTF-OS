@@ -11,9 +11,9 @@ shell_snapshot = true
 hooks = true
 
 [shell_environment_policy]
-set = { BASH_ENV = "/home/choijiwng/02_ctf_workspace/.codex/env.sh", CTF_WORKSPACE_ROOT = "/home/choijiwng/02_ctf_workspace", XDG_CACHE_HOME = "/home/choijiwng/02_ctf_workspace/.cache/xdg", MPLCONFIGDIR = "/home/choijiwng/02_ctf_workspace/.cache/matplotlib", NUMBA_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/numba", PIP_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/pip", UV_CACHE_DIR = "/home/choijiwng/02_ctf_workspace/.cache/uv", NPM_CONFIG_CACHE = "/home/choijiwng/02_ctf_workspace/.cache/npm", PYTHONPYCACHEPREFIX = "/home/choijiwng/02_ctf_workspace/.cache/python-pycache" }
+set = { BASH_ENV = "__CTF_WORKSPACE_ROOT__/.codex/env.sh", CTF_WORKSPACE_ROOT = "__CTF_WORKSPACE_ROOT__", XDG_CACHE_HOME = "__CTF_WORKSPACE_ROOT__/.cache/xdg", MPLCONFIGDIR = "__CTF_WORKSPACE_ROOT__/.cache/matplotlib", NUMBA_CACHE_DIR = "__CTF_WORKSPACE_ROOT__/.cache/numba", PIP_CACHE_DIR = "__CTF_WORKSPACE_ROOT__/.cache/pip", UV_CACHE_DIR = "__CTF_WORKSPACE_ROOT__/.cache/uv", NPM_CONFIG_CACHE = "__CTF_WORKSPACE_ROOT__/.cache/npm", PYTHONPYCACHEPREFIX = "__CTF_WORKSPACE_ROOT__/.cache/python-pycache" }
 
-[projects."/home/choijiwng/02_ctf_workspace"]
+[projects."__CTF_WORKSPACE_ROOT__"]
 trust_level = "trusted"
 
 [plugins."google-calendar@openai-curated"]
@@ -56,4 +56,4 @@ command = "npx"
 args = ["-y", "@playwright/mcp@0.0.75"]
 
 [mcp_servers.radare2]
-command = "/home/choijiwng/02_ctf_workspace/.codex/bin/r2mcp-codex.sh"
+command = "__CTF_WORKSPACE_ROOT__/.codex/bin/r2mcp-codex.sh"
