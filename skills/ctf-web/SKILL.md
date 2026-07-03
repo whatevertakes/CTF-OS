@@ -1,3 +1,8 @@
+---
+name: ctf-web
+description: Analyze web CTF targets through concrete requests, responses, client behavior, and server-side effects.
+---
+
 purpose: Analyze web CTF targets through concrete requests, responses, client behavior, and server-side effects.
 when_to_use:
 - The primary artifact is a web app, API, browser challenge, HTTP transcript, or URL.

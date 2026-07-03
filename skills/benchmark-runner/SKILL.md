@@ -1,3 +1,8 @@
+---
+name: benchmark-runner
+description: Run bounded workspace self-test benchmarks and Level 5 automation wrappers without adding solve capability.
+---
+
 purpose: Run bounded workspace self-test benchmarks and Level 5 automation wrappers without adding solve capability.
 when_to_use:
 - After changing Level 2 scripts, Level 3 orchestration, Level 4 interfaces, Level 5 automation wrappers, templates, registry, or proof behavior.

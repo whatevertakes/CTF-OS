@@ -1,3 +1,8 @@
+---
+name: ctf-cloud
+description: Analyze cloud CTF artifacts, IAM-like logic, service configs, metadata, and deployment paths within owned scope.
+---
+
 purpose: Analyze cloud CTF artifacts, IAM-like logic, service configs, metadata, and deployment paths within owned scope.
 when_to_use:
 - The challenge includes cloud configuration, identity policy, metadata, serverless, storage, or Kubernetes-adjacent clues.

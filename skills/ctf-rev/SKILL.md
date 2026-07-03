@@ -1,3 +1,8 @@
+---
+name: ctf-rev
+description: Extract behavior, constants, algorithms, and constraints from binaries or bytecode.
+---
+
 purpose: Extract behavior, constants, algorithms, and constraints from binaries or bytecode.
 when_to_use:
 - The main work is static or dynamic reverse engineering.

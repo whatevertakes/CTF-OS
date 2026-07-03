@@ -1,3 +1,8 @@
+---
+name: ctf-triage
+description: Create and route a challenge workspace with minimal state, notes, replay, evidence, dist, and work structure.
+---
+
 purpose: Create and route a challenge workspace with minimal state, notes, replay, evidence, dist, and work structure.
 when_to_use:
 - A new challenge needs a local directory and initial category selection.

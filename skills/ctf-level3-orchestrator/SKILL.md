@@ -1,3 +1,8 @@
+---
+name: ctf-level3-orchestrator
+description: Coordinate difficult CTF solves across bounded role-specific workers while preserving the Level 0-2 evidence contract.
+---
+
 purpose: Coordinate difficult CTF solves across bounded role-specific workers while preserving the Level 0-2 evidence contract.
 when_to_use:
 - A challenge has several plausible branches and a single linear solve loop is repeating negative probes.

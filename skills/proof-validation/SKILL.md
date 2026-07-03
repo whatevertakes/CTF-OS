@@ -1,3 +1,8 @@
+---
+name: proof-validation
+description: Check whether challenge state and evidence support the current claimed status.
+---
+
 purpose: Check whether challenge state and evidence support the current claimed status.
 when_to_use:
 - Before claiming solved.

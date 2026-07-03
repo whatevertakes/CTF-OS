@@ -1,3 +1,8 @@
+---
+name: ctf-container
+description: Analyze container, image, namespace, runtime, and Kubernetes CTF artifacts in local or owned environments.
+---
+
 purpose: Analyze container, image, namespace, runtime, and Kubernetes CTF artifacts in local or owned environments.
 when_to_use:
 - The challenge provides an image, Dockerfile, manifest, pod context, namespace clue, or local container service.

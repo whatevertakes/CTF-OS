@@ -1,3 +1,8 @@
+---
+name: ctf-jail
+description: Analyze sandbox, jail, blacklist, parser escape, and restricted execution challenges.
+---
+
 purpose: Analyze sandbox, jail, blacklist, parser escape, and restricted execution challenges.
 when_to_use:
 - The challenge constrains Python, shell, JavaScript, template engines, SQL, or another interpreter.

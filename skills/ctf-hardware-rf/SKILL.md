@@ -1,3 +1,8 @@
+---
+name: ctf-hardware-rf
+description: Analyze hardware, RF, SDR, signal, and physical-layer CTF artifacts from recorded evidence.
+---
+
 purpose: Analyze hardware, RF, SDR, signal, and physical-layer CTF artifacts from recorded evidence.
 when_to_use:
 - The challenge provides captures, traces, firmware, modulation clues, or hardware interaction notes.

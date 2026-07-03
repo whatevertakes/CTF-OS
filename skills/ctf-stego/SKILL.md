@@ -1,3 +1,8 @@
+---
+name: ctf-stego
+description: Analyze hidden data in images, audio, video, documents, and other carrier files.
+---
+
 purpose: Analyze hidden data in images, audio, video, documents, and other carrier files.
 when_to_use:
 - The challenge suggests steganography, metadata hiding, bit-plane tricks, or embedded payloads.

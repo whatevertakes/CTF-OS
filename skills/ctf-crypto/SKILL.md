@@ -1,3 +1,8 @@
+---
+name: ctf-crypto
+description: Solve cryptography challenges with explicit parameters, assumptions, scripts, and proof artifacts.
+---
+
 purpose: Solve cryptography challenges with explicit parameters, assumptions, scripts, and proof artifacts.
 when_to_use:
 - The challenge exposes ciphertext, keys, oracles, signatures, hashes, commitments, PRNG, or custom crypto.

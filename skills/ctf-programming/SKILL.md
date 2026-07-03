@@ -1,3 +1,8 @@
+---
+name: ctf-programming
+description: Solve programming and PPC challenges with small deterministic parsers, solvers, and input/output evidence.
+---
+
 purpose: Solve programming and PPC challenges with small deterministic parsers, solvers, and input/output evidence.
 when_to_use:
 - The challenge requires algorithmic solving, automation, parsing, or repeated remote interactions.

@@ -1,3 +1,8 @@
+---
+name: ctf-forensics
+description: Recover evidence from disk, memory, packet, archive, image, or log artifacts.
+---
+
 purpose: Recover evidence from disk, memory, packet, archive, image, or log artifacts.
 when_to_use:
 - The primary artifact requires carving, timeline work, metadata analysis, memory analysis, or packet reconstruction.

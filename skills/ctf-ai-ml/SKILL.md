@@ -1,3 +1,8 @@
+---
+name: ctf-ai-ml
+description: Analyze AI/ML security CTF tasks involving prompt injection, model behavior, agents, classifiers, or ML artifacts.
+---
+
 purpose: Analyze AI/ML security CTF tasks involving prompt injection, model behavior, agents, classifiers, or ML artifacts.
 when_to_use:
 - The challenge centers on prompts, model outputs, model files, embedding/search behavior, or agent tool use.

@@ -1,3 +1,8 @@
+---
+name: ctf-side-channel
+description: Analyze timing, power, cache, fault, and trace-based side-channel CTF artifacts.
+---
+
 purpose: Analyze timing, power, cache, fault, and trace-based side-channel CTF artifacts.
 when_to_use:
 - The challenge includes traces, timing data, repeated measurements, or leakage hypotheses.

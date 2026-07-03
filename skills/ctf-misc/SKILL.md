@@ -1,3 +1,8 @@
+---
+name: ctf-misc
+description: Route ambiguous or unconventional challenges while preserving evidence until a narrower category emerges.
+---
+
 purpose: Route ambiguous or unconventional challenges while preserving evidence until a narrower category emerges.
 when_to_use:
 - The category is unknown, mixed, puzzle-like, or not covered by a more specific skill.

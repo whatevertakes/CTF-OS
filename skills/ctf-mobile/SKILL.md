@@ -1,3 +1,8 @@
+---
+name: ctf-mobile
+description: Analyze mobile CTF artifacts such as APKs, IPAs, app data, and mobile protocol logic.
+---
+
 purpose: Analyze mobile CTF artifacts such as APKs, IPAs, app data, and mobile protocol logic.
 when_to_use:
 - The challenge provides a mobile package, app source, device artifact, or mobile API flow.

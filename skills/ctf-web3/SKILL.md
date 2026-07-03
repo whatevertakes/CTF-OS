@@ -1,3 +1,8 @@
+---
+name: ctf-web3
+description: Analyze blockchain and smart-contract CTF challenges through local state, transactions, bytecode, and proofs.
+---
+
 purpose: Analyze blockchain and smart-contract CTF challenges through local state, transactions, bytecode, and proofs.
 when_to_use:
 - The challenge includes contracts, bytecode, ABI, RPC, wallet state, transaction data, or on-chain puzzle logic.

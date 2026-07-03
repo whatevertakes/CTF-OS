@@ -1,3 +1,8 @@
+---
+name: ctf-osint
+description: Conduct OSINT-style CTF work with source citations, timestamps, and reproducible search paths.
+---
+
 purpose: Conduct OSINT-style CTF work with source citations, timestamps, and reproducible search paths.
 when_to_use:
 - The challenge depends on public information, archives, geolocation, usernames, domains, or historical pages.

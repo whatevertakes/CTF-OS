@@ -1,3 +1,8 @@
+---
+name: ctf-pwn
+description: Work native exploitation challenges from binary properties to a replayable exploit or proof command.
+---
+
 purpose: Work native exploitation challenges from binary properties to a replayable exploit or proof command.
 when_to_use:
 - The challenge centers on memory corruption, shellcode, ROP, sandbox escape, or native service exploitation.

@@ -1,3 +1,8 @@
+---
+name: ctf-hybrid-chain
+description: Coordinate solves where evidence crosses CTF category boundaries.
+---
+
 purpose: Coordinate solves where evidence crosses CTF category boundaries.
 when_to_use:
 - A source artifact from one category produces a concrete artifact for another category.

@@ -1,3 +1,8 @@
+---
+name: replay-runner
+description: Run a challenge `replay.sh`, preserve raw stdout/stderr evidence, write a redacted summary, and update state evidence paths.
+---
+
 purpose: Run a challenge `replay.sh`, preserve raw stdout/stderr evidence, write a redacted summary, and update state evidence paths.
 when_to_use:
 - A challenge has a replay script that should prove or preserve progress.
