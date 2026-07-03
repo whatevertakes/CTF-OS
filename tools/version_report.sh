@@ -126,8 +126,8 @@ PY
 
 echo "== pwn/rev tools =="
 run_optional checksec checksec --version
-run_optional ROPgadget ROPgadget --version
-run_optional ropper ropper --version
+run_optional ROPgadget env PYTHONWARNINGS=ignore::SyntaxWarning ROPgadget --version
+run_optional ropper env PYTHONWARNINGS=ignore::SyntaxWarning ropper --version
 run_optional one_gadget one_gadget --version
 run_optional seccomp-tools seccomp-tools --version
 run_optional r2 r2 -v

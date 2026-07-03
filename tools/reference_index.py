@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import html
 import json
 import re
 import sys
@@ -120,29 +122,45 @@ INTERESTING_PARTS = {
 KEYWORDS = {
     "aead",
     "apk",
+    "api",
     "auth",
     "bof",
     "canary",
     "capa",
     "cbc",
     "coppersmith",
+    "cisa",
     "csrf",
+    "cve",
+    "cvss",
+    "cwe",
     "deserialize",
     "deserialization",
+    "directory-traversal",
     "ecc",
     "format-string",
     "gadget",
     "heap",
+    "idor",
     "jwt",
+    "kev",
     "lattice",
+    "lfi",
     "lsb",
     "nonce",
+    "oauth",
     "oracle",
+    "open-redirect",
     "overflow",
     "padding",
+    "path-traversal",
+    "prototype-pollution",
     "prompt-injection",
     "prng",
+    "race",
     "reentrancy",
+    "request-smuggling",
+    "rfi",
     "rop",
     "rsa",
     "seccomp",
@@ -153,6 +171,9 @@ KEYWORDS = {
     "template",
     "traversal",
     "uaf",
+    "upload",
+    "web-cache",
+    "xss",
     "xxe",
     "yara",
 }
@@ -254,7 +275,12 @@ def materialized_root(ref: dict[str, Any], record: dict[str, Any]) -> Path | Non
 
 
 def tokenize(text: str) -> list[str]:
-    return [item.lower() for item in re.findall(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", text)]
+    tokens: list[str] = []
+    for item in re.findall(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", text):
+        lowered = item.lower()
+        tokens.append(lowered)
+        tokens.extend(part for part in re.split(r"[^a-z0-9]+", lowered) if len(part) > 1)
+    return tokens
 
 
 def read_lines(path: Path, limit: int = 220) -> list[str]:
@@ -266,6 +292,17 @@ def read_lines(path: Path, limit: int = 220) -> list[str]:
 
 
 def title_for(path: Path) -> str:
+    if path.suffix.lower() in {".html", ".htm"}:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:50_000]
+        except OSError:
+            text = ""
+        match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            title = re.sub(r"<[^>]+>", " ", match.group(1))
+            title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+            if title:
+                return title[:120]
     for line in read_lines(path, 80):
         stripped = line.strip()
         if not stripped:
@@ -406,15 +443,44 @@ def entries_for_ref(category: str, ref: dict[str, Any], record: dict[str, Any], 
         return [url_entry(category, ref, record)]
     ref_id = str(ref["id"])
     entries: list[dict[str, Any]] = []
+
+    def unique_entry_id(rel_file: str) -> str:
+        base = f"{ref_id}:{slug_for(Path(rel_file))}"
+        used = {str(entry["id"]) for entry in entries}
+        if base not in used:
+            return base
+        digest = hashlib.sha1(rel_file.encode("utf-8")).hexdigest()[:8]
+        candidate = f"{base}-{digest}"
+        counter = 2
+        while candidate in used:
+            candidate = f"{base}-{digest}-{counter}"
+            counter += 1
+        return candidate
+
     overview = overview_file(repo_root)
     if overview is not None:
         entries.append(file_entry(category, ref, record, repo_root, overview, f"{ref_id}:overview"))
     seen = {entry["file"] for entry in entries}
+    downloads = ref.get("download_files")
+    if isinstance(downloads, list):
+        for item in downloads:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            file_path = repo_root / item["path"]
+            if not file_path.is_file():
+                continue
+            rel_file = safe_rel(file_path, repo_root)
+            if rel_file in seen:
+                continue
+            entries.append(file_entry(category, ref, record, repo_root, file_path, unique_entry_id(rel_file)))
+            seen.add(rel_file)
+            if len(entries) >= max_files:
+                return entries
     for file_path in iter_files(repo_root):
         rel_file = safe_rel(file_path, repo_root)
         if rel_file in seen:
             continue
-        entries.append(file_entry(category, ref, record, repo_root, file_path, f"{ref_id}:{slug_for(Path(rel_file))}"))
+        entries.append(file_entry(category, ref, record, repo_root, file_path, unique_entry_id(rel_file)))
         seen.add(rel_file)
         if len(entries) >= max_files:
             break

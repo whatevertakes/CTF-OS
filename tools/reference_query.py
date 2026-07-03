@@ -30,7 +30,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def tokenize(text: str) -> set[str]:
-    return {item.lower() for item in re.findall(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", text)}
+    tokens: set[str] = set()
+    for item in re.findall(r"[A-Za-z0-9][A-Za-z0-9_+.-]{1,}", text):
+        lowered = item.lower()
+        tokens.add(lowered)
+        tokens.update(part for part in re.split(r"[^a-z0-9]+", lowered) if len(part) > 1)
+    return tokens
 
 
 def read_evidence(value: str) -> str:

@@ -5,6 +5,7 @@
 - `ref:foundry`: local smart-contract test and exploit scripting reference.
 - `ref:slither`: Solidity static analysis reference.
 - `ref:echidna`: smart-contract fuzzing reference.
+- `ref:not_so_smart_contracts`: minimal vulnerable-contract examples for common exploit classes.
 
 ## CTF-Relevant Patterns
 
@@ -12,6 +13,8 @@
 - Confirm target chain/account is challenge-owned or local before interaction.
 - Model storage, access control, signatures, randomness, block assumptions, invariants, and accounting flows before exploit transactions.
 - Preserve transaction input, output, state diff, and final verification.
+- Query not-so-smart-contracts after storage, access-control, randomness,
+  arithmetic, denial-of-service, or reentrancy behavior is evidenced.
 
 ## CWE/CVE Mapping
 
@@ -36,3 +39,4 @@
 - `idx:web3:foundry:overview`
 - `idx:web3:slither:overview`
 - `idx:web3:echidna:overview`
+- `idx:web3:not_so_smart_contracts:overview`

@@ -5,6 +5,7 @@
 - `ref:upstream_ctf_skills`: pwn subskills for overflow, format string, heap, ROP, sandbox, and kernel patterns.
 - `ref:pwntools`: local/remote exploit scripting reference.
 - `ref:pwndbg`: debugger workflow reference.
+- `ref:how2heap`: glibc heap exploitation examples by allocator version.
 - `ref:ropgadget`: gadget discovery reference.
 - `ref:mitre_cwe_top25`: memory safety weakness vocabulary.
 
@@ -14,6 +15,9 @@
 - Promote only evidenced primitives: leak, write, control-flow, heap overlap, UAF, OOB, format string, race, or sandbox escape.
 - Keep exploit phases explicit: crash triage, offset/control, primitive, leak, chain, local proof, remote transcript.
 - Treat one-gadget/ROP guesses as low-confidence until constraints and registers are evidenced.
+- Query how2heap only after heap metadata, allocator version, free/write
+  primitive, or glibc version is evidenced; do not copy an example before
+  proving matching constraints.
 
 ## CWE/CVE Mapping
 
@@ -41,5 +45,6 @@
 - `idx:pwn:upstream_ctf_skills:overview`
 - `idx:pwn:pwntools:overview`
 - `idx:pwn:pwndbg:overview`
+- `idx:pwn:how2heap:overview`
 - `idx:pwn:ropgadget:overview`
 - `idx:pwn:angr:overview`

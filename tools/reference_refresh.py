@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import re
 import shutil
@@ -111,6 +112,22 @@ def validate_reference(raw: object, index: int) -> dict[str, Any]:
         path = Path(source_subpath)
         if path.is_absolute() or ".." in path.parts:
             fail(f"{item_id}: source_subpath must be repo-relative and non-escaping", code=2)
+    download_files = raw.get("download_files")
+    if download_files is not None:
+        if not isinstance(download_files, list) or not download_files:
+            fail(f"{item_id}: download_files must be a non-empty list", code=2)
+        for offset, download in enumerate(download_files, start=1):
+            if not isinstance(download, dict):
+                fail(f"{item_id}: download_files[{offset}] must be a mapping", code=2)
+            url = download.get("url")
+            rel_path = download.get("path")
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                fail(f"{item_id}: download_files[{offset}].url must be http(s)", code=2)
+            if not isinstance(rel_path, str) or not rel_path.strip():
+                fail(f"{item_id}: download_files[{offset}].path must be a non-empty string", code=2)
+            path = Path(rel_path)
+            if path.is_absolute() or ".." in path.parts:
+                fail(f"{item_id}: download_files[{offset}].path must be relative and non-escaping", code=2)
     return {**raw, "category": as_categories(raw["category"], item_id)}
 
 
@@ -149,10 +166,23 @@ def github_clone_url(ref: dict[str, Any]) -> str:
 def default_materialize_path(ref: dict[str, Any]) -> str:
     repo = github_repo(str(ref["url"]))
     if repo is None:
-        return ""
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(ref["id"])).strip("-") or "reference"
+        return f".cache/references/{safe}@{{commit}}"
     owner, name = repo
     safe = f"{owner}-{name}".replace(".", "-")
     return f".cache/references/{safe}@{{commit}}"
+
+
+def download_id(ref: dict[str, Any]) -> str:
+    downloads = ref.get("download_files")
+    values = []
+    if isinstance(downloads, list):
+        for item in downloads:
+            if isinstance(item, dict):
+                values.append(f"{item.get('url', '')}|{item.get('path', '')}")
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    digest = hashlib.sha256("\n".join(values).encode("utf-8")).hexdigest()[:8]
+    return f"snapshot-{today}-{digest}"
 
 
 def fetch_json(url: str) -> dict[str, Any]:
@@ -202,7 +232,11 @@ def resolve_reference(ref: dict[str, Any]) -> dict[str, Any]:
         record["source_subpath"] = ref["source_subpath"]
     repo = github_repo(ref["url"])
     if repo is None:
-        record["resolution"] = "non_github_reference"
+        if isinstance(ref.get("download_files"), list):
+            record["resolution"] = "download_bundle"
+            record["commit"] = download_id(ref)
+        else:
+            record["resolution"] = "non_github_reference"
         return record
     owner, name = repo
     repo_url = f"https://github.com/{owner}/{name}"
@@ -264,11 +298,13 @@ def merge_records(old_records: list[dict[str, Any]], new_records: list[dict[str,
     merged: list[dict[str, Any]] = []
     for record in new_records:
         old = old_by_id.get(str(record["id"]), {})
-        kept = {
-            key: old[key]
-            for key in ("materialized_path", "materialized_at", "materialized_commit")
-            if key in old
-        }
+        kept = {}
+        if str(old.get("commit") or "") == str(record.get("commit") or ""):
+            kept = {
+                key: old[key]
+                for key in ("materialized_path", "materialized_at", "materialized_commit")
+                if key in old
+            }
         merged.append({**record, **kept})
     return merged
 
@@ -352,19 +388,75 @@ def clone_reference(ref: dict[str, Any], record: dict[str, Any]) -> dict[str, An
     }
 
 
+def download_url(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "ctf-workspace-reference-refresh"})
+    with urllib.request.urlopen(request, timeout=40) as response:
+        return response.read()
+
+
+def materialize_download_reference(ref: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    commit = str(record.get("commit") or "")
+    if not commit:
+        raise RuntimeError(f"cannot materialize without snapshot id: {ref['id']}")
+    target_template = ref.get("optional_materialize_path") or default_materialize_path(ref)
+    if not isinstance(target_template, str) or "{commit}" not in target_template:
+        raise RuntimeError(f"download reference lacks optional_materialize_path with {{commit}}: {ref['id']}")
+    target = ROOT / target_template.replace("{commit}", commit)
+    ensure_target_inside_cache(target)
+    target.mkdir(parents=True, exist_ok=True)
+    downloaded: list[dict[str, Any]] = []
+    for item in ref.get("download_files", []):
+        if not isinstance(item, dict):
+            continue
+        url = str(item["url"])
+        rel_path = Path(str(item["path"]))
+        output = target / rel_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.is_file():
+            data = output.read_bytes()
+        else:
+            data = download_url(url)
+            output.write_bytes(data)
+        downloaded.append(
+            {
+                "url": url,
+                "path": rel_path.as_posix(),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data),
+            }
+        )
+    manifest = {
+        "schema_version": 1,
+        "id": ref["id"],
+        "downloaded_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "files": downloaded,
+    }
+    (target / "download_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        **record,
+        "materialized_path": target.relative_to(ROOT).as_posix(),
+        "materialized_commit": commit,
+        "materialized_at": manifest["downloaded_at"],
+    }
+
+
+def is_materializable(ref: dict[str, Any]) -> bool:
+    return github_repo(str(ref["url"])) is not None or isinstance(ref.get("download_files"), list)
+
+
 def select_refs(refs: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     if args.materialize:
         selected.extend([ref for ref in refs if ref["id"] == args.materialize])
     if args.materialize_category:
         category = args.materialize_category.strip()
-        selected.extend([ref for ref in refs if category in ref["category"] and github_repo(str(ref["url"])) is not None])
+        selected.extend([ref for ref in refs if category in ref["category"] and is_materializable(ref)])
     if args.materialize_all:
-        selected.extend([ref for ref in refs if github_repo(str(ref["url"])) is not None])
+        selected.extend([ref for ref in refs if is_materializable(ref)])
     unique: dict[str, dict[str, Any]] = {}
     for ref in selected:
         unique[str(ref["id"])] = ref
-    if args.materialize and args.materialize not in unique:
+    if args.materialize and (args.materialize not in unique or not is_materializable(unique[args.materialize])):
         fail(f"unknown or non-materializable reference id: {args.materialize}", code=2)
     return list(unique.values())
 
@@ -380,7 +472,10 @@ def materialize_many(refs: list[dict[str, Any]], records: list[dict[str, Any]], 
         ref, record = item
         if not record:
             raise RuntimeError(f"missing lock record for {ref['id']}")
-        materialized = clone_reference(ref, record)
+        if github_repo(str(ref["url"])) is not None:
+            materialized = clone_reference(ref, record)
+        else:
+            materialized = materialize_download_reference(ref, record)
         return str(ref["id"]), materialized
 
     if jobs <= 1:

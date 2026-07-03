@@ -7,9 +7,9 @@ not loaded by default and are not proof. Workers read the category skill,
 
 | Category | Digest | Primary references |
 |---|---|---|
-| common | `docs/reference-digests/common.md` | `upstream_ctf_skills`, `cve_mitre`, `nvd_nist`, `cisa_kev`, `mitre_cwe_top25` |
-| pwn | `docs/reference-digests/pwn.md` | `upstream_ctf_skills`, `pwntools`, `pwndbg`, `ropgadget` |
-| web | `docs/reference-digests/web.md` | `upstream_ctf_skills`, `owasp_wstg`, `owasp_cheatsheets`, `sqlmap`, `tplmap`, `hacktricks` |
+| common | `docs/reference-digests/common.md` | `upstream_ctf_skills`, `cve_mitre`, `nvd_nist`, `cisa_kev`, `mitre_cwe_top25`, `cisa_kev_json`, `cve_json_schema` |
+| pwn | `docs/reference-digests/pwn.md` | `upstream_ctf_skills`, `pwntools`, `pwndbg`, `how2heap`, `ropgadget` |
+| web | `docs/reference-digests/web.md` | `upstream_ctf_skills`, `owasp_wstg`, `owasp_cheatsheets`, `owasp_top10`, `owasp_api_security`, `portswigger_wsa`, `sqlmap`, `tplmap`, `hacktricks`, `payloads_all_the_things` |
 | rev | `docs/reference-digests/rev.md` | `upstream_ctf_skills`, `angr`, `angr_examples`, `radare2`, `ghidra` |
 | crypto | `docs/reference-digests/crypto.md` | `upstream_ctf_skills`, `rsactftool`, `crypto_attacks`, `sage` |
 | forensics | `docs/reference-digests/forensics.md` | `upstream_ctf_skills`, `volatility3`, `sleuthkit`, `binwalk` |
@@ -19,7 +19,7 @@ not loaded by default and are not proof. Workers read the category skill,
 | misc | `docs/reference-digests/misc.md` | `upstream_ctf_skills` |
 | mobile | `docs/reference-digests/mobile.md` | `jadx`, `apktool`, `frida`, `mobsf`, `owasp_cheatsheets` |
 | malware | `docs/reference-digests/malware.md` | `upstream_ctf_skills`, `capa`, `yara`, `ghidra`, `radare2`, `volatility3` |
-| web3 | `docs/reference-digests/web3.md` | `foundry`, `slither`, `echidna` |
+| web3 | `docs/reference-digests/web3.md` | `foundry`, `slither`, `echidna`, `not_so_smart_contracts` |
 | cloud/container | `docs/reference-digests/cloud-container.md` | `kctf`, `kubernetes_goat`, `trivy`, `hacktricks` |
 | ai-ml | `docs/reference-digests/ai-ml.md` | `garak`, `damn_vulnerable_llm_agent`, `promptfoo`, `owasp_cheatsheets` |
 | hardware-rf/side-channel | `docs/reference-digests/hardware-rf-side-channel.md` | `chipwhisperer`, `sigmf`, `urh` |

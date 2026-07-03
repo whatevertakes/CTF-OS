@@ -41,6 +41,34 @@ references:
     mode: reference_digest
     why: Weakness taxonomy for mapping observations to vulnerability classes.
     digest_path: docs/reference-digests/common.md
+  - id: cisa_kev_json
+    category: [common, cloud, container]
+    source_type: official-data
+    url: https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+    license: official-reference
+    mode: reference_digest
+    why: Local CISA KEV JSON snapshot for CVE prioritization and product/version triage.
+    digest_path: docs/reference-digests/common.md
+    optional_materialize_path: .cache/references/cisa-kev-json@{commit}
+    download_files:
+      - url: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+        path: cisa-kev.json
+  - id: cve_json_schema
+    category: [common]
+    source_type: official-data
+    url: https://github.com/CVEProject/cve-schema
+    license: CC0-1.0
+    mode: reference_digest
+    why: Official CVE JSON 5 record schema for interpreting downloaded CVE records and CVE-shaped evidence.
+    digest_path: docs/reference-digests/common.md
+    optional_materialize_path: .cache/references/cve-json-schema@{commit}
+    download_files:
+      - url: https://raw.githubusercontent.com/CVEProject/cve-schema/main/README.md
+        path: README.md
+      - url: https://raw.githubusercontent.com/CVEProject/cve-schema/main/schema/CVE_Record_Format.json
+        path: schema/CVE_Record_Format.json
+      - url: https://raw.githubusercontent.com/CVEProject/cve-schema/main/LICENSE.txt
+        path: LICENSE.txt
   - id: pwntools
     category: [pwn]
     source_type: github
@@ -59,6 +87,15 @@ references:
     why: GDB workflow reference for heap, stack, and register triage.
     digest_path: docs/reference-digests/pwn.md
     optional_materialize_path: .cache/references/pwndbg-pwndbg@{commit}
+  - id: how2heap
+    category: [pwn]
+    source_type: github
+    url: https://github.com/shellphish/how2heap
+    license: MIT
+    mode: reference_digest
+    why: Heap exploitation technique examples indexed by glibc version for CTF pwn triage.
+    digest_path: docs/reference-digests/pwn.md
+    optional_materialize_path: .cache/references/shellphish-how2heap@{commit}
   - id: ropgadget
     category: [pwn]
     source_type: github
@@ -123,6 +160,100 @@ references:
     why: Defensive and weakness-oriented reference for web and app attack surfaces.
     digest_path: docs/reference-digests/web.md
     optional_materialize_path: .cache/references/OWASP-CheatSheetSeries@{commit}
+  - id: owasp_top10
+    category: [web]
+    source_type: official-data
+    url: https://owasp.org/www-project-top-ten/
+    license: OWASP-reference
+    mode: reference_digest
+    why: Official OWASP Top 10 risk taxonomy for web vulnerability classification.
+    digest_path: docs/reference-digests/web.md
+    optional_materialize_path: .cache/references/owasp-top10@{commit}
+    download_files:
+      - url: https://owasp.org/www-project-top-ten/
+        path: top10-project.html
+      - url: https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+        path: 2021/A01-broken-access-control.html
+      - url: https://owasp.org/Top10/A02_2021-Cryptographic_Failures/
+        path: 2021/A02-cryptographic-failures.html
+      - url: https://owasp.org/Top10/A03_2021-Injection/
+        path: 2021/A03-injection.html
+      - url: https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
+        path: 2021/A05-security-misconfiguration.html
+      - url: https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
+        path: 2021/A07-authentication-failures.html
+      - url: https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+        path: 2021/A08-integrity-failures.html
+      - url: https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+        path: 2021/A10-ssrf.html
+  - id: owasp_api_security
+    category: [web]
+    source_type: official-data
+    url: https://owasp.org/www-project-api-security/
+    license: OWASP-reference
+    mode: reference_digest
+    why: Official OWASP API Security Top 10 reference for API, authz, object-level, and function-level issues.
+    digest_path: docs/reference-digests/web.md
+    optional_materialize_path: .cache/references/owasp-api-security@{commit}
+    download_files:
+      - url: https://owasp.org/www-project-api-security/
+        path: api-security-project.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+        path: 2023/API1-bola.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/
+        path: 2023/API2-broken-authentication.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+        path: 2023/API3-bopla.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
+        path: 2023/API5-bfla.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xa8-security-misconfiguration/
+        path: 2023/API8-security-misconfiguration.html
+      - url: https://owasp.org/API-Security/editions/2023/en/0xaa-unsafe-consumption-of-apis/
+        path: 2023/API10-unsafe-consumption-of-apis.html
+  - id: portswigger_wsa
+    category: [web, jail]
+    source_type: official-data
+    url: https://portswigger.net/web-security
+    license: official-reference
+    mode: reference_digest
+    why: PortSwigger Web Security Academy methodology pages for common web CTF vulnerability classes.
+    digest_path: docs/reference-digests/web.md
+    optional_materialize_path: .cache/references/portswigger-wsa@{commit}
+    download_files:
+      - url: https://portswigger.net/web-security/all-materials/detailed
+        path: all-materials-detailed.html
+      - url: https://portswigger.net/web-security/sql-injection
+        path: sqli/sql-injection.html
+      - url: https://portswigger.net/web-security/cross-site-scripting
+        path: xss/cross-site-scripting.html
+      - url: https://portswigger.net/web-security/server-side-template-injection
+        path: ssti/server-side-template-injection.html
+      - url: https://portswigger.net/web-security/file-path-traversal
+        path: path-traversal/file-path-traversal.html
+      - url: https://portswigger.net/web-security/xxe
+        path: xxe/xxe.html
+      - url: https://portswigger.net/web-security/ssrf
+        path: ssrf/ssrf.html
+      - url: https://portswigger.net/web-security/access-control
+        path: access-control/access-control.html
+      - url: https://portswigger.net/web-security/authentication
+        path: auth/authentication.html
+      - url: https://portswigger.net/web-security/oauth
+        path: oauth/oauth.html
+      - url: https://portswigger.net/web-security/jwt
+        path: jwt/jwt.html
+      - url: https://portswigger.net/web-security/file-upload
+        path: upload/file-upload.html
+      - url: https://portswigger.net/web-security/deserialization
+        path: deserialization/deserialization.html
+      - url: https://portswigger.net/web-security/prototype-pollution
+        path: prototype-pollution/prototype-pollution.html
+      - url: https://portswigger.net/web-security/request-smuggling
+        path: request-smuggling/request-smuggling.html
+      - url: https://portswigger.net/web-security/race-conditions
+        path: race/race-conditions.html
+      - url: https://portswigger.net/web-security/web-cache-poisoning
+        path: web-cache/web-cache-poisoning.html
   - id: sqlmap
     category: [web]
     source_type: github
@@ -150,6 +281,15 @@ references:
     why: Broad offensive security reference for CTF-oriented checklists.
     digest_path: docs/reference-digests/web.md
     optional_materialize_path: .cache/references/HackTricks-wiki-hacktricks@{commit}
+  - id: payloads_all_the_things
+    category: [web, jail, cloud, container]
+    source_type: github
+    url: https://github.com/swisskyrepo/PayloadsAllTheThings
+    license: MIT
+    mode: reference_digest
+    why: CTF-oriented payload and bypass reference for web, API, and sandbox branches.
+    digest_path: docs/reference-digests/web.md
+    optional_materialize_path: .cache/references/swisskyrepo-PayloadsAllTheThings@{commit}
   - id: rsactftool
     category: [crypto]
     source_type: github
@@ -303,6 +443,15 @@ references:
     why: Smart-contract fuzzing reference; avoid vendoring.
     digest_path: docs/reference-digests/web3.md
     optional_materialize_path: .cache/references/crytic-echidna@{commit}
+  - id: not_so_smart_contracts
+    category: [web3]
+    source_type: github
+    url: https://github.com/crytic/not-so-smart-contracts
+    license: Apache-2.0
+    mode: reference_digest
+    why: Minimal vulnerable Solidity examples for mapping observed web3 behavior to exploit classes.
+    digest_path: docs/reference-digests/web3.md
+    optional_materialize_path: .cache/references/crytic-not-so-smart-contracts@{commit}
   - id: kctf
     category: [cloud, container]
     source_type: github
