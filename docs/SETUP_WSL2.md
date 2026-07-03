@@ -63,6 +63,7 @@ python3 tools/reference_refresh.py --materialize-all --jobs 4
 python3 tools/reference_index.py --all --max-files-per-ref 120
 python3 tools/preflight_check.py --strict-optional
 python3 tools/check_team_parity.py
+python3 tools/check_level3_tool_routing.py
 ```
 
 `references.yaml`, `references.lock.json`, `docs/reference-index/`는 Git으로

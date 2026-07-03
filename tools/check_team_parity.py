@@ -236,6 +236,20 @@ def check_python_module(package: str, module: str) -> int:
     return 1
 
 
+def check_level3_tool_routing() -> int:
+    result = subprocess.run(
+        [sys.executable, "tools/check_level3_tool_routing.py"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part.strip())
+    for line in output.splitlines():
+        print(line)
+    return 0 if result.returncode == 0 else 1
+
+
 def main() -> int:
     failures = 0
     for command in COMMANDS:
@@ -247,6 +261,7 @@ def main() -> int:
     failures += check_r2mcp()
     for package, module in PYTHON_MODULES:
         failures += check_python_module(package, module)
+    failures += check_level3_tool_routing()
     print(f"team parity summary failures={failures}")
     return 1 if failures else 0
 

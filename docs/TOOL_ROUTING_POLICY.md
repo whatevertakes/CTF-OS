@@ -81,3 +81,9 @@ correctness:
 
 Tool routing gaps are caveats. They are not proof failures and are not a reason
 to force MCP usage.
+
+`tools/check_level3_tool_routing.py` is the structural gate for category helper
+coverage. It verifies that installed helper CLIs such as `arjun`, `floss`,
+`frida`, `zsteg`, `wafw00f`, `pwninit`, and `RsaCtfTool` appear in the
+appropriate Level 3 strategy packets and category skills. This keeps CLI routing
+visible without turning those tools into MCP servers.

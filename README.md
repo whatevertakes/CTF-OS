@@ -55,6 +55,7 @@ python3 tools/reference_refresh.py --materialize-all --jobs 4
 python3 tools/reference_index.py --all --max-files-per-ref 120
 python3 tools/preflight_check.py --strict-optional
 python3 tools/check_team_parity.py
+python3 tools/check_level3_tool_routing.py
 ```
 
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
@@ -105,6 +106,7 @@ tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
 python3 tools/preflight_check.py
 python3 tools/preflight_check.py --strict-optional
 python3 tools/check_team_parity.py
+python3 tools/check_level3_tool_routing.py
 python3 tools/evaluate_corpus.py
 ```
 

@@ -311,6 +311,14 @@ capabilities:
     dependencies: [preflight_check, replay_runner, proof_validate, level2_selftest, ctf_solve_playbooks]
     loads_by_default: false
     future_agents: [level3-orchestrator, benchmark, reviewer]
+  - id: level3_tool_routing_check
+    type: script
+    category: orchestration
+    status: implemented
+    path: tools/check_level3_tool_routing.py
+    dependencies: [level3_orchestrator, skill_ctf_web, skill_ctf_pwn, skill_ctf_rev, skill_ctf_crypto, skill_ctf_forensics, skill_ctf_stego, skill_ctf_mobile, skill_ctf_malware]
+    loads_by_default: false
+    future_agents: [level3-orchestrator, category-workers, reviewer]
   - id: tool_searchsploit
     type: script
     category: web

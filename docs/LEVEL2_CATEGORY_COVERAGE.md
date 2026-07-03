@@ -30,3 +30,8 @@ profile checks.
 ## Coverage Rule
 
 Category skills are starting points. The challenge directory remains the source of truth, and every meaningful claim should point to a file, command, replay log, trace, packet capture, transaction, or other reproducible artifact.
+
+Run `python3 tools/check_level3_tool_routing.py` after changing category
+skills, Level 3 strategies, or parity CLI lists. The check fails when installed
+helper CLIs are no longer surfaced in the expected category strategy and skill
+text.
