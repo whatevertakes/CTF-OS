@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Demo Client App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; }
+      .card { max-width: 740px; margin: 0 auto; padding: 1.4rem 1.6rem; border: 1px solid #eee; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.05); }
+      h1 { margin: 0 0 1rem 0; }
+      a.button, button { display: inline-block; padding: .7rem 1rem; background: #111; color: #fff; border-radius: 10px; text-decoration: none; }
+      code { background: #f6f8fa; padding: .15rem .35rem; border-radius: 6px; }
+      pre { background: #f6f8fa; padding: .7rem; border-radius: 8px; overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; margin: .8rem 0; }
+      td, th { border-bottom: 1px solid #eee; text-align: left; padding: .5rem; }
+      .btns a { margin-right: .5rem; }
+      input[type="text"] { width: 100%; padding: .6rem; margin: .5rem 0; border-radius: 8px; border: 1px solid #ddd; }
+      .row { display: flex; flex-direction: column; gap: 20px; }
+      .form-block { display: flex; flex-direction: column; }
+      .muted { color:#666; font-size:.9rem; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Client App</h1>
+      <p>This app demonstrates the <code>Authorization Code</code> flow.</p>
+
+      <div class="row">
+        <form method="POST" action="/set-auth-server" class="form-block">
+          <label for="authServerUrl">Auth Server URL</label>
+          <input
+            type="text"
+            id="authServerUrl"
+            name="authServerUrl"
+            value="<%= authServerUrl || '' %>"
+            placeholder="Enter auth URL"
+          />
+          <button type="submit">Save Auth Server URL</button>
+        </form>
+      
+        <form method="POST" action="/set-client-url" class="form-block">
+          <label for="clientAppUrl">Client App URL</label>
+          <input
+            type="text"
+            id="clientAppUrl"
+            name="clientAppUrl"
+            value="<%= clientAppUrl || '' %>"
+            placeholder="Enter client URL"
+          />
+          <button type="submit">Save Client App URL</button>
+        </form>
+      </div>
+
+      <% if (authServerUrl) { %>
+        <p>Current Auth Server: <code><%= authServerUrl %></code></p>
+      <% } %>
+      <% if (clientAppUrl) { %>
+        <p>Current Client URL: <code><%= clientAppUrl %></code></p>
+      <% } %>
+
+      <% if (authServerUrl && clientAppUrl) { %>
+        <p><a class="button" href="/login">Login with Demo OAuth</a></p>
+      <% } %>
+
+      <% if (session.tokens) { %>
+        <h2>Tokens</h2>
+        <table>
+          <tr><th>access_token</th><td><code><%= session.tokens.access_token.slice(0,40) %>…</code></td></tr>
+          <tr><th>expires_in</th><td><%= session.tokens.expires_in %></td></tr>
+          <tr><th>token_type</th><td><%= session.tokens.token_type %></td></tr>
+          <tr><th>refresh_token</th><td><code><%= session.tokens.refresh_token %></code></td></tr>
+          <tr><th>scope</th><td><%= session.tokens.scope %></td></tr>
+        </table>
+        <p class="btns">
+          <a class="button" href="/call-api">Call Protected API</a>
+          <a class="button" href="/refresh">Refresh Token</a>
+          <a class="button" href="/logout">Logout</a>
+        </p>
+      <% } %>
+
+      <% if (session.apiResponse) { %>
+        <h2>API Response</h2>
+        <pre><%= JSON.stringify(session.apiResponse, null, 2) %></pre>
+      <% } %>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,46 @@
+services:
+  auth-server:
+    build: ./deploy/auth-server
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+      - TOKEN_SECRET=[REDACTED]
+      - CLIENT_ID=clientapp
+      - CLIENT_SECRET=[REDACTED]
+      - REDIRECT_HOST=.dreamhack.games
+      - ADMIN_PASSWORD=[REDACTED]
+
+  resource-server:
+    container_name: resource-server
+    build: ./deploy/resource-server
+    environment:
+      - PORT=5000
+      - TOKEN_SECRET=[REDACTED]
+
+  client-app:
+    build: ./deploy/client-app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - CLIENT_APP_URL=http://client-app:3000
+      - AUTH_SERVER_URL=http://auth-server:4000
+      - RESOURCE_SERVER_URL=http://resource-server:5000
+      - CLIENT_ID=clientapp
+      - CLIENT_SECRET=[REDACTED]
+    depends_on:
+      - auth-server
+      - resource-server
+  bot:
+    build: ./deploy/bot
+    ports:
+      - "8000:8000"
+    depends_on:
+      - auth-server
+      - client-app
+    environment:
+      - PORT=8000
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+      - PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+      - ADMIN_PASSWORD=[REDACTED]

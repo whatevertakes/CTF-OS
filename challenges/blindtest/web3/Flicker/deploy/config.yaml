@@ -1,0 +1,19 @@
+accounts:
+  - name: owner
+    balance: 1ether
+  - name: user
+    balance: 1ether
+
+deployments:
+  - name: setup_contract
+    path: "./src/Setup.sol:Setup"
+    private_key: owner_private_key
+    gas_limit: 30000000
+
+exposed:
+  - setup_contract_address
+  - user_private_key
+  - user_address
+
+verifier: "/app/verifier.py"
+flag_path: ./flag.txt

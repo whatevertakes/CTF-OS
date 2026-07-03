@@ -1,0 +1,1 @@
+proof ok: status=solved replay_logs=1 sensitive_logs=1 proof_scope=remote live exploit replay produced a flag-like marker in evidence/replay_20260701T050059Z.log with a redacted summary remote_status=live_flag_observed replay_kind=remote_live_exploit current_remote_liveness=live

@@ -1,0 +1,1 @@
+proof ok: status=solved replay_logs=1 sensitive_logs=1 proof_scope=local_unmodified_verifier_and_remote_live_flag remote_status=solved_live replay_kind=remote_live_exploit current_remote_liveness=live

@@ -1,0 +1,83 @@
+{
+  "event": "blindtest",
+  "category": "rev",
+  "name": "prismledger",
+  "workspace": "challenges/blindtest/rev/prismledger",
+  "status": "solved",
+  "created_at": "2026-07-01",
+  "updated_at": "2026-06-30T16:25:50Z",
+  "final_command": "python3 tools/replay_runner.py --allow-remote-live challenges/blindtest/rev/prismledger",
+  "blocker": {
+    "reason": "",
+    "next_action": ""
+  },
+  "blockers": [],
+  "evidence": [
+    "evidence/remote_proof.raw.log",
+    "evidence/remote_proof.raw.summary.md",
+    "evidence/replay_20260630T162550Z.log",
+    "evidence/replay_20260630T162550Z.summary.md",
+    "evidence/local_verification.summary.md",
+    "evidence/proof_validate.txt"
+  ],
+  "tool_routing": {
+    "primary_tools_used": [
+      "radare2 CLI",
+      "Python standard library solver",
+      "unpatched local verifier",
+      "direct TCP replay"
+    ],
+    "considered": [
+      "file/sha256sum/strings/readelf/objdump",
+      "local dynamic execution",
+      "radare2 CLI",
+      "radare2 MCP",
+      "angr MCP",
+      "direct TCP probe",
+      "HTTP/curl",
+      "Playwright",
+      "Burp",
+      "checksec"
+    ],
+    "used": [
+      "file",
+      "sha256sum",
+      "strings",
+      "readelf",
+      "objdump",
+      "radare2 CLI",
+      "Python hashlib brute force",
+      "unpatched local execution",
+      "nc remote proof"
+    ],
+    "skipped": [
+      "radare2 MCP: local batch CLI produced reproducible disassembly artifacts",
+      "angr MCP: each block had a concrete 4,913-candidate search bound",
+      "HTTP/Playwright/Burp: direct TCP matched the binary protocol and returned final proof"
+    ],
+    "missing": [
+      "checksec entrypoint has an unavailable recorded interpreter; readelf provided equivalent properties"
+    ],
+    "decision_summary": "Local static analysis recovered twenty independent three-byte checks; a deterministic standard-library brute-force solver and direct TCP replay produced the strongest proof with minimal tooling."
+  },
+  "notes": "See notes.md for human-readable evidence and reasoning.",
+  "metadata": {
+    "proof_scope": "local_unmodified_verifier_and_remote_live_flag",
+    "remote_status": "solved_live",
+    "remote_solve": "solved",
+    "replay_kind": "remote_live_exploit",
+    "current_remote_liveness": "live",
+    "evidence_sensitivity": "contains_flag",
+    "last_replay": {
+      "timestamp_utc": "20260630T162550Z",
+      "summary_only": false,
+      "sensitivity": "contains_flag",
+      "replay_kind": "remote_live_exploit",
+      "current_remote_liveness": "live",
+      "artifacts": [
+        "evidence/replay_20260630T162550Z.log",
+        "evidence/replay_20260630T162550Z.summary.md"
+      ]
+    }
+  }
+}
