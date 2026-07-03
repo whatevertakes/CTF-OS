@@ -108,6 +108,17 @@ command_succeeds() {
   timeout 30 "$@" >/dev/null 2>&1
 }
 
+sync_agent_skill_links() {
+  mkdir -p "$ROOT/.agents/skills"
+  local skill_dir
+  local name
+  for skill_dir in "$ROOT"/skills/*; do
+    [ -f "$skill_dir/SKILL.md" ] || continue
+    name="$(basename "$skill_dir")"
+    ln -sfn "../../skills/$name" "$ROOT/.agents/skills/$name"
+  done
+}
+
 install_jadx_fallback() {
   if command -v jadx >/dev/null 2>&1; then
     return 0
@@ -239,6 +250,7 @@ if [ "$SKIP_APT" -eq 0 ]; then
 fi
 
 mkdir -p \
+  "$ROOT/.agents/skills" \
   "$ROOT/.cache/xdg" \
   "$ROOT/.cache/matplotlib" \
   "$ROOT/.cache/numba" \
@@ -247,6 +259,8 @@ mkdir -p \
   "$ROOT/.cache/npm" \
   "$ROOT/.cache/python-pycache" \
   "$ROOT/.cache/tools"
+
+sync_agent_skill_links
 
 if [ "$SKIP_PYTHON" -eq 0 ]; then
   "$PYTHON" -m venv "$ROOT/.venv"

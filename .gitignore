@@ -1,4 +1,5 @@
 .cache/
+.agents/
 .codex/config.toml
 .codex/proxy.env
 .codex/tmp/
@@ -12,6 +13,7 @@ __pycache__/
 .ruff_cache/
 
 .env
+.venv
 .venv/
 venv/
 node_modules/

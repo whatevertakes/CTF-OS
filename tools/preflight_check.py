@@ -102,6 +102,7 @@ REQUIRED_PATHS = (
     "docs/LEVEL6_EVALUATION_POLICY.md",
     "docs/LEVEL6_AGENT_DESIGN_INPUTS.md",
     "docs/FAILURE_TAXONOMY.md",
+    ".agents/skills",
 )
 
 REQUIRED_COMMANDS = ("bash", "git", "python3")
@@ -378,6 +379,24 @@ def check_ctf_skills(reporter: Reporter) -> None:
             reporter.fail(f"skill contract incomplete {relative}: missing {', '.join(missing)}")
         else:
             reporter.pass_(f"skill contract {relative}")
+
+        name = path.parent.name
+        agent_link = ROOT / ".agents" / "skills" / name
+        if not agent_link.is_symlink():
+            reporter.fail(f"agent skill link missing {agent_link.relative_to(ROOT)}")
+            continue
+        try:
+            linked_skill = (agent_link / "SKILL.md").resolve(strict=True)
+        except OSError as exc:
+            reporter.fail(f"agent skill link broken {agent_link.relative_to(ROOT)}: {exc}")
+            continue
+        if linked_skill == path.resolve():
+            reporter.pass_(f"agent skill link {agent_link.relative_to(ROOT)}")
+        else:
+            reporter.fail(
+                f"agent skill link target mismatch {agent_link.relative_to(ROOT)}: "
+                f"{linked_skill}"
+            )
 
 
 def check_reference_layer(reporter: Reporter) -> None:

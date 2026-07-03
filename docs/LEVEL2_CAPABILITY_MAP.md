@@ -9,7 +9,7 @@ Level 2 is a small local capability layer for CTF work in this workspace. It fav
 | Preflight | Verify Level 0/1/2 prerequisites before replay or benchmark work. | `tools/preflight_check.py` |
 | Intake and state | Create a challenge workspace with a consistent notes, state, replay, and evidence layout. | `tools/intake_challenge.py`, `templates/challenge/` |
 | Replay and proof | Re-run exact local commands, write raw evidence plus redacted summaries, and validate whether a claimed solve is backed by evidence. | `tools/replay_runner.py`, `tools/proof_validate.py` |
-| Category skills | Give future agents compact routing contracts and category workflows for each CTF category. | `skills/ctf-*/SKILL.md` |
+| Category skills | Give future agents compact routing contracts and category workflows for each CTF category. | `skills/ctf-*/SKILL.md`, generated `.agents/skills/ctf-*` symlinks |
 | Solve playbooks | Provide practical first-pass, branch, and stop-condition guidance for real solves. | `docs/CTF_SOLVE_PLAYBOOKS.md` |
 | Web helpers | Provide narrow local wrappers for common web CTF workflows without polluting root `tools/`. | `.codex/bin/tplmap`, `.codex/bin/searchsploit` |
 | Hybrid chains | Describe cross-category workflows where the solve path crosses boundaries. | `skills/ctf-hybrid-chain/SKILL.md`, `docs/LEVEL2_HYBRID_CHAINS.md` |
@@ -36,6 +36,11 @@ Every capability entry in `capabilities/registry.yaml` has these fields:
 | `future_agents` | Agent roles expected to consume the capability. |
 
 ## Skill Contract Schema
+
+Each `SKILL.md` in this layer is also exposed as a repo-scoped Codex skill
+through generated `.agents/skills/<name>` symlinks. The source of truth remains
+`skills/<name>/SKILL.md`; `tools/bootstrap_wsl2.sh` regenerates the symlinks
+during team setup, and they are intentionally not tracked in Git.
 
 Each `SKILL.md` in this layer uses the same concise contract fields:
 
