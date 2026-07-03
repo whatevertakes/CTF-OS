@@ -55,6 +55,14 @@ capabilities:
     dependencies: [python3-stdlib, PyYAML, git]
     loads_by_default: false
     future_agents: [reference-maintainer, reviewer]
+  - id: reference_materialization_check
+    type: script
+    category: reference
+    status: implemented
+    path: tools/check_references.py
+    dependencies: [python3-stdlib, reference_lock]
+    loads_by_default: false
+    future_agents: [reference-maintainer, reviewer, team-setup]
   - id: reference_digest_check
     type: script
     category: reference
@@ -68,7 +76,7 @@ capabilities:
     category: reference
     status: implemented
     path: .cache/references
-    dependencies: [reference_manifest, reference_lock, reference_refresh, git]
+    dependencies: [reference_manifest, reference_lock, reference_materialization_check, reference_refresh, git]
     loads_by_default: false
     future_agents: [reference-maintainer, level3-orchestrator, category-workers]
   - id: reference_index

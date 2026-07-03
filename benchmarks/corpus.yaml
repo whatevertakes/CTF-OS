@@ -123,6 +123,86 @@ items:
       - notes.md
       - work/LEVEL3_WORKER_TASKS.md
     notes: Design benchmark for multi-branch web exploration and state tracking.
+  - id: blindtest_web_amos_oauth_level3
+    event: blindtest
+    category: web
+    challenge: "Amo's OAuth"
+    path: benchmarks/AMOS_OAUTH_LEVEL3_SANITIZED_BENCHMARK_REPORT.md
+    split: design
+    status: solved
+    difficulty: medium
+    tags:
+      - web
+      - oauth
+      - state-bypass
+      - request-bin
+      - admin-bot
+      - mutation-ledger
+      - independent-solve-comparison
+      - sanitized-evidence
+      - no-raw-flag
+      - level3-design
+    dependency_status: ok
+    agent_mode: autonomous
+    proof_scope: remote admin OAuth code capture and protected API flag retrieval
+    replay_kind: remote_live_exploit
+    replay_quality: redacted summary plus matching raw-log flag hash from two independent solves
+    shareability: sanitized report only; raw replay logs and consumed Request Bin data stay local
+    primary_tools_used:
+      - source inspection
+      - curl
+      - Python HTTP automation
+      - DreamHack Request Bin
+      - challenge admin bot
+    tools_considered:
+      - Playwright
+      - Burp
+      - tplmap
+      - searchsploit
+      - radare2
+      - angr
+    tools_used:
+      - source inspection
+      - curl
+      - Python requests
+      - Python urllib/CookieJar
+      - BeautifulSoup
+      - DreamHack Request Bin API
+      - challenge admin bot
+    tools_skipped:
+      - tool: Playwright
+        reason: "The supplied admin bot executed the browser flow and source review exposed the OAuth transitions."
+      - tool: Burp
+        reason: "Low-volume saved HTTP requests and direct automation preserved the relevant state transitions."
+      - tool: tplmap
+        reason: "No template injection sink was evidenced."
+      - tool: searchsploit
+        reason: "No version-specific CVE hypothesis was needed."
+      - tool: radare2
+        kind: mcp
+        reason: "No native binary analysis was involved."
+      - tool: angr
+        kind: mcp
+        reason: "No symbolic native path was involved."
+    time_metrics:
+      primary_replay_timestamp_utc: "2026-06-30T17:43:08Z"
+      comparison_replay_timestamp_utc: "2026-06-30T17:40:20Z"
+    attempt_metrics:
+      independent_solves_compared: 2
+      matching_flag_hashes: 2
+      captured_code_length: 24
+      preserved_primary_level3_files: 13
+      preserved_comparison_level3_files: 20
+      sensitive_local_only_files: 3
+    tool_effectiveness:
+      direct_http: high
+      request_bin: required
+      generic_scanners: low
+      browser_automation: delegated_to_challenge_bot
+    expected_artifacts:
+      - benchmarks/AMOS_OAUTH_LEVEL3_SANITIZED_BENCHMARK_REPORT.md
+      - benchmarks/AMOS_OAUTH_LEVEL3_DATA_MANIFEST.json
+    notes: Sanitized Level 3 design case for web OAuth state mutation, admin-code capture, missing-state callback redemption, and invariant comparison across two independent solves.
   - id: rev_holdout_placeholder
     event: holdout
     category: rev

@@ -33,3 +33,8 @@ Use the digest to form and rank hypotheses, then use
 files under `.cache/references/`. Use local artifacts, transcripts, commands,
 and replay evidence to validate claims. The reference cache is allowed; copying
 or vendoring reference code into challenge work remains forbidden by default.
+
+Before running the expensive materialization path, use
+`tools/check_references.py` to compare `references.lock.json` with local
+`.cache/references/`. Run `tools/reference_refresh.py --materialize-all --jobs
+4` only when that check reports missing references.

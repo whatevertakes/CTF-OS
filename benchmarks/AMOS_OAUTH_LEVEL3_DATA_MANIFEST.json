@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "id": "blindtest_web_amos_oauth_level3",
+  "purpose": "Level 3 web agent design data for comparing two independent OAuth solve outputs without committing raw flag or consumed authorization code values.",
+  "challenge": {
+    "event": "blindtest",
+    "category": "web",
+    "name": "Amo's OAuth",
+    "status": "solved",
+    "difficulty": "medium"
+  },
+  "source_workspaces": {
+    "primary": "challenges/blindtest/web/Amo's OAuth",
+    "comparison": "challenges/blindtest/web/teamhs_Amo's OAuth/Amo's OAuth"
+  },
+  "invariant_outputs": {
+    "remote_liveness": "live",
+    "replay_kind": "remote_live_exploit",
+    "primary_replay_timestamp_utc": "2026-06-30T17:43:08Z",
+    "comparison_replay_timestamp_utc": "2026-06-30T17:40:20Z",
+    "captured_code_length": 24,
+    "flag_count_per_raw_log": 1,
+    "flag_length": 65,
+    "flag_sha256": "0567c3e6a0cbcd16377a919d08cbc8e69f02cc94e55efc6f03e58920326a762f"
+  },
+  "exploit_architecture": [
+    "create DreamHack Request Bin host under *.request.dreamhack.games",
+    "set client app process-global callback base to the Request Bin",
+    "set client app auth server URL back to http://auth-server:4000",
+    "submit http://client-app:3000/login to the admin bot",
+    "capture admin authorization code from the Request Bin callback",
+    "redeem captured code through a fresh client session without a state parameter",
+    "call the protected resource API through the client app"
+  ],
+  "design_lessons": [
+    "separate mutable process-global OAuth configuration from per-session state",
+    "record state-changing remote requests in a mutation ledger",
+    "keep negative probes and ordinary callback failures as Level 3 worker evidence",
+    "compare independent solves by invariant proof fields rather than fresh request-bin hostnames or one-use codes",
+    "keep raw sensitive evidence local while preserving redacted summaries and stable hashes"
+  ],
+  "files": [
+    {
+      "workspace": "primary",
+      "path": "state.json",
+      "role": "level2_state",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "notes.md",
+      "role": "human_reasoning",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "replay.sh",
+      "role": "replay_entrypoint",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "work/solve.py",
+      "role": "exploit_automation",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "work/ATTEMPT_MATRIX.md",
+      "role": "negative_probe_catalog",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "work/MUTATION_LEDGER.md",
+      "role": "remote_mutation_log",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/baseline_client_root.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/baseline_auth_root.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/baseline_bot_report.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/client_login_redirect.headers",
+      "role": "oauth_redirect_evidence",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/requestbin_create_probe.http",
+      "role": "request_bin_probe",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/replay_20260630T174308Z.summary.md",
+      "role": "redacted_replay_summary",
+      "sensitivity": "redacted"
+    },
+    {
+      "workspace": "primary",
+      "path": "evidence/replay_20260630T174308Z.sanitize_check.md",
+      "role": "redaction_check",
+      "sensitivity": "redacted"
+    },
+    {
+      "workspace": "comparison",
+      "path": "state.json",
+      "role": "level2_state",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "notes.md",
+      "role": "human_reasoning",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "replay.sh",
+      "role": "replay_entrypoint",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/solve.py",
+      "role": "exploit_automation",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/ATTEMPT_MATRIX.md",
+      "role": "negative_probe_catalog",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/MUTATION_LEDGER.md",
+      "role": "remote_mutation_log",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/baseline-client.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/baseline-auth.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/baseline-bot.http",
+      "role": "baseline_http_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/login-redirect.http",
+      "role": "oauth_redirect_evidence",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/set-auth-server.http",
+      "role": "remote_mutation_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/set-client-url.http",
+      "role": "remote_mutation_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/bot-report.http",
+      "role": "admin_bot_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/callback-no-state.http",
+      "role": "state_bypass_probe",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/call-api-amo.http",
+      "role": "negative_or_control_api_response",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/requestbin-create.json",
+      "role": "request_bin_creation_metadata",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/requestbin-log.json",
+      "role": "request_bin_log_metadata",
+      "sensitivity": "safe"
+    },
+    {
+      "workspace": "comparison",
+      "path": "evidence/requestbin_admin_callback.summary.md",
+      "role": "redacted_admin_callback_provenance",
+      "sensitivity": "redacted"
+    },
+    {
+      "workspace": "comparison",
+      "path": "evidence/replay_20260630T174020Z.summary.md",
+      "role": "redacted_replay_summary",
+      "sensitivity": "redacted"
+    },
+    {
+      "workspace": "comparison",
+      "path": "evidence/replay_sanitize_check.summary.md",
+      "role": "redaction_check",
+      "sensitivity": "redacted"
+    },
+    {
+      "workspace": "comparison",
+      "path": "evidence/proof_validate.txt",
+      "role": "proof_validation_transcript",
+      "sensitivity": "safe"
+    }
+  ],
+  "local_only_sensitive_files": [
+    {
+      "workspace": "primary",
+      "path": "evidence/replay_20260630T174308Z.log",
+      "reason": "contains raw flag"
+    },
+    {
+      "workspace": "comparison",
+      "path": "evidence/replay_20260630T174020Z.log",
+      "reason": "contains raw flag"
+    },
+    {
+      "workspace": "comparison",
+      "path": "work/requestbin-data.raw.json",
+      "reason": "may contain consumed authorization code and callback query"
+    }
+  ]
+}
