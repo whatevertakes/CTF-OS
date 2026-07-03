@@ -12,7 +12,8 @@ echo "Proxy http://${host}:${proxy_port}/ -> http://example.com/"
 curl -sS --max-time 8 -x "http://${host}:${proxy_port}" -D /tmp/ctf_proxy_headers -o /tmp/ctf_proxy_body http://example.com/ || true
 sed -n '1,8p' /tmp/ctf_proxy_headers 2>/dev/null || true
 if rg -q "Have you tried selecting a project first|Could not acquire a connection to the database|Proxy encountered an unhandled error" /tmp/ctf_proxy_body 2>/dev/null; then
-  echo "WARN Caido is reachable, but no project is selected or the project DB is not ready."
+  echo "WARN Caido is reachable, but the Caido instance/project repository is not ready."
+  echo "WARN In the UI, select the running Caido instance first; create/select a project only if the UI asks for one."
 fi
 if rg -q "Example Domain" /tmp/ctf_proxy_body 2>/dev/null; then
   echo "PASS Caido proxy forwarded example.com"

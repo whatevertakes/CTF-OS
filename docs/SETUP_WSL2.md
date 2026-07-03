@@ -74,10 +74,11 @@ WSL proxy env:       http://<windows-vEthernet-WSL-ip>:18086
 `ctf-proxy-start`는 Windows Caido CLI가 없으면 최신 Windows CLI를
 `%LOCALAPPDATA%\ctf-workspace\caido-cli`에 설치합니다. 그 다음 현재 머신의
 Windows WSL vEthernet 주소를 감지해서 로컬 전용 `.codex/proxy.env`를 생성합니다.
-이 파일은 Git에 저장하지 않습니다. Caido UI에서 프로젝트를 생성하거나 선택해야
-실제 요청 중계가 됩니다. 프로젝트가 선택되지 않은 상태에서 `ctf-proxy-check`가
-`Caido is reachable, but no project is selected`를 출력하는 것은 브리지 자체가
-아니라 Caido 프로젝트 상태 문제입니다.
+이 파일은 Git에 저장하지 않습니다. Caido UI에서 실행 중인 인스턴스를 선택해야
+실제 요청 중계가 됩니다. UI가 프로젝트를 요구하는 경우에만 프로젝트를 생성하거나
+선택하세요. `ctf-proxy-check`가 `Caido instance/project repository is not ready`를
+출력하는 것은 브리지 자체가 아니라 Caido UI에서 인스턴스/프로젝트 저장소가 아직
+준비되지 않은 상태입니다.
 
 프록시가 필요 없는 풀이 단계에서는 다음으로 현재 셸의 프록시만 끕니다.
 

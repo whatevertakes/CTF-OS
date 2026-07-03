@@ -164,8 +164,9 @@ ctf-proxy-check
 ```
 
 정상 상태에서는 UI가 `200`을 반환합니다. 프록시 중계가 `500`이고
-`Caido is reachable, but no project is selected` 경고가 나오면 Caido UI에서
-프로젝트를 생성하거나 선택하세요.
+`Caido instance/project repository is not ready` 경고가 나오면 Caido UI에서
+실행 중인 인스턴스를 먼저 선택하세요. UI가 프로젝트를 요구하는 경우에만 프로젝트를
+생성하거나 선택하면 됩니다.
 
 Windows 방화벽이나 portproxy가 깨진 경우에도 `ctf-proxy-start`가 다음 항목을
 다시 설정합니다.
