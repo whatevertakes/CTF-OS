@@ -15,6 +15,10 @@ dependencies:
 - Optional `.codex/bin/searchsploit` for CVE and public exploit lookup.
 - Optional arjun for parameter discovery after a route baseline exists.
 - Optional flask-unsign for evidenced Flask signed cookie handling.
+- Optional sqlmap for an evidenced SQL injection hypothesis after request shape
+  and risk are bounded.
+- Optional ffuf or gobuster for scoped route/content discovery after baseline
+  routes and rate limits are known.
 - Optional wafw00f and shodan for scoped fingerprinting and public challenge
   target context.
 - Optional Burp Suite or Caido as external GUI proxies when manual HTTP
@@ -43,6 +47,10 @@ workflow:
   payload interpretation.
 - Use shodan only for challenge-owned or explicitly scoped public targets, and
   record the query and access date.
+- Use sqlmap only after a concrete parameter, header, cookie, or body field has
+  an SQLi signal; preserve the raw request and selected options.
+- Use ffuf or gobuster only with scoped wordlists, bounded recursion, and saved
+  status/length filters.
 - Log every state-changing remote action in `work/MUTATION_LEDGER.md` with before, after, target, action, and evidence.
 - Write negative families to `work/ATTEMPT_MATRIX.md`; avoid counting simple encoding variants as new hypotheses.
 - Escalate to rev, pwn, crypto, or jail only when a concrete artifact or behavior changes domain.
@@ -52,6 +60,8 @@ first_commands:
 - `arjun -u <url>` after baseline route inventory shows unknown parameters.
 - `flask-unsign --decode --cookie <cookie>` when Flask cookie signing is evidenced.
 - `wafw00f <url>` when WAF behavior affects probe interpretation.
+- `sqlmap -r work/request.txt --batch --risk 1 --level 1` after an SQLi signal is evidenced.
+- `ffuf -u <url>/FUZZ -w <wordlist> -mc all` or `gobuster dir -u <url> -w <wordlist>` when content discovery is scoped.
 - `.codex/bin/tplmap` only after a concrete template render path exists.
 - `.codex/bin/searchsploit` only when a product/version is evidenced.
 pointers:

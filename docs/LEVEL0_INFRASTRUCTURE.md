@@ -49,14 +49,25 @@ challenges often require the provided jail or service topology:
 
 - Docker client: `/usr/bin/docker`
 - Docker daemon: reachable through `docker info`
-- Observed Docker version during the 2026-06-30 recheck: `29.5.3`
+- Docker Compose v2: reachable through `docker compose version`
+- Workspace bind mount: verified by `tools/check_team_parity.py`
 
 The strict profile also tracks the CTF tools that are already present in this
 workspace or user path:
 
-- pwn/native: `checksec`, `ROPgadget`, `one_gadget`, `ropper`, `seccomp-tools`
-- reverse/browser/MCP support: `r2`, `angr-mcp`, `node`, `npm`, `npx`
-- mobile/forensics/math: `jadx`, `apktool`, `tshark`, `sage`
+- web: `arjun`, `flask-unsign`, `wafw00f`, `shodan`, `sqlmap`, plus deep
+  target-specific `ffuf` and `gobuster`
+- pwn/native: `checksec`, `ROPgadget`, `one_gadget`, `ropper`,
+  `seccomp-tools`, `pwninit`, `patchelf`, qemu-user profiles
+- reverse/MCP support: `r2`, `angr-mcp`, `floss`, `yara`, `upx`, `file`,
+  `strings`, `objdump`
+- crypto/math: `RsaCtfTool`, `sage`, `z3`, `fplll`, `pari-gp`
+- forensics/stego: `tshark`, `vol`, `binwalk`, `foremost`, `exiftool`,
+  `zsteg`, `stegolsb`, `steghide`
+- mobile: `jadx`, `apktool`, `frida`, `frida-ps`
+- web3: `forge`, `cast`, `anvil`, `chisel`, `solc`, `slither`
+- cloud/container: `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo`
+- MCP utility CLIs: `mcp`, `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`
 
 These tools are not loaded into every solve. They are availability checks so a
 future agent can choose a narrow tool when the challenge evidence justifies it.

@@ -10,8 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - kCTF and Kubernetes Goat references only.
-- Optional trivy, syft, grype, crane, and skopeo references when image or
-  registry evidence requires them.
+- Optional kubectl, trivy, syft, grype, crane, and skopeo references when image,
+  registry, or owned Kubernetes evidence requires them.
 reference_digest:
 - `docs/reference-digests/cloud-container.md`
 evidence produced:
@@ -27,6 +27,8 @@ future agent consumers:
 workflow:
 - Hash images, Dockerfiles, manifests, extracted layers, logs, and filesystem dumps.
 - Record users, capabilities, mounts, sockets, environment, entrypoints, seccomp, AppArmor, and Kubernetes context.
+- Use kubectl only for local, challenge-owned, or explicitly authorized
+  Kubernetes contexts; save namespace/context facts before mutation.
 - Use crane or skopeo for remote image metadata inside challenge scope; use
   syft for SBOM/package inventory, grype/trivy for vulnerability or secret
   clues, and preserve exact image digests.
@@ -35,6 +37,7 @@ workflow:
 - Route recovered services to web, native binaries to pwn/rev, and policies to cloud only after boundary evidence exists.
 first_commands:
 - `docker image inspect <image>` when an image is provided.
+- `kubectl version --client=true` before any scoped Kubernetes command.
 - `crane digest <image>` or `skopeo inspect docker://<image>` when registry access is scoped.
 - `syft <image>` and `grype <image>` when package inventory or vuln clues are justified.
 - `trivy image <image>` when vulnerability, secret, or misconfiguration clues are justified.

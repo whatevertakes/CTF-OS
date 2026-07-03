@@ -7,12 +7,16 @@ surface; deep category checks add heavier or target-specific tools.
 | Category | Required Tools | Optional Tools |
 | --- | --- | --- |
 | `mcp-cli` | `mcp`, `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy` | CLI utility surface only; registered MCP servers remain `angr`, `playwright`, `radare2`. |
-| `pwn` | `gcc`, `gdb`, `python3`, `pwntools`, `checksec`, `ROPgadget`, `ropper`, `pwninit` | `one_gadget`, `seccomp-tools`, qemu profiles. |
-| `rev` | `file`, `strings`, `r2`, `angr`, `floss` | `ghidra`, `yara`, `upx`, qemu profiles. |
-| `web` | `curl`, `python3`, `node`, `playwright`, `arjun`, `flask-unsign`, `wafw00f`, `shodan` | `Burp Suite`, `Caido` as external GUI tools. |
+| `pwn` | `gcc`, `gdb`, `python3`, `pwntools`, `checksec`, `ROPgadget`, `ropper`, `pwninit` | `one_gadget`, `seccomp-tools`, `patchelf`, qemu profiles. |
+| `rev` | `file`, `strings`, `objdump`, `r2`, `angr`, `floss` | `ghidra`, `yara`, `upx`, qemu profiles. |
+| `web` | `curl`, `python3`, `node`, `playwright`, `arjun`, `flask-unsign`, `wafw00f`, `shodan`, `sqlmap` | `ffuf`, `gobuster`, `Burp Suite`, `Caido` as external GUI tools. |
 | `crypto` | `python3`, `RsaCtfTool` | `sage`, `z3`, `fplll`, `pari-gp`. |
 | `forensics` | `binwalk`, `exiftool`, `tshark`, `floss`, `stegolsb`, `zsteg` | `foremost`, `volatility3`, `yara`, `upx`. |
+| `stego` | `file`, `exiftool`, `zsteg`, `stegolsb` | `binwalk`, `steghide`, custom extractors. |
 | `mobile` | `jadx`, `apktool`, `frida`, `frida-ps` | Device/emulator-specific tooling. |
+| `web3` | `python3`, `forge`, `cast`, `anvil`, `slither` | `chisel`, `solc`, `echidna` when specifically required. |
+| `cloud` | `python3`, `jq`, local config parsers | `kubectl`, provider CLIs, `trivy`, `syft`, `grype`, `crane`, `skopeo` inside owned scope. |
+| `container/k8s` | `docker`, `tar`, `jq` | `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo`, namespace/capability helpers. |
 | `firmware/hardware-rf/avr` | `avr-gcc`, `avr-objdump`, `avr-objcopy`, `avr-size` | `avrdude`, `simavr` |
 
 `mcp-reverse-proxy` is maintained as a compatibility CLI wrapper over

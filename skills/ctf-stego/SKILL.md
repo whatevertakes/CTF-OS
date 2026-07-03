@@ -9,8 +9,8 @@ outputs:
 - Extraction commands, recovered payloads, and evidence-backed interpretation.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional exiftool, binwalk, zsteg, and stegolsb references when carrier
-  properties justify them.
+- Optional exiftool, binwalk, steghide, zsteg, and stegolsb references when
+  carrier properties justify them.
 reference_digest:
 - `docs/reference-digests/stego.md`
 evidence produced:
@@ -29,12 +29,15 @@ workflow:
 - Test metadata, appended data, archive signatures, bit planes, palette changes, frame deltas, transforms, audio channels, and text encodings with provenance.
 - Use zsteg for PNG/BMP-style bit-plane and channel hypotheses; use stegolsb
   for explicit LSB extraction hypotheses.
+- Use steghide only when format support and a passphrase, hint, or wordlist
+  hypothesis exists; save both negative and positive extraction output.
 - Store recovered payloads under `work/`, rehash them, and route conventional artifacts to forensics, crypto, rev, or misc.
 - Make `replay.sh` reproduce the extraction path or verify the recovered payload.
 first_commands:
 - `file dist/*`
 - `sha256sum dist/*`
 - `exiftool <carrier>` when available and justified.
+- `steghide info <carrier>` when steghide-supported media and passphrase evidence exist.
 - `zsteg <carrier>` when bit-plane or channel evidence exists.
 - `stegolsb steglsb -r -i <carrier> -o work/recovered.bin` when LSB extraction is justified.
 - `python3 work/extract.py`

@@ -169,6 +169,9 @@ DEEP_CATEGORY_COMMANDS = {
         ("pari-gp", ("gp", "--version")),
     ),
     "forensics": (
+        ("binwalk", ("binwalk", "--help")),
+        ("exiftool", ("exiftool", "-ver")),
+        ("foremost", ("foremost", "-V")),
         ("floss", ("floss", "--version")),
         ("stegolsb", ("stegolsb", "--version")),
         ("zsteg", ("zsteg", "--help")),
@@ -190,6 +193,7 @@ DEEP_CATEGORY_COMMANDS = {
     ),
     "pwn": (
         ("pwninit", ("pwninit", "--version")),
+        ("patchelf", ("patchelf", "--version")),
         ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
         ("qemu-user-aarch64", ("qemu-aarch64", "--version")),
         ("qemu-system-x86_64", ("qemu-system-x86_64", "--version")),
@@ -197,6 +201,8 @@ DEEP_CATEGORY_COMMANDS = {
         ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
     ),
     "rev": (
+        ("objdump", ("objdump", "--version")),
+        ("strings", ("strings", "--version")),
         ("floss", ("floss", "--version")),
         ("yara", ("yara", "--version")),
         ("upx", ("upx", "--version")),
@@ -217,6 +223,9 @@ DEEP_CATEGORY_COMMANDS = {
         ("z3", ("z3", "--version")),
     ),
     "stego": (
+        ("exiftool", ("exiftool", "-ver")),
+        ("binwalk", ("binwalk", "--help")),
+        ("steghide", ("steghide", "--version")),
         ("stegolsb", ("stegolsb", "--version")),
         ("zsteg", ("zsteg", "--help")),
     ),
@@ -225,14 +234,20 @@ DEEP_CATEGORY_COMMANDS = {
         ("flask-unsign", ("flask-unsign", "--version")),
         ("shodan", ("shodan", "version")),
         ("wafw00f", ("wafw00f", "--version")),
+        ("sqlmap", ("sqlmap", "--version")),
+        ("ffuf", ("ffuf", "-V")),
+        ("gobuster", ("gobuster", "--help")),
     ),
     "web3": (
         ("forge", ("forge", "--version")),
         ("cast", ("cast", "--version")),
         ("anvil", ("anvil", "--version")),
+        ("chisel", ("chisel", "--version")),
+        ("solc", ("solc", "--version")),
         ("slither", ("slither", "--version")),
     ),
     "cloud": (
+        ("kubectl", ("kubectl", "version", "--client=true", "--output=yaml")),
         ("trivy", ("trivy", "--version")),
         ("syft", ("syft", "version")),
         ("grype", ("grype", "version")),
@@ -240,6 +255,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("skopeo", ("skopeo", "--version")),
     ),
     "container": (
+        ("kubectl", ("kubectl", "version", "--client=true", "--output=yaml")),
         ("trivy", ("trivy", "--version")),
         ("syft", ("syft", "version")),
         ("grype", ("grype", "version")),

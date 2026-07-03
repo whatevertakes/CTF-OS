@@ -11,8 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional pwntools, debugger, ROPgadget, ropper, one_gadget,
-  seccomp-tools, pwninit, and Docker references when the challenge requires
-  them.
+  seccomp-tools, pwninit, patchelf, qemu-user, and Docker references when the
+  challenge requires them.
 reference_digest:
 - `docs/reference-digests/pwn.md`
 evidence produced:
@@ -37,6 +37,10 @@ workflow:
   policy before building sandbox escape or syscall chains.
 - Use pwninit only to align a provided binary, libc, and loader; do not let it
   replace recorded environment facts.
+- Use patchelf only to reproduce a provided loader/libc environment locally;
+  record original interpreter/RPATH before changing a copy.
+- Use qemu-user only when architecture mismatch blocks local reproduction, and
+  keep the qemu command in replay evidence.
 - Minimize crashes before exploit development; save crash input, signal, offset, controlled bytes, and register/heap context.
 - Promote only evidenced primitives such as leak, write, control-flow, UAF, OOB, format string, sandbox escape, or race.
 - Write exploit drafts under `work/`, and make `replay.sh` run the narrowest local proof command before attempting remote proof.
@@ -48,6 +52,8 @@ first_commands:
 - `ROPgadget --binary <binary>` or `ropper --file <binary>` after a ROP need is evidenced.
 - `seccomp-tools dump <binary>` when seccomp is detected or suspected.
 - `pwninit --bin <binary> --libc <libc> --ld <loader>` when matching runtime files are provided.
+- `patchelf --print-interpreter <binary>` before patching a local copy.
+- `qemu-<arch> <binary>` when cross-architecture local execution is justified and safe.
 - `python3 work/exploit_*.py LOCAL=1`
 pointers:
 - `docs/CTF_SOLVE_PLAYBOOKS.md`

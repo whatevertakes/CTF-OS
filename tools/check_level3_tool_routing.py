@@ -19,12 +19,12 @@ LEVEL3_PATH = ROOT / "tools" / "level3_orchestrator.py"
 
 EXPECTED_CATEGORY_TOOLS: dict[str, dict[str, list[str]]] = {
     "web": {
-        "level3": ["arjun", "flask-unsign", "wafw00f", "shodan", "Burp/Caido"],
-        "skill": ["arjun", "flask-unsign", "wafw00f", "shodan", "Burp Suite or Caido"],
+        "level3": ["arjun", "flask-unsign", "wafw00f", "shodan", "sqlmap", "ffuf", "gobuster", "Burp/Caido"],
+        "skill": ["arjun", "flask-unsign", "wafw00f", "shodan", "sqlmap", "ffuf", "gobuster", "Burp Suite or Caido"],
     },
     "pwn": {
-        "level3": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools"],
-        "skill": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools"],
+        "level3": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
+        "skill": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
     },
     "rev": {
         "level3": ["floss", ".codex/bin/r2", ".codex/bin/angr-mcp", "yara/upx"],
@@ -39,8 +39,8 @@ EXPECTED_CATEGORY_TOOLS: dict[str, dict[str, list[str]]] = {
         "skill": ["tshark", "Volatility3", "floss", "stegolsb", "zsteg"],
     },
     "stego": {
-        "level3": ["zsteg", "stegolsb"],
-        "skill": ["zsteg", "stegolsb"],
+        "level3": ["steghide", "zsteg", "stegolsb"],
+        "skill": ["steghide", "zsteg", "stegolsb"],
     },
     "mobile": {
         "level3": ["jadx", "apktool", "frida/frida-ps"],
@@ -49,6 +49,18 @@ EXPECTED_CATEGORY_TOOLS: dict[str, dict[str, list[str]]] = {
     "malware": {
         "level3": ["floss", "yara", "upx", ".codex/bin/r2", ".codex/bin/angr-mcp", "vol/Volatility3", "tshark"],
         "skill": ["floss", "yara", "upx", "radare2/angr MCP", "Volatility3", "tshark"],
+    },
+    "web3": {
+        "level3": ["forge", "cast", "anvil", "chisel", "solc", "slither"],
+        "skill": ["forge", "cast", "anvil", "chisel", "solc", "slither"],
+    },
+    "cloud": {
+        "level3": ["kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
+        "skill": ["kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
+    },
+    "container": {
+        "level3": ["docker", "kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
+        "skill": ["docker", "kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
     },
 }
 
