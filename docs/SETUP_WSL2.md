@@ -50,6 +50,39 @@ CLI 유틸리티로 설치와 실행 가능 여부를 점검합니다.
 `Caido`는 외부 GUI 도구라 있으면 보고만 하고 팀 setup 실패 조건으로 삼지
 않습니다.
 
+## 웹 프록시 브리지
+
+고급 웹 CTF에서는 Windows 브라우저 트래픽뿐 아니라 WSL의 `curl`, Python
+exploit, replay script 트래픽도 Caido/Burp로 확인해야 할 때가 많습니다. 이
+저장소는 Windows Caido CLI를 CTF 전용 포트로 띄우고 WSL에서 접근 가능한
+portproxy를 만드는 helper를 제공합니다.
+
+```bash
+ctf-proxy-start
+. .codex/proxy.env
+ctf-proxy-check
+```
+
+기본 포트는 다음과 같습니다.
+
+```text
+Windows Caido proxy: 127.0.0.1:18086
+Windows Caido UI:    127.0.0.1:18087
+WSL proxy env:       http://<windows-vEthernet-WSL-ip>:18086
+```
+
+`ctf-proxy-start`는 현재 머신의 Windows WSL vEthernet 주소를 감지해서 로컬 전용
+`.codex/proxy.env`를 생성합니다. 이 파일은 Git에 저장하지 않습니다. Caido UI에서
+프로젝트를 생성하거나 선택해야 실제 요청 중계가 됩니다. 프로젝트가 선택되지 않은
+상태에서 `ctf-proxy-check`가 `Caido is reachable, but no project is selected`를
+출력하는 것은 브리지 자체가 아니라 Caido 프로젝트 상태 문제입니다.
+
+프록시가 필요 없는 풀이 단계에서는 다음으로 현재 셸의 프록시만 끕니다.
+
+```bash
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
+```
+
 ## Main 업데이트와 Level 2 Reference 동기화
 
 `main`의 최신 도구, 문서, reference lock, category index를 받은 뒤 소유자와

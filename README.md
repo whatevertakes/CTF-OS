@@ -58,6 +58,20 @@ python3 tools/check_team_parity.py
 python3 tools/check_level3_tool_routing.py
 ```
 
+웹 CTF에서 브라우저 트래픽과 WSL `curl`/Python exploit 트래픽을 같은 Caido
+프록시로 보고 싶다면 Windows Caido 브리지를 켭니다.
+
+```bash
+ctf-proxy-start
+. .codex/proxy.env
+ctf-proxy-check
+```
+
+`ctf-proxy-start`는 Windows Caido CLI를 CTF 전용 포트로 띄우고 WSL에서 접근할
+수 있도록 Windows portproxy/firewall rule을 설정합니다. Caido UI에서 프로젝트를
+생성하거나 선택해야 실제 프록시 중계가 됩니다. 프록시를 끄고 빠른 replay를
+돌릴 때는 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`를 실행하세요.
+
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
 실행하세요.
 

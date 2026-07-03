@@ -153,6 +153,36 @@ RsaCtfTool --help
 `RsaCtfTool`은 메인 `.venv`에 직접 넣지 않고 별도 venv로 격리합니다. 이 도구의
 고정 dependency가 일반 HTTP/crypto 패키지를 다운그레이드할 수 있기 때문입니다.
 
+### WSL `curl` does not appear in Caido
+
+먼저 CTF 전용 Caido 브리지를 다시 생성합니다.
+
+```bash
+ctf-proxy-start
+. .codex/proxy.env
+ctf-proxy-check
+```
+
+정상 상태에서는 UI가 `200`을 반환합니다. 프록시 중계가 `500`이고
+`Caido is reachable, but no project is selected` 경고가 나오면 Caido UI에서
+프로젝트를 생성하거나 선택하세요.
+
+Windows 방화벽이나 portproxy가 깨진 경우에도 `ctf-proxy-start`가 다음 항목을
+다시 설정합니다.
+
+```text
+CTF Proxy 18086
+CTF Proxy 18087
+Windows portproxy <WSL vEthernet IP>:18086 -> 127.0.0.1:18086
+Windows portproxy <WSL vEthernet IP>:18087 -> 127.0.0.1:18087
+```
+
+프록시가 필요 없는 replay나 benchmark에서는 현재 셸에서만 끕니다.
+
+```bash
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
+```
+
 ### `shodan` cannot import `pkg_resources`
 
 다음을 실행합니다.

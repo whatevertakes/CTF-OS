@@ -68,6 +68,11 @@ EXTERNAL_OPTIONAL_COMMANDS = (
     "caido",
     "caido-cli",
 )
+PROXY_HELPERS = (
+    ".codex/bin/ctf-proxy-start",
+    ".codex/bin/ctf-proxy-check",
+    ".codex/proxy.env.example",
+)
 PYTHON_MODULES = (
     ("angr", "angr"),
     ("angr-mcp", "angr.mcp.__main__"),
@@ -217,6 +222,31 @@ def check_r2mcp() -> int:
     return 1
 
 
+def check_proxy_helpers() -> int:
+    failures = 0
+    for relative in PROXY_HELPERS:
+        path = ROOT / relative
+        if path.is_file():
+            print(f"PASS web proxy helper {relative}")
+        else:
+            print(f"FAIL web proxy helper {relative}: missing")
+            failures += 1
+
+    for relative in (".codex/bin/ctf-proxy-start", ".codex/bin/ctf-proxy-check"):
+        path = ROOT / relative
+        if path.is_file() and os.access(path, os.X_OK):
+            print(f"PASS web proxy helper executable {relative}")
+        else:
+            print(f"FAIL web proxy helper executable {relative}")
+            failures += 1
+
+    if shutil.which("caido-cli"):
+        print("PASS web proxy bridge backend caido-cli")
+    else:
+        print("WARN web proxy bridge backend caido-cli: missing")
+    return failures
+
+
 def check_python_module(package: str, module: str) -> int:
     if not VENV_PYTHON.is_file():
         print(f"FAIL python module {package}: missing .venv/bin/python")
@@ -259,6 +289,7 @@ def main() -> int:
     if shutil.which("docker"):
         failures += check_docker_runtime()
     failures += check_r2mcp()
+    failures += check_proxy_helpers()
     for package, module in PYTHON_MODULES:
         failures += check_python_module(package, module)
     failures += check_level3_tool_routing()

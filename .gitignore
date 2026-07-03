@@ -1,5 +1,6 @@
 .cache/
 .codex/config.toml
+.codex/proxy.env
 .codex/tmp/
 .codex/state/
 pyghidra_mcp_projects/
