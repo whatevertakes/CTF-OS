@@ -50,6 +50,26 @@ CLI 유틸리티로 설치와 실행 가능 여부를 점검합니다.
 `Caido`는 외부 GUI 도구라 있으면 보고만 하고 팀 setup 실패 조건으로 삼지
 않습니다.
 
+## Main 업데이트와 Level 2 Reference 동기화
+
+`main`의 최신 도구, 문서, reference lock, category index를 받은 뒤 소유자와
+같은 Level 2 reference 환경을 만들려면 다음을 실행합니다.
+
+```bash
+git pull origin main
+tools/bootstrap_wsl2.sh
+. .codex/env.sh
+python3 tools/reference_refresh.py --materialize-all --jobs 4
+python3 tools/reference_index.py --all --max-files-per-ref 120
+python3 tools/preflight_check.py --strict-optional
+python3 tools/check_team_parity.py
+```
+
+`references.yaml`, `references.lock.json`, `docs/reference-index/`는 Git으로
+공유됩니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로 각
+팀원이 위 `reference_refresh.py --materialize-all` 명령으로 같은
+commit/snapshot 기준 자료를 내려받아야 합니다.
+
 고급 CTF 카테고리별 도구 프로필까지 검수하려면 다음을 사용합니다.
 
 ```bash

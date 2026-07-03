@@ -43,6 +43,20 @@ tools/team_member_setup.sh
 list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 팀 설정
 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를 참조하세요.
 
+`main` 업데이트를 받은 뒤 소유자와 같은 Level 2 reference 환경까지 맞추려면
+다음을 실행합니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로
+각 팀원이 lock 파일 기준으로 직접 materialize해야 합니다.
+
+```bash
+git pull origin main
+tools/bootstrap_wsl2.sh
+. .codex/env.sh
+python3 tools/reference_refresh.py --materialize-all --jobs 4
+python3 tools/reference_index.py --all --max-files-per-ref 120
+python3 tools/preflight_check.py --strict-optional
+python3 tools/check_team_parity.py
+```
+
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
 실행하세요.
 
