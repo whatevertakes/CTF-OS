@@ -24,6 +24,11 @@ core.*
 .DS_Store
 ghidra-mcp-cache/
 
+# Keep the challenge/event/category scaffold in Git, but keep individual
+# challenge workspaces local by default.
+challenges/*/*/*
+!challenges/*/*/.gitkeep
+
 # Secrets and challenge-private markers.
 flag
 flag.txt

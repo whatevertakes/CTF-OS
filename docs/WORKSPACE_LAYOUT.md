@@ -129,7 +129,12 @@ hybrid
 ## Git Policy
 
 - Do not commit secrets, flags, tokens, huge dumps, core files, or private keys.
-- Challenge `notes.md`, `state.json`, and `replay.sh` may be tracked locally.
+- `main` tracks the challenge scaffold only through
+  `challenges/<event>/<category>/.gitkeep`; individual challenge workspaces
+  under `challenges/<event>/<category>/<challenge>/` stay local by default.
+- Challenge `notes.md`, `state.json`, and `replay.sh` may be tracked on
+  explicit data/benchmark branches when intentionally sharing sanitized
+  artifacts.
 - `_selftest` challenge artifacts should not be committed.
 - `benchmarks/*.md` and intentional benchmark scripts may be committed.
 
