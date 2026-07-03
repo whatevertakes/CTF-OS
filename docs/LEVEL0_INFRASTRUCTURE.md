@@ -5,7 +5,7 @@ binaries, and cache or environment paths used by this CTF workspace.
 
 ## Current Contract
 
-- Active workspace root: `/home/choijiwng/02_ctf_workspace`
+- Active workspace root: the repository root containing `AGENTS.md`
 - Shell environment entrypoint: `.codex/env.sh`
 - Workspace cache root: `.cache/`
 - Python workspace virtualenv: `.venv/`

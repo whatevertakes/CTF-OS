@@ -14,7 +14,7 @@ Current effective workspace settings:
 - `plan_mode_reasoning_effort = "xhigh"`
 - `approval_policy = "never"`
 - `sandbox_mode = "danger-full-access"`
-- project trust for `/home/choijiwng/02_ctf_workspace` is `trusted`
+- project trust for the localized workspace root is `trusted`
 
 The shell environment policy sets `BASH_ENV` to `.codex/env.sh` and keeps CTF
 workspace caches under `.cache/`.

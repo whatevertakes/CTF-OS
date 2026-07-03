@@ -5,7 +5,8 @@ exists so future agents do not rely on chat history.
 
 ## Level 0 Lessons
 
-- Keep the active workspace rooted at `/home/choijiwng/02_ctf_workspace`.
+- Keep the active workspace rooted at the repository root that contains
+  `AGENTS.md`.
 - Prefer Ubuntu WSL2 plus narrow tooling over a full Kali migration.
 - Docker is required for strict Level 0 closure because many pwn and web
   challenges depend on the provided jail or service topology.

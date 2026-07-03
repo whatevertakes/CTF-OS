@@ -1,7 +1,7 @@
 # CTF Workspace Layout Contract
 
-This document defines the permanent layout contract for
-`/home/choijiwng/02_ctf_workspace`.
+This document defines the permanent layout contract for the repository root
+containing `AGENTS.md`.
 
 ## Root Workspace Role
 
