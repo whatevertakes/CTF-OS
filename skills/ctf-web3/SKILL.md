@@ -9,7 +9,8 @@ outputs:
 - Contract finding, exploit transaction or script, recovered value, and replay evidence.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional Foundry reference; avoid vendoring Echidna.
+- Optional Foundry, forge, cast, anvil, and slither references; avoid vendoring
+  Echidna.
 reference_digest:
 - `docs/reference-digests/web3.md`
 evidence produced:
@@ -26,12 +27,18 @@ workflow:
 - Collect contract source, bytecode, ABI, addresses, chain id, RPC or local fork details, balances, storage, transactions, and challenge goals.
 - Confirm the target is a challenge-owned chain, local fork, or explicitly scoped endpoint.
 - Model storage, access control, invariants, signatures, randomness, block assumptions, and token/accounting flows before exploit scripting.
+- Use slither for static contract checks when source is provided; record exact
+  findings instead of treating scanner output as proof.
+- Use anvil for local fork or challenge-local chain reproduction before live
+  transaction attempts.
 - Build local exploit transactions or scripts first.
 - Preserve transaction input, output, state diff, recovered value, and final verification.
 - Route ordinary cryptographic primitive work to `ctf-crypto` when the contract only supplies parameters.
 first_commands:
 - `forge test` when Foundry project files are provided.
 - `cast call <addr> <sig>` only within challenge scope.
+- `anvil` when a local chain or fork is needed for deterministic proof.
+- `slither .` when contract source is provided and static checks are justified.
 - `python3 work/solve_web3.py`
 - `python3 tools/replay_runner.py <challenge-dir>`
 pointers:

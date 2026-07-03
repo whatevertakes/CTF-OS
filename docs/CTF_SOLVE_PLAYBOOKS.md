@@ -28,6 +28,8 @@ First pass:
 - Hash binaries and supplied libraries.
 - Run `file`, `checksec`, `ldd` when safe, and identify architecture, libc,
   loader, RELRO, NX, PIE, canary, seccomp, and container topology.
+- Use `pwninit` only when the challenge provides a binary, libc, and loader
+  that must be aligned for local reproduction.
 - Reproduce the service locally with the provided Docker or wrapper before
   exploit work.
 - Save initial process transcript and any crash input under `evidence/`.
@@ -38,6 +40,11 @@ Exploit loop:
   allocator state.
 - Promote only evidenced primitives: leak, write, control-flow, sandbox escape,
   format string, heap overlap, UAF, OOB, or race.
+- Use `ROPgadget` or `ropper` after control-flow evidence shows a gadget search
+  is needed; use `one_gadget` only with a matched libc and recorded
+  constraints.
+- Use `seccomp-tools` when seccomp is detected or suspected, and save the
+  policy dump before syscall-chain work.
 - Build `work/exploit_*.py` with deterministic local mode first.
 - Separate local proof from remote proof; capture remote transcripts with
   timing, leak values, retry count, and failure reason.
@@ -54,6 +61,10 @@ First pass:
 
 - Hash artifacts, run `file`, `strings`, architecture detection, imports, and
   packer indicators.
+- Use `floss` when strings are sparse or obfuscated; use `yara` and `upx` when
+  rule matches or packer state affect routing.
+- Use `qemu-*` only for scoped cross-architecture local execution that can be
+  reproduced safely.
 - Identify input format, output format, success predicate, anti-debug checks,
   and high-value functions before opening a broad symbolic search.
 - Save offsets, function names, extracted constants, and commands in notes.
@@ -89,6 +100,15 @@ Branching loop:
 
 - Auth/session: compare roles, cookies, CSRF, JWT fields, reset/invite flows,
   feature flags, and cache boundaries.
+- Parameter discovery: run `arjun` only after route and method baselines exist,
+  then save discovered parameters with the target URL.
+- Flask cookies: use `flask-unsign` only when a Flask signed cookie or secret
+  key hypothesis is evidenced.
+- Filtering and public context: use `wafw00f` when WAF behavior changes probe
+  interpretation, and use `shodan` only for challenge-owned or explicitly
+  scoped public targets.
+- Manual proxying: record Burp Suite or Caido when either GUI materially shapes
+  request construction, comparison, or replay.
 - Source disclosure: test traversal, backup files, template includes, archive
   extraction, XXE, file handlers, and error oracles.
 - Policy oracle: build a table of granted, denied, row-count, timing, and
@@ -119,6 +139,10 @@ Attack loop:
 
 - Classify primitive: RSA, ECC, lattice, PRNG, stream cipher, block mode,
   hash/MAC/signature, commitment, ZK, custom algebra, or protocol oracle.
+- Use `RsaCtfTool` for RSA key/ciphertext cases with concrete public
+  parameters.
+- Use `z3` for explicit finite constraints, `fplll` for lattice reduction, and
+  `gp`/PARI-GP for number-theory calculations when parameters justify them.
 - For oracles, record input, output, error class, timing, rate limit, and query
   budget before adaptive exploitation.
 - Use Sage only when math structure justifies it; keep a Python verifier when
@@ -147,6 +171,12 @@ Analysis loop:
 
 - Split artifact inventory, timeline, carving, memory/network, and crypto
   bridge work.
+- Use `tshark` for packet inventories, filters, and stream reconstruction; use
+  `vol`/Volatility3 for memory dumps only with recorded plugin assumptions.
+- Use `zsteg` or `stegolsb` only when carrier properties suggest bit-plane or
+  LSB extraction.
+- Use `floss`, `yara`, and `upx` on recovered suspicious binaries before
+  routing them to reverse engineering or malware.
 - Reassemble streams and carved files with command logs and provenance.
 - Route recovered binaries, keys, ciphertext, or web traces to the matching
   category only after preserving boundary evidence.
@@ -214,6 +244,8 @@ Analysis loop:
 
 - Test metadata, appended data, archive signatures, bit planes, palettes, audio
   channels, frame deltas, transforms, and text encodings with provenance.
+- Use `zsteg` for PNG/BMP-style channel and bit-plane hypotheses; use
+  `stegolsb` for explicit LSB extraction hypotheses.
 - Rehash recovered payloads and route them to forensics, crypto, rev, or misc as
   soon as they become conventional artifacts.
 
@@ -255,6 +287,8 @@ First pass:
 Analysis loop:
 
 - Use jadx/apktool only when the artifact justifies it.
+- Use `frida-ps` and `frida` only after static findings identify a runtime
+  target and a scoped device or emulator is available.
 - Recover secrets, crypto, API endpoints, local checks, feature gates, and
   native logic with snippets and commands.
 - Replay API or local verifier behavior without device-only state when
@@ -278,6 +312,9 @@ Analysis loop:
 
 - Recover packed layers, configs, decryptors, indicators, and payloads without
   uncontrolled execution.
+- Use `floss`, `yara`, and `upx` for static string, rule, and packer triage;
+  use `tshark` or `vol` when supplied packet or memory artifacts drive behavior
+  claims.
 - Use memory or pcap evidence to model behavior when provided.
 - Validate extracted config or decrypted content with narrow scripts.
 
@@ -299,6 +336,9 @@ Analysis loop:
 
 - Model storage, access control, invariants, signatures, block assumptions,
   randomness, and token/accounting flows.
+- Use `slither` for source-backed static checks, then verify findings through a
+  transaction or state proof.
+- Use `anvil` for local chains or forks before live challenge transactions.
 - Build local exploit transactions or scripts first.
 - Preserve transaction input, output, state diff, and final verification.
 
@@ -323,6 +363,9 @@ Analysis loop:
   deployment paths independently.
 - Container: reproduce runtime behavior, namespace/cgroup state, filesystem
   layout, kernel interfaces, and escape surface locally.
+- Use `crane` or `skopeo` for scoped registry metadata, `syft` for package/SBOM
+  inventory, and `grype` or `trivy` for vulnerability, secret, or
+  misconfiguration clues in challenge-owned images.
 - Preserve sanitized command transcripts and never store real secrets in notes.
 
 Stop or escalate when:

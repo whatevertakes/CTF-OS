@@ -131,7 +131,11 @@ run_optional ropper ropper --version
 run_optional one_gadget one_gadget --version
 run_optional seccomp-tools seccomp-tools --version
 run_optional r2 r2 -v
-run_optional r2mcp-wrapper .codex/bin/r2mcp-codex.sh --help
+if [ -x .codex/bin/r2mcp-codex.sh ]; then
+  printf '%-24s %s\n' "r2mcp-wrapper" ".codex/bin/r2mcp-codex.sh configured"
+else
+  printf '%-24s MISSING\n' "r2mcp-wrapper"
+fi
 run_optional pwninit pwninit --version
 
 echo "== mobile/forensics/math =="

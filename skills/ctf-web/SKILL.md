@@ -13,6 +13,12 @@ dependencies:
 - Optional Playwright MCP for browser interactions.
 - Optional `.codex/bin/tplmap` for SSTI detection and exploitation.
 - Optional `.codex/bin/searchsploit` for CVE and public exploit lookup.
+- Optional arjun for parameter discovery after a route baseline exists.
+- Optional flask-unsign for evidenced Flask signed cookie handling.
+- Optional wafw00f and shodan for scoped fingerprinting and public challenge
+  target context.
+- Optional Burp Suite or Caido as external GUI proxies when manual HTTP
+  inspection materially shapes the solve.
 reference_digest:
 - `docs/reference-digests/web.md`
 evidence produced:
@@ -29,12 +35,23 @@ workflow:
 - Inventory routes, methods, content types, auth/session transitions, upload/render paths, background jobs, and state-changing endpoints.
 - Save representative requests, responses, screenshots, HTML, and JSON under `evidence/` or `work/html/`.
 - Split branches into auth/session, source disclosure, policy oracle, mutation, render/runtime, and SSRF/internal probes.
+- Use arjun only after baseline routes and methods are known; record the target
+  URL, wordlist assumptions, and discovered parameters.
+- Use flask-unsign only when a Flask signed cookie or secret-key hypothesis is
+  evidenced; save the cookie sample and verification command.
+- Use wafw00f for WAF fingerprinting only when filtering behavior affects
+  payload interpretation.
+- Use shodan only for challenge-owned or explicitly scoped public targets, and
+  record the query and access date.
 - Log every state-changing remote action in `work/MUTATION_LEDGER.md` with before, after, target, action, and evidence.
 - Write negative families to `work/ATTEMPT_MATRIX.md`; avoid counting simple encoding variants as new hypotheses.
 - Escalate to rev, pwn, crypto, or jail only when a concrete artifact or behavior changes domain.
 first_commands:
 - `python3 - <<'PY'` with `requests.Session()` for reproducible route inventory when source is not enough.
 - `curl -i <url>` for saved baseline responses.
+- `arjun -u <url>` after baseline route inventory shows unknown parameters.
+- `flask-unsign --decode --cookie <cookie>` when Flask cookie signing is evidenced.
+- `wafw00f <url>` when WAF behavior affects probe interpretation.
 - `.codex/bin/tplmap` only after a concrete template render path exists.
 - `.codex/bin/searchsploit` only when a product/version is evidenced.
 pointers:

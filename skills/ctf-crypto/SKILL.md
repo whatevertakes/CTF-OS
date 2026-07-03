@@ -10,7 +10,8 @@ outputs:
 - Solver script, derived key/plaintext, final command, and reasoning tied to parameters.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional RsaCtfTool or Sage references when required.
+- Optional RsaCtfTool, Sage, z3, fplll, and pari-gp/gp references when
+  required by the observed primitive.
 reference_digest:
 - `docs/reference-digests/crypto.md`
 evidence produced:
@@ -28,12 +29,20 @@ workflow:
 - Normalize numeric values and byte encodings in a local script before choosing an attack.
 - Write the attack assumption in `notes.md`, including primitive, weakness, query model, and verification condition.
 - Separate parameter extraction, oracle modeling, attack implementation, and independent verifier artifacts.
+- Use RsaCtfTool for RSA public-key/modulus cases with known attack families;
+  record the key material and selected attack output.
 - Use Sage only when the math structure justifies it; keep a deterministic Python verifier when possible.
+- Use z3 for explicit finite constraints, fplll for lattice reductions, and
+  gp/pari-gp for number-theory calculations when those primitives are
+  evidenced by parameters.
 - Record oracle input, output, error class, timing, rate limit, and query budget before adaptive exploitation.
 - Save recovered plaintext, key, seed, nonce, or flag proof under `evidence/`, and make `replay.sh` reproduce the final check.
 first_commands:
 - `python3 work/parse_params.py`
+- `RsaCtfTool --publickey <pubkey> --uncipherfile <ciphertext>` when RSA key/ciphertext evidence exists.
 - `sage work/attack.sage` when Sage is justified.
+- `python3 work/solve_z3.py` when an SMT model is justified.
+- `fplll <lattice-file>` or `gp -q < work/attack.gp` when lattice or PARI/GP math is justified.
 - `python3 work/solve.py`
 - `python3 work/verify.py`
 pointers:

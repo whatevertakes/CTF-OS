@@ -10,6 +10,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - kCTF or provider docs as references only.
+- Optional trivy, syft, grype, crane, and skopeo references when cloud evidence
+  includes container images, registries, or manifests.
 reference_digest:
 - `docs/reference-digests/cloud-container.md`
 evidence produced:
@@ -26,12 +28,16 @@ workflow:
 - Freeze authorization boundary, challenge-provided credentials, configs, endpoints, logs, and secret-handling rules.
 - Do not store real secrets in notes or public summaries; sanitize transcripts.
 - Analyze identity policy, metadata, storage, serverless, logs, and deployment paths independently.
+- Use trivy, syft, grype, crane, or skopeo only for challenge-owned image or
+  registry artifacts; route deeper runtime work to `ctf-container`.
 - Use provider CLIs only in owned challenge scope and record exact commands.
 - Route image, pod, or namespace artifacts to `ctf-container`; route web/API behavior to `ctf-web`.
 first_commands:
 - `find dist -maxdepth 3 -type f -print`
 - `sha256sum dist/*`
 - `jq . <config.json>` or `yq . <config.yaml>` when applicable.
+- `crane digest <image>` or `skopeo inspect docker://<image>` for scoped registry artifacts.
+- `trivy image <image>`, `syft <image>`, or `grype <image>` when image evidence is in scope.
 - `python3 tools/proof_validate.py <challenge-dir>`
 pointers:
 - `docs/CTF_SOLVE_PLAYBOOKS.md`
