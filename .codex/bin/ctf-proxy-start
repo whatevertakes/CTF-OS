@@ -52,7 +52,7 @@ export CTF_PROXY_URL="http://${wsl_host}:18086"
 export HTTP_PROXY="\$CTF_PROXY_URL"
 export HTTPS_PROXY="\$CTF_PROXY_URL"
 export ALL_PROXY="\$CTF_PROXY_URL"
-export NO_PROXY="\${NO_PROXY:-localhost,127.0.0.1,::1}"
+export NO_PROXY="\${NO_PROXY:-localhost,127.0.0.1,::1},${wsl_host}"
 EOF
 
 echo "PASS Caido CTF proxy bridge"
