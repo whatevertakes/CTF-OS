@@ -19,7 +19,7 @@ git fetch origin
 git switch --track origin/<github-user>
 ```
 
-현재 팀 브랜치는 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`입니다.
+현재 팀 브랜치는 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`, `lee`입니다.
 
 ## 팀원용 설정
 

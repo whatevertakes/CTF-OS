@@ -233,6 +233,7 @@ local virtualenvs, caches, node_modules, or build output
 shyunseok1029
 holymo-ly
 jiwoongchoi-norun
+lee
 ```
 
 처음 클론한 뒤 자기 브랜치를 체크아웃합니다.

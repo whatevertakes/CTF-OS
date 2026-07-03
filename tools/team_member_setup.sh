@@ -8,6 +8,7 @@ TEAM_BRANCHES=(
   shyunseok1029
   holymo-ly
   jiwoongchoi-norun
+  lee
 )
 DEEP_CHECK=0
 BOOTSTRAP_MINIMAL=0
@@ -31,6 +32,7 @@ usage() {
   shyunseok1029
   holymo-ly
   jiwoongchoi-norun
+  lee
 
 --deep은 고급 CTF 카테고리별 도구 프로필까지 검증합니다.
 EOF
@@ -103,6 +105,7 @@ FAIL 현재 브랜치는 팀원 작업 브랜치가 아닙니다: ${current_bran
   git switch --track origin/shyunseok1029
   git switch --track origin/holymo-ly
   git switch --track origin/jiwoongchoi-norun
+  git switch --track origin/lee
 
 또는:
   tools/team_member_setup.sh --branch <github-user>
