@@ -33,7 +33,9 @@ COMMANDS = (
 )
 PYTHON_MODULES = (
     ("angr", "angr"),
+    ("angr-mcp", "angr.mcp.__main__"),
     ("capstone", "capstone"),
+    ("fastmcp", "fastmcp"),
     ("pwntools", "pwn"),
     ("ropper", "ropper"),
     ("unicorn", "unicorn"),
@@ -84,6 +86,21 @@ def check_docker_runtime() -> int:
         reason = info.stderr.strip().splitlines()[-1] if info.stderr.strip() else "docker info failed"
         print(f"FAIL docker daemon: {reason}")
         return 1
+
+    compose = subprocess.run(
+        ["docker", "compose", "version"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    if compose.returncode == 0:
+        print(f"PASS docker compose v2: {compose.stdout.strip()}")
+    else:
+        reason = compose.stderr.strip().splitlines()[-1] if compose.stderr.strip() else "docker compose failed"
+        print(f"FAIL docker compose v2: {reason}")
+        failures += 1
 
     mounted_file = "tools/version_report.sh"
     run = subprocess.run(

@@ -12,6 +12,7 @@ APT_PACKAGES=(
   curl
   default-jre
   docker.io
+  docker-compose-v2
   file
   gdb
   gcc-avr

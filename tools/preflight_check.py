@@ -230,6 +230,8 @@ PYTHON_MODULES = (
     ("capstone", "capstone"),
     ("pefile", "pefile"),
     ("unicorn", "unicorn"),
+    ("fastmcp", "fastmcp"),
+    ("angr-mcp", "angr.mcp.__main__"),
 )
 
 REQUIRED_SKILL_SECTIONS = (
@@ -337,6 +339,15 @@ def check_commands(reporter: Reporter, *, strict_optional: bool) -> None:
             reporter.fail(f"docker daemon unreachable: {reason}")
         else:
             reporter.warn("docker daemon unreachable")
+
+        compose = run(["docker", "compose", "version"])
+        if compose.returncode == 0 and compose.stdout.strip():
+            reporter.pass_(f"docker compose v2 available {compose.stdout.strip()}")
+        elif strict_optional:
+            reason = compose.stderr.strip().splitlines()[-1] if compose.stderr.strip() else "docker compose failed"
+            reporter.fail(f"docker compose v2 unavailable: {reason}")
+        else:
+            reporter.warn("docker compose v2 unavailable")
 
 
 def requires_avr_toolchain(category: str | None, tags: list[str]) -> bool:

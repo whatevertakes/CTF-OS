@@ -14,3 +14,4 @@ capstone
 pefile
 ropper
 unicorn
+fastmcp
