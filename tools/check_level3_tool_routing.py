@@ -23,36 +23,36 @@ EXPECTED_CATEGORY_TOOLS: dict[str, dict[str, list[str]]] = {
         "skill": ["arjun", "flask-unsign", "wafw00f", "shodan", "sqlmap", "ffuf", "gobuster", "Burp Suite or Caido"],
     },
     "pwn": {
-        "level3": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
-        "skill": ["pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
+        "level3": ["pwndbg-gdb", "pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
+        "skill": ["pwndbg-gdb", "pwninit", "ROPgadget", "ropper", "one_gadget", "seccomp-tools", "patchelf", "qemu-user"],
     },
     "rev": {
-        "level3": ["floss", ".codex/bin/r2", ".codex/bin/angr-mcp", "yara/upx"],
-        "skill": ["floss", "radare2/angr MCP", "yara", "upx"],
+        "level3": ["floss", ".codex/bin/r2", ".codex/bin/angr-mcp", "ghidra/ghidra-analyzeHeadless", "yara/upx"],
+        "skill": ["floss", "Ghidra", "ghidra-analyzeHeadless", "radare2/angr MCP", "yara", "upx"],
     },
     "crypto": {
         "level3": ["RsaCtfTool", "sage", "z3", "fplll", "pari-gp/gp"],
         "skill": ["RsaCtfTool", "Sage", "z3", "fplll", "pari-gp/gp"],
     },
     "forensics": {
-        "level3": ["tshark", "vol/Volatility3", "floss", "zsteg/stegolsb"],
-        "skill": ["tshark", "Volatility3", "floss", "stegolsb", "zsteg"],
+        "level3": ["tshark", "vol/Volatility3", "floss", "Sleuth Kit fls/mmls", "zsteg/stegolsb"],
+        "skill": ["tshark", "Volatility3", "Sleuth Kit", "fls", "mmls", "floss", "stegolsb", "zsteg"],
     },
     "stego": {
-        "level3": ["steghide", "zsteg", "stegolsb"],
-        "skill": ["steghide", "zsteg", "stegolsb"],
+        "level3": ["steghide/stegseek", "zsteg", "stegolsb"],
+        "skill": ["steghide", "stegseek", "zsteg", "stegolsb"],
     },
     "mobile": {
-        "level3": ["jadx", "apktool", "frida/frida-ps"],
-        "skill": ["jadx", "apktool", "frida"],
+        "level3": ["jadx", "apktool", "adb", "objection", "frida/frida-ps"],
+        "skill": ["jadx", "apktool", "adb", "objection", "frida"],
     },
     "malware": {
         "level3": ["floss", "yara", "upx", ".codex/bin/r2", ".codex/bin/angr-mcp", "vol/Volatility3", "tshark"],
         "skill": ["floss", "yara", "upx", "radare2/angr MCP", "Volatility3", "tshark"],
     },
     "web3": {
-        "level3": ["forge", "cast", "anvil", "chisel", "solc", "slither"],
-        "skill": ["forge", "cast", "anvil", "chisel", "solc", "slither"],
+        "level3": ["forge", "cast", "anvil", "chisel", "solc", "slither", "halmos"],
+        "skill": ["forge", "cast", "anvil", "chisel", "solc", "slither", "halmos"],
     },
     "cloud": {
         "level3": ["kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
@@ -61,6 +61,18 @@ EXPECTED_CATEGORY_TOOLS: dict[str, dict[str, list[str]]] = {
     "container": {
         "level3": ["docker", "kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
         "skill": ["docker", "kubectl", "trivy", "syft", "grype", "crane", "skopeo"],
+    },
+    "ai-ml": {
+        "level3": ["garak"],
+        "skill": ["garak"],
+    },
+    "hardware-rf": {
+        "level3": ["URH/gnuradio"],
+        "skill": ["GNU Radio", "URH"],
+    },
+    "side-channel": {
+        "level3": ["gnuradio"],
+        "skill": ["GNU Radio"],
     },
 }
 

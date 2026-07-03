@@ -173,6 +173,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("binwalk", ("binwalk", "--help")),
         ("exiftool", ("exiftool", "-ver")),
         ("foremost", ("foremost", "-V")),
+        ("sleuthkit-mmls", ("mmls", "-V")),
         ("floss", ("floss", "--version")),
         ("stegolsb", ("stegolsb", "--version")),
         ("zsteg", ("zsteg", "--help")),
@@ -189,10 +190,13 @@ DEEP_CATEGORY_COMMANDS = {
     "mobile": (
         ("jadx", ("jadx", "--version")),
         ("apktool", ("apktool", "--version")),
+        ("adb", ("adb", "version")),
+        ("objection", ("objection", "version")),
         ("frida", ("frida", "--version")),
         ("frida-ps", ("frida-ps", "--version")),
     ),
     "pwn": (
+        ("pwndbg-gdb", ("pwndbg-gdb", "--batch", "-ex", "pi import pwndbg; print('pwndbg')")),
         ("pwninit", ("pwninit", "--version")),
         ("patchelf", ("patchelf", "--version")),
         ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
@@ -202,6 +206,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
     ),
     "rev": (
+        ("ghidra-check", ("ghidra-check",)),
         ("objdump", ("objdump", "--version")),
         ("strings", ("strings", "--version")),
         ("floss", ("floss", "--version")),
@@ -227,6 +232,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("exiftool", ("exiftool", "-ver")),
         ("binwalk", ("binwalk", "--help")),
         ("steghide", ("steghide", "--version")),
+        ("stegseek", ("stegseek", "--version")),
         ("stegolsb", ("stegolsb", "--version")),
         ("zsteg", ("zsteg", "--help")),
     ),
@@ -246,6 +252,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("chisel", ("chisel", "--version")),
         ("solc", ("solc", "--version")),
         ("slither", ("slither", "--version")),
+        ("halmos", ("halmos", "--version")),
     ),
     "cloud": (
         ("kubectl", ("kubectl", "version", "--client=true", "--output=yaml")),
@@ -262,6 +269,16 @@ DEEP_CATEGORY_COMMANDS = {
         ("grype", ("grype", "version")),
         ("crane", ("crane", "version")),
         ("skopeo", ("skopeo", "--version")),
+    ),
+    "ai-ml": (
+        ("garak", ("garak", "--version")),
+    ),
+    "hardware-rf": (
+        ("gnuradio", ("gnuradio-config-info", "-v")),
+        ("urh", ("urh", "--version")),
+    ),
+    "side-channel": (
+        ("gnuradio", ("gnuradio-config-info", "-v")),
     ),
 }
 

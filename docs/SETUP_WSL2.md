@@ -113,6 +113,25 @@ commit/snapshot 기준 자료를 내려받아야 합니다.
 tools/team_member_setup.sh --deep
 ```
 
+고급 문제용 대형 도구까지 설치하려면 다음을 사용합니다. 이 installer는
+`pwndbg`, Ghidra, Sleuth Kit, `stegseek`, `adb`/`objection`, `halmos`, `garak`,
+GNU Radio, URH를 user-local 경로와 apt 패키지로 구성합니다.
+
+```bash
+tools/install_advanced_ctf_tools.sh
+. .codex/env.sh
+python3 tools/preflight_check.py --deep --category pwn
+python3 tools/preflight_check.py --deep --category rev
+python3 tools/preflight_check.py --deep --category mobile
+python3 tools/preflight_check.py --deep --category web3
+python3 tools/preflight_check.py --deep --category ai-ml
+python3 tools/preflight_check.py --deep --category hardware-rf
+```
+
+`garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI
+문제가 아니라면 `tools/install_advanced_ctf_tools.sh --skip-garak`으로 건너뛸
+수 있습니다.
+
 시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
 ```bash

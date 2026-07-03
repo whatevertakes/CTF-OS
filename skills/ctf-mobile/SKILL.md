@@ -9,7 +9,8 @@ outputs:
 - Artifact inventory, static findings, recovered secrets or logic, and replayable proof.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional jadx, apktool, frida, and frida-ps references when required.
+- Optional jadx, apktool, adb, objection, frida, and frida-ps references when
+  required.
 reference_digest:
 - `docs/reference-digests/mobile.md`
 evidence produced:
@@ -26,6 +27,9 @@ workflow:
 - Hash APK, IPA, source, app data, logs, and traffic artifacts.
 - Extract manifests, resources, signing information, package names, URLs, native libraries, storage paths, and permissions.
 - Use jadx, apktool, strings, and local scripts only when the artifact justifies them.
+- Use adb only for scoped local devices or emulators, and record device state
+  before mutation.
+- Use objection only after a concrete runtime instrumentation target is known.
 - Use frida-ps and frida only after static evidence identifies runtime-only
   logic or instrumentation targets; record package/process names and scripts.
 - Recover secrets, crypto, API endpoints, feature gates, native checks, and local verifier logic with snippets and commands.
@@ -36,6 +40,8 @@ first_commands:
 - `sha256sum dist/*`
 - `jadx -d work/jadx <apk>` when APK analysis is justified.
 - `apktool d -o work/apktool <apk>` when resource/smali analysis is justified.
+- `adb devices` when a scoped device or emulator is required.
+- `objection --gadget <package> explore` when runtime instrumentation is justified.
 - `frida-ps -Uai` when a scoped device or emulator is available and dynamic instrumentation is justified.
 pointers:
 - `docs/CTF_SOLVE_PLAYBOOKS.md`

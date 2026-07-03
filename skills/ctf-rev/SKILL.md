@@ -33,6 +33,8 @@ workflow:
   plausible; save recovered strings that drive hypotheses.
 - Use yara and upx checks when packer, malware-like, or known-family
   indicators matter; keep rule names and unpacking commands with hashes.
+- Use Ghidra or ghidra-analyzeHeadless when decompiler-level structure,
+  references, or batch import materially improves static evidence.
 - Use qemu-user only for cross-architecture local behavior that can be safely
   reproduced from the challenge artifact.
 - Identify input format, success predicate, output format, anti-debug checks, high-value functions, and extracted constants.
@@ -46,6 +48,7 @@ first_commands:
 - `strings -a <binary> | head`
 - `floss <binary>` when obfuscated strings are suspected.
 - `upx -t <binary>` or `yara -r <rules> <binary>` when packer or rule evidence is relevant.
+- `ghidra-analyzeHeadless <project-dir> <project> -import <binary>` when batch decompilation/import is justified.
 - `qemu-<arch> <binary>` when cross-architecture local execution is justified and safe.
 - `r2 -A <binary>` when radare2 is justified by the artifact.
 pointers:

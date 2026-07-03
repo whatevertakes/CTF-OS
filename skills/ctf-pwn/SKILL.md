@@ -11,8 +11,8 @@ outputs:
 dependencies:
 - `skills/ctf-triage/SKILL.md`
 - Optional pwntools, debugger, ROPgadget, ropper, one_gadget,
-  seccomp-tools, pwninit, patchelf, qemu-user, and Docker references when the
-  challenge requires them.
+  seccomp-tools, pwninit, pwndbg-gdb, patchelf, qemu-user, and Docker
+  references when the challenge requires them.
 reference_digest:
 - `docs/reference-digests/pwn.md`
 evidence produced:
@@ -37,6 +37,8 @@ workflow:
   policy before building sandbox escape or syscall chains.
 - Use pwninit only to align a provided binary, libc, and loader; do not let it
   replace recorded environment facts.
+- Use pwndbg-gdb when interactive heap, stack, register, or exploit-state
+  inspection is needed; preserve reproduced commands and crash facts.
 - Use patchelf only to reproduce a provided loader/libc environment locally;
   record original interpreter/RPATH before changing a copy.
 - Use qemu-user only when architecture mismatch blocks local reproduction, and
@@ -52,6 +54,7 @@ first_commands:
 - `ROPgadget --binary <binary>` or `ropper --file <binary>` after a ROP need is evidenced.
 - `seccomp-tools dump <binary>` when seccomp is detected or suspected.
 - `pwninit --bin <binary> --libc <libc> --ld <loader>` when matching runtime files are provided.
+- `pwndbg-gdb <binary>` when interactive exploit debugging is justified.
 - `patchelf --print-interpreter <binary>` before patching a local copy.
 - `qemu-<arch> <binary>` when cross-architecture local execution is justified and safe.
 - `python3 work/exploit_*.py LOCAL=1`

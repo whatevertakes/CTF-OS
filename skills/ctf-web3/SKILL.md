@@ -9,8 +9,8 @@ outputs:
 - Contract finding, exploit transaction or script, recovered value, and replay evidence.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional Foundry, forge, cast, anvil, chisel, solc, and slither references;
-  avoid vendoring Echidna.
+- Optional Foundry, forge, cast, anvil, chisel, solc, slither, and halmos
+  references; avoid vendoring Echidna.
 reference_digest:
 - `docs/reference-digests/web3.md`
 evidence produced:
@@ -31,6 +31,8 @@ workflow:
   findings instead of treating scanner output as proof.
 - Use solc or chisel only for local compile/REPL checks tied to provided source
   or bytecode.
+- Use halmos for bounded symbolic checking only after source and invariants are
+  clear enough to make the result interpretable.
 - Use anvil for local fork or challenge-local chain reproduction before live
   transaction attempts.
 - Build local exploit transactions or scripts first.
@@ -40,6 +42,7 @@ first_commands:
 - `forge test` when Foundry project files are provided.
 - `cast call <addr> <sig>` only within challenge scope.
 - `solc --bin --abi <contract.sol>` when direct compilation is needed.
+- `halmos` when source-backed symbolic checks are justified.
 - `chisel` for bounded local Solidity REPL checks, not as proof by itself.
 - `anvil` when a local chain or fork is needed for deterministic proof.
 - `slither .` when contract source is provided and static checks are justified.

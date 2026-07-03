@@ -10,8 +10,8 @@ outputs:
 - Artifact inventory, hashes, extraction commands, recovered files, and next-step routing.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- Optional Volatility3, carving, tshark, floss, stegolsb, zsteg, yara, and upx
-  references when required by the artifact type.
+- Optional Volatility3, Sleuth Kit, carving, tshark, floss, stegolsb,
+  zsteg, yara, and upx references when required by the artifact type.
 reference_digest:
 - `docs/reference-digests/forensics.md`
 evidence produced:
@@ -33,6 +33,8 @@ workflow:
   reassembled output paths.
 - Use Volatility3/vol only for memory artifacts with compatible symbols or
   profiles; record plugin names and assumptions.
+- Use Sleuth Kit tools such as `mmls` and `fls` for disk images before carving,
+  and record partition offsets for reproducible extraction.
 - Use zsteg or stegolsb only when carrier properties point to bit-plane or LSB
   extraction, and preserve recovered payload hashes.
 - Use floss, yara, and upx when recovered binaries or suspicious scripts need
@@ -45,6 +47,7 @@ first_commands:
 - `sha256sum dist/*`
 - `tshark -r <pcap> -q -z io,phs` for packet captures.
 - `vol -f <memory> windows.info` or another scoped Volatility3 plugin for memory dumps.
+- `mmls <disk-image>` and `fls -o <offset> <disk-image>` for filesystem images.
 - `zsteg <carrier>` or `stegolsb steglsb -r -i <carrier> -o work/recovered.bin` when LSB evidence exists.
 - `floss <sample>`, `yara -r <rules> <sample>`, or `upx -t <sample>` for recovered suspicious binaries.
 - `python3 tools/replay_runner.py <challenge-dir>` after a replay path exists.

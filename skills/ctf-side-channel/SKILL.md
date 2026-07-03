@@ -9,7 +9,7 @@ outputs:
 - Leakage model, analysis script, recovered secret, and replayable validation.
 dependencies:
 - `skills/ctf-triage/SKILL.md`
-- ChipWhisperer references only when useful.
+- GNU Radio and ChipWhisperer references only when useful.
 reference_digest:
 - `docs/reference-digests/hardware-rf-side-channel.md`
 evidence produced:
@@ -26,11 +26,14 @@ workflow:
 - Inventory raw traces, timing logs, oracle behavior, sample counts, metadata, source code, and hypotheses.
 - Preserve raw measurements unchanged; write analysis scripts and derived data under `work/`.
 - Define timing, power, cache, fault, or statistical leakage model with confidence and sample-size notes.
+- Use GNU Radio only when traces are RF/signal captures rather than ordinary
+  timing tables.
 - Run bounded analysis and avoid claiming recovered secrets without independent deterministic verification.
 - Route recovered parameters or cryptographic material to `ctf-crypto` after preserving trace evidence.
 first_commands:
 - `file dist/*`
 - `sha256sum dist/*`
+- `gnuradio-config-info -v` when RF/signal tooling is required.
 - `python3 work/analyze_traces.py`
 - `python3 work/verify_secret.py`
 pointers:
