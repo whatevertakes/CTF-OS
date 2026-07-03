@@ -177,6 +177,10 @@ Windows portproxy <WSL vEthernet IP>:18086 -> 127.0.0.1:18086
 Windows portproxy <WSL vEthernet IP>:18087 -> 127.0.0.1:18087
 ```
 
+Caido CLI가 설치되어 있지 않으면 `ctf-proxy-start`가 최신 Windows CLI를
+`%LOCALAPPDATA%\ctf-workspace\caido-cli`에 내려받아 사용합니다. 설치 다운로드가
+실패하면 Windows 인터넷 연결과 GitHub/Caido download 접근을 확인하세요.
+
 프록시가 필요 없는 replay나 benchmark에서는 현재 셸에서만 끕니다.
 
 ```bash

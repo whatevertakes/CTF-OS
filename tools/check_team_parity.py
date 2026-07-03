@@ -240,10 +240,28 @@ def check_proxy_helpers() -> int:
             print(f"FAIL web proxy helper executable {relative}")
             failures += 1
 
-    if shutil.which("caido-cli"):
+    caido_paths = (
+        Path("/mnt/c/Program Files/Caido/resources/bin/caido-cli.exe"),
+        Path("/mnt/c/Program Files (x86)/Caido/resources/bin/caido-cli.exe"),
+    )
+    local_caido = subprocess.run(
+        [
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            "-NoProfile",
+            "-Command",
+            'Test-Path "$env:LOCALAPPDATA\\ctf-workspace\\caido-cli\\caido-cli.exe"',
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    has_local_caido = local_caido.returncode == 0 and "True" in local_caido.stdout
+    if shutil.which("caido-cli") or any(path.is_file() for path in caido_paths) or has_local_caido:
         print("PASS web proxy bridge backend caido-cli")
     else:
-        print("WARN web proxy bridge backend caido-cli: missing")
+        print("WARN web proxy bridge backend caido-cli: missing; ctf-proxy-start will install it")
     return failures
 
 

@@ -19,16 +19,62 @@ if [ -z "$wsl_host" ]; then
   exit 1
 fi
 
-"$POWERSHELL" -NoProfile -Command \
-  '$exe="C:\Program Files\Caido\resources\bin\caido-cli.exe";
-   if (-not (Test-Path $exe)) { Write-Error "Caido CLI not found"; exit 1 }
-   $data="$env:LOCALAPPDATA\Temp\caido-ctf-proxy";
-   New-Item -ItemType Directory -Force -Path $data | Out-Null;
-   $listening = netstat -ano | Select-String "127.0.0.1:18086";
-   if (-not $listening) {
-     Start-Process -FilePath $exe -ArgumentList @("--no-open","--no-sync","--allow-guests","--proxy-listen","127.0.0.1:18086","--ui-listen","127.0.0.1:18087","--data-path",$data) -WindowStyle Minimized;
-     Start-Sleep -Seconds 2;
-   }'
+caido_ps1="$(mktemp --suffix=.ps1)"
+trap 'rm -f "$caido_ps1"' EXIT
+cat >"$caido_ps1" <<'PS1'
+$ErrorActionPreference = "Stop"
+
+function Find-CaidoCli {
+  $candidates = @(
+    "$env:LOCALAPPDATA\ctf-workspace\caido-cli\caido-cli.exe",
+    "C:\Program Files\Caido\resources\bin\caido-cli.exe",
+    "C:\Program Files (x86)\Caido\resources\bin\caido-cli.exe"
+  )
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) { return $candidate }
+  }
+  $command = Get-Command caido-cli.exe -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+  return $null
+}
+
+function Install-CaidoCli {
+  $installDir = "$env:LOCALAPPDATA\ctf-workspace\caido-cli"
+  New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+  $release = (Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/caido/caido/releases/latest").Content
+  $pattern = 'https://caido\.download/releases/[^"<> ]+/caido-cli-[^"<> ]+-win-x86_64\.zip'
+  $match = [regex]::Match($release, $pattern)
+  if (-not $match.Success) {
+    throw "Could not find latest Caido CLI Windows download URL"
+  }
+  $zip = Join-Path $env:TEMP "caido-cli-win-x86_64.zip"
+  $extract = Join-Path $env:TEMP ("caido-cli-" + [guid]::NewGuid().ToString("N"))
+  Invoke-WebRequest -UseBasicParsing -Uri $match.Value -OutFile $zip
+  New-Item -ItemType Directory -Force -Path $extract | Out-Null
+  Expand-Archive -Force -Path $zip -DestinationPath $extract
+  $downloaded = Get-ChildItem -Path $extract -Filter "caido-cli.exe" -Recurse | Select-Object -First 1
+  if (-not $downloaded) { throw "Downloaded Caido CLI archive did not contain caido-cli.exe" }
+  Copy-Item -Force $downloaded.FullName (Join-Path $installDir "caido-cli.exe")
+  Remove-Item -Force $zip -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
+  return Join-Path $installDir "caido-cli.exe"
+}
+
+$exe = Find-CaidoCli
+if (-not $exe) {
+  Write-Output "Caido CLI not found; installing latest Windows CLI to LOCALAPPDATA"
+  $exe = Install-CaidoCli
+}
+
+$data = "$env:LOCALAPPDATA\Temp\caido-ctf-proxy"
+New-Item -ItemType Directory -Force -Path $data | Out-Null
+$listening = netstat -ano | Select-String "127.0.0.1:18086"
+if (-not $listening) {
+  Start-Process -FilePath $exe -ArgumentList @("--no-open","--no-sync","--allow-guests","--proxy-listen","127.0.0.1:18086","--ui-listen","127.0.0.1:18087","--data-path",$data) -WindowStyle Minimized
+  Start-Sleep -Seconds 2
+}
+PS1
+"$POWERSHELL" -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$caido_ps1")"
 
 "$NETSH" interface portproxy delete v4tov4 "listenaddress=$wsl_host" listenport=18086 >/dev/null 2>&1 || true
 "$NETSH" interface portproxy delete v4tov4 "listenaddress=$wsl_host" listenport=18087 >/dev/null 2>&1 || true

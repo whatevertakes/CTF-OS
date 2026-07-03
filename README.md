@@ -67,10 +67,11 @@ ctf-proxy-start
 ctf-proxy-check
 ```
 
-`ctf-proxy-start`는 Windows Caido CLI를 CTF 전용 포트로 띄우고 WSL에서 접근할
-수 있도록 Windows portproxy/firewall rule을 설정합니다. Caido UI에서 프로젝트를
-생성하거나 선택해야 실제 프록시 중계가 됩니다. 프록시를 끄고 빠른 replay를
-돌릴 때는 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`를 실행하세요.
+`ctf-proxy-start`는 Windows Caido CLI가 없으면 최신 Windows CLI를
+`%LOCALAPPDATA%\ctf-workspace\caido-cli`에 설치한 뒤 CTF 전용 포트로 띄우고,
+WSL에서 접근할 수 있도록 Windows portproxy/firewall rule을 설정합니다. Caido
+UI에서 프로젝트를 생성하거나 선택해야 실제 프록시 중계가 됩니다. 프록시를 끄고
+빠른 replay를 돌릴 때는 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`를 실행하세요.
 
 설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
 실행하세요.
