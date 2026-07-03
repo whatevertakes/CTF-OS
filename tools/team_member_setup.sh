@@ -162,7 +162,7 @@ fi
 
 if [ "$DEEP_CHECK" -eq 1 ]; then
   echo "== 고급 CTF deep profile 검증 =="
-  for category in crypto forensics malware mobile pwn rev misc programming web3 cloud container; do
+  for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container; do
     echo "-- $category --"
     python3 tools/preflight_check.py --deep --category "$category" | grep -E '^(PASS deep|WARN deep|summary)'
   done

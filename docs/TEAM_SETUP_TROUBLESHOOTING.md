@@ -47,6 +47,8 @@ radare2
 ```
 
 이 로컬 stdio MCP 서버에서 `Auth Unsupported`가 표시되는 것은 정상입니다.
+`mcp`, `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 CLI 유틸리티이며 이 목록에
+별도 서버로 나타나지 않는 것이 정상입니다.
 
 ## 버전 보고서
 
@@ -112,6 +114,56 @@ tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
 
 현재 `main`은 `angr-mcp`의 FastMCP 시작 배너를 억제합니다. 이 env 설정이
 없으면 stdio handshaking이 실패할 수 있습니다.
+
+### `mcp` prints `typer is required`
+
+다음을 실행합니다.
+
+```bash
+tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+. .codex/env.sh
+mcp --help
+```
+
+`requirements.txt`는 `mcp[cli]`와 `fastmcp`를 함께 설치합니다. 이전 venv가
+남아 있으면 `mcp` 명령만 있고 CLI extra가 빠진 상태가 될 수 있습니다.
+
+### `mcp-reverse-proxy` import error
+
+다음을 실행합니다.
+
+```bash
+tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+. .codex/env.sh
+mcp-reverse-proxy --version
+```
+
+현재 기준은 `mcp-proxy`입니다. bootstrap은 과거 `mcp-reverse-proxy` 진입점이
+깨져 있으면 같은 CLI 표면을 유지하는 compatibility wrapper를 생성합니다.
+
+### `RsaCtfTool` starts but crashes
+
+다음을 실행합니다.
+
+```bash
+tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+RsaCtfTool --help
+```
+
+`RsaCtfTool`은 메인 `.venv`에 직접 넣지 않고 별도 venv로 격리합니다. 이 도구의
+고정 dependency가 일반 HTTP/crypto 패키지를 다운그레이드할 수 있기 때문입니다.
+
+### `shodan` cannot import `pkg_resources`
+
+다음을 실행합니다.
+
+```bash
+python3 -m pip install -r requirements.txt
+shodan version
+```
+
+`requirements.txt`는 `setuptools<81`을 고정합니다. 최신 setuptools에서는
+`pkg_resources`가 빠져 `shodan` CLI가 실패할 수 있습니다.
 
 ### `. .codex/env.sh` prints nothing
 

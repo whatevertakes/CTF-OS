@@ -35,8 +35,9 @@ cd <workspace-dir>
 tools/team_member_setup.sh
 ```
 
-이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP,
-리버싱 도구 표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
+이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
+유틸리티 CLI, CTF 카테고리별 CLI 도구 표면을 설치하며, `.venv`와
+`requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
 `.codex/config.toml`을 생성하고, strict preflight, team parity, `codex mcp
 list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 팀 설정
@@ -58,6 +59,8 @@ team parity summary failures=0
 
 `codex mcp list`에는 `angr`, `playwright`, `radare2`가 표시되어야 합니다. 이
 로컬 stdio MCP 서버에서 `Auth Unsupported`가 표시되는 것은 정상입니다.
+`mcp`, `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 서버 등록 항목이 아니라
+CLI 유틸리티로 점검합니다.
 
 깔끔한 버전 보고서를 보려면 다음을 실행합니다.
 
@@ -79,6 +82,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -U pip setuptools wheel
 python -m pip install -r requirements.txt
+tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
 ```
 
 워크스페이스를 검증합니다.

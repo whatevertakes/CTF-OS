@@ -42,6 +42,7 @@ PARITY_APT_CANDIDATES=(
 )
 JADX_VERSION="1.5.5"
 APKTOOL_VERSION="3.0.2"
+PWNINIT_VERSION="3.3.1"
 
 usage() {
   cat <<'EOF'
@@ -101,6 +102,10 @@ install_available_apt_packages() {
   fi
 }
 
+command_succeeds() {
+  timeout 30 "$@" >/dev/null 2>&1
+}
+
 install_jadx_fallback() {
   if command -v jadx >/dev/null 2>&1; then
     return 0
@@ -146,6 +151,55 @@ install_radare2_fallback() {
   fi
 }
 
+install_rsactftool_fallback() {
+  if command_succeeds RsaCtfTool --help; then
+    return 0
+  fi
+
+  local dest="$HOME/.local/opt/ctf-tools/rsactftool"
+  mkdir -p "$dest" "$HOME/.local/bin"
+  "$PYTHON" -m venv "$dest/.venv"
+  "$dest/.venv/bin/python" -m pip install -U pip "setuptools<81" wheel
+  "$dest/.venv/bin/python" -m pip install -U "git+https://github.com/RsaCtfTool/RsaCtfTool.git"
+  cat >"$HOME/.local/bin/RsaCtfTool" <<EOF
+#!/usr/bin/env bash
+exec "$dest/.venv/bin/RsaCtfTool" "\$@"
+EOF
+  chmod +x "$HOME/.local/bin/RsaCtfTool"
+}
+
+install_pwninit_fallback() {
+  if command_succeeds pwninit --version; then
+    return 0
+  fi
+
+  mkdir -p "$HOME/.local/bin" "$ROOT/.cache/tools"
+  curl -L \
+    "https://github.com/io12/pwninit/releases/download/$PWNINIT_VERSION/pwninit" \
+    -o "$ROOT/.cache/tools/pwninit-$PWNINIT_VERSION"
+  install -m 0755 "$ROOT/.cache/tools/pwninit-$PWNINIT_VERSION" "$HOME/.local/bin/pwninit"
+}
+
+install_mcp_reverse_proxy_compat() {
+  mkdir -p "$HOME/.local/bin"
+  write_mcp_reverse_proxy_wrapper "$HOME/.local/bin/mcp-reverse-proxy"
+  if [ -d "$ROOT/.venv/bin" ]; then
+    write_mcp_reverse_proxy_wrapper "$ROOT/.venv/bin/mcp-reverse-proxy"
+  fi
+}
+
+write_mcp_reverse_proxy_wrapper() {
+  local wrapper="$1"
+  cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+if [ -x "$ROOT/.venv/bin/mcp-proxy" ]; then
+  exec "$ROOT/.venv/bin/mcp-proxy" "\$@"
+fi
+exec mcp-proxy "\$@"
+EOF
+  chmod +x "$wrapper"
+}
+
 install_team_parity_tools() {
   if [ "$SKIP_APT" -eq 0 ]; then
     install_available_apt_packages "${PARITY_APT_CANDIDATES[@]}"
@@ -158,13 +212,19 @@ install_team_parity_tools() {
     if ! command -v seccomp-tools >/dev/null 2>&1; then
       sudo gem install seccomp-tools
     fi
+    if ! command -v zsteg >/dev/null 2>&1; then
+      sudo gem install zsteg
+    fi
   else
-    echo "WARN gem을 사용할 수 없어 one_gadget과 seccomp-tools를 설치하지 못했습니다." >&2
+    echo "WARN gem을 사용할 수 없어 one_gadget, seccomp-tools, zsteg를 설치하지 못했습니다." >&2
   fi
 
   install_jadx_fallback
   install_apktool_fallback
   install_radare2_fallback
+  install_rsactftool_fallback
+  install_pwninit_fallback
+  install_mcp_reverse_proxy_compat
 }
 
 if [ "$SKIP_APT" -eq 0 ]; then

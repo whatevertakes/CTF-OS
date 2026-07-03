@@ -30,6 +30,9 @@ Configured MCP servers:
 Reverse-engineering MCP tools should be reached through `.codex/bin/` wrappers
 when possible, matching the workspace `AGENTS.md` contract.
 
+`mcp`, `fastmcp`, `mcp-proxy`, and `mcp-reverse-proxy` are installed and checked
+as CLI utilities. They are not separate Codex MCP server registrations.
+
 ## Config Preflight
 
 `tools/preflight_check.py` validates the Level 1 invariants that affected the

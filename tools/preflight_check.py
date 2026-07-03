@@ -112,6 +112,10 @@ OPTIONAL_COMMANDS = (
     "npx",
     "gcc",
     "gdb",
+    "mcp",
+    "fastmcp",
+    "mcp-proxy",
+    "mcp-reverse-proxy",
     "r2",
     "angr-mcp",
     "checksec",
@@ -123,15 +127,48 @@ OPTIONAL_COMMANDS = (
     "apktool",
     "sage",
     "tshark",
+    "RsaCtfTool",
+    "arjun",
+    "flask-unsign",
+    "floss",
+    "frida",
+    "frida-ps",
+    "shodan",
+    "stegolsb",
+    "zsteg",
+    "wafw00f",
+    "pwninit",
 )
+
+OPTIONAL_COMMAND_CHECKS = {
+    "mcp": ("mcp", "--help"),
+    "fastmcp": ("fastmcp", "--version"),
+    "mcp-proxy": ("mcp-proxy", "--version"),
+    "mcp-reverse-proxy": ("mcp-reverse-proxy", "--version"),
+    "RsaCtfTool": ("RsaCtfTool", "--help"),
+    "arjun": ("arjun", "-h"),
+    "flask-unsign": ("flask-unsign", "--version"),
+    "floss": ("floss", "--version"),
+    "frida": ("frida", "--version"),
+    "frida-ps": ("frida-ps", "--version"),
+    "shodan": ("shodan", "version"),
+    "stegolsb": ("stegolsb", "--version"),
+    "zsteg": ("zsteg", "--help"),
+    "wafw00f": ("wafw00f", "--version"),
+    "pwninit": ("pwninit", "--version"),
+}
 
 DEEP_CATEGORY_COMMANDS = {
     "crypto": (
+        ("RsaCtfTool", ("RsaCtfTool", "--help")),
         ("z3", ("z3", "--version")),
         ("fplll", ("fplll", "--version")),
         ("pari-gp", ("gp", "--version")),
     ),
     "forensics": (
+        ("floss", ("floss", "--version")),
+        ("stegolsb", ("stegolsb", "--version")),
+        ("zsteg", ("zsteg", "--help")),
         ("yara", ("yara", "--version")),
         ("upx", ("upx", "--version")),
         ("sleuthkit-fls", ("fls", "-V")),
@@ -145,8 +182,11 @@ DEEP_CATEGORY_COMMANDS = {
     "mobile": (
         ("jadx", ("jadx", "--version")),
         ("apktool", ("apktool", "--version")),
+        ("frida", ("frida", "--version")),
+        ("frida-ps", ("frida-ps", "--version")),
     ),
     "pwn": (
+        ("pwninit", ("pwninit", "--version")),
         ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
         ("qemu-user-aarch64", ("qemu-aarch64", "--version")),
         ("qemu-system-x86_64", ("qemu-system-x86_64", "--version")),
@@ -154,6 +194,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("qemu-system-aarch64", ("qemu-system-aarch64", "--version")),
     ),
     "rev": (
+        ("floss", ("floss", "--version")),
         ("yara", ("yara", "--version")),
         ("upx", ("upx", "--version")),
         ("qemu-user-x86_64", ("qemu-x86_64", "--version")),
@@ -171,6 +212,16 @@ DEEP_CATEGORY_COMMANDS = {
     ),
     "programming": (
         ("z3", ("z3", "--version")),
+    ),
+    "stego": (
+        ("stegolsb", ("stegolsb", "--version")),
+        ("zsteg", ("zsteg", "--help")),
+    ),
+    "web": (
+        ("arjun", ("arjun", "-h")),
+        ("flask-unsign", ("flask-unsign", "--version")),
+        ("shodan", ("shodan", "version")),
+        ("wafw00f", ("wafw00f", "--version")),
     ),
     "web3": (
         ("forge", ("forge", "--version")),
@@ -230,8 +281,17 @@ PYTHON_MODULES = (
     ("capstone", "capstone"),
     ("pefile", "pefile"),
     ("unicorn", "unicorn"),
+    ("mcp", "mcp"),
     ("fastmcp", "fastmcp"),
+    ("mcp-proxy", "mcp_proxy"),
     ("angr-mcp", "angr.mcp.__main__"),
+    ("arjun", "arjun"),
+    ("flask-unsign", "flask_unsign"),
+    ("flare-floss", "floss"),
+    ("frida-tools", "frida"),
+    ("shodan", "shodan"),
+    ("stego-lsb", "stego_lsb"),
+    ("wafw00f", "wafw00f"),
 )
 
 REQUIRED_SKILL_SECTIONS = (
@@ -325,6 +385,15 @@ def check_commands(reporter: Reporter, *, strict_optional: bool) -> None:
     for command in OPTIONAL_COMMANDS:
         if shutil.which(command):
             reporter.pass_(f"optional command {command}")
+            check = OPTIONAL_COMMAND_CHECKS.get(command)
+            if check:
+                ok, detail = command_version_line(check)
+                if ok:
+                    reporter.pass_(f"optional command check {command}: {detail}")
+                elif strict_optional:
+                    reporter.fail(f"optional command check failed {command}: {detail}")
+                else:
+                    reporter.warn(f"optional command check failed {command}: {detail}")
         elif strict_optional:
             reporter.fail(f"missing optional command {command}")
         else:

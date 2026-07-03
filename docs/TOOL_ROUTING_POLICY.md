@@ -17,6 +17,20 @@ attempt. It is an observability contract, not an enforcement layer.
 - Retrospective inferences must be marked as retrospective. Do not present a
   later reconstruction as live-session evidence.
 
+## MCP Boundary
+
+Configured Codex MCP servers are `angr`, `playwright`, and `radare2`.
+Reverse-engineering MCP access should continue to use the `.codex/bin/`
+wrappers configured in `.codex/config.toml`.
+
+The `mcp`, `fastmcp`, `mcp-proxy`, and `mcp-reverse-proxy` commands are CLI
+utilities and launch dependencies. They are checked by preflight and team
+parity, but they are not expected to appear as separate `codex mcp list`
+servers.
+
+External GUI tools such as Burp Suite and Caido may be recorded when they shape
+the solve path, but they are not required for team parity.
+
 ## State Schema
 
 Challenge `state.json` files may record:

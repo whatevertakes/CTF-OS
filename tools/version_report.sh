@@ -9,15 +9,42 @@ cd "$ROOT" || exit 1
 
 run_optional() {
   local label="$1"
+  local output
   shift
   printf '%-24s ' "$label"
-  "$@" 2>&1 | head -1 || true
+  output="$("$@" 2>&1 | sed '/^[[:space:]]*$/d' | head -1 || true)"
+  if [ -n "$output" ]; then
+    printf '%s\n' "$output"
+  else
+    printf 'OK\n'
+  fi
 }
 
 show_path() {
   local command="$1"
-  printf '%-24s ' "path $command"
-  command -v "$command" || true
+  local path
+  if path="$(command -v "$command")"; then
+    printf '%-24s %s\n' "path $command" "$path"
+  else
+    printf '%-24s MISSING\n' "path $command"
+  fi
+}
+
+show_r2mcp_path() {
+  local candidate
+  for candidate in \
+    "${R2MCP_BIN:-}" \
+    "$(command -v r2mcp 2>/dev/null || true)" \
+    "$HOME/.local/bin/r2mcp" \
+    "$HOME/.local/share/radare2/prefix/bin/r2mcp" \
+    "/usr/local/bin/r2mcp" \
+    "/usr/bin/r2mcp"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%-24s %s\n' "path r2mcp" "$candidate"
+      return
+    fi
+  done
+  printf '%-24s MISSING\n' "path r2mcp"
 }
 
 echo "== workspace =="
@@ -30,8 +57,22 @@ show_path checksec
 show_path ROPgadget
 show_path ropper
 show_path r2
-show_path r2mcp
+show_r2mcp_path
 show_path npx
+show_path mcp
+show_path fastmcp
+show_path mcp-proxy
+show_path mcp-reverse-proxy
+show_path RsaCtfTool
+show_path arjun
+show_path flask-unsign
+show_path floss
+show_path frida
+show_path shodan
+show_path stegolsb
+show_path zsteg
+show_path wafw00f
+show_path pwninit
 
 echo "== core =="
 run_optional git git --version
@@ -66,6 +107,16 @@ for package in [
     "pefile",
     "ropper",
     "unicorn",
+    "fastmcp",
+    "mcp",
+    "mcp-proxy",
+    "arjun",
+    "flask-unsign",
+    "flare-floss",
+    "frida-tools",
+    "shodan",
+    "stego-lsb",
+    "wafw00f",
 ]:
     try:
         print(f"{package}=={md.version(package)}")
@@ -81,12 +132,31 @@ run_optional one_gadget one_gadget --version
 run_optional seccomp-tools seccomp-tools --version
 run_optional r2 r2 -v
 run_optional r2mcp-wrapper .codex/bin/r2mcp-codex.sh --help
+run_optional pwninit pwninit --version
 
 echo "== mobile/forensics/math =="
 run_optional jadx jadx --version
 run_optional apktool apktool --version
+run_optional frida frida --version
+run_optional frida-ps frida-ps --version
+run_optional floss floss --version
+run_optional stegolsb stegolsb --version
+run_optional zsteg zsteg --help
 run_optional sage sage --version
 run_optional tshark tshark --version
+
+echo "== web/crypto cli =="
+run_optional RsaCtfTool RsaCtfTool --help
+run_optional arjun arjun -h
+run_optional flask-unsign flask-unsign --version
+run_optional shodan env PYTHONWARNINGS=ignore::UserWarning shodan version
+run_optional wafw00f wafw00f --version
+
+echo "== mcp utility cli =="
+run_optional mcp mcp version
+run_optional fastmcp fastmcp --version
+run_optional mcp-proxy mcp-proxy --version
+run_optional mcp-reverse-proxy mcp-reverse-proxy --version
 
 echo "== mcp =="
 codex mcp list

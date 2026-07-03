@@ -29,8 +29,9 @@ git switch --track origin/<github-user>
 tools/team_member_setup.sh
 ```
 
-이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP,
-리버싱 도구 표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
+이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
+유틸리티 CLI, CTF 카테고리별 CLI 도구 표면을 설치하며, `.venv`와
+`requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
 `.codex/config.toml`을 생성하고 다음 검증을 실행합니다.
 
@@ -39,6 +40,15 @@ python3 tools/preflight_check.py --strict-optional
 python3 tools/check_team_parity.py
 codex mcp list
 ```
+
+`codex mcp list`의 서버 기준은 `angr`, `playwright`, `radare2`입니다. `mcp`,
+`fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 MCP 서버로 추가 등록하지 않고
+CLI 유틸리티로 설치와 실행 가능 여부를 점검합니다.
+
+기본 parity CLI에는 `RsaCtfTool`, `arjun`, `flask-unsign`, `floss`, `frida`,
+`shodan`, `stegolsb`, `zsteg`, `wafw00f`, `pwninit`이 포함됩니다. `Burp Suite`와
+`Caido`는 외부 GUI 도구라 있으면 보고만 하고 팀 setup 실패 조건으로 삼지
+않습니다.
 
 고급 CTF 카테고리별 도구 프로필까지 검수하려면 다음을 사용합니다.
 

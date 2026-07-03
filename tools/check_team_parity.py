@@ -19,6 +19,10 @@ COMMANDS = (
     "npx",
     "gcc",
     "gdb",
+    "mcp",
+    "fastmcp",
+    "mcp-proxy",
+    "mcp-reverse-proxy",
     "r2",
     "angr-mcp",
     "checksec",
@@ -30,15 +34,57 @@ COMMANDS = (
     "apktool",
     "sage",
     "tshark",
+    "RsaCtfTool",
+    "arjun",
+    "flask-unsign",
+    "floss",
+    "frida",
+    "frida-ps",
+    "shodan",
+    "stegolsb",
+    "zsteg",
+    "wafw00f",
+    "pwninit",
+)
+COMMAND_CHECKS = {
+    "mcp": ("mcp", "--help"),
+    "fastmcp": ("fastmcp", "--version"),
+    "mcp-proxy": ("mcp-proxy", "--version"),
+    "mcp-reverse-proxy": ("mcp-reverse-proxy", "--version"),
+    "RsaCtfTool": ("RsaCtfTool", "--help"),
+    "arjun": ("arjun", "-h"),
+    "flask-unsign": ("flask-unsign", "--version"),
+    "floss": ("floss", "--version"),
+    "frida": ("frida", "--version"),
+    "frida-ps": ("frida-ps", "--version"),
+    "shodan": ("shodan", "version"),
+    "stegolsb": ("stegolsb", "--version"),
+    "zsteg": ("zsteg", "--help"),
+    "wafw00f": ("wafw00f", "--version"),
+    "pwninit": ("pwninit", "--version"),
+}
+EXTERNAL_OPTIONAL_COMMANDS = (
+    "burpsuite",
+    "caido",
+    "caido-cli",
 )
 PYTHON_MODULES = (
     ("angr", "angr"),
     ("angr-mcp", "angr.mcp.__main__"),
     ("capstone", "capstone"),
+    ("mcp", "mcp"),
     ("fastmcp", "fastmcp"),
+    ("mcp-proxy", "mcp_proxy"),
     ("pwntools", "pwn"),
     ("ropper", "ropper"),
     ("unicorn", "unicorn"),
+    ("arjun", "arjun"),
+    ("flask-unsign", "flask_unsign"),
+    ("flare-floss", "floss"),
+    ("frida-tools", "frida"),
+    ("shodan", "shodan"),
+    ("stego-lsb", "stego_lsb"),
+    ("wafw00f", "wafw00f"),
 )
 
 
@@ -61,13 +107,43 @@ def r2mcp_candidates() -> list[Path]:
     return candidates
 
 
-def check_command(command: str) -> int:
+def output_line(result: subprocess.CompletedProcess[str]) -> str:
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return lines[0].strip() if lines else "check passed"
+
+
+def check_command(command: str, *, required: bool = True) -> int:
     path = shutil.which(command)
-    if path:
-        print(f"PASS command {command}: {path}")
+    if not path:
+        prefix = "FAIL" if required else "WARN"
+        print(f"{prefix} command {command}: missing")
+        return 1 if required else 0
+
+    print(f"PASS command {command}: {path}")
+    check = COMMAND_CHECKS.get(command)
+    if not check:
         return 0
-    print(f"FAIL command {command}: missing")
-    return 1
+
+    try:
+        result = subprocess.run(
+            list(check),
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        prefix = "FAIL" if required else "WARN"
+        print(f"{prefix} command check {command}: timed out")
+        return 1 if required else 0
+    if result.returncode == 0:
+        print(f"PASS command check {command}: {output_line(result)}")
+        return 0
+    reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "command check failed"
+    prefix = "FAIL" if required else "WARN"
+    print(f"{prefix} command check {command}: {reason}")
+    return 1 if required else 0
 
 
 def check_docker_runtime() -> int:
@@ -164,6 +240,8 @@ def main() -> int:
     failures = 0
     for command in COMMANDS:
         failures += check_command(command)
+    for command in EXTERNAL_OPTIONAL_COMMANDS:
+        check_command(command, required=False)
     if shutil.which("docker"):
         failures += check_docker_runtime()
     failures += check_r2mcp()
