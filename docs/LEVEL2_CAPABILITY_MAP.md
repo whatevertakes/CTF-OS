@@ -78,7 +78,10 @@ Future agents should use this layer in this order:
 5. Read the category reference digest and index, then query local references only after local files and reproducible commands show a need.
 6. Keep replay logs and proof validation results under the challenge `evidence/` directory.
 7. Keep replay summaries next to raw logs as `evidence/replay_<timestamp>.summary.md`.
-8. Update `state.json` when status, proof scope, remote status, replay kind, current remote liveness, final command, blockers, or evidence paths change.
+8. Update `state.json` when status, proof scope, remote status, replay kind,
+   current remote liveness, final command, blockers, evidence paths, replay
+   quality, shareability, agent mode, failure class, or tool effectiveness
+   changes.
 9. Use Level 4 interface views for operator speed, but keep solve status and proof scope in Level 2 state.
 10. Use Level 5 automation only for bounded preflight/replay/proof/report/cleanup wrappers.
 11. When progress stalls, split the hypothesis space instead of repeating disproven payload families.
@@ -95,10 +98,18 @@ Future agents should use this layer in this order:
 | `replay_kind` | One of `local`, `local_proof`, `remote_liveness`, `remote_live`, `remote_live_exploit`, or `remote_saved_evidence`. |
 | `current_remote_liveness` | One of `not_applicable`, `unknown`, `live`, `partial`, `expired`, or `unavailable`. |
 | `evidence_sensitivity` | One of `no_sensitive_markers`, `contains_flag`, `contains_secret`, or `unknown`. |
+| `last_replay` | Object describing the most recent replay timestamp, sensitivity, replay kind, liveness, and artifacts. |
+| `agent_mode` | One of `none`, `assisted`, `autonomous`, `hermes_readonly`, `lazycodex_readonly`, or `gajae_bounded`; ordinary Codex solves use `assisted`. |
+| `failure_class` | `none` for solved challenges; for blocked or partial challenges use the narrowest label supported by `docs/FAILURE_TAXONOMY.md`. |
+| `replay_quality` | Short description of local/remote proof quality, determinism, redaction, summary-only status, and proof validation result. |
+| `shareability` | Short description of what can be committed or shared and what must stay local. |
+| `tool_effectiveness` | Object mapping important tools to concise labels such as `high`, `medium`, `low`, `skipped_low_value`, `missing_dependency`, or `not_applicable`. |
 
-`tools/proof_validate.py` enforces these fields. `tools/replay_runner.py`
-updates `current_remote_liveness` when replay output contains a
-`remote_liveness=...` marker.
+`tools/proof_validate.py` enforces the proof-critical subset.
+`tools/validate_data_submission.py` enforces the full benchmark data contract,
+including agent-design metadata and the structured blocker object.
+`tools/replay_runner.py` updates `current_remote_liveness` when replay output
+contains a `remote_liveness=...` marker.
 
 ## Replay Safety
 
@@ -121,6 +132,8 @@ The first three self-test benchmarks established these Level 2 requirements:
 - `partial` status requires either durable evidence entries or a blocker reason.
 - `state.json` evidence entries must be relative paths that exist inside the challenge directory.
 - `solved` status requires a non-empty `final_command`, replay evidence, and a non-`none` `proof_scope`.
+- `solved` status requires `metadata.failure_class` set to `none` for data submission.
+- Terminal data submissions require non-empty replay quality, shareability, and tool effectiveness metadata.
 - Remote live exploit replay requires explicit opt-in.
 - Level 3 worker results must include read receipts for the category skill, solve playbook, and reference digest before merge.
 - Level 3 worker results must include reference query records and consulted local reference files before merge.

@@ -33,6 +33,9 @@ Integrity metrics are:
 - proof validity through `tools/proof_validate.py`
 - solved entries missing replay evidence or proof state
 - blocked entries missing a blocker reason
+- terminal challenge data missing agent-design metadata:
+  `agent_mode`, `failure_class`, `replay_quality`, `shareability`, and
+  `tool_effectiveness`
 - dependency state and missing required tools
 - path and state hygiene, including missing challenge paths and stale corpus
   entries whose registry metadata disagrees with existing state
@@ -89,13 +92,39 @@ This keeps false-solved detection centralized:
 - solved requires `final_command`
 - solved requires replay evidence
 - solved requires a non-`none` proof scope
+- solved data submissions require `failure_class=none`
 - blocked requires a blocker reason
+- blocked and partial data submissions require a narrow `failure_class`
 - sensitive replay logs require redacted summaries
 
 Tool routing metrics are observability caveats, not proof claims. A challenge
 may use no MCP tools when CLI tools or local probes produce better evidence.
 Skipped MCP tools are acceptable when the reason is explicit, and missing
 required tools remain dependency findings.
+
+## Challenge Metadata Gate
+
+Before a solved, blocked, or partial challenge can be promoted into benchmark
+corpus data, `tools/validate_data_submission.py` requires the workspace
+contract used by `templates/challenge/`.
+
+The challenge `state.json` must include structured `blocker.reason` and
+`blocker.next_action`, full proof/replay metadata, `metadata.last_replay`, and
+the agent-design fields:
+
+```text
+metadata.agent_mode
+metadata.failure_class
+metadata.replay_quality
+metadata.shareability
+metadata.tool_effectiveness
+```
+
+The challenge `notes.md` must include `## Agent Design Metadata` as well as the
+standard summary, artifacts, observations, hypotheses, attempts, tool routing,
+blocker or solve, and evidence sections. This gate keeps examples such as a
+proof-valid solve with missing `agent_mode` or missing shareability metadata
+from being treated as complete agent-design data.
 
 ## Benchmark Splits
 

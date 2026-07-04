@@ -44,6 +44,56 @@ challenges/blindtest/<category>/<challenge>/work/*
 raw flag, raw replay log, private key, `.env` 파일, challenge `work/` scratch
 dependency checkout, 프레임워크 파일은 commit하지 않습니다.
 
+## 정제 데이터 계약
+
+제출되는 `state.json`은 현재 템플릿 형태를 유지해야 합니다. 특히 다음 필드는
+terminal 상태(`solved`, `blocked`, `partial`)에서 필수입니다.
+
+```text
+blocker.reason
+blocker.next_action
+metadata.proof_scope
+metadata.remote_status
+metadata.remote_solve
+metadata.replay_kind
+metadata.current_remote_liveness
+metadata.evidence_sensitivity
+metadata.last_replay
+metadata.agent_mode
+metadata.failure_class
+metadata.replay_quality
+metadata.shareability
+metadata.tool_effectiveness
+tool_routing.primary_tools_used
+tool_routing.considered
+tool_routing.used
+tool_routing.skipped
+tool_routing.missing
+tool_routing.decision_summary
+```
+
+일반 Codex-assisted 풀이의 `metadata.agent_mode`는 `assisted`입니다. solved
+상태는 `metadata.failure_class`를 `none`으로 둡니다. blocked 또는 partial
+상태는 `docs/FAILURE_TAXONOMY.md`에서 가장 좁은 실패 분류를 선택합니다.
+
+`notes.md`는 다음 `##` heading을 포함해야 합니다.
+
+```text
+## Summary
+## Artifacts
+## Observations
+## Hypotheses
+## Attempts
+## Tool Routing Decision
+## Agent Design Metadata
+## Blocker or Solve
+## Evidence
+```
+
+raw 로그에 flag나 secret이 있으면 raw 로그는 제출하지 말고 matching redacted
+summary와 sanitizer check 결과만 제출합니다. `metadata.shareability`에는 공유
+가능한 파일과 local-only 파일을 명시합니다.
+
 ## 로컬 검증
 
 PR을 열기 전에 다음을 실행합니다.

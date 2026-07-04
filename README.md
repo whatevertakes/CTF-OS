@@ -160,6 +160,12 @@ challenges/<event>/<category>/<challenge>/
   체크아웃. 광범위한 vendored dependency나 로컬 빌드 트리는 제출하지 않습니다.
 - `evidence/`: 리플레이 요약과 정제된 증명 출력.
 - `state.json`, `notes.md`, `replay.sh`: 보존해야 하는 벤치마크 실행 메타데이터.
+  `state.json`에는 proof/replay 상태뿐 아니라 `metadata.agent_mode`,
+  `metadata.failure_class`, `metadata.replay_quality`, `metadata.shareability`,
+  `metadata.tool_effectiveness`, `metadata.last_replay`, 구조화된
+  `blocker.reason`/`blocker.next_action`, `tool_routing` 필드를 기록합니다.
+  `notes.md`에는 `## Agent Design Metadata`와 `## Tool Routing Decision`을
+  포함합니다.
 
 ## 벤치마크 러너 워크플로
 
@@ -173,6 +179,12 @@ corpus 일관성을 다시 확인합니다.
 
 ```bash
 python3 tools/evaluate_corpus.py
+```
+
+정제 데이터 제출 전에는 현재 state/notes 계약도 확인합니다.
+
+```bash
+python3 tools/validate_data_submission.py --staged
 ```
 
 원시 로그나 출력에 플래그, 토큰, 키, 챌린지 시크릿이 포함되어 있다면 제출 전에

@@ -6,7 +6,10 @@
   "created_at": "",
   "updated_at": "",
   "final_command": "",
-  "blocker": "",
+  "blocker": {
+    "reason": "",
+    "next_action": ""
+  },
   "blockers": [],
   "evidence": [],
   "tool_routing": {
@@ -24,6 +27,12 @@
     "remote_solve": "not_attempted",
     "replay_kind": "local",
     "current_remote_liveness": "not_applicable",
-    "evidence_sensitivity": "no_sensitive_markers"
+    "evidence_sensitivity": "no_sensitive_markers",
+    "last_replay": {},
+    "agent_mode": "assisted",
+    "failure_class": "unknown",
+    "replay_quality": "",
+    "shareability": "",
+    "tool_effectiveness": {}
   }
 }

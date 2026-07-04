@@ -54,11 +54,14 @@ challenges/<event>/<category>/<challenge>/
 
 ## Directory Meanings
 
-- `state.json`: machine-readable status, `final_command`, blocker,
-  `next_action`, evidence paths, proof scope, remote status, replay kind,
-  remote liveness, evidence sensitivity, tool routing decisions, and metadata.
-- `notes.md`: human-readable solve log, including a tool routing decision
-  section for considered, used, skipped, and missing tools.
+- `state.json`: machine-readable status, `final_command`, `blocker.reason`,
+  `blocker.next_action`, evidence paths, proof scope, remote status, replay
+  kind, remote liveness, evidence sensitivity, replay quality, shareability,
+  agent mode, failure class, tool effectiveness, tool routing decisions, and
+  replay metadata.
+- `notes.md`: human-readable solve log, including standard `##` sections for
+  summary, artifacts, observations, hypotheses, attempts, tool routing, agent
+  design metadata, blocker or solve, and evidence.
 - `replay.sh`: reproducible proof or replay entrypoint.
 - `evidence/`: replay logs, redacted replay summaries, screenshots, and final
   proof outputs.
@@ -114,6 +117,10 @@ hybrid
 - Record tool routing decisions in `state.json` and `notes.md` for
   observability. This records MCP and non-MCP tool selection, non-selection, and
   missing dependencies; it must not be used to force MCP usage.
+- Record agent-design metadata for every solved, blocked, or partial challenge.
+  `metadata.agent_mode`, `metadata.failure_class`, `metadata.replay_quality`,
+  `metadata.shareability`, and `metadata.tool_effectiveness` are required for
+  data-submission validation.
 - Raw replay logs that contain flag-like markers must have a matching redacted
   `*.summary.md` file before proof validation succeeds.
 - Live remote exploit replays should set `metadata.replay_kind` to
@@ -125,6 +132,58 @@ hybrid
 - Level 5 automation may run preflight, replay, proof validation, report
   sanitization, and temporary artifact cleanup. It must not mark challenges
   solved, add solvers, or use `challenges/_selftest` as benchmark input.
+
+## Challenge Data Contract
+
+New challenge workspaces are created from `templates/challenge/`. Terminal
+states (`solved`, `blocked`, or `partial`) must preserve the current template
+shape before being shared as benchmark data.
+
+`state.json.blocker` must be an object:
+
+```json
+{
+  "reason": "",
+  "next_action": ""
+}
+```
+
+`state.json.metadata` must include:
+
+```text
+proof_scope
+remote_status
+remote_solve
+replay_kind
+current_remote_liveness
+evidence_sensitivity
+last_replay
+agent_mode
+failure_class
+replay_quality
+shareability
+tool_effectiveness
+```
+
+Allowed `agent_mode` values are `none`, `assisted`, `autonomous`,
+`hermes_readonly`, `lazycodex_readonly`, and `gajae_bounded`. Ordinary
+Codex-assisted solving uses `assisted`. Solved challenges must set
+`failure_class` to `none`; blocked and partial challenges use the narrowest
+label supported by `docs/FAILURE_TAXONOMY.md`.
+
+`notes.md` must use these headings exactly:
+
+```text
+## Summary
+## Artifacts
+## Observations
+## Hypotheses
+## Attempts
+## Tool Routing Decision
+## Agent Design Metadata
+## Blocker or Solve
+## Evidence
+```
 
 ## Git Policy
 
