@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that a runner PR contains only sanitized benchmark data."""
+"""Validate that a runner PR contains only approved blindtest challenge data."""
 
 from __future__ import annotations
 
@@ -17,11 +17,8 @@ SECRET_NAME_PATTERN = re.compile(
     r"(^|/)(?:\.env(?:\..*)?|flag(?:\.txt)?|id_rsa|id_ed25519|.*\.(?:pem|key|log|pcap|pcapng|dmp))$",
     re.IGNORECASE,
 )
-APPROVED_BENCHMARK_RE = re.compile(
-    r"^benchmarks/[^/]+_(?:SANITIZED_BENCHMARK_REPORT\.md|DATA_MANIFEST\.json)$"
-)
 APPROVED_CHALLENGE_RE = re.compile(
-    r"^challenges/[^/]+/[^/]+/[^/]+/(?:state\.json|notes\.md|replay\.sh|evidence/[^/]+\.(?:summary\.md|sanitize_check\.md))$"
+    r"^challenges/blindtest/[^/]+/[^/]+/(?:state\.json|notes\.md|replay\.sh|(?:evidence|work)/.+)$"
 )
 APPROVED_STATUS = {"A", "M", "T"}
 
@@ -83,7 +80,7 @@ def changed_entries(*, base: str | None, head: str, staged: bool) -> list[tuple[
 
 
 def is_approved_path(path: str) -> bool:
-    return APPROVED_BENCHMARK_RE.match(path) is not None or APPROVED_CHALLENGE_RE.match(path) is not None
+    return APPROVED_CHALLENGE_RE.match(path) is not None
 
 
 def read_text(path: Path) -> str:
