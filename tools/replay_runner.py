@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -160,6 +161,8 @@ def parse_remote_liveness(log_text: str) -> str:
 def write_summary(challenge_dir: Path, log_path: Path) -> tuple[Path, str, str]:
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     redacted, sensitivity = redact_text(log_text)
+    raw_sha256 = hashlib.sha256(log_path.read_bytes()).hexdigest()
+    redacted_sha256 = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
     summary_path = summary_path_for(log_path)
     raw_rel = log_path.relative_to(challenge_dir).as_posix()
     timestamp = parse_header_value(log_text, "timestamp_utc")
@@ -176,6 +179,8 @@ def write_summary(challenge_dir: Path, log_path: Path) -> tuple[Path, str, str]:
         f"- cwd: `{cwd or 'unknown'}`",
         f"- exit_code: `{exit_code or 'unknown'}`",
         f"- sensitivity: `{sensitivity}`",
+        f"- raw_log_sha256: `{raw_sha256}`",
+        f"- redacted_transcript_sha256: `{redacted_sha256}`",
         "",
         "## Redacted Transcript",
         "",

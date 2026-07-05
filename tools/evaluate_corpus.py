@@ -279,6 +279,15 @@ def replay_logs(challenge_path: Path) -> list[Path]:
     return sorted(evidence_dir.glob("replay_*.log"))
 
 
+def replay_proof_evidence(challenge_path: Path) -> list[Path]:
+    evidence_dir = challenge_path / "evidence"
+    if not evidence_dir.is_dir():
+        return []
+    return sorted(
+        set(evidence_dir.glob("replay_*.log")) | set(evidence_dir.glob("replay_*.summary.md"))
+    )
+
+
 def is_sanitized_report_path(path: Path) -> bool:
     name = path.name.upper()
     return path.is_file() and "SANITIZED" in name and "BENCHMARK_REPORT" in name
@@ -766,9 +775,14 @@ def evaluate(items: list[dict[str, Any]]) -> dict[str, Any]:
 
         if effective_status == "solved":
             if state is not None and item_path is not None:
-                logs = replay_logs(item_path)
-                if not logs:
-                    solved_missing_evidence.append({"id": item_id, "reason": "missing evidence/replay_*.log"})
+                proof_evidence = replay_proof_evidence(item_path)
+                if not proof_evidence:
+                    solved_missing_evidence.append(
+                        {
+                            "id": item_id,
+                            "reason": "missing replay proof evidence (evidence/replay_*.log or evidence/replay_*.summary.md)",
+                        }
+                    )
                 proof_ok, reason = run_proof_validate(item_path)
                 if proof_ok:
                     proof_valid_solved.append(item_id)

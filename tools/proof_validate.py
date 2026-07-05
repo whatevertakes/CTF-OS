@@ -20,6 +20,8 @@ ALLOWED_STATUSES = {
     "blocked",
 }
 FLAG_PATTERN = re.compile(r"\b(?:FLAG|CTF|DH|SEKAI)\{[^}\r\n]{1,200}\}", re.IGNORECASE)
+REPLAY_LOG_RE = re.compile(r"^replay_[^/]+\.log$")
+REPLAY_SUMMARY_RE = re.compile(r"^replay_[^/]+\.summary\.md$")
 REQUIRED_METADATA_FIELDS = (
     "proof_scope",
     "remote_status",
@@ -115,6 +117,14 @@ def validate_metadata_contract(metadata: dict[str, object]) -> None:
         )
 
 
+def is_replay_log_relative(relative: Path) -> bool:
+    return len(relative.parts) == 2 and relative.parts[0] == "evidence" and REPLAY_LOG_RE.match(relative.name)
+
+
+def summary_path_for(log_path: Path) -> Path:
+    return log_path.with_name(f"{log_path.stem}.summary.md")
+
+
 def validate_evidence_entries(challenge_dir: Path, state: dict[str, object]) -> list[Path]:
     raw_entries = state.get("evidence", [])
     if raw_entries is None:
@@ -131,13 +141,14 @@ def validate_evidence_entries(challenge_dir: Path, state: dict[str, object]) -> 
             fail(f"evidence entry must stay inside the challenge directory: {entry!r}")
         path = challenge_dir / relative
         if not path.exists():
+            if is_replay_log_relative(relative):
+                summary_path = summary_path_for(path)
+                if summary_path.is_file():
+                    paths.append(summary_path)
+                    continue
             fail(f"evidence entry does not exist: {entry}")
         paths.append(path)
     return paths
-
-
-def summary_path_for(log_path: Path) -> Path:
-    return log_path.with_name(f"{log_path.stem}.summary.md")
 
 
 def contains_sensitive_marker(path: Path) -> bool:
@@ -146,6 +157,20 @@ def contains_sensitive_marker(path: Path) -> bool:
     except OSError:
         return False
     return FLAG_PATTERN.search(text) is not None
+
+
+def replay_summary_paths(challenge_dir: Path, evidence_paths: list[Path]) -> list[Path]:
+    candidates = set((challenge_dir / "evidence").glob("replay_*.summary.md"))
+    for path in evidence_paths:
+        if path.parent.name == "evidence" and REPLAY_SUMMARY_RE.match(path.name):
+            candidates.add(path)
+    return sorted(candidates)
+
+
+def validate_replay_summary_sanitized(summary_paths: list[Path]) -> None:
+    for summary_path in summary_paths:
+        if contains_sensitive_marker(summary_path):
+            fail(f"redacted replay summary still contains a flag-like marker: {summary_path}")
 
 
 def validate_sensitive_replay_summaries(replay_logs: list[Path]) -> int:
@@ -192,6 +217,7 @@ def main() -> int:
 
     evidence_paths = validate_evidence_entries(challenge_dir, state)
     replay_logs = sorted((challenge_dir / "evidence").glob("replay_*.log"))
+    replay_summaries = replay_summary_paths(challenge_dir, evidence_paths)
     final_command = str(state.get("final_command") or "").strip()
     blocker_reason = extract_blocker_reason(state)
     metadata = metadata_dict(state)
@@ -202,12 +228,16 @@ def main() -> int:
     replay_kind = text_reason(metadata.get("replay_kind"))
     current_remote_liveness = text_reason(metadata.get("current_remote_liveness"))
     sensitive_logs = validate_sensitive_replay_summaries(replay_logs)
+    validate_replay_summary_sanitized(replay_summaries)
 
     if status == "solved":
         if not final_command:
             fail("solved status requires non-empty final_command")
-        if not replay_logs:
-            fail("solved status requires at least one evidence/replay_*.log")
+        if not replay_logs and not replay_summaries:
+            fail(
+                "solved status requires replay proof evidence "
+                "(evidence/replay_*.log or evidence/replay_*.summary.md)"
+            )
         if proof_scope in {"", "none"}:
             fail("solved status requires metadata.proof_scope to describe the proof")
         if remote_status_failed(remote_status or remote_solve) and "local" not in proof_scope.lower():
@@ -223,6 +253,7 @@ def main() -> int:
         "proof ok: "
         f"status={status} "
         f"replay_logs={len(replay_logs)} "
+        f"replay_summaries={len(replay_summaries)} "
         f"sensitive_logs={sensitive_logs} "
         f"proof_scope={scope} "
         f"remote_status={remote} "
