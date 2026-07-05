@@ -13,6 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 COMMANDS = (
+    "rg",
+    "binwalk",
+    "exiftool",
+    "nmap",
+    "socat",
     "docker",
     "node",
     "npm",
@@ -47,6 +52,11 @@ COMMANDS = (
     "pwninit",
 )
 COMMAND_CHECKS = {
+    "rg": ("rg", "--version"),
+    "binwalk": ("binwalk", "--help"),
+    "exiftool": ("exiftool", "-ver"),
+    "nmap": ("nmap", "--version"),
+    "socat": ("socat", "-V"),
     "mcp": ("mcp", "--help"),
     "fastmcp": ("fastmcp", "--version"),
     "mcp-proxy": ("mcp-proxy", "--version"),
@@ -73,6 +83,7 @@ PROXY_HELPERS = (
     ".codex/bin/ctf-proxy-check",
     ".codex/proxy.env.example",
 )
+PLAYWRIGHT_HELPER = ".codex/bin/playwright-mcp-codex.sh"
 PYTHON_MODULES = (
     ("angr", "angr"),
     ("angr-mcp", "angr.mcp.__main__"),
@@ -265,6 +276,30 @@ def check_proxy_helpers() -> int:
     return failures
 
 
+def check_playwright_helper() -> int:
+    path = ROOT / PLAYWRIGHT_HELPER
+    if not path.is_file() or not os.access(path, os.X_OK):
+        print(f"FAIL playwright helper executable {PLAYWRIGHT_HELPER}")
+        return 1
+    print(f"PASS playwright helper executable {PLAYWRIGHT_HELPER}")
+
+    result = subprocess.run(
+        [str(path), "--print-browser"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    browser = result.stdout.strip()
+    if result.returncode == 0 and browser:
+        print(f"PASS playwright browser executable {browser}")
+        return 0
+    reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "browser not found"
+    print(f"FAIL playwright browser executable: {reason}")
+    return 1
+
+
 def check_python_module(package: str, module: str) -> int:
     if not VENV_PYTHON.is_file():
         print(f"FAIL python module {package}: missing .venv/bin/python")
@@ -308,6 +343,7 @@ def main() -> int:
         failures += check_docker_runtime()
     failures += check_r2mcp()
     failures += check_proxy_helpers()
+    failures += check_playwright_helper()
     for package, module in PYTHON_MODULES:
         failures += check_python_module(package, module)
     failures += check_level3_tool_routing()

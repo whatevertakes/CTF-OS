@@ -52,8 +52,8 @@ args = ["--transport", "stdio"]
 env = { FASTMCP_SHOW_SERVER_BANNER = "false", FASTMCP_LOG_LEVEL = "ERROR" }
 
 [mcp_servers.playwright]
-command = "npx"
-args = ["-y", "@playwright/mcp@0.0.75"]
+command = "__CTF_WORKSPACE_ROOT__/.codex/bin/playwright-mcp-codex.sh"
+args = []
 
 [mcp_servers.radare2]
 command = "__CTF_WORKSPACE_ROOT__/.codex/bin/r2mcp-codex.sh"

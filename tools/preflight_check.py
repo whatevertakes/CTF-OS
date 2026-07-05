@@ -24,6 +24,7 @@ REQUIRED_PATHS = (
     ".codex/proxy.env.example",
     ".codex/bin/ctf-proxy-check",
     ".codex/bin/ctf-proxy-start",
+    ".codex/bin/playwright-mcp-codex.sh",
     ".codex/bin/r2mcp-codex.sh",
     ".codex/bin/searchsploit",
     ".codex/bin/tplmap",
@@ -84,6 +85,7 @@ REQUIRED_PATHS = (
     "tools/regression_check.py",
     "tools/level3_orchestrator.py",
     "tools/level4_interface.py",
+    "tools/admin_status.sh",
     "tools/team_member_setup.sh",
     "tools/validate_data_submission.py",
     "templates/challenge/state.json",
@@ -110,6 +112,11 @@ AVR_REQUIRED_COMMANDS = ("avr-gcc", "avr-objdump", "avr-objcopy", "avr-size")
 AVR_TRIGGER_CATEGORIES = {"hardware-rf"}
 AVR_TRIGGER_TAGS = {"avr", "firmware", "arduino"}
 OPTIONAL_COMMANDS = (
+    "rg",
+    "binwalk",
+    "exiftool",
+    "nmap",
+    "socat",
     "docker",
     "node",
     "npm",
@@ -145,6 +152,11 @@ OPTIONAL_COMMANDS = (
 )
 
 OPTIONAL_COMMAND_CHECKS = {
+    "rg": ("rg", "--version"),
+    "binwalk": ("binwalk", "--help"),
+    "exiftool": ("exiftool", "-ver"),
+    "nmap": ("nmap", "--version"),
+    "socat": ("socat", "-V"),
     "mcp": ("mcp", "--help"),
     "fastmcp": ("fastmcp", "--version"),
     "mcp-proxy": ("mcp-proxy", "--version"),
@@ -473,6 +485,23 @@ def check_commands(reporter: Reporter, *, strict_optional: bool) -> None:
         else:
             reporter.warn("docker compose v2 unavailable")
 
+    playwright_wrapper = ROOT / ".codex" / "bin" / "playwright-mcp-codex.sh"
+    if playwright_wrapper.is_file() and os.access(playwright_wrapper, os.X_OK):
+        reporter.pass_("playwright mcp wrapper executable")
+        result = run([str(playwright_wrapper), "--print-browser"])
+        browser = result.stdout.strip()
+        if result.returncode == 0 and browser:
+            reporter.pass_(f"playwright browser executable {browser}")
+        elif strict_optional:
+            reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "browser not found"
+            reporter.fail(f"playwright browser executable unavailable: {reason}")
+        else:
+            reporter.warn("playwright browser executable unavailable")
+    elif strict_optional:
+        reporter.fail("playwright mcp wrapper missing or not executable")
+    else:
+        reporter.warn("playwright mcp wrapper missing or not executable")
+
 
 def requires_avr_toolchain(category: str | None, tags: list[str]) -> bool:
     normalized_category = (category or "").strip().lower()
@@ -606,6 +635,12 @@ def check_config(reporter: Reporter) -> None:
         reporter.pass_("config mcp radare2 wrapper")
     else:
         reporter.fail(f"config mcp radare2 wrapper mismatch: {radare2!r}")
+
+    playwright = mcp.get("playwright", {}).get("command")
+    if playwright == str(ROOT / ".codex" / "bin" / "playwright-mcp-codex.sh"):
+        reporter.pass_("config mcp playwright wrapper")
+    else:
+        reporter.fail(f"config mcp playwright wrapper mismatch: {playwright!r}")
 
     if "angr" in mcp and "playwright" in mcp:
         reporter.pass_("config mcp angr/playwright present")

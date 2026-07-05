@@ -8,10 +8,28 @@ BIN_DIR="$HOME/.local/bin"
 
 APT_PACKAGES=(
   adb
+  binwalk
+  ffuf
+  fplll-tools
+  foremost
   gir1.2-gtk-3.0
   gnuradio
+  gobuster
+  libimage-exiftool-perl
+  nmap
+  pari-gp
+  patchelf
+  qemu-system-arm
+  qemu-system-x86
+  qemu-user
+  ripgrep
+  skopeo
   sleuthkit
+  socat
+  steghide
   stegseek
+  upx-ucl
+  yara
 )
 
 PIP_TOOLS=(
@@ -23,12 +41,14 @@ PIP_TOOLS=(
 
 usage() {
   cat <<'EOF'
-Usage: tools/install_advanced_ctf_tools.sh [--skip-apt] [--skip-ghidra] [--skip-pwndbg] [--skip-garak]
+Usage: tools/install_advanced_ctf_tools.sh [--skip-apt] [--skip-ghidra] [--skip-pwndbg] [--skip-garak] [--skip-foundry]
 
 Installs advanced, target-specific CTF tools into user-local paths:
-  - apt: adb, GNU Radio, Sleuth Kit, stegseek
-  - user venv wrappers: objection, halmos, garak, urh
+  - apt: adb, binwalk, exiftool, qemu, GNU Radio, Sleuth Kit, stegseek, web/pwn helpers
+  - user venv wrappers: objection, halmos, garak, urh, volatility3, slither, solc-select
   - user checkouts/downloads: pwndbg, Ghidra
+  - Foundry toolchain: forge, cast, anvil, chisel
+  - Cloud/container tools: kubectl, trivy, syft, grype, crane
 
 Run from a terminal with sudo available. These tools are intentionally not part
 of the default team setup because garak/Ghidra/GNU Radio are large.
@@ -39,12 +59,14 @@ SKIP_APT=0
 SKIP_GHIDRA=0
 SKIP_PWNDBG=0
 SKIP_GARAK=0
+SKIP_FOUNDRY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-apt) SKIP_APT=1 ;;
     --skip-ghidra) SKIP_GHIDRA=1 ;;
     --skip-pwndbg) SKIP_PWNDBG=1 ;;
     --skip-garak) SKIP_GARAK=1 ;;
+    --skip-foundry) SKIP_FOUNDRY=1 ;;
     -h|--help)
       usage
       exit 0
@@ -60,6 +82,27 @@ done
 
 mkdir -p "$OPT_ROOT" "$BIN_DIR" "$ROOT/.cache/tools"
 
+apt_package_available() {
+  local candidate
+  candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  [ -n "$candidate" ] && [ "$candidate" != "(none)" ]
+}
+
+install_available_apt_packages() {
+  local packages=()
+  local package
+  for package in "$@"; do
+    if apt_package_available "$package"; then
+      packages+=("$package")
+    else
+      echo "WARN apt package unavailable: $package" >&2
+    fi
+  done
+  if [ "${#packages[@]}" -gt 0 ]; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+  fi
+}
+
 install_apt_tools() {
   if [ "$SKIP_APT" -eq 1 ]; then
     return 0
@@ -70,19 +113,26 @@ install_apt_tools() {
   fi
   sudo -v
   sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_PACKAGES[@]}"
+  install_available_apt_packages "${APT_PACKAGES[@]}"
+}
+
+install_pip_entry_tool() {
+  local name="$1"
+  local entry="$2"
+  local dest="$OPT_ROOT/$name"
+  shift 2
+  "$PYTHON" -m venv "$dest/.venv"
+  "$dest/.venv/bin/python" -m pip install -U pip setuptools wheel
+  "$dest/.venv/bin/python" -m pip install -U "$@"
+  if [ -x "$dest/.venv/bin/$entry" ]; then
+    ln -sfn "$dest/.venv/bin/$entry" "$BIN_DIR/$entry"
+  fi
 }
 
 install_pip_tool() {
   local name="$1"
   shift
-  local dest="$OPT_ROOT/$name"
-  "$PYTHON" -m venv "$dest/.venv"
-  "$dest/.venv/bin/python" -m pip install -U pip setuptools wheel
-  "$dest/.venv/bin/python" -m pip install -U "$@"
-  if [ -x "$dest/.venv/bin/$name" ]; then
-    ln -sfn "$dest/.venv/bin/$name" "$BIN_DIR/$name"
-  fi
+  install_pip_entry_tool "$name" "$name" "$@"
 }
 
 install_pip_tools() {
@@ -93,6 +143,20 @@ install_pip_tools() {
     fi
     install_pip_tool "$tool" "$tool"
   done
+  install_pip_entry_tool volatility3 vol volatility3
+  install_pip_entry_tool slither slither slither-analyzer
+}
+
+install_solc_select() {
+  if command -v solc >/dev/null 2>&1; then
+    return 0
+  fi
+  install_pip_entry_tool solc-select solc-select solc-select
+  if [ -x "$OPT_ROOT/solc-select/.venv/bin/solc" ]; then
+    ln -sfn "$OPT_ROOT/solc-select/.venv/bin/solc" "$BIN_DIR/solc"
+  fi
+  "$BIN_DIR/solc-select" install latest
+  "$BIN_DIR/solc-select" use latest
 }
 
 install_pwndbg() {
@@ -195,11 +259,127 @@ EOF
   chmod +x "$BIN_DIR/gnuradio-companion-clean"
 }
 
+install_upx_wrapper() {
+  if command -v upx >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v upx-ucl >/dev/null 2>&1; then
+    cat >"$BIN_DIR/upx" <<'EOF'
+#!/usr/bin/env bash
+exec upx-ucl "$@"
+EOF
+    chmod +x "$BIN_DIR/upx"
+  fi
+}
+
+install_foundry() {
+  if [ "$SKIP_FOUNDRY" -eq 1 ]; then
+    return 0
+  fi
+  if command -v forge >/dev/null 2>&1 && command -v cast >/dev/null 2>&1 \
+    && command -v anvil >/dev/null 2>&1 && command -v chisel >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -L https://foundry.paradigm.xyz | bash
+  "$HOME/.foundry/bin/foundryup"
+}
+
+linux_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *)
+      echo "Unsupported architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+crane_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x86_64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    *)
+      echo "Unsupported architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+install_kubectl() {
+  if command -v kubectl >/dev/null 2>&1; then
+    return 0
+  fi
+  local arch
+  local version
+  local dest
+  arch="$(linux_arch)"
+  version="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+  dest="$ROOT/.cache/tools/kubectl-$version-$arch"
+  curl -L "https://dl.k8s.io/release/$version/bin/linux/$arch/kubectl" -o "$dest"
+  install -m 0755 "$dest" "$BIN_DIR/kubectl"
+}
+
+install_trivy() {
+  if command -v trivy >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+    | sh -s -- -b "$BIN_DIR"
+}
+
+install_syft() {
+  if command -v syft >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+    | sh -s -- -b "$BIN_DIR"
+}
+
+install_grype() {
+  if command -v grype >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+    | sh -s -- -b "$BIN_DIR"
+}
+
+install_crane() {
+  if command -v crane >/dev/null 2>&1; then
+    return 0
+  fi
+  local arch
+  local archive
+  local extract_dir
+  arch="$(crane_arch)"
+  archive="$ROOT/.cache/tools/go-containerregistry_Linux_$arch.tar.gz"
+  extract_dir="$ROOT/.cache/tools/go-containerregistry_Linux_$arch"
+  curl -L \
+    "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_$arch.tar.gz" \
+    -o "$archive"
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
+  tar -xzf "$archive" -C "$extract_dir"
+  install -m 0755 "$extract_dir/crane" "$BIN_DIR/crane"
+}
+
+install_cloud_container_tools() {
+  install_kubectl
+  install_trivy
+  install_syft
+  install_grype
+  install_crane
+}
+
 install_apt_tools
 install_pip_tools
+install_solc_select
 install_pwndbg
 ROOT="$ROOT" OPT_ROOT="$OPT_ROOT" BIN_DIR="$BIN_DIR" install_ghidra
 install_gnuradio_wrapper
+install_upx_wrapper
+install_foundry
+install_cloud_container_tools
 
 cat <<EOF
 

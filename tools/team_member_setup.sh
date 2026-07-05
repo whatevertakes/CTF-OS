@@ -7,19 +7,21 @@ cd "$ROOT"
 TEAM_BRANCHES=(
   shyunseok1029
   holymo-ly
-  jiwoongchoi-norun
   lee
+  jiwoongchoi-norun
 )
 DEEP_CHECK=0
 BOOTSTRAP_MINIMAL=0
 SKIP_APT=0
 SKIP_PYTHON=0
 SKIP_MCP=0
+SKIP_ADVANCED=0
+SKIP_GARAK=0
 TARGET_BRANCH=""
 
 usage() {
   cat <<'EOF'
-사용법: tools/team_member_setup.sh [--branch <github-user>] [--deep] [--minimal] [--skip-apt] [--skip-python] [--skip-mcp]
+사용법: tools/team_member_setup.sh [--branch <github-user>] [--deep] [--minimal] [--skip-apt] [--skip-python] [--skip-mcp] [--skip-advanced] [--skip-garak]
 
 팀원용 1회 설정/검증 스크립트입니다.
   - 자기 팀 브랜치인지 확인하거나 --branch 값으로 전환
@@ -31,10 +33,12 @@ usage() {
 팀 브랜치:
   shyunseok1029
   holymo-ly
-  jiwoongchoi-norun
   lee
+  jiwoongchoi-norun
 
---deep은 고급 CTF 카테고리별 도구 프로필까지 검증합니다.
+--deep은 고급 CTF 도구 설치 후 카테고리별 도구 프로필까지 검증합니다.
+--skip-advanced는 --deep에서 고급 도구 설치를 건너뛰고 검증만 수행합니다.
+--skip-garak은 --deep 설치 중 대형 AI/ML 도구 garak만 건너뜁니다.
 EOF
 }
 
@@ -64,6 +68,8 @@ while [ "$#" -gt 0 ]; do
     --skip-apt) SKIP_APT=1 ;;
     --skip-python) SKIP_PYTHON=1 ;;
     --skip-mcp) SKIP_MCP=1 ;;
+    --skip-advanced) SKIP_ADVANCED=1 ;;
+    --skip-garak) SKIP_GARAK=1 ;;
     -h|--help)
       usage
       exit 0
@@ -104,8 +110,8 @@ FAIL 현재 브랜치는 팀원 작업 브랜치가 아닙니다: ${current_bran
 다음 중 자기 브랜치로 전환한 뒤 다시 실행하세요.
   git switch --track origin/shyunseok1029
   git switch --track origin/holymo-ly
-  git switch --track origin/jiwoongchoi-norun
   git switch --track origin/lee
+  git switch --track origin/jiwoongchoi-norun
 
 또는:
   tools/team_member_setup.sh --branch <github-user>
@@ -164,8 +170,22 @@ if [ "$SKIP_MCP" -eq 0 ]; then
 fi
 
 if [ "$DEEP_CHECK" -eq 1 ]; then
+  if [ "$SKIP_ADVANCED" -eq 0 ]; then
+    echo "== 고급 CTF 도구 설치 =="
+    advanced_args=()
+    if [ "$SKIP_APT" -eq 1 ]; then
+      advanced_args+=(--skip-apt)
+    fi
+    if [ "$SKIP_GARAK" -eq 1 ]; then
+      advanced_args+=(--skip-garak)
+    fi
+    tools/install_advanced_ctf_tools.sh "${advanced_args[@]}"
+  fi
+
+  # shellcheck disable=SC1091
+  . .codex/env.sh
   echo "== 고급 CTF deep profile 검증 =="
-  for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container; do
+  for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container ai-ml hardware-rf side-channel; do
     echo "-- $category --"
     python3 tools/preflight_check.py --deep --category "$category" | grep -E '^(PASS deep|WARN deep|summary)'
   done

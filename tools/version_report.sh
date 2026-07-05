@@ -52,6 +52,11 @@ pwd
 echo "CTF_WORKSPACE_ROOT=$CTF_WORKSPACE_ROOT"
 
 echo "== paths =="
+show_path rg
+show_path binwalk
+show_path exiftool
+show_path nmap
+show_path socat
 show_path angr-mcp
 show_path checksec
 show_path ROPgadget
@@ -76,6 +81,7 @@ show_path pwninit
 
 echo "== core =="
 run_optional git git --version
+run_optional rg rg --version
 run_optional python3 python3 --version
 run_optional venv-python .venv/bin/python --version
 run_optional docker docker --version
@@ -136,9 +142,16 @@ if [ -x .codex/bin/r2mcp-codex.sh ]; then
 else
   printf '%-24s MISSING\n' "r2mcp-wrapper"
 fi
+if [ -x .codex/bin/playwright-mcp-codex.sh ]; then
+  printf '%-24s %s\n' "playwright-wrapper" "$(.codex/bin/playwright-mcp-codex.sh --print-browser 2>/dev/null || printf 'browser missing')"
+else
+  printf '%-24s MISSING\n' "playwright-wrapper"
+fi
 run_optional pwninit pwninit --version
 
 echo "== mobile/forensics/math =="
+run_optional binwalk binwalk --help
+run_optional exiftool exiftool -ver
 run_optional jadx jadx --version
 run_optional apktool apktool --version
 run_optional frida frida --version
@@ -150,6 +163,8 @@ run_optional sage sage --version
 run_optional tshark tshark --version
 
 echo "== web/crypto cli =="
+run_optional nmap nmap --version
+run_optional socat socat -V
 run_optional RsaCtfTool RsaCtfTool --help
 run_optional arjun arjun -h
 run_optional flask-unsign flask-unsign --version

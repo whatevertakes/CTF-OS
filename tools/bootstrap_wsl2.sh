@@ -22,7 +22,6 @@ APT_PACKAGES=(
   libssl-dev
   netcat-openbsd
   nodejs
-  npm
   pkg-config
   python3
   python3-pip
@@ -36,9 +35,21 @@ APT_PACKAGES=(
 )
 PARITY_APT_CANDIDATES=(
   apktool
+  binwalk
+  checksec
+  ffuf
+  foremost
+  gobuster
+  libimage-exiftool-perl
+  nmap
+  patchelf
+  ripgrep
   jadx
   radare2
   sagemath
+  socat
+  steghide
+  yara
 )
 JADX_VERSION="1.5.5"
 APKTOOL_VERSION="3.0.2"
@@ -102,6 +113,34 @@ install_available_apt_packages() {
   if [ "${#packages[@]}" -gt 0 ]; then
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
   fi
+}
+
+install_npm_if_needed() {
+  if command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! apt_package_available npm; then
+    echo "WARN apt 패키지를 사용할 수 없습니다: npm" >&2
+    return 0
+  fi
+  if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y npm; then
+    echo "WARN npm apt 설치를 건너뜁니다. NodeSource nodejs 환경에서는 npm이 nodejs 패키지에 포함될 수 있습니다." >&2
+  fi
+}
+
+playwright_browser_available() {
+  "$ROOT/.codex/bin/playwright-mcp-codex.sh" --print-browser >/dev/null 2>&1
+}
+
+install_playwright_browser_if_needed() {
+  if playwright_browser_available; then
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    echo "WARN npx가 없어 Playwright Chromium 설치를 건너뜁니다." >&2
+    return 0
+  fi
+  npx --yes playwright@latest install chromium
 }
 
 command_succeeds() {
@@ -240,15 +279,6 @@ install_team_parity_tools() {
   install_mcp_reverse_proxy_compat
 }
 
-if [ "$SKIP_APT" -eq 0 ]; then
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "기본 WSL2 부트스트랩에는 apt-get이 필요합니다. 패키지를 직접 관리하려면 --skip-apt로 다시 실행하세요." >&2
-    exit 1
-  fi
-  sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_PACKAGES[@]}"
-fi
-
 mkdir -p \
   "$ROOT/.agents/skills" \
   "$ROOT/.cache/xdg" \
@@ -262,6 +292,16 @@ mkdir -p \
 
 sync_agent_skill_links
 
+if [ "$SKIP_APT" -eq 0 ]; then
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "기본 WSL2 부트스트랩에는 apt-get이 필요합니다. 패키지를 직접 관리하려면 --skip-apt로 다시 실행하세요." >&2
+    exit 1
+  fi
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${APT_PACKAGES[@]}"
+  install_npm_if_needed
+fi
+
 if [ "$SKIP_PYTHON" -eq 0 ]; then
   "$PYTHON" -m venv "$ROOT/.venv"
   "$ROOT/.venv/bin/python" -m pip install -U pip setuptools wheel
@@ -270,6 +310,7 @@ fi
 
 if [ "$TEAM_PARITY" -eq 1 ]; then
   install_team_parity_tools
+  install_playwright_browser_if_needed
 fi
 
 CONFIG_PYTHON="$ROOT/.venv/bin/python"
