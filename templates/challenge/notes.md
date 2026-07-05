@@ -17,6 +17,10 @@
 
 - Record facts backed by files, commands, traces, or service responses.
 
+## Hypotheses
+
+- Record current theories and what evidence would prove or disprove them.
+
 ## Attempts
 
 - Keep payloads, commands, and failed assumptions that shaped the solve path.
@@ -30,10 +34,21 @@
 - Missing:
 - Decision summary:
 
-## Solve
+## Agent Design Metadata
+
+- Agent mode:
+- Failure class:
+- Replay quality:
+- Shareability:
+- Tool effectiveness:
+- Skipped tools/MCP rationale:
+
+## Blocker or Solve
 
 - Final command:
 - Flag or proof:
+- Blocker reason:
+- Next action:
 
 ## Evidence
 
