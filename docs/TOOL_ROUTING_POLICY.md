@@ -46,6 +46,12 @@ Challenge `state.json` files may record:
 }
 ```
 
+Agent-design summaries belong in `state.json.metadata.tool_effectiveness`.
+Use that object for compact tool outcome labels such as `high`, `medium`,
+`low`, `skipped_low_value`, `missing_dependency`, or `not_applicable`.
+Keep detailed reasoning in `tool_routing` and in the `notes.md` Tool Routing
+Decision section.
+
 Tool entries may be strings or objects. Use objects when a reason, kind, or
 retrospective marker is needed:
 

@@ -1,8 +1,8 @@
 # WSL2 설정
 
-이 문서는 Ubuntu WSL2에서 Codex를 실행하는 팀원을 위한 1단계 설정 절차입니다.
-이 단계는 이후 Level 3 설계 작업에 사용할 재현 가능한 CTF 풀이 데이터를
-수집하는 데 필요한 기본 dependency만 설치합니다.
+이 문서는 Ubuntu WSL2에서 이 CTF 워크스페이스를 실행하기 위한 기본 설정
+절차입니다. 목표는 challenge intake, replay, proof validation, reference lookup,
+category routing, MCP wrapper를 재현 가능한 상태로 맞추는 것입니다.
 
 ## 클론
 
@@ -11,29 +11,26 @@ git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
 cd <workspace-dir>
 ```
 
-챌린지 출력 작업은 `main`에서 직접 하지 않습니다. 클론 직후 자기 팀 브랜치로
-전환하세요.
+`main`은 안정 baseline으로 유지합니다. 챌린지 풀이, benchmark 작성, reference
+재생성 같은 변경은 별도 작업 브랜치나 worktree에서 수행합니다.
 
 ```bash
 git fetch origin
-git switch --track origin/<github-user>
+git switch -c <work-branch> origin/main
 ```
 
-현재 팀 브랜치는 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`, `lee`입니다.
+## 기본 설정
 
-## 팀원용 설정
-
-저장소 루트에서 팀원용 설정 스크립트를 실행합니다.
+저장소 루트에서 기본 bootstrap을 실행합니다.
 
 ```bash
-tools/team_member_setup.sh
+tools/bootstrap_wsl2.sh
 ```
 
-이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
-유틸리티 CLI, CTF 카테고리별 CLI 도구 표면을 설치하며, `.venv`와
-`requirements.txt`를 준비합니다. 또한
-`.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
-`.codex/config.toml`을 생성하고 다음 검증을 실행합니다.
+이 스크립트는 Ubuntu, Python, Ruby, MCP 유틸리티 CLI, CTF 카테고리별 CLI 도구
+표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
+`.codex/config.toml.template`에서 현재 clone 경로에 맞는 로컬
+`.codex/config.toml`을 생성하고 기본 검증을 실행합니다.
 
 ```bash
 python3 tools/preflight_check.py --strict-optional
@@ -45,10 +42,10 @@ codex mcp list
 `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 MCP 서버로 추가 등록하지 않고
 CLI 유틸리티로 설치와 실행 가능 여부를 점검합니다.
 
-기본 parity CLI에는 `RsaCtfTool`, `arjun`, `flask-unsign`, `floss`, `frida`,
-`shodan`, `stegolsb`, `zsteg`, `wafw00f`, `pwninit`이 포함됩니다. `Burp Suite`와
-`Caido`는 외부 GUI 도구라 있으면 보고만 하고 팀 setup 실패 조건으로 삼지
-않습니다.
+기본 parity CLI에는 `rg`, `binwalk`, `exiftool`, `nmap`, `socat`,
+`RsaCtfTool`, `arjun`, `flask-unsign`, `floss`, `frida`, `shodan`, `stegolsb`,
+`zsteg`, `wafw00f`, `pwninit`이 포함됩니다. `Burp Suite`와 `Caido`는 외부 GUI
+도구라 있으면 보고만 하고 기본 setup 실패 조건으로 삼지 않습니다.
 
 ## 웹 프록시 브리지
 
@@ -86,13 +83,14 @@ Windows WSL vEthernet 주소를 감지해서 로컬 전용 `.codex/proxy.env`를
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ```
 
-## Main 업데이트와 Level 2 Reference 동기화
+## Baseline 업데이트와 Level 2 Reference 동기화
 
-`main`의 최신 도구, 문서, reference lock, category index를 받은 뒤 소유자와
-같은 Level 2 reference 환경을 만들려면 다음을 실행합니다.
+최신 도구, 문서, reference lock, category index를 받은 뒤 같은 Level 2 reference
+환경을 만들려면 다음을 실행합니다.
 
 ```bash
-git pull origin main
+git fetch origin
+git merge --ff-only origin/main
 tools/bootstrap_wsl2.sh
 . .codex/env.sh
 python3 tools/reference_refresh.py --materialize-all --jobs 4
@@ -103,23 +101,24 @@ python3 tools/check_level3_tool_routing.py
 ```
 
 `references.yaml`, `references.lock.json`, `docs/reference-index/`는 Git으로
-공유됩니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로 각
-팀원이 위 `reference_refresh.py --materialize-all` 명령으로 같은
-commit/snapshot 기준 자료를 내려받아야 합니다.
+공유됩니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로 각 clone은
+위 `reference_refresh.py --materialize-all` 명령으로 같은 commit/snapshot 기준
+자료를 내려받습니다.
 
-고급 CTF 카테고리별 도구 프로필까지 검수하려면 다음을 사용합니다.
-
-```bash
-tools/team_member_setup.sh --deep
-```
-
-고급 문제용 대형 도구까지 설치하려면 다음을 사용합니다. 이 installer는
-`pwndbg`, Ghidra, Sleuth Kit, `stegseek`, `adb`/`objection`, `halmos`, `garak`,
-GNU Radio, URH를 user-local 경로와 apt 패키지로 구성합니다.
+고급 CTF 카테고리별 도구까지 설치하려면 다음을 사용합니다.
 
 ```bash
 tools/install_advanced_ctf_tools.sh
 . .codex/env.sh
+python3 tools/preflight_check.py --deep --category <category>
+```
+
+이 installer는 `pwndbg`, Ghidra, Sleuth Kit, `binwalk`, `exiftool`, `nmap`,
+`socat`, `stegseek`, `adb`/`objection`, `volatility3`, `slither`, `solc-select`,
+`halmos`, `garak`, GNU Radio, URH, Foundry, `kubectl`, `trivy`, `syft`, `grype`,
+`crane`을 user-local 경로와 apt 패키지로 구성합니다.
+
+```bash
 python3 tools/preflight_check.py --deep --category pwn
 python3 tools/preflight_check.py --deep --category rev
 python3 tools/preflight_check.py --deep --category mobile
@@ -128,26 +127,27 @@ python3 tools/preflight_check.py --deep --category ai-ml
 python3 tools/preflight_check.py --deep --category hardware-rf
 ```
 
-`garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI
-문제가 아니라면 `tools/install_advanced_ctf_tools.sh --skip-garak`으로 건너뛸
-수 있습니다.
+`garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI 문제가
+아니라면 `tools/install_advanced_ctf_tools.sh --skip-garak`으로 건너뛸 수
+있습니다. 설치는 건너뛰고 현재 상태만 검사하려면 category deep preflight만
+실행합니다.
 
 시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
 ```bash
-tools/team_member_setup.sh --skip-apt
+tools/bootstrap_wsl2.sh --skip-apt
 ```
 
 Python dependency가 이미 설치되어 있다면 다음을 사용합니다.
 
 ```bash
-tools/team_member_setup.sh --skip-python
+tools/bootstrap_wsl2.sh --skip-python
 ```
 
 전체 parity 툴체인 없이 가벼운 baseline만 맞추려면 다음을 사용합니다.
 
 ```bash
-tools/team_member_setup.sh --minimal
+tools/bootstrap_wsl2.sh --minimal
 ```
 
 ## Docker
@@ -168,7 +168,7 @@ python3 tools/preflight_check.py
 
 ## 예상 출력
 
-`tools/preflight_check.py --strict-optional`은 failure 없이 끝나야 합니다. 팀
+`tools/preflight_check.py --strict-optional`은 failure 없이 끝나야 합니다. workspace
 parity 검증도 통과해야 합니다.
 
 ```bash
