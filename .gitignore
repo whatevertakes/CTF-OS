@@ -44,6 +44,7 @@ challenges/*/*/*
 !challenges/blindtest/*/*/replay.sh
 !challenges/blindtest/*/*/evidence/
 !challenges/blindtest/*/*/evidence/**
+challenges/blindtest/*/*/evidence/*.log
 challenges/blindtest/*/*/dist/
 challenges/blindtest/*/*/dist/**
 

@@ -1,0 +1,95 @@
+{
+  "event": "blindtest",
+  "category": "misc",
+  "name": "NX 1",
+  "workspace": "challenges/blindtest/misc/NX 1",
+  "status": "solved",
+  "created_at": "2026-07-06",
+  "updated_at": "2026-07-06",
+  "final_command": "python3 tools/replay_runner.py --allow-remote-live \"challenges/blindtest/misc/NX 1\"",
+  "blocker": {
+    "reason": "",
+    "next_action": ""
+  },
+  "blockers": [],
+  "evidence": [
+    "evidence/remote_raw.summary.md",
+    "evidence/remote_raw.sanitize_check.md",
+    "evidence/replay_20260706T141930Z.summary.md",
+    "evidence/replay_20260706T141930Z.sanitize_check.md",
+    "evidence/proof_validate.txt"
+  ],
+  "tool_routing": {
+    "primary_tools_used": [
+      "file",
+      "sha256sum",
+      "Python source audit",
+      "gcc",
+      "patchelf",
+      "Docker pinned image",
+      "socket exploit script",
+      "replay_runner",
+      "report_sanitize"
+    ],
+    "considered": [
+      "ctf-misc routing",
+      "ctf-pwn native-loader analysis",
+      "radare2 MCP",
+      "angr MCP",
+      "Playwright MCP",
+      "Docker reproduction"
+    ],
+    "used": [
+      "local source inspection",
+      "ELF header probes",
+      "DT_PREINIT_ARRAY payload",
+      "libpython Py_BytesMain",
+      "remote socket replay",
+      "sanitizer"
+    ],
+    "skipped": [
+      "radare2 MCP: low value because the challenge target is Python source plus generated ELFs",
+      "angr MCP: low value because no symbolic path was needed",
+      "Playwright MCP: not a browser/web challenge",
+      "checksec: generated payload properties were inspected with readelf instead"
+    ],
+    "missing": [],
+    "decision_summary": "Misc path routed into native ELF-loader exploitation. The final payload uses DT_PREINIT_ARRAY to make ld-linux call libpython Py_BytesMain before the uploaded ELF entry point, so the uploaded ELF has no executable segments or sections while Python code from stdin reads /flag."
+  },
+  "notes": "Use notes.md for human-readable evidence and reasoning.",
+  "metadata": {
+    "proof_scope": "remote_live_flag",
+    "remote_status": "live_reachable",
+    "remote_solve": "solved_remote_flag_obtained",
+    "replay_kind": "remote_live_exploit",
+    "current_remote_liveness": "live",
+    "evidence_sensitivity": "contains_flag",
+    "last_replay": {
+      "timestamp_utc": "20260706T141930Z",
+      "command": "./replay.sh",
+      "exit_code": 0,
+      "raw_log": "evidence/replay_20260706T141930Z.log",
+      "summary": "evidence/replay_20260706T141930Z.summary.md",
+      "remote_liveness_observed": "live as of 2026-07-06T14:19:30Z replay",
+      "proof_validate": "passed"
+    },
+    "agent_mode": "assisted",
+    "failure_class": "none",
+    "replay_quality": "remote-live replay, deterministic payload, saved raw evidence with redacted summaries, proof_validate passed on 2026-07-06",
+    "shareability": "Share state.json, notes.md, replay.sh, exploit script, payload generator/source, and redacted evidence summaries/checks; keep raw logs containing the flag local.",
+    "tool_effectiveness": {
+      "file": "high",
+      "sha256sum": "high",
+      "local_python": "high",
+      "gcc": "high",
+      "patchelf": "medium",
+      "docker": "high",
+      "socket_exploit": "high",
+      "report_sanitize": "high",
+      "checksec": "not_applicable",
+      "radare2_mcp": "skipped_low_value",
+      "angr_mcp": "skipped_low_value",
+      "playwright_mcp": "not_applicable"
+    }
+  }
+}
