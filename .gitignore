@@ -100,3 +100,6 @@ challenges/**/work/**/*.so
 challenges/**/work/**/*.so.*
 challenges/**/work/**/*.elf
 challenges/**/work/**/*.bin
+
+# Local machine snapshots.
+system-info-*.txt
