@@ -38,6 +38,17 @@ challenges/<event>/<category>/<challenge>/
 The workspace should not create separate root workspaces per event or per
 challenge.
 
+Blindtest category slots are tracked on main:
+
+```text
+challenges/blindtest/<category>/
+```
+
+Concrete blindtest challenge workspaces may commit solve outputs such as
+`state.json`, `notes.md`, `replay.sh`, and `evidence/`. Raw handouts and
+provided problem files under `dist/` remain local-only. Sanitized benchmark
+records live under `benchmarks/`.
+
 ## Standard Challenge Layout
 
 Every challenge workspace should use this structure:
