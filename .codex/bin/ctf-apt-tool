@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="${CTF_WORKSPACE_ROOT:-$(cd "$(dirname "$SCRIPT")/../.." && pwd)}"
+APT_ROOT="$ROOT/.cache/tools/apt-root"
+TOOL="$(basename "$0")"
+case "$TOOL" in
+  upx) TOOL="upx-ucl" ;;
+esac
+
+export PATH="$APT_ROOT/usr/bin:$APT_ROOT/usr/sbin${PATH:+:$PATH}"
+export LD_LIBRARY_PATH="$APT_ROOT/usr/lib/x86_64-linux-gnu:$APT_ROOT/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PYTHONPATH="$APT_ROOT/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}"
+export PERL5LIB="$APT_ROOT/usr/share/perl5:$APT_ROOT/usr/lib/x86_64-linux-gnu/perl5/5.40${PERL5LIB:+:$PERL5LIB}"
+
+TARGET="$APT_ROOT/usr/bin/$TOOL"
+if [ ! -x "$TARGET" ]; then
+  printf 'ctf-apt-tool: %s is not installed under %s\n' "$TOOL" "$APT_ROOT" >&2
+  exit 127
+fi
+
+exec "$TARGET" "$@"
