@@ -188,10 +188,12 @@ python3 tools/report_sanitize.py challenges/<event>/<category>/<challenge>/evide
 
 ```text
 benchmarks/*_SANITIZED_BENCHMARK_REPORT.md
+benchmarks/*_DATA_MANIFEST.json
 challenges/<event>/<category>/<challenge>/state.json
 challenges/<event>/<category>/<challenge>/notes.md
 challenges/<event>/<category>/<challenge>/replay.sh
 challenges/<event>/<category>/<challenge>/evidence/*.summary.md
+challenges/<event>/<category>/<challenge>/evidence/*.sanitize_check.md
 ```
 
 다음 경로는 소유자 전용입니다.
@@ -256,10 +258,12 @@ git merge origin/main
 
 ```bash
 git add benchmarks/*_SANITIZED_BENCHMARK_REPORT.md \
+  benchmarks/*_DATA_MANIFEST.json \
   challenges/<event>/<category>/<challenge>/state.json \
   challenges/<event>/<category>/<challenge>/notes.md \
   challenges/<event>/<category>/<challenge>/replay.sh \
-  challenges/<event>/<category>/<challenge>/evidence/*.summary.md
+  challenges/<event>/<category>/<challenge>/evidence/*.summary.md \
+  challenges/<event>/<category>/<challenge>/evidence/*.sanitize_check.md
 git commit -m "submit benchmark data for <benchmark-id>"
 git push origin HEAD:<github-user>
 ```

@@ -34,18 +34,22 @@ git switch <github-user>
 git merge origin/main
 ```
 
-승인된 blindtest 데이터 파일만 commit합니다.
+승인된 정제 데이터 파일만 commit합니다.
 
 ```text
-challenges/blindtest/<category>/<challenge>/state.json
-challenges/blindtest/<category>/<challenge>/notes.md
-challenges/blindtest/<category>/<challenge>/replay.sh
-challenges/blindtest/<category>/<challenge>/evidence/*
-challenges/blindtest/<category>/<challenge>/work/*
+benchmarks/*_SANITIZED_BENCHMARK_REPORT.md
+benchmarks/*_DATA_MANIFEST.json
+challenges/<event>/<category>/<challenge>/state.json
+challenges/<event>/<category>/<challenge>/notes.md
+challenges/<event>/<category>/<challenge>/replay.sh
+challenges/<event>/<category>/<challenge>/evidence/*.summary.md
+challenges/<event>/<category>/<challenge>/evidence/*.sanitize_check.md
 ```
 
 raw flag, raw replay log, private key, `.env` 파일, challenge `work/` scratch
-dependency checkout, 프레임워크 파일은 commit하지 않습니다.
+dependency checkout, 프레임워크 파일은 commit하지 않습니다. `work/`에서 나온
+증거는 필요한 내용만 `evidence/*.summary.md` 또는 `evidence/*.sanitize_check.md`로
+정제해서 제출합니다.
 
 ## 로컬 검증
 
@@ -72,7 +76,7 @@ git push origin HEAD:<github-user>
 
 자기 브랜치에서 `main`으로 PR을 엽니다. data-submission GitHub Action은
 `shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`, `lee` 브랜치에서 올라온 PR이
-승인된 blindtest 데이터 경로만 바꾸는지 검사합니다. 병합은 소유자 리뷰 후에만
+승인된 정제 데이터 경로만 바꾸는지 검사합니다. 병합은 소유자 리뷰 후에만
 진행합니다.
 
 직접 브랜치 push가 불가능하면 benchmark data issue template을 사용하고 동일한
