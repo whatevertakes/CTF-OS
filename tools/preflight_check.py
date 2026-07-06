@@ -486,8 +486,23 @@ class Reporter:
         print(f"FAIL {label}")
 
 
-def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=False)
+def run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=exc.stdout or "",
+            stderr=f"timed out after {timeout}s",
+        )
 
 
 def check_paths(reporter: Reporter) -> None:
