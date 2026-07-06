@@ -186,12 +186,23 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
   # shellcheck disable=SC1091
   . .codex/env.sh
   echo "== 고급 CTF strict deep profile 검증 =="
+  deep_failures=0
   for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container ai-ml hardware-rf side-channel; do
     echo "-- $category --"
+    set +e
     python3 tools/preflight_check.py --strict-deep --category "$category" | grep -E '^(PASS deep|WARN deep|FAIL deep|summary)'
+    deep_status=${PIPESTATUS[0]}
+    set -e
+    if [ "$deep_status" -ne 0 ]; then
+      deep_failures=$((deep_failures + 1))
+    fi
   done
   echo "-- hardware-rf avr --"
   python3 tools/preflight_check.py --category hardware-rf --tag avr | grep -E '^(PASS command avr|PASS dependency avr|FAIL dependency_missing|summary)'
+  if [ "$deep_failures" -ne 0 ]; then
+    echo "FAIL strict deep profile categories failed: $deep_failures" >&2
+    exit 1
+  fi
 fi
 
 cat <<EOF
