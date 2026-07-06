@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
+VENV_PYTHON="$ROOT/.venv/bin/python"
 OPT_ROOT="${CTF_ADVANCED_TOOLS_ROOT:-$HOME/.local/opt/ctf-tools}"
 BIN_DIR="$HOME/.local/bin"
 
@@ -81,6 +82,15 @@ PIP_TOOLS=(
   halmos
   garak
   urh
+)
+
+PYTHON_MODULE_TOOLS=(
+  cysignals
+  fpylll
+  sigmf
+  chipwhisperer
+  yara-python
+  volatility3
 )
 
 PIPX_TOOLS=(
@@ -162,7 +172,8 @@ Usage: tools/install_advanced_ctf_tools.sh [options]
 
 Installs advanced, target-specific CTF tools into user-local paths:
   - apt: adb, binwalk, exiftool, qemu, GNU Radio, Sleuth Kit, stegseek, web/pwn helpers
-  - user venv wrappers: objection, halmos, garak, urh, volatility3, slither, solc-select
+  - isolated user venv wrappers: objection, halmos, garak, urh, volatility3, slither, solc-select
+  - workspace venv modules: fpylll, sigmf, chipwhisperer, yara-python, volatility3
   - pipx tools: apkid, awscli, capa, checkov, commix, httpie, mobsfscan
   - Go tools: nuclei, katana, subfinder, gau, waybackurls, hakrawler, dalfox,
     interactsh-client, dnsx, naabu, helm, k9s, kind, cosign, dive, regctl, oras
@@ -331,6 +342,18 @@ install_pip_tools() {
   done
   install_pip_entry_tool volatility3 vol volatility3 || true
   install_pip_entry_tool slither slither slither-analyzer || true
+}
+
+install_workspace_python_modules() {
+  if [ ! -x "$VENV_PYTHON" ]; then
+    echo "WARN workspace venv python missing; skipping advanced Python modules" >&2
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN workspace python modules %s\n' "${PYTHON_MODULE_TOOLS[*]}"
+    return 0
+  fi
+  "$VENV_PYTHON" -m pip install -U "${PYTHON_MODULE_TOOLS[@]}" || true
 }
 
 install_solc_select() {
@@ -726,6 +749,7 @@ print_manual_tools() {
 
 install_apt_tools || true
 install_pip_tools || true
+install_workspace_python_modules || true
 install_pipx_tools || true
 install_go_tools || true
 install_npm_tools || true

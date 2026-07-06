@@ -185,7 +185,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("yafu", ("yafu", "--version")),
         ("msieve", ("msieve", "-h")),
         ("cado-nfs", ("cado-nfs.py", "-h")),
-        ("gap", ("gap", "-v")),
+        ("gap", ("gap", "-q", "-b", "-c", "Display(GAPInfo.Version); QUIT;")),
         ("magma", ("magma", "-v")),
     ),
     "forensics": (
@@ -226,7 +226,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("objection", ("objection", "version")),
         ("frida", ("frida", "--version")),
         ("frida-ps", ("frida-ps", "--version")),
-        ("apkid", ("apkid", "--version")),
+        ("apkid", ("apkid", "-h")),
         ("apksigner", ("apksigner", "--version")),
         ("MobSF", ("mobsf", "--version")),
         ("mobsfscan", ("mobsfscan", "--version")),
@@ -236,7 +236,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("pwninit", ("pwninit", "--version")),
         ("patchelf", ("patchelf", "--version")),
         ("valgrind", ("valgrind", "--version")),
-        ("afl-fuzz", ("afl-fuzz", "-h")),
+        ("afl-fuzz", ("afl-fuzz", "--version")),
         ("honggfuzz", ("honggfuzz", "--help")),
         ("radamsa", ("radamsa", "--version")),
         ("gef-gdb", ("gef-gdb", "--batch", "-ex", "pi print('gef-gdb')")),
@@ -263,7 +263,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("dotnet", ("dotnet", "--version")),
         ("ilspycmd", ("ilspycmd", "--version")),
         ("dnspy", ("dnspy", "--version")),
-        ("monodis", ("monodis", "--version")),
+        ("monodis", ("monodis",)),
         ("emcc", ("emcc", "--version")),
         ("llvm-objdump", ("llvm-objdump", "--version")),
         ("floss", ("floss", "--version")),
@@ -302,7 +302,7 @@ DEEP_CATEGORY_COMMANDS = {
         ("subfinder", ("subfinder", "-version")),
         ("gau", ("gau", "--version")),
         ("waybackurls", ("waybackurls", "-h")),
-        ("hakrawler", ("hakrawler", "-version")),
+        ("hakrawler", ("hakrawler", "--help")),
         ("dalfox", ("dalfox", "version")),
         ("XSStrike", ("xsstrike", "--help")),
         ("commix", ("commix", "--version")),
@@ -386,24 +386,22 @@ DEEP_CATEGORY_COMMANDS = {
     "hardware-rf": (
         ("gnuradio", ("gnuradio-config-info", "-v")),
         ("urh", ("urh", "--version")),
-        ("inspectrum", ("inspectrum", "--version")),
-        ("sigmf-cli", ("sigmf", "--version")),
+        ("inspectrum", ("inspectrum", "-h")),
+        ("sigmf-cli", ("sigmf_validate", "--help")),
         ("rtl_433", ("rtl_433", "-V")),
-        ("rtl_sdr", ("rtl_sdr", "-h")),
-        ("hackrf_info", ("hackrf_info", "--help")),
+        ("rtl_sdr", ("rtl_sdr",)),
+        ("hackrf_info", ("hackrf_info",)),
         ("sigrok-cli", ("sigrok-cli", "--version")),
         ("pulseview", ("pulseview", "--version")),
         ("openocd", ("openocd", "--version")),
         ("arm-none-eabi-gcc", ("arm-none-eabi-gcc", "--version")),
         ("arm-none-eabi-objdump", ("arm-none-eabi-objdump", "--version")),
-        ("chipwhisperer", ("chipwhisperer", "--version")),
         ("audacity", ("audacity", "--version")),
         ("baudline", ("baudline", "--version")),
     ),
     "side-channel": (
         ("gnuradio", ("gnuradio-config-info", "-v")),
-        ("chipwhisperer", ("chipwhisperer", "--version")),
-        ("sigmf-cli", ("sigmf", "--version")),
+        ("sigmf-cli", ("sigmf_validate", "--help")),
         ("openocd", ("openocd", "--version")),
         ("arm-none-eabi-gcc", ("arm-none-eabi-gcc", "--version")),
         ("arm-none-eabi-objdump", ("arm-none-eabi-objdump", "--version")),
@@ -428,8 +426,13 @@ DEEP_CATEGORY_MODULES = {
     "programming": (
         ("z3-solver", "z3"),
     ),
-    "web3": (
-        ("slither-analyzer", "slither"),
+    "hardware-rf": (
+        ("chipwhisperer", "chipwhisperer"),
+        ("sigmf", "sigmf"),
+    ),
+    "side-channel": (
+        ("chipwhisperer", "chipwhisperer"),
+        ("sigmf", "sigmf"),
     ),
 }
 
@@ -484,6 +487,18 @@ class Reporter:
     def fail(self, label: str) -> None:
         self.failures += 1
         print(f"FAIL {label}")
+
+
+NONZERO_OK_OUTPUT_PATTERNS = {
+    ("monodis",): ("Mono Common Intermediate Language Disassembler", "Usage is: monodis"),
+    ("rtl_sdr",): ("rtl_sdr, an I/Q recorder",),
+    ("hackrf_info",): ("hackrf_info version:", "libhackrf version:"),
+}
+
+
+def result_detail(result: subprocess.CompletedProcess[str]) -> str:
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return lines[0].strip() if lines else "version check passed"
 
 
 def run(command: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -662,10 +677,13 @@ def normalize_category(value: str | None) -> str:
 def command_version_line(command: tuple[str, ...]) -> tuple[bool, str]:
     result = run(list(command))
     if result.returncode != 0:
+        combined = f"{result.stdout}\n{result.stderr}"
+        patterns = NONZERO_OK_OUTPUT_PATTERNS.get(command, ())
+        if patterns and any(pattern in combined for pattern in patterns):
+            return True, result_detail(result)
         reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "version check failed"
         return False, reason
-    lines = (result.stdout or result.stderr).strip().splitlines()
-    return True, lines[0].strip() if lines else "version check passed"
+    return True, result_detail(result)
 
 
 def check_deep_category_tools(reporter: Reporter, category: str | None) -> None:

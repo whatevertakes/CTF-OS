@@ -22,6 +22,12 @@ arjun
 flask-unsign
 flare-floss
 frida-tools==12.5.1
+cysignals
+fpylll
 shodan
+sigmf
 stego-lsb
 wafw00f
+chipwhisperer
+yara-python
+volatility3
