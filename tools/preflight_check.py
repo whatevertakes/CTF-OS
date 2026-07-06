@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -176,7 +177,56 @@ OPTIONAL_COMMAND_CHECKS = {
     "pwninit": ("pwninit", "--version"),
 }
 
-DEEP_CATEGORY_COMMANDS = {
+DEEP_SOURCE_MANAGED = "managed"
+DEEP_SOURCE_EXTERNAL = "external"
+
+
+@dataclass(frozen=True)
+class DeepTool:
+    label: str
+    command: tuple[str, ...]
+    source: str
+
+
+EXTERNAL_DEEP_TOOL_LABELS = frozenset(
+    {
+        "magma",
+        "XSStrike",
+        "phpggc",
+        "gef-gdb",
+        "peda-gdb",
+        "keystone-as",
+        "cfr",
+        "procyon",
+        "rz-ghidra",
+        "r2ghidra",
+        "dotnet",
+        "dnspy",
+        "NetworkMiner",
+        "MobSF",
+        "diec",
+        "pestudio",
+        "peid",
+        "gcloud",
+        "az",
+        "terraform",
+        "kubescape",
+        "nerdctl",
+        "baudline",
+    }
+)
+
+EXTERNAL_DEPENDENT_MANAGED_TOOLS = {
+    "ilspycmd": ("dotnet",),
+}
+
+
+def deep_tool(label: str, command: tuple[str, ...]) -> DeepTool:
+    source = DEEP_SOURCE_EXTERNAL if label in EXTERNAL_DEEP_TOOL_LABELS else DEEP_SOURCE_MANAGED
+    return DeepTool(label=label, command=tuple(command), source=source)
+
+
+DEEP_CATEGORY_COMMANDS_RAW = {
     "crypto": (
         ("RsaCtfTool", ("RsaCtfTool", "--help")),
         ("z3", ("z3", "--version")),
@@ -410,6 +460,11 @@ DEEP_CATEGORY_COMMANDS = {
     ),
 }
 
+DEEP_CATEGORY_COMMANDS = {
+    category: tuple(deep_tool(label, command) for label, command in tools)
+    for category, tools in DEEP_CATEGORY_COMMANDS_RAW.items()
+}
+
 DEEP_CATEGORY_MODULES = {
     "crypto": (
         ("z3-solver", "z3"),
@@ -476,6 +531,8 @@ class Reporter:
     def __init__(self) -> None:
         self.failures = 0
         self.warnings = 0
+        self.external_missing = 0
+        self.external_failed = 0
 
     def pass_(self, label: str) -> None:
         print(f"PASS {label}")
@@ -484,9 +541,24 @@ class Reporter:
         self.warnings += 1
         print(f"WARN {label}")
 
+    def info(self, label: str) -> None:
+        print(f"INFO {label}")
+
     def fail(self, label: str) -> None:
         self.failures += 1
         print(f"FAIL {label}")
+
+    def external_unavailable(self, label: str, *, fail: bool) -> None:
+        self.external_missing += 1
+        if fail:
+            self.failures += 1
+        print(f"EXTERNAL {label}")
+
+    def external_check_failed(self, label: str, *, fail: bool) -> None:
+        self.external_failed += 1
+        if fail:
+            self.failures += 1
+        print(f"EXTERNAL {label}")
 
 
 NONZERO_OK_OUTPUT_PATTERNS = {
@@ -686,7 +758,13 @@ def command_version_line(command: tuple[str, ...]) -> tuple[bool, str]:
     return True, result_detail(result)
 
 
-def check_deep_category_tools(reporter: Reporter, category: str | None, *, strict: bool) -> None:
+def check_deep_category_tools(
+    reporter: Reporter,
+    category: str | None,
+    *,
+    strict: bool,
+    external_policy: str,
+) -> None:
     normalized = normalize_category(category)
     if not normalized:
         if strict:
@@ -704,20 +782,50 @@ def check_deep_category_tools(reporter: Reporter, category: str | None, *, stric
             reporter.warn(f"deep category checks have no configured tool profile for {normalized}")
         return
 
-    for label, command in commands:
+    external_fail = external_policy == "fail"
+    external_missing = {
+        tool.label
+        for tool in commands
+        if tool.source == DEEP_SOURCE_EXTERNAL and not shutil.which(tool.command[0])
+    }
+
+    for tool in commands:
+        label = tool.label
+        command = tool.command
         executable = command[0]
+        blocked_by_external = [
+            dependency
+            for dependency in EXTERNAL_DEPENDENT_MANAGED_TOOLS.get(label, ())
+            if dependency in external_missing
+        ]
+        if blocked_by_external:
+            reporter.info(
+                f"deep command skipped {label}: external dependency missing "
+                f"{', '.join(blocked_by_external)}"
+            )
+            continue
         if shutil.which(executable):
             ok, detail = command_version_line(command)
             if ok:
                 prefix = "deep command" if strict else "deep optional command"
                 reporter.pass_(f"{prefix} {label}: {detail}")
             else:
-                if strict:
+                if tool.source == DEEP_SOURCE_EXTERNAL:
+                    reporter.external_check_failed(
+                        f"deep command check failed {label}: {detail}",
+                        fail=external_fail,
+                    )
+                elif strict:
                     reporter.fail(f"deep command check failed {label}: {detail}")
                 else:
                     reporter.warn(f"deep optional command check failed {label}: {detail}")
         else:
-            if strict:
+            if tool.source == DEEP_SOURCE_EXTERNAL:
+                reporter.external_unavailable(
+                    f"deep command unavailable {label}",
+                    fail=external_fail,
+                )
+            elif strict:
                 reporter.fail(f"deep command unavailable {label}")
             else:
                 reporter.warn(f"deep optional command unavailable {label}")
@@ -860,6 +968,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="treat category-specific deep profile commands and modules as required",
     )
+    parser.add_argument(
+        "--external-policy",
+        choices=("report", "fail"),
+        default="report",
+        help="report external/manual deep tools separately by default; use fail for full workstation parity",
+    )
     return parser.parse_args()
 
 
@@ -873,12 +987,20 @@ def main() -> int:
     if requires_avr_toolchain(args.category, args.tag):
         check_avr_toolchain(reporter)
     if args.deep or args.strict_deep:
-        check_deep_category_tools(reporter, args.category, strict=args.strict_deep)
+        check_deep_category_tools(
+            reporter,
+            args.category,
+            strict=args.strict_deep,
+            external_policy=args.external_policy,
+        )
     check_python_modules(reporter)
     check_config(reporter)
     check_runtime_environment(reporter)
 
-    print(f"summary failures={reporter.failures} warnings={reporter.warnings}")
+    print(
+        f"summary failures={reporter.failures} warnings={reporter.warnings} "
+        f"external_missing={reporter.external_missing} external_failed={reporter.external_failed}"
+    )
     return 1 if reporter.failures else 0
 
 

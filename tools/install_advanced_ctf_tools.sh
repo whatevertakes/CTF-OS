@@ -21,6 +21,9 @@ APT_PACKAGES=(
   cargo
   checkov
   cmake
+  autoconf
+  automake
+  bison
   cutter
   dnsutils
   emscripten
@@ -39,17 +42,26 @@ APT_PACKAGES=(
   honggfuzz
   httpie
   inspectrum
+  flex
+  libgmp-dev
   llvm
   llvm-dev
+  libpcap-dev
   mono-devel
   mono-utils
+  libsqlite3-dev
+  libssl-dev
   libimage-exiftool-perl
+  libtool
+  meson
   minikube
   msieve
+  ninja-build
   openocd
   outguess
   php-cli
   php-curl
+  python3-dev
   podman
   pulseview
   nmap
@@ -75,6 +87,7 @@ APT_PACKAGES=(
   yara
   yafu
   zeek
+  zlib1g-dev
 )
 
 PIP_TOOLS=(
@@ -134,6 +147,7 @@ NPM_TOOLS=(
 
 CARGO_TOOLS=(
   "feroxbuster|feroxbuster"
+  "rga|ripgrep_all"
 )
 
 DOTNET_TOOLS=(
@@ -161,7 +175,6 @@ REQUIRED_EXTERNAL_TOOLS=(
   "terraform|team deep profile required; install HashiCorp release or distro package and keep provider credentials out of this workspace"
   "gcloud|team deep profile required; install Google Cloud SDK externally and keep cloud credentials out of this workspace"
   "az|team deep profile required; install Azure CLI externally and keep cloud credentials out of this workspace"
-  "terragrunt|team deep profile required; the script may attempt a Go install, but failures remain an external PATH setup issue"
   "kubescape|team deep profile required; install upstream release or script externally and expose kubescape on PATH"
   "nerdctl|team deep profile required; install a release matching local containerd outside this repo"
   "baudline|team deep profile required; closed-source signal GUI, install externally and keep binaries out of Git"
@@ -180,6 +193,7 @@ Installs advanced, target-specific CTF tools into user-local paths:
     interactsh-client, dnsx, naabu, helm, k9s, kind, cosign, dive, regctl, oras
   - npm tools: promptfoo
   - cargo/dotnet tools when cargo or dotnet is already present
+  - source or upstream binary fallbacks for managed tools with no apt candidate
   - user checkouts/downloads: pwndbg, Ghidra
   - Foundry toolchain: forge, cast, anvil, chisel
   - Cloud/container tools: kubectl, trivy, syft, grype, crane
@@ -200,7 +214,9 @@ Options:
 Run from a terminal with sudo available. Script-managed tools and required
 external tools are both part of the team deep profile. Licensed, GUI,
 Windows-only, credentialed, service-style, or non-portable tools stay outside
-Git and are verified through PATH/version checks instead of forced automation.
+Git and are reported through PATH/version checks by default. Use
+--strict-external on team setup when a full workstation parity gate should fail
+on external/manual gaps.
 EOF
 }
 
@@ -264,6 +280,112 @@ plan_or_run() {
   return 0
 }
 
+cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    printf '2\n'
+  fi
+}
+
+warn_fallback_failed() {
+  printf 'WARN fallback %s failed\n' "$1" >&2
+}
+
+git_checkout() {
+  local repo="$1"
+  local dest="$2"
+  local recursive="${3:-0}"
+  if [ ! -d "$dest/.git" ]; then
+    if [ "$recursive" -eq 1 ]; then
+      git clone --depth 1 --recursive "$repo" "$dest"
+    else
+      git clone --depth 1 "$repo" "$dest"
+    fi
+    return
+  fi
+  git -C "$dest" pull --ff-only
+  if [ "$recursive" -eq 1 ]; then
+    git -C "$dest" submodule update --init --recursive
+  fi
+}
+
+install_from_path() {
+  local source="$1"
+  local target="$2"
+  [ -x "$source" ] || return 1
+  install -m 0755 "$source" "$target"
+}
+
+write_exec_wrapper() {
+  local wrapper="$1"
+  local target="$2"
+  [ -x "$target" ] || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN wrapper %s -> %s\n' "$wrapper" "$target"
+    return 0
+  fi
+  cat >"$BIN_DIR/$wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$target" "\$@"
+EOF
+  chmod +x "$BIN_DIR/$wrapper"
+}
+
+write_python_wrapper() {
+  local wrapper="$1"
+  local target="$2"
+  [ -f "$target" ] || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN wrapper %s -> %s %s\n' "$wrapper" "$PYTHON" "$target"
+    return 0
+  fi
+  cat >"$BIN_DIR/$wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$PYTHON" "$target" "\$@"
+EOF
+  chmod +x "$BIN_DIR/$wrapper"
+}
+
+install_alias_wrapper() {
+  local wrapper="$1"
+  shift
+  if command -v "$wrapper" >/dev/null 2>&1; then
+    return 0
+  fi
+  local candidate
+  local target
+  for candidate in "$@"; do
+    target="$(command -v "$candidate" 2>/dev/null || true)"
+    if [ -n "$target" ] && [ -x "$target" ] && [ "$target" != "$BIN_DIR/$wrapper" ]; then
+      write_exec_wrapper "$wrapper" "$target"
+      return 0
+    fi
+  done
+  return 0
+}
+
+print_install_policy_summary() {
+  printf '\n== Advanced install policy ==\n'
+  printf 'INFO managed install phases are best-effort; strict-deep preflight is the final managed gate.\n'
+  printf 'INFO external/manual tools are reported, not auto-installed; use team --strict-external for full parity.\n'
+  if [ "$SKIP_APT" -eq 1 ]; then
+    printf 'INFO apt package phase disabled by --skip-apt.\n'
+  elif ! command -v apt-get >/dev/null 2>&1; then
+    printf 'WARN apt-get unavailable; apt package phase cannot run.\n' >&2
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    printf 'INFO apt package phase can use non-interactive sudo.\n'
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    printf 'WARN sudo non-interactive apt unavailable for real install; dry-run still prints the apt plan.\n' >&2
+    printf 'INFO run from an interactive sudo-capable terminal for apt coverage, or rely on user-local fallbacks.\n'
+  elif [ -t 0 ]; then
+    printf 'INFO apt package phase may request sudo interactively.\n'
+  else
+    printf 'WARN sudo non-interactive apt unavailable; apt package phase will be skipped.\n' >&2
+    printf 'INFO run from an interactive sudo-capable terminal for apt coverage, or rely on user-local fallbacks.\n'
+  fi
+}
+
 apt_package_available() {
   local candidate
   candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
@@ -306,7 +428,8 @@ install_apt_tools() {
       return 0
     fi
   else
-    echo "WARN sudo unavailable; skipping apt advanced tools" >&2
+    echo "WARN sudo non-interactive apt unavailable; skipping apt advanced tools" >&2
+    echo "INFO apt-managed tools will rely on user-local fallbacks where configured" >&2
     return 0
   fi
   install_available_apt_packages "${APT_PACKAGES[@]}"
@@ -477,34 +600,40 @@ PY
 }
 
 install_gnuradio_wrapper() {
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN wrapper gnuradio-companion-clean\n'
+  local target
+  target="$(command -v gnuradio-companion 2>/dev/null || true)"
+  if [ -z "$target" ] && [ -x /usr/bin/gnuradio-companion ]; then
+    target="/usr/bin/gnuradio-companion"
+  fi
+  if [ -z "$target" ]; then
     return 0
   fi
-  cat >"$BIN_DIR/gnuradio-companion-clean" <<'EOF'
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN wrapper gnuradio-companion-clean -> %s\n' "$target"
+    return 0
+  fi
+  cat >"$BIN_DIR/gnuradio-companion-clean" <<EOF
 #!/usr/bin/env bash
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH
-exec /usr/bin/gnuradio-companion "$@"
+exec "$target" "\$@"
 EOF
   chmod +x "$BIN_DIR/gnuradio-companion-clean"
 }
 
 install_upx_wrapper() {
-  if command -v upx >/dev/null 2>&1; then
-    return 0
-  fi
-  if command -v upx-ucl >/dev/null 2>&1; then
-    if [ "$DRY_RUN" -eq 1 ]; then
-      printf 'DRYRUN wrapper upx -> upx-ucl\n'
-      return 0
-    fi
-    cat >"$BIN_DIR/upx" <<'EOF'
-#!/usr/bin/env bash
-exec upx-ucl "$@"
-EOF
-    chmod +x "$BIN_DIR/upx"
-  fi
+  install_alias_wrapper upx upx-ucl
+}
+
+install_name_mismatch_wrappers() {
+  install_upx_wrapper
+  install_alias_wrapper cado-nfs.py cado-nfs
+  install_alias_wrapper pdfid.py pdfid
+  install_alias_wrapper pdf-parser.py pdf-parser
+  install_alias_wrapper oledump.py oledump
+  install_alias_wrapper qemu-x86_64 qemu-x86_64-static
+  install_alias_wrapper qemu-aarch64 qemu-aarch64-static
+  install_alias_wrapper rga ripgrep-all
 }
 
 install_foundry() {
@@ -543,6 +672,255 @@ crane_arch() {
       return 1
       ;;
   esac
+}
+
+install_minikube_binary_fallback() {
+  if command -v minikube >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback minikube upstream binary\n'
+    return 0
+  fi
+  local arch
+  local dest
+  arch="$(linux_arch)" || return 1
+  dest="$ROOT/.cache/tools/minikube-linux-$arch"
+  curl -L "https://storage.googleapis.com/minikube/releases/latest/minikube-linux-$arch" -o "$dest"
+  install -m 0755 "$dest" "$BIN_DIR/minikube"
+}
+
+install_terragrunt_binary_fallback() {
+  if command -v terragrunt >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback terragrunt upstream binary\n'
+    return 0
+  fi
+  local arch
+  local dest
+  arch="$(linux_arch)" || return 1
+  dest="$ROOT/.cache/tools/terragrunt_linux_$arch"
+  curl -L "https://github.com/gruntwork-io/terragrunt/releases/latest/download/terragrunt_linux_$arch" -o "$dest"
+  install -m 0755 "$dest" "$BIN_DIR/terragrunt"
+}
+
+install_honggfuzz_fallback() {
+  if command -v honggfuzz >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback honggfuzz source build %s\n' "$OPT_ROOT/honggfuzz"
+    return 0
+  fi
+  local dest="$OPT_ROOT/honggfuzz"
+  git_checkout https://github.com/google/honggfuzz "$dest"
+  make -C "$dest" -j"$(cpu_count)"
+  install_from_path "$dest/honggfuzz" "$BIN_DIR/honggfuzz"
+}
+
+install_radamsa_fallback() {
+  if command -v radamsa >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback radamsa source build %s\n' "$OPT_ROOT/radamsa"
+    return 0
+  fi
+  local dest="$OPT_ROOT/radamsa"
+  git_checkout https://gitlab.com/akihe/radamsa.git "$dest"
+  make -C "$dest" -j"$(cpu_count)"
+  install_from_path "$dest/bin/radamsa" "$BIN_DIR/radamsa"
+}
+
+install_rizin_fallback() {
+  if command -v rizin >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback rizin source build %s\n' "$OPT_ROOT/rizin"
+    return 0
+  fi
+  local dest="$OPT_ROOT/rizin"
+  git_checkout https://github.com/rizinorg/rizin "$dest" 1
+  if [ -d "$dest/build" ]; then
+    meson setup "$dest/build" "$dest" --prefix "$dest/prefix" --reconfigure
+  else
+    meson setup "$dest/build" "$dest" --prefix "$dest/prefix"
+  fi
+  ninja -C "$dest/build" install
+  install_from_path "$dest/prefix/bin/rizin" "$BIN_DIR/rizin"
+}
+
+install_msieve_fallback() {
+  if command -v msieve >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback msieve source build %s\n' "$OPT_ROOT/msieve"
+    return 0
+  fi
+  local dest="$OPT_ROOT/msieve"
+  git_checkout https://github.com/radii/msieve "$dest"
+  make -C "$dest" -j"$(cpu_count)" all
+  install_from_path "$dest/msieve" "$BIN_DIR/msieve"
+}
+
+install_yafu_fallback() {
+  if command -v yafu >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback yafu source build %s\n' "$OPT_ROOT/yafu"
+    return 0
+  fi
+  local dest="$OPT_ROOT/yafu"
+  local binary
+  git_checkout https://github.com/bbuhrow/yafu "$dest" 1
+  make -C "$dest" -j"$(cpu_count)" x86_64 || make -C "$dest" -j"$(cpu_count)"
+  binary="$(find "$dest" -type f -name yafu -perm -111 | head -1)"
+  install_from_path "$binary" "$BIN_DIR/yafu"
+}
+
+install_bulk_extractor_fallback() {
+  if command -v bulk_extractor >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback bulk_extractor source build %s\n' "$OPT_ROOT/bulk_extractor"
+    return 0
+  fi
+  local dest="$OPT_ROOT/bulk_extractor"
+  git_checkout https://github.com/simsong/bulk_extractor "$dest" 1
+  if [ ! -x "$dest/configure" ] && [ -x "$dest/bootstrap.sh" ]; then
+    (cd "$dest" && ./bootstrap.sh)
+  fi
+  (cd "$dest" && ./configure --prefix="$dest/prefix")
+  make -C "$dest" -j"$(cpu_count)" install
+  install_from_path "$dest/prefix/bin/bulk_extractor" "$BIN_DIR/bulk_extractor"
+}
+
+install_cado_nfs_fallback() {
+  if command -v cado-nfs.py >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback cado-nfs source checkout %s\n' "$OPT_ROOT/cado-nfs"
+    return 0
+  fi
+  local dest="$OPT_ROOT/cado-nfs"
+  git_checkout https://gitlab.inria.fr/cado-nfs/cado-nfs.git "$dest"
+  if [ -f "$dest/cado-nfs.py" ]; then
+    chmod +x "$dest/cado-nfs.py"
+    write_exec_wrapper cado-nfs.py "$dest/cado-nfs.py"
+  else
+    return 1
+  fi
+}
+
+install_didier_stevens_fallback() {
+  if command -v pdfid.py >/dev/null 2>&1 && command -v pdf-parser.py >/dev/null 2>&1 \
+    && command -v oledump.py >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback didier-stevens scripts %s\n' "$OPT_ROOT/didier-stevens"
+    return 0
+  fi
+  local dest="$OPT_ROOT/didier-stevens"
+  local script
+  mkdir -p "$dest"
+  for script in pdfid.py pdf-parser.py oledump.py; do
+    if [ ! -s "$dest/$script" ]; then
+      curl -fsSL "https://raw.githubusercontent.com/DidierStevens/DidierStevensSuite/master/$script" \
+        -o "$dest/$script"
+    fi
+    chmod +x "$dest/$script"
+    write_python_wrapper "$script" "$dest/$script"
+  done
+}
+
+install_zeek_official_package() {
+  command -v apt-get >/dev/null 2>&1 || return 1
+  command -v sudo >/dev/null 2>&1 || return 1
+  if ! sudo -n true 2>/dev/null && { [ ! -t 0 ] || ! sudo -v; }; then
+    return 1
+  fi
+  if [ ! -r /etc/os-release ]; then
+    return 1
+  fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  if [ "${ID:-}" != "ubuntu" ]; then
+    return 1
+  fi
+  local repo_id="xUbuntu_${VERSION_ID:-}"
+  local keyring="/usr/share/keyrings/zeek-archive-keyring.gpg"
+  local repo_url="https://download.opensuse.org/repositories/security:/zeek/$repo_id"
+  local key_path="$ROOT/.cache/tools/zeek-release.key"
+  curl -fsSL "$repo_url/Release.key" -o "$key_path"
+  if command -v gpg >/dev/null 2>&1; then
+    gpg --dearmor <"$key_path" >"$ROOT/.cache/tools/zeek-archive-keyring.gpg"
+    sudo install -m 0644 "$ROOT/.cache/tools/zeek-archive-keyring.gpg" "$keyring"
+  else
+    sudo install -m 0644 "$key_path" "$keyring"
+  fi
+  printf 'deb [signed-by=%s] %s/ /\n' "$keyring" "$repo_url" \
+    | sudo tee /etc/apt/sources.list.d/zeek.list >/dev/null
+  sudo apt-get update
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y zeek
+}
+
+install_zeek_source_fallback() {
+  if command -v zeek >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback zeek source build %s\n' "$OPT_ROOT/zeek"
+    return 0
+  fi
+  local dest="$OPT_ROOT/zeek"
+  git_checkout https://github.com/zeek/zeek "$dest" 1
+  (cd "$dest" && ./configure --prefix="$dest/prefix")
+  make -C "$dest" -j"$(cpu_count)" install
+  install_from_path "$dest/prefix/bin/zeek" "$BIN_DIR/zeek"
+}
+
+install_zeek_fallback() {
+  if command -v zeek >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN fallback zeek official package or source build\n'
+    return 0
+  fi
+  install_zeek_official_package && return 0
+  install_zeek_source_fallback
+}
+
+run_fallback() {
+  local label="$1"
+  shift
+  if "$@"; then
+    return 0
+  fi
+  warn_fallback_failed "$label"
+  return 0
+}
+
+install_managed_fallbacks() {
+  run_fallback minikube install_minikube_binary_fallback
+  run_fallback terragrunt install_terragrunt_binary_fallback
+  run_fallback honggfuzz install_honggfuzz_fallback
+  run_fallback radamsa install_radamsa_fallback
+  run_fallback rizin install_rizin_fallback
+  run_fallback msieve install_msieve_fallback
+  run_fallback yafu install_yafu_fallback
+  run_fallback bulk_extractor install_bulk_extractor_fallback
+  run_fallback cado-nfs install_cado_nfs_fallback
+  run_fallback didier-stevens install_didier_stevens_fallback
+  run_fallback zeek install_zeek_fallback
 }
 
 install_kubectl() {
@@ -744,13 +1122,15 @@ print_required_external_tools() {
   local tool
   local reason
   printf '\nRequired external tools not portably auto-installed by this script:\n'
-  printf 'These are not optional; strict deep preflight verifies PATH/version availability.\n'
+  printf 'These remain team-standard tools, but default strict deep setup reports them separately.\n'
+  printf 'Use --strict-external in team setup to fail on PATH/version gaps.\n'
   for spec in "${REQUIRED_EXTERNAL_TOOLS[@]}"; do
     IFS='|' read -r tool reason <<<"$spec"
     printf '  - %s: %s\n' "$tool" "$reason"
   done
 }
 
+print_install_policy_summary
 install_apt_tools || true
 install_pip_tools || true
 install_workspace_python_modules || true
@@ -759,11 +1139,12 @@ install_go_tools || true
 install_npm_tools || true
 install_cargo_tools || true
 install_dotnet_tools || true
+install_managed_fallbacks || true
 install_solc_select || true
 install_pwndbg || true
 ROOT="$ROOT" OPT_ROOT="$OPT_ROOT" BIN_DIR="$BIN_DIR" install_ghidra || true
 install_gnuradio_wrapper || true
-install_upx_wrapper || true
+install_name_mismatch_wrappers || true
 install_foundry || true
 install_cloud_container_tools || true
 print_required_external_tools
@@ -789,4 +1170,5 @@ Run:
   python3 tools/preflight_check.py --strict-deep --category ai-ml
   python3 tools/preflight_check.py --strict-deep --category hardware-rf
   python3 tools/preflight_check.py --strict-deep --category side-channel
+  python3 tools/preflight_check.py --strict-deep --external-policy fail --category rev
 EOF

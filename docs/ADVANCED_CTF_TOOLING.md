@@ -32,22 +32,33 @@ Patch/update contract:
 - Re-run apt updates through the same script from an interactive terminal with
   sudo available. In non-interactive sessions without sudo, apt tools are
   skipped with warnings instead of blocking the setup.
+- Installer phases are best-effort by design. `install_apt_tools || true`,
+  `install_go_tools || true`, Cargo, dotnet, and source fallback phases keep
+  the setup moving so later phases can still install useful tools. The final
+  gate is strict deep preflight: managed gaps fail there, while default
+  external/manual gaps are reported separately.
 - Keep required external GUI, licensed, Windows-only, hardware-specific,
   service-style, or cloud-provider tools out of Git and record their local
   version in challenge notes when used as solve evidence.
+- The default team setup fails only on script-managed deep profile gaps.
+  Required external tools are reported separately. Use
+  `tools/setup_workspace.sh team --strict-external` for full workstation
+  parity where external/manual gaps should fail the setup.
 - Never commit cloud credentials, SDR captures with private content, malware
   samples, large third-party binaries, package caches, or third-party
   dependency directories.
 
 ## Script-Managed And Required External Surface
 
-Both columns are mandatory team deep profile surfaces. "Script-managed" means
-the workspace script can usually install or refresh the tool in a portable
-user-local way. "Required external" means the tool is still required by the
-team standard, but licensing, GUI, Windows, cloud credentials, service runtime,
-platform policy, or non-portable installers keep it outside Git and outside
-forced unattended automation. Required external tools must be installed by the
-operator and exposed through PATH/version checks.
+Both columns are mandatory team deep profile surfaces. The difference is the
+default gate. "Script-managed" means the workspace script can usually install
+or refresh the tool in a portable user-local way, so missing or broken managed
+tools fail the default team setup. "Required external" means the tool is still
+required by the team standard, but licensing, GUI, Windows, cloud credentials,
+service runtime, platform policy, or non-portable installers keep it outside
+Git and outside forced unattended automation. Required external tools must be
+installed by the operator and exposed through PATH/version checks; default
+setup reports gaps, while `--strict-external` turns those gaps into failures.
 
 | Category | Script-managed, team-required | Required external, team-required |
 | --- | --- | --- |
@@ -55,18 +66,37 @@ operator and exposed through PATH/version checks.
 | Pwn | `valgrind`, `afl-fuzz`, `honggfuzz`, `radamsa`, `heaptrack`, `pwndbg-gdb`, `patchelf`, qemu profiles | `gef-gdb`, `peda-gdb`, `keystone-as` |
 | Reverse engineering | `capa`, `rizin`, `cutter`, `ilspycmd` when `dotnet` is present, `monodis`, `emcc`, `llvm-objdump`, Ghidra wrappers | `dotnet`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dnspy` |
 | Crypto | `yafu`, `msieve`, `cado-nfs`, `gap`, `fplll`, `pari-gp` | `magma` |
-| Forensics/stego | `bulk_extractor`, `zeek`, `outguess`, `exiv2`, `ripgrep-all`, existing binwalk/exiftool/Sleuth Kit/steg tools | `NetworkMiner`, `pdfid`, `pdf-parser`, `oledump` |
+| Forensics/stego | `bulk_extractor`, `zeek`, `pdfid`, `pdf-parser`, `oledump`, `outguess`, `exiv2`, `ripgrep-all`, existing binwalk/exiftool/Sleuth Kit/steg tools | `NetworkMiner` |
 | Mobile | `apkid`, `apksigner`, `mobsfscan`, existing `adb`, `objection`, `frida`, `jadx`, `apktool` | full `MobSF` service |
 | Malware | `capa`, `yara`, `upx`, Volatility3 | `diec`, `pestudio`, `peid` |
-| Cloud/container | `helm`, `k9s`, `kind`, `minikube`, `podman`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `checkov`, `kube-linter`, `kube-score`, plus existing `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo` | `nerdctl`, `terraform`, `terragrunt`, `gcloud`, `az`, `kubescape` |
+| Cloud/container | `helm`, `k9s`, `kind`, `minikube`, `podman`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, plus existing `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo` | `nerdctl`, `terraform`, `gcloud`, `az`, `kubescape` |
 | AI/ML | `garak`, `promptfoo` | model/API credentials are never installed or stored by this workspace |
 | RF/hardware/side-channel | `inspectrum`, `sigmf-cli`, `rtl_433`, `rtl_sdr`, `hackrf_info`, `sigrok-cli`, `pulseview`, `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `chipwhisperer`, `audacity`, GNU Radio, URH | `baudline` |
 
 The distinction is operational, not optionality. Required external tools are
 excluded from unattended installation because they are licensed, GUI-only,
 platform-specific, credential-sensitive, hardware-bound, or high-impact
-services, but strict deep verification still treats missing commands or failed
-version checks as team setup failures.
+services. Default strict deep verification prints `EXTERNAL ...` report lines
+and summary counts for those tools without failing the setup. Full parity
+checks use `--external-policy fail` or the team setup `--strict-external`
+option.
+
+## Install Failure Model
+
+If `sudo -n true` returns `sudo: a password is required`, Codex or another
+non-interactive session cannot run the apt phase. Apt-targeted tools such as
+`feroxbuster`, `honggfuzz`, `radamsa`, `rizin`, `cutter`, `yafu`, `msieve`,
+`cado-nfs`, `bulk_extractor`, `zeek`, and `minikube` may then remain missing
+unless a Go, Cargo, upstream binary, or source fallback succeeds.
+
+Some apt package names also have no candidate in a default distro repository.
+For example, a package with `Candidate: (none)` will not install through the
+default apt phase even when sudo is available. Those cases are expected to move
+through the configured user-local fallback path or remain as managed preflight
+failures until the installer gains a reliable fallback.
+
+The installer never creates fake passing commands. Wrappers and symlinks are
+created only when they point at a real executable or a real checked-out script.
 
 ## Verification
 
@@ -86,6 +116,13 @@ python3 tools/preflight_check.py --strict-deep --category container
 python3 tools/preflight_check.py --strict-deep --category ai-ml
 python3 tools/preflight_check.py --strict-deep --category hardware-rf
 python3 tools/preflight_check.py --strict-deep --category side-channel
+```
+
+For full workstation parity, include external/manual tools in the failure gate:
+
+```bash
+python3 tools/preflight_check.py --strict-deep --external-policy fail --category rev
+tools/setup_workspace.sh team --branch <github-user> --strict-external
 ```
 
 For a compact local inventory:

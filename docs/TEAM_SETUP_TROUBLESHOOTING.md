@@ -34,6 +34,37 @@ summary failures=0 warnings=0
 team parity summary failures=0
 ```
 
+고급 도구 설치는 설치 단계와 검증 단계를 분리합니다. 설치 스크립트는 가능한
+경로를 최대한 시도하고, 최종 성공 여부는 `preflight --strict-deep`가 판정합니다.
+따라서 `install_* || true` 형태의 best-effort 단계가 있어도 정상입니다. 설치
+중단을 줄이기 위한 구조이며, managed 도구 누락은 뒤의 strict deep 검증에서
+실패로 다시 드러납니다.
+
+비대화형 Codex 세션에서 `sudo -n true`가 `sudo: a password is required`를
+반환하면 apt 구간은 통째로 스킵됩니다. 이 경우 apt 대상 도구는 설치되지 않고,
+Go/Cargo/source/user-local fallback이 있는 도구만 추가로 시도됩니다. apt 기반
+coverage가 필요하면 일반 터미널에서 sudo가 가능한 상태로 다음을 다시 실행합니다.
+
+```bash
+. .codex/env.sh
+tools/setup_workspace.sh advanced
+```
+
+기본 apt 저장소에 패키지 후보가 없는 경우도 있습니다. 예를 들어 `zeek`처럼
+`Candidate: (none)`인 패키지는 sudo가 가능해도 기본 repo만으로는 설치되지 않을
+수 있습니다. 이런 도구는 installer가 별도 repo, upstream binary, Cargo/Go, 또는
+source fallback을 시도하고, 실패하면 `WARN fallback <tool> failed`로 남깁니다.
+
+`XSStrike`, `phpggc`, `dotnet`, `dnspy`, `NetworkMiner`, `MobSF`, `diec`,
+`pestudio`, `gcloud`, `az`, `terraform`, `kubescape`, `baudline` 같은 도구는
+external/manual 표면입니다. 기본 team setup에서는 자동 설치하지 않고
+`EXTERNAL ...` report와 summary count로만 표시합니다. full workstation parity가
+필요할 때만 다음처럼 external 누락도 실패로 처리합니다.
+
+```bash
+tools/setup_workspace.sh team --strict-external
+```
+
 `codex mcp list`에는 다음 서버가 포함되어야 합니다.
 
 ```text
