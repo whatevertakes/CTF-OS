@@ -33,6 +33,20 @@ ghidra-mcp-cache/
 challenges/*/*/*
 !challenges/*/*/.gitkeep
 
+# Blindtest keeps problem handouts local, but allows solve outputs to be shared
+# from concrete challenge workspaces.
+!challenges/blindtest/
+!challenges/blindtest/*/
+!challenges/blindtest/*/.gitkeep
+!challenges/blindtest/*/*/
+!challenges/blindtest/*/*/state.json
+!challenges/blindtest/*/*/notes.md
+!challenges/blindtest/*/*/replay.sh
+!challenges/blindtest/*/*/evidence/
+!challenges/blindtest/*/*/evidence/**
+challenges/blindtest/*/*/dist/
+challenges/blindtest/*/*/dist/**
+
 # Corpus placeholder skeletons that are intentionally tracked even before a
 # full challenge artifact is imported.
 !challenges/historical/pwn/mikuprotect/
