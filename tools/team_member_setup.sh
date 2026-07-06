@@ -210,7 +210,7 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
       {
         echo "-- $category --"
         grep -E '^FAIL deep' "$category_report" || true
-        grep -E '^summary (failures=[1-9]|failures=[0-9]+ warnings=[1-9])' "$category_report" || true
+        printf 'managed_failure_lines=%s\n' "$(grep -Ec '^FAIL deep' "$category_report" || true)"
       } >>"$deep_managed_report"
     fi
     if grep -Eq '^EXTERNAL deep' "$category_report"; then
@@ -234,7 +234,7 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
       {
         echo "-- $category --"
         grep -E '^EXTERNAL deep' "$category_report" || true
-        grep -E '^summary .*external_(missing|failed)=[1-9]' "$category_report" || true
+        printf 'external_missing_failed=%s\n' "$category_external_missing"
       } >>"$deep_external_report"
     fi
     if [ "$deep_status" -ne 0 ] && ! grep -Eq '^(FAIL deep|EXTERNAL deep)' "$category_report"; then

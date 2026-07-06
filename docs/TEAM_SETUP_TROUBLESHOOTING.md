@@ -50,20 +50,32 @@ coverage가 필요하면 일반 터미널에서 sudo가 가능한 상태로 다�
 tools/setup_workspace.sh advanced
 ```
 
-기본 apt 저장소에 패키지 후보가 없는 경우도 있습니다. 예를 들어 `zeek`처럼
+기본 apt 저장소에 패키지 후보가 없는 경우도 있습니다. 예를 들어
 `Candidate: (none)`인 패키지는 sudo가 가능해도 기본 repo만으로는 설치되지 않을
-수 있습니다. 이런 도구는 installer가 별도 repo, upstream binary, Cargo/Go, 또는
-source fallback을 시도하고, 실패하면 `WARN fallback <tool> failed`로 남깁니다.
+수 있습니다. 관리 대상으로 남은 도구는 user-local fallback을 시도하거나 managed
+preflight 실패로 남고, local failure 후 external로 이동한 도구는 기본 team
+setup에서 `EXTERNAL ...` report로만 표시합니다.
 
-`XSStrike`, `phpggc`, `dotnet`, `dnspy`, `NetworkMiner`, `MobSF`, `diec`,
-`pestudio`, `gcloud`, `az`, `terraform`, `kubescape`, `baudline` 같은 도구는
-external/manual 표면입니다. 기본 team setup에서는 자동 설치하지 않고
-`EXTERNAL ...` report와 summary count로만 표시합니다. full workstation parity가
-필요할 때만 다음처럼 external 누락도 실패로 처리합니다.
+`yafu`, `msieve`, `bulk_extractor`, `honggfuzz`, `feroxbuster`,
+`ripgrep-all`, `cutter`, `zeek`, `oledump`, `rizin`, `XSStrike`, `phpggc`,
+`dotnet`, `dnspy`, `NetworkMiner`, `MobSF`, `diec`, `pestudio`, `gcloud`,
+`az`, `terraform`, `kubescape`, `baudline` 같은 도구는 external/manual
+표면입니다. 기본 team setup에서는 자동 설치하지 않고 `EXTERNAL ...` report와
+summary count로만 표시합니다. full workstation parity가 필요할 때만 다음처럼
+external 누락도 실패로 처리합니다.
 
 ```bash
 tools/setup_workspace.sh team --strict-external
 ```
+
+수동 설치 대상도 파일로 추적합니다. 운영자가 실행해야 하는 sudo/system package
+후보, user-local wrapper 후보, GUI/라이선스 도구 목록은 다음 파일을 봅니다.
+
+```bash
+tools/manual_external_tool_plan.sh
+```
+
+상세 정책과 체크리스트는 `docs/MANUAL_EXTERNAL_TOOL_INSTALL.md`에 있습니다.
 
 `codex mcp list`에는 다음 서버가 포함되어야 합니다.
 

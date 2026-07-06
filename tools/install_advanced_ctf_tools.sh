@@ -16,7 +16,6 @@ APT_PACKAGES=(
   apksigner
   audacity
   binwalk
-  bulk-extractor
   cado-nfs
   cargo
   checkov
@@ -24,11 +23,9 @@ APT_PACKAGES=(
   autoconf
   automake
   bison
-  cutter
   dnsutils
   emscripten
   exiv2
-  feroxbuster
   ffuf
   fplll-tools
   foremost
@@ -39,7 +36,6 @@ APT_PACKAGES=(
   gobuster
   hackrf
   heaptrack
-  honggfuzz
   httpie
   inspectrum
   flex
@@ -55,7 +51,6 @@ APT_PACKAGES=(
   libtool
   meson
   minikube
-  msieve
   ninja-build
   openocd
   outguess
@@ -72,8 +67,6 @@ APT_PACKAGES=(
   qemu-user
   radamsa
   ripgrep
-  ripgrep-all
-  rizin
   rtl-433
   rtl-sdr
   sigrok-cli
@@ -85,8 +78,6 @@ APT_PACKAGES=(
   upx-ucl
   valgrind
   yara
-  yafu
-  zeek
   zlib1g-dev
 )
 
@@ -145,10 +136,7 @@ NPM_TOOLS=(
   "promptfoo|promptfoo@latest"
 )
 
-CARGO_TOOLS=(
-  "feroxbuster|feroxbuster"
-  "rga|ripgrep_all"
-)
+CARGO_TOOLS=()
 
 DOTNET_TOOLS=(
   "ilspycmd|ilspycmd"
@@ -156,18 +144,27 @@ DOTNET_TOOLS=(
 
 REQUIRED_EXTERNAL_TOOLS=(
   "magma|team deep profile required; commercial CAS, install under a valid license and expose the magma command"
+  "yafu|team deep profile required after local managed install failures; install an approved external release or source build and expose yafu on PATH"
+  "msieve|team deep profile required after local managed install failures; install an approved external release or source build and expose msieve on PATH"
   "XSStrike|team deep profile required; clone https://github.com/s0md3v/XSStrike externally and expose xsstrike on PATH"
+  "feroxbuster|team deep profile required after local managed install failures; install an upstream release or Cargo package externally and expose feroxbuster on PATH"
   "phpggc|team deep profile required; clone https://github.com/ambionics/phpggc externally and expose phpggc on PATH"
   "gef-gdb|team deep profile required; create an external wrapper that sources gef.py from an approved checkout"
   "peda-gdb|team deep profile required for legacy writeup parity; create an external wrapper that sources peda.py"
   "keystone-as|team deep profile required; install an OS or package-manager Keystone assembler build"
   "cfr|team deep profile required; download the CFR jar from https://www.benf.org/other/cfr/ and wrap java -jar"
   "procyon|team deep profile required; download Procyon decompiler jars externally and wrap java -jar"
+  "rizin|team deep profile required after local managed install failures; install a distro or upstream release externally and expose rizin on PATH"
+  "cutter|team deep profile required after local managed install failures; install the GUI/distro release externally and expose cutter on PATH"
   "rz-ghidra|team deep profile required; install with the matching rizin plugin manager for the local rizin version"
   "r2ghidra|team deep profile required; install with r2pm for the local radare2 version"
   "dotnet|team deep profile required for .NET reversing; install the Microsoft .NET SDK package feed appropriate for the host OS"
   "dnspy|team deep profile required; Windows GUI, use dnSpyEx or an approved local copy outside this repo"
+  "bulk_extractor|team deep profile required after local managed install failures; install an approved external package or source build and expose bulk_extractor on PATH"
+  "zeek|team deep profile required after local managed install failures; install an approved package/feed externally and expose zeek on PATH"
   "NetworkMiner|team deep profile required; GUI, install from the official upstream release outside this repo"
+  "oledump|team deep profile required after local managed install failures; install Didier Stevens oledump.py externally and expose oledump.py on PATH"
+  "ripgrep-all|team deep profile required after local managed install failures; install a package or Cargo build externally and expose rga on PATH"
   "MobSF|team deep profile required; heavy service, run official Docker or source setup outside this repo"
   "diec|team deep profile required; Detect It Easy CLI/GUI, install the upstream release matching the host platform"
   "pestudio|team deep profile required; Windows GUI, install externally and keep binaries out of Git"
@@ -192,8 +189,8 @@ Installs advanced, target-specific CTF tools into user-local paths:
   - Go tools: nuclei, katana, subfinder, gau, waybackurls, hakrawler, dalfox,
     interactsh-client, dnsx, naabu, helm, k9s, kind, cosign, dive, regctl, oras
   - npm tools: promptfoo
-  - cargo/dotnet tools when cargo or dotnet is already present
-  - source or upstream binary fallbacks for managed tools with no apt candidate
+  - dotnet tools when dotnet is already present
+  - source or upstream binary fallbacks for the remaining managed tools with no apt candidate
   - user checkouts/downloads: pwndbg, Ghidra
   - Foundry toolchain: forge, cast, anvil, chisel
   - Cloud/container tools: kubectl, trivy, syft, grype, crane
@@ -630,10 +627,8 @@ install_name_mismatch_wrappers() {
   install_alias_wrapper cado-nfs.py cado-nfs
   install_alias_wrapper pdfid.py pdfid
   install_alias_wrapper pdf-parser.py pdf-parser
-  install_alias_wrapper oledump.py oledump
   install_alias_wrapper qemu-x86_64 qemu-x86_64-static
   install_alias_wrapper qemu-aarch64 qemu-aarch64-static
-  install_alias_wrapper rga ripgrep-all
 }
 
 install_foundry() {
@@ -706,20 +701,6 @@ install_terragrunt_binary_fallback() {
   install -m 0755 "$dest" "$BIN_DIR/terragrunt"
 }
 
-install_honggfuzz_fallback() {
-  if command -v honggfuzz >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback honggfuzz source build %s\n' "$OPT_ROOT/honggfuzz"
-    return 0
-  fi
-  local dest="$OPT_ROOT/honggfuzz"
-  git_checkout https://github.com/google/honggfuzz "$dest"
-  make -C "$dest" -j"$(cpu_count)"
-  install_from_path "$dest/honggfuzz" "$BIN_DIR/honggfuzz"
-}
-
 install_radamsa_fallback() {
   if command -v radamsa >/dev/null 2>&1; then
     return 0
@@ -732,73 +713,6 @@ install_radamsa_fallback() {
   git_checkout https://gitlab.com/akihe/radamsa.git "$dest"
   make -C "$dest" -j"$(cpu_count)"
   install_from_path "$dest/bin/radamsa" "$BIN_DIR/radamsa"
-}
-
-install_rizin_fallback() {
-  if command -v rizin >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback rizin source build %s\n' "$OPT_ROOT/rizin"
-    return 0
-  fi
-  local dest="$OPT_ROOT/rizin"
-  git_checkout https://github.com/rizinorg/rizin "$dest" 1
-  if [ -d "$dest/build" ]; then
-    meson setup "$dest/build" "$dest" --prefix "$dest/prefix" --reconfigure
-  else
-    meson setup "$dest/build" "$dest" --prefix "$dest/prefix"
-  fi
-  ninja -C "$dest/build" install
-  install_from_path "$dest/prefix/bin/rizin" "$BIN_DIR/rizin"
-}
-
-install_msieve_fallback() {
-  if command -v msieve >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback msieve source build %s\n' "$OPT_ROOT/msieve"
-    return 0
-  fi
-  local dest="$OPT_ROOT/msieve"
-  git_checkout https://github.com/radii/msieve "$dest"
-  make -C "$dest" -j"$(cpu_count)" all
-  install_from_path "$dest/msieve" "$BIN_DIR/msieve"
-}
-
-install_yafu_fallback() {
-  if command -v yafu >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback yafu source build %s\n' "$OPT_ROOT/yafu"
-    return 0
-  fi
-  local dest="$OPT_ROOT/yafu"
-  local binary
-  git_checkout https://github.com/bbuhrow/yafu "$dest" 1
-  make -C "$dest" -j"$(cpu_count)" x86_64 || make -C "$dest" -j"$(cpu_count)"
-  binary="$(find "$dest" -type f -name yafu -perm -111 | head -1)"
-  install_from_path "$binary" "$BIN_DIR/yafu"
-}
-
-install_bulk_extractor_fallback() {
-  if command -v bulk_extractor >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback bulk_extractor source build %s\n' "$OPT_ROOT/bulk_extractor"
-    return 0
-  fi
-  local dest="$OPT_ROOT/bulk_extractor"
-  git_checkout https://github.com/simsong/bulk_extractor "$dest" 1
-  if [ ! -x "$dest/configure" ] && [ -x "$dest/bootstrap.sh" ]; then
-    (cd "$dest" && ./bootstrap.sh)
-  fi
-  (cd "$dest" && ./configure --prefix="$dest/prefix")
-  make -C "$dest" -j"$(cpu_count)" install
-  install_from_path "$dest/prefix/bin/bulk_extractor" "$BIN_DIR/bulk_extractor"
 }
 
 install_cado_nfs_fallback() {
@@ -820,8 +734,7 @@ install_cado_nfs_fallback() {
 }
 
 install_didier_stevens_fallback() {
-  if command -v pdfid.py >/dev/null 2>&1 && command -v pdf-parser.py >/dev/null 2>&1 \
-    && command -v oledump.py >/dev/null 2>&1; then
+  if command -v pdfid.py >/dev/null 2>&1 && command -v pdf-parser.py >/dev/null 2>&1; then
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -831,7 +744,7 @@ install_didier_stevens_fallback() {
   local dest="$OPT_ROOT/didier-stevens"
   local script
   mkdir -p "$dest"
-  for script in pdfid.py pdf-parser.py oledump.py; do
+  for script in pdfid.py pdf-parser.py; do
     if [ ! -s "$dest/$script" ]; then
       curl -fsSL "https://raw.githubusercontent.com/DidierStevens/DidierStevensSuite/master/$script" \
         -o "$dest/$script"
@@ -839,64 +752,6 @@ install_didier_stevens_fallback() {
     chmod +x "$dest/$script"
     write_python_wrapper "$script" "$dest/$script"
   done
-}
-
-install_zeek_official_package() {
-  command -v apt-get >/dev/null 2>&1 || return 1
-  command -v sudo >/dev/null 2>&1 || return 1
-  if ! sudo -n true 2>/dev/null && { [ ! -t 0 ] || ! sudo -v; }; then
-    return 1
-  fi
-  if [ ! -r /etc/os-release ]; then
-    return 1
-  fi
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  if [ "${ID:-}" != "ubuntu" ]; then
-    return 1
-  fi
-  local repo_id="xUbuntu_${VERSION_ID:-}"
-  local keyring="/usr/share/keyrings/zeek-archive-keyring.gpg"
-  local repo_url="https://download.opensuse.org/repositories/security:/zeek/$repo_id"
-  local key_path="$ROOT/.cache/tools/zeek-release.key"
-  curl -fsSL "$repo_url/Release.key" -o "$key_path"
-  if command -v gpg >/dev/null 2>&1; then
-    gpg --dearmor <"$key_path" >"$ROOT/.cache/tools/zeek-archive-keyring.gpg"
-    sudo install -m 0644 "$ROOT/.cache/tools/zeek-archive-keyring.gpg" "$keyring"
-  else
-    sudo install -m 0644 "$key_path" "$keyring"
-  fi
-  printf 'deb [signed-by=%s] %s/ /\n' "$keyring" "$repo_url" \
-    | sudo tee /etc/apt/sources.list.d/zeek.list >/dev/null
-  sudo apt-get update
-  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y zeek
-}
-
-install_zeek_source_fallback() {
-  if command -v zeek >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback zeek source build %s\n' "$OPT_ROOT/zeek"
-    return 0
-  fi
-  local dest="$OPT_ROOT/zeek"
-  git_checkout https://github.com/zeek/zeek "$dest" 1
-  (cd "$dest" && ./configure --prefix="$dest/prefix")
-  make -C "$dest" -j"$(cpu_count)" install
-  install_from_path "$dest/prefix/bin/zeek" "$BIN_DIR/zeek"
-}
-
-install_zeek_fallback() {
-  if command -v zeek >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'DRYRUN fallback zeek official package or source build\n'
-    return 0
-  fi
-  install_zeek_official_package && return 0
-  install_zeek_source_fallback
 }
 
 run_fallback() {
@@ -912,15 +767,9 @@ run_fallback() {
 install_managed_fallbacks() {
   run_fallback minikube install_minikube_binary_fallback
   run_fallback terragrunt install_terragrunt_binary_fallback
-  run_fallback honggfuzz install_honggfuzz_fallback
   run_fallback radamsa install_radamsa_fallback
-  run_fallback rizin install_rizin_fallback
-  run_fallback msieve install_msieve_fallback
-  run_fallback yafu install_yafu_fallback
-  run_fallback bulk_extractor install_bulk_extractor_fallback
   run_fallback cado-nfs install_cado_nfs_fallback
   run_fallback didier-stevens install_didier_stevens_fallback
-  run_fallback zeek install_zeek_fallback
 }
 
 install_kubectl() {
