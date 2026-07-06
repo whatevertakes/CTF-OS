@@ -187,22 +187,34 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
   . .codex/env.sh
   echo "== 고급 CTF strict deep profile 검증 =="
   deep_failures=0
+  deep_failure_report="$(mktemp)"
   for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container ai-ml hardware-rf side-channel; do
-    echo "-- $category --"
+    echo "CHECK deep $category"
+    category_report="$(mktemp)"
     set +e
-    python3 tools/preflight_check.py --strict-deep --category "$category" | grep -E '^(PASS deep|WARN deep|FAIL deep|summary)'
-    deep_status=${PIPESTATUS[0]}
+    python3 tools/preflight_check.py --strict-deep --category "$category" >"$category_report"
+    deep_status=$?
     set -e
     if [ "$deep_status" -ne 0 ]; then
       deep_failures=$((deep_failures + 1))
+      {
+        echo "-- $category --"
+        grep -E '^FAIL deep' "$category_report" || true
+        grep -E '^summary failures=[1-9]' "$category_report" || true
+      } >>"$deep_failure_report"
     fi
+    rm -f "$category_report"
   done
   echo "-- hardware-rf avr --"
   python3 tools/preflight_check.py --category hardware-rf --tag avr | grep -E '^(PASS command avr|PASS dependency avr|FAIL dependency_missing|summary)'
   if [ "$deep_failures" -ne 0 ]; then
+    echo "== strict deep failures =="
+    cat "$deep_failure_report"
+    rm -f "$deep_failure_report"
     echo "FAIL strict deep profile categories failed: $deep_failures" >&2
     exit 1
   fi
+  rm -f "$deep_failure_report"
 fi
 
 cat <<EOF
