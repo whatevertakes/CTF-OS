@@ -147,6 +147,48 @@ command_succeeds() {
   timeout 30 "$@" >/dev/null 2>&1
 }
 
+venv_has_foreign_paths() {
+  local venv="$ROOT/.venv"
+  local expected="$venv"
+  local script
+  local first_line
+
+  [ -d "$venv" ] || return 1
+
+  if [ -f "$venv/bin/activate" ] && ! grep -Fq "VIRTUAL_ENV=$expected" "$venv/bin/activate"; then
+    return 0
+  fi
+
+  if [ -f "$venv/pyvenv.cfg" ] && grep -Fq "/.venv" "$venv/pyvenv.cfg" && ! grep -Fq "$expected" "$venv/pyvenv.cfg"; then
+    return 0
+  fi
+
+  while IFS= read -r -d '' script; do
+    IFS= read -r first_line <"$script" || true
+    case "$first_line" in
+      "#!"*"/.venv/bin/python"*)
+        case "$first_line" in
+          "#!$expected/bin/python"*) ;;
+          *) return 0 ;;
+        esac
+        ;;
+    esac
+  done < <(find "$venv/bin" -maxdepth 1 -type f -print0 2>/dev/null)
+
+  return 1
+}
+
+prepare_python_venv() {
+  if venv_has_foreign_paths; then
+    echo "WARN 기존 .venv가 다른 clone 경로를 가리켜 재생성합니다: $ROOT/.venv" >&2
+    rm -rf "$ROOT/.venv"
+  fi
+
+  "$PYTHON" -m venv "$ROOT/.venv"
+  "$ROOT/.venv/bin/python" -m pip install -U pip setuptools wheel
+  "$ROOT/.venv/bin/python" -m pip install -r "$ROOT/requirements.txt"
+}
+
 sync_agent_skill_links() {
   mkdir -p "$ROOT/.agents/skills"
   local skill_dir
@@ -244,8 +286,8 @@ write_mcp_reverse_proxy_wrapper() {
   local wrapper="$1"
   cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
-if [ -x "$ROOT/.venv/bin/mcp-proxy" ]; then
-  exec "$ROOT/.venv/bin/mcp-proxy" "\$@"
+if [ -x "$ROOT/.venv/bin/python" ] && [ -f "$ROOT/.venv/bin/mcp-proxy" ]; then
+  exec "$ROOT/.venv/bin/python" "$ROOT/.venv/bin/mcp-proxy" "\$@"
 fi
 exec mcp-proxy "\$@"
 EOF
@@ -276,7 +318,6 @@ install_team_parity_tools() {
   install_radare2_fallback
   install_rsactftool_fallback
   install_pwninit_fallback
-  install_mcp_reverse_proxy_compat
 }
 
 mkdir -p \
@@ -303,10 +344,10 @@ if [ "$SKIP_APT" -eq 0 ]; then
 fi
 
 if [ "$SKIP_PYTHON" -eq 0 ]; then
-  "$PYTHON" -m venv "$ROOT/.venv"
-  "$ROOT/.venv/bin/python" -m pip install -U pip setuptools wheel
-  "$ROOT/.venv/bin/python" -m pip install -r "$ROOT/requirements.txt"
+  prepare_python_venv
 fi
+
+install_mcp_reverse_proxy_compat
 
 if [ "$TEAM_PARITY" -eq 1 ]; then
   install_team_parity_tools

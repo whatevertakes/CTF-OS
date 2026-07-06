@@ -140,6 +140,9 @@ mcp-reverse-proxy --version
 
 현재 기준은 `mcp-proxy`입니다. bootstrap은 과거 `mcp-reverse-proxy` 진입점이
 깨져 있으면 같은 CLI 표면을 유지하는 compatibility wrapper를 생성합니다.
+기존 `.venv`가 다른 clone 경로에서 만들어진 상태라면 bootstrap이 자동으로
+감지해 `.venv`를 재생성합니다. 이 경우 `cannot execute: required file not
+found`나 `cannot import name 'client'` 오류가 같이 사라져야 합니다.
 
 ### `RsaCtfTool` starts but crashes
 
