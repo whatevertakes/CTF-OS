@@ -25,13 +25,13 @@ jobs:
       - name: Validate data-only PR paths
         run: |
           case "${{ github.head_ref }}" in
-            shyunseok1029|holymo-ly|lee)
+            shyunseok1029|holymo-ly|jiwoongchoi-norun|lee)
               python3 tools/validate_data_submission.py \
                 --base "${{ github.event.pull_request.base.sha }}" \
                 --head "${{ github.event.pull_request.head.sha }}"
               ;;
             *)
               echo "Non-runner branch; treating this as an owner/framework PR."
-              echo "Team runner submissions must use one of: shyunseok1029, holymo-ly, lee."
+              echo "Team runner submissions must use one of: shyunseok1029, holymo-ly, jiwoongchoi-norun, lee."
               ;;
           esac

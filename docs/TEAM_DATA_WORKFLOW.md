@@ -7,11 +7,14 @@
 ## 브랜치
 
 `main`은 소유자 `jiwoongchoi-norun`만 push합니다. 팀원은 자기 이름의 고정
-브랜치에만 commit/push합니다.
+브랜치에만 commit/push합니다. 소유자도 챌린지 실행 데이터를 제출할 때는
+`jiwoongchoi-norun` 개인 브랜치를 사용하고, 프레임워크/admin 변경은 별도
+owner 브랜치에서 처리합니다.
 
 ```text
 shyunseok1029
 holymo-ly
+jiwoongchoi-norun
 lee
 ```
 
@@ -68,7 +71,7 @@ git push origin HEAD:<github-user>
 ```
 
 자기 브랜치에서 `main`으로 PR을 엽니다. data-submission GitHub Action은
-`shyunseok1029`, `holymo-ly`, `lee` 브랜치에서 올라온 PR이
+`shyunseok1029`, `holymo-ly`, `jiwoongchoi-norun`, `lee` 브랜치에서 올라온 PR이
 승인된 blindtest 데이터 경로만 바꾸는지 검사합니다. 병합은 소유자 리뷰 후에만
 진행합니다.
 
