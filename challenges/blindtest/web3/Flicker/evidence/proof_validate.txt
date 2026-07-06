@@ -1,1 +1,0 @@
-proof ok: status=solved replay_logs=4 sensitive_logs=1 proof_scope=remote flag via live exploit against host3.dreamhack.games:8459 with saved replay evidence remote_status=solved_live replay_kind=remote_saved_evidence current_remote_liveness=live

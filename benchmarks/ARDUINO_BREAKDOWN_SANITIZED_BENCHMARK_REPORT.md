@@ -5,7 +5,7 @@
 - Event: blindtest
 - Category: pwn
 - Challenge: Arduino_Breakdown
-- Workspace: challenges/blindtest/pwn/Arduino_Breakdown
+- Workspace: local-only blindtest workspace, removed from main
 - Status: blocked
 - Remote replay scope: liveness only
 

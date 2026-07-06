@@ -2,7 +2,7 @@
 
 This document is the update contract for the broad, non-default CTF tool
 surface. The default workspace remains lean; these tools are installed only
-when an operator explicitly opts in with `tools/install_advanced_ctf_tools.sh`
+when an operator explicitly opts in with `tools/setup_workspace.sh advanced`
 or when a challenge notes file records a specific need.
 
 ## Install And Patch Path
@@ -11,18 +11,18 @@ Run from the repository root:
 
 ```bash
 . .codex/env.sh
-tools/install_advanced_ctf_tools.sh
+tools/setup_workspace.sh advanced
 ```
 
 For a no-change preview:
 
 ```bash
-tools/install_advanced_ctf_tools.sh --dry-run
+tools/setup_workspace.sh advanced --dry-run
 ```
 
 Patch/update contract:
 
-- Re-run `tools/install_advanced_ctf_tools.sh` to refresh managed user-local
+- Re-run `tools/setup_workspace.sh advanced` to refresh managed user-local
   tools. Go, npm, cargo, dotnet, pipx, Foundry, Ghidra, and container helpers
   are requested from their latest upstream channel unless an upstream installer
   pins internally.

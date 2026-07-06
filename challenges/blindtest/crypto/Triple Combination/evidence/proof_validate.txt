@@ -1,1 +1,0 @@
-proof ok: status=solved replay_logs=2 sensitive_logs=2 proof_scope=local RSA factor recovery from digit-reversal structured primes and ciphertext roundtrip validation remote_status=no_remote_provided replay_kind=local_proof current_remote_liveness=not_applicable

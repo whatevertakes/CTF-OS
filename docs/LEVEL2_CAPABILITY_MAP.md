@@ -39,7 +39,7 @@ Every capability entry in `capabilities/registry.yaml` has these fields:
 
 Each `SKILL.md` in this layer is also exposed as a repo-scoped Codex skill
 through generated `.agents/skills/<name>` symlinks. The source of truth remains
-`skills/<name>/SKILL.md`; `tools/bootstrap_wsl2.sh` regenerates the symlinks
+`skills/<name>/SKILL.md`; `tools/setup_workspace.sh bootstrap` regenerates the symlinks
 during workspace bootstrap, and they are intentionally not tracked in Git.
 
 Each `SKILL.md` in this layer uses the same concise contract fields:

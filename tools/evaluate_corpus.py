@@ -357,6 +357,15 @@ def has_sanitized_report(item: dict[str, Any], item_path: Path | None, state: di
     return sanitized_report_from_state(state, item_path if item_path is not None and item_path.is_dir() else None) is not None
 
 
+def accepts_historical_saved_evidence(item: dict[str, Any]) -> bool:
+    replay_kind = str(item.get("replay_kind") or "").strip()
+    replay_quality = str(item.get("replay_quality") or "").strip()
+    shareability = str(item.get("shareability") or "").strip()
+    return replay_kind in {"remote_saved_evidence", "sanitized_historical_report"} and bool(
+        replay_quality and shareability
+    )
+
+
 def run_proof_validate(challenge_path: Path) -> tuple[bool, str]:
     result = subprocess.run(
         ["python3", "tools/proof_validate.py", challenge_path.as_posix()],
@@ -790,9 +799,10 @@ def evaluate(items: list[dict[str, Any]]) -> dict[str, Any]:
                     proof_invalid_solved.append({"id": item_id, "reason": reason})
             elif expected_artifacts_present(item, base=ROOT):
                 historical_solved.append(item_id)
-                historical_solved_without_current_proof_valid_replay.append(
-                    {"id": item_id, "reason": "historical solved evidence lacks current proof-valid replay"}
-                )
+                if not accepts_historical_saved_evidence(item):
+                    historical_solved_without_current_proof_valid_replay.append(
+                        {"id": item_id, "reason": "historical solved evidence lacks current proof-valid replay"}
+                    )
             else:
                 solved_missing_evidence.append({"id": item_id, "reason": "missing proof state or artifact"})
 

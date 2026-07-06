@@ -8,7 +8,7 @@
 저장소 루트에서 실행합니다.
 
 ```bash
-tools/repair_team_setup.sh
+tools/setup_workspace.sh repair
 ```
 
 이 명령은 다음 작업을 수행합니다.
@@ -22,13 +22,13 @@ tools/repair_team_setup.sh
 팀원 브랜치에서 처음 설정하거나 전체 검증을 다시 돌릴 때는 다음을 사용합니다.
 
 ```bash
-tools/team_member_setup.sh
+tools/setup_workspace.sh team
 ```
 
 고급 CTF 도구 프로필까지 확인하려면:
 
 ```bash
-tools/team_member_setup.sh --deep
+tools/setup_workspace.sh team --deep
 ```
 
 예상 성공 표시:
@@ -97,7 +97,7 @@ radare2
 다음을 실행합니다.
 
 ```bash
-tools/repair_team_setup.sh
+tools/setup_workspace.sh repair
 ```
 
 복구 스크립트는 필요한 경우 pull 전에 이전 tracked `.codex/config.toml` 변경을
@@ -109,7 +109,7 @@ tools/repair_team_setup.sh
 
 ```bash
 git pull origin main
-tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
+tools/setup_workspace.sh bootstrap --skip-apt --skip-python --skip-preflight
 ```
 
 현재 `main`은 `angr-mcp`의 FastMCP 시작 배너를 억제합니다. 이 env 설정이
@@ -120,7 +120,7 @@ tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
 다음을 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+tools/setup_workspace.sh bootstrap --skip-apt --skip-preflight
 . .codex/env.sh
 mcp --help
 ```
@@ -133,7 +133,7 @@ mcp --help
 다음을 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+tools/setup_workspace.sh bootstrap --skip-apt --skip-preflight
 . .codex/env.sh
 mcp-reverse-proxy --version
 ```
@@ -149,7 +149,7 @@ found`나 `cannot import name 'client'` 오류가 같이 사라져야 합니다.
 다음을 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-apt --skip-preflight
+tools/setup_workspace.sh bootstrap --skip-apt --skip-preflight
 RsaCtfTool --help
 ```
 

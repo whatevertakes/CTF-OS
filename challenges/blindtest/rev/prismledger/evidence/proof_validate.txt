@@ -1,1 +1,0 @@
-proof ok: status=solved replay_logs=1 sensitive_logs=1 proof_scope=remote service accepted the recovered 60-character input and returned a flag-like proof; raw flag is redacted in summaries remote_status=solved_live replay_kind=remote_live current_remote_liveness=live

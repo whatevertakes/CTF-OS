@@ -86,6 +86,7 @@ REQUIRED_PATHS = (
     "tools/regression_check.py",
     "tools/level3_orchestrator.py",
     "tools/level4_interface.py",
+    "tools/setup_workspace.sh",
     "tools/admin_status.sh",
     "tools/team_member_setup.sh",
     "tools/validate_data_submission.py",

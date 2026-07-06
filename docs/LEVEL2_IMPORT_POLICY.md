@@ -3,7 +3,7 @@
 This workspace does not vendor broad CTF repositories or install heavy tools by
 default. External resources are references unless a specific challenge justifies
 a narrow, reversible import. Broad tool installation is allowed only as an
-explicit operator opt-in through `tools/install_advanced_ctf_tools.sh`; see
+explicit operator opt-in through `tools/setup_workspace.sh advanced`; see
 `docs/ADVANCED_CTF_TOOLING.md` for the patch/update contract and manual-tool
 boundaries.
 

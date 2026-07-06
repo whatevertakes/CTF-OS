@@ -25,12 +25,12 @@ surface; deep category checks add heavier or target-specific tools.
 `mcp-proxy`. It is not a separate Codex MCP server registration.
 
 `RsaCtfTool` is installed in an isolated user-level venv by
-`tools/bootstrap_wsl2.sh` because its upstream dependency pins can downgrade
+`tools/setup_workspace.sh bootstrap` because its upstream dependency pins can downgrade
 general-purpose Python packages. `pwninit` uses the upstream release binary; the
 legacy PyPI package is not Python 3 compatible.
 
 Large advanced tools are installed only on demand with
-`tools/install_advanced_ctf_tools.sh`; see
+`tools/setup_workspace.sh advanced`; see
 `docs/ADVANCED_CTF_TOOLING.md` for the install and patch contract. They are
 intentionally excluded from the default team bootstrap because Ghidra,
 garak/PyTorch, GNU Radio, GUI tools, and cloud/mobile services add large local

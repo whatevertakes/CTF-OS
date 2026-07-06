@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--proof-validate-existing",
         action="store_true",
-        help="run proof_validate.py on every existing corpus challenge path with state.json",
+        help="also run proof_validate.py on every existing corpus challenge path with state.json",
     )
     return parser.parse_args()
 
@@ -78,6 +78,10 @@ def load_corpus_paths(corpus_path: Path) -> list[Path]:
     return sorted(set(paths))
 
 
+def load_all_challenge_state_paths() -> list[Path]:
+    return sorted(path.parent.resolve() for path in (ROOT / "challenges").glob("**/state.json"))
+
+
 def critical_evaluation_findings(metrics: dict[str, object]) -> list[str]:
     failures: list[str] = []
     for key in (
@@ -106,6 +110,9 @@ def main() -> int:
     preflight_result = run_check("preflight_check", ["python3", "tools/preflight_check.py"])
     failures += preflight_result.returncode != 0
 
+    level5_result = run_check("level5_selftest", ["python3", "benchmarks/level5_selftest.py"])
+    failures += level5_result.returncode != 0
+
     evaluate_result = run_check(
         "evaluate_corpus",
         ["python3", "tools/evaluate_corpus.py", "--corpus", corpus_path.as_posix(), "--json"],
@@ -125,16 +132,15 @@ def main() -> int:
             else:
                 print("PASS evaluate_corpus critical findings clear")
 
-    corpus_paths = load_corpus_paths(corpus_path)
+    proof_paths = load_all_challenge_state_paths()
     if args.proof_validate_existing:
-        for path in corpus_paths:
-            result = run_check("proof_validate_existing", ["python3", "tools/proof_validate.py", path.as_posix()])
-            failures += result.returncode != 0
-    else:
-        print("proof_validate_existing: skipped (use --proof-validate-existing)")
+        proof_paths = sorted(set(proof_paths) | set(load_corpus_paths(corpus_path)))
+    for path in proof_paths:
+        result = run_check("proof_validate_existing", ["python3", "tools/proof_validate.py", path.as_posix()])
+        failures += result.returncode != 0
 
     if args.run_replay:
-        for path in corpus_paths:
+        for path in load_corpus_paths(corpus_path):
             result = run_check("replay", ["python3", "tools/replay_runner.py", path.as_posix()])
             failures += result.returncode != 0
     else:

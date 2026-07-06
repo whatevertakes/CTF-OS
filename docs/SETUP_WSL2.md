@@ -24,7 +24,7 @@ git switch -c <work-branch> origin/main
 저장소 루트에서 기본 bootstrap을 실행합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh
+tools/setup_workspace.sh bootstrap
 ```
 
 이 스크립트는 Ubuntu, Python, Ruby, MCP 유틸리티 CLI, CTF 카테고리별 CLI 도구
@@ -33,8 +33,7 @@ tools/bootstrap_wsl2.sh
 `.codex/config.toml`을 생성하고 기본 검증을 실행합니다.
 
 ```bash
-python3 tools/preflight_check.py --strict-optional
-python3 tools/check_team_parity.py
+tools/setup_workspace.sh verify
 codex mcp list
 ```
 
@@ -91,13 +90,10 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ```bash
 git fetch origin
 git merge --ff-only origin/main
-tools/bootstrap_wsl2.sh
+tools/setup_workspace.sh bootstrap
 . .codex/env.sh
-python3 tools/reference_refresh.py --materialize-all --jobs 4
-python3 tools/reference_index.py --all --max-files-per-ref 120
-python3 tools/preflight_check.py --strict-optional
-python3 tools/check_team_parity.py
-python3 tools/check_level3_tool_routing.py
+tools/setup_workspace.sh references
+tools/setup_workspace.sh verify
 ```
 
 `references.yaml`, `references.lock.json`, `docs/reference-index/`는 Git으로
@@ -108,7 +104,7 @@ python3 tools/check_level3_tool_routing.py
 고급 CTF 카테고리별 도구까지 설치하려면 다음을 사용합니다.
 
 ```bash
-tools/install_advanced_ctf_tools.sh
+tools/setup_workspace.sh advanced
 . .codex/env.sh
 python3 tools/preflight_check.py --deep --category <category>
 ```
@@ -134,26 +130,26 @@ python3 tools/preflight_check.py --deep --category side-channel
 ```
 
 `garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI 문제가
-아니라면 `tools/install_advanced_ctf_tools.sh --skip-garak`으로 건너뛸 수
+아니라면 `tools/setup_workspace.sh advanced --skip-garak`으로 건너뛸 수
 있습니다. 설치는 건너뛰고 현재 상태만 검사하려면 category deep preflight만
 실행합니다.
 
 시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-apt
+tools/setup_workspace.sh bootstrap --skip-apt
 ```
 
 Python dependency가 이미 설치되어 있다면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --skip-python
+tools/setup_workspace.sh bootstrap --skip-python
 ```
 
 전체 parity 툴체인 없이 가벼운 baseline만 맞추려면 다음을 사용합니다.
 
 ```bash
-tools/bootstrap_wsl2.sh --minimal
+tools/setup_workspace.sh bootstrap --minimal
 ```
 
 ## Docker

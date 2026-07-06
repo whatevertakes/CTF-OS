@@ -5,8 +5,8 @@
 - Event: blindtest
 - Category: web
 - Challenge: Amo's OAuth
-- Primary workspace: `challenges/blindtest/web/Amo's OAuth`
-- Independent comparison workspace: `challenges/blindtest/web/teamhs_Amo's OAuth/Amo's OAuth`
+- Primary workspace: local-only blindtest workspace, removed from main
+- Independent comparison workspace: local-only blindtest workspace, removed from main
 - Status: solved
 - Replay kind: remote live exploit
 - Evidence sensitivity: raw replay logs contain the flag; raw Request Bin data may contain a consumed authorization code.
@@ -104,9 +104,9 @@ Comparison workspace files useful to Level 3:
 
 Sensitive local-only files:
 
-- `challenges/blindtest/web/Amo's OAuth/evidence/replay_20260630T174308Z.log`
-- `challenges/blindtest/web/teamhs_Amo's OAuth/Amo's OAuth/evidence/replay_20260630T174020Z.log`
-- `challenges/blindtest/web/teamhs_Amo's OAuth/Amo's OAuth/work/requestbin-data.raw.json`
+- primary raw replay log
+- comparison raw replay log
+- comparison raw Request Bin data
 
 ## Evidence Shape Difference
 

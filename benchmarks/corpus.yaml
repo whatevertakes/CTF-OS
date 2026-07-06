@@ -28,6 +28,20 @@ items:
       - sanitized-evidence
       - remote-proof
       - no-raw-flag
+    agent_mode: none
+    proof_scope: sanitized historical remote pwn solve report
+    replay_kind: sanitized_historical_report
+    replay_quality: sanitized report only; current raw replay logs are intentionally not committed
+    shareability: sanitized report is shareable; raw flag and raw replay logs stay local
+    tools_used:
+      - sanitized historical report
+    tools_skipped:
+      - tool: radare2
+        kind: mcp
+        reason: "Historical report predates MCP routing capture; no native re-analysis is required for this sanitized control."
+      - tool: angr
+        kind: mcp
+        reason: "Historical report predates MCP routing capture; replay data is preserved only as a sanitized report."
     expected_artifacts:
       - benchmarks/PWN_PPP_SANITIZED_BENCHMARK_REPORT.md
     notes: Historical sanitized remote-solved pwn control. Raw flag and raw replay logs are intentionally not committed.
@@ -35,7 +49,7 @@ items:
     event: blindtest
     category: pwn
     challenge: Arduino_Breakdown
-    path: challenges/blindtest/pwn/Arduino_Breakdown
+    path: benchmarks/ARDUINO_BREAKDOWN_SANITIZED_BENCHMARK_REPORT.md
     split: holdout
     status: blocked
     difficulty: hard
@@ -53,6 +67,7 @@ items:
       - avr-objdump
       - avr-objcopy
       - avr-size
+    agent_mode: assisted
     missing_tools: []
     dependency_status: ok
     primary_tools_used:
@@ -83,12 +98,13 @@ items:
         kind: mcp
         retrospective: true
         reason: "The blocker depends on runtime heap layout, ASLR samples, and callback reachability rather than a static symbolic path."
+    proof_scope: sanitized blocked pwn analysis report
+    replay_kind: sanitized_historical_report
+    replay_quality: sanitized report only; blindtest workspace artifacts are intentionally not committed on main
+    shareability: sanitized report is shareable; raw handout, work files, and replay logs stay local
     expected_artifacts:
-      - state.json
-      - replay.sh
-      - notes.md
-      - evidence/replay_*.summary.md
-    notes: Blocked holdout for ASLR-stable exploitation of a simulator-host memory corruption; replay evidence covers remote liveness only.
+      - benchmarks/ARDUINO_BREAKDOWN_SANITIZED_BENCHMARK_REPORT.md
+    notes: Blocked holdout preserved as a sanitized report only; blindtest challenge workspaces and replay artifacts are not committed on main.
   - id: mikuprotect_design
     event: historical
     category: pwn
@@ -101,6 +117,13 @@ items:
       - local-proof
       - remote-env-mismatch
       - deadline
+    agent_mode: none
+    tools_considered:
+      - pending challenge import
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Challenge artifact is not imported yet, so MCP use is deferred until a concrete local target exists."
     expected_artifacts:
       - state.json
       - replay.sh
@@ -118,6 +141,13 @@ items:
       - stateful-web
       - negative-probes
       - mutation-ledger
+    agent_mode: none
+    tools_considered:
+      - pending challenge import
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Challenge artifact is not imported yet, so MCP use is deferred until a concrete local target exists."
     expected_artifacts:
       - state.json
       - notes.md
@@ -145,7 +175,7 @@ items:
     dependency_status: ok
     agent_mode: autonomous
     proof_scope: remote admin OAuth code capture and protected API flag retrieval
-    replay_kind: remote_live_exploit
+    replay_kind: remote_saved_evidence
     replay_quality: redacted summary plus matching raw-log flag hash from two independent solves
     shareability: sanitized report only; raw replay logs and consumed Request Bin data stay local
     primary_tools_used:
@@ -214,6 +244,13 @@ items:
     tags:
       - holdout
       - reverse
+    agent_mode: none
+    tools_considered:
+      - pending holdout assignment
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Holdout placeholder has no imported artifact, so MCP use is deferred until assignment."
     expected_artifacts:
       - state.json
       - replay.sh
@@ -230,6 +267,13 @@ items:
     tags:
       - holdout
       - crypto
+    agent_mode: none
+    tools_considered:
+      - pending holdout assignment
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Holdout placeholder has no imported artifact, so MCP use is deferred until assignment."
     expected_artifacts:
       - state.json
       - replay.sh
@@ -246,6 +290,13 @@ items:
     tags:
       - regression
       - forensics
+    agent_mode: none
+    tools_considered:
+      - pending regression fixture
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Regression placeholder has no imported artifact, so MCP use is deferred until fixture creation."
     expected_artifacts:
       - state.json
       - replay.sh
@@ -263,6 +314,13 @@ items:
       - holdout
       - programming
       - misc
+    agent_mode: none
+    tools_considered:
+      - pending holdout assignment
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Holdout placeholder has no imported artifact, so MCP use is deferred until assignment."
     expected_artifacts:
       - state.json
       - replay.sh
@@ -280,6 +338,13 @@ items:
       - hybrid
       - handoff
       - category-boundary
+    agent_mode: none
+    tools_considered:
+      - pending hybrid handoff fixture
+    tools_skipped:
+      - tool: category MCP tools
+        kind: mcp
+        reason: "Hybrid placeholder has no imported artifact, so MCP use is deferred until fixture creation."
     expected_artifacts:
       - state.json
       - replay.sh

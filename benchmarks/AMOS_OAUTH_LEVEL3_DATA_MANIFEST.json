@@ -10,8 +10,8 @@
     "difficulty": "medium"
   },
   "source_workspaces": {
-    "primary": "challenges/blindtest/web/Amo's OAuth",
-    "comparison": "challenges/blindtest/web/teamhs_Amo's OAuth/Amo's OAuth"
+    "primary": "local-only blindtest primary workspace; removed from main",
+    "comparison": "local-only blindtest comparison workspace; removed from main"
   },
   "invariant_outputs": {
     "remote_liveness": "live",

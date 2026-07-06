@@ -29,10 +29,10 @@ git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
 cd <workspace-dir>
 ```
 
-팀원은 자기 브랜치에서 팀원용 설정 스크립트를 실행합니다.
+팀원은 자기 브랜치에서 통합 설정 스크립트를 실행합니다.
 
 ```bash
-tools/team_member_setup.sh
+tools/setup_workspace.sh team
 ```
 
 이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
@@ -49,13 +49,10 @@ list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 �
 
 ```bash
 git pull origin main
-tools/bootstrap_wsl2.sh
+tools/setup_workspace.sh bootstrap
 . .codex/env.sh
-python3 tools/reference_refresh.py --materialize-all --jobs 4
-python3 tools/reference_index.py --all --max-files-per-ref 120
-python3 tools/preflight_check.py --strict-optional
-python3 tools/check_team_parity.py
-python3 tools/check_level3_tool_routing.py
+tools/setup_workspace.sh references
+tools/setup_workspace.sh verify
 ```
 
 고급 문제에서 대형 도구까지 맞춰야 하면 별도 installer를 실행합니다. 이 단계는
@@ -65,7 +62,7 @@ RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 큰 의존성을 설�
 [docs/ADVANCED_CTF_TOOLING.md](docs/ADVANCED_CTF_TOOLING.md)에 있습니다.
 
 ```bash
-tools/install_advanced_ctf_tools.sh
+tools/setup_workspace.sh advanced
 . .codex/env.sh
 python3 tools/preflight_check.py --deep --category web
 python3 tools/preflight_check.py --deep --category pwn
@@ -99,7 +96,7 @@ UI에서 실행 중인 인스턴스를 선택해야 실제 프록시 중계가 �
 실행하세요.
 
 ```bash
-tools/repair_team_setup.sh
+tools/setup_workspace.sh repair
 ```
 
 예상되는 성공 표시:
@@ -134,17 +131,13 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -U pip setuptools wheel
 python -m pip install -r requirements.txt
-tools/bootstrap_wsl2.sh --skip-apt --skip-python --skip-preflight
+tools/setup_workspace.sh bootstrap --skip-apt --skip-python --skip-preflight
 ```
 
 워크스페이스를 검증합니다.
 
 ```bash
-python3 tools/preflight_check.py
-python3 tools/preflight_check.py --strict-optional
-python3 tools/check_team_parity.py
-python3 tools/check_level3_tool_routing.py
-python3 tools/evaluate_corpus.py
+tools/setup_workspace.sh verify
 ```
 
 ## 워크스페이스 레이아웃
@@ -249,7 +242,7 @@ lee
 ```bash
 git fetch origin
 git switch --track origin/<github-user>
-tools/team_member_setup.sh
+tools/setup_workspace.sh team --branch <github-user>
 ```
 
 `main` 업데이트를 자기 브랜치에 반영하려면:

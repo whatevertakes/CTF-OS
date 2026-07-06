@@ -1,3 +1,0 @@
-correct!
-<REDACTED_FLAG>
-

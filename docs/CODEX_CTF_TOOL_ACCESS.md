@@ -19,7 +19,7 @@ Use it with `docs/TOOLCHAIN_MATRIX.md`, `docs/ADVANCED_CTF_TOOLING.md`,
 | MCP wrappers | Configured Codex MCP servers are `angr`, `playwright`, and `radare2`; use `.codex/bin/` wrappers where configured. |
 | Web proxy helpers | `.codex/bin/ctf-proxy-start` and `.codex/bin/ctf-proxy-check` provide optional Caido bridge support for web CTF traffic inspection. |
 | Reference layer | `references.yaml`, `references.lock.json`, `docs/reference-digests/`, and `docs/reference-index/` define the curated reference surface; `.cache/references/` is local cache only. |
-| Advanced tooling | `tools/install_advanced_ctf_tools.sh`, `tools/preflight_check.py --deep --category ...`, and `docs/ADVANCED_CTF_TOOLING.md` define opt-in broad tool installs and patch/update expectations. |
+| Advanced tooling | `tools/setup_workspace.sh advanced`, `tools/preflight_check.py --deep --category ...`, and `docs/ADVANCED_CTF_TOOLING.md` define opt-in broad tool installs and patch/update expectations. |
 
 ## Codex Usage Rules
 
@@ -67,7 +67,7 @@ python3 tools/preflight_check.py
 python3 tools/preflight_check.py --strict-optional
 python3 tools/check_team_parity.py
 python3 tools/check_level3_tool_routing.py
-tools/install_advanced_ctf_tools.sh --dry-run
+tools/setup_workspace.sh advanced --dry-run
 codex mcp list
 .codex/bin/playwright-mcp-codex.sh --print-browser
 ```

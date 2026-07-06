@@ -1,6 +1,0 @@
-반드시 제공된 링크를 통해 문제를 다운받으시길 바랍니다.
-
-Download Link: https://dreamhack-media.s3.ap-northeast-2.amazonaws.com/uploads/incognito-ctf/Fake-E-Commerce.7z
-- Fake-E-Commerce.dd SHA1: 45fdd37e89c17f5ccf26db629186d194d1b2d19d    
-- Fake-E-Commerce.7z SHA1: 85e3dae866eef02a79e073ca71a73f959f623b38   
-- Fake-E-Commerce.7z Password: tr#inc20o@@f@k3r

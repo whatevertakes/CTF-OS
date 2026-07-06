@@ -176,7 +176,7 @@ def assert_solved_without_replay_evidence_fails() -> Path:
     metadata["proof_scope"] = "local"
     write_json(path / "state.json", state)
     result = run(["python3", "tools/proof_validate.py", path.relative_to(ROOT).as_posix()], expect_ok=False)
-    if "solved status requires at least one evidence/replay_*.log" not in result.stderr:
+    if "solved status requires replay proof evidence" not in result.stderr:
         fail("solved without replay evidence failed for the wrong reason")
     return path
 

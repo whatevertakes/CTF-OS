@@ -33,6 +33,37 @@ ghidra-mcp-cache/
 challenges/*/*/*
 !challenges/*/*/.gitkeep
 
+# Corpus placeholder skeletons that are intentionally tracked even before a
+# full challenge artifact is imported.
+!challenges/historical/pwn/mikuprotect/
+!challenges/historical/pwn/mikuprotect/state.json
+!challenges/historical/pwn/mikuprotect/notes.md
+!challenges/historical/pwn/mikuprotect/replay.sh
+!challenges/historical/web/DreamFlow/
+!challenges/historical/web/DreamFlow/state.json
+!challenges/historical/web/DreamFlow/notes.md
+!challenges/historical/web/DreamFlow/replay.sh
+!challenges/holdout/rev/rev-holdout-placeholder/
+!challenges/holdout/rev/rev-holdout-placeholder/state.json
+!challenges/holdout/rev/rev-holdout-placeholder/notes.md
+!challenges/holdout/rev/rev-holdout-placeholder/replay.sh
+!challenges/holdout/crypto/crypto-holdout-placeholder/
+!challenges/holdout/crypto/crypto-holdout-placeholder/state.json
+!challenges/holdout/crypto/crypto-holdout-placeholder/notes.md
+!challenges/holdout/crypto/crypto-holdout-placeholder/replay.sh
+!challenges/regression/forensics/forensics-regression-placeholder/
+!challenges/regression/forensics/forensics-regression-placeholder/state.json
+!challenges/regression/forensics/forensics-regression-placeholder/notes.md
+!challenges/regression/forensics/forensics-regression-placeholder/replay.sh
+!challenges/holdout/misc/programming-holdout-placeholder/
+!challenges/holdout/misc/programming-holdout-placeholder/state.json
+!challenges/holdout/misc/programming-holdout-placeholder/notes.md
+!challenges/holdout/misc/programming-holdout-placeholder/replay.sh
+!challenges/historical/hybrid/hybrid-chain-placeholder/
+!challenges/historical/hybrid/hybrid-chain-placeholder/state.json
+!challenges/historical/hybrid/hybrid-chain-placeholder/notes.md
+!challenges/historical/hybrid/hybrid-chain-placeholder/replay.sh
+
 # Secrets and challenge-private markers.
 flag
 flag.txt

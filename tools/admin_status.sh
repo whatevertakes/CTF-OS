@@ -121,11 +121,11 @@ If this report is clean, send teammates one of these:
   git fetch origin
   git switch <their-branch>
   git merge origin/main
-  tools/team_member_setup.sh --branch <their-branch> --deep --skip-garak
+  tools/setup_workspace.sh team --branch <their-branch> --deep --skip-garak --references
 
 For a teammate repair:
 
-  tools/repair_team_setup.sh
+  tools/setup_workspace.sh repair
 
 Before merging a data PR:
 

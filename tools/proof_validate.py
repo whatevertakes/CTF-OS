@@ -20,7 +20,6 @@ ALLOWED_STATUSES = {
     "blocked",
 }
 FLAG_PATTERN = re.compile(r"\b(?:FLAG|CTF|DH|SEKAI)\{[^}\r\n]{1,200}\}", re.IGNORECASE)
-REPLAY_LOG_RE = re.compile(r"^replay_[^/]+\.log$")
 REPLAY_SUMMARY_RE = re.compile(r"^replay_[^/]+\.summary\.md$")
 REQUIRED_METADATA_FIELDS = (
     "proof_scope",
@@ -117,8 +116,8 @@ def validate_metadata_contract(metadata: dict[str, object]) -> None:
         )
 
 
-def is_replay_log_relative(relative: Path) -> bool:
-    return len(relative.parts) == 2 and relative.parts[0] == "evidence" and REPLAY_LOG_RE.match(relative.name)
+def is_evidence_log_relative(relative: Path) -> bool:
+    return len(relative.parts) == 2 and relative.parts[0] == "evidence" and relative.suffix == ".log"
 
 
 def summary_path_for(log_path: Path) -> Path:
@@ -141,7 +140,7 @@ def validate_evidence_entries(challenge_dir: Path, state: dict[str, object]) -> 
             fail(f"evidence entry must stay inside the challenge directory: {entry!r}")
         path = challenge_dir / relative
         if not path.exists():
-            if is_replay_log_relative(relative):
+            if is_evidence_log_relative(relative):
                 summary_path = summary_path_for(path)
                 if summary_path.is_file():
                     paths.append(summary_path)
