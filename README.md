@@ -29,19 +29,20 @@ git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
 cd <workspace-dir>
 ```
 
-팀원은 자기 브랜치에서 통합 설정 스크립트를 실행합니다.
+팀원은 자기 브랜치에서 우승 기준 통합 설정 스크립트를 실행합니다.
 
 ```bash
 tools/setup_workspace.sh team
 ```
 
 이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
-유틸리티 CLI, CTF 카테고리별 CLI 도구 표면을 설치하며, `.venv`와
-`requirements.txt`를 준비합니다. 또한
+유틸리티 CLI, CTF 카테고리별 CLI 도구 표면, 대형 고급 CTF 도구까지 설치하며,
+`.venv`와 `requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
 `.codex/config.toml`을 생성하고, strict preflight, team parity, `codex mcp
-list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 팀 설정
-흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를 참조하세요.
+list`의 `angr`/`playwright`/`radare2` 연결, 카테고리별 deep profile까지
+확인합니다. 자세한 팀 설정 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를
+참조하세요.
 
 `main` 업데이트를 받은 뒤 소유자와 같은 Level 2 reference 환경까지 맞추려면
 다음을 실행합니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로
@@ -49,31 +50,20 @@ list`의 `angr`/`playwright`/`radare2` 연결까지 확인합니다. 자세한 �
 
 ```bash
 git pull origin main
-tools/setup_workspace.sh bootstrap
+tools/setup_workspace.sh team --branch <github-user>
 . .codex/env.sh
 tools/setup_workspace.sh references
 tools/setup_workspace.sh verify
 ```
 
-고급 문제에서 대형 도구까지 맞춰야 하면 별도 installer를 실행합니다. 이 단계는
-웹 스캐너, fuzzing 도구, RE/decompiler 보조 도구, cloud/container CLI,
-RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 큰 의존성을 설치하므로
-기본 팀 부트스트랩에는 포함하지 않습니다. 설치/패치 계약은
-[docs/ADVANCED_CTF_TOOLING.md](docs/ADVANCED_CTF_TOOLING.md)에 있습니다.
+`team` 설정은 웹 스캐너, fuzzing 도구, RE/decompiler 보조 도구,
+cloud/container CLI, RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 큰
+의존성까지 우승용 단일 환경으로 맞춥니다. 설치/패치 계약은
+[docs/ADVANCED_CTF_TOOLING.md](docs/ADVANCED_CTF_TOOLING.md)에 있으며, garak만
+건너뛰어야 하는 머신에서는 다음처럼 실행합니다.
 
 ```bash
-tools/setup_workspace.sh advanced
-. .codex/env.sh
-python3 tools/preflight_check.py --deep --category web
-python3 tools/preflight_check.py --deep --category pwn
-python3 tools/preflight_check.py --deep --category rev
-python3 tools/preflight_check.py --deep --category crypto
-python3 tools/preflight_check.py --deep --category mobile
-python3 tools/preflight_check.py --deep --category web3
-python3 tools/preflight_check.py --deep --category cloud
-python3 tools/preflight_check.py --deep --category container
-python3 tools/preflight_check.py --deep --category ai-ml
-python3 tools/preflight_check.py --deep --category hardware-rf
+tools/setup_workspace.sh team --branch <github-user> --skip-garak
 ```
 
 웹 CTF에서 브라우저 트래픽과 WSL `curl`/Python exploit 트래픽을 같은 Caido

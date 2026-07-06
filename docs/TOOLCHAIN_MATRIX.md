@@ -1,8 +1,9 @@
 # Toolchain Matrix
 
 This matrix records dependency expectations for CTF challenge triage and
-benchmark evaluation. Strict preflight checks the shared team parity CLI
-surface; deep category checks add heavier or target-specific tools.
+benchmark evaluation. Team setup installs the shared parity CLI surface and
+managed heavier category tools; deep category checks verify the target-specific
+surface.
 
 | Category | Required Tools | Optional Tools |
 | --- | --- | --- |
@@ -29,12 +30,10 @@ surface; deep category checks add heavier or target-specific tools.
 general-purpose Python packages. `pwninit` uses the upstream release binary; the
 legacy PyPI package is not Python 3 compatible.
 
-Large advanced tools are installed only on demand with
-`tools/setup_workspace.sh advanced`; see
-`docs/ADVANCED_CTF_TOOLING.md` for the install and patch contract. They are
-intentionally excluded from the default team bootstrap because Ghidra,
-garak/PyTorch, GNU Radio, GUI tools, and cloud/mobile services add large local
-dependencies and can require external credentials, hardware, or licenses.
+Managed advanced tools are installed by `tools/setup_workspace.sh team`; see
+`docs/ADVANCED_CTF_TOOLING.md` for the install and patch contract. GUI tools,
+cloud/mobile services, licensed tooling, hardware-specific dependencies, and
+external credentials remain manual or external even in the winning-mode setup.
 
 Corpus entries may record dependency state with:
 

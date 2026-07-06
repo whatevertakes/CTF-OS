@@ -11,16 +11,16 @@ Usage: tools/setup_workspace.sh <profile> [options]
 Single setup entrypoint for the CTF workspace.
 
 Profiles:
-  team        Team branch setup, bootstrap, strict parity checks, optional deep tools.
-  bootstrap   Base WSL2/bootstrap setup only.
-  advanced    Advanced CTF tool installation only.
+  team        Winning-mode team setup: bootstrap, parity, MCP, advanced tools, deep checks.
+  bootstrap   Compatibility bootstrap for repair/manual package management.
+  advanced    Compatibility alias for advanced CTF tool refresh only.
   references  Materialize and index Level 2 local reference cache.
   verify      Run local validation gates without installing tools.
   repair      Fast-forward from origin/main, refresh local config, and verify.
 
 Common examples:
   tools/setup_workspace.sh team --branch <github-user>
-  tools/setup_workspace.sh team --branch <github-user> --deep --skip-garak --references
+  tools/setup_workspace.sh team --branch <github-user> --skip-garak --references
   tools/setup_workspace.sh bootstrap --skip-apt
   tools/setup_workspace.sh advanced --skip-garak
   tools/setup_workspace.sh references

@@ -1,9 +1,9 @@
 # Advanced CTF Tooling Contract
 
-This document is the update contract for the broad, non-default CTF tool
-surface. The default workspace remains lean; these tools are installed only
-when an operator explicitly opts in with `tools/setup_workspace.sh advanced`
-or when a challenge notes file records a specific need.
+This document is the update contract for the broad CTF tool surface used by
+the team winning-mode setup. Team members get this surface through
+`tools/setup_workspace.sh team`; `tools/setup_workspace.sh advanced` remains a
+compatibility entrypoint for refreshing only the managed advanced tools.
 
 ## Install And Patch Path
 
@@ -11,7 +11,7 @@ Run from the repository root:
 
 ```bash
 . .codex/env.sh
-tools/setup_workspace.sh advanced
+tools/setup_workspace.sh team --branch <github-user>
 ```
 
 For a no-change preview:
@@ -22,9 +22,12 @@ tools/setup_workspace.sh advanced --dry-run
 
 Patch/update contract:
 
-- Re-run `tools/setup_workspace.sh advanced` to refresh managed user-local
-  tools. Go, npm, cargo, dotnet, pipx, Foundry, Ghidra, and container helpers
-  are requested from their latest upstream channel unless an upstream installer
+- Re-run `tools/setup_workspace.sh team --branch <github-user>` after pulling
+  `main` to refresh the full team environment. Use
+  `tools/setup_workspace.sh advanced` only when you intentionally want to
+  refresh managed user-local advanced tools without the rest of the team setup.
+  Go, npm, cargo, dotnet, pipx, Foundry, Ghidra, and container helpers are
+  requested from their latest upstream channel unless an upstream installer
   pins internally.
 - Re-run apt updates through the same script from an interactive terminal with
   sudo available. In non-interactive sessions without sudo, apt tools are

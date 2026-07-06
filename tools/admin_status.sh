@@ -121,7 +121,7 @@ If this report is clean, send teammates one of these:
   git fetch origin
   git switch <their-branch>
   git merge origin/main
-  tools/setup_workspace.sh team --branch <their-branch> --deep --skip-garak --references
+  tools/setup_workspace.sh team --branch <their-branch> --skip-garak --references
 
 For a teammate repair:
 

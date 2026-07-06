@@ -801,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--deep",
         action="store_true",
-        help="run opt-in category-specific advanced tool availability checks",
+        help="run category-specific deep tool availability checks",
     )
     return parser.parse_args()
 

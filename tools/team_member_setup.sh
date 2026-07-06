@@ -10,7 +10,7 @@ TEAM_BRANCHES=(
   lee
   jiwoongchoi-norun
 )
-DEEP_CHECK=0
+DEEP_CHECK=1
 BOOTSTRAP_MINIMAL=0
 SKIP_APT=0
 SKIP_PYTHON=0
@@ -23,12 +23,13 @@ usage() {
   cat <<'EOF'
 사용법: tools/team_member_setup.sh [--branch <github-user>] [--deep] [--minimal] [--skip-apt] [--skip-python] [--skip-mcp] [--skip-advanced] [--skip-garak]
 
-팀원용 1회 설정/검증 스크립트입니다.
+팀원용 우승 기준 1회 설정/검증 스크립트입니다.
   - 자기 팀 브랜치인지 확인하거나 --branch 값으로 전환
   - 현재 clone 경로에 맞는 .codex/config.toml 생성
   - tools/bootstrap_wsl2.sh 실행
   - strict preflight와 team parity 검증
   - codex mcp list에서 angr/playwright/radare2 연결 확인
+  - CTF 카테고리별 고급 도구 설치와 deep profile 검증
 
 팀 브랜치:
   shyunseok1029
@@ -36,9 +37,9 @@ usage() {
   lee
   jiwoongchoi-norun
 
---deep은 고급 CTF 도구 설치 후 카테고리별 도구 프로필까지 검증합니다.
---skip-advanced는 --deep에서 고급 도구 설치를 건너뛰고 검증만 수행합니다.
---skip-garak은 --deep 설치 중 대형 AI/ML 도구 garak만 건너뜁니다.
+--deep은 호환용 옵션입니다. 팀 설정은 기본적으로 deep 설치/검증을 수행합니다.
+--skip-advanced는 고급 도구 설치를 건너뛰고 검증만 수행합니다.
+--skip-garak은 설치 중 대형 AI/ML 도구 garak만 건너뜁니다.
 EOF
 }
 

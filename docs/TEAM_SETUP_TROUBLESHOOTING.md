@@ -25,11 +25,7 @@ tools/setup_workspace.sh repair
 tools/setup_workspace.sh team
 ```
 
-고급 CTF 도구 프로필까지 확인하려면:
-
-```bash
-tools/setup_workspace.sh team --deep
-```
+이 명령은 고급 CTF 도구 설치와 카테고리별 deep profile 검증까지 포함합니다.
 
 예상 성공 표시:
 

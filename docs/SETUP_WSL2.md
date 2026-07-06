@@ -1,8 +1,9 @@
 # WSL2 설정
 
-이 문서는 Ubuntu WSL2에서 이 CTF 워크스페이스를 실행하기 위한 기본 설정
-절차입니다. 목표는 challenge intake, replay, proof validation, reference lookup,
-category routing, MCP wrapper를 재현 가능한 상태로 맞추는 것입니다.
+이 문서는 Ubuntu WSL2에서 이 CTF 워크스페이스를 실행하기 위한 우승 기준 단일
+설정 절차입니다. 목표는 challenge intake, replay, proof validation, reference
+lookup, category routing, MCP wrapper, 카테고리별 고급 도구를 팀원 모두 같은
+상태로 맞추는 것입니다.
 
 ## 클론
 
@@ -19,18 +20,19 @@ git fetch origin
 git switch -c <work-branch> origin/main
 ```
 
-## 기본 설정
+## 팀 통합 설정
 
-저장소 루트에서 기본 bootstrap을 실행합니다.
+저장소 루트에서 팀 통합 설정을 실행합니다.
 
 ```bash
-tools/setup_workspace.sh bootstrap
+tools/setup_workspace.sh team --branch <github-user>
 ```
 
 이 스크립트는 Ubuntu, Python, Ruby, MCP 유틸리티 CLI, CTF 카테고리별 CLI 도구
-표면을 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
+표면과 고급 CTF 도구를 설치하며, `.venv`와 `requirements.txt`를 준비합니다. 또한
 `.codex/config.toml.template`에서 현재 clone 경로에 맞는 로컬
-`.codex/config.toml`을 생성하고 기본 검증을 실행합니다.
+`.codex/config.toml`을 생성하고 strict preflight, team parity, MCP 연결,
+카테고리별 deep profile 검증을 실행합니다.
 
 ```bash
 tools/setup_workspace.sh verify
@@ -41,10 +43,10 @@ codex mcp list
 `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 MCP 서버로 추가 등록하지 않고
 CLI 유틸리티로 설치와 실행 가능 여부를 점검합니다.
 
-기본 parity CLI에는 `rg`, `binwalk`, `exiftool`, `nmap`, `socat`,
+팀 parity CLI에는 `rg`, `binwalk`, `exiftool`, `nmap`, `socat`,
 `RsaCtfTool`, `arjun`, `flask-unsign`, `floss`, `frida`, `shodan`, `stegolsb`,
 `zsteg`, `wafw00f`, `pwninit`이 포함됩니다. `Burp Suite`와 `Caido`는 외부 GUI
-도구라 있으면 보고만 하고 기본 setup 실패 조건으로 삼지 않습니다.
+도구라 있으면 보고만 하고 setup 실패 조건으로 삼지 않습니다.
 
 ## 웹 프록시 브리지
 
@@ -82,7 +84,7 @@ Windows WSL vEthernet 주소를 감지해서 로컬 전용 `.codex/proxy.env`를
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ```
 
-## Baseline 업데이트와 Level 2 Reference 동기화
+## Main 업데이트와 Level 2 Reference 동기화
 
 최신 도구, 문서, reference lock, category index를 받은 뒤 같은 Level 2 reference
 환경을 만들려면 다음을 실행합니다.
@@ -90,7 +92,7 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 ```bash
 git fetch origin
 git merge --ff-only origin/main
-tools/setup_workspace.sh bootstrap
+tools/setup_workspace.sh team --branch <github-user>
 . .codex/env.sh
 tools/setup_workspace.sh references
 tools/setup_workspace.sh verify
@@ -101,19 +103,12 @@ tools/setup_workspace.sh verify
 위 `reference_refresh.py --materialize-all` 명령으로 같은 commit/snapshot 기준
 자료를 내려받습니다.
 
-고급 CTF 카테고리별 도구까지 설치하려면 다음을 사용합니다.
-
-```bash
-tools/setup_workspace.sh advanced
-. .codex/env.sh
-python3 tools/preflight_check.py --deep --category <category>
-```
-
-이 installer는 웹 스캐너/크롤러, fuzzing 도구, RE/decompiler 보조 도구,
+팀 통합 설정은 웹 스캐너/크롤러, fuzzing 도구, RE/decompiler 보조 도구,
 forensics/stego CLI, mobile 보조 도구, cloud/container CLI, RF/hardware 도구,
-`pwndbg`, Ghidra, `garak`, GNU Radio, URH, Foundry 등을 user-local 경로와
-가능한 apt 패키지로 구성합니다. 전체 범위, 수동 설치 항목, 패치 갱신 계약은
-`docs/ADVANCED_CTF_TOOLING.md`를 기준으로 합니다.
+`pwndbg`, Ghidra, `garak`, GNU Radio, URH, Foundry 등을 user-local 경로와 가능한
+apt 패키지로 구성합니다. 전체 범위, 수동 설치 항목, 패치 갱신 계약은
+`docs/ADVANCED_CTF_TOOLING.md`를 기준으로 합니다. 카테고리별 상태만 다시 보고
+싶으면 다음을 실행합니다.
 
 ```bash
 python3 tools/preflight_check.py --deep --category pwn
@@ -130,9 +125,9 @@ python3 tools/preflight_check.py --deep --category side-channel
 ```
 
 `garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI 문제가
-아니라면 `tools/setup_workspace.sh advanced --skip-garak`으로 건너뛸 수
-있습니다. 설치는 건너뛰고 현재 상태만 검사하려면 category deep preflight만
-실행합니다.
+아니라면 `tools/setup_workspace.sh team --branch <github-user> --skip-garak`으로
+건너뛸 수 있습니다. 설치는 건너뛰고 현재 상태만 검사하려면 category deep
+preflight만 실행합니다.
 
 시스템 패키지를 별도로 관리한다면 다음을 사용합니다.
 
@@ -146,7 +141,8 @@ Python dependency가 이미 설치되어 있다면 다음을 사용합니다.
 tools/setup_workspace.sh bootstrap --skip-python
 ```
 
-전체 parity 툴체인 없이 가벼운 baseline만 맞추려면 다음을 사용합니다.
+복구나 제한된 머신에서 전체 parity 툴체인 없이 가벼운 bootstrap만 맞추려면
+다음을 사용합니다. 팀 기준 설정은 아닙니다.
 
 ```bash
 tools/setup_workspace.sh bootstrap --minimal
