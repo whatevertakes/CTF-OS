@@ -140,30 +140,31 @@ DOTNET_TOOLS=(
   "ilspycmd|ilspycmd"
 )
 
-MANUAL_TOOLS=(
-  "magma|commercial CAS; install under a valid license and expose the magma command"
-  "XSStrike|clone https://github.com/s0md3v/XSStrike when an XSS challenge needs context-aware payload generation"
-  "phpggc|clone https://github.com/ambionics/phpggc and expose phpggc after PHP is installed"
-  "gef|source gef.py from an explicit gef-gdb wrapper when a challenge needs this GDB UI"
-  "peda|source peda.py from an explicit peda-gdb wrapper only for legacy writeup compatibility"
-  "keystone-as|install an OS/package-manager Keystone assembler build when shellcode assembly needs it"
-  "cfr|download the CFR jar from https://www.benf.org/other/cfr/ and wrap java -jar"
-  "procyon|download Procyon decompiler jars and wrap java -jar"
-  "rz-ghidra|install with the matching rizin plugin manager for the local rizin version"
-  "r2ghidra|install with r2pm for the local radare2 version"
-  "dotnet|install the Microsoft .NET SDK package feed appropriate for the host OS"
-  "dnspy|Windows GUI; use dnSpyEx or an approved local copy"
-  "NetworkMiner|GUI; install from the official upstream release when packet extraction needs it"
-  "MobSF|heavy service; run official Docker or source setup only for mobile challenges"
-  "diec|Detect It Easy CLI/GUI; install the upstream release matching the host platform"
-  "pestudio|Windows GUI; install externally if PE triage requires it"
-  "peid|legacy Windows GUI; install externally only for compatibility with old writeups"
-  "terraform|install HashiCorp release or distro package; keep provider credentials out of this workspace"
-  "gcloud|install Google Cloud SDK externally when an owned cloud challenge requires it"
-  "az|install Azure CLI externally when an owned cloud challenge requires it"
-  "kubescape|install upstream release or script when Kubernetes posture checks require it"
-  "nerdctl|install a release matching local containerd when Docker-compatible containerd work is needed"
-  "baudline|closed-source signal GUI; install externally if a signal challenge requires it"
+REQUIRED_EXTERNAL_TOOLS=(
+  "magma|team deep profile required; commercial CAS, install under a valid license and expose the magma command"
+  "XSStrike|team deep profile required; clone https://github.com/s0md3v/XSStrike externally and expose xsstrike on PATH"
+  "phpggc|team deep profile required; clone https://github.com/ambionics/phpggc externally and expose phpggc on PATH"
+  "gef-gdb|team deep profile required; create an external wrapper that sources gef.py from an approved checkout"
+  "peda-gdb|team deep profile required for legacy writeup parity; create an external wrapper that sources peda.py"
+  "keystone-as|team deep profile required; install an OS or package-manager Keystone assembler build"
+  "cfr|team deep profile required; download the CFR jar from https://www.benf.org/other/cfr/ and wrap java -jar"
+  "procyon|team deep profile required; download Procyon decompiler jars externally and wrap java -jar"
+  "rz-ghidra|team deep profile required; install with the matching rizin plugin manager for the local rizin version"
+  "r2ghidra|team deep profile required; install with r2pm for the local radare2 version"
+  "dotnet|team deep profile required for .NET reversing; install the Microsoft .NET SDK package feed appropriate for the host OS"
+  "dnspy|team deep profile required; Windows GUI, use dnSpyEx or an approved local copy outside this repo"
+  "NetworkMiner|team deep profile required; GUI, install from the official upstream release outside this repo"
+  "MobSF|team deep profile required; heavy service, run official Docker or source setup outside this repo"
+  "diec|team deep profile required; Detect It Easy CLI/GUI, install the upstream release matching the host platform"
+  "pestudio|team deep profile required; Windows GUI, install externally and keep binaries out of Git"
+  "peid|team deep profile required for legacy PE triage parity; install externally and keep binaries out of Git"
+  "terraform|team deep profile required; install HashiCorp release or distro package and keep provider credentials out of this workspace"
+  "gcloud|team deep profile required; install Google Cloud SDK externally and keep cloud credentials out of this workspace"
+  "az|team deep profile required; install Azure CLI externally and keep cloud credentials out of this workspace"
+  "terragrunt|team deep profile required; the script may attempt a Go install, but failures remain an external PATH setup issue"
+  "kubescape|team deep profile required; install upstream release or script externally and expose kubescape on PATH"
+  "nerdctl|team deep profile required; install a release matching local containerd outside this repo"
+  "baudline|team deep profile required; closed-source signal GUI, install externally and keep binaries out of Git"
 )
 
 usage() {
@@ -196,8 +197,10 @@ Options:
   --skip-cargo          skip cargo tool installs
   --skip-dotnet         skip dotnet global tool installs
 
-Run from a terminal with sudo available. These tools are intentionally not part
-of the default team setup because garak/Ghidra/GNU Radio are large.
+Run from a terminal with sudo available. Script-managed tools and required
+external tools are both part of the team deep profile. Licensed, GUI,
+Windows-only, credentialed, service-style, or non-portable tools stay outside
+Git and are verified through PATH/version checks instead of forced automation.
 EOF
 }
 
@@ -736,12 +739,13 @@ install_dotnet_tools() {
   done
 }
 
-print_manual_tools() {
+print_required_external_tools() {
   local spec
   local tool
   local reason
-  printf '\nManual or externally managed tools:\n'
-  for spec in "${MANUAL_TOOLS[@]}"; do
+  printf '\nRequired external tools not portably auto-installed by this script:\n'
+  printf 'These are not optional; strict deep preflight verifies PATH/version availability.\n'
+  for spec in "${REQUIRED_EXTERNAL_TOOLS[@]}"; do
     IFS='|' read -r tool reason <<<"$spec"
     printf '  - %s: %s\n' "$tool" "$reason"
   done
@@ -762,7 +766,7 @@ install_gnuradio_wrapper || true
 install_upx_wrapper || true
 install_foundry || true
 install_cloud_container_tools || true
-print_manual_tools
+print_required_external_tools
 
 if [ "$DRY_RUN" -eq 1 ]; then
   status_line="Advanced CTF tool install plan generated."
@@ -775,14 +779,14 @@ cat <<EOF
 $status_line
 Run:
   . .codex/env.sh
-  python3 tools/preflight_check.py --deep --category pwn
-  python3 tools/preflight_check.py --deep --category rev
-  python3 tools/preflight_check.py --deep --category mobile
-  python3 tools/preflight_check.py --deep --category web3
-  python3 tools/preflight_check.py --deep --category web
-  python3 tools/preflight_check.py --deep --category cloud
-  python3 tools/preflight_check.py --deep --category container
-  python3 tools/preflight_check.py --deep --category ai-ml
-  python3 tools/preflight_check.py --deep --category hardware-rf
-  python3 tools/preflight_check.py --deep --category side-channel
+  python3 tools/preflight_check.py --strict-deep --category pwn
+  python3 tools/preflight_check.py --strict-deep --category rev
+  python3 tools/preflight_check.py --strict-deep --category mobile
+  python3 tools/preflight_check.py --strict-deep --category web3
+  python3 tools/preflight_check.py --strict-deep --category web
+  python3 tools/preflight_check.py --strict-deep --category cloud
+  python3 tools/preflight_check.py --strict-deep --category container
+  python3 tools/preflight_check.py --strict-deep --category ai-ml
+  python3 tools/preflight_check.py --strict-deep --category hardware-rf
+  python3 tools/preflight_check.py --strict-deep --category side-channel
 EOF

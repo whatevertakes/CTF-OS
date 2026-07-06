@@ -185,10 +185,10 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
 
   # shellcheck disable=SC1091
   . .codex/env.sh
-  echo "== 고급 CTF deep profile 검증 =="
+  echo "== 고급 CTF strict deep profile 검증 =="
   for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container ai-ml hardware-rf side-channel; do
     echo "-- $category --"
-    python3 tools/preflight_check.py --deep --category "$category" | grep -E '^(PASS deep|WARN deep|summary)'
+    python3 tools/preflight_check.py --strict-deep --category "$category" | grep -E '^(PASS deep|WARN deep|FAIL deep|summary)'
   done
   echo "-- hardware-rf avr --"
   python3 tools/preflight_check.py --category hardware-rf --tag avr | grep -E '^(PASS command avr|PASS dependency avr|FAIL dependency_missing|summary)'

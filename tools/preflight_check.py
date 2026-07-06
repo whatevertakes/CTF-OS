@@ -686,16 +686,22 @@ def command_version_line(command: tuple[str, ...]) -> tuple[bool, str]:
     return True, result_detail(result)
 
 
-def check_deep_category_tools(reporter: Reporter, category: str | None) -> None:
+def check_deep_category_tools(reporter: Reporter, category: str | None, *, strict: bool) -> None:
     normalized = normalize_category(category)
     if not normalized:
-        reporter.warn("deep category checks skipped: --category is required with --deep")
+        if strict:
+            reporter.fail("deep category checks skipped: --category is required with --strict-deep")
+        else:
+            reporter.warn("deep category checks skipped: --category is required with --deep")
         return
 
     commands = DEEP_CATEGORY_COMMANDS.get(normalized, ())
     modules = DEEP_CATEGORY_MODULES.get(normalized, ())
     if not commands and not modules:
-        reporter.warn(f"deep category checks have no configured tool profile for {normalized}")
+        if strict:
+            reporter.fail(f"deep category checks have no configured tool profile for {normalized}")
+        else:
+            reporter.warn(f"deep category checks have no configured tool profile for {normalized}")
         return
 
     for label, command in commands:
@@ -703,15 +709,25 @@ def check_deep_category_tools(reporter: Reporter, category: str | None) -> None:
         if shutil.which(executable):
             ok, detail = command_version_line(command)
             if ok:
-                reporter.pass_(f"deep optional command {label}: {detail}")
+                prefix = "deep command" if strict else "deep optional command"
+                reporter.pass_(f"{prefix} {label}: {detail}")
             else:
-                reporter.warn(f"deep optional command check failed {label}: {detail}")
+                if strict:
+                    reporter.fail(f"deep command check failed {label}: {detail}")
+                else:
+                    reporter.warn(f"deep optional command check failed {label}: {detail}")
         else:
-            reporter.warn(f"deep optional command unavailable {label}")
+            if strict:
+                reporter.fail(f"deep command unavailable {label}")
+            else:
+                reporter.warn(f"deep optional command unavailable {label}")
 
     if not VENV_PYTHON.is_file():
         if modules:
-            reporter.warn(f"deep python modules skipped for {normalized}: missing virtualenv python")
+            if strict:
+                reporter.fail(f"deep python modules skipped for {normalized}: missing virtualenv python")
+            else:
+                reporter.warn(f"deep python modules skipped for {normalized}: missing virtualenv python")
         return
 
     for package, module in modules:
@@ -720,7 +736,10 @@ def check_deep_category_tools(reporter: Reporter, category: str | None) -> None:
             reporter.pass_(f"deep python module {package}")
         else:
             reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "import failed"
-            reporter.warn(f"deep optional python module unavailable {package}: {reason}")
+            if strict:
+                reporter.fail(f"deep python module unavailable {package}: {reason}")
+            else:
+                reporter.warn(f"deep optional python module unavailable {package}: {reason}")
 
 
 def check_python_modules(reporter: Reporter) -> None:
@@ -836,6 +855,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run category-specific deep tool availability checks",
     )
+    parser.add_argument(
+        "--strict-deep",
+        action="store_true",
+        help="treat category-specific deep profile commands and modules as required",
+    )
     return parser.parse_args()
 
 
@@ -848,8 +872,8 @@ def main() -> int:
     check_commands(reporter, strict_optional=args.strict_optional)
     if requires_avr_toolchain(args.category, args.tag):
         check_avr_toolchain(reporter)
-    if args.deep:
-        check_deep_category_tools(reporter, args.category)
+    if args.deep or args.strict_deep:
+        check_deep_category_tools(reporter, args.category, strict=args.strict_deep)
     check_python_modules(reporter)
     check_config(reporter)
     check_runtime_environment(reporter)

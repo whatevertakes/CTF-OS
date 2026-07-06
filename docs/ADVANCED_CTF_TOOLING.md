@@ -32,49 +32,60 @@ Patch/update contract:
 - Re-run apt updates through the same script from an interactive terminal with
   sudo available. In non-interactive sessions without sudo, apt tools are
   skipped with warnings instead of blocking the setup.
-- Keep manually managed GUI, licensed, Windows-only, hardware-specific, or
-  cloud-provider tools out of Git and record their local version in challenge
-  notes when used as solve evidence.
+- Keep required external GUI, licensed, Windows-only, hardware-specific,
+  service-style, or cloud-provider tools out of Git and record their local
+  version in challenge notes when used as solve evidence.
 - Never commit cloud credentials, SDR captures with private content, malware
-  samples, package caches, or third-party dependency directories.
+  samples, large third-party binaries, package caches, or third-party
+  dependency directories.
 
-## Managed Tool Surface
+## Script-Managed And Required External Surface
 
-| Category | Managed by script | Manual or external |
+Both columns are mandatory team deep profile surfaces. "Script-managed" means
+the workspace script can usually install or refresh the tool in a portable
+user-local way. "Required external" means the tool is still required by the
+team standard, but licensing, GUI, Windows, cloud credentials, service runtime,
+platform policy, or non-portable installers keep it outside Git and outside
+forced unattended automation. Required external tools must be installed by the
+operator and exposed through PATH/version checks.
+
+| Category | Script-managed, team-required | Required external, team-required |
 | --- | --- | --- |
 | Web | `nuclei`, `katana`, `feroxbuster`, `amass`, `subfinder`, `gau`, `waybackurls`, `hakrawler`, `dalfox`, `commix`, `interactsh-client`, `dnsx`, `naabu`, `httpie` | `XSStrike`, `phpggc` |
-| Pwn | `valgrind`, `afl-fuzz`, `honggfuzz`, `radamsa`, `heaptrack`, `pwndbg-gdb`, `patchelf`, qemu profiles | `gef`, `peda`, `keystone-as` when unavailable from the OS package set |
+| Pwn | `valgrind`, `afl-fuzz`, `honggfuzz`, `radamsa`, `heaptrack`, `pwndbg-gdb`, `patchelf`, qemu profiles | `gef-gdb`, `peda-gdb`, `keystone-as` |
 | Reverse engineering | `capa`, `rizin`, `cutter`, `ilspycmd` when `dotnet` is present, `monodis`, `emcc`, `llvm-objdump`, Ghidra wrappers | `dotnet`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dnspy` |
 | Crypto | `yafu`, `msieve`, `cado-nfs`, `gap`, `fplll`, `pari-gp` | `magma` |
 | Forensics/stego | `bulk_extractor`, `zeek`, `outguess`, `exiv2`, `ripgrep-all`, existing binwalk/exiftool/Sleuth Kit/steg tools | `NetworkMiner`, `pdfid`, `pdf-parser`, `oledump` |
 | Mobile | `apkid`, `apksigner`, `mobsfscan`, existing `adb`, `objection`, `frida`, `jadx`, `apktool` | full `MobSF` service |
 | Malware | `capa`, `yara`, `upx`, Volatility3 | `diec`, `pestudio`, `peid` |
-| Cloud/container | `helm`, `k9s`, `kind`, `minikube`, `podman`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, plus existing `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo` | `nerdctl`, `terraform`, `gcloud`, `az`, `kubescape` when not available through local package policy |
+| Cloud/container | `helm`, `k9s`, `kind`, `minikube`, `podman`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `checkov`, `kube-linter`, `kube-score`, plus existing `kubectl`, `trivy`, `syft`, `grype`, `crane`, `skopeo` | `nerdctl`, `terraform`, `terragrunt`, `gcloud`, `az`, `kubescape` |
 | AI/ML | `garak`, `promptfoo` | model/API credentials are never installed or stored by this workspace |
 | RF/hardware/side-channel | `inspectrum`, `sigmf-cli`, `rtl_433`, `rtl_sdr`, `hackrf_info`, `sigrok-cli`, `pulseview`, `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `chipwhisperer`, `audacity`, GNU Radio, URH | `baudline` |
 
-The distinction is operational, not a claim that a manual tool is less useful.
-Manual tools are excluded from unattended installation because they are
-licensed, GUI-only, platform-specific, hardware-bound, or high-impact services.
+The distinction is operational, not optionality. Required external tools are
+excluded from unattended installation because they are licensed, GUI-only,
+platform-specific, credential-sensitive, hardware-bound, or high-impact
+services, but strict deep verification still treats missing commands or failed
+version checks as team setup failures.
 
 ## Verification
 
-After install or patching, run the relevant deep check:
+After install or patching, run the relevant strict deep check:
 
 ```bash
-python3 tools/preflight_check.py --deep --category web
-python3 tools/preflight_check.py --deep --category pwn
-python3 tools/preflight_check.py --deep --category rev
-python3 tools/preflight_check.py --deep --category crypto
-python3 tools/preflight_check.py --deep --category forensics
-python3 tools/preflight_check.py --deep --category stego
-python3 tools/preflight_check.py --deep --category mobile
-python3 tools/preflight_check.py --deep --category malware
-python3 tools/preflight_check.py --deep --category cloud
-python3 tools/preflight_check.py --deep --category container
-python3 tools/preflight_check.py --deep --category ai-ml
-python3 tools/preflight_check.py --deep --category hardware-rf
-python3 tools/preflight_check.py --deep --category side-channel
+python3 tools/preflight_check.py --strict-deep --category web
+python3 tools/preflight_check.py --strict-deep --category pwn
+python3 tools/preflight_check.py --strict-deep --category rev
+python3 tools/preflight_check.py --strict-deep --category crypto
+python3 tools/preflight_check.py --strict-deep --category forensics
+python3 tools/preflight_check.py --strict-deep --category stego
+python3 tools/preflight_check.py --strict-deep --category mobile
+python3 tools/preflight_check.py --strict-deep --category malware
+python3 tools/preflight_check.py --strict-deep --category cloud
+python3 tools/preflight_check.py --strict-deep --category container
+python3 tools/preflight_check.py --strict-deep --category ai-ml
+python3 tools/preflight_check.py --strict-deep --category hardware-rf
+python3 tools/preflight_check.py --strict-deep --category side-channel
 ```
 
 For a compact local inventory:
