@@ -78,6 +78,76 @@ show_path stegolsb
 show_path zsteg
 show_path wafw00f
 show_path pwninit
+show_path nuclei
+show_path katana
+show_path feroxbuster
+show_path amass
+show_path subfinder
+show_path gau
+show_path waybackurls
+show_path hakrawler
+show_path dalfox
+show_path commix
+show_path phpggc
+show_path interactsh-client
+show_path dnsx
+show_path naabu
+show_path http
+show_path valgrind
+show_path afl-fuzz
+show_path honggfuzz
+show_path radamsa
+show_path heaptrack
+show_path keystone-as
+show_path capa
+show_path rizin
+show_path ilspycmd
+show_path monodis
+show_path llvm-objdump
+show_path yafu
+show_path msieve
+show_path cado-nfs.py
+show_path gap
+show_path bulk_extractor
+show_path zeek
+show_path outguess
+show_path exiv2
+show_path rga
+show_path apkid
+show_path apksigner
+show_path mobsfscan
+show_path helm
+show_path k9s
+show_path kind
+show_path minikube
+show_path podman
+show_path nerdctl
+show_path cosign
+show_path dive
+show_path regctl
+show_path oras
+show_path aws
+show_path gcloud
+show_path az
+show_path terraform
+show_path terragrunt
+show_path checkov
+show_path kube-linter
+show_path kube-score
+show_path kubescape
+show_path promptfoo
+show_path inspectrum
+show_path sigmf
+show_path rtl_433
+show_path rtl_sdr
+show_path hackrf_info
+show_path sigrok-cli
+show_path pulseview
+show_path openocd
+show_path arm-none-eabi-gcc
+show_path arm-none-eabi-objdump
+show_path chipwhisperer
+show_path audacity
 
 echo "== core =="
 run_optional git git --version
@@ -170,12 +240,46 @@ run_optional arjun arjun -h
 run_optional flask-unsign flask-unsign --version
 run_optional shodan env PYTHONWARNINGS=ignore::UserWarning shodan version
 run_optional wafw00f wafw00f --version
+run_optional nuclei nuclei -version
+run_optional katana katana -version
+run_optional feroxbuster feroxbuster --version
+run_optional subfinder subfinder -version
+run_optional gau gau --version
+run_optional dalfox dalfox version
+run_optional dnsx dnsx -version
+run_optional naabu naabu -version
+run_optional httpie http --version
 
 echo "== mcp utility cli =="
 run_optional mcp mcp version
 run_optional fastmcp fastmcp --version
 run_optional mcp-proxy mcp-proxy --version
 run_optional mcp-reverse-proxy mcp-reverse-proxy --version
+
+echo "== advanced category cli =="
+run_optional valgrind valgrind --version
+run_optional radamsa radamsa --version
+run_optional heaptrack heaptrack --version
+run_optional capa capa --version
+run_optional rizin rizin -v
+run_optional llvm-objdump llvm-objdump --version
+run_optional bulk_extractor bulk_extractor -V
+run_optional zeek zeek --version
+run_optional exiv2 exiv2 --version
+run_optional apkid apkid --version
+run_optional mobsfscan mobsfscan --version
+run_optional helm helm version --short
+run_optional kind kind version
+run_optional podman podman --version
+run_optional cosign cosign version
+run_optional regctl regctl version
+run_optional oras oras version
+run_optional aws aws --version
+run_optional checkov checkov --version
+run_optional promptfoo promptfoo --version
+run_optional sigrok-cli sigrok-cli --version
+run_optional openocd openocd --version
+run_optional arm-none-eabi-gcc arm-none-eabi-gcc --version
 
 echo "== mcp =="
 codex mcp list

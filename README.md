@@ -59,16 +59,22 @@ python3 tools/check_level3_tool_routing.py
 ```
 
 고급 문제에서 대형 도구까지 맞춰야 하면 별도 installer를 실행합니다. 이 단계는
-Ghidra, garak/PyTorch, GNU Radio처럼 큰 의존성을 설치하므로 기본 팀
-부트스트랩에는 포함하지 않습니다.
+웹 스캐너, fuzzing 도구, RE/decompiler 보조 도구, cloud/container CLI,
+RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 큰 의존성을 설치하므로
+기본 팀 부트스트랩에는 포함하지 않습니다. 설치/패치 계약은
+[docs/ADVANCED_CTF_TOOLING.md](docs/ADVANCED_CTF_TOOLING.md)에 있습니다.
 
 ```bash
 tools/install_advanced_ctf_tools.sh
 . .codex/env.sh
+python3 tools/preflight_check.py --deep --category web
 python3 tools/preflight_check.py --deep --category pwn
 python3 tools/preflight_check.py --deep --category rev
+python3 tools/preflight_check.py --deep --category crypto
 python3 tools/preflight_check.py --deep --category mobile
 python3 tools/preflight_check.py --deep --category web3
+python3 tools/preflight_check.py --deep --category cloud
+python3 tools/preflight_check.py --deep --category container
 python3 tools/preflight_check.py --deep --category ai-ml
 python3 tools/preflight_check.py --deep --category hardware-rf
 ```

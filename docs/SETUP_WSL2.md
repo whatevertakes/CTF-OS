@@ -113,18 +113,24 @@ tools/install_advanced_ctf_tools.sh
 python3 tools/preflight_check.py --deep --category <category>
 ```
 
-이 installer는 `pwndbg`, Ghidra, Sleuth Kit, `binwalk`, `exiftool`, `nmap`,
-`socat`, `stegseek`, `adb`/`objection`, `volatility3`, `slither`, `solc-select`,
-`halmos`, `garak`, GNU Radio, URH, Foundry, `kubectl`, `trivy`, `syft`, `grype`,
-`crane`을 user-local 경로와 apt 패키지로 구성합니다.
+이 installer는 웹 스캐너/크롤러, fuzzing 도구, RE/decompiler 보조 도구,
+forensics/stego CLI, mobile 보조 도구, cloud/container CLI, RF/hardware 도구,
+`pwndbg`, Ghidra, `garak`, GNU Radio, URH, Foundry 등을 user-local 경로와
+가능한 apt 패키지로 구성합니다. 전체 범위, 수동 설치 항목, 패치 갱신 계약은
+`docs/ADVANCED_CTF_TOOLING.md`를 기준으로 합니다.
 
 ```bash
 python3 tools/preflight_check.py --deep --category pwn
 python3 tools/preflight_check.py --deep --category rev
+python3 tools/preflight_check.py --deep --category web
+python3 tools/preflight_check.py --deep --category crypto
 python3 tools/preflight_check.py --deep --category mobile
 python3 tools/preflight_check.py --deep --category web3
+python3 tools/preflight_check.py --deep --category cloud
+python3 tools/preflight_check.py --deep --category container
 python3 tools/preflight_check.py --deep --category ai-ml
 python3 tools/preflight_check.py --deep --category hardware-rf
+python3 tools/preflight_check.py --deep --category side-channel
 ```
 
 `garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI 문제가
