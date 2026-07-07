@@ -1011,7 +1011,11 @@ Run:
   . .codex/env.sh
   python3 tools/preflight_check.py --strict-deep --category pwn
   python3 tools/preflight_check.py --strict-deep --category rev
+  python3 tools/preflight_check.py --strict-deep --category crypto
+  python3 tools/preflight_check.py --strict-deep --category forensics
+  python3 tools/preflight_check.py --strict-deep --category stego
   python3 tools/preflight_check.py --strict-deep --category mobile
+  python3 tools/preflight_check.py --strict-deep --category malware
   python3 tools/preflight_check.py --strict-deep --category web3
   python3 tools/preflight_check.py --strict-deep --category web
   python3 tools/preflight_check.py --strict-deep --category cloud
@@ -1019,5 +1023,7 @@ Run:
   python3 tools/preflight_check.py --strict-deep --category ai-ml
   python3 tools/preflight_check.py --strict-deep --category hardware-rf
   python3 tools/preflight_check.py --strict-deep --category side-channel
+  python3 tools/preflight_check.py --strict-deep --category misc
+  python3 tools/preflight_check.py --strict-deep --category programming
   python3 tools/preflight_check.py --strict-deep --external-policy fail --category rev
 EOF

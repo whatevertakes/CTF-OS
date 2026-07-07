@@ -95,14 +95,14 @@ command on `PATH`.
 
 ## Verification
 
-After installing a subset, run:
+After installing a subset, run the matching category check:
 
 ```bash
-tools/preflight_check.py --deep --strict-deep --external-policy report
+python3 tools/preflight_check.py --strict-deep --external-policy report --category web
 ```
 
 For a parity gate that fails on missing external tools:
 
 ```bash
-tools/preflight_check.py --deep --strict-deep --external-policy fail
+tools/setup_workspace.sh team --strict-external
 ```

@@ -56,13 +56,14 @@ tools/setup_workspace.sh advanced
 preflight 실패로 남고, local failure 후 external로 이동한 도구는 기본 team
 setup에서 `EXTERNAL ...` report로만 표시합니다.
 
-`yafu`, `msieve`, `bulk_extractor`, `honggfuzz`, `feroxbuster`,
-`ripgrep-all`, `cutter`, `zeek`, `oledump`, `rizin`, `XSStrike`, `phpggc`,
-`dotnet`, `dnspy`, `NetworkMiner`, `MobSF`, `diec`, `pestudio`, `gcloud`,
-`az`, `terraform`, `kubescape`, `baudline` 같은 도구는 external/manual
-표면입니다. 기본 team setup에서는 자동 설치하지 않고 `EXTERNAL ...` report와
-summary count로만 표시합니다. full workstation parity가 필요할 때만 다음처럼
-external 누락도 실패로 처리합니다.
+`magma`, `yafu`, `msieve`, `feroxbuster`, `XSStrike`, `phpggc`, `honggfuzz`,
+`gef-gdb`, `peda-gdb`, `keystone-as`, `rizin`, `cutter`, `rz-ghidra`,
+`r2ghidra`, `cfr`, `procyon`, `dotnet`, `dnspy`, `bulk_extractor`, `zeek`,
+`NetworkMiner`, `oledump`, `ripgrep-all`, `MobSF`, `diec`, `pestudio`,
+`peid`, `nerdctl`, `terraform`, `gcloud`, `az`, `kubescape`, `baudline` 같은
+도구는 external/manual 표면입니다. 기본 team setup에서는 자동 설치하지 않고
+`EXTERNAL ...` report와 summary count로만 표시합니다. full workstation parity가
+필요할 때만 다음처럼 external 누락도 실패로 처리합니다.
 
 ```bash
 tools/setup_workspace.sh team --strict-external

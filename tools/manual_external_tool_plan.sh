@@ -79,8 +79,8 @@ Policy:
     commands.
 
 Verification:
-  tools/preflight_check.py --deep --strict-deep --external-policy report
-  tools/preflight_check.py --deep --strict-deep --external-policy fail
+  python3 tools/preflight_check.py --strict-deep --external-policy report --category web
+  tools/setup_workspace.sh team --strict-external
 
 More detail:
   docs/MANUAL_EXTERNAL_TOOL_INSTALL.md

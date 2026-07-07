@@ -115,13 +115,18 @@ python3 tools/preflight_check.py --deep --category pwn
 python3 tools/preflight_check.py --deep --category rev
 python3 tools/preflight_check.py --deep --category web
 python3 tools/preflight_check.py --deep --category crypto
+python3 tools/preflight_check.py --deep --category forensics
+python3 tools/preflight_check.py --deep --category stego
 python3 tools/preflight_check.py --deep --category mobile
+python3 tools/preflight_check.py --deep --category malware
 python3 tools/preflight_check.py --deep --category web3
 python3 tools/preflight_check.py --deep --category cloud
 python3 tools/preflight_check.py --deep --category container
 python3 tools/preflight_check.py --deep --category ai-ml
 python3 tools/preflight_check.py --deep --category hardware-rf
 python3 tools/preflight_check.py --deep --category side-channel
+python3 tools/preflight_check.py --deep --category misc
+python3 tools/preflight_check.py --deep --category programming
 ```
 
 `garak`은 PyTorch 계열 의존성 때문에 수 GB를 사용할 수 있습니다. LLM/AI 문제가
