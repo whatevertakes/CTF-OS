@@ -58,6 +58,9 @@ _codex_path_append() {
 _codex_path_prepend "$CTF_WORKSPACE_ROOT/.codex/bin"
 _codex_path_prepend "$CTF_WORKSPACE_ROOT/.venv/bin"
 _codex_path_prepend "$HOME/.local/bin"
+_codex_path_prepend "$HOME/go/bin"
+_codex_path_prepend "$HOME/.cargo/bin"
+_codex_path_prepend "$HOME/.dotnet/tools"
 _codex_path_append "$HOME/.foundry/bin"
 export PATH
 

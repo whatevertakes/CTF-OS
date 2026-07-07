@@ -51,7 +51,7 @@ echo "== workspace =="
 pwd
 echo "CTF_WORKSPACE_ROOT=$CTF_WORKSPACE_ROOT"
 
-echo "== paths =="
+echo "== managed paths =="
 show_path rg
 show_path binwalk
 show_path exiftool
@@ -88,7 +88,6 @@ show_path waybackurls
 show_path hakrawler
 show_path dalfox
 show_path commix
-show_path phpggc
 show_path interactsh-client
 show_path dnsx
 show_path naabu
@@ -98,7 +97,6 @@ show_path afl-fuzz
 show_path honggfuzz
 show_path radamsa
 show_path heaptrack
-show_path keystone-as
 show_path capa
 show_path rizin
 show_path ilspycmd
@@ -110,6 +108,9 @@ show_path cado-nfs.py
 show_path gap
 show_path bulk_extractor
 show_path zeek
+show_path pdfid.py
+show_path pdf-parser.py
+show_path oledump.py
 show_path outguess
 show_path exiv2
 show_path rga
@@ -121,23 +122,18 @@ show_path k9s
 show_path kind
 show_path minikube
 show_path podman
-show_path nerdctl
 show_path cosign
 show_path dive
 show_path regctl
 show_path oras
 show_path aws
-show_path gcloud
-show_path az
-show_path terraform
 show_path terragrunt
 show_path checkov
 show_path kube-linter
 show_path kube-score
-show_path kubescape
 show_path promptfoo
 show_path inspectrum
-show_path sigmf
+show_path sigmf_validate
 show_path rtl_433
 show_path rtl_sdr
 show_path hackrf_info
@@ -148,6 +144,36 @@ show_path arm-none-eabi-gcc
 show_path arm-none-eabi-objdump
 show_path chipwhisperer
 show_path audacity
+show_path qemu-x86_64
+show_path qemu-aarch64
+show_path qemu-system-x86_64
+show_path qemu-system-arm
+show_path qemu-system-aarch64
+
+echo "== external manual paths =="
+show_path magma
+show_path xsstrike
+show_path phpggc
+show_path gef-gdb
+show_path peda-gdb
+show_path keystone-as
+show_path cfr
+show_path procyon
+show_path rz-ghidra
+show_path r2ghidra
+show_path dotnet
+show_path dnspy
+show_path NetworkMiner
+show_path mobsf
+show_path diec
+show_path pestudio
+show_path peid
+show_path gcloud
+show_path az
+show_path terraform
+show_path kubescape
+show_path nerdctl
+show_path baudline
 
 echo "== core =="
 run_optional git git --version

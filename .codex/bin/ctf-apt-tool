@@ -5,6 +5,7 @@ SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="${CTF_WORKSPACE_ROOT:-$(cd "$(dirname "$SCRIPT")/../.." && pwd)}"
 APT_ROOT="$ROOT/.cache/tools/apt-root"
 TOOL="$(basename "$0")"
+
 case "$TOOL" in
   upx) TOOL="upx-ucl" ;;
 esac

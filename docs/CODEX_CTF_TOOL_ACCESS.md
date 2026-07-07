@@ -42,15 +42,16 @@ Use it with `docs/TOOLCHAIN_MATRIX.md`, `docs/ADVANCED_CTF_TOOLING.md`,
 | --- | --- |
 | Core/triage | `intake_challenge.py`, `replay_runner.py`, `proof_validate.py`, templates, evidence layout |
 | Web | Playwright MCP, `curl`, Python HTTP clients, `arjun`, `flask-unsign`, `wafw00f`, `shodan`, `sqlmap`, `ffuf`, `gobuster`, `tplmap`, `searchsploit`, `nuclei`, `katana`, `feroxbuster`, `amass`, `subfinder`, `gau`, `waybackurls`, `hakrawler`, `dalfox`, `commix`, `phpggc`, `interactsh-client`, `dnsx`, `naabu`, `httpie`, optional Caido/Burp helpers |
-| Pwn | `gcc`, `gdb`, `pwntools`, `checksec`, `ROPgadget`, `ropper`, `one_gadget`, `seccomp-tools`, `pwninit`, `patchelf`, qemu profiles, `valgrind`, `afl-fuzz`, `honggfuzz`, `radamsa`, `gef`, `peda`, `heaptrack`, `keystone-as` |
-| Rev | `file`, `strings`, `objdump`, `r2`, radare2 MCP, angr MCP, `floss`, Ghidra wrappers, `capa`, `rizin`, `cutter`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dotnet`, `ilspycmd`, `dnspy`, `monodis`, `emcc`, `llvm-objdump`, `yara`, `upx`, qemu profiles |
+| Pwn | `gcc`, `gdb`, `pwntools`, `checksec`, `ROPgadget`, `ropper`, `one_gadget`, `seccomp-tools`, `pwninit`, `patchelf`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64`, `valgrind`, `afl-fuzz`, `honggfuzz`, `radamsa`, `gef-gdb`, `peda-gdb`, `heaptrack`, `keystone-as` |
+| Rev | `file`, `strings`, `objdump`, `r2`, radare2 MCP, angr MCP, `floss`, `ghidra-check`, `capa`, `rizin`, `cutter`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dotnet`, `ilspycmd`, `dnspy`, `monodis`, `emcc`, `llvm-objdump`, `yara`, `upx`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` |
 | Crypto | `RsaCtfTool`, Sage, `z3`, `fplll`, PARI/GP, `yafu`, `msieve`, `cado-nfs`, `gap`, licensed `magma`, Python verifier workflow |
 | Forensics | `binwalk`, `exiftool`, `tshark`, Volatility3, Sleuth Kit, `bulk_extractor`, `zeek`, NetworkMiner, `pdfid`, `pdf-parser`, `oledump`, `outguess`, `exiv2`, `ripgrep-all`, `floss`, `stegolsb`, `zsteg`, `yara`, `upx` |
 | Stego | `exiftool`, `binwalk`, `steghide`, `stegseek`, `zsteg`, `stegolsb`, `outguess` |
 | Mobile | `jadx`, `apktool`, `adb`, `objection`, `frida`, `frida-ps`, `apkid`, `apksigner`, MobSF, `mobsfscan` |
 | Malware | `floss`, `capa`, `diec`, `pestudio`, `peid`, `yara`, `upx`, Volatility3, `tshark`, radare2 MCP, angr MCP |
 | Web3 | Foundry `forge`/`cast`/`anvil`, `chisel`, `solc`, `slither`, `halmos` |
-| Cloud/container | Docker, `helm`, `k9s`, `kind`, `minikube`, `kubectl`, `podman`, `nerdctl`, `cosign`, `dive`, `regctl`, `oras`, provider CLIs, `terraform`, `terragrunt`, `checkov`, `trivy`, `syft`, `grype`, `crane`, `skopeo`, Kubernetes linters/scanners |
+| Cloud | Docker, `kubectl`, `helm`, `k9s`, `kind`, `minikube`, `podman`, `nerdctl`, `trivy`, `syft`, `grype`, `crane`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `gcloud`, `az`, `terraform`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, `kubescape`, `skopeo` |
+| Container | Docker, `kubectl`, `helm`, `k9s`, `kind`, `minikube`, `podman`, `nerdctl`, `trivy`, `syft`, `grype`, `crane`, `cosign`, `dive`, `regctl`, `oras`, `terraform`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, `kubescape`, `skopeo` |
 | AI/ML | Python prompt/model harnesses, `garak`, `promptfoo` |
 | Hardware/RF | AVR toolchain, GNU Radio, URH, `inspectrum`, `sigmf-cli`, RTL-SDR tools, HackRF checks, sigrok/PulseView, OpenOCD, ChipWhisperer, audio/signal viewers |
 | Side-channel | GNU Radio, ChipWhisperer, SigMF, OpenOCD, ARM toolchain, and Python trace/timing/power/cache analysis scripts |

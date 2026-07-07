@@ -66,6 +66,17 @@ cloud/container CLI, RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 
 tools/setup_workspace.sh team --branch <github-user> --skip-garak
 ```
 
+Ubuntu 24.04에서 수동 external 도구를 맞출 때 README에는 검증 가능한 sudo
+quick block만 둡니다. 나머지 external 도구는
+[docs/MANUAL_EXTERNAL_TOOL_INSTALL.md](docs/MANUAL_EXTERNAL_TOOL_INSTALL.md)의
+PATH 확인 대상으로 관리합니다.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y zeek python3-olefile
+sudo ln -sfn /opt/zeek/bin/zeek /usr/local/bin/zeek
+```
+
 웹 CTF에서 브라우저 트래픽과 WSL `curl`/Python exploit 트래픽을 같은 Caido
 프록시로 보고 싶다면 Windows Caido 브리지를 켭니다.
 

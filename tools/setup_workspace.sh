@@ -21,6 +21,7 @@ Profiles:
 Common examples:
   tools/setup_workspace.sh team --branch <github-user>
   tools/setup_workspace.sh team --branch <github-user> --skip-garak --references
+  tools/setup_workspace.sh team --branch <github-user> --strict-external
   tools/setup_workspace.sh bootstrap --skip-apt
   tools/setup_workspace.sh advanced --skip-garak
   tools/setup_workspace.sh references

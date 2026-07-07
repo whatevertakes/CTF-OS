@@ -17,11 +17,12 @@ SKIP_PYTHON=0
 SKIP_MCP=0
 SKIP_ADVANCED=0
 SKIP_GARAK=0
+STRICT_EXTERNAL=0
 TARGET_BRANCH=""
 
 usage() {
   cat <<'EOF'
-사용법: tools/team_member_setup.sh [--branch <github-user>] [--deep] [--minimal] [--skip-apt] [--skip-python] [--skip-mcp] [--skip-advanced] [--skip-garak]
+사용법: tools/team_member_setup.sh [--branch <github-user>] [--deep] [--minimal] [--skip-apt] [--skip-python] [--skip-mcp] [--skip-advanced] [--skip-garak] [--strict-external]
 
 팀원용 우승 기준 1회 설정/검증 스크립트입니다.
   - 자기 팀 브랜치인지 확인하거나 --branch 값으로 전환
@@ -40,6 +41,7 @@ usage() {
 --deep은 호환용 옵션입니다. 팀 설정은 기본적으로 deep 설치/검증을 수행합니다.
 --skip-advanced는 고급 도구 설치를 건너뛰고 검증만 수행합니다.
 --skip-garak은 설치 중 대형 AI/ML 도구 garak만 건너뜁니다.
+--strict-external은 GUI/라이선스/클라우드 등 manual external 도구 누락도 실패로 처리합니다.
 EOF
 }
 
@@ -71,6 +73,7 @@ while [ "$#" -gt 0 ]; do
     --skip-mcp) SKIP_MCP=1 ;;
     --skip-advanced) SKIP_ADVANCED=1 ;;
     --skip-garak) SKIP_GARAK=1 ;;
+    --strict-external) STRICT_EXTERNAL=1 ;;
     -h|--help)
       usage
       exit 0
@@ -186,35 +189,84 @@ if [ "$DEEP_CHECK" -eq 1 ]; then
   # shellcheck disable=SC1091
   . .codex/env.sh
   echo "== 고급 CTF strict deep profile 검증 =="
-  deep_failures=0
-  deep_issue_report="$(mktemp)"
+  deep_managed_failures=0
+  deep_external_failures=0
+  deep_external_missing=0
+  external_policy="report"
+  if [ "$STRICT_EXTERNAL" -eq 1 ]; then
+    external_policy="fail"
+  fi
+  deep_managed_report="$(mktemp)"
+  deep_external_report="$(mktemp)"
   for category in crypto forensics malware mobile pwn rev misc programming stego web web3 cloud container ai-ml hardware-rf side-channel; do
     echo "CHECK deep $category"
     category_report="$(mktemp)"
     set +e
-    python3 tools/preflight_check.py --strict-deep --category "$category" >"$category_report"
+    python3 tools/preflight_check.py --strict-deep --external-policy "$external_policy" --category "$category" >"$category_report"
     deep_status=$?
     set -e
-    if [ "$deep_status" -ne 0 ]; then
-      deep_failures=$((deep_failures + 1))
+    if grep -Eq '^FAIL deep' "$category_report"; then
+      deep_managed_failures=$((deep_managed_failures + 1))
       {
         echo "-- $category --"
-        grep -E '^(FAIL|WARN) deep' "$category_report" || true
-        grep -E '^summary (failures=[1-9]|failures=[0-9]+ warnings=[1-9])' "$category_report" || true
-      } >>"$deep_issue_report"
+        grep -E '^FAIL deep' "$category_report" || true
+        printf 'managed_failure_lines=%s\n' "$(grep -Ec '^FAIL deep' "$category_report" || true)"
+      } >>"$deep_managed_report"
+    fi
+    if grep -Eq '^EXTERNAL deep' "$category_report"; then
+      deep_external_failures=$((deep_external_failures + 1))
+      category_external_missing="$(awk '
+        /^summary / {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^external_missing=/) {
+              split($i, parts, "=")
+              missing += parts[2]
+            }
+            if ($i ~ /^external_failed=/) {
+              split($i, parts, "=")
+              failed += parts[2]
+            }
+          }
+        }
+        END { print missing + failed + 0 }
+      ' "$category_report")"
+      deep_external_missing=$((deep_external_missing + category_external_missing))
+      {
+        echo "-- $category --"
+        grep -E '^EXTERNAL deep' "$category_report" || true
+        printf 'external_missing_failed=%s\n' "$category_external_missing"
+      } >>"$deep_external_report"
+    fi
+    if [ "$deep_status" -ne 0 ] && ! grep -Eq '^(FAIL deep|EXTERNAL deep)' "$category_report"; then
+      deep_managed_failures=$((deep_managed_failures + 1))
+      {
+        echo "-- $category --"
+        grep -E '^FAIL ' "$category_report" || true
+        grep -E '^summary ' "$category_report" || true
+      } >>"$deep_managed_report"
     fi
     rm -f "$category_report"
   done
   echo "-- hardware-rf avr --"
   python3 tools/preflight_check.py --category hardware-rf --tag avr | grep -E '^(PASS command avr|PASS dependency avr|FAIL dependency_missing|summary)'
-  if [ "$deep_failures" -ne 0 ]; then
-    echo "== strict deep failures/warnings =="
-    cat "$deep_issue_report"
-    rm -f "$deep_issue_report"
-    echo "FAIL strict deep profile categories failed: $deep_failures" >&2
+  if [ "$deep_external_missing" -ne 0 ]; then
+    echo "== strict deep external manual report =="
+    cat "$deep_external_report"
+    echo "INFO strict deep external manual missing: $deep_external_missing"
+  fi
+  if [ "$deep_managed_failures" -ne 0 ] || { [ "$STRICT_EXTERNAL" -eq 1 ] && [ "$deep_external_failures" -ne 0 ]; }; then
+    if [ "$deep_managed_failures" -ne 0 ]; then
+      echo "== strict deep managed failures =="
+      cat "$deep_managed_report"
+      echo "FAIL strict deep managed categories failed: $deep_managed_failures" >&2
+    fi
+    if [ "$STRICT_EXTERNAL" -eq 1 ] && [ "$deep_external_failures" -ne 0 ]; then
+      echo "FAIL strict deep external categories failed: $deep_external_failures" >&2
+    fi
+    rm -f "$deep_managed_report" "$deep_external_report"
     exit 1
   fi
-  rm -f "$deep_issue_report"
+  rm -f "$deep_managed_report" "$deep_external_report"
 fi
 
 cat <<EOF
