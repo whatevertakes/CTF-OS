@@ -9,74 +9,30 @@ BIN_DIR="$HOME/.local/bin"
 
 APT_PACKAGES=(
   adb
-  afl++
-  afl
-  amass
-  apkid
-  apksigner
-  audacity
   binwalk
-  cado-nfs
-  cargo
-  checkov
-  cmake
-  autoconf
-  automake
-  bison
-  dnsutils
-  emscripten
-  exiv2
   ffuf
   fplll-tools
   foremost
-  gap
-  gcc-arm-none-eabi
   gir1.2-gtk-3.0
   gnuradio
   gobuster
-  hackrf
-  heaptrack
-  httpie
-  inspectrum
-  flex
   libgmp-dev
-  llvm
-  llvm-dev
-  libpcap-dev
-  mono-devel
-  mono-utils
-  libsqlite3-dev
   libssl-dev
   libimage-exiftool-perl
-  libtool
-  meson
-  minikube
-  ninja-build
-  openocd
-  outguess
-  php-cli
-  php-curl
   python3-dev
-  podman
-  pulseview
   nmap
   pari-gp
   patchelf
   qemu-system-arm
   qemu-system-x86
   qemu-user
-  radamsa
   ripgrep
-  rtl-433
-  rtl-sdr
-  sigrok-cli
   skopeo
   sleuthkit
   socat
   steghide
   stegseek
   upx-ucl
-  valgrind
   yara
   zlib1g-dev
 )
@@ -98,42 +54,12 @@ PYTHON_MODULE_TOOLS=(
 )
 
 PIPX_TOOLS=(
-  "apkid|apkid|apkid"
-  "aws|awscli|awscli"
-  "capa|flare-capa|capa"
-  "checkov|checkov|checkov"
-  "commix|commix|commix"
-  "http|httpie|httpie"
-  "mobsfscan|mobsfscan|mobsfscan"
 )
 
 GO_TOOLS=(
-  "nuclei|github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-  "katana|github.com/projectdiscovery/katana/cmd/katana@latest"
-  "subfinder|github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
-  "gau|github.com/lc/gau/v2/cmd/gau@latest"
-  "waybackurls|github.com/tomnomnom/waybackurls@latest"
-  "hakrawler|github.com/hakluke/hakrawler@latest"
-  "dalfox|github.com/hahwul/dalfox/v2@latest"
-  "interactsh-client|github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest"
-  "dnsx|github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
-  "naabu|github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
-  "amass|github.com/owasp-amass/amass/v4/...@master"
-  "helm|helm.sh/helm/v3/cmd/helm@latest"
-  "k9s|github.com/derailed/k9s@latest"
-  "kind|sigs.k8s.io/kind@latest"
-  "minikube|k8s.io/minikube/cmd/minikube@latest"
-  "cosign|github.com/sigstore/cosign/v2/cmd/cosign@latest"
-  "dive|github.com/wagoodman/dive@latest"
-  "regctl|github.com/regclient/regclient/cmd/regctl@latest"
-  "oras|oras.land/oras/cmd/oras@latest"
-  "terragrunt|github.com/gruntwork-io/terragrunt@latest"
-  "kube-linter|golang.stackrox.io/kube-linter/cmd/kube-linter@latest"
-  "kube-score|github.com/zegl/kube-score/cmd/kube-score@latest"
 )
 
 NPM_TOOLS=(
-  "promptfoo|promptfoo@latest"
 )
 
 CARGO_TOOLS=()
@@ -185,11 +111,7 @@ Installs advanced, target-specific CTF tools into user-local paths:
   - apt: adb, binwalk, exiftool, qemu, GNU Radio, Sleuth Kit, stegseek, web/pwn helpers
   - isolated user venv wrappers: objection, halmos, garak, urh, volatility3, slither, solc-select
   - workspace venv modules: fpylll, sigmf, chipwhisperer, yara-python, volatility3
-  - pipx tools: apkid, awscli, capa, checkov, commix, httpie, mobsfscan
-  - Go tools: nuclei, katana, subfinder, gau, waybackurls, hakrawler, dalfox,
-    interactsh-client, dnsx, naabu, helm, k9s, kind, cosign, dive, regctl, oras
-  - npm tools: promptfoo
-  - dotnet tools when dotnet is already present
+  - optional deferred installers only when their tool lists are enabled locally
   - source or upstream binary fallbacks for the remaining managed tools with no apt candidate
   - user checkouts/downloads: pwndbg, Ghidra
   - Foundry toolchain: forge, cast, anvil, chisel
@@ -370,11 +292,10 @@ print_install_policy_summary() {
     printf 'INFO apt package phase disabled by --skip-apt.\n'
   elif ! command -v apt-get >/dev/null 2>&1; then
     printf 'WARN apt-get unavailable; apt package phase cannot run.\n' >&2
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    printf 'INFO dry-run prints the apt plan without requiring sudo.\n'
   elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     printf 'INFO apt package phase can use non-interactive sudo.\n'
-  elif [ "$DRY_RUN" -eq 1 ]; then
-    printf 'WARN sudo non-interactive apt unavailable for real install; dry-run still prints the apt plan.\n' >&2
-    printf 'INFO run from an interactive sudo-capable terminal for apt coverage, or rely on user-local fallbacks.\n'
   elif [ -t 0 ]; then
     printf 'INFO apt package phase may request sudo interactively.\n'
   else
@@ -861,6 +782,9 @@ install_pipx_tools() {
   if [ "$SKIP_PIPX" -eq 1 ]; then
     return 0
   fi
+  if [ "${#PIPX_TOOLS[@]}" -eq 0 ]; then
+    return 0
+  fi
   if ! command -v pipx >/dev/null 2>&1; then
     echo "WARN pipx unavailable; skipping pipx advanced tools" >&2
     return 0
@@ -880,6 +804,9 @@ install_pipx_tools() {
 
 install_go_tools() {
   if [ "$SKIP_GO" -eq 1 ]; then
+    return 0
+  fi
+  if [ "${#GO_TOOLS[@]}" -eq 0 ]; then
     return 0
   fi
   if ! command -v go >/dev/null 2>&1; then
@@ -910,6 +837,9 @@ install_npm_tools() {
   if [ "$SKIP_NPM" -eq 1 ]; then
     return 0
   fi
+  if [ "${#NPM_TOOLS[@]}" -eq 0 ]; then
+    return 0
+  fi
   if ! command -v npm >/dev/null 2>&1; then
     echo "WARN npm unavailable; skipping npm advanced tools" >&2
     return 0
@@ -928,6 +858,9 @@ install_npm_tools() {
 
 install_cargo_tools() {
   if [ "$SKIP_CARGO" -eq 1 ]; then
+    return 0
+  fi
+  if [ "${#CARGO_TOOLS[@]}" -eq 0 ]; then
     return 0
   fi
   if ! command -v cargo >/dev/null 2>&1; then
@@ -950,8 +883,11 @@ install_dotnet_tools() {
   if [ "$SKIP_DOTNET" -eq 1 ]; then
     return 0
   fi
+  if [ "${#DOTNET_TOOLS[@]}" -eq 0 ]; then
+    return 0
+  fi
   if ! command -v dotnet >/dev/null 2>&1; then
-    echo "WARN dotnet unavailable; skipping dotnet advanced tools" >&2
+    echo "INFO dotnet unavailable; skipping dotnet-dependent advanced tools"
     return 0
   fi
   local spec
