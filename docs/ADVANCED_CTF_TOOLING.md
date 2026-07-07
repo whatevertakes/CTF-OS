@@ -64,20 +64,20 @@ the deep profile defines them.
 
 | Category | Script-managed, team-required | Required external, team-required |
 | --- | --- | --- |
-| Web | `nuclei`, `katana`, `amass`, `subfinder`, `gau`, `waybackurls`, `hakrawler`, `dalfox`, `commix`, `interactsh-client`, `dnsx`, `naabu`, `httpie`, `arjun`, `flask-unsign`, `shodan`, `wafw00f`, `sqlmap`, `ffuf`, `gobuster` | `feroxbuster`, `XSStrike`, `phpggc` |
+| Web | `arjun`, `flask-unsign`, `shodan`, `wafw00f`, `sqlmap`, `ffuf`, `gobuster` | `nuclei`, `katana`, `feroxbuster`, `amass`, `subfinder`, `gau`, `waybackurls`, `hakrawler`, `dalfox`, `XSStrike`, `commix`, `phpggc`, `interactsh-client`, `dnsx`, `naabu`, `httpie` |
 | Web3 | `forge`, `cast`, `anvil`, `chisel`, `solc`, `slither`, `halmos` | None |
-| Pwn | `pwndbg-gdb`, `pwninit`, `patchelf`, `valgrind`, `afl-fuzz`, `radamsa`, `heaptrack`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` | `honggfuzz`, `gef-gdb`, `peda-gdb`, `keystone-as` |
-| Reverse engineering | `ghidra-check`, `objdump`, `strings`, `capa`, `ilspycmd`, `monodis`, `emcc`, `llvm-objdump`, `floss`, `yara`, `upx`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` | `rizin`, `cutter`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dotnet`, `dnspy` |
-| Crypto | `RsaCtfTool`, `z3`, `fplll`, `pari-gp`, `cado-nfs`, `gap`; Python modules: `z3-solver`, `fpylll` | `yafu`, `msieve`, `magma` |
-| Forensics | `binwalk`, `exiftool`, `foremost`, `mmls`, `pdfid.py`, `pdf-parser.py`, `outguess`, `exiv2`, `floss`, `stegolsb`, `zsteg`, `yara`, `upx`, `fls`, `vol`; Python modules: `yara-python`, `volatility3` | `bulk_extractor`, `zeek`, `NetworkMiner`, `oledump`, `ripgrep-all` |
-| Stego | `exiftool`, `binwalk`, `steghide`, `stegseek`, `outguess`, `stegolsb`, `zsteg` | None |
-| Mobile | `jadx`, `apktool`, `adb`, `objection`, `frida`, `frida-ps`, `apkid`, `apksigner`, `mobsfscan` | `MobSF` |
-| Malware | `capa`, `yara`, `upx`, `vol`; Python modules: `yara-python`, `volatility3` | `diec`, `pestudio`, `peid` |
-| Cloud | `kubectl`, `helm`, `k9s`, `kind`, `minikube`, `podman`, `trivy`, `syft`, `grype`, `crane`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, `skopeo` | `nerdctl`, `gcloud`, `az`, `terraform`, `kubescape` |
-| Container | `kubectl`, `helm`, `k9s`, `kind`, `minikube`, `podman`, `trivy`, `syft`, `grype`, `crane`, `cosign`, `dive`, `regctl`, `oras`, `terragrunt`, `checkov`, `kube-linter`, `kube-score`, `skopeo` | `nerdctl`, `terraform`, `kubescape` |
-| AI/ML | `garak`, `promptfoo` | None |
-| Hardware/RF | `gnuradio-config-info`, `urh`, `inspectrum`, `sigmf_validate`, `rtl_433`, `rtl_sdr`, `hackrf_info`, `sigrok-cli`, `pulseview`, `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `audacity`; Python modules: `chipwhisperer`, `sigmf` | `baudline` |
-| Side-channel | `gnuradio-config-info`, `sigmf_validate`, `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `audacity`; Python modules: `chipwhisperer`, `sigmf` | `baudline` |
+| Pwn | `pwndbg-gdb`, `pwninit`, `patchelf`, `radamsa`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` | `valgrind`, `afl-fuzz`, `honggfuzz`, `gef-gdb`, `peda-gdb`, `heaptrack`, `keystone-as` |
+| Reverse engineering | `ghidra-check`, `objdump`, `strings`, `ilspycmd`, `floss`, `yara`, `upx`, `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` | `capa`, `rizin`, `cutter`, `rz-ghidra`, `r2ghidra`, `cfr`, `procyon`, `dotnet`, `dnspy`, `monodis`, `emcc`, `llvm-objdump` |
+| Crypto | `RsaCtfTool`, `z3`, `fplll`, `pari-gp`, `cado-nfs`; Python modules: `z3-solver`, `fpylll` | `yafu`, `msieve`, `gap`, `magma` |
+| Forensics | `binwalk`, `exiftool`, `foremost`, `mmls`, `pdfid.py`, `pdf-parser.py`, `floss`, `stegolsb`, `zsteg`, `yara`, `upx`, `fls`, `vol`; Python modules: `yara-python`, `volatility3` | `bulk_extractor`, `zeek`, `NetworkMiner`, `oledump`, `outguess`, `exiv2`, `ripgrep-all` |
+| Stego | `exiftool`, `binwalk`, `steghide`, `stegseek`, `stegolsb`, `zsteg` | `outguess` |
+| Mobile | `jadx`, `apktool`, `adb`, `objection`, `frida`, `frida-ps` | `apkid`, `apksigner`, `MobSF`, `mobsfscan` |
+| Malware | `yara`, `upx`, `vol`; Python modules: `yara-python`, `volatility3` | `capa`, `diec`, `pestudio`, `peid` |
+| Cloud | `kubectl`, `minikube`, `trivy`, `syft`, `grype`, `crane`, `terragrunt`, `skopeo` | `helm`, `k9s`, `kind`, `podman`, `nerdctl`, `cosign`, `dive`, `regctl`, `oras`, `aws`, `gcloud`, `az`, `terraform`, `checkov`, `kube-linter`, `kube-score`, `kubescape` |
+| Container | `kubectl`, `minikube`, `trivy`, `syft`, `grype`, `crane`, `terragrunt`, `skopeo` | `helm`, `k9s`, `kind`, `podman`, `nerdctl`, `cosign`, `dive`, `regctl`, `oras`, `terraform`, `checkov`, `kube-linter`, `kube-score`, `kubescape` |
+| AI/ML | `garak` | `promptfoo` |
+| Hardware/RF | `gnuradio-config-info`, `urh`, `sigmf_validate`; Python modules: `chipwhisperer`, `sigmf` | `inspectrum`, `rtl_433`, `rtl_sdr`, `hackrf_info`, `sigrok-cli`, `pulseview`, `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `audacity`, `baudline` |
+| Side-channel | `gnuradio-config-info`, `sigmf_validate`; Python modules: `chipwhisperer`, `sigmf` | `openocd`, `arm-none-eabi-gcc`, `arm-none-eabi-objdump`, `audacity`, `baudline` |
 | Misc | `qemu-x86_64`, `qemu-aarch64`, `qemu-system-x86_64`, `qemu-system-arm`, `qemu-system-aarch64` | None |
 | Programming | `z3`; Python module: `z3-solver` | None |
 
