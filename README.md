@@ -14,16 +14,16 @@ CTF-OS는 `incoming/{contest}/contest.md`에 선언한 승인된 CTF 대회와 �
 git clone https://github.com/whatevertakes/CTF-OS.git
 cd CTF-OS
 uv sync --frozen
-uv run ctf-os init "SCA CTF 2026" --config config.yaml
+uv run ctf-os init "SCA CTF 2026" --config sca_config.yaml
 ```
 
-`config.yaml`에서 `contest.team_id`, `member.name`, 담당 카테고리를 설정합니다. 이어서 `incoming/SCA CTF 2026/contest.md`에 승인된 대회와 챌린지 메타데이터를 추가합니다.
+`sca_config.yaml`에서 `contest.team_id`, `member.name`, 담당 카테고리를 설정합니다. 이어서 `incoming/SCA CTF 2026/contest.md`에 승인된 대회와 챌린지 메타데이터를 추가합니다.
 
 공용 sandbox 이미지를 준비하고 로컬 상태를 검증합니다.
 
 ```bash
-scripts/deploy_ctf_os.sh --config config.yaml
-uv run ctf-os doctor --config config.yaml --non-mock
+scripts/deploy_ctf_os.sh --config sca_config.yaml
+uv run ctf-os doctor --config sca_config.yaml --non-mock
 ```
 
 `ctf-os run`은 Docker 이미지를 자동으로 빌드하지 않습니다. 풀이를 시작하기 전에 배포와 진단이 모두 성공해야 합니다.
@@ -33,24 +33,24 @@ uv run ctf-os doctor --config config.yaml --non-mock
 대회 입력을 파싱한 뒤 상시 실행 또는 한 번의 실행을 선택합니다.
 
 ```bash
-uv run ctf-os parse --config config.yaml
-uv run ctf-os run --config config.yaml
-uv run ctf-os run --once --config config.yaml
+uv run ctf-os parse --config sca_config.yaml
+uv run ctf-os run --config sca_config.yaml
+uv run ctf-os run --once --config sca_config.yaml
 ```
 
 상태와 현재 노드가 담당한 챌린지의 플래그 후보는 TUI에서 확인합니다.
 
 ```bash
-uv run ctf-os tui --config config.yaml
-uv run ctf-os tui --plain --config config.yaml
+uv run ctf-os tui --config sca_config.yaml
+uv run ctf-os tui --plain --config sca_config.yaml
 ```
 
 아래 제어 명령은 현재 PC의 현재 노드에만 적용됩니다.
 
 ```bash
-uv run ctf-os pause <challenge> --config config.yaml
-uv run ctf-os resume <challenge> --config config.yaml
-uv run ctf-os retry <challenge> --config config.yaml
+uv run ctf-os pause <challenge> --config sca_config.yaml
+uv run ctf-os resume <challenge> --config sca_config.yaml
+uv run ctf-os retry <challenge> --config sca_config.yaml
 ```
 
 ## 여러 팀 분리
@@ -97,8 +97,8 @@ uv run ctf-os doctor --config config-sca-a.yaml --non-mock
 
 ```bash
 git pull --ff-only origin main
-scripts/deploy_ctf_os.sh --config config.yaml
-uv run ctf-os doctor --config config.yaml --non-mock
+scripts/deploy_ctf_os.sh --config sca_config.yaml
+uv run ctf-os doctor --config sca_config.yaml --non-mock
 ```
 
-`config.yaml`, 대회 입력, SQLite 데이터베이스, 산출물, TeamSync 로그, 자격 증명, 키, 플래그는 커밋하지 마세요. 최초 설치와 업데이트의 자세한 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
+`sca_config.yaml`, 대회 입력, SQLite 데이터베이스, 산출물, TeamSync 로그, 자격 증명, 키, 플래그는 커밋하지 마세요. 최초 설치와 업데이트의 자세한 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
