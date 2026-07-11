@@ -1,13 +1,10 @@
-# CTF-OS team deployment
+# CTF-OS 팀 배포 가이드
 
-Each member runs CTF-OS locally. Pulling `main` distributes the code, but does
-not distribute or overwrite another member's configuration, SQLite state,
-contest input, output, TeamSync ledger, Codex login, or Docker containers.
+각 팀원은 CTF-OS를 자신의 PC에서 실행합니다. `main`을 pull하면 코드만 배포됩니다. 다른 팀원의 설정, SQLite 상태, 대회 입력, 출력물, TeamSync 로그, Codex 로그인, Docker 컨테이너를 공유하거나 덮어쓰지 않습니다.
 
-## Update an existing node
+## 기존 노드 업데이트
 
-Commit or stash unrelated source edits before updating. Local runtime files are
-Git-ignored and remain on the member's machine.
+업데이트 전, 본인이 수정한 소스 파일이 있다면 커밋하거나 stash합니다. 로컬 실행 파일은 Git에서 무시되므로 각 팀원의 PC에 그대로 남습니다.
 
 ```bash
 git pull --ff-only origin main
@@ -15,48 +12,44 @@ scripts/deploy_ctf_os.sh --config config.yaml
 uv run ctf-os doctor --config config.yaml --non-mock
 ```
 
-The deployment script is idempotent. It performs `uv sync --frozen`, opens the
-configured local SQLite database to run the repository's ordered transactional
-migrations, builds `ctf-os-sandbox:latest` only when it is absent, and always
-runs the sandbox smoke test. The smoke test verifies the installed CTF tools,
-shared image ID, 16 GiB hard memory limit, zero memory reservation, 2 vCPU
-quota, and no CPU pinning. `ctf-os run` never builds the image automatically.
+배포 스크립트는 여러 번 실행해도 안전합니다. 다음 작업을 수행합니다.
 
-To intentionally replace an existing image after the Dockerfile changes:
+- `uv sync --frozen`으로 잠긴 의존성을 설치합니다.
+- 설정된 로컬 SQLite 데이터베이스를 열어 순서가 보장된 트랜잭션 마이그레이션을 실행합니다.
+- `ctf-os-sandbox:latest` 이미지가 없을 때만 빌드합니다.
+- 항상 sandbox smoke test를 실행합니다.
+
+Smoke test는 설치된 CTF 도구, 공용 이미지 ID, 16 GiB 하드 메모리 제한, 메모리 예약 0, 2 vCPU 제한, CPU 고정 미사용을 확인합니다. `ctf-os run`은 이미지를 자동으로 빌드하지 않습니다.
+
+Dockerfile 변경 뒤 기존 이미지를 의도적으로 교체하려면 다음을 사용합니다.
 
 ```bash
 scripts/deploy_ctf_os.sh --config config.yaml --rebuild-image
 ```
 
-For a machine that is temporarily unable to use Docker, install and migrate
-only with `--skip-image`. This does not make the node ready for real solver
-attempts; run the normal command later to build and verify the image.
+Docker를 일시적으로 사용할 수 없는 PC에서는 설치와 마이그레이션만 하려면 `--skip-image`를 사용합니다. 이 상태는 실제 풀이 시도를 실행할 준비가 된 것이 아닙니다. Docker를 사용할 수 있게 된 뒤 일반 배포 명령으로 이미지를 빌드하고 검증하세요.
 
 ```bash
 scripts/deploy_ctf_os.sh --config config.yaml --skip-image
 ```
 
-## First installation
+## 최초 설치
 
-Create the member-local configuration before asking the deployment script to
-migrate state. Review `config.example.yaml` and use the member's own identity
-and owned categories.
+배포 스크립트가 상태를 마이그레이션하기 전에 팀원별 로컬 설정을 만듭니다. `config.example.yaml`을 검토하고 각자의 식별자와 담당 카테고리를 입력하세요.
 
 ```bash
 uv sync --frozen
-uv run ctf-os init "CONTEST NAME" --config config.yaml
-# Review config.yaml and incoming/CONTEST NAME/contest.md.
+uv run ctf-os init "대회 이름" --config config.yaml
+# config.yaml 및 incoming/대회 이름/contest.md를 검토합니다.
 scripts/deploy_ctf_os.sh --config config.yaml
 uv run ctf-os doctor --config config.yaml --non-mock
 ```
 
-Do not commit `config.yaml`, `incoming/`, `output/`, `sync/`, SQLite files,
-logs, credentials, keys, or flags. The script does not delete, reset, copy, or
-publish any of those paths.
+`config.yaml`, `incoming/`, `output/`, `sync/`, SQLite 파일, 로그, 자격 증명, 키, 플래그는 커밋하지 마세요. 배포 스크립트는 이 경로들을 삭제·초기화·복사·외부 전송하지 않습니다.
 
-## Separate verification steps
+## 개별 검증 명령
 
-The operations can also be run independently:
+각 작업은 필요할 때 다음처럼 따로 실행할 수 있습니다.
 
 ```bash
 uv sync --frozen
@@ -65,5 +58,4 @@ docker build -f sandbox/Dockerfile.sandbox -t ctf-os-sandbox:latest .
 scripts/verify_sandbox_image.sh ctf-os-sandbox:latest
 ```
 
-The explicit `docker build` command is a one-time node setup operation, not a
-challenge or attempt lifecycle action.
+명시적인 `docker build`는 노드를 한 번 준비하는 작업입니다. 챌린지나 풀이 시도 라이프사이클에서 수행하는 명령이 아닙니다.
