@@ -262,6 +262,27 @@ class ModelRouter:
         self._require_profile(profile_name, "requested profile")
         return self._selection_from_profile(profile_name, role=role)
 
+    def select_execution_profile(
+        self, profile_name: str, *, reasoning_effort: str, role: str,
+    ) -> ModelSelection:
+        """Validate a Sol-issued branch selection against the configured allowlist.
+
+        A solve plan may choose among configured profiles, but it cannot
+        synthesize a model/effort pair that the operator did not authorize.
+        """
+        if profile_name not in self._profiles:
+            raise ModelRoutingError(
+                f"execution contract model_profile references unknown model profile: {profile_name}"
+            )
+        _validate_effort(reasoning_effort, "execution contract reasoning_effort")
+        profile = self._profiles[profile_name]
+        if reasoning_effort != profile.reasoning_effort:
+            raise ModelRoutingError(
+                "execution contract reasoning_effort must match its configured model_profile "
+                f"({profile_name}={profile.reasoning_effort})"
+            )
+        return self._selection_from_profile(profile_name, role=role)
+
     def select_fallback(self, selection: ModelSelection) -> ModelSelection:
         """Return the first configured fallback, or the original selection if absent."""
         fallbacks = self._fallback_selections(selection)

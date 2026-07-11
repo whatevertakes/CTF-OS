@@ -1,7 +1,7 @@
 """Solver backends and orchestration helpers."""
 
 from .backend import SolverBackend
-from .category_planner import CategoryPlanner, ExecutionContract, PlanParseError, SolvePlan, SolvePlanParser
+from .category_planner import BranchExecutionSpec, CategoryPlanner, ExecutionContract, PlanParseError, SolvePlan, SolvePlanParser
 from .context import ChallengeContext, ChallengeContextBuilder
 from .knowledge import KnowledgeChunk, KnowledgeIndex, PlaybookSelector
 from .loop_detector import LoopDetector, LoopSignal
@@ -21,6 +21,7 @@ __all__ = [
     "ChallengeContext",
     "ChallengeContextBuilder",
     "CategoryPlanner",
+    "BranchExecutionSpec",
     "ExecutionContract",
     "PlanParseError",
     "SolvePlan",

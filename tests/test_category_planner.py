@@ -17,12 +17,17 @@ def _payload(**changes):
         "representation": "validation",
         "mode": "direct",
         "contracts": [{
-            "id": "A", "worker": "terra_high", "exclusive_scope": "validator input path",
+            "id": "A", "session_role": "exploit", "exclusive_scope": "validator input path",
             "objective": "build and replay a validator bypass",
             "first_decisive_action": "trace the submitted value to its comparison",
             "success_condition": "a replay.py that reproduces one candidate",
             "stop_condition": "the comparison is proven non-bypassable",
             "handoff": "replay.py and the exact input or the eliminated predicate",
+            "execution": {
+                "backend": "codex", "model_profile": "terra_high",
+                "reasoning_effort": "high", "prompt_family": "implementation",
+                "timeout_sec": 1200, "tool_strategy": "exploit_build", "priority": 80,
+            },
         }],
         "replan_when": "new decisive result",
         "escalate_when": "two distinct branches fail or conceptual ambiguity remains",
@@ -59,6 +64,10 @@ def test_strict_plan_parser_builds_contract_race_and_worker_prompt() -> None:
     assert race.attempts[0].profile.name == "contract_terra_high"
     assert "You own contract A" in prompt
     assert "trace the submitted value" in prompt
+    assert "Model profile: terra_high" in prompt
+    assert "Reasoning effort: high" in prompt
+    assert "Tool strategy: exploit_build" in prompt
+    assert race.attempts[0].profile.max_runtime_sec == 1200
     assert "do not continue broad exploration" in prompt
 
 
@@ -76,7 +85,7 @@ def test_strict_plan_parser_rejects_prose_unknown_keys_and_inconsistent_modes(ou
 
 def test_strict_plan_parser_rejects_duplicate_contract_scope() -> None:
     first = _payload()["contracts"][0]
-    second = {**first, "id": "B", "worker": "luna_medium"}
+    second = {**first, "id": "B", "session_role": "recon"}
     with pytest.raises(PlanParseError, match="exclusive_scope"):
         SolvePlanParser().parse(json.dumps(_payload(mode="parallel", contracts=[first, second])))
 
@@ -87,6 +96,55 @@ def test_contract_worker_name_selects_the_exact_configured_profile() -> None:
     assert (selection.profile, selection.model, selection.reasoning_effort) == (
         "terra_high", "gpt-5.6-terra", "high",
     )
+
+
+@pytest.mark.parametrize("execution,match", [
+    ({"backend": "shell"}, "backend"),
+    ({"reasoning_effort": "medium"}, "reasoning_effort"),
+    ({"prompt_family": "general"}, "prompt_family"),
+    ({"timeout_sec": 59}, "timeout_sec"),
+    ({"tool_strategy": "use_every_tool"}, "tool_strategy"),
+    ({"priority": 101}, "priority"),
+])
+def test_branch_execution_spec_is_strict_and_bounded(execution, match) -> None:
+    contract = _payload()["contracts"][0]
+    contract = {**contract, "execution": {**contract["execution"], **execution}}
+    with pytest.raises(PlanParseError, match=match):
+        SolvePlanParser().parse(json.dumps(_payload(contracts=[contract])))
+
+
+def test_execution_priority_orders_branches_and_profile_is_explicit() -> None:
+    first = _payload()["contracts"][0]
+    second = {
+        **first, "id": "B", "session_role": "recon", "exclusive_scope": "route discovery",
+        "execution": {
+            **first["execution"], "model_profile": "luna_high", "reasoning_effort": "high",
+            "prompt_family": "recon", "timeout_sec": 300, "tool_strategy": "fast_recon",
+            "priority": 95,
+        },
+    }
+    plan = SolvePlanParser().parse(json.dumps(_payload(mode="parallel", contracts=[first, second])))
+    race = RacePlan.from_solve_plan(plan, id_factory=lambda: "id", seed_factory=lambda: "seed")
+    assert [item.contract.id for item in race.attempts] == ["B", "A"]
+    assert race.attempts[0].profile.name == "contract_luna_high"
+    assert race.attempts[0].profile.role == "recon"
+    assert race.attempts[0].profile.max_runtime_sec == 300
+
+
+def test_same_session_role_can_use_different_model_families() -> None:
+    first = _payload()["contracts"][0]
+    second = {
+        **first, "id": "B", "exclusive_scope": "independent exploit path",
+        "execution": {
+            **first["execution"], "model_profile": "sol_xhigh", "reasoning_effort": "max",
+            "prompt_family": "deep_solve", "tool_strategy": "deep_analysis",
+        },
+    }
+    plan = SolvePlanParser().parse(json.dumps(_payload(mode="parallel", contracts=[first, second])))
+    assert {item.session_role for item in plan.contracts} == {"exploit"}
+    assert {item.execution.model_profile for item in plan.contracts if item.execution} == {
+        "terra_high", "sol_xhigh",
+    }
 
 
 def test_missing_score_never_becomes_easy_and_hard_categories_start_hard() -> None:

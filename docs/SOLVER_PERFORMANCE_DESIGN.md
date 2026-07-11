@@ -20,8 +20,11 @@ ChallengeSession (Sol max, persistent)
 ```
 
 Each contract states its exclusive scope, first decisive action, success
-condition, stop condition, required deliverables, and failure handoff. The
-scheduler persists both the session and every contract task in local SQLite.
+condition, stop condition, required deliverables, and failure handoff. It also
+contains a complete `BranchExecutionSpec`: child-session role, authorized model
+profile, reasoning effort, prompt family, tool strategy, timeout, and scheduler
+priority. The scheduler persists both the session and every contract task in
+local SQLite.
 
 ## Model roles
 
@@ -32,6 +35,11 @@ scheduler persists both the session and every contract task in local SQLite.
 - **Luna** answers a narrow uncertainty quickly. It is not the primary owner of
   an unscored challenge.
 
+These are child Codex sessions, not native subagents. Sol may assign the same
+job to Luna, Terra, or Sol depending on the current evidence. For example, an
+exploit role can start as a short Terra session and later be reissued as a Sol
+max takeover without changing the problem's persistent owner.
+
 ## Solver algorithm
 
 `CategoryPlanner` output is the scheduler input. `RacePlan.from_solve_plan`
@@ -39,6 +47,13 @@ turns the plan into branch attempts; the score-only race is a compatibility
 fallback, not the normal production path. Missing scores are never treated as
 easy: pwn, rev, and crypto start at hard/Sol ownership, while other categories
 start at least medium.
+
+For a clear route Sol should issue one short direct session. For an uncertain
+or difficult challenge it may concentrate up to four disjoint high/max
+sessions on the core attack surface. `model-routing.yaml` is an operator
+allowlist and fallback boundary; it no longer silently replaces a Sol-issued
+contract with a static role route. The selected execution timeout and priority
+are used by the actual backend call and scheduler queue.
 
 Workers keep isolated `/work` directories. The controller promotes bounded
 records and approved `exploit.py`, `solver.py`, `replay.sh`, or `writeup.md`

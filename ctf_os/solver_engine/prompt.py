@@ -1,4 +1,4 @@
-"""Render explicit, bounded worker prompts from a ChallengeContext."""
+"""Render explicit, bounded child solver session prompts from a ChallengeContext."""
 
 from __future__ import annotations
 
@@ -56,21 +56,31 @@ class PromptRenderer:
         contract = ""
         if attempt.contract is not None:
             item = attempt.contract
+            execution = item.execution
+            assert execution is not None
             contract = f"""You own contract {item.id}. Solve the assigned branch; do not provide a narrative.
 
 Objective: {item.objective}
+Child solver session role: {item.session_role}
 Exclusive scope: {item.exclusive_scope}
 First decisive action: {item.first_decisive_action}
 Stop condition: {item.stop_condition}
 Success means: {item.success_condition}
 Handoff required: {item.handoff}
+Backend: {execution.backend}
+Model profile: {execution.model_profile}
+Reasoning effort: {execution.reasoning_effort}
+Prompt family: {execution.prompt_family}
+Timeout: {execution.timeout_sec} seconds
+Tool strategy: {execution.tool_strategy}
+Scheduler priority: {execution.priority}
 
 Start executing. Every action must either test this branch or construct its solver.
 If the stop condition is reached, emit the decisive negative result and exact handoff;
 do not continue broad exploration.
 
 """
-        return f"""{contract}You are a local CTF solver worker. Work on this one attempt only.
+        return f"""{contract}You are a child CTF solver session. Work on this one contract only.
 
 Challenge:
 - id: {context.challenge_id}
@@ -117,7 +127,7 @@ Controller-validated session state (trusted as handoff, but replay before a flag
 
 {_SAFETY}
 
-Solve the challenge end to end; optimize for a valid flag, not for a report. Never wait for reconnaissance or implementation from another worker. Execute the category strategy above as a closed loop: run a discriminating command, inspect its actual output, update the attack, and continue through verification. Use scripts and debuggers instead of mental simulation when possible. Keep this attempt's tool path distinct from its profile peers. Stop repeating a path when it produces no new state, primitive, decoded bytes, or constraint.
+Solve the assigned branch end to end; optimize for a valid flag, not for a report. Never wait for another child session. Execute the selected prompt family and tool strategy as a closed loop: run a discriminating command, inspect its actual output, update the attack, and continue through verification. Use scripts and debuggers instead of mental simulation when possible. Keep this attempt's tool path distinct from its profile peers. Stop repeating a path when it produces no new state, primitive, decoded bytes, or constraint.
 
 Emit only concise machine-readable milestones using these tags: {_TAGS}
 Do not emit private chain-of-thought. Record commands and decisive observations, not narration. Record a SHIFT when a branch stalls. A flag is only a candidate until independently verified.

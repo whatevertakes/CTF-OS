@@ -44,7 +44,7 @@ class StateError(ValueError):
     """Raised when a local-state database cannot be opened safely."""
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -244,6 +244,8 @@ class LocalState:
             self._migrate_v6_to_v7(conn)
         elif version == 7:
             self._migrate_v7_to_v8(conn)
+        elif version == 8:
+            self._migrate_v8_to_v9(conn)
         else:  # Defensive guard for future edits to CURRENT_SCHEMA_VERSION.
             raise StateError(f"no migration is registered from schema version {version}")
 
@@ -458,6 +460,35 @@ class LocalState:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_contract_tasks_session_status ON contract_tasks(session_id, status, created_at)")
+
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        """Persist complete branch execution specifications on durable tasks."""
+        self._add_column_if_missing(conn, "contract_tasks", "backend", "TEXT NOT NULL DEFAULT 'codex'")
+        self._add_column_if_missing(conn, "contract_tasks", "model_profile", "TEXT NOT NULL DEFAULT 'terra_high'")
+        self._add_column_if_missing(conn, "contract_tasks", "reasoning_effort", "TEXT NOT NULL DEFAULT 'high'")
+        self._add_column_if_missing(conn, "contract_tasks", "prompt_family", "TEXT NOT NULL DEFAULT 'implementation'")
+        self._add_column_if_missing(conn, "contract_tasks", "timeout_sec", "INTEGER NOT NULL DEFAULT 1200")
+        self._add_column_if_missing(conn, "contract_tasks", "tool_strategy", "TEXT NOT NULL DEFAULT 'exploit_build'")
+        self._add_column_if_missing(conn, "contract_tasks", "priority", "INTEGER NOT NULL DEFAULT 50")
+        conn.execute("""
+            UPDATE contract_tasks SET
+              model_profile=CASE WHEN role IN (
+                'terra_high','terra_xhigh','luna_medium','luna_high','sol_high','sol_xhigh'
+              ) THEN role ELSE model_profile END,
+              reasoning_effort=CASE
+                WHEN role IN ('terra_xhigh','sol_xhigh') THEN 'max'
+                WHEN role='luna_medium' THEN 'medium'
+                ELSE reasoning_effort END,
+              prompt_family=CASE
+                WHEN role LIKE 'luna_%' THEN 'recon'
+                WHEN role='sol_xhigh' THEN 'takeover'
+                WHEN role='sol_high' THEN 'deep_solve'
+                ELSE prompt_family END
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contract_tasks_priority "
+            "ON contract_tasks(session_id, status, priority DESC, created_at)"
+        )
 
     def _bind_team_identity(self, conn: sqlite3.Connection) -> None:
         """Bind node identity and normalize legacy keys without guessing ownership."""
@@ -844,22 +875,32 @@ class LocalState:
                 raise KeyError(f"unknown challenge session: {task.session_id}")
             if str(session["challenge_id"]) != task.challenge_id:
                 raise StateTransitionError("contract task challenge does not match its session")
+            existing = conn.execute(
+                "SELECT session_id, challenge_id, branch FROM contract_tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            if existing is not None and (
+                str(existing["session_id"]), str(existing["challenge_id"]), str(existing["branch"])
+            ) != (task.session_id, task.challenge_id, task.branch):
+                raise StateTransitionError("contract task identity cannot be rebound")
             conn.execute("""
                 INSERT INTO contract_tasks (
                   id, session_id, challenge_id, branch, role, objective, status,
+                  backend, model_profile, reasoning_effort, prompt_family, timeout_sec,
+                  tool_strategy, priority,
                   success_criteria_json, deliverables_json, failure_handoff,
                   depends_on_json, assigned_attempt_id, result_summary,
                   evidence_ids_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   branch=excluded.branch, role=excluded.role, objective=excluded.objective,
-                  status=excluded.status, success_criteria_json=excluded.success_criteria_json,
+                  backend=excluded.backend, model_profile=excluded.model_profile,
+                  reasoning_effort=excluded.reasoning_effort,
+                  prompt_family=excluded.prompt_family, timeout_sec=excluded.timeout_sec,
+                  tool_strategy=excluded.tool_strategy, priority=excluded.priority,
+                  success_criteria_json=excluded.success_criteria_json,
                   deliverables_json=excluded.deliverables_json,
                   failure_handoff=excluded.failure_handoff,
                   depends_on_json=excluded.depends_on_json,
-                  assigned_attempt_id=excluded.assigned_attempt_id,
-                  result_summary=excluded.result_summary,
-                  evidence_ids_json=excluded.evidence_ids_json,
                   updated_at=excluded.updated_at
             """, _contract_task_values(task))
         return self.get_contract_task(task.id)  # type: ignore[return-value]
@@ -882,12 +923,23 @@ class LocalState:
         if current is None:
             raise KeyError(f"unknown contract task: {task_id}")
         desired = status if isinstance(status, ContractTaskStatus) else ContractTaskStatus(str(status).upper())
-        return self.upsert_contract_task(replace(
-            current, status=desired, result_summary=result_summary,
-            evidence_ids=tuple(evidence_ids),
-            assigned_attempt_id=assigned_attempt_id or current.assigned_attempt_id,
-            updated_at=ensure_utc(self._clock()),
-        ))
+        allowed = {
+            ContractTaskStatus.PENDING: {ContractTaskStatus.RUNNING, ContractTaskStatus.SUCCEEDED, ContractTaskStatus.CANCELLED, ContractTaskStatus.FAILED},
+            ContractTaskStatus.RUNNING: {ContractTaskStatus.SUCCEEDED, ContractTaskStatus.FAILED, ContractTaskStatus.CANCELLED},
+            ContractTaskStatus.SUCCEEDED: set(), ContractTaskStatus.FAILED: set(),
+            ContractTaskStatus.CANCELLED: set(),
+        }
+        if desired is not current.status and desired not in allowed[current.status]:
+            raise StateTransitionError(f"invalid contract task transition: {current.status} -> {desired}")
+        durable_evidence = tuple(evidence_ids) or current.evidence_ids
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE contract_tasks SET status=?, result_summary=COALESCE(?, result_summary), "
+                "evidence_ids_json=?, assigned_attempt_id=COALESCE(?, assigned_attempt_id), updated_at=? WHERE id=?",
+                (desired.value, result_summary, _json_value(durable_evidence), assigned_attempt_id,
+                 self._now(), task_id),
+            )
+        return self.get_contract_task(task_id)  # type: ignore[return-value]
 
     def list_contract_tasks(
         self, session_id: str, *, status: ContractTaskStatus | str | None = None,
@@ -1186,6 +1238,11 @@ class LocalState:
                 ChallengeStatus.RUNNING.value, ChallengeStatus.FLAG_CANDIDATE.value, ChallengeStatus.VERIFYING.value,
             }:
                 conn.execute("UPDATE challenges SET status=?, updated_at=? WHERE id=?", (ChallengeStatus.QUEUED.value, now_text, challenge_id))
+                conn.execute(
+                    "UPDATE contract_tasks SET status='CANCELLED', result_summary=COALESCE(result_summary, ?), updated_at=? "
+                    "WHERE challenge_id=? AND status='PENDING'",
+                    ("local coordinator recovery requeued challenge", now_text, challenge_id),
+                )
                 requeued.append(challenge_id)
         return stale_ids, requeued
 
@@ -1687,7 +1744,9 @@ def _contract_task_values(task: ContractTask) -> tuple[Any, ...]:
     status = task.status.value if isinstance(task.status, ContractTaskStatus) else str(task.status).upper()
     return (
         task.id, task.session_id, task.challenge_id, task.branch, task.role, task.objective,
-        status, _json_value(task.success_criteria), _json_value(task.deliverables),
+        status, task.backend, task.model_profile, task.reasoning_effort, task.prompt_family,
+        task.timeout_sec, task.tool_strategy, task.priority,
+        _json_value(task.success_criteria), _json_value(task.deliverables),
         task.failure_handoff, _json_value(task.depends_on), task.assigned_attempt_id,
         task.result_summary, _json_value(task.evidence_ids), timestamp_text(task.created_at),
         timestamp_text(task.updated_at),
@@ -1698,6 +1757,10 @@ def _contract_task_from_row(row: sqlite3.Row) -> ContractTask:
     return ContractTask(
         id=row["id"], session_id=row["session_id"], challenge_id=row["challenge_id"],
         branch=row["branch"], role=row["role"], objective=row["objective"], status=row["status"],
+        backend=row["backend"], model_profile=row["model_profile"],
+        reasoning_effort=row["reasoning_effort"], prompt_family=row["prompt_family"],
+        timeout_sec=row["timeout_sec"], tool_strategy=row["tool_strategy"],
+        priority=row["priority"],
         success_criteria=tuple(json.loads(row["success_criteria_json"])),
         deliverables=tuple(json.loads(row["deliverables_json"])),
         failure_handoff=row["failure_handoff"],

@@ -158,23 +158,23 @@ class RacePlan:
     ) -> "RacePlan":
         make_id = id_factory or (lambda: uuid4().hex)
         make_seed = seed_factory or (lambda: token_hex(8))
-        profiles = {
-            "terra_high": AttemptProfile("contract_terra_high", "implementer", "execute a concrete solve contract", 1200),
-            "luna_medium": AttemptProfile("contract_luna_medium", "recon", "answer a narrow branch question", 600),
-            "sol_high": AttemptProfile("contract_sol_high", "source", "resolve a hard conceptual fork", 1500),
-            "terra_xhigh": AttemptProfile("contract_terra_xhigh", "implementer", "execute a deep implementation contract", 1800),
-            "luna_high": AttemptProfile("contract_luna_high", "recon", "answer a deep branch question", 900),
-            "sol_xhigh": AttemptProfile("contract_sol_xhigh", "takeover", "take over a stalled or core solve branch", 1800),
-        }
+        ordered_contracts = sorted(
+            plan.contracts, key=lambda item: -(item.execution.priority if item.execution else 0),
+        )
         return cls(
             difficulty="contract",
             attempts=tuple(
                 RaceAttempt(
-                    make_id(), make_seed(), profiles[item.worker],
+                    make_id(), make_seed(), AttemptProfile(
+                        f"contract_{item.execution.model_profile}",  # type: ignore[union-attr]
+                        item.session_role,
+                        f"{item.execution.prompt_family} via {item.execution.tool_strategy}",  # type: ignore[union-attr]
+                        item.execution.timeout_sec,  # type: ignore[union-attr]
+                    ),
                     category=canonical_solver_category(category), contract=item, session_id=session_id,
                     branch_kind="contract",
                 )
-                for item in plan.contracts
+                for item in ordered_contracts
             ),
         )
 

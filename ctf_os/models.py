@@ -220,8 +220,15 @@ class ContractTask:
     branch: str
     role: str
     objective: str
-    id: str = field(default_factory=lambda: f"task_{uuid4().hex}")
+    id: str = ""
     status: ContractTaskStatus | str = ContractTaskStatus.PENDING
+    backend: str = "codex"
+    model_profile: str | None = "terra_high"
+    reasoning_effort: str | None = "high"
+    prompt_family: str = "implementation"
+    timeout_sec: int | None = 1200
+    tool_strategy: str = "exploit_build"
+    priority: int = 50
     success_criteria: tuple[str, ...] = ()
     deliverables: tuple[str, ...] = ()
     failure_handoff: str | None = None
@@ -235,6 +242,26 @@ class ContractTask:
     def __post_init__(self) -> None:
         if not all((self.session_id.strip(), self.challenge_id.strip(), self.branch.strip(), self.role.strip(), self.objective.strip())):
             raise ValueError("contract task session, challenge, branch, role, and objective are required")
+        if self.backend != "codex":
+            raise ValueError("contract task backend must be codex")
+        if not isinstance(self.timeout_sec, int) or isinstance(self.timeout_sec, bool) or not 60 <= self.timeout_sec <= 3600:
+            raise ValueError("contract task timeout_sec must be between 60 and 3600")
+        if not isinstance(self.priority, int) or isinstance(self.priority, bool) or not 1 <= self.priority <= 100:
+            raise ValueError("contract task priority must be between 1 and 100")
+        if not self.model_profile or not self.reasoning_effort or not self.prompt_family.strip():
+            raise ValueError("contract task model_profile, reasoning_effort, and prompt_family are required")
+        strategy = self.tool_strategy
+        if not isinstance(strategy, str):
+            # Transitional callers may still wrap the one bounded planner
+            # strategy in a tuple. Durable state has one canonical string.
+            if isinstance(strategy, (tuple, list)) and len(strategy) == 1:
+                strategy = str(strategy[0])
+            else:
+                raise ValueError("contract task tool_strategy must be one string")
+        object.__setattr__(self, "tool_strategy", strategy)
+        if not strategy.strip():
+            raise ValueError("contract task tool_strategy is required")
+        object.__setattr__(self, "id", self.id or stable_id(self.session_id, self.branch, prefix="task_"))
         object.__setattr__(self, "status", ContractTaskStatus(str(self.status).upper()))
         for name in ("success_criteria", "deliverables", "depends_on", "evidence_ids"):
             object.__setattr__(self, name, tuple(str(item) for item in getattr(self, name)))

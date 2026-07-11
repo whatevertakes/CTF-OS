@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from ctf_os.local_state import CURRENT_SCHEMA_VERSION, LocalState, StateError, StateTransitionError
-from ctf_os.models import Attempt, Challenge, Event, FlagCandidate
+from ctf_os.models import Attempt, Challenge, ChallengeSession, ContractTask, Event, FlagCandidate
 
 
 LEGACY_V1_SCHEMA = """
@@ -260,8 +260,8 @@ def test_v3_to_v4_adds_nullable_codex_session_columns_without_losing_attempt_dat
 
     state = LocalState(path)
 
-    assert CURRENT_SCHEMA_VERSION == 8
-    assert _schema_version(path) == 8
+    assert CURRENT_SCHEMA_VERSION == 9
+    assert _schema_version(path) == 9
     assert {"session_id", "resume_id"} <= _table_columns(path, "attempts")
     attempt = state.get_attempt("attempt-legacy")
     assert attempt is not None
@@ -469,3 +469,51 @@ def test_fenced_cooldown_refuses_a_stale_lease_without_event_or_state_write(tmp_
         )
     assert not state.model_in_cooldown("gpt-5.6-terra", selection_key="selection:terra:gpt-5.6-terra:high")
     assert not state.list_events(challenge_id=challenge.id)
+
+
+def test_v8_to_v9_preserves_tasks_and_backfills_execution_spec(tmp_path):
+    path = tmp_path / "legacy-v8.db"
+    state = LocalState(path)
+    challenge = state.upsert_challenge(Challenge(contest="Demo", category="pwn", name="legacy-task"))
+    session = state.upsert_challenge_session(ChallengeSession(
+        challenge_id=challenge.id, leader_model="gpt-5.6-sol"
+    ))
+    task = state.upsert_contract_task(ContractTask(
+        id="legacy-contract", session_id=session.id, challenge_id=challenge.id,
+        branch="g1:A", role="sol_xhigh", objective="take over exploit",
+    ))
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("ALTER TABLE contract_tasks RENAME TO contract_tasks_v9")
+        conn.execute("""
+            CREATE TABLE contract_tasks (
+              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, challenge_id TEXT NOT NULL,
+              branch TEXT NOT NULL, role TEXT NOT NULL, objective TEXT NOT NULL,
+              status TEXT NOT NULL, success_criteria_json TEXT NOT NULL,
+              deliverables_json TEXT NOT NULL, failure_handoff TEXT,
+              depends_on_json TEXT NOT NULL, assigned_attempt_id TEXT,
+              result_summary TEXT, evidence_ids_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT INTO contract_tasks (
+              id,session_id,challenge_id,branch,role,objective,status,
+              success_criteria_json,deliverables_json,failure_handoff,depends_on_json,
+              assigned_attempt_id,result_summary,evidence_ids_json,created_at,updated_at
+            ) SELECT id,session_id,challenge_id,branch,role,objective,status,
+              success_criteria_json,deliverables_json,failure_handoff,depends_on_json,
+              assigned_attempt_id,result_summary,evidence_ids_json,created_at,updated_at
+              FROM contract_tasks_v9
+        """)
+        conn.execute("DROP TABLE contract_tasks_v9")
+        conn.execute("PRAGMA user_version=8")
+
+    migrated = LocalState(path).get_contract_task(task.id)
+    assert migrated is not None
+    assert migrated.model_profile == "sol_xhigh"
+    assert migrated.reasoning_effort == "max"
+    assert migrated.prompt_family == "takeover"
+    assert (migrated.backend, migrated.timeout_sec, migrated.tool_strategy, migrated.priority) == (
+        "codex", 1200, "exploit_build", 50
+    )

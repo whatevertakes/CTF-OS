@@ -41,7 +41,7 @@ def _config(tmp_path: Path, *, routing: bool = False, sandbox: bool = False) -> 
         route.write_text(
             "model_profiles:\n  selected:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n"
             "  leader:\n    model: gpt-5.6-sol\n    reasoning_effort: max\n"
-            "  luna_medium:\n    model: gpt-5.6-luna\n    reasoning_effort: high\n"
+            "  luna_medium:\n    model: gpt-5.6-luna\n    reasoning_effort: medium\n"
             "  terra_high:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n"
             "default_roles:\n  session_leader: leader\n  supervisor: leader\n  recon: selected\n  exploit: selected\n  source: selected\n  fallback: selected\n"
             "model_policy:\n  easy:\n    recon_fast: selected\n    exploit_fast: selected\n",

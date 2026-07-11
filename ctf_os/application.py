@@ -328,7 +328,7 @@ class LocalApplication:
                     task = plans.popleft()
                     challenge = task.state.get_challenge(task.intake.challenge.id)
                     if challenge is None or challenge.status not in {
-                        ChallengeStatus.QUEUED, ChallengeStatus.RUNNING,
+                        ChallengeStatus.QUEUED, ChallengeStatus.RUNNING, ChallengeStatus.FLAG_CANDIDATE,
                     }:
                         made_progress = True
                         continue
@@ -682,7 +682,9 @@ class LocalApplication:
 
     def _start_attempt(self, pool: LocalWorkerPool, task: PlannedAttempt, *, mock_worker: bool) -> WorkerHandle | None:
         challenge = task.state.get_challenge(task.intake.challenge.id)
-        if challenge is None or challenge.status not in {ChallengeStatus.QUEUED, ChallengeStatus.RUNNING}:
+        if challenge is None or challenge.status not in {
+            ChallengeStatus.QUEUED, ChallengeStatus.RUNNING, ChallengeStatus.FLAG_CANDIDATE,
+        }:
             return None
         selection: ModelSelection | None = None
         router: ModelRouter | None = None
@@ -690,6 +692,9 @@ class LocalApplication:
             model = "mock-synthetic"
         else:
             router = self.config.model_router()
+            contract = task.race_attempt.contract
+            if contract is not None and contract.execution.backend != "codex":
+                raise PrerequisiteError("execution contract backend must be the configured codex backend")
             selection = self._select_model(task.state, challenge, task.race_attempt, router=router)
             if selection is None:
                 quota_blocked = self._quota_warning_blocks_new_workers(task.state, router)
@@ -732,7 +737,9 @@ class LocalApplication:
             # challenge left a launchable local state.
             latest = task.state.get_challenge(challenge.id)
             if (
-                latest is None or latest.status not in {ChallengeStatus.QUEUED, ChallengeStatus.RUNNING}
+                latest is None or latest.status not in {
+                    ChallengeStatus.QUEUED, ChallengeStatus.RUNNING, ChallengeStatus.FLAG_CANDIDATE,
+                }
                 or self._operator_pause_active(task.state, challenge.id)
             ):
                 task.state.finish_attempt(
@@ -868,13 +875,17 @@ class LocalApplication:
             if leader.model != "gpt-5.6-sol":
                 raise ModelRoutingError("persistent session leader must route to gpt-5.6-sol")
             return leader
-        if self._promotion_applies(state, challenge, router=router):
-            return router.select_promotion(role="supervisor")
         if race_attempt.contract is not None:
-            return router.select_profile(
-                race_attempt.contract.worker,
+            execution = race_attempt.contract.execution
+            return router.select_execution_profile(
+                execution.model_profile, reasoning_effort=execution.reasoning_effort,
                 role=race_attempt.profile.role,
             )
+        # Legacy one-shot attempts may still use configured automatic
+        # promotion. A Sol-issued child-session contract is authoritative and
+        # must never be silently replaced by this compatibility policy.
+        if self._promotion_applies(state, challenge, router=router):
+            return router.select_promotion(role="supervisor")
         return router.select(
             role=race_attempt.profile.role,
             difficulty=RacePlan.difficulty_for(challenge.score, category=challenge.category),
@@ -1036,7 +1047,7 @@ class LocalApplication:
             result: CodexExecResult = backend.run(
                 replace(request, selection=candidate, resume_id=resume_id or request.resume_id,
                         persistent_session=request.persistent_session and not (resume_id or request.resume_id)),
-                timeout_sec=self.config.attempt_timeout_sec(attempt.profile, task.race_attempt.profile.max_runtime_sec),
+                timeout_sec=self._attempt_timeout(task),
                 on_output=lambda record: self._stream_line(task, challenge, active_attempt, record.line, synthetic=False),
                 # _stream_line captures bounded parent-observed records in the
                 # private staging root.  Supplying an aggregate evidence sink here
@@ -1117,6 +1128,17 @@ class LocalApplication:
             output, (final_result.stdout if final_result is not None else ""), status, False, token_usage=total_tokens,
             session_id=session_id, resume_id=resume_id,
             records=self._records_snapshot(attempt.id),
+        )
+
+    def _attempt_timeout(self, task: PlannedAttempt) -> int:
+        contract = task.race_attempt.contract
+        requested = contract.execution.timeout_sec if contract is not None else None
+        if requested is not None:
+            if isinstance(requested, bool) or not isinstance(requested, int) or not 60 <= requested <= 3600:
+                raise PrerequisiteError("execution contract timeout_sec must be between 60 and 3600")
+            return requested
+        return self.config.attempt_timeout_sec(
+            task.race_attempt.profile.name, task.race_attempt.profile.max_runtime_sec,
         )
 
     @staticmethod
@@ -1998,6 +2020,10 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
         )
         attempts = contract_race.attempts
         ordered = StrategyReranker().rerank(attempts, findings=findings, failures=failures)
+        ordered = tuple(sorted(
+            ordered, key=lambda item: item.contract.execution.priority if item.contract is not None else 0,
+            reverse=True,
+        ))
         tasks: list[PlannedAttempt] = []
         for race_attempt in ordered:
             contract = race_attempt.contract
@@ -2006,8 +2032,16 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
             durable = state.upsert_contract_task(ContractTask(
                 id=stable_id(session.id, f"g{session.generation + 1}:{contract.id}", prefix="task_"),
                 session_id=session.id, challenge_id=challenge.id,
-                branch=f"g{session.generation + 1}:{contract.id}", role=contract.worker,
+                branch=f"g{session.generation + 1}:{contract.id}",
+                role=self._contract_session_role(contract),
                 objective=contract.objective,
+                backend=contract.execution.backend,
+                model_profile=contract.execution.model_profile,
+                reasoning_effort=contract.execution.reasoning_effort,
+                prompt_family=contract.execution.prompt_family,
+                timeout_sec=contract.execution.timeout_sec,
+                tool_strategy=contract.execution.tool_strategy,
+                priority=contract.execution.priority,
                 success_criteria=(contract.success_condition,),
                 deliverables=(contract.handoff,), failure_handoff=contract.stop_condition,
             ))
@@ -2045,6 +2079,10 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
             race.attempts,
             findings=findings, failures=failures,
         )
+        attempts = tuple(sorted(
+            attempts, key=lambda item: item.contract.execution.priority if item.contract is not None else 0,
+            reverse=True,
+        ))
         materialized: list[PlannedAttempt] = []
         for race_attempt in attempts:
             contract = race_attempt.contract
@@ -2052,8 +2090,16 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
             durable = leader_task.state.upsert_contract_task(ContractTask(
                 id=stable_id(session.id, f"g{session.generation + 1}:{contract.id}", prefix="task_"),
                 session_id=session.id, challenge_id=challenge.id,
-                branch=f"g{session.generation + 1}:{contract.id}", role=contract.worker,
+                branch=f"g{session.generation + 1}:{contract.id}",
+                role=self._contract_session_role(contract),
                 objective=contract.objective, success_criteria=(contract.success_condition,),
+                backend=contract.execution.backend,
+                model_profile=contract.execution.model_profile,
+                reasoning_effort=contract.execution.reasoning_effort,
+                prompt_family=contract.execution.prompt_family,
+                timeout_sec=contract.execution.timeout_sec,
+                tool_strategy=contract.execution.tool_strategy,
+                priority=contract.execution.priority,
                 deliverables=(contract.handoff,), failure_handoff=contract.stop_condition,
             ))
             materialized.append(replace(
@@ -2061,6 +2107,16 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
                 contract_task_id=durable.id, is_session_leader=False,
             ))
         return tuple(materialized)
+
+    @staticmethod
+    def _contract_session_role(contract: ExecutionContract) -> str:
+        role = getattr(contract, "session_role", None)
+        if isinstance(role, str) and role:
+            return role
+        legacy = getattr(contract, "worker", None)
+        if isinstance(legacy, str) and legacy:
+            return legacy
+        raise PrerequisiteError("execution contract has no session role")
 
     @staticmethod
     def _bootstrap_solve_plan(challenge: Challenge) -> SolvePlan:
