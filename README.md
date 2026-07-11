@@ -283,4 +283,87 @@ python3 tools/validate_data_submission.py --base origin/main
 
 ## CTF-OS local node
 
-이 저장소에는 local-first CTF-OS 노드가 함께 배포됩니다. 팀원별 설치, 기존 SQLite migration, 공유 sandbox 이미지의 1회 build 및 smoke 검증 절차는 [CTF-OS team deployment](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 따르세요. CTF-OS는 원격 팀원의 프로세스를 제어하지 않으며 TeamSync append-only JSONL만 공유합니다.
+이 저장소에는 local-first CTF-OS 노드가 함께 배포됩니다. 각 팀원은 자기 PC에서만 solver/container를 실행하고, TeamSync append-only JSONL로 상태·finding·flag만 공유합니다. 다른 팀원의 Codex나 컨테이너를 원격 제어하지 않습니다.
+
+### 처음 한 번 설정
+
+자기 팀 브랜치에서 최신 `main`을 반영한 뒤, 팀원별 설정을 만듭니다.
+
+```bash
+git fetch origin
+git switch <github-user>
+git merge origin/main
+
+uv sync --frozen
+uv run ctf-os init "SCA CTF 2026" --config config.yaml
+```
+
+`config.yaml`에서 `contest.team_id`, `member.name`, `member.owned_categories`를 실제 팀과 담당 분야로 바꾼 뒤, 대회 문제 목록을 `incoming/SCA CTF 2026/contest.md`에 작성합니다. `config.yaml`, SQLite DB, `incoming/`, `output/`, `sync/`는 팀원 로컬 데이터이므로 commit하지 않습니다.
+
+공유 sandbox 이미지와 로컬 DB를 준비합니다.
+
+```bash
+scripts/deploy_ctf_os.sh --config config.yaml
+uv run ctf-os doctor --config config.yaml --non-mock
+```
+
+이 명령은 locked Python 환경을 설치하고 DB migration을 실행합니다. `ctf-os-sandbox:latest`가 없을 때만 한 번 build하고 smoke test를 수행합니다. `ctf-os run`은 이미지를 자동 build하지 않습니다.
+
+### SCA에서 두 팀을 운영할 때
+
+서로 다른 팀은 절대 SQLite state나 TeamSync namespace를 공유하지 않습니다. 같은 PC에서 두 팀을 운영한다면 설정도 분리합니다.
+
+```yaml
+# config-sca-a.yaml
+contest:
+  name: "SCA CTF 2026"
+  team_id: "sca-team-a"
+paths:
+  incoming: "incoming"
+  output: "output/sca-team-a"
+sync:
+  root: "sync/sca-team-a"
+  team_namespace: "sca-team-a"
+```
+
+팀 B는 `team_id`, `output`, `sync.root`, `sync.team_namespace`를 모두 `sca-team-b`로 바꿉니다. 이미 팀 A에 바인딩된 DB를 팀 B 설정으로 열지 마세요. 새 output 경로를 사용해야 기존 기록이 보존됩니다.
+
+팀별 초기화와 점검은 config를 항상 명시합니다.
+
+```bash
+uv run ctf-os state migrate --config config-sca-a.yaml
+uv run ctf-os parse --config config-sca-a.yaml
+uv run ctf-os doctor --config config-sca-a.yaml --non-mock
+```
+
+### 일상 실행
+
+문제 목록을 읽어 담당 challenge를 queue에 넣고, 로컬 attempt race를 실행합니다.
+
+```bash
+uv run ctf-os parse --config config.yaml
+uv run ctf-os run --config config.yaml
+```
+
+한 cycle만 실행하려면 `--once`를 사용합니다.
+
+```bash
+uv run ctf-os run --once --config config.yaml
+```
+
+상태와 challenge별 flag를 봅니다.
+
+```bash
+uv run ctf-os tui --config config.yaml
+uv run ctf-os tui --plain --config config.yaml
+```
+
+문제를 제어해야 할 때는 해당 node에서만 다음 명령을 사용합니다.
+
+```bash
+uv run ctf-os pause <challenge> --config config.yaml
+uv run ctf-os resume <challenge> --config config.yaml
+uv run ctf-os retry <challenge> --config config.yaml
+```
+
+상세한 배포·Docker 재빌드·migration 절차는 [CTF-OS team deployment](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참조하세요.
