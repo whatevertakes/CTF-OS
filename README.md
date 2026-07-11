@@ -280,3 +280,7 @@ python3 tools/validate_data_submission.py --base origin/main
 
 전체 데이터 전용 제출 흐름은
 [docs/TEAM_DATA_WORKFLOW.md](docs/TEAM_DATA_WORKFLOW.md)를 참조하세요.
+
+## CTF-OS local node
+
+이 저장소에는 local-first CTF-OS 노드가 함께 배포됩니다. 팀원별 설치, 기존 SQLite migration, 공유 sandbox 이미지의 1회 build 및 smoke 검증 절차는 [CTF-OS team deployment](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 따르세요. CTF-OS는 원격 팀원의 프로세스를 제어하지 않으며 TeamSync append-only JSONL만 공유합니다.

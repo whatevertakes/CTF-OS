@@ -1,0 +1,101 @@
+mode: local_node
+solver_mode: cli_attempt_race
+
+paths:
+  incoming: "incoming"
+  output: "output"
+
+contest:
+  name: "SCA CTF 2026"
+  team_id: "sca-jiwoong-team"
+  flag_patterns:
+    - "SCA\\{[^}]+\\}"
+    - "FLAG\\{[^}]+\\}"
+    - "[A-Z0-9_]+\\{[A-Za-z0-9_!@#$%^&*\\-+=.,?]+\\}"
+
+member:
+  name: "jiwoong"
+  display_name: "jiwoong"
+  owned_categories:
+    - pwn
+    - web
+    - misc
+
+solvers:
+  codex:
+    enabled: true
+    backend: codex_cli
+    command: "codex"
+    max_workers: 2
+
+scheduler:
+  max_concurrent_challenges: 2
+  max_active_containers: 2
+  policy: local_safe
+  fairness: challenge_round_robin
+
+worker_policy:
+  max_workers_total: 2
+  max_workers_per_challenge: 2
+  kill_others_on_verified_flag: true
+
+codex_models:
+  supervisor: "gpt-5.6-sol"
+  strong: "gpt-5.6-sol"
+  default: "gpt-5.6-terra"
+  fast: "gpt-5.6-luna"
+  fallback: "gpt-5.5"
+
+model_routing:
+  enabled: true
+  config_path: "config/model-routing.yaml"
+
+supervision:
+  enabled: true
+  supervisor_model: supervisor
+  # Local-only no-progress supervisor timing. These never dispatch work to a
+  # teammate or central service.
+  hint_after_sec: 600
+  loop_check_sec: 120
+  hint_timeout_sec: 90
+  review_interval_sec: 120
+  max_plan_revisions: 5
+  stop_repeated_failures: true
+
+race_policy:
+  diversity: strategy
+  same_backend_parallel_attempts: true
+  api_model_race: false
+  remote_worker_race: false
+  kill_local_attempts_on_solved: true
+
+sandbox:
+  enabled: true
+  image: "ctf-os-sandbox:latest"
+  container_per_attempt: true
+  precreate_on_queue: false
+  max_containers: 2
+  cleanup: true
+  preserve_failed_attempts: false
+  # Every parent-owned Docker CLI invocation has a hard wall-clock bound.
+  command_timeout_sec: 30
+  # Egress is deny-by-default. Until Host/SNI mediation exists, contest.md may
+  # declare only one `nc HOST PORT`; CTF-OS resolves it before each container.
+  egress_policy: manifest_exact_endpoints
+  default_limits:
+    memory: "16g"
+    cpus: 2.0
+
+sync:
+  enabled: true
+  type: file
+  root: "sync"
+  team_namespace: "sca-jiwoong-team"
+
+flag_verification:
+  auto_confirm_flags: false
+  require_verifier_before_solved: true
+  ignore_placeholders: true
+
+watcher:
+  poll_interval_sec: 2

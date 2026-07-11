@@ -117,3 +117,17 @@ challenges/**/work/**/*.bin
 
 # Local machine snapshots.
 system-info-*.txt
+
+# CTF-OS local runtime and release outputs.
+incoming/*
+output/*
+sync/*
+!incoming/.gitkeep
+!output/.gitkeep
+!sync/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+build/
+dist/
+*.egg-info/
