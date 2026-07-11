@@ -8,6 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from ..categories import canonical_solver_category
+from .category_planner import ExecutionContract, SolvePlan
 
 
 @dataclass(frozen=True)
@@ -107,9 +108,12 @@ class RaceAttempt:
     strategy_seed: str
     profile: AttemptProfile
     category: str = "misc"
+    contract: ExecutionContract | None = None
 
     @property
     def strategy_instruction(self) -> str:
+        if self.contract is not None:
+            return self.contract.objective
         phase = {"recon_fast": "recon", "recon_deep": "recon", "source_deep": "source",
                  "exploit_fast": "main", "exploit_main": "main", "exploit_alt": "alt",
                  "fallback": "fallback", "verifier": "main"}.get(self.profile.name, "main")
@@ -124,6 +128,29 @@ class RaceAttempt:
 class RacePlan:
     difficulty: str
     attempts: tuple[RaceAttempt, ...]
+
+    @classmethod
+    def from_solve_plan(
+        cls, plan: SolvePlan, *, id_factory: Callable[[], str] | None = None,
+        seed_factory: Callable[[], str] | None = None,
+    ) -> "RacePlan":
+        make_id = id_factory or (lambda: uuid4().hex)
+        make_seed = seed_factory or (lambda: token_hex(8))
+        profiles = {
+            "terra_high": AttemptProfile("contract_terra_high", "implementer", "execute a concrete solve contract", 1200),
+            "luna_medium": AttemptProfile("contract_luna_medium", "recon", "answer a narrow branch question", 600),
+            "sol_high": AttemptProfile("contract_sol_high", "source", "resolve a hard conceptual fork", 1500),
+        }
+        return cls(
+            difficulty="contract",
+            attempts=tuple(
+                RaceAttempt(
+                    make_id(), make_seed(), profiles[item.worker],
+                    category="misc", contract=item,
+                )
+                for item in plan.contracts
+            ),
+        )
 
     @classmethod
     def for_score(
@@ -144,7 +171,7 @@ class RacePlan:
         return cls(
             difficulty=difficulty,
             attempts=tuple(
-                RaceAttempt(make_id(), make_seed(), ATTEMPT_PROFILES[name], normalized)
+                RaceAttempt(make_id(), make_seed(), ATTEMPT_PROFILES[name], category=normalized)
                 for name in _PROFILE_NAMES[difficulty]
             ),
         )

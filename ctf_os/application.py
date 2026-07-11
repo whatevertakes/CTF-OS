@@ -843,6 +843,11 @@ class LocalApplication:
     ) -> ModelSelection:
         if self._promotion_applies(state, challenge, router=router):
             return router.select_promotion(role="supervisor")
+        if race_attempt.contract is not None:
+            return router.select_profile(
+                race_attempt.contract.worker,
+                role=race_attempt.profile.role,
+            )
         return router.select(
             role=race_attempt.profile.role,
             difficulty=RacePlan.for_score(challenge.score or 0).difficulty,
