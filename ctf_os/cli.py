@@ -486,6 +486,7 @@ def _init_workspace(
     member_name: str | None = None,
 ) -> AppConfig:
     config_path = config_path.expanduser().resolve(strict=False)
+    created_config = False
     if config_path.exists():
         config = AppConfig.from_file(config_path)
         if config.contest_name != contest:
@@ -504,6 +505,7 @@ def _init_workspace(
                 "use a separate config file for each local node"
             )
     else:
+        created_config = True
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(
             yaml.safe_dump(
@@ -517,7 +519,8 @@ def _init_workspace(
     contest_root = config.incoming_contest_dir()
     manifest = contest_root / "contest.md"
     if manifest.exists() and not force:
-        raise FileExistsError(f"refusing to overwrite existing manifest without --force: {manifest}")
+        if not created_config:
+            raise FileExistsError(f"refusing to overwrite existing manifest without --force: {manifest}")
     contest_root.mkdir(parents=True, exist_ok=True)
     config.output_contest_dir().mkdir(parents=True, exist_ok=True)
     (config.sync_root / config.team_id).mkdir(parents=True, exist_ok=True)
@@ -528,11 +531,12 @@ def _init_workspace(
             resources.files("ctf_os.resources").joinpath("model-routing.yaml").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-    manifest.write_text(
-        f"# 대회명: {contest}\n\n## 대회 정보\n- 팀: {config.team_id}\n\n## 문제 목록\n\n"
-        "<!-- Add one ### category/challenge section before parsing. -->\n",
-        encoding="utf-8",
-    )
+    if not manifest.exists() or force:
+        manifest.write_text(
+            f"# 대회명: {contest}\n\n## 대회 정보\n- 팀: {config.team_id}\n\n## 문제 목록\n\n"
+            "<!-- Add one ### category/challenge section before parsing. -->\n",
+            encoding="utf-8",
+        )
     return config
 
 

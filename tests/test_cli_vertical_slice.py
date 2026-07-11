@@ -74,6 +74,26 @@ def test_init_creates_team_and_member_isolated_local_paths(tmp_path: Path) -> No
     ]) == 2
 
 
+def test_init_for_a_new_member_reuses_an_existing_contest_manifest(tmp_path: Path) -> None:
+    first_config = tmp_path / "jiwoong.yaml"
+    second_config = tmp_path / "jueon.yaml"
+    assert main([
+        "init", "SCA CTF 2026", "--config", str(first_config),
+        "--team-id", "sca-jiwoong-team", "--member", "jiwoong",
+    ]) == 0
+    manifest = tmp_path / "incoming" / "SCA CTF 2026" / "contest.md"
+    manifest.write_text("# SCA CTF 2026\n\n### web/login\n", encoding="utf-8")
+
+    assert main([
+        "init", "SCA CTF 2026", "--config", str(second_config),
+        "--team-id", "sca-jiwoong-team", "--member", "jueon",
+    ]) == 0
+
+    assert manifest.read_text(encoding="utf-8") == "# SCA CTF 2026\n\n### web/login\n"
+    second = AppConfig.from_file(second_config)
+    assert second.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jueon" / "SCA CTF 2026"
+
+
 def test_state_migrate_is_idempotent_and_uses_configured_local_database(tmp_path: Path, capsys) -> None:
     config = _write_config(tmp_path)
     assert main(["state", "migrate", "--config", str(config.path)]) == 0
