@@ -522,6 +522,8 @@ def _init_workspace(
         if not created_config:
             raise FileExistsError(f"refusing to overwrite existing manifest without --force: {manifest}")
     contest_root.mkdir(parents=True, exist_ok=True)
+    for category in ("pwn", "rev", "web", "crypto", "misc", "forensic"):
+        (contest_root / category).mkdir(exist_ok=True)
     config.output_contest_dir().mkdir(parents=True, exist_ok=True)
     (config.sync_root / config.team_id).mkdir(parents=True, exist_ok=True)
     routing_path = config.model_routing_path

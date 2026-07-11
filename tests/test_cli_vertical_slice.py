@@ -64,6 +64,11 @@ def test_init_creates_team_and_member_isolated_local_paths(tmp_path: Path) -> No
     assert config.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jiwoong" / "SCA CTF 2026"
     assert config.sync_root == tmp_path / "sync"
     assert "team_namespace" not in config.get_mapping("sync")
+    assert "forensic" in config.owned_categories
+    contest_root = tmp_path / "incoming" / "SCA CTF 2026"
+    assert {
+        path.name for path in contest_root.iterdir() if path.is_dir()
+    } == {"pwn", "rev", "web", "crypto", "misc", "forensic"}
 
     assert main([
         "init", "SCA CTF 2026", "--config", str(config_path),
@@ -91,6 +96,10 @@ def test_init_for_a_new_member_reuses_an_existing_contest_manifest(tmp_path: Pat
     ]) == 0
 
     assert manifest.read_text(encoding="utf-8") == "# SCA CTF 2026\n\n### web/login\n"
+    assert all(
+        (manifest.parent / category).is_dir()
+        for category in ("pwn", "rev", "web", "crypto", "misc", "forensic")
+    )
     second = AppConfig.from_file(second_config)
     assert second.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jueon" / "SCA CTF 2026"
 

@@ -56,7 +56,7 @@ def default_config_mapping(
         "member": {
             "name": resolved_member_name,
             "display_name": resolved_member_name,
-            "owned_categories": ["pwn", "web", "rev", "crypto", "forensics", "misc", "cloud"],
+            "owned_categories": ["pwn", "web", "rev", "crypto", "forensic", "forensics", "misc", "cloud"],
         },
         "paths": {
             "incoming": "incoming",
