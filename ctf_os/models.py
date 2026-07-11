@@ -79,6 +79,20 @@ class AttemptStatus(StrEnum):
     STOPPED = "STOPPED"
 
 
+class SessionStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+
+
+class ContractTaskStatus(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 @dataclass(frozen=True, slots=True)
 class Challenge:
     contest: str
@@ -164,6 +178,68 @@ class Attempt:
             raise ValueError("fencing_token must be positive when set")
         object.__setattr__(self, "started_at", ensure_utc(self.started_at) if self.started_at else None)
         object.__setattr__(self, "ended_at", ensure_utc(self.ended_at) if self.ended_at else None)
+
+
+@dataclass(frozen=True, slots=True)
+class ChallengeSession:
+    """Durable controller state for one Sol-owned challenge lifecycle."""
+
+    challenge_id: str
+    leader_model: str
+    leader_profile: str = "sol"
+    reasoning_effort: str = "xhigh"
+    id: str = ""
+    status: SessionStatus | str = SessionStatus.ACTIVE
+    leader_session_id: str | None = None
+    leader_resume_id: str | None = None
+    execution_contract: Mapping[str, Any] = field(default_factory=dict)
+    summary_state: Mapping[str, Any] = field(default_factory=dict)
+    generation: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.challenge_id.strip() or not self.leader_model.strip():
+            raise ValueError("session challenge_id and leader_model are required")
+        if self.generation < 0:
+            raise ValueError("session generation cannot be negative")
+        object.__setattr__(self, "id", self.id or stable_id(self.challenge_id, prefix="session_"))
+        object.__setattr__(self, "status", SessionStatus(str(self.status).upper()))
+        object.__setattr__(self, "execution_contract", dict(self.execution_contract))
+        object.__setattr__(self, "summary_state", dict(self.summary_state))
+        object.__setattr__(self, "created_at", ensure_utc(self.created_at))
+        object.__setattr__(self, "updated_at", ensure_utc(self.updated_at))
+
+
+@dataclass(frozen=True, slots=True)
+class ContractTask:
+    """One branch issued by a challenge session under an execution contract."""
+
+    session_id: str
+    challenge_id: str
+    branch: str
+    role: str
+    objective: str
+    id: str = field(default_factory=lambda: f"task_{uuid4().hex}")
+    status: ContractTaskStatus | str = ContractTaskStatus.PENDING
+    success_criteria: tuple[str, ...] = ()
+    deliverables: tuple[str, ...] = ()
+    failure_handoff: str | None = None
+    depends_on: tuple[str, ...] = ()
+    assigned_attempt_id: str | None = None
+    result_summary: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not all((self.session_id.strip(), self.challenge_id.strip(), self.branch.strip(), self.role.strip(), self.objective.strip())):
+            raise ValueError("contract task session, challenge, branch, role, and objective are required")
+        object.__setattr__(self, "status", ContractTaskStatus(str(self.status).upper()))
+        for name in ("success_criteria", "deliverables", "depends_on", "evidence_ids"):
+            object.__setattr__(self, name, tuple(str(item) for item in getattr(self, name)))
+        object.__setattr__(self, "created_at", ensure_utc(self.created_at))
+        object.__setattr__(self, "updated_at", ensure_utc(self.updated_at))
 
 
 @dataclass(frozen=True, slots=True)

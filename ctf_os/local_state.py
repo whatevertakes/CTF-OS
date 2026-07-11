@@ -23,9 +23,13 @@ from .models import (
     Attempt,
     AttemptStatus,
     Challenge,
+    ChallengeSession,
     ChallengeStatus,
+    ContractTask,
+    ContractTaskStatus,
     Event,
     FlagCandidate,
+    SessionStatus,
     ensure_utc,
     timestamp_text,
     utc_now,
@@ -40,7 +44,7 @@ class StateError(ValueError):
     """Raised when a local-state database cannot be opened safely."""
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -238,6 +242,8 @@ class LocalState:
             self._migrate_v5_to_v6(conn)
         elif version == 6:
             self._migrate_v6_to_v7(conn)
+        elif version == 7:
+            self._migrate_v7_to_v8(conn)
         else:  # Defensive guard for future edits to CURRENT_SCHEMA_VERSION.
             raise StateError(f"no migration is registered from schema version {version}")
 
@@ -422,6 +428,36 @@ class LocalState:
               key TEXT PRIMARY KEY, value TEXT NOT NULL
             )
         """)
+
+    @staticmethod
+    def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+        """Add durable Sol session and contract branch state."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS challenge_sessions (
+              id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL UNIQUE,
+              leader_model TEXT NOT NULL, leader_profile TEXT NOT NULL,
+              reasoning_effort TEXT NOT NULL, status TEXT NOT NULL,
+              leader_session_id TEXT, leader_resume_id TEXT,
+              execution_contract_json TEXT NOT NULL, summary_state_json TEXT NOT NULL,
+              generation INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              FOREIGN KEY(challenge_id) REFERENCES challenges(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contract_tasks (
+              id TEXT PRIMARY KEY, session_id TEXT NOT NULL, challenge_id TEXT NOT NULL,
+              branch TEXT NOT NULL, role TEXT NOT NULL, objective TEXT NOT NULL,
+              status TEXT NOT NULL, success_criteria_json TEXT NOT NULL,
+              deliverables_json TEXT NOT NULL, failure_handoff TEXT,
+              depends_on_json TEXT NOT NULL, assigned_attempt_id TEXT,
+              result_summary TEXT, evidence_ids_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              FOREIGN KEY(session_id) REFERENCES challenge_sessions(id),
+              FOREIGN KEY(challenge_id) REFERENCES challenges(id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contract_tasks_session_status ON contract_tasks(session_id, status, created_at)")
 
     def _bind_team_identity(self, conn: sqlite3.Connection) -> None:
         """Bind node identity and normalize legacy keys without guessing ownership."""
@@ -712,6 +748,160 @@ class LocalState:
 
     transition_challenge = transition_challenge_status
 
+    # --- persistent challenge sessions and contract branches -----------------------
+
+    def upsert_challenge_session(self, session: ChallengeSession) -> ChallengeSession:
+        """Create or checkpoint the single persistent controller for a challenge."""
+        with self._write() as conn:
+            if conn.execute("SELECT 1 FROM challenges WHERE id=?", (session.challenge_id,)).fetchone() is None:
+                raise KeyError(f"unknown challenge: {session.challenge_id}")
+            conn.execute("""
+                INSERT INTO challenge_sessions (
+                  id, challenge_id, leader_model, leader_profile, reasoning_effort,
+                  status, leader_session_id, leader_resume_id, execution_contract_json,
+                  summary_state_json, generation, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(challenge_id) DO UPDATE SET
+                  leader_model=excluded.leader_model, leader_profile=excluded.leader_profile,
+                  reasoning_effort=excluded.reasoning_effort, status=excluded.status,
+                  leader_session_id=COALESCE(excluded.leader_session_id, challenge_sessions.leader_session_id),
+                  leader_resume_id=COALESCE(excluded.leader_resume_id, challenge_sessions.leader_resume_id),
+                  execution_contract_json=excluded.execution_contract_json,
+                  summary_state_json=excluded.summary_state_json,
+                  generation=excluded.generation, updated_at=excluded.updated_at
+            """, _challenge_session_values(session))
+        return self.get_challenge_session(session.challenge_id)  # type: ignore[return-value]
+
+    def get_or_create_challenge_session(
+        self,
+        challenge_id: str,
+        *,
+        leader_model: str,
+        leader_profile: str = "sol",
+        reasoning_effort: str = "xhigh",
+        execution_contract: dict[str, Any] | None = None,
+    ) -> ChallengeSession:
+        existing = self.get_challenge_session(challenge_id)
+        if existing is not None:
+            return existing
+        return self.upsert_challenge_session(ChallengeSession(
+            challenge_id=challenge_id, leader_model=leader_model,
+            leader_profile=leader_profile, reasoning_effort=reasoning_effort,
+            execution_contract=execution_contract or {},
+        ))
+
+    def checkpoint_challenge_session(
+        self,
+        challenge_id: str,
+        *,
+        summary_state: dict[str, Any] | None = None,
+        execution_contract: dict[str, Any] | None = None,
+        leader_session_id: str | None = None,
+        leader_resume_id: str | None = None,
+        status: SessionStatus | str | None = None,
+        advance_generation: bool = False,
+    ) -> ChallengeSession:
+        """Checkpoint Sol continuation and distilled state between controller cycles."""
+        current = self.get_challenge_session(challenge_id)
+        if current is None:
+            raise KeyError(f"unknown challenge session: {challenge_id}")
+        return self.upsert_challenge_session(replace(
+            current,
+            summary_state=current.summary_state if summary_state is None else summary_state,
+            execution_contract=current.execution_contract if execution_contract is None else execution_contract,
+            leader_session_id=leader_session_id or current.leader_session_id,
+            leader_resume_id=leader_resume_id or current.leader_resume_id,
+            status=current.status if status is None else status,
+            generation=current.generation + int(advance_generation),
+            updated_at=ensure_utc(self._clock()),
+        ))
+
+    def get_challenge_session(self, challenge_id: str) -> ChallengeSession | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM challenge_sessions WHERE challenge_id=?", (challenge_id,)
+            ).fetchone()
+        return _challenge_session_from_row(row) if row else None
+
+    def list_challenge_sessions(self, *, status: str | None = None) -> list[ChallengeSession]:
+        query = "SELECT * FROM challenge_sessions"
+        values: tuple[Any, ...] = ()
+        if status is not None:
+            query += " WHERE status=?"
+            values = (str(status).upper(),)
+        query += " ORDER BY created_at, id"
+        with self._connect() as conn:
+            rows = conn.execute(query, values).fetchall()
+        return [_challenge_session_from_row(row) for row in rows]
+
+    def upsert_contract_task(self, task: ContractTask) -> ContractTask:
+        """Persist a controller-issued branch and its eventual handoff result."""
+        with self._write() as conn:
+            session = conn.execute(
+                "SELECT challenge_id FROM challenge_sessions WHERE id=?", (task.session_id,)
+            ).fetchone()
+            if session is None:
+                raise KeyError(f"unknown challenge session: {task.session_id}")
+            if str(session["challenge_id"]) != task.challenge_id:
+                raise StateTransitionError("contract task challenge does not match its session")
+            conn.execute("""
+                INSERT INTO contract_tasks (
+                  id, session_id, challenge_id, branch, role, objective, status,
+                  success_criteria_json, deliverables_json, failure_handoff,
+                  depends_on_json, assigned_attempt_id, result_summary,
+                  evidence_ids_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  branch=excluded.branch, role=excluded.role, objective=excluded.objective,
+                  status=excluded.status, success_criteria_json=excluded.success_criteria_json,
+                  deliverables_json=excluded.deliverables_json,
+                  failure_handoff=excluded.failure_handoff,
+                  depends_on_json=excluded.depends_on_json,
+                  assigned_attempt_id=excluded.assigned_attempt_id,
+                  result_summary=excluded.result_summary,
+                  evidence_ids_json=excluded.evidence_ids_json,
+                  updated_at=excluded.updated_at
+            """, _contract_task_values(task))
+        return self.get_contract_task(task.id)  # type: ignore[return-value]
+
+    def get_contract_task(self, task_id: str) -> ContractTask | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM contract_tasks WHERE id=?", (task_id,)).fetchone()
+        return _contract_task_from_row(row) if row else None
+
+    def mark_contract_task_outcome(
+        self,
+        task_id: str,
+        *,
+        status: ContractTaskStatus | str,
+        result_summary: str | None = None,
+        evidence_ids: Iterable[str] = (),
+        assigned_attempt_id: str | None = None,
+    ) -> ContractTask:
+        current = self.get_contract_task(task_id)
+        if current is None:
+            raise KeyError(f"unknown contract task: {task_id}")
+        desired = status if isinstance(status, ContractTaskStatus) else ContractTaskStatus(str(status).upper())
+        return self.upsert_contract_task(replace(
+            current, status=desired, result_summary=result_summary,
+            evidence_ids=tuple(evidence_ids),
+            assigned_attempt_id=assigned_attempt_id or current.assigned_attempt_id,
+            updated_at=ensure_utc(self._clock()),
+        ))
+
+    def list_contract_tasks(
+        self, session_id: str, *, status: ContractTaskStatus | str | None = None,
+    ) -> list[ContractTask]:
+        query = "SELECT * FROM contract_tasks WHERE session_id=?"
+        values: list[Any] = [session_id]
+        if status is not None:
+            query += " AND status=?"
+            values.append(status.value if isinstance(status, ContractTaskStatus) else str(status).upper())
+        query += " ORDER BY created_at, id"
+        with self._connect() as conn:
+            rows = conn.execute(query, values).fetchall()
+        return [_contract_task_from_row(row) for row in rows]
+
     def upsert_attempt(self, attempt: Attempt, *, owner: str | None = None, fencing_token: int | None = None,
                        now: datetime | str | None = None) -> Attempt:
         with self._write() as conn:
@@ -979,8 +1169,13 @@ class LocalState:
             )
             conn.executemany(
                 "UPDATE flag_candidates SET verification_status='UNAVAILABLE', verification_reason=? "
-                "WHERE attempt_id=? AND verification_status IN ('CANDIDATE', 'VERIFYING', 'UNAVAILABLE')",
+                "WHERE attempt_id=? AND verification_status IN ('RAW_CANDIDATE', 'CANDIDATE', 'VERIFYING', 'UNAVAILABLE')",
                 [("attempt lease expired; candidate remains retryable", item) for item in stale_ids],
+            )
+            conn.executemany(
+                "UPDATE contract_tasks SET status='FAILED', result_summary=?, updated_at=? "
+                "WHERE assigned_attempt_id=? AND status IN ('PENDING', 'RUNNING')",
+                [("assigned attempt lease expired; Sol must replan", now_text, item) for item in stale_ids],
             )
             conn.execute("DELETE FROM attempt_leases WHERE expires_at <= ?", (now_text,))
         requeued: list[str] = []
@@ -1159,13 +1354,20 @@ class LocalState:
             ON CONFLICT(challenge_id, value) DO UPDATE SET
               challenge_key=excluded.challenge_key,
               attempt_id=COALESCE(excluded.attempt_id, flag_candidates.attempt_id),
-              source=excluded.source, confidence=excluded.confidence, verified=excluded.verified,
-              verification_status=excluded.verification_status, verification_reason=excluded.verification_reason,
+              source=excluded.source, confidence=excluded.confidence,
+              verified=CASE WHEN flag_candidates.verified=1 THEN 1 ELSE excluded.verified END,
+              verification_status=CASE
+                WHEN flag_candidates.verification_status IN ('VERIFIED','REJECTED','REPLAY_VERIFIED')
+                THEN flag_candidates.verification_status ELSE excluded.verification_status END,
+              verification_reason=CASE
+                WHEN flag_candidates.verification_status IN ('VERIFIED','REJECTED','REPLAY_VERIFIED')
+                THEN flag_candidates.verification_reason ELSE excluded.verification_reason END,
               synthetic=excluded.synthetic
         """, _candidate_values(candidate))
 
     def record_candidate(
         self, candidate: FlagCandidate, event: Event, *, owner: str | None, fencing_token: int | None,
+        promote_challenge_status: bool = True,
         now: datetime | str | None = None,
     ) -> FlagCandidate:
         """Persist candidate evidence and its append-only event in one commit."""
@@ -1174,20 +1376,28 @@ class LocalState:
         with self._write() as conn:
             self._require_active_attempt_lease_conn(conn, candidate.attempt_id, owner, fencing_token, now=now)
             self._add_candidate_conn(conn, candidate)
-            conn.execute(
-                "UPDATE challenges SET status=?, updated_at=? WHERE id=? AND status=?",
-                (ChallengeStatus.FLAG_CANDIDATE.value, self._now(now), candidate.challenge_id, ChallengeStatus.RUNNING.value),
-            )
+            if promote_challenge_status:
+                conn.execute(
+                    "UPDATE challenges SET status=?, updated_at=? WHERE id=? AND status=?",
+                    (ChallengeStatus.FLAG_CANDIDATE.value, self._now(now), candidate.challenge_id, ChallengeStatus.RUNNING.value),
+                )
             self._record_event_conn(conn, event)
         self._notify_committed_events((event,))
-        return candidate
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM flag_candidates WHERE challenge_id=? AND value=?",
+                (candidate.challenge_id, candidate.value),
+            ).fetchone()
+        if row is None:  # pragma: no cover - same transaction inserted or retained it
+            raise StateError("candidate commit completed without a durable row")
+        return _candidate_from_row(row)
 
     def set_candidate_verification(
         self, candidate_id: str, *, status: str, reason: str = "", verified: bool = False,
         owner: str | None, fencing_token: int | None, now: datetime | str | None = None,
     ) -> FlagCandidate:
         status = status.upper()
-        if status not in {"CANDIDATE", "VERIFYING", "VERIFIED", "REJECTED", "UNAVAILABLE"}:
+        if status not in {"RAW_CANDIDATE", "CANDIDATE", "VERIFYING", "REPLAY_VERIFIED", "VERIFIED", "REJECTED", "UNAVAILABLE"}:
             raise ValueError("invalid verification status")
         with self._write() as conn:
             candidate = conn.execute("SELECT attempt_id FROM flag_candidates WHERE id=?", (candidate_id,)).fetchone()
@@ -1232,6 +1442,45 @@ class LocalState:
             conn.execute(
                 "UPDATE flag_candidates SET verified=1, verification_status='VERIFIED', verification_reason='verification succeeded' WHERE id=?",
                 (candidate_id,),
+            )
+            self._record_event_conn(conn, event)
+        self._notify_committed_events((event,))
+        return self.get_challenge(str(candidate["challenge_id"]))  # type: ignore[return-value]
+
+    def solve_replay_approved(
+        self, *, candidate_id: str, flag: str, event: Event, leader_attempt_id: str,
+        now: datetime | str | None = None,
+    ) -> Challenge:
+        """Commit SOLVED only after replay verification and a completed Sol leader decision."""
+        with self._write() as conn:
+            candidate = conn.execute(
+                "SELECT challenge_id, value, verification_status FROM flag_candidates WHERE id=?",
+                (candidate_id,),
+            ).fetchone()
+            leader = conn.execute(
+                "SELECT challenge_id, role, profile, status FROM attempts WHERE id=?",
+                (leader_attempt_id,),
+            ).fetchone()
+            if candidate is None or leader is None:
+                raise KeyError("candidate or Sol leader attempt is missing")
+            if candidate["value"] != flag or candidate["verification_status"] != "REPLAY_VERIFIED":
+                raise StateTransitionError("Sol may approve only the exact replay-verified candidate")
+            if (leader["challenge_id"] != candidate["challenge_id"] or
+                    leader["role"] != "session_leader" or leader["profile"] != "session_leader" or
+                    leader["status"] != AttemptStatus.SUCCEEDED.value):
+                raise StateTransitionError("approval requires a successful persistent Sol leader attempt")
+            conn.execute(
+                "UPDATE challenges SET status=?, flag=?, synthetic=0, updated_at=? WHERE id=? AND status<>?",
+                (ChallengeStatus.SOLVED.value, flag, self._now(now), candidate["challenge_id"], ChallengeStatus.SOLVED.value),
+            )
+            conn.execute(
+                "UPDATE flag_candidates SET verified=1, verification_status='VERIFIED', "
+                "verification_reason='sandbox replay verified and Sol approved' WHERE id=?",
+                (candidate_id,),
+            )
+            conn.execute(
+                "UPDATE challenge_sessions SET status=?, updated_at=? WHERE challenge_id=?",
+                (SessionStatus.COMPLETED.value, self._now(now), candidate["challenge_id"]),
             )
             self._record_event_conn(conn, event)
         self._notify_committed_events((event,))
@@ -1405,6 +1654,57 @@ def _attempt_values(attempt: Attempt) -> tuple[Any, ...]:
         timestamp_text(attempt.ended_at) if attempt.ended_at else None, attempt.token_total,
         int(attempt.synthetic), attempt.cleanup_status, attempt.cleanup_message,
         attempt.lease_owner, attempt.fencing_token,
+    )
+
+
+def _json_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _challenge_session_values(session: ChallengeSession) -> tuple[Any, ...]:
+    status = session.status.value if isinstance(session.status, SessionStatus) else str(session.status).upper()
+    return (
+        session.id, session.challenge_id, session.leader_model, session.leader_profile,
+        session.reasoning_effort, status, session.leader_session_id, session.leader_resume_id,
+        _json_value(dict(session.execution_contract)), _json_value(dict(session.summary_state)),
+        session.generation, timestamp_text(session.created_at), timestamp_text(session.updated_at),
+    )
+
+
+def _challenge_session_from_row(row: sqlite3.Row) -> ChallengeSession:
+    return ChallengeSession(
+        id=row["id"], challenge_id=row["challenge_id"], leader_model=row["leader_model"],
+        leader_profile=row["leader_profile"], reasoning_effort=row["reasoning_effort"],
+        status=row["status"], leader_session_id=row["leader_session_id"],
+        leader_resume_id=row["leader_resume_id"],
+        execution_contract=json.loads(row["execution_contract_json"]),
+        summary_state=json.loads(row["summary_state_json"]), generation=row["generation"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+    )
+
+
+def _contract_task_values(task: ContractTask) -> tuple[Any, ...]:
+    status = task.status.value if isinstance(task.status, ContractTaskStatus) else str(task.status).upper()
+    return (
+        task.id, task.session_id, task.challenge_id, task.branch, task.role, task.objective,
+        status, _json_value(task.success_criteria), _json_value(task.deliverables),
+        task.failure_handoff, _json_value(task.depends_on), task.assigned_attempt_id,
+        task.result_summary, _json_value(task.evidence_ids), timestamp_text(task.created_at),
+        timestamp_text(task.updated_at),
+    )
+
+
+def _contract_task_from_row(row: sqlite3.Row) -> ContractTask:
+    return ContractTask(
+        id=row["id"], session_id=row["session_id"], challenge_id=row["challenge_id"],
+        branch=row["branch"], role=row["role"], objective=row["objective"], status=row["status"],
+        success_criteria=tuple(json.loads(row["success_criteria_json"])),
+        deliverables=tuple(json.loads(row["deliverables_json"])),
+        failure_handoff=row["failure_handoff"],
+        depends_on=tuple(json.loads(row["depends_on_json"])),
+        assigned_attempt_id=row["assigned_attempt_id"], result_summary=row["result_summary"],
+        evidence_ids=tuple(json.loads(row["evidence_ids_json"])),
+        created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
 

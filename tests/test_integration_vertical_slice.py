@@ -40,7 +40,10 @@ def _config(tmp_path: Path, *, routing: bool = False, sandbox: bool = False) -> 
         route = tmp_path / "routing.yaml"
         route.write_text(
             "model_profiles:\n  selected:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n"
-            "default_roles:\n  recon: selected\n  exploit: selected\n  source: selected\n  fallback: selected\n"
+            "  leader:\n    model: gpt-5.6-sol\n    reasoning_effort: max\n"
+            "  luna_medium:\n    model: gpt-5.6-luna\n    reasoning_effort: high\n"
+            "  terra_high:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n"
+            "default_roles:\n  session_leader: leader\n  supervisor: leader\n  recon: selected\n  exploit: selected\n  source: selected\n  fallback: selected\n"
             "model_policy:\n  easy:\n    recon_fast: selected\n    exploit_fast: selected\n",
             encoding="utf-8",
         )
@@ -208,7 +211,7 @@ def test_nonmock_request_uses_automatic_model_route_and_never_uses_host_commands
     docker = DockerCli(runner=RecordingCommandRunner())
     app = LocalApplication(config, docker=docker, codex_backend_factory=lambda **_: FakeCodex(), command_exists=lambda _: "/fake/codex")
     app.run_once(auto_confirm_flags=True)
-    assert received and received[0].difficulty == "easy" and received[0].attempt_kind == "recon_fast"
+    assert received and received[0].difficulty == "hard" and received[0].attempt_kind == "session_leader"
     assert all("docker" == call[0] for call in docker.calls)
     ledger = LocalState(config.state_path()).list_events()
     by_attempt: dict[str, list[str]] = {}

@@ -98,6 +98,36 @@ def test_coordinator_lease_rejects_a_separate_cli_process(tmp_path: Path) -> Non
     assert child.exitcode == 0 and result_queue.get(timeout=2) is False
 
 
+def test_raw_flag_observation_does_not_advance_challenge_status(tmp_path: Path) -> None:
+    state = LocalState(tmp_path / "state.db")
+    challenge = state.upsert_challenge(Challenge(contest="Demo", category="pwn", name="raw"))
+    state.transition_challenge_status(challenge.id, ChallengeStatus.QUEUED)
+    attempt = _attempt(challenge.id, "raw-attempt")
+    claim = state.claim_attempt(
+        attempt, owner="leader", lease_seconds=30,
+        max_workers_total=1, max_workers_per_challenge=1,
+    )
+    assert claim.granted and claim.fencing_token is not None
+    state.transition_challenge_status(
+        challenge.id, ChallengeStatus.RUNNING, attempt_id=attempt.id,
+        owner="leader", fencing_token=claim.fencing_token,
+    )
+    observed = state.record_candidate(
+        FlagCandidate(
+            challenge_id=challenge.id, attempt_id=attempt.id,
+            value="FLAG{OBSERVED}", verification_status="RAW_CANDIDATE",
+        ),
+        Event(
+            team_id="team", member="member", contest="Demo", type="FLAG_OBSERVED",
+            challenge_id=challenge.id, attempt_id=attempt.id,
+        ),
+        owner="leader", fencing_token=claim.fencing_token,
+        promote_challenge_status=False,
+    )
+    assert observed.verification_status == "RAW_CANDIDATE"
+    assert state.get_challenge(challenge.id).status is ChallengeStatus.RUNNING
+
+
 def test_verifier_refuses_worker_owned_artifacts_and_reports_unavailable(tmp_path: Path) -> None:
     work = tmp_path / "work"
     output = tmp_path / "output"
@@ -143,7 +173,10 @@ def _runtime_config(tmp_path: Path) -> AppConfig:
     route = tmp_path / "routing.yaml"
     route.write_text(
         "model_profiles:\n  primary:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n    fallback: gpt-5.5\n    fallback_reasoning_effort: medium\n"
-        "default_roles:\n  recon: primary\n  exploit: primary\n  source: primary\n  fallback: primary\n"
+        "  terra_high:\n    model: gpt-5.6-terra\n    reasoning_effort: high\n"
+        "  luna_medium:\n    model: gpt-5.6-luna\n    reasoning_effort: medium\n"
+        "  leader:\n    model: gpt-5.6-sol\n    reasoning_effort: max\n    fallback: gpt-5.5\n    fallback_reasoning_effort: high\n"
+        "default_roles:\n  session_leader: leader\n  supervisor: leader\n  recon: primary\n  exploit: primary\n  source: primary\n  fallback: primary\n"
         "model_policy:\n  easy:\n    recon_fast: primary\n    exploit_fast: primary\n",
         encoding="utf-8",
     )
@@ -251,8 +284,13 @@ def test_streamed_worker_replay_remains_candidate_and_never_cancels_other_attemp
     state = LocalState(config.state_path())
     challenges = {item.name: item for item in state.list_challenges()}
     web, misc = challenges["login"], challenges["keep-running"]
-    assert report.solved_challenges == 0 and web.status is ChallengeStatus.FLAG_CANDIDATE
-    assert misc.status is ChallengeStatus.FAILED
+    assert report.solved_challenges == 0 and web.status is ChallengeStatus.STUCK
+    observed = state.list_flag_candidates(web.id)
+    assert observed and observed[0].verification_status == "UNAVAILABLE"
+    # A branch/leader failure no longer terminates the challenge. Repeated
+    # malformed controller plans leave the persistent session visibly STUCK
+    # for takeover instead of advancing to an unrelated problem as FAILED.
+    assert misc.status is ChallengeStatus.STUCK
     assert cancellations["web"] and all(not event.is_set() for event in cancellations["web"])
     assert cancellations["misc"] and all(not event.is_set() for event in cancellations["misc"])
 

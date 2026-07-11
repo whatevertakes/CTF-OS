@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import copy
 from datetime import datetime, timezone
 import json
@@ -28,19 +28,23 @@ from .local_state import LocalState, StateTransitionError
 from .local_worker_pool import LocalWorkerPool, WorkerHandle
 from .local_event_state import LocalEventState
 from .model_routing import ModelRouter, ModelRoutingError, ModelSelection
-from .models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, FlagCandidate, utc_now
+from .models import (
+    Attempt, AttemptStatus, Challenge, ChallengeStatus, ContractTask,
+    ContractTaskStatus, Event, FlagCandidate, stable_id, utc_now,
+)
 from .sandbox.broker import BrokerResponse, broker_transport_supported, send_broker_request
 from .sandbox.container import SandboxScope, SandboxSpec
 from .sandbox.docker_cli import DockerCli
 from .sandbox.network_policy import parse_remote_endpoints, resolve_remote_endpoints
 from .sandbox.pool import DockerSandboxPool
 from .solver_engine.codex_cli_backend import CodexCliBackend, CodexExecRequest, CodexExecResult, CodexStreamRecord
-from .solver_engine.context import ChallengeContextBuilder
+from .solver_engine.category_planner import CategoryPlanner, ExecutionContract, PlanParseError, SolvePlan, SolvePlanParser
+from .solver_engine.context import ChallengeContext, ChallengeContextBuilder
 from .solver_engine.knowledge import KnowledgeIndex
 from .solver_engine.loop_detector import LoopDetector
 from .solver_engine.mock_backend import MockBackend
 from .solver_engine.parser import ActionObservationParser
-from .solver_engine.prompt import PromptRenderer
+from .solver_engine.prompt import PromptRenderer, SessionHandoff
 from .solver_engine.race_plan import RaceAttempt, RacePlan
 from .solver_engine.strategy_reranker import StrategyReranker
 from .solver_engine.types import SolverEvent
@@ -68,6 +72,7 @@ class IntakeBlockedError(PrerequisiteError):
 @dataclass(frozen=True)
 class AttemptExecution:
     output: str
+    controller_output: str
     status: str
     synthetic: bool
     token_usage: int = 0
@@ -82,6 +87,9 @@ class PlannedAttempt:
     state: LocalState
     writer: ArtifactWriter
     race_attempt: RaceAttempt
+    session_id: str | None = None
+    contract_task_id: str | None = None
+    is_session_leader: bool = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,7 @@ class LocalApplication:
         command_exists: Callable[[str], str | None] = shutil.which,
         strict_isolation_probe: Callable[[str], bool] = CodexCliBackend.strict_isolation_supported,
         supervisor_hint_factory: Callable[[SupervisorHintRequest], str | None] | None = None,
+        planner_plan_factory: Callable[[ChallengeContext, tuple[str, ...], tuple[str, ...], dict[str, object]], SolvePlan] | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
         _synthetic_namespace: bool = False,
     ) -> None:
@@ -159,6 +168,7 @@ class LocalApplication:
         self._command_exists = command_exists
         self._strict_isolation_probe = strict_isolation_probe
         self._supervisor_hint_factory = supervisor_hint_factory
+        self._planner_plan_factory = planner_plan_factory
         self._monotonic_clock = monotonic_clock
         self._synthetic_namespace = _synthetic_namespace
         self._sandbox_by_attempt: dict[str, DockerSandboxPool] = {}
@@ -220,6 +230,7 @@ class LocalApplication:
                 codex_backend_factory=self._codex_backend_factory,
                 command_exists=self._command_exists, strict_isolation_probe=self._strict_isolation_probe,
                 supervisor_hint_factory=self._supervisor_hint_factory, monotonic_clock=self._monotonic_clock,
+                planner_plan_factory=self._planner_plan_factory,
                 _synthetic_namespace=True,
             )
             return synthetic.run_once(
@@ -284,10 +295,9 @@ class LocalApplication:
                     continue
                 writer = ArtifactWriter(self.config.output_root, item.manifest.name)
                 writer.prepare_challenge(challenge)
-                findings, failures, _commands = self._local_evidence(state, challenge.id)
-                race_plan = RacePlan.for_score(challenge.score or 0, category=challenge.category)
-                ordered = StrategyReranker().rerank(race_plan.attempts, findings=findings, failures=failures)
-                plans.extend(PlannedAttempt(item, state, writer, race_attempt) for race_attempt in ordered)
+                plans.extend(self._enqueue_session_generation(
+                    item, state, writer, challenge, require_live_leader=not mock_worker,
+                ))
 
             while plans or active or supervisors:
                 if not coordinator_state.heartbeat_coordinator(
@@ -317,7 +327,9 @@ class LocalApplication:
                 for _ in range(len(plans)):
                     task = plans.popleft()
                     challenge = task.state.get_challenge(task.intake.challenge.id)
-                    if challenge is None or challenge.status is not ChallengeStatus.QUEUED:
+                    if challenge is None or challenge.status not in {
+                        ChallengeStatus.QUEUED, ChallengeStatus.RUNNING,
+                    }:
                         made_progress = True
                         continue
                     active_challenges = {handle.attempt.challenge_id for handle, _ in active.values()}
@@ -338,6 +350,11 @@ class LocalApplication:
                         made_progress = True
                         continue
                     active[handle.attempt.id] = (handle, task)
+                    if task.contract_task_id is not None:
+                        task.state.mark_contract_task_outcome(
+                            task.contract_task_id, status=ContractTaskStatus.RUNNING,
+                            assigned_attempt_id=handle.attempt.id,
+                        )
                     started += 1
                     made_progress = True
                     self._notify_status()
@@ -351,7 +368,7 @@ class LocalApplication:
                     self._notify_status()
 
                 made_progress = self._drain_candidate_signals(pool, plans, solved, auto_confirm_flags) or made_progress
-                self._mark_exhausted_challenges_failed(plans, active, intake)
+                self._replan_exhausted_challenges(plans, active, intake)
                 self._flush_outbox(coordinator_state)
                 self._notify_status()
                 if (plans or active or supervisors) and not made_progress:
@@ -841,6 +858,16 @@ class LocalApplication:
         *,
         router: ModelRouter,
     ) -> ModelSelection:
+        if race_attempt.profile.name == "session_leader":
+            try:
+                leader = router.select(role="session_leader")
+            except ModelRoutingError:
+                # Older node-local routing files predate the dedicated role;
+                # their supervisor route is still required to be Sol.
+                leader = router.select(role="supervisor")
+            if leader.model != "gpt-5.6-sol":
+                raise ModelRoutingError("persistent session leader must route to gpt-5.6-sol")
+            return leader
         if self._promotion_applies(state, challenge, router=router):
             return router.select_promotion(role="supervisor")
         if race_attempt.contract is not None:
@@ -850,7 +877,7 @@ class LocalApplication:
             )
         return router.select(
             role=race_attempt.profile.role,
-            difficulty=RacePlan.for_score(challenge.score or 0).difficulty,
+            difficulty=RacePlan.difficulty_for(challenge.score, category=challenge.category),
             attempt_kind=race_attempt.profile.name,
         )
 
@@ -895,6 +922,10 @@ class LocalApplication:
         return False
 
     def _precreate_sandbox(self, task: PlannedAttempt, challenge: Challenge, attempt: Attempt) -> Attempt:
+        if task.session_id is not None:
+            task.writer.seed_session_handoff_artifacts(
+                challenge, session_id=task.session_id, attempt_workdir=attempt.workdir,
+            )
         scope = SandboxScope(self.config.team_id, self.config.member_name, challenge.contest, challenge.name,
                              challenge.id, challenge.challenge_key)
         sandbox_pool = DockerSandboxPool(
@@ -939,7 +970,8 @@ class LocalApplication:
                 task.writer.append_evidence(challenge, f"[synthetic mock] {line}")
                 self._stream_line(task, challenge, attempt, line, synthetic=True)
             result = backend.run(prompt, on_output=mock_output)
-            return AttemptExecution("\n".join(lines), result.status, True, records=self._records_snapshot(attempt.id))
+            rendered = "\n".join(lines)
+            return AttemptExecution(rendered, rendered, result.status, True, records=self._records_snapshot(attempt.id))
 
         if not isinstance(selection, ModelSelection):
             raise PrerequisiteError("production attempt has no explicit model selection")
@@ -949,10 +981,19 @@ class LocalApplication:
         broker = sandbox_pool.broker(attempt.id) if sandbox_pool is not None else None
         if broker is None or not broker.running:
             raise RuntimeError("attempt command broker is unavailable; refusing to start Codex")
+        leader_session = task.state.get_challenge_session(challenge.id) if task.is_session_leader else None
+        leader_resume_id = (
+            (leader_session.leader_resume_id or leader_session.leader_session_id)
+            if leader_session is not None else None
+        )
         request = CodexExecRequest(
             workdir=Path(attempt.workdir), prompt=prompt, role=attempt.role,
-            difficulty=RacePlan.for_score(challenge.score or 0).difficulty, attempt_kind=attempt.profile,
+            difficulty=("hard" if task.is_session_leader else
+                        RacePlan.difficulty_for(challenge.score, category=challenge.category)),
+            attempt_kind=attempt.profile,
             broker_socket=broker.socket_path,
+            resume_id=leader_resume_id,
+            persistent_session=task.is_session_leader and leader_resume_id is None,
             # Structured Codex terminal errors are the only trusted source
             # for model availability state.  Human-readable assistant output
             # is never allowed to drive cooldown/fallback policy.
@@ -993,7 +1034,8 @@ class LocalApplication:
                     publish=False,
                 )
             result: CodexExecResult = backend.run(
-                replace(request, selection=candidate),
+                replace(request, selection=candidate, resume_id=resume_id or request.resume_id,
+                        persistent_session=request.persistent_session and not (resume_id or request.resume_id)),
                 timeout_sec=self.config.attempt_timeout_sec(attempt.profile, task.race_attempt.profile.max_runtime_sec),
                 on_output=lambda record: self._stream_line(task, challenge, active_attempt, record.line, synthetic=False),
                 # _stream_line captures bounded parent-observed records in the
@@ -1072,7 +1114,7 @@ class LocalApplication:
         for line in output.splitlines():
             self._stream_line(task, challenge, attempt, line, synthetic=False)
         return AttemptExecution(
-            output, status, False, token_usage=total_tokens,
+            output, (final_result.stdout if final_result is not None else ""), status, False, token_usage=total_tokens,
             session_id=session_id, resume_id=resume_id,
             records=self._records_snapshot(attempt.id),
         )
@@ -1173,7 +1215,8 @@ class LocalApplication:
                 # appears instead of allowing a process-local dedupe set to
                 # strand it permanently.
                 for existing in task.state.list_flag_candidates(
-                    challenge.id, attempt_id=attempt.id, verification_statuses=("CANDIDATE", "UNAVAILABLE"),
+                    challenge.id, attempt_id=attempt.id,
+                    verification_statuses=("RAW_CANDIDATE", "CANDIDATE", "UNAVAILABLE"),
                 ):
                     key = (attempt.id, existing.id)
                     with self._stream_lock:
@@ -1190,17 +1233,23 @@ class LocalApplication:
             attempt_id=attempt.id, source="codex-stream",
         )
         for raw_candidate in candidates:
-            candidate = replace(raw_candidate, synthetic=synthetic)
+            candidate = replace(
+                raw_candidate, synthetic=synthetic,
+                verification_status=("CANDIDATE" if synthetic else "RAW_CANDIDATE"),
+            )
             key = (attempt.id, candidate.value)
             with self._stream_lock:
                 if key in self._candidate_values:
                     continue
                 self._candidate_values.add(key)
-            event = self._event(challenge, "FLAG_CANDIDATE", attempt=attempt,
+            event = self._event(challenge, "FLAG_CANDIDATE" if synthetic else "FLAG_OBSERVED", attempt=attempt,
                                 message="synthetic candidate" if synthetic else "streamed flag candidate detected",
                                 payload={"flag": candidate.value}, synthetic=synthetic)
             try:
-                task.state.record_candidate(candidate, event, owner=self._owner, fencing_token=_fence(attempt))
+                candidate = task.state.record_candidate(
+                    candidate, event, owner=self._owner, fencing_token=_fence(attempt),
+                    promote_challenge_status=synthetic,
+                )
             except StateTransitionError:
                 # A stale callback is intentionally a no-op outside its
                 # private capture.  In particular it must not enqueue a later
@@ -1457,7 +1506,9 @@ class LocalApplication:
             result: CodexExecResult = backend.run(
                 CodexExecRequest(
                     workdir=Path(request.attempt.workdir), prompt=request.prompt, role="supervisor",
-                    difficulty=RacePlan.for_score(request.challenge.score or 0).difficulty,
+                    difficulty=RacePlan.difficulty_for(
+                        request.challenge.score, category=request.challenge.category,
+                    ),
                     attempt_kind="supervisor_hint", broker_socket=broker.socket_path,
                     selection=candidate, json_events=True,
                 ),
@@ -1492,7 +1543,7 @@ class LocalApplication:
         return f"""You are the local Sol supervisor for one authorized CTF attempt.
 Do not execute commands, access the network, write files, or propose a flag. Give one concise strategy shift grounded only in the supplied local records.
 
-Challenge: {challenge.name} ({challenge.category}, score={challenge.score or 0})
+Challenge: {challenge.name} ({challenge.category}, score={challenge.score if challenge.score is not None else 'unknown'})
 Description: {challenge.description or '(none)'}
 Why review started: {reason}
 Findings: {findings[-8:] or ['(none)']}
@@ -1598,11 +1649,17 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
 
         for path in promoted:
             self._emit(task.state, challenge, "ARTIFACT_WRITTEN", attempt=attempt, message=str(path), publish=False)
-        solved_event = self._event(challenge, "SOLVED", attempt=attempt, message="replay verification succeeded",
-                                   payload={"flag": candidate.value})
-        task.state.solve_verified(candidate_id=candidate.id, flag=candidate.value, event=solved_event,
-                                  owner=self._owner, fencing_token=_fence(attempt))
-        self._complete_solve(challenge.id, pool, pending, solved)
+        task.state.set_candidate_verification(
+            candidate.id, status="REPLAY_VERIFIED", reason="sandbox replay succeeded; awaiting Sol approval",
+            owner=self._owner, fencing_token=_fence(attempt),
+        )
+        if challenge.status is ChallengeStatus.VERIFYING:
+            task.state.transition_challenge_status(
+                challenge.id, ChallengeStatus.FLAG_CANDIDATE, attempt_id=attempt.id,
+                owner=self._owner, fencing_token=_fence(attempt),
+            )
+        self._emit(task.state, challenge, "REPLAY_VERIFIED", attempt=attempt,
+                   message="sandbox replay succeeded; persistent Sol must approve", publish=False)
 
     @staticmethod
     def _broker_exec(broker, attempt_id: str, argv: tuple[str, ...]) -> BrokerResponse:
@@ -1635,6 +1692,12 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
             attempt = task.state.finish_attempt(handle.attempt.id, status, owner=self._owner, fencing_token=_fence(handle.attempt))
             self._emit(task.state, challenge, "WORKER_STOPPED" if status is AttemptStatus.STOPPED else "FAILED",
                        attempt=attempt, message=str(handle.error), synthetic=attempt.synthetic, fenced=False)
+            if task.contract_task_id is not None:
+                task.state.mark_contract_task_outcome(
+                    task.contract_task_id,
+                    status=(ContractTaskStatus.CANCELLED if status is AttemptStatus.STOPPED else ContractTaskStatus.FAILED),
+                    result_summary=str(handle.error), assigned_attempt_id=attempt.id,
+                )
             self._release_attempt(attempt.id, task.state, preserve=status is AttemptStatus.FAILED and self.config.preserve_failed_attempts)
             return
 
@@ -1666,9 +1729,90 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
                    message="attempt completed" if status is AttemptStatus.SUCCEEDED else "attempt stopped",
                    payload=self._attempt_session_payload(attempt),
                    synthetic=execution.synthetic, fenced=False)
+        if task.is_session_leader:
+            if execution.session_id or execution.resume_id:
+                task.state.checkpoint_challenge_session(
+                    challenge.id, leader_session_id=execution.session_id,
+                    leader_resume_id=execution.resume_id,
+                )
+            try:
+                solve_plan = SolvePlanParser().parse(execution.controller_output)
+            except PlanParseError as exc:
+                session = task.state.get_challenge_session(challenge.id)
+                summary_state = dict(session.summary_state) if session is not None else {}
+                rejection_count = int(summary_state.get("plan_rejections", 0)) + 1
+                summary_state["plan_rejections"] = rejection_count
+                task.state.checkpoint_challenge_session(
+                    challenge.id, summary_state=summary_state,
+                )
+                self._emit(
+                    task.state, challenge, "SESSION_PLAN_REJECTED", attempt=attempt,
+                    message=str(exc), payload={"count": rejection_count}, fenced=False,
+                )
+                if challenge.status is ChallengeStatus.RUNNING:
+                    if rejection_count == 1:
+                        pending.extend(self._materialize_solve_plan(
+                            task, challenge, self._bootstrap_solve_plan(challenge),
+                        ))
+                    else:
+                        stuck = self._event(
+                            challenge, "STUCK", attempt=attempt,
+                            message="persistent Sol leader returned malformed plans twice",
+                            payload={"plan_rejections": rejection_count},
+                        )
+                        challenge = task.state.transition_challenge_status(
+                            challenge.id, ChallengeStatus.STUCK, event=stuck,
+                        )
+            else:
+                session = task.state.get_challenge_session(challenge.id)
+                if session is not None and session.summary_state.get("plan_rejections"):
+                    summary_state = dict(session.summary_state)
+                    summary_state["plan_rejections"] = 0
+                    task.state.checkpoint_challenge_session(challenge.id, summary_state=summary_state)
+                approved = solve_plan.approved_candidate
+                replay = next((item for item in task.state.list_flag_candidates(challenge.id)
+                               if item.value == approved and item.verification_status == "REPLAY_VERIFIED"), None)
+                if approved and replay is not None:
+                    solved_event = self._event(
+                        challenge, "SOLVED", attempt=attempt,
+                        message="replay evidence approved by persistent Sol leader",
+                        payload={"flag": approved, "session_id": task.session_id},
+                    )
+                    task.state.solve_replay_approved(
+                        candidate_id=replay.id, flag=approved, event=solved_event,
+                        leader_attempt_id=attempt.id,
+                    )
+                    self._complete_solve(challenge.id, pool, pending, solved)
+                else:
+                    pending.extend(self._materialize_solve_plan(task, challenge, solve_plan))
+        if task.contract_task_id is not None and not execution.synthetic:
+            records = execution.records or self._records_snapshot(attempt.id)
+            summary = "\n".join(
+                f"[{record.kind.upper()}] {record.content}" for record in records[-20:]
+            ) or execution.output[-2_000:]
+            staging = ArtifactWriter.staging_for_workdir(attempt.workdir)
+            declared = Verifier().declared_artifacts(
+                records, attempt_workdir=attempt.workdir,
+                challenge_artifacts=staging.artifacts,
+            )
+            promoted = task.writer.promote_session_handoff_artifacts(
+                challenge,
+                session_id=task.session_id or "legacy-session",
+                contract_id=task.contract_task_id,
+                attempt_workdir=attempt.workdir,
+                artifact_paths=declared,
+                parent_approved=status is AttemptStatus.SUCCEEDED and bool(records),
+            )
+            task.state.mark_contract_task_outcome(
+                task.contract_task_id,
+                status=(ContractTaskStatus.SUCCEEDED if status is AttemptStatus.SUCCEEDED else
+                        ContractTaskStatus.CANCELLED if status is AttemptStatus.STOPPED else ContractTaskStatus.FAILED),
+                result_summary=summary, assigned_attempt_id=attempt.id,
+                evidence_ids=(attempt.id, *(str(path) for path in promoted)),
+            )
         self._release_attempt(attempt.id, task.state, preserve=status is AttemptStatus.FAILED and self.config.preserve_failed_attempts)
 
-    def _mark_exhausted_challenges_failed(
+    def _replan_exhausted_challenges(
         self, pending: deque[PlannedAttempt], active: dict[str, tuple[WorkerHandle, PlannedAttempt]], intake: tuple[IntakeChallenge, ...]
     ) -> None:
         pending_ids = {item.intake.challenge.id for item in pending}
@@ -1678,9 +1822,24 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
                 self.config, contest_name=item.manifest.name
             )
             challenge = state.get_challenge(item.challenge.id)
-            if challenge and challenge.status is ChallengeStatus.RUNNING and challenge.id not in pending_ids | active_ids:
-                challenge = state.transition_challenge_status(challenge.id, ChallengeStatus.FAILED)
-                self._emit(state, challenge, "FAILED", message="all local race attempts completed without a candidate")
+            if challenge and challenge.status in {ChallengeStatus.RUNNING, ChallengeStatus.FLAG_CANDIDATE} and challenge.id not in pending_ids | active_ids:
+                session = state.get_challenge_session(challenge.id)
+                if session is None:
+                    continue
+                tasks = state.list_contract_tasks(session.id)
+                if not tasks or any(task.status in {
+                    ContractTaskStatus.PENDING, ContractTaskStatus.RUNNING,
+                } for task in tasks):
+                    continue
+                writer = ArtifactWriter(self.config.output_root, item.manifest.name)
+                next_generation = self._enqueue_session_generation(item, state, writer, challenge)
+                pending.extend(next_generation)
+                self._emit(
+                    state, challenge, "SESSION_REPLANNED",
+                    message="Sol replaced terminal branches with a fresh contract generation",
+                    payload={"session_id": session.id, "generation": session.generation + 1,
+                             "contract_count": len(next_generation)},
+                )
 
     def _release_attempt(self, attempt_id: str, state: LocalState, *, preserve: bool) -> None:
         sandbox_pool = self._sandbox_by_attempt.pop(attempt_id, None)
@@ -1767,26 +1926,254 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
 
     # --- prompt/context integration ---------------------------------------------------
 
-    def _render_prompt(self, task: PlannedAttempt, challenge: Challenge) -> str:
+    def _initial_solve_plan(
+        self,
+        context: ChallengeContext,
+        challenge: Challenge,
+        findings: list[str],
+        failures: list[str],
+        summary: dict[str, object] | None = None,
+    ) -> SolvePlan:
+        """Produce the contracts that the scheduler actually executes.
+
+        The injected boundary is intentionally synchronous: a persistent Sol
+        session adapter can resume its own backend session and return the next
+        strict plan without teaching the scheduler about a particular Codex
+        transport.  The built-in plan is a category-aware bootstrap, not the
+        old score-zero/easy race.
+        """
+        if self._planner_plan_factory is not None:
+            plan = self._planner_plan_factory(
+                context, tuple(findings), tuple(failures), dict(summary or {}),
+            )
+            if not isinstance(plan, SolvePlan):
+                raise PrerequisiteError("planner plan factory must return a SolvePlan")
+            return plan
+        return self._bootstrap_solve_plan(challenge)
+
+    def _enqueue_session_generation(
+        self,
+        intake: IntakeChallenge,
+        state: LocalState,
+        writer: ArtifactWriter,
+        challenge: Challenge,
+        *,
+        require_live_leader: bool = True,
+    ) -> tuple[PlannedAttempt, ...]:
+        """Ask the persistent Sol controller for one generation of branches."""
+        session = state.get_or_create_challenge_session(
+            challenge.id, leader_model="gpt-5.6-sol", leader_profile="sol_xhigh",
+            reasoning_effort="max",
+        )
+        findings, failures, commands = self._local_evidence(state, challenge.id)
+        context = self._build_challenge_context(
+            intake, state, challenge, findings=findings, failures=failures, commands=commands,
+        )
+        if self._planner_plan_factory is None and require_live_leader:
+            leader = RaceAttempt.session_leader(
+                session.id, category=context.category,
+            )
+            return (PlannedAttempt(
+                intake, state, writer, leader, session_id=session.id,
+                is_session_leader=True,
+            ),)
+        # Keep the callback signature transport-independent while exposing the
+        # durable session summary to a resumed Sol adapter.
+        solve_plan = self._initial_solve_plan(
+            context, challenge, findings, failures, dict(session.summary_state),
+        )
+        state.checkpoint_challenge_session(
+            challenge.id,
+            execution_contract=asdict(solve_plan),
+            summary_state={
+                **dict(session.summary_state),
+                "findings": findings[-20:], "failures": failures[-20:],
+                "reviewed_findings": findings[-20:],
+                "commands": commands[-20:], "last_generation": session.generation + 1,
+            },
+            advance_generation=True,
+        )
+        contract_race = RacePlan.from_solve_plan(
+            solve_plan, category=context.category, session_id=session.id,
+        )
+        attempts = contract_race.attempts
+        ordered = StrategyReranker().rerank(attempts, findings=findings, failures=failures)
+        tasks: list[PlannedAttempt] = []
+        for race_attempt in ordered:
+            contract = race_attempt.contract
+            if contract is None:
+                continue
+            durable = state.upsert_contract_task(ContractTask(
+                id=stable_id(session.id, f"g{session.generation + 1}:{contract.id}", prefix="task_"),
+                session_id=session.id, challenge_id=challenge.id,
+                branch=f"g{session.generation + 1}:{contract.id}", role=contract.worker,
+                objective=contract.objective,
+                success_criteria=(contract.success_condition,),
+                deliverables=(contract.handoff,), failure_handoff=contract.stop_condition,
+            ))
+            tasks.append(PlannedAttempt(
+                intake, state, writer, race_attempt,
+                session_id=session.id, contract_task_id=durable.id,
+            ))
+        return tuple(tasks)
+
+    def _materialize_solve_plan(
+        self, leader_task: PlannedAttempt, challenge: Challenge, solve_plan: SolvePlan,
+    ) -> tuple[PlannedAttempt, ...]:
+        """Persist strict Sol output and turn it into schedulable branches."""
+        session = leader_task.state.get_challenge_session(challenge.id)
+        if session is None:
+            raise KeyError(f"missing challenge session: {challenge.id}")
+        findings, failures, _ = self._local_evidence(leader_task.state, challenge.id)
+        leader_task.state.checkpoint_challenge_session(
+            challenge.id, execution_contract=asdict(solve_plan),
+            summary_state={**dict(session.summary_state),
+                           "findings": findings[-20:], "failures": failures[-20:],
+                           "reviewed_findings": findings[-20:],
+                           "branch_handoffs": [
+                               item.result_summary for item in
+                               leader_task.state.list_contract_tasks(session.id)[-12:]
+                               if item.result_summary
+                           ],
+                           "last_generation": session.generation + 1},
+            advance_generation=True,
+        )
+        race = RacePlan.from_solve_plan(
+            solve_plan, category=challenge.category, session_id=session.id,
+        )
+        attempts = StrategyReranker().rerank(
+            race.attempts,
+            findings=findings, failures=failures,
+        )
+        materialized: list[PlannedAttempt] = []
+        for race_attempt in attempts:
+            contract = race_attempt.contract
+            assert contract is not None
+            durable = leader_task.state.upsert_contract_task(ContractTask(
+                id=stable_id(session.id, f"g{session.generation + 1}:{contract.id}", prefix="task_"),
+                session_id=session.id, challenge_id=challenge.id,
+                branch=f"g{session.generation + 1}:{contract.id}", role=contract.worker,
+                objective=contract.objective, success_criteria=(contract.success_condition,),
+                deliverables=(contract.handoff,), failure_handoff=contract.stop_condition,
+            ))
+            materialized.append(replace(
+                leader_task, race_attempt=race_attempt,
+                contract_task_id=durable.id, is_session_leader=False,
+            ))
+        return tuple(materialized)
+
+    @staticmethod
+    def _bootstrap_solve_plan(challenge: Challenge) -> SolvePlan:
+        category = challenge.category.casefold()
+        missing_score = challenge.score is None
+        hard = (challenge.score or 0) >= 500 or (missing_score and category in {"pwn", "rev", "crypto"})
+        easy = not missing_score and (challenge.score or 0) <= 200
+        worker_order = (
+            ("sol_high", "terra_high", "luna_medium") if hard
+            else (("luna_medium", "terra_high") if easy else ("terra_high", "luna_medium"))
+        )
+        objectives = {
+            "sol_high": "Own the core solve path, resolve the hardest conceptual fork, and leave a reproducible solver or exploit handoff.",
+            "terra_high": "Implement and execute the strongest concrete attack hypothesis; preserve a runnable solver or exploit and exact replay command.",
+            "luna_medium": "Answer one narrow branch-selecting question quickly with tool output that eliminates or promotes an attack path.",
+        }
+        contracts = tuple(
+            ExecutionContract(
+                id=chr(ord("A") + index), worker=worker,
+                exclusive_scope=f"{category} bootstrap branch {index + 1}: {worker}",
+                objective=objectives[worker],
+                first_decisive_action=(
+                    "Inspect the original inputs and execute the cheapest command that distinguishes the leading attack paths."
+                ),
+                success_condition="Produce a decisive finding or a runnable replay artifact that advances the challenge toward a real flag.",
+                stop_condition="Stop only after the assigned hypothesis is disproved with captured evidence or the replay artifact succeeds.",
+                handoff="Return findings, failed assumptions, artifact paths, and exact replay commands to the persistent Sol challenge session.",
+            )
+            for index, worker in enumerate(worker_order)
+        )
+        return SolvePlan(
+            solve_target="Obtain and reproduce the real challenge flag",
+            representation={
+                "crypto": "algebra", "pwn": "state", "rev": "validation",
+                "web": "protocol", "cloud": "protocol", "forensics": "file-flow",
+            }.get(category, "file-flow"),
+            mode="parallel" if len(contracts) > 1 else "direct",
+            contracts=contracts,
+            replan_when="new decisive result or two contracts terminate",
+            escalate_when="two distinct branches fail or conceptual ambiguity remains",
+        )
+
+    def _build_challenge_context(
+        self,
+        intake: IntakeChallenge,
+        state: LocalState,
+        challenge: Challenge,
+        *,
+        findings: list[str],
+        failures: list[str],
+        commands: list[str],
+    ) -> ChallengeContext:
         files: list[str] = []
-        if task.intake.workspace.is_dir():
-            for path in sorted(task.intake.workspace.rglob("*")):
+        if intake.workspace.is_dir():
+            for path in sorted(intake.workspace.rglob("*")):
                 if path.is_file() and not path.is_symlink():
-                    files.append("/workspace/" + str(path.relative_to(task.intake.workspace)))
+                    files.append("/workspace/" + str(path.relative_to(intake.workspace)))
                 if len(files) >= 100:
                     break
-        findings, failures, commands = self._local_evidence(task.state, challenge.id)
         knowledge = self._retrieve_knowledge(
-            challenge, findings=findings, failures=failures, strategy_seed=task.race_attempt.strategy_seed,
+            challenge, findings=findings, failures=failures, strategy_seed=challenge.id,
         )
-        supervisor_hints = self._supervisor_hints(task.state, challenge.id)
-        context = ChallengeContextBuilder().build(
-            {"id": challenge.id, "name": challenge.name, "category": challenge.category, "score": challenge.score or 0,
-             "description": challenge.description or "", "remote": challenge.remote or "",
+        supervisor_hints = self._supervisor_hints(state, challenge.id)
+        return ChallengeContextBuilder().build(
+            {"id": challenge.id, "name": challenge.name, "category": challenge.category,
+             "score": challenge.score, "description": challenge.description or "",
+             "remote": challenge.remote or "",
              "hints": tuple(item for item in ((challenge.hint or ""), *supervisor_hints) if item)},
-            files=files, findings=tuple(findings[:12]) + tuple(knowledge), failed_strategies=failures[:12], failed_commands=commands[:12],
+            files=files, findings=tuple(findings[:12]) + tuple(knowledge),
+            failed_strategies=failures[:12], failed_commands=commands[:12],
         )
-        return PromptRenderer().render(context, task.race_attempt)
+
+    def _render_prompt(self, task: PlannedAttempt, challenge: Challenge) -> str:
+        findings, failures, commands = self._local_evidence(task.state, challenge.id)
+        context = self._build_challenge_context(
+            task.intake, task.state, challenge,
+            findings=findings, failures=failures, commands=commands,
+        )
+        if task.is_session_leader:
+            session = task.state.get_challenge_session(challenge.id)
+            prior = task.state.list_contract_tasks(session.id) if session is not None else ()
+            contracts = tuple(
+                f"{item.branch}:{item.status.value}:{item.result_summary or ''}" for item in prior[-12:]
+            )
+            return CategoryPlanner().render(
+                context,
+                session_id=session.id if session is not None else task.session_id or "",
+                session_summary=(
+                    json.dumps(dict(session.summary_state), ensure_ascii=False, sort_keys=True)
+                    if session is not None else ""
+                ),
+                findings=findings[-20:], failures=failures[-20:], contracts=contracts,
+            )
+        session = task.state.get_challenge_session(challenge.id)
+        session_tasks = task.state.list_contract_tasks(session.id) if session is not None else ()
+        summary = dict(session.summary_state) if session is not None else {}
+        replay_artifacts = tuple(
+            f"/work/handoff/{item.id}/{Path(evidence).name}"
+            for item in session_tasks
+            for evidence in item.evidence_ids
+            if evidence != item.assigned_attempt_id and Path(evidence).name in {
+                "exploit.py", "solver.py", "replay.sh", "writeup.md",
+            }
+        )
+        handoff = SessionHandoff(
+            session_summary=json.dumps(summary, ensure_ascii=False, sort_keys=True),
+            validated_findings=tuple(str(item) for item in summary.get("reviewed_findings", ())),
+            replay_artifacts=replay_artifacts,
+            branch_handoffs=tuple(
+                item.result_summary for item in session_tasks[-12:] if item.result_summary
+            ),
+        )
+        return PromptRenderer().render(context, task.race_attempt, handoff=handoff)
 
     @staticmethod
     def _local_evidence(state: LocalState, challenge_id: str) -> tuple[list[str], list[str], list[str]]:

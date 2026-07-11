@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .context import ChallengeContext
+from .category_planner import CategoryPlanner
 from .race_plan import RaceAttempt
+
+
+@dataclass(frozen=True)
+class SessionHandoff:
+    """Coordinator-validated challenge state passed across isolated branches."""
+
+    session_summary: str = ""
+    validated_findings: tuple[str, ...] = ()
+    replay_artifacts: tuple[str, ...] = ()
+    branch_handoffs: tuple[str, ...] = ()
 
 _SAFETY = """Safety invariants:
 - This is an authorized CTF challenge only.
@@ -27,7 +40,19 @@ def _items(values: tuple[str, ...]) -> str:
 
 
 class PromptRenderer:
-    def render(self, context: ChallengeContext, attempt: RaceAttempt) -> str:
+    def render(
+        self, context: ChallengeContext, attempt: RaceAttempt, *, handoff: SessionHandoff | None = None,
+    ) -> str:
+        handoff = handoff or SessionHandoff()
+        if attempt.branch_kind == "leader":
+            return CategoryPlanner().render(
+                context,
+                session_id=attempt.session_id or "",
+                session_summary=handoff.session_summary,
+                findings=handoff.validated_findings or context.findings,
+                failures=context.failed_strategies,
+                contracts=handoff.branch_handoffs,
+            )
         contract = ""
         if attempt.contract is not None:
             item = attempt.contract
@@ -61,6 +86,7 @@ Attempt:
 - maximum runtime: {attempt.profile.max_runtime_sec} seconds
 - strategy seed: {attempt.strategy_seed}
 - profile instruction: {attempt.strategy_instruction}
+- persistent session: {attempt.session_id or '(legacy one-shot)'}
 
 Challenge files:
 {_items(context.files)}
@@ -79,6 +105,15 @@ Previously tried or failed commands; do not repeat without a new, recorded reaso
 
 Supervisor/operator guidance from this same local challenge:
 {_items(context.hints)}
+
+Controller-validated session state (trusted as handoff, but replay before a flag decision):
+- summary: {handoff.session_summary or '(none)'}
+- validated findings:
+{_items(handoff.validated_findings)}
+- parent-approved replay artifacts:
+{_items(handoff.replay_artifacts)}
+- completed branch handoffs:
+{_items(handoff.branch_handoffs)}
 
 {_SAFETY}
 

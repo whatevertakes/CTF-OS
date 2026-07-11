@@ -95,11 +95,13 @@ model_profiles:
       - fallback_xhigh
 
 default_roles:
+  session_leader: sol_xhigh
+  branch_takeover: sol_xhigh
   supervisor: sol_xhigh
   routine_supervisor: sol_medium
   architect: sol_xhigh
   implementer: terra_high
-  recon: terra_high
+  recon: luna_high
   source: sol_xhigh
   fallback: sol_xhigh
   summarizer: luna_medium

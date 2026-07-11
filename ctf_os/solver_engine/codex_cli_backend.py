@@ -28,6 +28,7 @@ _DANGEROUS_CLI_TOKENS = frozenset({
     "--danger-full-access", "--full-auto",
 })
 _BROKER_IPC_DIRECTORY = ".ctf-os-broker"
+_RESUME_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 
 
 def _require_broker_socket(socket_path: Path | None, workdir: Path) -> Path:
@@ -152,6 +153,8 @@ class CodexExecRequest:
     broker_socket: Path | None = None
     selection: ModelSelection | None = None
     json_events: bool = False
+    resume_id: str | None = None
+    persistent_session: bool = False
 
 
 @dataclass(frozen=True)
@@ -239,13 +242,19 @@ class CodexCliBackend:
         permission_override = _permission_profile_override(
             workdir, socket_path, runtime_executable=_runtime_executable(self.command),
         )
+        persistent = request.persistent_session or request.resume_id is not None
+        if request.resume_id is not None and not _RESUME_ID.fullmatch(request.resume_id):
+            raise ValueError("resume_id must be a bounded opaque Codex session identifier")
         argv = [
             self.command,
             "exec",
             "--strict-config",
             "--ignore-user-config",
             "--ignore-rules",
-            "--ephemeral",
+        ]
+        if not persistent:
+            argv.append("--ephemeral")
+        argv.extend([
             "--disable",
             "hooks",
             "--skip-git-repo-check",
@@ -263,15 +272,18 @@ class CodexCliBackend:
             'default_permissions="ctf_os_attempt"',
             "-c",
             permission_override,
-        ]
+        ])
         if request.json_events:
             argv.append("--json")
+        if request.resume_id is not None:
+            argv.extend(["resume", request.resume_id])
         argv.append(request.prompt)
         _validate_production_argv(
             argv,
             workdir=workdir,
             socket_path=socket_path,
             runtime_executable=_runtime_executable(self.command),
+            require_ephemeral=not persistent,
         )
         return argv
 
@@ -368,7 +380,8 @@ class CodexCliBackend:
                     stdout.append(record.line)
                 else:
                     stderr.append(record.line)
-                self._deliver(record, on_output, evidence_sink)
+                for delivered in self._observable_records(record, json_events=request.json_events):
+                    self._deliver(delivered, on_output, evidence_sink)
 
             returncode, stopped_for_wait = self._wait_until_reaped(
                 proc,
@@ -383,10 +396,11 @@ class CodexCliBackend:
             failure_kind, failure_code = self._structured_failure(
                 (*stdout, *stderr), json_events=request.json_events,
             )
+            assistant_output = self._assistant_output(tuple(stdout)) if request.json_events else "\n".join(stdout)
             return CodexExecResult(
                 argv=tuple(argv),
                 returncode=returncode,
-                stdout="\n".join(stdout),
+                stdout=assistant_output,
                 stderr="\n".join(stderr),
                 timed_out=timed_out,
                 # Never infer service state from arbitrary retained output:
@@ -395,8 +409,8 @@ class CodexCliBackend:
                 # trusted service-failure provenance.
                 rate_limited=failure_kind == "rate_limited",
                 token_usage=self._parse_token_usage(combined),
-                session_id=self._parse_session_id(combined),
-                resume_id=self._parse_resume_id(combined),
+                session_id=self._parse_session_id(combined, machine_events_only=request.json_events),
+                resume_id=self._parse_resume_id(combined, machine_events_only=request.json_events),
                 unavailable=failure_kind == "unavailable",
                 truncated=truncated,
                 failure_provenance="structured" if failure_kind is not None else None,
@@ -438,6 +452,33 @@ class CodexCliBackend:
         else:
             sink.write(f"[{record.stream}] {record.line}\n")
             sink.flush()
+
+    @staticmethod
+    def _observable_records(record: CodexStreamRecord, *, json_events: bool) -> tuple[CodexStreamRecord, ...]:
+        """Expose assistant text, never raw JSON envelopes, to solver parsers."""
+        if not json_events or record.stream != "stdout":
+            return (record,)
+        try:
+            event = json.loads(record.line)
+        except json.JSONDecodeError:
+            return ()
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            return ()
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            return ()
+        value = item.get("text")
+        if not isinstance(value, str):
+            return ()
+        return tuple(CodexStreamRecord("stdout", line) for line in value.splitlines())
+
+    @classmethod
+    def _assistant_output(cls, lines: tuple[str, ...]) -> str:
+        return "\n".join(
+            record.line
+            for line in lines
+            for record in cls._observable_records(CodexStreamRecord("stdout", line), json_events=True)
+        )
 
     def _terminate_process_group(self, proc: Any, grace_sec: float) -> None:
         self._kill_process_group(proc, signal.SIGTERM)
@@ -502,14 +543,30 @@ class CodexCliBackend:
         return int(match.group(1).replace(",", "")) if match else None
 
     @staticmethod
-    def _parse_session_id(output: str) -> str | None:
+    def _parse_session_id(output: str, *, machine_events_only: bool = False) -> str | None:
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                for key in ("thread_id", "session_id"):
+                    value = event.get(key)
+                    if isinstance(value, str) and _RESUME_ID.fullmatch(value):
+                        return value
+        if machine_events_only:
+            return None
         match = re.search(r"session[ _-]?id\s*[:=]\s*\"?([A-Za-z0-9_.-]+)", output, re.IGNORECASE)
         return match.group(1) if match else None
 
     @staticmethod
-    def _parse_resume_id(output: str) -> str | None:
+    def _parse_resume_id(output: str, *, machine_events_only: bool = False) -> str | None:
+        if machine_events_only:
+            return CodexCliBackend._parse_session_id(output, machine_events_only=True)
         match = re.search(r"resume[ _-]?id\s*[:=]\s*\"?([A-Za-z0-9_.-]+)", output, re.IGNORECASE)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+        return CodexCliBackend._parse_session_id(output)
 
     @staticmethod
     def _structured_failure(
@@ -662,12 +719,14 @@ class CodexCliBackend:
 
 def _validate_production_argv(
     argv: list[str], *, workdir: Path, socket_path: Path,
-    runtime_executable: Path | None = None,
+    runtime_executable: Path | None = None, require_ephemeral: bool = True,
 ) -> None:
     """Assert the non-negotiable named-profile argv construction."""
     if any(item in _DANGEROUS_CLI_TOKENS or "dangerously-bypass" in item or "danger-full-access" in item for item in argv):
         raise ValueError("production Codex argv contains a legacy sandbox or dangerous escape hatch")
-    required_flags = {"--strict-config", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check"}
+    required_flags = {"--strict-config", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"}
+    if require_ephemeral:
+        required_flags.add("--ephemeral")
     if not required_flags.issubset(argv):
         raise ValueError("production Codex argv lacks strict isolation flags")
     configs = [argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "-c"]

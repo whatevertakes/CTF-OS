@@ -246,13 +246,13 @@ def test_h2_reassigned_old_callback_cannot_mutate_aggregate_or_events(tmp_path: 
     _config_value, app, state, challenge, task = _planned_task(tmp_path)
     staging = task.writer.create_attempt_staging()
     old = Attempt(id="attempt-old", challenge_id=challenge.id, profile="recon_fast", role="recon", backend="codex_cli", workdir=str(staging.workdir))
-    first = state.claim_attempt(old, owner=app._owner, lease_seconds=0.01, max_workers_total=1, max_workers_per_challenge=1)
+    first = state.claim_attempt(old, owner=app._owner, lease_seconds=0.2, max_workers_total=1, max_workers_per_challenge=1)
     assert first.granted and first.fencing_token
     old = replace(old, lease_owner=app._owner, fencing_token=first.fencing_token, status=AttemptStatus.RUNNING)
     state.upsert_attempt(old, owner=app._owner, fencing_token=first.fencing_token)
     state.transition_challenge_status(challenge.id, ChallengeStatus.RUNNING, attempt_id=old.id, owner=app._owner, fencing_token=first.fencing_token)
     import time
-    time.sleep(0.03)
+    time.sleep(0.25)
     replacement = Attempt(id="attempt-new", challenge_id=challenge.id, profile="recon_fast", role="recon", backend="codex_cli", workdir="/work")
     second = state.claim_attempt(replacement, owner="new-owner", lease_seconds=30, max_workers_total=1, max_workers_per_challenge=1)
     assert second.granted

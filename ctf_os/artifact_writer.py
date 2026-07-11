@@ -303,6 +303,127 @@ class ArtifactWriter:
                 approved.append(self.challenge_dir(challenge) / ("final" if destination_name in {"exploit.py", "replay.sh"} else "") / destination_name)
         return tuple(approved)
 
+    def promote_session_handoff_artifacts(
+        self,
+        challenge: Challenge,
+        *,
+        session_id: str,
+        contract_id: str,
+        attempt_workdir: str | Path,
+        artifact_paths: Iterable[str | Path],
+        parent_approved: bool,
+    ) -> tuple[Path, ...]:
+        """Snapshot useful branch output for Sol without declaring it final.
+
+        The controller must parse/review the branch result before setting
+        ``parent_approved``. Sources remain restricted to this attempt's
+        descriptor-validated staging tree and to replay-oriented filenames.
+        """
+        if not parent_approved:
+            return ()
+        session_name = _safe_name(session_id)
+        branch_name = _safe_name(contract_id)
+        staging = self.staging_for_workdir(attempt_workdir)
+        promoted: list[Path] = []
+        with _open_attempt_staging(staging.workdir) as (_root_fd, work_fd, artifacts_fd):
+            with self._challenge_fd(challenge) as challenge_fd:
+                handoff_fd = _open_or_create_dir(challenge_fd, "handoff")
+                try:
+                    session_fd = _open_or_create_dir(handoff_fd, session_name)
+                    try:
+                        branch_fd = _open_or_create_dir(session_fd, branch_name)
+                        try:
+                            for supplied in artifact_paths:
+                                match = _attempt_source_relative(Path(supplied), staging.workdir, staging.artifacts)
+                                if match is None:
+                                    continue
+                                source_root, components = match
+                                name = components[-1]
+                                if name not in {"exploit.py", "replay.sh", "writeup.md", "solver.py"}:
+                                    continue
+                                source_fd = _open_regular_at(work_fd if source_root == "work" else artifacts_fd, components)
+                                try:
+                                    _copy_fd_atomic_to_fd(source_fd, branch_fd, name)
+                                finally:
+                                    os.close(source_fd)
+                                promoted.append(self.challenge_dir(challenge) / "handoff" / session_name / branch_name / name)
+                        finally:
+                            os.close(branch_fd)
+                    finally:
+                        os.close(session_fd)
+                finally:
+                    os.close(handoff_fd)
+        return tuple(promoted)
+
+    def seed_session_handoff_artifacts(
+        self,
+        challenge: Challenge,
+        *,
+        session_id: str,
+        attempt_workdir: str | Path,
+    ) -> tuple[str, ...]:
+        """Copy controller-approved branch artifacts into a new attempt seed.
+
+        Aggregate output is never mounted directly.  Each new isolated branch
+        receives a bounded snapshot below ``/work/handoff`` before its sandbox
+        starts, so it can reuse a solver without gaining access to sibling
+        staging roots or mutable challenge-level state.
+        """
+        staging = self.staging_for_workdir(attempt_workdir)
+        copied: list[str] = []
+        with self._challenge_fd(challenge) as challenge_fd:
+            try:
+                handoff_fd = os.open("handoff", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=challenge_fd)
+            except FileNotFoundError:
+                return ()
+            try:
+                try:
+                    session_fd = os.open(
+                        _safe_name(session_id), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=handoff_fd,
+                    )
+                except FileNotFoundError:
+                    return ()
+                try:
+                    with _open_attempt_staging(staging.workdir) as (_root_fd, work_fd, _artifacts_fd):
+                        seed_fd = _open_or_create_dir(work_fd, "handoff")
+                        try:
+                            for branch in sorted(os.listdir(session_fd)):
+                                _safe_name(branch)
+                                try:
+                                    source_branch_fd = os.open(
+                                        branch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                        dir_fd=session_fd,
+                                    )
+                                except OSError:
+                                    continue
+                                try:
+                                    destination_branch_fd = _open_or_create_dir(seed_fd, branch)
+                                    try:
+                                        for name in sorted(os.listdir(source_branch_fd)):
+                                            if name not in {"exploit.py", "solver.py", "replay.sh", "writeup.md"}:
+                                                continue
+                                            try:
+                                                source_fd = _open_regular_at(source_branch_fd, (name,))
+                                            except ValueError:
+                                                continue
+                                            try:
+                                                _copy_fd_atomic_to_fd(source_fd, destination_branch_fd, name)
+                                            finally:
+                                                os.close(source_fd)
+                                            copied.append(f"/work/handoff/{branch}/{name}")
+                                    finally:
+                                        os.close(destination_branch_fd)
+                                finally:
+                                    os.close(source_branch_fd)
+                        finally:
+                            os.close(seed_fd)
+                finally:
+                    os.close(session_fd)
+            finally:
+                os.close(handoff_fd)
+        return tuple(copied)
+
     @contextmanager
     def _challenge_fd(self, challenge: Challenge):
         root_fd = _open_directory(self.output_root)

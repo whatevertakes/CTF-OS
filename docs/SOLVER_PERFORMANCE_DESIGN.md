@@ -3,69 +3,53 @@
 This policy optimizes valid-flag solve rate, not prose quality, evidence volume,
 or model cost. Safety and candidate verification remain hard constraints.
 
+## Persistent solve session
+
+Every queued challenge has one durable `ChallengeSession`. Sol owns that
+session across planning generations, resumes the same Codex thread, issues
+strict `ExecutionContract` branches, synthesizes their handoffs, and decides
+what must run next. A completed recon or failed exploit ends only its branch;
+it does not end the challenge session.
+
+```text
+ChallengeSession (Sol max, persistent)
+├─ Luna: narrow reconnaissance and branch-selecting tool checks
+├─ Terra: concrete exploit, decoder, solver, and independent reproduction
+├─ Sol: hard conceptual branch or stalled-branch takeover
+└─ Sol: synthesis, replanning, replay review, and termination decision
+```
+
+Each contract states its exclusive scope, first decisive action, success
+condition, stop condition, required deliverables, and failure handoff. The
+scheduler persists both the session and every contract task in local SQLite.
+
 ## Model roles
 
-- **GPT-5.6 Sol** is the primary medium/hard solver, stalled-branch takeover,
-  and final exploit solver at `max` effort. It is not held back as a reviewer.
-- **GPT-5.6 Terra** runs complete independent alternative solves and tool-heavy
-  branches. It is not merely an implementation subcontractor.
-- **GPT-5.6 Luna** runs a complete fast independent solve on easy challenges.
-  It is not used merely to summarize another solver.
-
-This ordering follows OpenAI's published CTF results: Sol 96.7%, Terra 91.8%,
-and Luna 85.2%, as well as the corresponding Terminal-Bench 2.1 results of
-88.8%, 87.4%, and 84.7%. OpenAI identifies Sol as the flagship, Terra as the
-balanced tier, Luna as the fastest tier, and documents `max` as a GPT-5.6
-reasoning level. No public category-by-category comparison exists, so this
-repository does not invent a claim that one tier is intrinsically a crypto,
-pwn, or web specialist.
-
-Sources:
-
-- [OpenAI GPT-5.6 release and benchmark tables](https://openai.com/index/gpt-5-6/)
-- [GPT-5.6 Sol API model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
-- [GPT-5.6 Terra API model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
-- [GPT-5.6 Luna API model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+- **Sol** owns the problem, creates/replaces contracts, resolves hard forks,
+  takes over stalled work, and performs final synthesis.
+- **Terra** implements a concrete attack branch and leaves a runnable artifact
+  plus exact replay instructions.
+- **Luna** answers a narrow uncertainty quickly. It is not the primary owner of
+  an unscored challenge.
 
 ## Solver algorithm
 
-`RacePlan` now maps each attempt to an executable category search direction.
-Pwn uses mitigation/primitive/debugger/exploit loops; rev races static,
-dynamic, emulation, and symbolic paths; crypto classifies parameters before
-implementing competing attacks; web preserves sessions and branches by
-endpoint and vulnerability class; forensics recursively extracts typed
-artifacts; cloud traces effective identity/resource access; misc first runs a
-bounded domain-classification portfolio.
+`CategoryPlanner` output is the scheduler input. `RacePlan.from_solve_plan`
+turns the plan into branch attempts; the score-only race is a compatibility
+fallback, not the normal production path. Missing scores are never treated as
+easy: pwn, rev, and crypto start at hard/Sol ownership, while other categories
+start at least medium.
 
-Parallel attempts must differ in primitive, vulnerability family,
-representation, or tool path. Every worker operates in a closed command-output
-loop and pivots when a branch produces no new state, primitive, decoded bytes,
-or constraint. Executable scripts, debuggers, supplied samples, round trips,
-and challenge feedback outrank model confidence.
+Workers keep isolated `/work` directories. The controller promotes bounded
+records and approved `exploit.py`, `solver.py`, `replay.sh`, or `writeup.md`
+snapshots into a challenge handoff area and seeds later branches from that
+area. Raw flag-shaped output is only an observation; it does not change the
+challenge lifecycle. Replay evidence and controller approval are required for
+a solved decision.
 
-The design is grounded in:
+## Validation policy
 
-- [EnIGMA](https://arxiv.org/abs/2409.16165), whose interactive tools,
-  summarizer, and demonstrations each improved NYU CTF pass@1 in ablations.
-- [EnIGMA implementation](https://github.com/SWE-agent/SWE-agent/tree/v0.7),
-  including debugger and remote-interaction interfaces.
-- [NYU CTF Bench (NeurIPS 2024)](https://nyu-llm-ctf.github.io/), the
-  six-category, 200-challenge benchmark used for category solve rates.
-- [InterCode](https://arxiv.org/abs/2306.14898), which evaluates multi-step
-  action/feedback interaction in containerized environments.
-- [Cybench](https://openreview.net/forum?id=tc90LV0yRL), which evaluates
-  unguided solves on professional CTF challenges.
-- [D-CIPHER reference agents](https://github.com/NYU-LLM-CTF/nyuctf_agents),
-  supporting planner plus heterogeneous executor portfolios.
-- [Scaling LLM test-time compute](https://arxiv.org/abs/2408.03314), supporting
-  difficulty-adaptive search rather than equal compute for every branch.
-- [AlphaCode](https://arxiv.org/abs/2203.07814), supporting diverse sampling,
-  execution filtering, clustering, and reranking instead of duplicate samples.
-
-## Performance gate
-
-Architecture changes should be compared on a held-out, category-stratified CTF
-set using valid-flag pass@1, fixed-budget pass@k, and time to first valid flag.
-Subtask completion and report quality are diagnostics only. Category routing
-must ultimately be calibrated from local blind solve rates rather than asserted
-from model names.
+Solver quality is evaluated during authorized real CTF operation. Repository
+checks cover parser, state migration, scheduling, handoff, routing, sandbox,
+and mock/integration behavior only. CTF-OS does not run a synthetic benchmark
+suite or use benchmark scores to retune model routing.

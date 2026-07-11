@@ -20,6 +20,7 @@ class AttemptProfile:
 
 
 ATTEMPT_PROFILES: dict[str, AttemptProfile] = {
+    "session_leader": AttemptProfile("session_leader", "session_leader", "own, synthesize, and advance one challenge session", 1800),
     "recon_fast": AttemptProfile("recon_fast", "recon", "fast file, remote, and description reconnaissance", 300),
     "recon_deep": AttemptProfile("recon_deep", "recon", "deep initial reconnaissance", 900),
     "exploit_fast": AttemptProfile("exploit_fast", "exploit", "quickly recover a simple vulnerability", 600),
@@ -109,11 +110,31 @@ class RaceAttempt:
     profile: AttemptProfile
     category: str = "misc"
     contract: ExecutionContract | None = None
+    session_id: str | None = None
+    branch_kind: str = "solve"
+
+    @classmethod
+    def session_leader(
+        cls, session_id: str, *, category: str, attempt_id: str | None = None,
+        strategy_seed: str | None = None,
+    ) -> "RaceAttempt":
+        return cls(
+            attempt_id or uuid4().hex, strategy_seed or token_hex(8), ATTEMPT_PROFILES["session_leader"],
+            category=canonical_solver_category(category), session_id=session_id, branch_kind="leader",
+        )
 
     @property
     def strategy_instruction(self) -> str:
         if self.contract is not None:
-            return self.contract.objective
+            contract = self.contract
+            return (
+                f"Objective: {contract.objective}\n"
+                f"Exclusive scope: {contract.exclusive_scope}\n"
+                f"First decisive action: {contract.first_decisive_action}\n"
+                f"Success condition: {contract.success_condition}\n"
+                f"Stop condition: {contract.stop_condition}\n"
+                f"Required handoff: {contract.handoff}"
+            )
         phase = {"recon_fast": "recon", "recon_deep": "recon", "source_deep": "source",
                  "exploit_fast": "main", "exploit_main": "main", "exploit_alt": "alt",
                  "fallback": "fallback", "verifier": "main"}.get(self.profile.name, "main")
@@ -131,7 +152,8 @@ class RacePlan:
 
     @classmethod
     def from_solve_plan(
-        cls, plan: SolvePlan, *, id_factory: Callable[[], str] | None = None,
+        cls, plan: SolvePlan, *, category: str = "misc", session_id: str | None = None,
+        id_factory: Callable[[], str] | None = None,
         seed_factory: Callable[[], str] | None = None,
     ) -> "RacePlan":
         make_id = id_factory or (lambda: uuid4().hex)
@@ -140,13 +162,17 @@ class RacePlan:
             "terra_high": AttemptProfile("contract_terra_high", "implementer", "execute a concrete solve contract", 1200),
             "luna_medium": AttemptProfile("contract_luna_medium", "recon", "answer a narrow branch question", 600),
             "sol_high": AttemptProfile("contract_sol_high", "source", "resolve a hard conceptual fork", 1500),
+            "terra_xhigh": AttemptProfile("contract_terra_xhigh", "implementer", "execute a deep implementation contract", 1800),
+            "luna_high": AttemptProfile("contract_luna_high", "recon", "answer a deep branch question", 900),
+            "sol_xhigh": AttemptProfile("contract_sol_xhigh", "takeover", "take over a stalled or core solve branch", 1800),
         }
         return cls(
             difficulty="contract",
             attempts=tuple(
                 RaceAttempt(
                     make_id(), make_seed(), profiles[item.worker],
-                    category="misc", contract=item,
+                    category=canonical_solver_category(category), contract=item, session_id=session_id,
+                    branch_kind="contract",
                 )
                 for item in plan.contracts
             ),
@@ -155,19 +181,19 @@ class RacePlan:
     @classmethod
     def for_score(
         cls,
-        score: int,
+        score: int | None,
         *,
         category: str = "misc",
         id_factory: Callable[[], str] | None = None,
         seed_factory: Callable[[], str] | None = None,
     ) -> "RacePlan":
         """Return a full plan; 401--499 is treated as medium to avoid an uncovered gap."""
-        if score < 0:
+        if score is not None and score < 0:
             raise ValueError("score must be non-negative")
-        difficulty = "easy" if score <= 200 else "medium" if score < 500 else "hard"
+        normalized = canonical_solver_category(category)
+        difficulty = cls.difficulty_for(score, category=normalized)
         make_id = id_factory or (lambda: uuid4().hex)
         make_seed = seed_factory or (lambda: token_hex(8))
-        normalized = canonical_solver_category(category)
         return cls(
             difficulty=difficulty,
             attempts=tuple(
@@ -175,6 +201,14 @@ class RacePlan:
                 for name in _PROFILE_NAMES[difficulty]
             ),
         )
+
+    @staticmethod
+    def difficulty_for(score: int | None, *, category: str = "misc") -> str:
+        """Classify scheduler cost without silently treating an absent score as easy."""
+        normalized = canonical_solver_category(category)
+        if score is None:
+            return "hard" if normalized in {"pwn", "rev", "crypto"} else "medium"
+        return "easy" if score <= 200 else "medium" if score < 500 else "hard"
 
     @classmethod
     def build(

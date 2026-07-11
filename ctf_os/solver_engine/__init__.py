@@ -7,7 +7,7 @@ from .knowledge import KnowledgeChunk, KnowledgeIndex, PlaybookSelector
 from .loop_detector import LoopDetector, LoopSignal
 from .mock_backend import MockBackend
 from .parser import ActionObservationParser
-from .prompt import PromptRenderer
+from .prompt import PromptRenderer, SessionHandoff
 from .race_plan import ATTEMPT_PROFILES, AttemptProfile, RaceAttempt, RacePlan
 from .strategy_reranker import StrategyReranker
 from .types import BackendResult, SolverEvent
@@ -32,6 +32,7 @@ __all__ = [
     "MockBackend",
     "PlaybookSelector",
     "PromptRenderer",
+    "SessionHandoff",
     "RaceAttempt",
     "RacePlan",
     "SolverBackend",

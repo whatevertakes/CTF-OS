@@ -7,8 +7,8 @@ import pytest
 from ctf_os.model_routing import ModelRouter
 from ctf_os.solver_engine.category_planner import CategoryPlanner, PlanParseError, SolvePlanParser
 from ctf_os.solver_engine.context import ChallengeContextBuilder
-from ctf_os.solver_engine.prompt import PromptRenderer
-from ctf_os.solver_engine.race_plan import RacePlan
+from ctf_os.solver_engine.prompt import PromptRenderer, SessionHandoff
+from ctf_os.solver_engine.race_plan import RaceAttempt, RacePlan
 
 
 def _payload(**changes):
@@ -36,11 +36,16 @@ def test_category_planner_renders_bounded_state_and_exact_json_instruction() -> 
         {"id": "check", "title": "Check", "category": "web", "description": "bypass", "remotes": ["https://ctf.example"]},
         files=["/workspace/app.py"],
     )
-    prompt = CategoryPlanner().render(context, findings=["comparison trims NUL"], failures=["SQLi eliminated"])
+    prompt = CategoryPlanner().render(
+        context, session_id="s1", session_summary="validator path remains",
+        findings=["comparison trims NUL"], failures=["SQLi eliminated"],
+    )
     assert "You are Sol, the local solve orchestrator" in prompt
     assert 'files: ["/workspace/app.py"]' in prompt
     assert 'authorized_remotes: ["https://ctf.example"]' in prompt
     assert 'decisive_observations: ["comparison trims NUL"]' in prompt
+    assert "session_id: s1" in prompt
+    assert "rolling_session_summary: validator path remains" in prompt
     assert "Return exactly one JSON object" in prompt
     assert "private chain-of-thought" not in prompt
 
@@ -82,3 +87,47 @@ def test_contract_worker_name_selects_the_exact_configured_profile() -> None:
     assert (selection.profile, selection.model, selection.reasoning_effort) == (
         "terra_high", "gpt-5.6-terra", "high",
     )
+
+
+def test_missing_score_never_becomes_easy_and_hard_categories_start_hard() -> None:
+    assert RacePlan.for_score(None, category="web").difficulty == "medium"
+    assert RacePlan.for_score(None, category="pwn").difficulty == "hard"
+    assert RacePlan.for_score(None, category="cryptography").difficulty == "hard"
+
+
+def test_contract_attempt_carries_session_category_and_validated_handoff() -> None:
+    plan = SolvePlanParser().parse(json.dumps(_payload()))
+    attempt = RacePlan.from_solve_plan(
+        plan, category="web", session_id="session-1", id_factory=lambda: "branch-1",
+        seed_factory=lambda: "seed",
+    ).attempts[0]
+    prompt = PromptRenderer().render(
+        ChallengeContextBuilder().build({"id": "check", "category": "web"}), attempt,
+        handoff=SessionHandoff(
+            session_summary="validator is the active route",
+            validated_findings=("NUL survives decoding",),
+            replay_artifacts=("handoff/session-1/A/replay.sh",),
+            branch_handoffs=("B eliminated SQL injection",),
+        ),
+    )
+    assert attempt.session_id == "session-1"
+    assert attempt.branch_kind == "contract"
+    assert attempt.category == "web"
+    assert "Controller-validated session state" in prompt
+    assert "NUL survives decoding" in prompt
+
+
+def test_session_leader_is_explicit_persistent_sol_role() -> None:
+    attempt = RaceAttempt.session_leader("session-1", category="rev", attempt_id="leader", strategy_seed="s")
+    router = ModelRouter.from_file("config/model-routing.yaml")
+    selected = router.select(role=attempt.profile.role)
+    assert attempt.branch_kind == "leader"
+    assert selected.model == "gpt-5.6-sol"
+    assert selected.reasoning_effort == "max"
+    prompt = PromptRenderer().render(
+        ChallengeContextBuilder().build({"id": "rev", "category": "rev"}), attempt,
+        handoff=SessionHandoff(session_summary="comparison recovered"),
+    )
+    assert "Return exactly one JSON object" in prompt
+    assert "rolling_session_summary: comparison recovered" in prompt
+    assert "[FLAG_CANDIDATE]" not in prompt
