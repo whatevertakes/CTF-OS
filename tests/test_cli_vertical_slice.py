@@ -62,7 +62,6 @@ def test_init_creates_team_and_member_isolated_local_paths(tmp_path: Path) -> No
     assert config.team_id == "sca-jiwoong-team"
     assert config.member_name == "jiwoong"
     assert config.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jiwoong" / "SCA CTF 2026"
-    assert config.sync_root == tmp_path / "sync"
     assert "team_namespace" not in config.get_mapping("sync")
     assert "forensic" in config.owned_categories
     contest_root = tmp_path / "incoming" / "SCA CTF 2026"
@@ -185,12 +184,16 @@ def test_doctor_checks_only_the_configured_contest_manifest(tmp_path: Path) -> N
     current = config.incoming_contest_dir() / "contest.md"
     current.parent.mkdir(parents=True, exist_ok=True)
     current.write_text("# 대회명: Demo\n\n### web/login\n- 점수: 1\n", encoding="utf-8")
+    (current.parent / "web" / "login").mkdir(parents=True)
+    (current.parent / "web" / "login" / "challenge.txt").write_text("ready\n", encoding="utf-8")
 
     report = run_doctor(config.path, which=lambda _: None)
 
-    manifest_checks = [check for check in report.checks if check.name == "contest manifest"]
+    manifest_checks = [check for check in report.checks if check.name == "contest intake"]
     assert len(manifest_checks) == 1
-    assert manifest_checks[0].ok and manifest_checks[0].detail == str(current)
+    assert manifest_checks[0].ok
+    assert str(current) in manifest_checks[0].detail
+    assert "1 owned challenge(s) ready" in manifest_checks[0].detail
     assert all(str(old) not in check.detail for check in report.checks)
     assert report.exit_code == 0
 
@@ -229,6 +232,12 @@ def test_sandbox_exec_maps_local_attempt_to_docker_argv_and_cleanup_is_scoped(tm
 
 def test_doctor_is_mock_safe_when_sandbox_is_disabled(tmp_path: Path) -> None:
     config = _write_config(tmp_path, sandbox_enabled=False)
+    manifest = config.incoming_contest_dir() / "contest.md"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("# 대회명: Demo\n\n### web/login\n- 설명: ready\n", encoding="utf-8")
+    source = manifest.parent / "web" / "login"
+    source.mkdir(parents=True)
+    (source / "challenge.txt").write_text("ready\n", encoding="utf-8")
     report = run_doctor(config.path, which=lambda _: None)
     assert report.exit_code == 0
     assert any(check.name == "docker sandbox" and check.ok for check in report.checks)

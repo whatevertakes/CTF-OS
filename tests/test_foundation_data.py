@@ -7,10 +7,8 @@ import pytest
 from ctf_os.artifact_writer import ArtifactWriter
 from ctf_os.contest_parser import ContestParseError, filter_challenges, parse_contest
 from ctf_os.flag_detector import FlagDetector, is_placeholder
-from ctf_os.local_event_bus import LocalEventBus
 from ctf_os.local_state import LocalState, StateTransitionError
 from ctf_os.models import Attempt, Challenge, ChallengeStatus, Event, FlagCandidate
-from ctf_os.team_sync import TeamSync
 
 
 def _manifest(tmp_path):
@@ -107,27 +105,6 @@ def test_local_state_upsert_transitions_attempt_events_and_candidates(tmp_path, 
     candidate = FlagCandidate(challenge_id=inserted.id, attempt_id=attempt.id, value="SCA{REAL_FLAG}", confidence=0.9)
     state.add_flag_candidate(candidate)
     assert state.list_flag_candidates(inserted.id) == [candidate]
-
-
-def test_jsonl_local_events_and_team_merge_are_isolated_deduplicated_and_tolerant(tmp_path):
-    root = tmp_path / "sync"
-    timestamp = datetime(2026, 7, 10, 12, tzinfo=timezone.utc)
-    duplicate = Event(id="event_shared", timestamp=timestamp, team_id="team-a", member="alice", contest="SCA", type="RUNNING")
-    alice = TeamSync(root, team_id="team-a", member="alice")
-    alice.append(duplicate)
-    with pytest.raises(PermissionError):
-        alice.append(Event(team_id="team-a", member="bob", contest="SCA", type="RUNNING"))
-
-    bob_path = root / "team-a" / "bob.events.jsonl"
-    LocalEventBus(bob_path, member="bob").append(Event(id="event_shared", timestamp=timestamp, team_id="team-a", member="bob", contest="SCA", type="RUNNING"))
-    LocalEventBus(bob_path, member="bob").append(Event(timestamp=timestamp, team_id="other-team", member="bob", contest="SCA", type="SOLVED"))
-    with bob_path.open("ab") as handle:
-        handle.write(b'{"id":"interrupted"')
-
-    merged = alice.merge()
-    assert [event.id for event in merged] == ["event_shared"]
-    assert merged[0].member == "alice"  # deterministic duplicate winner
-    assert bob_path.read_bytes().endswith(b'{"id":"interrupted"')  # merge is read-only
 
 
 def test_flag_detector_prioritizes_custom_patterns_and_filters_placeholders():

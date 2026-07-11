@@ -18,11 +18,9 @@ from textual.containers import Vertical
 from textual.widgets import DataTable, Footer, Header, Static
 
 from .config import AppConfig
-from .local_event_bus import EventLogDiagnostic
 from .local_state import LocalState
-from .merged_team_state import MergedTeamState
+from .local_event_state import LocalEventState
 from .models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, FlagCandidate
-from .team_sync import TeamSync
 
 
 _ACTIVE_ATTEMPT_STATUSES = frozenset({AttemptStatus.QUEUED, AttemptStatus.RUNNING})
@@ -66,18 +64,18 @@ def challenge_view(
     state: LocalState,
     challenge_id: str,
     *,
-    team_state: MergedTeamState | None = None,
+    event_state: LocalEventState | None = None,
 ) -> ChallengeView | None:
     """Project one challenge and only its owned flag candidates."""
     challenge = state.get_challenge(challenge_id)
     if challenge is None:
         return None
-    team = (team_state or MergedTeamState()).get(challenge.challenge_key)
+    projected = (event_state or LocalEventState()).get(challenge.challenge_key)
     attempts = state.list_attempts(challenge.id)
     candidates = state.list_flag_candidates(challenge.id)
     candidate = _primary_candidate(candidates)
-    verified = challenge.flag or (team.solved_flag if team else None)
-    latest = None if verified else ((candidate.value if candidate else None) or (team.candidate_flag if team else None))
+    verified = challenge.flag or (projected.solved_flag if projected else None)
+    latest = None if verified else ((candidate.value if candidate else None) or (projected.candidate_flag if projected else None))
     return ChallengeView(
         challenge_id=challenge.id,
         challenge_key=challenge.challenge_key,
@@ -85,12 +83,12 @@ def challenge_view(
         category=challenge.category,
         score=challenge.score,
         assignee=challenge.assignee,
-        status=_display_status(challenge, team),
+        status=_display_status(challenge, projected),
         active_attempts=sum(_attempt_is_active(attempt) for attempt in attempts),
         verified_flag=verified,
         latest_candidate=latest,
         candidate_source_attempt=candidate.attempt_id if candidate else None,
-        solved_by_member=getattr(team, "solved_by_member", None) if team else None,
+        solved_by_member=getattr(projected, "solved_by_member", None) if projected else None,
     )
 
 
@@ -104,15 +102,14 @@ class CTFOSDashboard(App[None]):
         ("active workers", "workers"), ("flag", "flag"),
     )
 
-    def __init__(self, config: AppConfig, state: LocalState, *, team_state: MergedTeamState | None = None) -> None:
+    def __init__(self, config: AppConfig, state: LocalState, *, event_state: LocalEventState | None = None) -> None:
         super().__init__()
         self.config = config
         self.local_state = state
-        self.team_state = team_state or MergedTeamState()
+        self.event_state = event_state or LocalEventState()
         self._views: dict[str, ChallengeView] = {}
         self._ui_thread_id: int | None = None
         self._known_local_events: set[str] = set()
-        self._known_team_events: set[str] = set()
         self._unsubscribe_local_events = None
 
     def compose(self) -> ComposeResult:
@@ -131,9 +128,9 @@ class CTFOSDashboard(App[None]):
         for challenge in self.local_state.list_challenges():
             self.refresh_challenge(challenge.id)
         self._known_local_events = {event.id for event in self.local_state.list_events()}
-        self._known_team_events = {
+        self._known_projected_events = {
             event.id
-            for item in self.team_state.challenges.values()
+            for item in self.event_state.challenges.values()
             for event in item.events
         }
         self._unsubscribe_local_events = self.local_state.subscribe_events(self._on_committed_event)
@@ -161,7 +158,7 @@ class CTFOSDashboard(App[None]):
 
     def refresh_challenge(self, challenge_id: str, event: Event | None = None) -> None:
         """Update exactly one keyed row; safe to schedule via notify below."""
-        view = challenge_view(self.local_state, challenge_id, team_state=self.team_state)
+        view = challenge_view(self.local_state, challenge_id, event_state=self.event_state)
         if view is None:
             return
         table = self.query_one("#challenges", DataTable)
@@ -221,7 +218,7 @@ class CTFOSDashboard(App[None]):
     def _append_flag_event(self, event: Event, view: ChallengeView) -> None:
         flag = event.payload.get("flag") if isinstance(event.payload, dict) else None
         attempt = f"[{event.attempt_id}]" if event.attempt_id else ""
-        locality = "LOCAL" if event.member == self.config.member_name else f"TEAM][{event.member}"
+        locality = "LOCAL" if event.member == self.config.member_name else f"LOCAL-EVENT][{event.member}"
         prefix = f"[{locality}][{view.category}/{view.name}]{attempt}"
         log = self.query_one("#event-log", Static)
         prior = str(log.renderable or "")
@@ -233,15 +230,8 @@ class CTFOSDashboard(App[None]):
         changed = [event for event in local_events if event.id not in self._known_local_events]
         self._known_local_events.update(event.id for event in changed)
 
-        sync = TeamSync(self.config.sync_root, team_id=self.config.team_id, member=self.config.member_name)
-        team_events = sync.merge_report().events
-        new_team = [event for event in team_events if event.id not in self._known_team_events]
-        self._known_team_events.update(event.id for event in new_team)
-        if new_team:
-            self.team_state = MergedTeamState.from_events(team_events)
-
         local_by_key = {item.challenge_key: item.id for item in self.local_state.list_challenges()}
-        for event in (*changed, *new_team):
+        for event in changed:
             challenge_id = event.challenge_id if self.local_state.get_challenge(event.challenge_id or "") else None
             challenge_id = challenge_id or local_by_key.get(event.challenge_key or "")
             if challenge_id:
@@ -252,17 +242,15 @@ def render_tui(
     config: AppConfig,
     state: LocalState | None,
     *,
-    team_state: MergedTeamState | None = None,
-    show_team: bool = False,
-    sync_diagnostics: Iterable[EventLogDiagnostic] = (),
+    event_state: LocalEventState | None = None,
 ) -> str:
     """Render a side-effect-free dashboard suitable for TTYs and tests.
 
     The caller owns polling and screen refresh.  This function only reads
-    SQLite/TeamSync-derived values, making it safe for ``tui --readonly`` and
+    SQLite-derived values, making it safe for ``tui --readonly`` and
     preventing the display path from ever participating in scheduling.
     """
-    team_state = team_state or MergedTeamState()
+    event_state = event_state or LocalEventState()
     challenges = state.list_challenges() if state is not None else []
     events = state.list_events() if state is not None else []
     events_by_challenge: dict[str, list[Event]] = {}
@@ -283,15 +271,14 @@ def render_tui(
         active = sum(_attempt_is_active(attempt) for attempt in attempts)
         latest_attempt = attempts[-1] if attempts else None
         candidates = state.list_flag_candidates(challenge.id)
-        team = team_state.get(challenge.challenge_key) or team_state.get(challenge.id)
-        status = _display_status(challenge, team)
-        flag_text = _flag_text(challenge, candidates, team)
+        projected = event_state.get(challenge.challenge_key) or event_state.get(challenge.id)
+        status = _display_status(challenge, projected)
+        flag_text = _flag_text(challenge, candidates, projected)
         model = _model_text(latest_attempt)
         reason = _latest_message(
             events_by_challenge.get(challenge.id, ()),
             {"PAUSED", "STUCK", "HINTING", "SUPERVISOR_UNAVAILABLE", "SUPERVISOR_HINT"},
         )
-        team_members = ",".join(team.running_members) if show_team and team else ""
         rows.append((
             challenge.name,
             challenge.category,
@@ -302,38 +289,13 @@ def render_tui(
             model,
             flag_text,
             reason,
-            team_members,
+            "",
         ))
         for attempt in attempts:
             attempt_details.append(_attempt_detail(
                 challenge, attempt,
                 events_by_attempt.get(attempt.id, ()),
                 candidates,
-            ))
-
-    if show_team:
-        local_ids = {identity for challenge in challenges for identity in (challenge.id, challenge.challenge_key)}
-        for item in sorted(team_state.challenges.values(), key=lambda value: (value.contest, value.category or "", value.name or "")):
-            if item.key in local_ids:
-                continue
-            flag_text = (
-                f"TEAM_SOLVED: {item.solved_flag}" if item.solved_flag else
-                f"TEAM_CANDIDATE: {item.candidate_flag}" if item.candidate_flag else "-"
-            )
-            status = "DUPLICATE_RUNNING" if item.duplicate_running else f"TEAM_{item.status}"
-            # Team-only work has no local Attempt rows.  Its worker count is
-            # the merged member reduction, never a placeholder zero.
-            rows.append((
-                item.name or item.key,
-                item.category or "-",
-                "-",
-                "-",
-                status,
-                str(len(item.running_members)),
-                "-",
-                flag_text,
-                "-",
-                ",".join(item.running_members),
             ))
 
     headers = ("problem", "category", "score", "assignee", "status", "active workers", "model", "flag", "reason / supervisor hint", "team running")
@@ -354,8 +316,8 @@ def render_tui(
     if attempt_details:
         body.append("attempt details:")
         body.extend(attempt_details)
-    if team_state.duplicate_warnings:
-        names = ", ".join(item.name or item.key for item in team_state.duplicate_warnings)
+    if event_state.duplicate_warnings:
+        names = ", ".join(item.name or item.key for item in event_state.duplicate_warnings)
         body.append(f"WARNING duplicate RUNNING claims: {names}")
     for event in events:
         if event.type in _OPERATOR_EVENT_TYPES:
@@ -365,8 +327,6 @@ def render_tui(
             attempt = f"[{event.attempt_id}]" if event.attempt_id else ""
             flag = event.payload.get("flag") if isinstance(event.payload, dict) else None
             body.append(f"[LOCAL][{label}]{attempt} {event.type}: {flag or event.message or '-'}")
-    for diagnostic in sync_diagnostics:
-        body.append(f"SYNC DIAGNOSTIC {diagnostic.kind}: {diagnostic.message}")
     return "\n".join(body)
 
 
@@ -376,7 +336,7 @@ def _display_status(challenge: Challenge, team) -> str:
     if challenge.status is ChallengeStatus.SOLVED:
         return "SOLVED"
     if team and team.status == "SOLVED":
-        return "TEAM_SOLVED"
+        return "SOLVED"
     if team and team.duplicate_running:
         return "DUPLICATE_RUNNING"
     if challenge.status is ChallengeStatus.RUNNING:
@@ -388,7 +348,7 @@ def _display_status(challenge: Challenge, team) -> str:
     if challenge.status is ChallengeStatus.PAUSED:
         return "PAUSED"
     if team and team.running_members:
-        return "TEAM_RUNNING"
+        return "LOCAL_RUNNING"
     return challenge.status.value
 
 
@@ -401,9 +361,9 @@ def _flag_text(challenge: Challenge, candidates: list[FlagCandidate], team) -> s
     if candidate:
         return f"? {candidate.value}"
     if team and team.solved_flag:
-        return f"TEAM_SOLVED: {team.solved_flag}"
+        return f"SOLVED: {team.solved_flag}"
     if team and team.candidate_flag:
-        return f"TEAM_CANDIDATE: {team.candidate_flag}"
+        return f"? {team.candidate_flag}"
     return "-"
 
 

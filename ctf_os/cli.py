@@ -16,14 +16,13 @@ from .application import LocalApplication, PrerequisiteError
 from .config import AppConfig, ConfigError, default_config_mapping
 from .doctor import run_doctor
 from .local_state import CURRENT_SCHEMA_VERSION, LocalState
-from .merged_team_state import MergedTeamState
+from .local_event_state import LocalEventState
 from .model_routing import ModelRouter
 from .sandbox.docker_cli import DockerCli
 from .sandbox.exec import SandboxExecError, execute_attempt_command
 from .solver_engine.codex_cli_backend import CodexCliBackend, CodexExecRequest
 from .solver_engine.knowledge import KnowledgeChunk, KnowledgeIndex
 from .solver_engine.knowledge_import import audit_snapshot, import_snapshot
-from .team_sync import TeamSync
 from .tui import CTFOSDashboard, render_tui
 from .watcher import PathPollingWatcher
 
@@ -97,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Memory reservation: disabled")
             dashboard_config = app.dashboard_config(mock_worker=args.mock_worker)
             def status_update() -> None:
-                _print_dashboard(dashboard_config, show_team=True)
+                _print_dashboard(dashboard_config)
             report = app.run(
                 once=args.once,
                 mock_worker=args.mock_worker,
@@ -110,34 +109,22 @@ def main(argv: list[str] | None = None) -> int:
             if report is not None:
                 print(f"run complete: parsed={report.parsed_challenges} started={report.started_attempts} solved={report.solved_challenges}" + (" (synthetic mock)" if report.synthetic else ""))
                 if not args.no_tui:
-                    _print_dashboard(dashboard_config, show_team=True)
+                    _print_dashboard(dashboard_config)
             return 0
         if args.command == "tui":
             if args.readonly:
                 try:
-                    return _watch_readonly_tui(config, show_team=True)
+                    return _watch_readonly_tui(config)
                 except KeyboardInterrupt:
                     return 0
             if sys.stdout.isatty() and not args.plain and config.state_path().is_file():
                 state = LocalState.for_config(config)
-                sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
                 CTFOSDashboard(
-                    config, state, team_state=MergedTeamState.from_events(sync.merge_report().events),
+                    config, state, event_state=LocalEventState.from_events(state.list_events()),
                 ).run()
                 return 0
-            _print_dashboard(config, show_team=args.team)
+            _print_dashboard(config)
             return 0
-        if args.command == "sync":
-            sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
-            if args.sync_command == "merge":
-                events = sync.merge()
-                for event in events:
-                    print(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
-                return 0
-            try:
-                return _watch_sync(config, sync)
-            except KeyboardInterrupt:
-                return 0
         if args.command == "sandbox":
             if args.sandbox_command == "exec":
                 command = _sandbox_command_argv(args.command_parts)
@@ -209,7 +196,7 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("contest")
     init_parser.add_argument("--force", action="store_true")
     init_parser.add_argument("--config", default="config.yaml")
-    init_parser.add_argument("--team-id", help="shared TeamSync team identifier for this local node")
+    init_parser.add_argument("--team-id", help="local team label used for output and Docker isolation")
     init_parser.add_argument("--member", help="this local node's member identifier (default: local)")
 
     for name, help_text in (("doctor", "check local prerequisites"), ("parse", "parse owned local challenges")):
@@ -244,13 +231,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     tui_parser = subparsers.add_parser("tui", help="render a deterministic local dashboard")
     tui_parser.add_argument("--config", default="config.yaml")
-    tui_parser.add_argument("--team", action="store_true")
     tui_parser.add_argument("--readonly", action="store_true", help="poll the local dashboard read-only until Ctrl-C")
     tui_parser.add_argument("--plain", action="store_true", help="use the deterministic plain/Rich-compatible fallback")
 
-    sync_parser = subparsers.add_parser("sync", help="read the append-only team ledger")
-    sync_parser.add_argument("sync_command", choices=("merge", "watch"))
-    sync_parser.add_argument("--config", default="config.yaml")
 
     sandbox_parser = subparsers.add_parser("sandbox", help="Docker-only sandbox commands")
     sandbox_sub = sandbox_parser.add_subparsers(dest="sandbox_command", required=True)
@@ -377,26 +360,23 @@ def _render_knowledge_chunk(chunk: KnowledgeChunk) -> str:
     )
 
 
-def _dashboard_text(config: AppConfig, *, show_team: bool) -> str:
+def _dashboard_text(config: AppConfig) -> str:
     """Read status without claiming work or creating an empty state database."""
     state = (
         LocalState.for_config(config)
         if config.state_path().is_file()
         else None
     )
-    sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
-    report = sync.merge_report()
+    events = state.list_events() if state is not None else ()
     return render_tui(
         config,
         state,
-        team_state=MergedTeamState.from_events(report.events),
-        show_team=show_team,
-        sync_diagnostics=report.diagnostics,
+        event_state=LocalEventState.from_events(events),
     )
 
 
-def _print_dashboard(config: AppConfig, *, show_team: bool, printer: Callable[[str], None] = print) -> str:
-    dashboard = _dashboard_text(config, show_team=show_team)
+def _print_dashboard(config: AppConfig, *, printer: Callable[[str], None] = print) -> str:
+    dashboard = _dashboard_text(config)
     if printer is print and sys.stdout.isatty():
         print("\x1b[2J\x1b[H" + dashboard, flush=True)
     else:
@@ -407,70 +387,18 @@ def _print_dashboard(config: AppConfig, *, show_team: bool, printer: Callable[[s
 def _watch_readonly_tui(
     config: AppConfig,
     *,
-    show_team: bool,
     stop_event: ThreadEvent | None = None,
     printer: Callable[[str], None] = print,
 ) -> int:
-    """Poll only local SQLite/TeamSync files; never run or control workers."""
+    """Poll only the local SQLite file; never run or control workers."""
     watcher = PathPollingWatcher(
-        (config.state_path(), config.sync_root / config.team_id),
+        (config.state_path(),),
         interval_sec=config.poll_interval_sec,
-        include=lambda path: path.name.startswith("local_state.db") or path.name.endswith(".events.jsonl"),
+        include=lambda path: path.name.startswith("local_state.db"),
     )
     while True:
         if watcher.changed():
-            _print_dashboard(config, show_team=show_team, printer=printer)
-        if stop_event is not None and stop_event.is_set():
-            return 0
-        if not watcher.wait(stop_event):
-            return 0
-
-
-def _sync_watch_signature(sync) -> tuple[object, ...]:
-    merged = MergedTeamState.from_events(sync.events)
-    challenges = tuple(
-        (item.key, item.status, item.solved_flag, item.candidate_flag, item.running_members, item.duplicate_running)
-        for item in sorted(merged.challenges.values(), key=lambda value: value.key)
-    )
-    diagnostics = tuple((item.path, item.line, item.kind, item.message) for item in sync.diagnostics)
-    return challenges, diagnostics
-
-
-def _render_sync_watch_update(sync) -> str:
-    """Render changed TeamSync reduction plus non-mutating tail diagnostics."""
-    merged = MergedTeamState.from_events(sync.events)
-    lines: list[str] = []
-    for item in sorted(merged.challenges.values(), key=lambda value: value.key):
-        details = [f"status={item.status}", f"running={','.join(item.running_members) or '-'}"]
-        if item.candidate_flag:
-            details.append(f"candidate={item.candidate_flag}")
-        if item.solved_flag:
-            details.append(f"solved={item.solved_flag}")
-        if item.duplicate_running:
-            details.append("duplicate=true")
-        lines.append(f"MERGED {item.key}: {' '.join(details)}")
-    if not lines:
-        lines.append("MERGED state: empty")
-    for diagnostic in sync.diagnostics:
-        lines.append(f"DIAGNOSTIC {diagnostic.kind}: {diagnostic.message}")
-    return "\n".join(lines)
-
-
-def _watch_sync(config: AppConfig, sync: TeamSync, *, stop_event: ThreadEvent | None = None) -> int:
-    """Watch append-only TeamSync files without dispatching any remote work."""
-    watcher = PathPollingWatcher(
-        (sync.team_directory,),
-        interval_sec=config.poll_interval_sec,
-        include=lambda path: path.name.endswith(".events.jsonl"),
-    )
-    previous: tuple[object, ...] | None = None
-    while True:
-        if watcher.changed():
-            report = sync.merge_report()
-            current = _sync_watch_signature(report)
-            if current != previous:
-                print(_render_sync_watch_update(report), flush=True)
-                previous = current
+            _print_dashboard(config, printer=printer)
         if stop_event is not None and stop_event.is_set():
             return 0
         if not watcher.wait(stop_event):
@@ -525,7 +453,6 @@ def _init_workspace(
     for category in ("pwn", "rev", "web", "crypto", "misc", "forensic"):
         (contest_root / category).mkdir(exist_ok=True)
     config.output_contest_dir().mkdir(parents=True, exist_ok=True)
-    (config.sync_root / config.team_id).mkdir(parents=True, exist_ok=True)
     routing_path = config.model_routing_path
     if not routing_path.exists():
         routing_path.parent.mkdir(parents=True, exist_ok=True)

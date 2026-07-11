@@ -17,12 +17,11 @@ from ctf_os.contest_parser import ContestManifest
 from ctf_os.intake import IntakeChallenge
 from ctf_os.local_state import LocalState
 from ctf_os.local_worker_pool import LocalWorkerPool, WorkerHandle
-from ctf_os.merged_team_state import MergedTeamState
+from ctf_os.local_event_state import LocalEventState
 from ctf_os.models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event
 from ctf_os.sandbox.docker_cli import CommandResult, DockerCli
 from ctf_os.solver_engine.knowledge import KnowledgeIndex
 from ctf_os.solver_engine.race_plan import RacePlan
-from ctf_os.team_sync import TeamSync
 from ctf_os.tui import render_tui
 
 
@@ -105,9 +104,9 @@ def test_pause_resume_are_local_fenced_actions_and_pause_is_idempotent(tmp_path:
     assert paused.cancelled_attempt_ids == (attempt.id,)
     assert handle.cancel_event.is_set()
     assert [event.type for event in state.list_events(challenge_id=challenge.id)] == ["PAUSED"]
-    ledger = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name).merge()
+    ledger = state.list_events(challenge_id=challenge.id)
     assert [(event.member, event.type) for event in ledger] == [(config.member_name, "PAUSED")]
-    merged = MergedTeamState.from_events(ledger).get(challenge.id)
+    merged = LocalEventState.from_events(ledger).get(challenge.id)
     assert merged and merged.status == "PAUSED" and not merged.running_members
     assert app.pause_challenge(challenge.slug).already_in_target_state
 
@@ -162,10 +161,6 @@ def test_pause_resume_reject_foreign_nonowned_team_only_and_solved(tmp_path: Pat
         event=Event(team_id=config.team_id, member=config.member_name, contest="Demo", type="SOLVED", challenge_id=solved.id, attempt_id=attempt.id),
         owner=app._owner, fencing_token=attempt.fencing_token,
     )
-    TeamSync(config.sync_root, team_id=config.team_id, member="teammate").append(
-        Event(team_id=config.team_id, member="teammate", contest="Demo", type="RUNNING", challenge_id="team-only", challenge="team-only")
-    )
-
     for target, message in ((foreign.name, "foreign"), (nonowned.name, "non-owned"), (solved.name, "SOLVED"), ("team-only", "team-only")):
         with pytest.raises(ValueError, match=message):
             app.pause_challenge(target)

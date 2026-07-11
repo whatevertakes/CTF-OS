@@ -67,19 +67,13 @@ def default_config_mapping(
                       "policy": "local_safe", "fairness": "challenge_round_robin"},
         "worker_policy": {"max_workers_total": 2, "max_workers_per_challenge": 2,
                           "kill_others_on_verified_flag": True},
-        # These are deliberately coordinator-local timers.  They never
-        # create a remote scheduler or a TeamSync command channel.
+        # These are deliberately coordinator-local timers.
         "coordinator": {"hint_after_sec": 600, "loop_check_sec": 120},
         "model_routing": {"enabled": False, "config_path": "config/model-routing.yaml"},
         "sandbox": {"enabled": True, "image": "ctf-os-sandbox:latest", "container_per_attempt": True,
                     "precreate_on_queue": False, "max_containers": 2,
                     "command_timeout_sec": 30,
                     "default_limits": {"memory": "16g", "cpus": 2.0}},
-        "sync": {
-            "enabled": True,
-            "type": "file",
-            "root": "sync",
-        },
         "flag_verification": {"auto_confirm_flags": False, "require_verifier_before_solved": True,
                               "ignore_placeholders": True},
         "watcher": {"poll_interval_sec": 2},
@@ -165,11 +159,6 @@ class AppConfig:
     @property
     def output_root(self) -> Path:
         return self.resolve_path(self.get_mapping("paths").get("output", "output"), field="paths.output")
-
-    @property
-    def sync_root(self) -> Path:
-        sync = self.get_mapping("sync")
-        return self.resolve_path(self.get_mapping("paths").get("sync", sync.get("root", "sync")), field="sync.root")
 
     def incoming_contest_dir(self, contest: str | None = None) -> Path:
         return self.incoming_root / _safe_component(contest or self.contest_name, "contest.name")
@@ -277,10 +266,6 @@ class AppConfig:
         return False
 
     @property
-    def sync_enabled(self) -> bool:
-        return bool(self.get_mapping("sync").get("enabled", True))
-
-    @property
     def model_routing(self) -> dict[str, Any]:
         return self.get_mapping("model_routing")
 
@@ -381,7 +366,7 @@ class AppConfig:
             raise ConfigError("contest.flag_patterns must be a list of non-empty strings")
 
         paths = self.get_mapping("paths")
-        for key in ("incoming", "output", "sync"):
+        for key in ("incoming", "output"):
             if key in paths:
                 self.resolve_path(paths[key], field=f"paths.{key}")
         output = self.output_root
@@ -440,13 +425,6 @@ class AppConfig:
                     raise ConfigError("sandbox.egress_policy must be 'manifest_exact_endpoints'")
                 if sandbox.get("allow_private_egress", False):
                     raise ConfigError("sandbox.allow_private_egress is disabled: private, Docker-gateway, and host-service egress are unsafe")
-
-        sync = self.get_mapping("sync")
-        if sync and sync.get("type", "file") != "file":
-            raise ConfigError("sync.type must be 'file'; remote command synchronization is unsupported")
-        namespace = sync.get("team_namespace")
-        if namespace is not None and namespace != self.team_id:
-            raise ConfigError("sync.team_namespace must match contest.team_id")
 
         routing = self.model_routing
         if routing and not isinstance(routing.get("enabled", True), bool):

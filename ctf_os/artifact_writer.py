@@ -201,7 +201,7 @@ class ArtifactWriter:
         """Capture parent-observed worker output outside both worker mounts.
 
         Late/stale callbacks may at most alter their own disposable staging
-        directory.  They cannot append notes, evidence, events, or TeamSync
+        directory.  They cannot append notes, evidence, or local state events
         until the coordinator promotes this parent-owned capture under the
         current SQLite lease fence.
         """

@@ -6,12 +6,10 @@ from threading import Event as ThreadEvent
 
 import yaml
 
-from ctf_os.cli import _render_sync_watch_update, _watch_readonly_tui, main
+from ctf_os.cli import _watch_readonly_tui, main
 from ctf_os.config import AppConfig, default_config_mapping
 from ctf_os.local_state import LocalState
-from ctf_os.merged_team_state import MergedTeamState
 from ctf_os.models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, FlagCandidate
-from ctf_os.team_sync import TeamSync
 from ctf_os.tui import render_tui
 
 
@@ -26,10 +24,13 @@ def _config(tmp_path: Path) -> AppConfig:
 def _manifest(config: AppConfig) -> None:
     path = config.incoming_contest_dir() / "contest.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("# 대회명: Demo\n\n### web/login\n- 점수: 100\n", encoding="utf-8")
+    path.write_text(
+        "# 대회명: Demo\n\n### web/login\n- 점수: 100\n- 원격: nc example.com 31337\n",
+        encoding="utf-8",
+    )
 
 
-def test_mock_once_renders_the_synthetic_namespace_without_team_sync_publish(tmp_path: Path, capsys) -> None:
+def test_mock_once_renders_the_synthetic_local_namespace(tmp_path: Path, capsys) -> None:
     config = _config(tmp_path)
     _manifest(config)
 
@@ -41,7 +42,6 @@ def test_mock_once_renders_the_synthetic_namespace_without_team_sync_publish(tmp
     assert "SYNTHETIC_SOLVED" in output
     assert "SYNTHETIC SOLVED:" in output
     assert output.count("SYNTHETIC_SOLVED") == 1
-    assert not TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name).merge()
 
 
 def test_mock_run_status_callback_observes_running_attempt_and_streamed_finding(tmp_path: Path) -> None:
@@ -76,7 +76,7 @@ def test_retry_requeues_only_failed_local_challenges_and_emits_event(tmp_path: P
     assert "requeued login" in capsys.readouterr().out
     assert state.get_challenge(challenge.id).status is ChallengeStatus.QUEUED
     assert [event.type for event in state.list_events(challenge_id=challenge.id)] == ["RETRY_QUEUED"]
-    assert [event.type for event in TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name).merge()] == ["RETRY_QUEUED"]
+    assert not state.pending_outbox()
     assert main(["retry", "missing-team-only", "--config", str(config.path)]) == 2
     assert "not a local failed challenge" in capsys.readouterr().err
 
@@ -100,16 +100,12 @@ def test_retry_rejects_solved_foreign_and_team_only_challenges(tmp_path: Path, c
     foreign = state.upsert_challenge(Challenge(contest="Other", category="web", name="foreign"))
     state.transition_challenge_status(foreign.id, ChallengeStatus.QUEUED)
     state.transition_challenge_status(foreign.id, ChallengeStatus.FAILED)
-    TeamSync(config.sync_root, team_id=config.team_id, member="teammate").append(
-        Event(team_id=config.team_id, member="teammate", contest="Demo", type="FAILED", category="rev", challenge="team-only", challenge_id="team-only")
-    )
-
     for target, reason in (("solved", "SOLVED"), ("foreign", "foreign"), ("team-only", "team-only")):
         assert main(["retry", target, "--config", str(config.path)]) == 2
         assert reason in capsys.readouterr().err
 
 
-def test_plain_tui_includes_attempt_node_team_and_operator_details(tmp_path: Path) -> None:
+def test_plain_tui_includes_attempt_node_and_operator_details(tmp_path: Path) -> None:
     config = _config(tmp_path)
     state = LocalState(config.state_path())
     challenge = state.upsert_challenge(Challenge(contest="Demo", category="web", name="login"))
@@ -131,12 +127,7 @@ def test_plain_tui_includes_attempt_node_team_and_operator_details(tmp_path: Pat
         state.append_event(Event(team_id=config.team_id, member=config.member_name, contest="Demo", type=type_, challenge_id=challenge.id,
                                  attempt_id=attempt.id, message=message, payload=payload))
     state.add_flag_candidate(FlagCandidate(challenge_id=challenge.id, attempt_id=attempt.id, value="FLAG{CANDIDATE}"))
-    events = [
-        Event(team_id=config.team_id, member="alice", contest="Demo", type="RUNNING", category="rev", challenge="team-only", challenge_id="team-only", attempt_id="a"),
-        Event(team_id=config.team_id, member="bob", contest="Demo", type="RUNNING", category="rev", challenge="team-only", challenge_id="team-only", attempt_id="b"),
-    ]
-
-    rendered = render_tui(config, state, team_state=MergedTeamState.from_events(events), show_team=True)
+    rendered = render_tui(config, state)
 
     assert "local Codex active/max: 1/2" in rendered
     assert "sandbox active/max: 1/2" in rendered
@@ -148,7 +139,6 @@ def test_plain_tui_includes_attempt_node_team_and_operator_details(tmp_path: Pat
     assert "flag_candidate=FLAG{CANDIDATE}" in rendered
     assert "container=RUNNING:ctf-os-login" in rendered
     assert "model=terra/gpt-5.6-terra/high" in rendered
-    assert "team-only" in rendered and "| 2 " in rendered
     assert "OPERATOR ORPHAN_CLEANUP: removed stale container orphan-1" in rendered
 
 
@@ -160,25 +150,12 @@ def test_init_rejects_mismatched_config_contest_even_with_force(tmp_path: Path, 
     assert not (tmp_path / "incoming" / "Other").exists()
 
 
-def test_sync_watch_render_reports_merged_changes_and_recoverable_tail(tmp_path: Path) -> None:
-    sync = TeamSync(tmp_path / "sync", team_id="team", member="alice")
-    sync.append(Event(team_id="team", member="alice", contest="Demo", type="RUNNING", challenge="login", challenge_id="chal", attempt_id="a"))
-    path = tmp_path / "sync" / "team" / "bob.events.jsonl"
-    path.write_bytes(b'{"id":"interrupted"')
-
-    rendered = _render_sync_watch_update(sync.merge_report())
-
-    assert "MERGED chal: status=RUNNING running=alice" in rendered
-    assert "DIAGNOSTIC incomplete_tail" in rendered
-
-
 def test_readonly_tui_polls_only_local_state_and_stops_without_writes(tmp_path: Path) -> None:
     config = _config(tmp_path)
     stop = ThreadEvent()
     stop.set()
     output: list[str] = []
 
-    assert _watch_readonly_tui(config, show_team=True, stop_event=stop, printer=output.append) == 0
+    assert _watch_readonly_tui(config, stop_event=stop, printer=output.append) == 0
     assert output and "CTF-OS Local Node" in output[0]
     assert not config.state_path().exists()
-    assert not (config.sync_root / config.team_id).exists()

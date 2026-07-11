@@ -48,9 +48,8 @@ class PollingWatcher:
 class PathPollingWatcher:
     """Bounded, read-only polling for a small explicit set of local paths.
 
-    It is used by operator views only.  It neither opens a coordinator lease
-    nor writes state, so watching another member's TeamSync ledger remains a
-    display operation rather than remote worker control.
+    It never opens a coordinator lease or writes state.  Callers use it for
+    local input, SQLite, and read-only operator-view polling.
     """
 
     def __init__(
@@ -76,6 +75,10 @@ class PathPollingWatcher:
         self._previous = snapshot
         return changed
 
+    def acknowledge(self) -> None:
+        """Accept handler-owned writes as the new polling baseline."""
+        self._previous = self._snapshot()
+
     def wait(self, stop_event: ThreadEvent | None = None) -> bool:
         if stop_event is None:
             time.sleep(self.interval_sec)
@@ -88,7 +91,7 @@ class PathPollingWatcher:
             candidates = (root,) if root.is_file() else root.rglob("*") if root.is_dir() else ()
             for path in candidates:
                 try:
-                    if path.is_symlink() or not path.is_file() or not self.include(path):
+                    if path.is_symlink() or not (path.is_file() or path.is_dir()) or not self.include(path):
                         continue
                     details = path.stat()
                 except OSError:

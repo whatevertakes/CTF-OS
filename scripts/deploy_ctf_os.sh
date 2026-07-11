@@ -4,6 +4,12 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Restricted desktops and CI sandboxes may expose a read-only home cache.
+# Keep uv's cache local to the machine's temporary area unless the operator
+# already selected a writable cache explicitly.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/ctf-os-uv-cache-${UID:-local}}"
+mkdir -p "$UV_CACHE_DIR"
+
 config="config.yaml"
 image="ctf-os-sandbox:latest"
 skip_image=0
@@ -41,7 +47,7 @@ if ((skip_migrate == 0)); then
   [[ -f "$config" ]] || {
     echo "Local config not found: $config" >&2
     echo "Create it once with: uv run ctf-os init \"CONTEST NAME\" --config \"$config\"" >&2
-    echo "No config, database, incoming files, output, or TeamSync data were changed." >&2
+    echo "No config, database, incoming files, or output data were changed." >&2
     exit 1
   }
   echo "Applying transactional SQLite migrations through $config..."

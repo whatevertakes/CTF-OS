@@ -1,4 +1,4 @@
-"""Deterministic read model for the append-only TeamSync event ledger."""
+"""Deterministic read model for events persisted in local SQLite."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .models import Event
 
 
 @dataclass(frozen=True)
-class MergedChallenge:
+class LocalChallengeProjection:
     key: str
     contest: str
     category: str | None
@@ -22,18 +22,18 @@ class MergedChallenge:
     events: tuple[Event, ...]
 
 
-class MergedTeamState:
-    """Read-only status reduction; it never dispatches work to another node."""
+class LocalEventState:
+    """Read-only reduction of one node's locally persisted events."""
 
     def __init__(self, events: Iterable[Event] = ()) -> None:
         self.events = tuple(sorted(events, key=lambda event: (event.timestamp, event.id)))
         self.challenges = _merge(self.events)
 
     @classmethod
-    def from_events(cls, events: Iterable[Event]) -> "MergedTeamState":
+    def from_events(cls, events: Iterable[Event]) -> "LocalEventState":
         return cls(events)
 
-    def get(self, challenge_id: str) -> MergedChallenge | None:
+    def get(self, challenge_id: str) -> LocalChallengeProjection | None:
         direct = self.challenges.get(challenge_id)
         if direct is not None:
             return direct
@@ -41,7 +41,7 @@ class MergedTeamState:
                      if any(event.challenge_id == challenge_id for event in item.events)), None)
 
     @property
-    def duplicate_warnings(self) -> tuple[MergedChallenge, ...]:
+    def duplicate_warnings(self) -> tuple[LocalChallengeProjection, ...]:
         return tuple(item for item in self.challenges.values() if item.duplicate_running)
 
 
@@ -53,16 +53,16 @@ def _event_key(event: Event) -> str:
     return "\x1f".join((event.contest, event.category or "", event.challenge or ""))
 
 
-def _merge(events: tuple[Event, ...]) -> dict[str, MergedChallenge]:
+def _merge(events: tuple[Event, ...]) -> dict[str, LocalChallengeProjection]:
     grouped: dict[str, list[Event]] = {}
     for event in events:
         # Mock fixtures are useful local diagnostics but must never become a
-        # team solve/flag/status in the shared operational read model.
+        # local solve/flag/status in the operational read model.
         if isinstance(event.payload, dict) and event.payload.get("synthetic") is True:
             continue
         if event.challenge_key or event.challenge_id or event.challenge:
             grouped.setdefault(_event_key(event), []).append(event)
-    result: dict[str, MergedChallenge] = {}
+    result: dict[str, LocalChallengeProjection] = {}
     for key, history in grouped.items():
         active_attempts: dict[str, str] = {}
         candidate: str | None = None
@@ -75,9 +75,8 @@ def _merge(events: tuple[Event, ...]) -> dict[str, MergedChallenge]:
             elif event.type in {"WORKER_STOPPED", "FAILED"}:
                 active_attempts.pop(attempt_key, None)
             elif event.type == "PAUSED":
-                # PAUSED is a status/share record, not a request to control a
-                # peer.  In this read model it closes only that member's prior
-                # local attempt claims for this one challenge.
+                # PAUSED closes this node member's prior local attempt claims
+                # for this one challenge.
                 active_attempts = {
                     item_key: member for item_key, member in active_attempts.items()
                     if member != event.member
@@ -99,8 +98,8 @@ def _merge(events: tuple[Event, ...]) -> dict[str, MergedChallenge]:
         )
         # A confirmed solve wins the read model outright. Historical RUNNING
         # records remain visible in ``events``, but are not an active duplicate
-        # claim after a solve has been shared.
-        result[key] = MergedChallenge(
+        # claim after a solve.
+        result[key] = LocalChallengeProjection(
             key=key, contest=last.contest, category=last.category, name=last.challenge,
             status=status, solved_flag=solved, candidate_flag=candidate,
             running_members=active, duplicate_running=not has_solved and len(active) > 1, events=tuple(history),

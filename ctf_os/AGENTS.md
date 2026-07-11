@@ -9,7 +9,7 @@ This repository implements CTF-OS, a local-first multi-node CTF agent.
 - No shared Codex account.
 - No CTFd auto-submit.
 - Each member runs a local node on their own PC.
-- TeamSync only shares append-only JSONL events for status, findings, and flags.
+- Runtime state remains in this node's local SQLite database only.
 - Challenge commands must run through per-attempt Docker containers whenever possible.
 
 ## Model Routing
@@ -36,7 +36,6 @@ The default Codex model for repository work is Sol. Implementation code should s
 
 - Prefer `uv` for Python commands.
 - Keep MVP modules small and testable.
-- Use SQLite for local state and JSONL for append-only events.
+- Use SQLite for local state and events.
 - Keep Docker cleanup label-based and scoped to the local member/team/challenge.
 - Add focused pytest coverage for parser, state, events, model routing, sandbox command construction, and mock worker flows.
-

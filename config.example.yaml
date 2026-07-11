@@ -86,11 +86,6 @@ sandbox:
     memory: "16g"
     cpus: 2.0
 
-sync:
-  enabled: true
-  type: file
-  root: "sync"
-
 flag_verification:
   auto_confirm_flags: false
   require_verifier_before_solved: true

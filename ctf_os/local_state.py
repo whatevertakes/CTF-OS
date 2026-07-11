@@ -1,4 +1,4 @@
-"""Durable local state, leases, and transactional TeamSync outbox.
+"""Durable local state, leases, and transactional local event outbox.
 
 The database is deliberately scoped to one local contest output directory.  It
 is a concurrency authority for *this node only*: no table or method here can
@@ -944,7 +944,7 @@ class LocalState:
 
         Recovery lifecycle events are inserted in the same transaction as the
         lease deletion/state transition when a factory is supplied.  They carry
-        the old fencing token, making the TeamSync explanation attributable to
+        the old fencing token, making the local event explanation attributable to
         the exact lease that died rather than a later replacement worker.
         """
         now_text = self._now(now)

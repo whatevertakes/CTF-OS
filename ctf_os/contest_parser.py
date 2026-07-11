@@ -52,6 +52,10 @@ def parse_contest(path: str | Path) -> ContestManifest:
         content = manifest_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ContestParseError("contest.md must be UTF-8") from exc
+    except PermissionError as exc:
+        raise ContestParseError(f"permission denied reading contest manifest: {manifest_path}") from exc
+    except OSError as exc:
+        raise ContestParseError(f"cannot read contest manifest {manifest_path}: {exc}") from exc
 
     name: str | None = None
     metadata: dict[str, list[str]] = {}
@@ -141,8 +145,14 @@ def parse_contest(path: str | Path) -> ContestManifest:
 
 
 def filter_challenges(challenges: Iterable[Challenge], owned_categories: Iterable[str]) -> list[Challenge]:
-    owned = {category.strip().casefold() for category in owned_categories if category.strip()}
-    return [challenge for challenge in challenges if challenge.category.casefold() in owned]
+    owned = {canonical_category(category) for category in owned_categories if category.strip()}
+    return [challenge for challenge in challenges if canonical_category(challenge.category) in owned]
+
+
+def canonical_category(value: str) -> str:
+    """Normalize category aliases that share one local challenge layout."""
+    category = value.strip().casefold()
+    return "forensics" if category in {"forensic", "forensics"} else category
 
 
 def _normal_key(value: str) -> str:

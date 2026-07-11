@@ -15,14 +15,13 @@ from ctf_os.config import AppConfig, default_config_mapping
 from ctf_os.doctor import run_doctor
 from ctf_os.flag_detector import FlagDetector
 from ctf_os.local_state import LocalState, StateTransitionError
-from ctf_os.merged_team_state import MergedTeamState
+from ctf_os.local_event_state import LocalEventState
 from ctf_os.models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, FlagCandidate
 from ctf_os.sandbox.docker_cli import CommandResult, DockerCli, RecordingCommandRunner
 from ctf_os.solver_engine.codex_cli_backend import CodexExecResult
 from ctf_os.solver_engine.parser import ActionObservationParser
 from ctf_os.solver_engine.race_plan import RacePlan
 from ctf_os.solver_engine.verifier import Verifier
-from ctf_os.team_sync import TeamSync
 
 
 class Clock:
@@ -99,21 +98,6 @@ def test_coordinator_lease_rejects_a_separate_cli_process(tmp_path: Path) -> Non
     assert child.exitcode == 0 and result_queue.get(timeout=2) is False
 
 
-def test_outbox_retry_is_idempotent_jsonl(tmp_path: Path) -> None:
-    state = LocalState(tmp_path / "state.db")
-    challenge = state.upsert_challenge(Challenge(contest="Demo", category="web", name="login"))
-    event = Event(team_id="team", member="alice", contest="Demo", type="FINDING", challenge_id=challenge.id, message="a")
-    state.append_event(event)
-    sync = TeamSync(tmp_path / "sync", team_id="team", member="alice")
-    # Simulate a crash after the durable append but before the SQLite ack.
-    sync.append_idempotent(event)
-    assert state.pending_outbox()[0].event.id == event.id
-    sync.append_idempotent(state.pending_outbox()[0].event)
-    state.mark_outbox_published(event.id)
-    assert not state.pending_outbox()
-    assert [item.id for item in sync.merge()] == [event.id]
-
-
 def test_verifier_refuses_worker_owned_artifacts_and_reports_unavailable(tmp_path: Path) -> None:
     work = tmp_path / "work"
     output = tmp_path / "output"
@@ -145,7 +129,7 @@ def test_custom_patterns_synthetic_isolation_and_active_attempt_reduction() -> N
         Event(timestamp=now, team_id="t", member="bob", contest="D", type="WORKER_STARTED", challenge_id="c", attempt_id="b"),
         Event(timestamp=now, team_id="t", member="eve", contest="D", type="SOLVED", challenge_id="synthetic", payload={"flag": "SYNTHETIC{X}", "synthetic": True}),
     ]
-    state = MergedTeamState.from_events(events)
+    state = LocalEventState.from_events(events)
     merged = state.get("c")
     assert merged and merged.running_members == ("alice", "bob") and merged.duplicate_running
     assert state.get("synthetic") is None
@@ -216,6 +200,12 @@ def _manifest(tmp_path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _source(tmp_path: Path, category: str, name: str) -> None:
+    source = tmp_path / "incoming" / "Demo" / category / name
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "challenge.txt").write_text("ready\n", encoding="utf-8")
+
+
 def test_streamed_worker_replay_remains_candidate_and_never_cancels_other_attempts(tmp_path: Path) -> None:
     config = _runtime_config(tmp_path)
     _manifest(tmp_path, """# 대회명: Demo
@@ -226,6 +216,8 @@ def test_streamed_worker_replay_remains_candidate_and_never_cancels_other_attemp
 ### misc/keep-running
 - 점수: 1
 """)
+    _source(tmp_path, "web", "login")
+    _source(tmp_path, "misc", "keep-running")
     cancellations: dict[str, list[ThreadEvent]] = {}
 
     class StreamingCodex:
@@ -268,6 +260,7 @@ def test_streamed_worker_replay_remains_candidate_and_never_cancels_other_attemp
 def test_attempt_exception_finalizes_container_and_persists_cleanup(tmp_path: Path) -> None:
     config = _runtime_config(tmp_path)
     _manifest(tmp_path, "# 대회명: Demo\n\n### web/login\n- 점수: 1\n")
+    _source(tmp_path, "web", "login")
 
     class BrokenCodex:
         def run(self, _request, **_kwargs):

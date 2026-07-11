@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from threading import Thread
 
 from textual.widgets import DataTable, Static
 
 from ctf_os.config import AppConfig, default_config_mapping
 from ctf_os.local_state import LocalState
-from ctf_os.merged_team_state import MergedTeamState
+from ctf_os.local_event_state import LocalEventState
 from ctf_os.models import Attempt, Challenge, ChallengeStatus, Event, FlagCandidate
 from ctf_os.tui import CTFOSDashboard, challenge_view
 
@@ -88,20 +89,20 @@ def test_candidate_display_priority_and_full_value_are_preserved(tmp_path) -> No
     assert view.flag_text(compact=True).endswith("…")
 
 
-def test_team_sync_flag_projects_to_matching_challenge_key(tmp_path) -> None:
+def test_local_sqlite_event_projects_to_matching_challenge_key(tmp_path) -> None:
     state = LocalState(tmp_path / "state.db")
     target = _challenge(state, "pwn", "bof")
     other = _challenge(state, "rev", "bof")
     event = Event(
-        team_id="demo-team", member="alice", contest="Demo", type="SOLVED",
-        category="pwn", challenge="bof", challenge_id="alice-local-id",
-        challenge_key=target.challenge_key, payload={"flag": "FLAG{team-owned}"},
+        team_id="demo-team", member="local", contest="Demo", type="SOLVED",
+        category="pwn", challenge="bof", challenge_id=target.id,
+        challenge_key=target.challenge_key, payload={"flag": "FLAG{local-owned}"},
     )
-    team = MergedTeamState.from_events([event])
+    projected = LocalEventState.from_events([event])
 
-    owned = challenge_view(state, target.id, team_state=team)
-    untouched = challenge_view(state, other.id, team_state=team)
-    assert owned is not None and owned.flag_text() == "FLAG{team-owned}"
+    owned = challenge_view(state, target.id, event_state=projected)
+    untouched = challenge_view(state, other.id, event_state=projected)
+    assert owned is not None and owned.flag_text() == "FLAG{local-owned}"
     assert untouched is not None and untouched.flag_text() == "-"
 
 
@@ -161,8 +162,11 @@ def test_background_safe_notification_updates_matching_row(tmp_path) -> None:
                 challenge_id=item.id, challenge_key=item.challenge_key,
                 attempt_id="thread-attempt", value="FLAG{thread-safe}",
             ))
-            await asyncio.to_thread(app.notify_challenge_changed, item.id)
+            notifier = Thread(target=app.notify_challenge_changed, args=(item.id,))
+            notifier.start()
             await pilot.pause()
+            notifier.join(timeout=2)
+            assert not notifier.is_alive()
             table = app.query_one("#challenges", DataTable)
             assert table.get_cell(item.id, "flag") == "? FLAG{thread-safe}"
 

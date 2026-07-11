@@ -6,7 +6,7 @@ This repository implements CTF-OS, a local-first multi-node CTF agent.
 
 - No central executor, remote worker stealing, shared Codex account, or CTFd auto-submit.
 - Each member runs a local node on their own PC.
-- TeamSync shares only append-only JSONL events for status, findings, and flags.
+- Nodes do not share runtime state; each member coordinates assignments directly.
 - Challenge commands run through per-attempt Docker containers whenever possible.
 
 ## Model routing
@@ -24,6 +24,6 @@ This repository implements CTF-OS, a local-first multi-node CTF agent.
 
 ## Engineering
 
-- Prefer `uv`; retain SQLite local state and TeamSync JSONL history.
+- Prefer `uv`; retain SQLite local state on each node.
 - Keep Docker cleanup label-scoped to the local member/team/challenge.
 - Add focused tests for parser, state, events, sandbox, model routing, and mock worker flows.

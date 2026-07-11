@@ -1,5 +1,7 @@
 # CTF-OS 설계도 v1.3 — Local-first Multi-Node CTF Agent
 
+> **폐기된 역사 문서:** 이 v1.3 설계의 TeamSync/JSONL 공유 기능과 관련 CLI는 현재 구현에서 제거되었습니다. 현행 운영은 노드별 로컬 SQLite만 사용하며, 실제 명령과 설정은 README 및 `CTF_OS_TEAM_DEPLOYMENT.md`를 기준으로 하세요.
+
 > 국내 CTF 우승 목표 자율 풀이 시스템  
 > 기준일: 2026-07-10  
 > 기반 아이디어: `verialabs/ctf-agent`의 challenge swarm / solver racing / message bus / sandbox 구조  

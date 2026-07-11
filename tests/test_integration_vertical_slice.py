@@ -7,16 +7,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import yaml
 import pytest
 
-from ctf_os.application import LocalApplication
+from ctf_os.application import LocalApplication, PrerequisiteError
 from ctf_os.config import AppConfig, default_config_mapping
 from ctf_os.intake import IntakeError, extract_zip_safely
-from ctf_os.local_event_bus import LocalEventBus
 from ctf_os.local_state import LocalState
-from ctf_os.merged_team_state import MergedTeamState
 from ctf_os.models import Challenge, ChallengeStatus, Event, FlagCandidate
 from ctf_os.sandbox.docker_cli import DockerCli, RecordingCommandRunner
 from ctf_os.solver_engine.codex_cli_backend import CodexExecResult
-from ctf_os.team_sync import TeamSync
 from ctf_os.tui import render_tui
 
 
@@ -57,14 +54,99 @@ def _manifest(tmp_path: Path) -> Path:
     path = tmp_path / "incoming" / "Demo" / "contest.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(MANIFEST, encoding="utf-8")
+    (path.parent / "web" / "login").mkdir(parents=True, exist_ok=True)
     return path
+
+
+def test_queue_is_blocked_when_contest_manifest_is_missing(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+
+    with pytest.raises(PrerequisiteError, match=r"queue blocked:.*contest manifest not found"):
+        LocalApplication(config).parse()
+
+    assert not config.state_path().exists()
+
+
+def test_queue_is_blocked_with_clear_reason_when_manifest_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    manifest = _manifest(tmp_path)
+    original = Path.read_text
+
+    def denied(path: Path, *args, **kwargs):
+        if path == manifest:
+            raise PermissionError(13, "Permission denied", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(PrerequisiteError, match=r"queue blocked:.*permission denied reading contest manifest"):
+        LocalApplication(config).parse()
+
+    assert not config.state_path().exists()
+
+
+def test_queue_is_blocked_when_contest_manifest_is_invalid(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    manifest = _manifest(tmp_path)
+    manifest.write_text("# malformed\n", encoding="utf-8")
+
+    with pytest.raises(PrerequisiteError, match=r"queue blocked:.*expected '# .*<name>' heading"):
+        LocalApplication(config).parse()
+
+    assert not config.state_path().exists()
+
+
+@pytest.mark.parametrize("category", ["web", "pwn", "rev", "crypto", "misc", "forensic"])
+def test_queue_is_blocked_for_unedited_template_challenges_across_categories(
+    tmp_path: Path, category: str,
+) -> None:
+    config = _config(tmp_path)
+    raw = default_config_mapping("Demo")
+    raw["member"]["owned_categories"] = [category]
+    raw["sandbox"]["enabled"] = False
+    raw["model_routing"]["enabled"] = False
+    config.path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = AppConfig.from_file(config.path)
+    manifest = tmp_path / "incoming" / "Demo" / "contest.md"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        f"# 대회명: Demo\n\n### {category}/problem-01\n- 설명: 입력 예정\n- 원격:\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        PrerequisiteError,
+        match=rf"queue blocked:.*template challenge is not ready to queue: {category}/problem-01.*description",
+    ):
+        LocalApplication(config).parse()
+
+    assert not config.state_path().exists()
+
+
+def test_ready_challenge_queues_while_unused_template_siblings_are_ignored(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    manifest = tmp_path / "incoming" / "Demo" / "contest.md"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        "# 대회명: Demo\n\n"
+        "### web/real-login\n- 설명: supplied challenge\n\n"
+        "### web/problem-02\n- 설명: 입력 예정\n\n"
+        "### crypto/problem-01\n- 설명: 입력 예정\n",
+        encoding="utf-8",
+    )
+    (manifest.parent / "web" / "real-login").mkdir(parents=True)
+
+    parsed = LocalApplication(config).parse()
+
+    assert [item.challenge.name for item in parsed] == ["real-login"]
 
 
 def test_safe_zip_extraction_rejects_zip_slip_and_parse_filters_and_upserts(tmp_path: Path) -> None:
     config = _config(tmp_path)
     _manifest(tmp_path)
     archive = tmp_path / "incoming" / "Demo" / "web" / "login.zip"
-    archive.parent.mkdir(parents=True)
+    archive.parent.mkdir(parents=True, exist_ok=True)
     with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
         bundle.writestr("app.py", "print('safe')\n")
 
@@ -75,7 +157,7 @@ def test_safe_zip_extraction_rejects_zip_slip_and_parse_filters_and_upserts(tmp_
     assert [challenge.name for challenge in state.list_challenges()] == ["login"]
     LocalApplication(config).parse()
     assert len(state.list_challenges()) == 1
-    assert [event.type for event in TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name).merge()] == ["CHALLENGE_SEEN", "QUEUED"]
+    assert [event.type for event in state.list_events()] == ["CHALLENGE_SEEN", "QUEUED"]
 
     malicious = tmp_path / "bad.zip"
     with ZipFile(malicious, "w") as bundle:
@@ -100,18 +182,16 @@ def test_mock_once_end_to_end_writes_synthetic_candidate_solved_event_and_artifa
     output = synthetic_config.output_contest_dir() / challenge.slug
     assert "synthetic mock" in (output / "evidence.log").read_text(encoding="utf-8")
     assert "FINDING" in (output / "notes.md").read_text(encoding="utf-8")
-    # Synthetic mock fixtures remain in their private SQLite/output namespace
-    # and are never appended to any TeamSync member ledger.
-    events = TeamSync(synthetic_config.sync_root, team_id=synthetic_config.team_id, member=synthetic_config.member_name).merge()
-    assert not events
-    assert "SYNTHETIC SOLVED:" in render_tui(synthetic_config, state, show_team=True)
+    # Synthetic mock fixtures remain in their private SQLite/output namespace.
+    assert [event.type for event in state.list_events()]
+    assert "SYNTHETIC SOLVED:" in render_tui(synthetic_config, state)
 
     LocalApplication(config).parse()
     production_state = LocalState(config.state_path())
     production_challenge = production_state.list_challenges()[0]
     assert production_challenge.status is ChallengeStatus.QUEUED
     assert not production_state.list_flag_candidates(production_challenge.id)
-    assert not [event for event in TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name).merge() if event.type == "SOLVED"]
+    assert not [event for event in production_state.list_events() if event.type == "SOLVED"]
 
 
 def test_nonmock_request_uses_automatic_model_route_and_never_uses_host_commands(tmp_path: Path) -> None:
@@ -130,8 +210,7 @@ def test_nonmock_request_uses_automatic_model_route_and_never_uses_host_commands
     app.run_once(auto_confirm_flags=True)
     assert received and received[0].difficulty == "easy" and received[0].attempt_kind == "recon_fast"
     assert all("docker" == call[0] for call in docker.calls)
-    sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
-    ledger = LocalEventBus(sync.own_event_path, member=config.member_name).read()
+    ledger = LocalState(config.state_path()).list_events()
     by_attempt: dict[str, list[str]] = {}
     for event in ledger:
         if event.attempt_id:
@@ -149,26 +228,6 @@ def test_nonmock_request_uses_automatic_model_route_and_never_uses_host_commands
         and event.payload.get("resume_id") == "resume-vertical"
         for event in worker_stopped
     )
-
-
-def test_team_merged_state_has_solved_precedence_team_isolation_and_duplicate_warning(tmp_path: Path) -> None:
-    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    root = tmp_path / "sync"
-    alpha = TeamSync(root, team_id="alpha", member="alice")
-    alpha.append(Event(timestamp=now, team_id="alpha", member="alice", contest="Demo", type="RUNNING", challenge_id="c", challenge="login"))
-    bob = TeamSync(root, team_id="alpha", member="bob")
-    bob.append(Event(timestamp=now, team_id="alpha", member="bob", contest="Demo", type="RUNNING", challenge_id="c", challenge="login"))
-    bob.append(Event(timestamp=now, team_id="alpha", member="bob", contest="Demo", type="SOLVED", challenge_id="c", challenge="login", payload={"flag": "FLAG{DONE}"}))
-    TeamSync(root, team_id="beta", member="eve").append(Event(timestamp=now, team_id="beta", member="eve", contest="Demo", type="RUNNING", challenge_id="c", challenge="login"))
-    merged = MergedTeamState.from_events(alpha.merge())
-    status = merged.get("c")
-    assert status and status.status == "SOLVED" and status.solved_flag == "FLAG{DONE}"
-    assert status.duplicate_running is False  # bob's latest record is SOLVED
-    duplicate = MergedTeamState.from_events([
-        Event(timestamp=now, team_id="alpha", member="alice", contest="Demo", type="RUNNING", challenge_id="d"),
-        Event(timestamp=now, team_id="alpha", member="bob", contest="Demo", type="RUNNING", challenge_id="d"),
-    ])
-    assert duplicate.get("d") and duplicate.get("d").duplicate_running
 
 
 def test_tui_distinguishes_candidate_from_solved(tmp_path: Path, claimed_attempt) -> None:

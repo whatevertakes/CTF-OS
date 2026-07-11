@@ -1,13 +1,13 @@
 # CTF-OS 팀 배포 가이드
 
-이 문서는 4명이 각자 저장소를 clone해 운영하고, 다음 대회만 2명+2명으로 나뉘는 경우를 기준으로 합니다. 핵심은 코드만 Git으로 맞추고, 설정과 SQLite는 PC별로 분리하며, TeamSync JSONL만 `team_id`별 폴더 안에서 공유하는 것입니다.
+이 문서는 4명이 각자 저장소를 clone해 독립 운영하는 경우를 기준으로 합니다. 코드만 Git으로 맞추고, 설정·SQLite·output은 PC별로 분리합니다. TeamSync JSONL 공유 기능은 제거되었으며 기존 설정의 `sync` 항목은 무시됩니다.
 
 ## 먼저 이해할 구조
 
 ```text
 설정 파일 (PC별)
 ├─ contest.team_id ───────────────┐
-├─ member.name (PC마다 고유) ────┴─ sync root/<team_id>/*.events.jsonl
+├─ member.name (PC마다 고유) ────┘
 └─ paths.output ─────────────────── output/<team_id>/<member>/<contest>/local_state.db
 ```
 
@@ -37,7 +37,7 @@ SQLite의 `local_state.db`는 처음 연 `team_id`, `member.name`, `contest.name
 | A팀 | jiwoong, jueon | `next-a` | `local.next-a.jiwoong.yaml`, `local.next-a.jueon.yaml` |
 | B팀 | hyunseok, howon | `next-b` | `local.next-b.hyunseok.yaml`, `local.next-b.howon.yaml` |
 
-A팀과 B팀은 같은 대회 이름을 써도 됩니다. 단, `team_id`, 설정 파일, output, `sync/<team_id>`가 달라야 합니다. A팀 JSONL이 B팀 폴더에 들어가지 않도록 공유 폴더 권한과 동기화 대상을 확인하세요.
+A팀과 B팀은 같은 대회 이름을 써도 됩니다. 단, `team_id`, 설정 파일과 output이 달라야 합니다.
 
 다음 대회 뒤 4명으로 돌아갈 때는 A/B 설정의 `team_id`를 수정하지 않습니다. 새 대회용 설정을 `sca-jiwoong-team`으로 다시 만들면 A/B 대회의 DB와 기록을 손상하지 않고 4명 운영을 재개할 수 있습니다.
 
@@ -82,19 +82,13 @@ model_routing:
   enabled: true                # 생성된 routing 파일을 검토한 뒤 실제 실행 때 활성화
   config_path: "config/model-routing.yaml"
 
-sync:
-  enabled: true
-  type: "file"
-  root: "sync"                # 또는 팀이 합의한 공유 폴더의 절대 경로
 ```
 
-`paths.sync`를 별도로 적으면 `sync.root`보다 우선합니다. 혼동을 막으려면 생성된 설정처럼 `sync.root` 한 곳만 사용하세요.
-
-신규 설정은 `contest.team_id`를 TeamSync 팀 폴더의 단일 기준으로 사용합니다. 기존 YAML에 `sync.team_namespace`가 남아 있으면 하위 호환 검증을 위해 `contest.team_id`와 같은 값이어야 하지만, 새 설정에 추가할 필요는 없습니다.
+`contest.team_id`는 Docker 라벨과 로컬 output 격리에만 사용합니다. 기존 YAML에 남은 `sync` 항목은 호환을 위해 읽되 무시합니다.
 
 모델 라우팅은 사람이 매 실행마다 모델을 고르는 방식이 아닙니다. 검토한 `config/model-routing.yaml`을 사용해 Sol은 감독·전략·최종 검증, Terra는 구현과 일반 풀이, Luna는 정찰·요약·가벼운 병렬 시도를 담당하게 합니다.
 
-TeamSync가 PC 사이에서 보이려면 각 PC의 `sync.root`가 같은 파일 동기화/공유 폴더를 가리켜야 합니다. 기본값 `sync`는 현재 clone 내부의 로컬 폴더이므로 Git pull만으로 다른 PC와 동기화되지 않습니다. 각 노드는 `sync/<team_id>/<member>.events.jsonl` 중 자기 member 파일에만 추가하고, 팀원 파일은 읽기만 합니다.
+노드 간 상태 파일 공유는 지원하지 않습니다. 각 PC는 자기 SQLite와 output만 사용하고, 문제 분담은 팀원끼리 별도로 합의합니다.
 
 ## contest.md 준비
 
@@ -144,7 +138,7 @@ Dockerfile이 바뀌어 이미지를 의도적으로 다시 만들 때만 다음
 | `scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml` | 코드에 맞춰 환경·DB·이미지를 다시 준비합니다. |
 | `uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock` | 실제 풀이 필수 조건을 최종 확인합니다. |
 | `uv run ctf-os parse --config local.next-a.jiwoong.yaml` | 담당 카테고리 문제만 로컬 DB에 안전하게 반영합니다. |
-| `uv run ctf-os tui --plain --team --config local.next-a.jiwoong.yaml` | 대회명, member, team ID와 팀 상태를 화면에서 확인합니다. |
+| `uv run ctf-os tui --plain --config local.next-a.jiwoong.yaml` | 대회명, member, team ID와 로컬 상태를 화면에서 확인합니다. |
 
 `parse` 결과의 문제 수가 예상과 다르면 `member.owned_categories`와 `contest.md`의 category 철자를 먼저 확인하세요.
 
@@ -154,33 +148,31 @@ Dockerfile이 바뀌어 이미지를 의도적으로 다시 만들 때만 다음
 | --- | --- |
 | `uv run ctf-os run --config local.next-a.jiwoong.yaml` | 이 PC 큐를 계속 처리합니다. |
 | `uv run ctf-os run --once --config local.next-a.jiwoong.yaml` | 한 번만 처리하고 종료해 설정을 점검할 때 사용합니다. |
-| `uv run ctf-os tui --team --config local.next-a.jiwoong.yaml` | 로컬 DB와 같은 `team_id`의 TeamSync 상태를 봅니다. |
-| `uv run ctf-os tui --readonly --team --config local.next-a.jiwoong.yaml` | worker를 건드리지 않고 상태 파일 변경만 계속 읽습니다. |
-| `uv run ctf-os sync merge --config local.next-a.jiwoong.yaml` | 같은 팀 JSONL 이벤트를 정렬·중복 제거해 출력합니다. |
-| `uv run ctf-os sync watch --config local.next-a.jiwoong.yaml` | 같은 팀 JSONL 변경을 읽기 전용으로 감시합니다. |
+| `uv run ctf-os tui --config local.next-a.jiwoong.yaml` | 이 PC의 로컬 SQLite 상태를 봅니다. |
+| `uv run ctf-os tui --readonly --config local.next-a.jiwoong.yaml` | worker를 건드리지 않고 로컬 SQLite 변경만 계속 읽습니다. |
 | `uv run ctf-os pause <문제명> --config local.next-a.jiwoong.yaml` | 현재 PC에서 문제 하나를 정지합니다. |
 | `uv run ctf-os resume <문제명> --config local.next-a.jiwoong.yaml` | 정지한 문제를 현재 PC 큐에 다시 넣습니다. |
 | `uv run ctf-os retry <문제명> --config local.next-a.jiwoong.yaml` | 실패한 문제를 현재 PC에서 다시 시도합니다. |
 | `uv run ctf-os sandbox cleanup --config local.next-a.jiwoong.yaml` | 현재 team/member/contest 라벨의 컨테이너만 정리합니다. |
 
-TeamSync는 명령 채널이 아닙니다. 다른 팀원의 worker를 pause/resume하거나 원격 실행하지 않으며, 플래그도 자동 제출하지 않습니다.
+다른 팀원의 worker를 pause/resume하거나 원격 실행하지 않으며, 플래그도 자동 제출하지 않습니다.
 
 ## clone 후 팀 맞춤 체크리스트
 
 - [ ] 네 PC 모두 같은 `main` 커밋을 사용한다.
 - [ ] 같은 참가 팀끼리 대회 이름과 `team_id` 철자가 완전히 같다.
-- [ ] 같은 팀의 `contest.team_id`가 같고, 기존 `sync.team_namespace`가 있다면 그 값도 같다.
+- [ ] 같은 팀의 `contest.team_id`가 같다.
 - [ ] 네 PC의 `member.name`이 서로 겹치지 않는다.
 - [ ] 설정 파일 이름이 `local.<team>.<member>.yaml`이고 Git 추적 대상이 아니다.
 - [ ] `paths.output`이 `output/<team_id>/<member>`이고 공유 폴더가 아니다.
 - [ ] 기존 DB의 `team_id + member.name + contest.name`이 현재 설정과 모두 같다.
 - [ ] 서로의 `output/` 또는 `local_state.db`를 복사하지 않았다.
-- [ ] TeamSync를 공유한다면 `sync.root`만 같은 공유 위치를 가리킨다.
-- [ ] A팀과 B팀의 `team_id` 및 `sync/<team_id>`가 다르다.
+- [ ] 설정·SQLite·output은 노드별 로컬 경로를 사용한다.
+- [ ] A팀과 B팀의 `team_id`와 output 경로가 다르다.
 - [ ] `contest.md`의 대회명과 설정의 `contest.name`이 정확히 같다.
 - [ ] 담당 category가 겹치는 것이 의도인지 확인했다.
 - [ ] 각 PC에서 배포, `doctor --non-mock`, `parse`가 성공했다.
-- [ ] `tui --plain --team` 제목의 대회명·member·team ID를 사람이 확인했다.
+- [ ] `tui --plain` 제목의 대회명·member·team ID를 사람이 확인했다.
 
 ## DB ID 오류가 날 때
 
@@ -188,7 +180,7 @@ TeamSync는 명령 채널이 아닙니다. 다른 팀원의 worker를 pause/resu
 
 1. 실행을 멈추고 오류에 표시된 DB 경로를 기록합니다.
 2. 사용한 `--config` 파일이 현재 참가 팀용인지 확인합니다.
-3. `contest.team_id`가 현재 팀 값인지 확인하고, 기존 `sync.team_namespace`가 남아 있다면 같은지 확인합니다.
+3. `contest.team_id`가 현재 팀 값인지 확인합니다.
 4. `contest.name`, `member.name`과 `paths.output`이 현재 노드용인지 확인합니다.
 5. 팀을 옮긴 상황이면 기존 YAML을 수정하지 말고 새 이름의 설정을 `init`으로 만듭니다.
 6. 새 설정이 새 `output/<team_id>/<member>`를 가리키는지 확인한 뒤 배포와 doctor를 다시 실행합니다.
@@ -209,4 +201,4 @@ scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml
 uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock
 ```
 
-Git으로 공유하는 것은 코드뿐입니다. 설정 YAML, `incoming/`, `output/`, `sync/`, SQLite, 로그, 자격 증명, 키, 실제 플래그는 커밋하지 않습니다. 배포 스크립트도 이 로컬 데이터를 삭제하거나 다른 PC로 전송하지 않습니다.
+Git으로 공유하는 것은 코드뿐입니다. 설정 YAML, `incoming/`, `output/`, SQLite, 로그, 자격 증명, 키, 실제 플래그는 커밋하지 않습니다. 배포 스크립트도 이 로컬 데이터를 삭제하거나 다른 PC로 전송하지 않습니다.

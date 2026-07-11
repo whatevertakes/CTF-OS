@@ -185,7 +185,9 @@ def test_sandbox_release_failure_publishes_standard_stop_with_false_ok_payload(t
     assert len(stopped) == 1
     assert stopped[0].payload["ok"] is False
     assert stopped[0].payload["remove_requested"] is True
-    assert [event.type for event in app.team_sync.merge()] == ["SANDBOX_STOPPED", "SANDBOX_CLEANUP_FAILED"]
+    assert [event.type for event in state.list_events(challenge_id=challenge.id)] == [
+        "SANDBOX_STOPPED", "SANDBOX_CLEANUP_FAILED",
+    ]
 
 
 def test_quota_class_cooldown_stops_new_launches_until_expiry(tmp_path: Path) -> None:

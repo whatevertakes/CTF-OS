@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from ctf_os.flag_detector import FlagDetector
 from ctf_os.local_state import LocalState
-from ctf_os.merged_team_state import MergedTeamState
+from ctf_os.local_event_state import LocalEventState
 from ctf_os.models import Attempt, Challenge, Event, FlagCandidate
 
 
@@ -70,7 +70,7 @@ def test_same_flag_value_can_exist_for_different_challenges(tmp_path):
     assert state.list_flag_candidates(b.id)[0].challenge_id == b.id
 
 
-def test_team_sync_flag_maps_by_challenge_key_and_not_flag_value():
+def test_local_events_map_by_challenge_key_and_not_flag_value():
     events = [
         Event(team_id="team", member="alice", contest="Demo", type="SOLVED",
               challenge_id="foreign-a", challenge_key="team:demo:pwn:bof", category="pwn", challenge="bof",
@@ -79,7 +79,7 @@ def test_team_sync_flag_maps_by_challenge_key_and_not_flag_value():
               challenge_id="foreign-b", challenge_key="team:demo:web:bof", category="web", challenge="bof",
               payload={"flag": "SCA{same}", "verified": True}),
     ]
-    merged = MergedTeamState.from_events(events)
+    merged = LocalEventState.from_events(events)
     assert merged.get("team:demo:pwn:bof").events == (events[0],)
     assert merged.get("team:demo:web:bof").events == (events[1],)
 

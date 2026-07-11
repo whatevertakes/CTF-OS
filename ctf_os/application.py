@@ -22,10 +22,11 @@ from uuid import uuid4
 from .artifact_writer import ArtifactWriter
 from .config import AppConfig, ConfigError
 from .flag_detector import FlagDetector
-from .intake import IntakeChallenge, IntakeService
+from .contest_parser import ContestParseError
+from .intake import IntakeChallenge, IntakeError, IntakeService
 from .local_state import LocalState, StateTransitionError
 from .local_worker_pool import LocalWorkerPool, WorkerHandle
-from .merged_team_state import MergedTeamState
+from .local_event_state import LocalEventState
 from .model_routing import ModelRouter, ModelRoutingError, ModelSelection
 from .models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, FlagCandidate, utc_now
 from .sandbox.broker import BrokerResponse, broker_transport_supported, send_broker_request
@@ -44,7 +45,6 @@ from .solver_engine.race_plan import RaceAttempt, RacePlan
 from .solver_engine.strategy_reranker import StrategyReranker
 from .solver_engine.types import SolverEvent
 from .solver_engine.verifier import Verifier
-from .team_sync import TeamSync
 from .watcher import PathPollingWatcher
 
 
@@ -59,6 +59,10 @@ _MEANINGFUL_PROGRESS_TYPES = frozenset({
 
 class PrerequisiteError(RuntimeError):
     """A safe refusal to start a non-mock worker without required local tools."""
+
+
+class IntakeBlockedError(PrerequisiteError):
+    """A transient local manifest/source error that a watcher may recover from."""
 
 
 @dataclass(frozen=True)
@@ -157,7 +161,6 @@ class LocalApplication:
         self._supervisor_hint_factory = supervisor_hint_factory
         self._monotonic_clock = monotonic_clock
         self._synthetic_namespace = _synthetic_namespace
-        self.team_sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
         self._sandbox_by_attempt: dict[str, DockerSandboxPool] = {}
         self._candidate_signals: queue.SimpleQueue[CandidateSignal] = queue.SimpleQueue()
         self._records_by_attempt: dict[str, deque[SolverEvent]] = {}
@@ -176,13 +179,16 @@ class LocalApplication:
 
     def parse(self) -> tuple[IntakeChallenge, ...]:
         """Discover exact-manifest owned challenges and queue only this node's work."""
-        intake = tuple(
-            replace(item, challenge=replace(
-                item.challenge,
-                challenge_key=f"{self.config.team_id}:{item.challenge.challenge_key}",
-            ))
-            for item in IntakeService(self.config).collect()
-        )
+        try:
+            intake = tuple(
+                replace(item, challenge=replace(
+                    item.challenge,
+                    challenge_key=f"{self.config.team_id}:{item.challenge.challenge_key}",
+                ))
+                for item in IntakeService(self.config).collect()
+            )
+        except (ContestParseError, IntakeError, PermissionError, OSError) as exc:
+            raise IntakeBlockedError(f"queue blocked: contest.md intake failed: {exc}") from exc
         for item in intake:
             state = LocalState.for_config(
                 self.config, contest_name=item.manifest.name
@@ -238,7 +244,7 @@ class LocalApplication:
         )
         # This reference exists only inside this local process.  It lets a
         # pause requested through the in-process API cancel *only* handles
-        # created by this node; it is never a TeamSync control mechanism.
+        # created by this node; it is never a remote control mechanism.
         self._active_pool = pool
         plans: deque[PlannedAttempt] = deque()
         solved: set[str] = set()
@@ -246,6 +252,8 @@ class LocalApplication:
         intake: tuple[IntakeChallenge, ...] = ()
         supervisors: dict[str, _SupervisorHandle] = {}
         try:
+            # Surface malformed/missing intake before Docker/Codex diagnostics.
+            intake = self.parse()
             recovery = coordinator_state.reconcile_stale_attempts(recovery_event_factory=self._recovery_event)
             self._flush_outbox(coordinator_state)
             if recovery.stale_attempt_ids:
@@ -266,7 +274,6 @@ class LocalApplication:
                         payload={"container_ids": orphaned},
                     )
 
-            intake = self.parse()
             self._notify_status()
             for item in intake:
                 state = LocalState.for_config(
@@ -391,27 +398,47 @@ class LocalApplication:
     ) -> RunReport | None:
         if once:
             return self.run_once(mock_worker=mock_worker, auto_confirm_flags=auto_confirm_flags, on_status=on_status)
-        # Watch the local state too so ``ctf-os resume`` is picked up without
-        # waiting for a contest file edit.  This remains a local poller: it
-        # neither reads a teammate's process list nor executes TeamSync data.
-        watcher = PathPollingWatcher(
-            (self.config.incoming_root, self.config.state_path()),
+        # Input and SQLite use separate baselines.  A run writes SQLite itself,
+        # so only the state baseline is acknowledged after handling; input
+        # files added while a long attempt is running must remain observable.
+        contest_root = self.config.incoming_contest_dir()
+        workspace_root = contest_root / "workspace"
+
+        def watched_input(path: Path) -> bool:
+            try:
+                path.relative_to(workspace_root)
+            except ValueError:
+                return True
+            return False
+
+        input_watcher = PathPollingWatcher(
+            (self.config.incoming_root,),
             interval_sec=self.config.poll_interval_sec,
-            include=lambda path: (
-                path.name.startswith("local_state.db")
-                or path.name == "contest.md"
-                or path.suffix.casefold() == ".zip"
-            ),
+            include=watched_input,
+        )
+        state_watcher = PathPollingWatcher(
+            (self.config.state_path(),),
+            interval_sec=self.config.poll_interval_sec,
         )
         while stop_event is None or not stop_event.is_set():
-            if watcher.changed():
-                self.run_once(mock_worker=mock_worker, auto_confirm_flags=auto_confirm_flags, on_status=on_status)
-            if not watcher.wait(stop_event):
+            if input_watcher.changed() or state_watcher.changed():
+                try:
+                    self.run_once(mock_worker=mock_worker, auto_confirm_flags=auto_confirm_flags, on_status=on_status)
+                except IntakeBlockedError:
+                    # Editors commonly expose a missing/partial manifest for
+                    # one poll.  Keep the queue blocked and retry only after a
+                    # local manifest/source change instead of killing watch.
+                    pass
+                finally:
+                    state_watcher.acknowledge()
+            if not input_watcher.wait(stop_event):
                 break
         return None
 
-    def merged_state(self) -> MergedTeamState:
-        return MergedTeamState.from_events(self.team_sync.merge())
+    def merged_state(self) -> LocalEventState:
+        """Return a projection of this node's durable SQLite event history."""
+        state = LocalState.for_config(self.config)
+        return LocalEventState.from_events(state.list_events())
 
     def dashboard_config(self, *, mock_worker: bool) -> AppConfig:
         """Return the local-only namespace whose state a run is displaying."""
@@ -503,7 +530,7 @@ class LocalApplication:
     def resume_challenge(self, selector: str) -> OperatorActionResult:
         """Requeue exactly one manually paused local challenge.
 
-        Resume does not construct a process command or contact TeamSync peers;
+        Resume does not construct a process command or contact peers;
         the next ordinary local watcher/run claim is the only way work starts.
         """
         state, challenge = self._operator_local_challenge(selector, action="resume")
@@ -585,8 +612,6 @@ class LocalApplication:
         raw = copy.deepcopy(self.config.raw)
         paths = raw.setdefault("paths", {})
         paths["output"] = str(self.config.output_root / ".synthetic")
-        paths["sync"] = str(self.config.sync_root / ".synthetic")
-        raw.setdefault("sync", {})["enabled"] = False
         return AppConfig(raw=raw, path=self.config.path)
 
     # --- prerequisites and sandbox lifecycle -----------------------------------------
@@ -747,7 +772,7 @@ class LocalApplication:
                            message="synthetic mock attempt running" if mock_worker else "local Codex attempt running",
                            payload=running_payload, synthetic=mock_worker)
             # Older consumers still recognize WORKER_STARTED.  RUNNING above
-            # is the canonical TeamSync lifecycle record and is always first.
+            # is the canonical local lifecycle record and is always first.
             self._emit(task.state, challenge, "WORKER_STARTED", attempt=attempt,
                        message="synthetic mock attempt running" if mock_worker else "local Codex attempt running",
                        payload=running_payload, synthetic=mock_worker)
@@ -1088,7 +1113,7 @@ class LocalApplication:
         if not synthetic:
             # This root-level capture is neither /work nor /artifacts, so the
             # solver cannot edit it and late workers cannot reach aggregate
-            # notes/evidence/TeamSync through this callback.
+            # notes, evidence, or local state through this callback.
             task.writer.append_attempt_capture(attempt.workdir, f"[solver] {line}")
         parser = ActionObservationParser()
         record = parser.parse_line(line)
@@ -1205,7 +1230,7 @@ class LocalApplication:
         """Start at most one bounded hint review per locally leased challenge.
 
         The coordinator only observes handles it owns.  It does not inspect
-        teammates' TeamSync state for control purposes and it never turns an
+        another node's state for control purposes and it never turns an
         event into a remote command.
         """
         now = self._monotonic_clock()
@@ -1701,7 +1726,7 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
             payload=payload,
             fenced=False,
         )
-        # Keep prior event names for local consumers while the TeamSync
+        # Keep prior event names for local consumers while the local
         # vocabulary migrates to SANDBOX_STOPPED.
         self._emit(
             state,
@@ -1726,15 +1751,14 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
                         self._emit_sandbox_stopped(state, challenge, attempt, result.ok, result.stderr, preserve=False)
 
     def _flush_outbox(self, state: LocalState) -> None:
-        if self._synthetic_namespace or not self.config.sync_enabled:
-            return
+        """Retire locally committed events without publishing a shared ledger.
+
+        SQLite is the sole runtime source of truth.  Keeping the transactional
+        outbox rows acknowledged preserves existing migrations and avoids an
+        ever-growing pending queue on upgraded nodes.
+        """
         for record in state.pending_outbox():
-            try:
-                self.team_sync.append_idempotent(record.event)
-                state.mark_outbox_published(record.event.id)
-            except (OSError, ValueError, PermissionError) as exc:
-                state.mark_outbox_failed(record.event.id, str(exc))
-                break
+            state.mark_outbox_published(record.event.id)
 
     # --- prompt/context integration ---------------------------------------------------
 
