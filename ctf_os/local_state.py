@@ -14,7 +14,10 @@ import json
 from pathlib import Path
 import sqlite3
 from threading import RLock
-from typing import Any, Callable, Iterable, Iterator, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, TypeVar
+
+if TYPE_CHECKING:
+    from .config import AppConfig
 
 from .models import (
     Attempt,
@@ -37,7 +40,7 @@ class StateError(ValueError):
     """Raised when a local-state database cannot be opened safely."""
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -92,17 +95,43 @@ class LocalState:
         *,
         clock: Callable[[], datetime] = utc_now,
         team_id: str | None = None,
+        member_name: str | None = None,
+        contest_name: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
         self._team_id = team_id.strip() if team_id is not None else None
+        self._member_name = member_name.strip() if member_name is not None else None
+        self._contest_name = contest_name.strip() if contest_name is not None else None
         self._bound_team_id: str | None = None
         self._event_listeners: list[Callable[[Event], None]] = []
         self._event_listener_lock = RLock()
         if team_id is not None and not self._team_id:
             raise ValueError("team_id must be non-empty when provided")
+        if member_name is not None and not self._member_name:
+            raise ValueError("member_name must be non-empty when provided")
+        if contest_name is not None and not self._contest_name:
+            raise ValueError("contest_name must be non-empty when provided")
         self.initialize()
+
+    @classmethod
+    def for_config(
+        cls,
+        config: "AppConfig",
+        *,
+        contest_name: str | None = None,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> "LocalState":
+        """Open the configured DB while enforcing its complete node identity."""
+        resolved_contest = contest_name or config.contest_name
+        return cls(
+            config.state_path(resolved_contest),
+            clock=clock,
+            team_id=config.team_id,
+            member_name=config.member_name,
+            contest_name=resolved_contest,
+        )
 
     def subscribe_events(self, listener: Callable[[Event], None]) -> Callable[[], None]:
         """Subscribe to committed events produced through this repository.
@@ -207,6 +236,8 @@ class LocalState:
             self._migrate_v4_to_v5(conn)
         elif version == 5:
             self._migrate_v5_to_v6(conn)
+        elif version == 6:
+            self._migrate_v6_to_v7(conn)
         else:  # Defensive guard for future edits to CURRENT_SCHEMA_VERSION.
             raise StateError(f"no migration is registered from schema version {version}")
 
@@ -377,28 +408,88 @@ class LocalState:
             )
         """)
 
+    @staticmethod
+    def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+        """Reserve metadata bindings for the local member and contest.
+
+        The table was introduced in v6, so the migration itself is intentionally
+        structural-no-op. Identity values are written only by
+        :meth:`_bind_team_identity`, where the caller's complete config is
+        available and mismatches can be rejected atomically.
+        """
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS state_metadata (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL
+            )
+        """)
+
     def _bind_team_identity(self, conn: sqlite3.Connection) -> None:
-        """Bind and normalize legacy keys without guessing challenge ownership."""
+        """Bind node identity and normalize legacy keys without guessing ownership."""
         if not self._table_exists(conn, "state_metadata"):
             return
-        row = conn.execute(
-            "SELECT value FROM state_metadata WHERE key='team_id'"
-        ).fetchone()
-        stored_team_id = str(row["value"]) if row is not None else None
+        metadata = {
+            str(row["key"]): str(row["value"])
+            for row in conn.execute(
+                "SELECT key, value FROM state_metadata "
+                "WHERE key IN ('team_id', 'member_name', 'contest_name')"
+            )
+        }
+        stored_team_id = metadata.get("team_id")
         if self._team_id is not None and stored_team_id not in {None, self._team_id}:
             raise StateError(
                 f"local-state database is bound to team {stored_team_id!r}, "
-                f"not configured team {self._team_id!r}"
+                f"not configured team {self._team_id!r}: {self.path}. "
+                "This usually means paths.output points to another team's data; "
+                "use that team's config or a separate output path."
             )
+
+        self._require_matching_metadata(
+            field="member.name", configured=self._member_name,
+            stored=metadata.get("member_name"),
+        )
+        self._require_matching_metadata(
+            field="contest.name", configured=self._contest_name,
+            stored=metadata.get("contest_name"),
+        )
+
+        if self._member_name is not None and metadata.get("member_name") is None:
+            evidence = self._legacy_event_members(conn)
+            if len(evidence) == 1 and self._member_name not in evidence:
+                stored_member = next(iter(evidence))
+                raise StateError(
+                    f"local-state identity mismatch at {self.path}: legacy event data "
+                    f"belongs to member.name {stored_member!r}, but config member.name is "
+                    f"{self._member_name!r}. Use the matching config or a separate output path."
+                )
+
+        if self._contest_name is not None and metadata.get("contest_name") is None:
+            contests = {
+                str(row["contest"])
+                for row in conn.execute("SELECT DISTINCT contest FROM challenges")
+            }
+            if len(contests) == 1 and self._contest_name not in contests:
+                stored_contest = next(iter(contests))
+                raise StateError(
+                    f"local-state identity mismatch at {self.path}: legacy challenge data "
+                    f"belongs to contest.name {stored_contest!r}, but config contest.name is "
+                    f"{self._contest_name!r}. Use the matching config or a separate output path."
+                )
+
+        for key, value in (
+            ("team_id", self._team_id),
+            ("member_name", self._member_name),
+            ("contest_name", self._contest_name),
+        ):
+            if value is not None and key not in metadata:
+                conn.execute(
+                    "INSERT INTO state_metadata(key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+
         authoritative_team_id = self._team_id or stored_team_id
         if authoritative_team_id is None:
             return
         self._bound_team_id = authoritative_team_id
-        if stored_team_id is None:
-            conn.execute(
-                "INSERT INTO state_metadata(key, value) VALUES ('team_id', ?)",
-                (authoritative_team_id,),
-            )
 
         from .models import slugify
         rows = conn.execute(
@@ -463,6 +554,38 @@ class LocalState:
                 "UPDATE outbox SET event_json=? WHERE event_id=?",
                 (encoded, event_row["id"]),
             )
+
+    def _require_matching_metadata(
+        self,
+        *,
+        field: str,
+        configured: str | None,
+        stored: str | None,
+    ) -> None:
+        if configured is None or stored in {None, configured}:
+            return
+        raise StateError(
+            f"local-state identity mismatch at {self.path}: database {field} is "
+            f"{stored!r}, but config {field} is {configured!r}. This usually means "
+            "the config was copied or edited while paths.output still points to another "
+            "local node; use the matching config or a separate output path."
+        )
+
+    @staticmethod
+    def _legacy_event_members(conn: sqlite3.Connection) -> set[str]:
+        """Return unambiguous member evidence from pre-v7 persisted events."""
+        members: set[str] = set()
+        for row in conn.execute(
+            "SELECT event_json FROM events WHERE event_json IS NOT NULL AND event_json != ''"
+        ):
+            try:
+                data = json.loads(str(row["event_json"]))
+            except (TypeError, ValueError):
+                continue
+            member = data.get("member") if isinstance(data, dict) else None
+            if isinstance(member, str) and member.strip():
+                members.add(member.strip())
+        return members
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, table: str) -> bool:

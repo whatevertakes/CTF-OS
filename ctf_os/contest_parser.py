@@ -102,6 +102,8 @@ def parse_contest(path: str | Path) -> ContestManifest:
         patterns = [_format_to_pattern(flag_format)]
     challenges: list[Challenge] = []
     seen: set[tuple[str, str]] = set()
+    seen_keys: dict[str, str] = {}
+    seen_slugs: dict[str, str] = {}
     for heading, fields in raw_challenges:
         category, challenge_name = _parse_challenge_heading(heading)
         key = (category.casefold(), challenge_name.casefold())
@@ -110,12 +112,27 @@ def parse_contest(path: str | Path) -> ContestManifest:
         seen.add(key)
         score_text = _first(fields, "score")
         score = _parse_score(score_text, heading) if score_text is not None else None
-        challenges.append(Challenge(
+        challenge = Challenge(
             contest=name, category=category, name=challenge_name, score=score,
             remote=_first(fields, "remote"), description=_first(fields, "description"),
             hint=_first(fields, "hint"), flag_format=_first(fields, "flag_format") or flag_format,
             flag_pattern=_first(fields, "flag_pattern") or (patterns[0] if patterns else None),
-        ))
+        )
+        previous = seen_keys.get(challenge.challenge_key)
+        if previous is not None:
+            raise ContestParseError(
+                f"challenge identifier collision: {previous!r} and {heading!r} "
+                f"both normalize to {challenge.challenge_key!r}"
+            )
+        previous = seen_slugs.get(challenge.slug)
+        if previous is not None:
+            raise ContestParseError(
+                f"challenge workspace collision: {previous!r} and {heading!r} "
+                f"both normalize to {challenge.slug!r}"
+            )
+        seen_keys[challenge.challenge_key] = heading
+        seen_slugs[challenge.slug] = heading
+        challenges.append(challenge)
     return ContestManifest(
         name=name, path=manifest_path, challenges=tuple(challenges),
         date=_first(metadata, "date"), flag_format=flag_format,

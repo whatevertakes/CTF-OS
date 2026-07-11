@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "state":
             state_path = config.state_path()
             existed = state_path.is_file()
-            LocalState(state_path, team_id=config.team_id)
+            LocalState.for_config(config)
             action = "migrated" if existed else "initialized"
             print(f"{action} local state: {state_path} (schema v{CURRENT_SCHEMA_VERSION})")
             return 0
@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 except KeyboardInterrupt:
                     return 0
             if sys.stdout.isatty() and not args.plain and config.state_path().is_file():
-                state = LocalState(config.state_path(), team_id=config.team_id)
+                state = LocalState.for_config(config)
                 sync = TeamSync(config.sync_root, team_id=config.team_id, member=config.member_name)
                 CTFOSDashboard(
                     config, state, team_state=MergedTeamState.from_events(sync.merge_report().events),
@@ -380,7 +380,7 @@ def _render_knowledge_chunk(chunk: KnowledgeChunk) -> str:
 def _dashboard_text(config: AppConfig, *, show_team: bool) -> str:
     """Read status without claiming work or creating an empty state database."""
     state = (
-        LocalState(config.state_path(), team_id=config.team_id)
+        LocalState.for_config(config)
         if config.state_path().is_file()
         else None
     )

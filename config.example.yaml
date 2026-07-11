@@ -90,7 +90,6 @@ sync:
   enabled: true
   type: file
   root: "sync"
-  team_namespace: "sca-jiwoong-team"
 
 flag_verification:
   auto_confirm_flags: false

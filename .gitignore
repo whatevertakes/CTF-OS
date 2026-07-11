@@ -21,6 +21,8 @@ sync/*
 *.sqlite
 *.sqlite3
 *.log
+/config.yaml
+/local.*.yaml
 
 # Never commit challenge-private material or credentials.
 flag

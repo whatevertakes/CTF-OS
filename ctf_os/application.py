@@ -184,8 +184,8 @@ class LocalApplication:
             for item in IntakeService(self.config).collect()
         )
         for item in intake:
-            state = LocalState(
-                self.config.state_path(item.manifest.name), team_id=self.config.team_id
+            state = LocalState.for_config(
+                self.config, contest_name=item.manifest.name
             )
             existing = state.get_challenge(item.challenge.id)
             challenge = state.upsert_challenge(item.challenge)
@@ -223,9 +223,7 @@ class LocalApplication:
             )
         previous_callback = self._status_callback
         self._status_callback = on_status
-        coordinator_state = LocalState(
-            self.config.state_path(), team_id=self.config.team_id
-        )
+        coordinator_state = LocalState.for_config(self.config)
         claim = coordinator_state.claim_coordinator(
             contest=self.config.contest_name, owner=self._owner, lease_seconds=self.config.lease_ttl_sec,
         )
@@ -271,8 +269,8 @@ class LocalApplication:
             intake = self.parse()
             self._notify_status()
             for item in intake:
-                state = LocalState(
-                    self.config.state_path(item.manifest.name), team_id=self.config.team_id
+                state = LocalState.for_config(
+                    self.config, contest_name=item.manifest.name
                 )
                 challenge = state.get_challenge(item.challenge.id)
                 if challenge is None or challenge.status is not ChallengeStatus.QUEUED:
@@ -429,7 +427,7 @@ class LocalApplication:
         wanted = selector.strip()
         if not wanted:
             raise ValueError("retry requires a local challenge name, slug, or id")
-        state = LocalState(self.config.state_path(), team_id=self.config.team_id)
+        state = LocalState.for_config(self.config)
         local = next(
             (
                 challenge for challenge in state.list_challenges()
@@ -526,7 +524,7 @@ class LocalApplication:
         wanted = selector.strip()
         if not wanted:
             raise ValueError(f"{action} requires a local challenge name, slug, or id")
-        state = LocalState(self.config.state_path(), team_id=self.config.team_id)
+        state = LocalState.for_config(self.config)
         challenge = next(
             (item for item in state.list_challenges() if wanted in {item.id, item.name, item.slug}),
             None,
@@ -1646,8 +1644,8 @@ Return the guidance as one [SUPERVISOR_HINT] line. Do not reveal private chain-o
         pending_ids = {item.intake.challenge.id for item in pending}
         active_ids = {task.intake.challenge.id for _, task in active.values()}
         for item in intake:
-            state = LocalState(
-                self.config.state_path(item.manifest.name), team_id=self.config.team_id
+            state = LocalState.for_config(
+                self.config, contest_name=item.manifest.name
             )
             challenge = state.get_challenge(item.challenge.id)
             if challenge and challenge.status is ChallengeStatus.RUNNING and challenge.id not in pending_ids | active_ids:

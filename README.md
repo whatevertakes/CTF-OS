@@ -1,104 +1,106 @@
 # CTF-OS
 
-CTF-OS는 각 팀원이 자신의 PC에서 독립적으로 실행하는 로컬 우선(local-first) 멀티 노드 CTF 풀이 도구입니다. 각 노드는 자체 Codex 시도와 격리된 Docker 컨테이너를 사용합니다. TeamSync는 상태, 발견 사항, 챌린지 소유 이벤트만 append-only 방식으로 공유하며, 다른 팀원의 프로세스를 제어하거나 CTFd에 자동 제출하지 않습니다.
+CTF-OS는 팀원 각자의 PC에서 독립적으로 실행하는 로컬 CTF 풀이 도구입니다. 풀이 명령은 가능한 한 Docker 컨테이너에서 실행하고, TeamSync에는 상태·발견 사항·플래그 이벤트만 JSONL로 기록합니다. 다른 팀원의 프로세스를 실행하지 않으며 CTFd에 플래그를 자동 제출하지 않습니다.
 
-## 시작 전 확인
+승인된 대회와 원격 대상만 `incoming/<대회 이름>/contest.md`에 적어 사용하세요.
 
-CTF-OS는 `incoming/{contest}/contest.md`에 선언한 승인된 CTF 대회와 원격 대상에서만 사용합니다. 각 팀원은 자신의 PC에서 별도의 설정, SQLite 상태, Docker 컨테이너, Codex 로그인을 사용합니다.
+## 가장 중요한 규칙
 
-## 최초 설치
+한 로컬 DB는 처음 사용한 `team_id + member.name + contest.name` 조합에 묶입니다. 기존 DB를 둔 채 이 셋 중 하나만 바꾸면 오류가 나는 것이 정상입니다.
 
-새 팀원은 아래 순서로 로컬 노드를 준비합니다. 예시의 `SCA CTF 2026`은 실제 대회 이름으로 바꿉니다.
+- 같은 팀: `contest.team_id`는 전원이 같은 값을 씁니다. 이것이 TeamSync 팀 폴더의 유일한 기준입니다.
+- 다른 팀: `contest.team_id`가 반드시 달라야 합니다.
+- 각 PC: `member.name`은 겹치지 않게 정하고 `paths.output`은 반드시 `<team_id>/<member>`로 끝나게 분리합니다. 맞지 않으면 새 DB를 만들기 전 설정 단계에서 거부됩니다.
+- 공유 가능: `sync/<team_id>/*.events.jsonl`만 팀 단위로 공유합니다.
+- 공유 금지: `output/`, `local_state.db`, Codex 로그인, Docker 컨테이너, 자격 증명과 플래그 파일은 PC 사이에 복사하지 않습니다.
+- 팀을 옮길 때: 기존 설정을 수정하지 말고 새 설정 파일과 새 output 경로를 만듭니다.
 
-```bash
-git clone https://github.com/whatevertakes/CTF-OS.git
-cd CTF-OS
-uv sync --frozen
-uv run ctf-os init "SCA CTF 2026" --config sca_config.yaml --team-id sca-jiwoong-team --member jiwoong
-```
+## 1. 사람이 먼저 정할 값
 
-`--team-id`는 같은 팀원이 공유할 TeamSync 식별자이고, `--member`는 이 PC의 로컬 노드 식별자입니다. 초기화는 SQLite 출력 경로를 `output/<team-id>/<member>`로 자동 분리합니다. 이어서 `sca_config.yaml`에서 담당 카테고리를 설정하고, `incoming/SCA CTF 2026/contest.md`에 승인된 대회와 챌린지 메타데이터를 추가합니다.
+대회마다 아래 값을 팀 채널에 먼저 확정한 뒤 모든 PC에서 그대로 사용합니다.
 
-공용 sandbox 이미지를 준비하고 로컬 상태를 검증합니다.
+| 값 | 누가 같아야 하나 | 예시 |
+| --- | --- | --- |
+| 대회 이름 | 같은 대회 참가자 전원 | `Next CTF 2026` |
+| `team_id` | 같은 참가 팀 2명 또는 4명 | `next-a` |
+| `member` | PC마다 고유 | `jiwoong` |
+| 설정 파일 | PC/팀 조합마다 별도 | `local.next-a.jiwoong.yaml` |
+| output | PC/팀 조합마다 별도 | `output/next-a/jiwoong` |
+| TeamSync root | 같은 팀끼리 같은 공유 폴더 | `/공유폴더/ctf-os-sync` |
 
-```bash
-scripts/deploy_ctf_os.sh --config sca_config.yaml
-uv run ctf-os doctor --config sca_config.yaml --non-mock
-```
+`team_id`, `member`, 대회 이름에는 `/`, `\`를 쓰지 말고 값 전체를 `.` 또는 `..`로 정하지 마세요.
 
-`ctf-os run`은 Docker 이미지를 자동으로 빌드하지 않습니다. 풀이를 시작하기 전에 배포와 진단이 모두 성공해야 합니다.
+## 2. 최초 1회 세팅
 
-## 챌린지 실행
+아래 예시는 다음 대회의 A팀에 참가하는 `jiwoong` PC입니다. 따옴표 안의 대회 이름과 세 식별자는 실제 값으로 바꾸세요.
 
-대회 입력을 파싱한 뒤 상시 실행 또는 한 번의 실행을 선택합니다.
-
-```bash
-uv run ctf-os parse --config sca_config.yaml
-uv run ctf-os run --config sca_config.yaml
-uv run ctf-os run --once --config sca_config.yaml
-```
-
-상태와 현재 노드가 담당한 챌린지의 플래그 후보는 TUI에서 확인합니다.
-
-```bash
-uv run ctf-os tui --config sca_config.yaml
-uv run ctf-os tui --plain --config sca_config.yaml
-```
-
-아래 제어 명령은 현재 PC의 현재 노드에만 적용됩니다.
-
-```bash
-uv run ctf-os pause <challenge> --config sca_config.yaml
-uv run ctf-os resume <challenge> --config sca_config.yaml
-uv run ctf-os retry <challenge> --config sca_config.yaml
-```
-
-## 여러 팀 분리
-
-같은 대회에 두 팀을 운영할 때는 팀마다 `team_id`, SQLite 출력 경로, TeamSync 경로와 네임스페이스를 모두 분리합니다. 다른 팀에 연결된 데이터베이스를 열지 마세요.
-
-```yaml
-# config-sca-a.yaml
-contest:
-  name: "SCA CTF 2026"
-  team_id: "sca-team-a"
-paths:
-  incoming: "incoming"
-  output: "output/sca-team-a/jiwoong"
-sync:
-  root: "sync"
-  team_namespace: "sca-team-a"
-```
-
-다른 팀에는 위 네 값 전체에 `sca-team-b`를 일관되게 사용합니다. 설정 파일을 명시해 상태를 준비하고 검증합니다.
-
-```bash
-uv run ctf-os state migrate --config config-sca-a.yaml
-uv run ctf-os parse --config config-sca-a.yaml
-uv run ctf-os doctor --config config-sca-a.yaml --non-mock
-```
-
-### 4인 팀 예시
-
-한 로컬 전용 팀은 공통 `team_id`인 `sca-jiwoong-team`을 사용하고, 팀원은 각자의 노드에서 맡은 카테고리만 처리합니다.
-
-| 팀원 | 담당 카테고리 예시 |
+| 명령 | 설명 |
 | --- | --- |
-| jiwoong | pwn, web |
-| jueon | rev, crypto |
-| hyunseok | forensics, misc |
-| howon | cloud, web3 |
+| `git clone https://github.com/whatevertakes/CTF-OS.git` | 코드를 처음 한 번 받습니다. |
+| `cd CTF-OS` | 저장소로 이동합니다. |
+| `uv sync --frozen` | 잠긴 버전 그대로 실행 환경을 설치합니다. |
+| `uv run ctf-os init "Next CTF 2026" --config local.next-a.jiwoong.yaml --team-id next-a --member jiwoong` | 이 PC 전용 설정·입력 폴더·output 경로를 만듭니다. |
 
-팀원별 `member.name`, 로컬 SQLite 데이터베이스, 컨테이너, Codex 로그인은 분리됩니다. TeamSync는 챌린지 소유 이벤트만 공유하며, 다른 팀원의 로컬 프로세스를 시작하거나 중지하지 않습니다.
+그다음 `local.next-a.jiwoong.yaml`에서 사람이 편집할 항목은 다음과 같습니다. `local.<team>.<member>.yaml` 이름은 로컬 설정임을 분명히 하며 Git에서 제외됩니다.
 
-## 업데이트
+- `member.owned_categories`: 이 PC가 맡을 카테고리
+- `contest.flag_patterns`: 실제 대회의 플래그 형식
+- `sync.root`: 팀원끼리 JSONL을 공유할 폴더(공유하지 않을 테스트라면 기본 `sync` 유지)
+- `model_routing.enabled`: 실제 Codex 실행은 라우팅 파일을 검토한 뒤 `true`
+- `paths.output`: 자동 생성된 `output/next-a/jiwoong`처럼 마지막 두 폴더가 `team_id/member`인지 확인
 
-대회 중에는 아래 순서로 코드와 로컬 환경을 업데이트합니다.
+신규 설정에서는 `contest.team_id`만 정하면 됩니다. 기존 YAML에 `sync.team_namespace`가 남아 있다면 호환 검증을 위해 `contest.team_id`와 같아야 합니다. 초기화 뒤에는 기존 설정의 `contest.team_id`, `member.name`, `contest.name`을 다른 노드 값으로 바꾸지 마세요.
 
-```bash
-git pull --ff-only origin main
-scripts/deploy_ctf_os.sh --config sca_config.yaml
-uv run ctf-os doctor --config sca_config.yaml --non-mock
-```
+모델은 라우팅 파일에 따라 자동 선택합니다. Sol은 감독·전략·최종 검증, Terra는 구현과 일반 풀이, Luna는 정찰·요약·가벼운 병렬 시도를 맡는 것이 기본 운영 원칙입니다.
 
-`sca_config.yaml`, 대회 입력, SQLite 데이터베이스, 산출물, TeamSync 로그, 자격 증명, 키, 플래그는 커밋하지 마세요. 최초 설치와 업데이트의 자세한 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
+팀에서 받은 동일한 `contest.md`를 `incoming/Next CTF 2026/contest.md`에 놓고, 문제를 `### category/name` 형식으로 작성합니다. `incoming/`은 Git으로 배포되지 않으므로 팀끼리 별도로 전달해야 합니다.
+
+| 명령 | 설명 |
+| --- | --- |
+| `scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml` | DB 마이그레이션, sandbox 이미지 준비와 smoke test를 한 번에 수행합니다. |
+| `uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock` | Codex·Docker·이미지·broker와 경로가 실제 풀이 가능한지 검사합니다. |
+
+## 3. 실제 대회 직전
+
+| 명령 | 설명 |
+| --- | --- |
+| `git pull --ff-only origin main` | 최신 코드를 안전하게 받습니다. |
+| `scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml` | 의존성·DB·Docker 이미지를 다시 검증합니다. |
+| `uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock` | 실제 실행 전 필수 조건을 최종 확인합니다. |
+| `uv run ctf-os parse --config local.next-a.jiwoong.yaml` | `contest.md`에서 이 PC 담당 카테고리만 로컬 DB에 넣습니다. |
+| `uv run ctf-os tui --plain --team --config local.next-a.jiwoong.yaml` | 로컬 상태와 같은 TeamSync 팀의 상태가 맞는지 한 번 출력합니다. |
+
+어느 명령에서든 DB의 노드 정체성이 다르다는 오류가 나오면 DB를 덮어쓰지 마세요. 설정 파일의 `team_id`, `member`, 대회 이름과 output 경로를 확인하고 현재 노드용 새 설정으로 다시 초기화합니다. 자세한 복구 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
+
+예전 설정의 `paths.output`이 단순히 `output`이라면 새 경로 검증에서 거부될 수 있습니다. 기존 YAML과 DB는 그대로 보존하고, 현재 대회에 `init --config local.<team>.<member>.yaml`을 실행해 새 노드를 만드세요.
+
+## 4. 대회 중
+
+| 명령 | 설명 |
+| --- | --- |
+| `uv run ctf-os run --config local.next-a.jiwoong.yaml` | 이 PC 담당 문제를 계속 처리합니다. |
+| `uv run ctf-os run --once --config local.next-a.jiwoong.yaml` | 현재 큐를 한 번만 처리하고 종료합니다. |
+| `uv run ctf-os tui --team --config local.next-a.jiwoong.yaml` | 로컬 및 같은 팀의 진행 상태를 대시보드로 봅니다. |
+| `uv run ctf-os sync watch --config local.next-a.jiwoong.yaml` | 같은 TeamSync 폴더의 변경 이벤트를 읽기 전용으로 지켜봅니다. |
+| `uv run ctf-os pause <문제명> --config local.next-a.jiwoong.yaml` | 이 PC의 문제 하나를 일시 정지합니다. |
+| `uv run ctf-os resume <문제명> --config local.next-a.jiwoong.yaml` | 정지한 문제를 이 PC 큐에 다시 넣습니다. |
+| `uv run ctf-os retry <문제명> --config local.next-a.jiwoong.yaml` | 실패한 문제를 명시적으로 다시 시도합니다. |
+
+플래그 후보는 사람이 검증하고 직접 제출해야 합니다.
+
+## 4명 기본 운영과 다음 대회 2+2 운영
+
+### KISIA four-member example · 평소 4인 팀
+
+평소에는 네 명이 `team_id: sca-jiwoong-team`을 공유하고, `member.name`과 담당 카테고리만 각자 다르게 둡니다.
+
+| member | 담당 예시 |
+| --- | --- |
+| `jiwoong` | pwn, web |
+| `jueon` | rev, crypto |
+| `hyunseok` | forensics, misc |
+| `howon` | cloud, web3 |
+
+다음 대회만 두 팀으로 나뉜다면 A팀 2명은 `next-a`, B팀 2명은 `next-b`를 사용합니다. 두 팀은 설정 파일, output, `sync/<team_id>` 폴더가 완전히 분리되어야 합니다. 대회가 끝난 뒤 4명 운영으로 돌아갈 때는 기존 A/B 설정을 고치지 말고, 다음 대회용 `sca-jiwoong-team` 설정 파일을 새로 만드세요. 각 대회의 SQLite 기록은 그대로 보존됩니다.
+
+더 자세한 clone 점검표, 설정 예시와 오류 복구는 [CTF-OS 팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)에 있습니다.

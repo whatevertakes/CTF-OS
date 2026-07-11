@@ -64,6 +64,22 @@ def test_contest_parser_rejects_unsafe_challenge_paths(tmp_path, heading):
         parse_contest(path)
 
 
+@pytest.mark.parametrize(
+    ("headings", "message"),
+    [
+        (("web/a-b", "web/a b"), "identifier collision"),
+        (("web/a-b", "web-a/b"), "workspace collision"),
+    ],
+)
+def test_contest_parser_rejects_normalized_identifier_collisions(tmp_path, headings, message):
+    path = tmp_path / "contest.md"
+    sections = "\n\n".join(f"### {heading}\n- 점수: 1" for heading in headings)
+    path.write_text(f"# 대회명: test\n\n{sections}\n", encoding="utf-8")
+
+    with pytest.raises(ContestParseError, match=message):
+        parse_contest(path)
+
+
 def test_local_state_upsert_transitions_attempt_events_and_candidates(tmp_path, claimed_attempt):
     state = LocalState(tmp_path / "output" / "local_state.db")
     challenge = Challenge(contest="SCA", category="web", name="sqli", score=100, description="old")

@@ -20,3 +20,9 @@ def test_team_deployment_document_keeps_image_build_explicit() -> None:
     document = (ROOT / "docs" / "CTF_OS_TEAM_DEPLOYMENT.md").read_text(encoding="utf-8")
     assert "ctf-os run`은 이미지를 자동으로 빌드하지 않습니다" in document
     assert "17179869184" not in document or "16 GiB" in document
+
+
+def test_member_local_config_names_are_ignored() -> None:
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "/config.yaml" in ignore
+    assert "/local.*.yaml" in ignore

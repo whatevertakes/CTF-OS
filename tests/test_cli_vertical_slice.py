@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import yaml
 
@@ -62,7 +63,7 @@ def test_init_creates_team_and_member_isolated_local_paths(tmp_path: Path) -> No
     assert config.member_name == "jiwoong"
     assert config.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jiwoong" / "SCA CTF 2026"
     assert config.sync_root == tmp_path / "sync"
-    assert config.get_mapping("sync")["team_namespace"] == "sca-jiwoong-team"
+    assert "team_namespace" not in config.get_mapping("sync")
 
     assert main([
         "init", "SCA CTF 2026", "--config", str(config_path),
@@ -102,6 +103,87 @@ def test_state_migrate_is_idempotent_and_uses_configured_local_database(tmp_path
 
     assert main(["state", "migrate", "--config", str(config.path)]) == 0
     assert "migrated local state" in capsys.readouterr().out
+
+
+def test_copied_config_requires_member_and_split_team_output_suffix(tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "team.yaml"
+    raw = default_config_mapping(
+        "Next CTF", team_id="four-person-team", member_name="alice"
+    )
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert main(["state", "migrate", "--config", str(config_path)]) == 0
+    capsys.readouterr()
+
+    # A teammate copied Alice's config and edited only member.name. Because
+    # paths.output still names Alice, this would previously open Alice's DB.
+    raw["member"]["name"] = "bob"
+    raw["member"]["display_name"] = "bob"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert main(["state", "migrate", "--config", str(config_path)]) == 2
+    error = capsys.readouterr().err
+    assert "paths.output must end with 'four-person-team'/'bob'" in error
+    assert "Do not delete or move the existing output" in error
+
+    # The next contest temporarily splits the four-person team into two teams.
+    # Updating the team fields but leaving the old output path is also refused.
+    raw["member"]["name"] = "alice"
+    raw["member"]["display_name"] = "alice"
+    raw["contest"]["team_id"] = "split-team-a"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    assert main(["state", "migrate", "--config", str(config_path)]) == 2
+    error = capsys.readouterr().err
+    assert "paths.output must end with 'split-team-a'/'alice'" in error
+    assert "use a new local config" in error
+
+    # A properly isolated split-team config initializes an independent DB.
+    split_path = tmp_path / "split-team-a.yaml"
+    split = default_config_mapping(
+        "Next CTF", team_id="split-team-a", member_name="alice"
+    )
+    split_path.write_text(yaml.safe_dump(split, sort_keys=False), encoding="utf-8")
+    assert main(["state", "migrate", "--config", str(split_path)]) == 0
+    split_config = AppConfig.from_file(split_path)
+    assert split_config.state_path().is_file()
+
+
+def test_doctor_rejects_a_database_copied_from_another_member(tmp_path: Path) -> None:
+    alice_path = tmp_path / "local.team.alice.yaml"
+    bob_path = tmp_path / "local.team.bob.yaml"
+    for path, member in ((alice_path, "alice"), (bob_path, "bob")):
+        raw = default_config_mapping("Demo", team_id="team", member_name=member)
+        raw["sandbox"]["enabled"] = False
+        path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    alice = AppConfig.from_file(alice_path)
+    bob = AppConfig.from_file(bob_path)
+    assert main(["state", "migrate", "--config", str(alice_path)]) == 0
+    bob.state_path().parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(alice.state_path(), bob.state_path())
+
+    report = run_doctor(bob.path, which=lambda _: None)
+    identity = next(check for check in report.checks if check.name == "local state identity")
+    assert not identity.ok and identity.required
+    assert "database member.name is 'alice'" in identity.detail
+    assert "config member.name is 'bob'" in identity.detail
+    assert report.exit_code == 1
+
+
+def test_doctor_checks_only_the_configured_contest_manifest(tmp_path: Path) -> None:
+    config = _write_config(tmp_path, sandbox_enabled=False)
+    old = config.incoming_contest_dir("Old CTF") / "contest.md"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text("this unrelated old manifest is invalid\n", encoding="utf-8")
+    current = config.incoming_contest_dir() / "contest.md"
+    current.parent.mkdir(parents=True, exist_ok=True)
+    current.write_text("# 대회명: Demo\n\n### web/login\n- 점수: 1\n", encoding="utf-8")
+
+    report = run_doctor(config.path, which=lambda _: None)
+
+    manifest_checks = [check for check in report.checks if check.name == "contest manifest"]
+    assert len(manifest_checks) == 1
+    assert manifest_checks[0].ok and manifest_checks[0].detail == str(current)
+    assert all(str(old) not in check.detail for check in report.checks)
+    assert report.exit_code == 0
 
 
 def test_sandbox_exec_maps_local_attempt_to_docker_argv_and_cleanup_is_scoped(tmp_path: Path) -> None:

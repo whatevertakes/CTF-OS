@@ -79,7 +79,6 @@ def default_config_mapping(
             "enabled": True,
             "type": "file",
             "root": "sync",
-            "team_namespace": resolved_team_id,
         },
         "flag_verification": {"auto_confirm_flags": False, "require_verifier_before_solved": True,
                               "ignore_placeholders": True},
@@ -385,6 +384,17 @@ class AppConfig:
         for key in ("incoming", "output", "sync"):
             if key in paths:
                 self.resolve_path(paths[key], field=f"paths.{key}")
+        output = self.output_root
+        expected_suffix = (self.team_id, self.member_name)
+        if len(output.parts) < 2 or output.parts[-2:] != expected_suffix:
+            expected = Path("output") / self.team_id / self.member_name
+            raise ConfigError(
+                f"paths.output must end with {self.team_id!r}/{self.member_name!r} "
+                f"to isolate this local node; got {str(output)!r}. Set paths.output "
+                f"to {str(expected)!r} (or another base with the same suffix). "
+                "Do not delete or move the existing output; use a new local config "
+                "for a different team or member."
+            )
 
         codex = self.get_mapping("solvers").get("codex", {})
         if not isinstance(codex, Mapping):

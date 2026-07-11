@@ -10,6 +10,7 @@ from typing import Callable
 
 from .config import AppConfig, ConfigError
 from .contest_parser import ContestParseError, parse_contest
+from .local_state import LocalState, StateError
 from .sandbox.docker_cli import DockerCli
 from .sandbox.broker import broker_transport_supported
 from .solver_engine.codex_cli_backend import CodexCliBackend
@@ -72,7 +73,24 @@ def run_doctor(
         except OSError as exc:
             checks.append(DoctorCheck(f"{label} writable", False, True, str(exc)))
 
-    manifests = sorted(config.incoming_root.glob("*/contest.md")) if config.incoming_root.exists() else []
+    state_path = config.state_path()
+    if state_path.is_file():
+        try:
+            LocalState.for_config(config)
+            checks.append(DoctorCheck(
+                "local state identity", True, True,
+                f"team={config.team_id} member={config.member_name} contest={config.contest_name}: {state_path}",
+            ))
+        except (StateError, OSError) as exc:
+            checks.append(DoctorCheck("local state identity", False, True, str(exc)))
+    else:
+        checks.append(DoctorCheck(
+            "local state identity", True, True,
+            f"not initialized yet; state migrate will bind {config.team_id}/{config.member_name}/{config.contest_name}",
+        ))
+
+    current_manifest = config.incoming_contest_dir() / "contest.md"
+    manifests = [current_manifest] if current_manifest.is_file() else []
     if not manifests:
         checks.append(DoctorCheck("contest manifests", True, False, "none yet; add incoming/<contest>/contest.md"))
     for manifest in manifests:

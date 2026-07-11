@@ -30,7 +30,7 @@ class ResolvedAttempt:
 
 def resolve_local_attempt(config: AppConfig, attempt_id: str) -> ResolvedAttempt:
     """Resolve one live, marker-backed local attempt by exact identity."""
-    state = LocalState(config.state_path(), team_id=config.team_id)
+    state = LocalState.for_config(config)
     attempt = state.get_active_attempt(attempt_id)
     if attempt is None:
         raise SandboxExecError(f"attempt is unknown, expired, or no longer locally leased: {attempt_id}")
@@ -102,7 +102,7 @@ def execute_attempt_command(
             detail = scrub_error or "direct sandbox exec timed out/cancelled; staging scrub failed and staging was retained"
         else:
             detail = "direct sandbox exec timed out/cancelled; exact container and staging removed"
-        LocalState(config.state_path(), team_id=config.team_id).record_cleanup(
+        LocalState.for_config(config).record_cleanup(
             attempt.attempt_id, ok=cleanup.ok and scrub_ok, detail=detail,
         )
     return result

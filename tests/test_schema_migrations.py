@@ -260,8 +260,8 @@ def test_v3_to_v4_adds_nullable_codex_session_columns_without_losing_attempt_dat
 
     state = LocalState(path)
 
-    assert CURRENT_SCHEMA_VERSION == 6
-    assert _schema_version(path) == 6
+    assert CURRENT_SCHEMA_VERSION == 7
+    assert _schema_version(path) == 7
     assert {"session_id", "resume_id"} <= _table_columns(path, "attempts")
     attempt = state.get_attempt("attempt-legacy")
     assert attempt is not None
@@ -351,6 +351,82 @@ def test_team_binding_is_idempotent_and_refuses_cross_team_rewrite(tmp_path):
     assert LocalState(path).get_challenge(challenge.id).challenge_key == (
         "team-a:demo:web:login"
     )
+
+
+def test_local_state_binds_complete_node_identity_and_refuses_reuse(tmp_path):
+    path = tmp_path / "node.db"
+    LocalState(
+        path,
+        team_id="four-person-team",
+        member_name="alice",
+        contest_name="Main CTF",
+    )
+
+    with sqlite3.connect(path) as conn:
+        assert dict(conn.execute("SELECT key, value FROM state_metadata")) == {
+            "team_id": "four-person-team",
+            "member_name": "alice",
+            "contest_name": "Main CTF",
+        }
+
+    LocalState(
+        path,
+        team_id="four-person-team",
+        member_name="alice",
+        contest_name="Main CTF",
+    )
+    for changed, message in (
+        ({"team_id": "split-team-a"}, "another team's data"),
+        ({"member_name": "bob"}, "config member.name is 'bob'"),
+        ({"contest_name": "Next CTF"}, "config contest.name is 'Next CTF'"),
+    ):
+        identity = {
+            "team_id": "four-person-team",
+            "member_name": "alice",
+            "contest_name": "Main CTF",
+            **changed,
+        }
+        with pytest.raises(StateError, match=message):
+            LocalState(path, **identity)
+
+    # Failed opens are atomic: they cannot relabel the original local node.
+    with sqlite3.connect(path) as conn:
+        assert dict(conn.execute("SELECT key, value FROM state_metadata")) == {
+            "team_id": "four-person-team",
+            "member_name": "alice",
+            "contest_name": "Main CTF",
+        }
+
+
+def test_v6_member_and_contest_evidence_prevents_wrong_first_v7_binding(tmp_path):
+    path = tmp_path / "legacy-v6.db"
+    legacy = LocalState(path, team_id="team")
+    challenge = legacy.upsert_challenge(
+        Challenge(contest="Legacy CTF", category="web", name="login")
+    )
+    legacy.append_event(Event(
+        team_id="team", member="alice", contest="Legacy CTF", type="FINDING",
+        challenge_id=challenge.id,
+    ))
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA user_version = 6")
+
+    with pytest.raises(StateError, match="legacy event data.*member.name 'alice'.*member.name is 'bob'"):
+        LocalState(
+            path, team_id="team", member_name="bob", contest_name="Legacy CTF"
+        )
+    assert _schema_version(path) == 6
+
+    with pytest.raises(StateError, match="legacy challenge data.*contest.name 'Legacy CTF'.*contest.name is 'Other CTF'"):
+        LocalState(
+            path, team_id="team", member_name="alice", contest_name="Other CTF"
+        )
+    assert _schema_version(path) == 6
+
+    LocalState(
+        path, team_id="team", member_name="alice", contest_name="Legacy CTF"
+    )
+    assert _schema_version(path) == CURRENT_SCHEMA_VERSION
 
 
 def test_attempt_session_ids_require_the_active_lease_and_reject_stale_writes(tmp_path):
