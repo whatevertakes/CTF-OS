@@ -1,124 +1,16 @@
-.cache/
-.playwright-mcp/
-.agents/
-.codex/config.toml
-.codex/proxy.env
-.codex/tmp/
-.codex/state/
-pyghidra_mcp_projects/
-
+.env
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
 
-.env
-.venv
-.venv/
-venv/
-node_modules/
-
-*.log
-core
-core.*
-*.dmp
-*:Zone.Identifier
-
-.DS_Store
-ghidra-mcp-cache/
-
-# Keep the challenge/event/category scaffold in Git, but keep individual
-# challenge workspaces local by default.
-challenges/*/*/*
-!challenges/*/*/.gitkeep
-
-# Blindtest keeps problem handouts local, but allows solve outputs to be shared
-# from concrete challenge workspaces.
-!challenges/blindtest/
-!challenges/blindtest/*/
-!challenges/blindtest/*/.gitkeep
-!challenges/blindtest/*/*/
-!challenges/blindtest/*/*/state.json
-!challenges/blindtest/*/*/notes.md
-!challenges/blindtest/*/*/replay.sh
-!challenges/blindtest/*/*/evidence/
-!challenges/blindtest/*/*/evidence/**
-challenges/blindtest/*/*/dist/
-challenges/blindtest/*/*/dist/**
-
-# Corpus placeholder skeletons that are intentionally tracked even before a
-# full challenge artifact is imported.
-!challenges/historical/pwn/mikuprotect/
-!challenges/historical/pwn/mikuprotect/state.json
-!challenges/historical/pwn/mikuprotect/notes.md
-!challenges/historical/pwn/mikuprotect/replay.sh
-!challenges/historical/web/DreamFlow/
-!challenges/historical/web/DreamFlow/state.json
-!challenges/historical/web/DreamFlow/notes.md
-!challenges/historical/web/DreamFlow/replay.sh
-!challenges/holdout/rev/rev-holdout-placeholder/
-!challenges/holdout/rev/rev-holdout-placeholder/state.json
-!challenges/holdout/rev/rev-holdout-placeholder/notes.md
-!challenges/holdout/rev/rev-holdout-placeholder/replay.sh
-!challenges/holdout/crypto/crypto-holdout-placeholder/
-!challenges/holdout/crypto/crypto-holdout-placeholder/state.json
-!challenges/holdout/crypto/crypto-holdout-placeholder/notes.md
-!challenges/holdout/crypto/crypto-holdout-placeholder/replay.sh
-!challenges/regression/forensics/forensics-regression-placeholder/
-!challenges/regression/forensics/forensics-regression-placeholder/state.json
-!challenges/regression/forensics/forensics-regression-placeholder/notes.md
-!challenges/regression/forensics/forensics-regression-placeholder/replay.sh
-!challenges/holdout/misc/programming-holdout-placeholder/
-!challenges/holdout/misc/programming-holdout-placeholder/state.json
-!challenges/holdout/misc/programming-holdout-placeholder/notes.md
-!challenges/holdout/misc/programming-holdout-placeholder/replay.sh
-!challenges/historical/hybrid/hybrid-chain-placeholder/
-!challenges/historical/hybrid/hybrid-chain-placeholder/state.json
-!challenges/historical/hybrid/hybrid-chain-placeholder/notes.md
-!challenges/historical/hybrid/hybrid-chain-placeholder/replay.sh
-
-# Secrets and challenge-private markers.
-flag
-flag.txt
-**/flag
-**/flag.txt
-*.pem
-*.key
-id_rsa
-id_ed25519
-
-# Challenge handouts may be tracked from dist/, but duplicate top-level
-# archives and scratch archives should stay local.
-challenges/**/*.zip
-challenges/**/*.7z
-challenges/**/*.tar
-challenges/**/*.tar.gz
-!challenges/**/dist/*.zip
-!challenges/**/dist/*.7z
-!challenges/**/dist/*.tar
-!challenges/**/dist/*.tar.gz
-
-# Local dependency checkouts and build output under challenge workspaces.
-challenges/**/work/**
-!challenges/**/work/
-!challenges/**/work/.gitkeep
-challenges/**/work/**/.git/
-challenges/**/work/simavr*/
-challenges/**/work/extracted/
-challenges/**/work/docker_pinned/
-challenges/**/work/pinned_build/
-challenges/**/work/**/*.o
-challenges/**/work/**/*.a
-challenges/**/work/**/*.so
-challenges/**/work/**/*.so.*
-challenges/**/work/**/*.elf
-challenges/**/work/**/*.bin
-
-# Local machine snapshots.
-system-info-*.txt
-
-# CTF-OS local runtime and release outputs.
+# Member-local runtime state. Keep only scaffold placeholders in Git.
 incoming/*
 output/*
 sync/*
@@ -128,6 +20,14 @@ sync/*
 *.db
 *.sqlite
 *.sqlite3
-build/
-dist/
-*.egg-info/
+*.log
+
+# Never commit challenge-private material or credentials.
+flag
+flag.txt
+**/flag
+**/flag.txt
+*.pem
+*.key
+id_rsa
+id_ed25519

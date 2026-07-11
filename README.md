@@ -1,317 +1,53 @@
-# CTF 워크스페이스
+# CTF-OS
 
-이 저장소는 `whatevertakes` 팀 프로젝트의 표준 CTF 실행 워크스페이스입니다.
+CTF-OS is a local-first, multi-node CTF solver. Each teammate runs their own local Codex attempts and isolated Docker containers. TeamSync shares append-only status, findings, and challenge-owned flags; it does not control remote workers or auto-submit to CTFd.
 
-아키텍처는 의도적으로 고정되어 있습니다. 소유자는 프레임워크, 스킬, 도구,
-문서, 벤치마크 정의, 저장소 정책을 관리합니다. 벤치마크 러너는 배정된 CTF
-케이스를 실행하고, 정제된 실행 데이터만 제출합니다.
-
-## 역할
-
-- 소유자: `jiwoongchoi-norun`
-  - `main`을 소유합니다.
-  - 모든 변경 사항을 검토하고 병합합니다.
-  - 프레임워크 파일, 도구, 스킬, 문서, 템플릿, 벤치마크 정의를 수정할 수
-    있습니다.
-- 벤치마크 러너:
-  - 저장소를 클론하고 동일한 워크스페이스 레이아웃을 유지합니다.
-  - 배정된 벤치마크 CTF 문제를 실행합니다.
-  - 정제된 벤치마크 데이터만 제출합니다.
-  - 프레임워크 아키텍처, 도구, 스킬, 템플릿, 참조 인덱스, 정책 파일을
-    수정하지 않습니다.
-
-## 클론 및 설정
-
-원하는 로컬 경로에 클론하되, 저장소 안의 레이아웃은 동일하게 유지합니다.
+## Quick start
 
 ```bash
-git clone git@github.com:whatevertakes/ctf_workspace.git <workspace-dir>
-cd <workspace-dir>
-```
-
-팀원은 자기 브랜치에서 우승 기준 통합 설정 스크립트를 실행합니다.
-
-```bash
-tools/setup_workspace.sh team
-```
-
-이 스크립트는 팀 브랜치를 확인하고, 팀 기준에 맞춘 Ubuntu, Python, Ruby, MCP
-유틸리티 CLI, CTF 카테고리별 CLI 도구 표면, 대형 고급 CTF 도구까지 설치하며,
-`.venv`와 `requirements.txt`를 준비합니다. 또한
-`.codex/config.toml.template`에서 현재 클론 경로에 맞는 로컬
-`.codex/config.toml`을 생성하고, strict preflight, team parity, `codex mcp
-list`의 `angr`/`playwright`/`radare2` 연결, 카테고리별 deep profile까지
-확인합니다. 자세한 팀 설정 흐름은 [docs/SETUP_WSL2.md](docs/SETUP_WSL2.md)를
-참조하세요.
-
-`main` 업데이트를 받은 뒤 소유자와 같은 Level 2 reference 환경까지 맞추려면
-다음을 실행합니다. `.cache/references/`는 Git에 저장하지 않는 로컬 캐시이므로
-각 팀원이 lock 파일 기준으로 직접 materialize해야 합니다.
-
-```bash
-git pull origin main
-tools/setup_workspace.sh team --branch <github-user>
-. .codex/env.sh
-tools/setup_workspace.sh references
-tools/setup_workspace.sh verify
-```
-
-`team` 설정은 웹 스캐너, fuzzing 도구, RE/decompiler 보조 도구,
-cloud/container CLI, RF/hardware 도구, Ghidra, garak/PyTorch, GNU Radio처럼 큰
-의존성까지 우승용 단일 환경으로 맞춥니다. 설치/패치 계약은
-[docs/ADVANCED_CTF_TOOLING.md](docs/ADVANCED_CTF_TOOLING.md)에 있으며, garak만
-건너뛰어야 하는 머신에서는 다음처럼 실행합니다.
-
-```bash
-tools/setup_workspace.sh team --branch <github-user> --skip-garak
-```
-
-Ubuntu 24.04에서 수동 external 도구를 맞출 때 README에는 검증 가능한 sudo
-quick block만 둡니다. 나머지 external 도구는
-[docs/MANUAL_EXTERNAL_TOOL_INSTALL.md](docs/MANUAL_EXTERNAL_TOOL_INSTALL.md)의
-PATH 확인 대상으로 관리합니다.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y zeek python3-olefile
-sudo ln -sfn /opt/zeek/bin/zeek /usr/local/bin/zeek
-```
-
-웹 CTF에서 브라우저 트래픽과 WSL `curl`/Python exploit 트래픽을 같은 Caido
-프록시로 보고 싶다면 Windows Caido 브리지를 켭니다.
-
-```bash
-ctf-proxy-start
-. .codex/proxy.env
-ctf-proxy-check
-```
-
-`ctf-proxy-start`는 Windows Caido CLI가 없으면 최신 Windows CLI를
-`%LOCALAPPDATA%\ctf-workspace\caido-cli`에 설치한 뒤 CTF 전용 포트로 띄우고,
-WSL에서 접근할 수 있도록 Windows portproxy/firewall rule을 설정합니다. Caido
-UI에서 실행 중인 인스턴스를 선택해야 실제 프록시 중계가 됩니다. UI가 프로젝트를
-요구하는 경우에만 프로젝트를 생성하거나 선택하세요. 프록시를 끄고 빠른 replay를
-돌릴 때는 `unset HTTP_PROXY HTTPS_PROXY ALL_PROXY`를 실행하세요.
-
-설정이나 MCP가 멈추면 긴 명령 블록을 수동으로 붙여넣지 말고 복구 스크립트를
-실행하세요.
-
-```bash
-tools/setup_workspace.sh repair
-```
-
-예상되는 성공 표시:
-
-```text
-summary failures=0 warnings=0
-team parity summary failures=0
-```
-
-`codex mcp list`에는 `angr`, `playwright`, `radare2`가 표시되어야 합니다. 이
-로컬 stdio MCP 서버에서 `Auth Unsupported`가 표시되는 것은 정상입니다.
-`mcp`, `fastmcp`, `mcp-proxy`, `mcp-reverse-proxy`는 서버 등록 항목이 아니라
-CLI 유틸리티로 점검합니다.
-
-깔끔한 버전 보고서를 보려면 다음을 실행합니다.
-
-```bash
-tools/version_report.sh
-```
-
-오류별 복구 절차와 예상 출력은
-[docs/TEAM_SETUP_TROUBLESHOOTING.md](docs/TEAM_SETUP_TROUBLESHOOTING.md)를
-참조하세요.
-
-일부 항목을 수동으로 설치해야 한다면 vendored dependency가 아니라 명령어와
-패키지 매니저를 사용하세요.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y bash binutils binutils-avr build-essential ca-certificates curl docker.io file gdb gcc-avr git jq libffi-dev libssl-dev netcat-openbsd nodejs npm pkg-config python3 python3-pip python3-venv unzip xz-utils avr-libc
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip setuptools wheel
-python -m pip install -r requirements.txt
-tools/setup_workspace.sh bootstrap --skip-apt --skip-python --skip-preflight
-```
-
-워크스페이스를 검증합니다.
-
-```bash
-tools/setup_workspace.sh verify
-```
-
-## 워크스페이스 레이아웃
-
-모든 챌린지는 표준 계약 아래에 유지합니다.
-
-```text
-challenges/<event>/<category>/<challenge>/
-  state.json
-  notes.md
-  replay.sh
-  evidence/
-  dist/
-  work/
-```
-
-- `dist/`: 원본 챌린지 배포 파일.
-- `work/`: 로컬 스크래치 파일, 추출 파일, 빌드 출력, 프로브, 임시 dependency
-  체크아웃. 광범위한 vendored dependency나 로컬 빌드 트리는 제출하지 않습니다.
-- `evidence/`: 리플레이 요약과 정제된 증명 출력.
-- `state.json`, `notes.md`, `replay.sh`: 보존해야 하는 벤치마크 실행 메타데이터.
-
-## 벤치마크 러너 워크플로
-
-배정된 챌린지를 실행합니다.
-
-```bash
-python3 tools/benchmark_runner.py run challenges/<event>/<category>/<challenge>
-```
-
-corpus 일관성을 다시 확인합니다.
-
-```bash
-python3 tools/evaluate_corpus.py
-```
-
-원시 로그나 출력에 플래그, 토큰, 키, 챌린지 시크릿이 포함되어 있다면 제출 전에
-정제합니다.
-
-```bash
-python3 tools/report_sanitize.py challenges/<event>/<category>/<challenge>/evidence/<raw-log>.log --check
-```
-
-## 제출 정책
-
-벤치마크 러너는 데이터 경로만 제출할 수 있습니다.
-
-```text
-benchmarks/*_SANITIZED_BENCHMARK_REPORT.md
-benchmarks/*_DATA_MANIFEST.json
-challenges/<event>/<category>/<challenge>/state.json
-challenges/<event>/<category>/<challenge>/notes.md
-challenges/<event>/<category>/<challenge>/replay.sh
-challenges/<event>/<category>/<challenge>/evidence/*.summary.md
-challenges/<event>/<category>/<challenge>/evidence/*.sanitize_check.md
-```
-
-다음 경로는 소유자 전용입니다.
-
-```text
-AGENTS.md
-.codex/
-.github/
-tools/
-templates/
-skills/
-capabilities/
-docs/
-benchmarks/corpus.yaml
-references.yaml
-references.lock.json
-```
-
-다음은 제출하지 않습니다.
-
-```text
-flags, tokens, private keys, .env files
-raw replay logs containing secrets
-work/extracted/
-work/docker_pinned/
-work/pinned_build/
-work/simavr*/
-local virtualenvs, caches, node_modules, or build output
-```
-
-## Git 워크플로
-
-표준 저장소의 `main`은 소유자 `jiwoongchoi-norun`만 push합니다. 팀원은 자기
-이름의 고정 브랜치에만 commit/push합니다.
-
-팀 브랜치:
-
-```text
-shyunseok1029
-holymo-ly
-jiwoongchoi-norun
-lee
-```
-
-처음 클론한 뒤 자기 브랜치를 체크아웃합니다.
-
-```bash
-git fetch origin
-git switch --track origin/<github-user>
-tools/setup_workspace.sh team --branch <github-user>
-```
-
-`main` 업데이트를 자기 브랜치에 반영하려면:
-
-```bash
-git fetch origin
-git switch <github-user>
-git merge origin/main
-```
-
-제출할 때는 승인된 데이터 파일만 commit하고 자기 브랜치로 push합니다.
-
-```bash
-git add benchmarks/*_SANITIZED_BENCHMARK_REPORT.md \
-  benchmarks/*_DATA_MANIFEST.json \
-  challenges/<event>/<category>/<challenge>/state.json \
-  challenges/<event>/<category>/<challenge>/notes.md \
-  challenges/<event>/<category>/<challenge>/replay.sh \
-  challenges/<event>/<category>/<challenge>/evidence/*.summary.md \
-  challenges/<event>/<category>/<challenge>/evidence/*.sanitize_check.md
-git commit -m "submit benchmark data for <benchmark-id>"
-git push origin HEAD:<github-user>
-```
-
-자기 브랜치에서 `main`으로 pull request를 엽니다. 직접 브랜치 push가
-불가능한 경우 동일한 정제 파일을 GitHub issue에 첨부합니다. 소유자가 데이터를
-검증하고 승인된 데이터만 `main`에 병합합니다.
-
-pull request를 열기 전에 다음을 실행합니다.
-
-```bash
-python3 tools/validate_data_submission.py --base origin/main
-```
-
-전체 데이터 전용 제출 흐름은
-[docs/TEAM_DATA_WORKFLOW.md](docs/TEAM_DATA_WORKFLOW.md)를 참조하세요.
-
-## CTF-OS local node
-
-이 저장소에는 local-first CTF-OS 노드가 함께 배포됩니다. 각 팀원은 자기 PC에서만 solver/container를 실행하고, TeamSync append-only JSONL로 상태·finding·flag만 공유합니다. 다른 팀원의 Codex나 컨테이너를 원격 제어하지 않습니다.
-
-### 처음 한 번 설정
-
-자기 팀 브랜치에서 최신 `main`을 반영한 뒤, 팀원별 설정을 만듭니다.
-
-```bash
-git fetch origin
-git switch <github-user>
-git merge origin/main
-
+git clone https://github.com/whatevertakes/ctf_workspace.git
+cd ctf_workspace
 uv sync --frozen
 uv run ctf-os init "SCA CTF 2026" --config config.yaml
 ```
 
-`config.yaml`에서 `contest.team_id`, `member.name`, `member.owned_categories`를 실제 팀과 담당 분야로 바꾼 뒤, 대회 문제 목록을 `incoming/SCA CTF 2026/contest.md`에 작성합니다. `config.yaml`, SQLite DB, `incoming/`, `output/`, `sync/`는 팀원 로컬 데이터이므로 commit하지 않습니다.
+Edit `config.yaml` with your team's `contest.team_id`, your member name, and owned categories. Add the authorized contest and challenge metadata to `incoming/SCA CTF 2026/contest.md`.
 
-공유 sandbox 이미지와 로컬 DB를 준비합니다.
+Build the shared image once and migrate local state:
 
 ```bash
 scripts/deploy_ctf_os.sh --config config.yaml
 uv run ctf-os doctor --config config.yaml --non-mock
 ```
 
-이 명령은 locked Python 환경을 설치하고 DB migration을 실행합니다. `ctf-os-sandbox:latest`가 없을 때만 한 번 build하고 smoke test를 수행합니다. `ctf-os run`은 이미지를 자동 build하지 않습니다.
+`ctf-os run` never builds the Docker image automatically.
 
-### SCA에서 두 팀을 운영할 때
+## Run a local node
 
-서로 다른 팀은 절대 SQLite state나 TeamSync namespace를 공유하지 않습니다. 같은 PC에서 두 팀을 운영한다면 설정도 분리합니다.
+```bash
+uv run ctf-os parse --config config.yaml
+uv run ctf-os run --config config.yaml
+uv run ctf-os run --once --config config.yaml
+```
+
+Inspect state and challenge-owned flags:
+
+```bash
+uv run ctf-os tui --config config.yaml
+uv run ctf-os tui --plain --config config.yaml
+```
+
+Local controls affect only the current node:
+
+```bash
+uv run ctf-os pause <challenge> --config config.yaml
+uv run ctf-os resume <challenge> --config config.yaml
+uv run ctf-os retry <challenge> --config config.yaml
+```
+
+## Two teams in one contest
+
+Each team must have a distinct `team_id`, SQLite output path, and TeamSync namespace. Do not reopen a database bound to another team.
 
 ```yaml
 # config-sca-a.yaml
@@ -326,9 +62,7 @@ sync:
   team_namespace: "sca-team-a"
 ```
 
-팀 B는 `team_id`, `output`, `sync.root`, `sync.team_namespace`를 모두 `sca-team-b`로 바꿉니다. 이미 팀 A에 바인딩된 DB를 팀 B 설정으로 열지 마세요. 새 output 경로를 사용해야 기존 기록이 보존됩니다.
-
-팀별 초기화와 점검은 config를 항상 명시합니다.
+For the other team, use `sca-team-b` consistently in all four values. Then migrate, parse, and inspect with the explicit config:
 
 ```bash
 uv run ctf-os state migrate --config config-sca-a.yaml
@@ -336,34 +70,27 @@ uv run ctf-os parse --config config-sca-a.yaml
 uv run ctf-os doctor --config config-sca-a.yaml --non-mock
 ```
 
-### 일상 실행
+### KISIA four-member example
 
-문제 목록을 읽어 담당 challenge를 queue에 넣고, 로컬 attempt race를 실행합니다.
+One local-only team can use the shared `team_id` `sca-jiwoong-team` while
+each member runs a separate node and owns only their assigned categories:
 
-```bash
-uv run ctf-os parse --config config.yaml
-uv run ctf-os run --config config.yaml
-```
+| Member | Example ownership |
+| --- | --- |
+| jiwoong | pwn, web |
+| jueon | rev, crypto |
+| hyunseok | forensics, misc |
+| howon | cloud, web3 |
 
-한 cycle만 실행하려면 `--once`를 사용합니다.
+Each member has their own `member.name`, local SQLite database, containers,
+and Codex login. TeamSync shares challenge-owned events only; it never starts
+or stops another member's local process.
 
-```bash
-uv run ctf-os run --once --config config.yaml
-```
-
-상태와 challenge별 flag를 봅니다.
-
-```bash
-uv run ctf-os tui --config config.yaml
-uv run ctf-os tui --plain --config config.yaml
-```
-
-문제를 제어해야 할 때는 해당 node에서만 다음 명령을 사용합니다.
+## Team update
 
 ```bash
-uv run ctf-os pause <challenge> --config config.yaml
-uv run ctf-os resume <challenge> --config config.yaml
-uv run ctf-os retry <challenge> --config config.yaml
+git pull --ff-only origin main
+scripts/deploy_ctf_os.sh --config config.yaml
 ```
 
-상세한 배포·Docker 재빌드·migration 절차는 [CTF-OS team deployment](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참조하세요.
+Local `config.yaml`, contest input, SQLite databases, artifacts, TeamSync ledgers, credentials, keys, and flags must not be committed. See [team deployment](docs/CTF_OS_TEAM_DEPLOYMENT.md) for the complete deployment procedure.

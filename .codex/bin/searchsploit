@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-exec "$CTF_WORKSPACE_ROOT/.cache/tools/exploitdb/searchsploit" "$@"
