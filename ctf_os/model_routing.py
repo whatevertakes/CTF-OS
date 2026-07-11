@@ -257,6 +257,11 @@ class ModelRouter:
         )
         return self._selection_from_profile(profile_name, role=role or attempt_kind or "default")
 
+    def select_profile(self, profile_name: str, *, role: str) -> ModelSelection:
+        """Select one explicitly named configured profile without policy inference."""
+        self._require_profile(profile_name, "requested profile")
+        return self._selection_from_profile(profile_name, role=role)
+
     def select_fallback(self, selection: ModelSelection) -> ModelSelection:
         """Return the first configured fallback, or the original selection if absent."""
         fallbacks = self._fallback_selections(selection)

@@ -28,7 +28,24 @@ def _items(values: tuple[str, ...]) -> str:
 
 class PromptRenderer:
     def render(self, context: ChallengeContext, attempt: RaceAttempt) -> str:
-        return f"""You are a local CTF solver worker. Work on this one attempt only.
+        contract = ""
+        if attempt.contract is not None:
+            item = attempt.contract
+            contract = f"""You own contract {item.id}. Solve the assigned branch; do not provide a narrative.
+
+Objective: {item.objective}
+Exclusive scope: {item.exclusive_scope}
+First decisive action: {item.first_decisive_action}
+Stop condition: {item.stop_condition}
+Success means: {item.success_condition}
+Handoff required: {item.handoff}
+
+Start executing. Every action must either test this branch or construct its solver.
+If the stop condition is reached, emit the decisive negative result and exact handoff;
+do not continue broad exploration.
+
+"""
+        return f"""{contract}You are a local CTF solver worker. Work on this one attempt only.
 
 Challenge:
 - id: {context.challenge_id}

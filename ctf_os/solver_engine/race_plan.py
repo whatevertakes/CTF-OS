@@ -7,6 +7,8 @@ from secrets import token_hex
 from typing import Callable
 from uuid import uuid4
 
+from .category_planner import ExecutionContract, SolvePlan
+
 
 @dataclass(frozen=True)
 class AttemptProfile:
@@ -39,9 +41,12 @@ class RaceAttempt:
     attempt_id: str
     strategy_seed: str
     profile: AttemptProfile
+    contract: ExecutionContract | None = None
 
     @property
     def strategy_instruction(self) -> str:
+        if self.contract is not None:
+            return self.contract.objective
         if self.profile.name == "exploit_main":
             return "Use the strongest evidence-backed vulnerability hypothesis from reconnaissance."
         if self.profile.name == "exploit_alt":
@@ -58,6 +63,23 @@ class RaceAttempt:
 class RacePlan:
     difficulty: str
     attempts: tuple[RaceAttempt, ...]
+
+    @classmethod
+    def from_solve_plan(
+        cls, plan: SolvePlan, *, id_factory: Callable[[], str] | None = None,
+        seed_factory: Callable[[], str] | None = None,
+    ) -> "RacePlan":
+        make_id = id_factory or (lambda: uuid4().hex)
+        make_seed = seed_factory or (lambda: token_hex(8))
+        profiles = {
+            "terra_high": AttemptProfile("contract_terra_high", "implementer", "execute a concrete solve contract", 1200),
+            "luna_medium": AttemptProfile("contract_luna_medium", "recon", "answer a narrow branch question", 600),
+            "sol_high": AttemptProfile("contract_sol_high", "source", "resolve a hard conceptual fork", 1500),
+        }
+        return cls(
+            difficulty="contract",
+            attempts=tuple(RaceAttempt(make_id(), make_seed(), profiles[item.worker], item) for item in plan.contracts),
+        )
 
     @classmethod
     def for_score(
