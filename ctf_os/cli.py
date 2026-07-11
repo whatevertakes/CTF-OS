@@ -37,7 +37,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "codex-argv":
             return _codex_argv(args)
         if args.command == "init":
-            config = _init_workspace(args.contest, Path(args.config), force=args.force)
+            config = _init_workspace(
+                args.contest,
+                Path(args.config),
+                force=args.force,
+                team_id=args.team_id,
+                member_name=args.member,
+            )
             print(f"initialized {config.incoming_contest_dir()}")
             return 0
         if args.command == "knowledge":
@@ -203,6 +209,8 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("contest")
     init_parser.add_argument("--force", action="store_true")
     init_parser.add_argument("--config", default="config.yaml")
+    init_parser.add_argument("--team-id", help="shared TeamSync team identifier for this local node")
+    init_parser.add_argument("--member", help="this local node's member identifier (default: local)")
 
     for name, help_text in (("doctor", "check local prerequisites"), ("parse", "parse owned local challenges")):
         command = subparsers.add_parser(name, help=help_text)
@@ -469,7 +477,14 @@ def _watch_sync(config: AppConfig, sync: TeamSync, *, stop_event: ThreadEvent | 
             return 0
 
 
-def _init_workspace(contest: str, config_path: Path, *, force: bool) -> AppConfig:
+def _init_workspace(
+    contest: str,
+    config_path: Path,
+    *,
+    force: bool,
+    team_id: str | None = None,
+    member_name: str | None = None,
+) -> AppConfig:
     config_path = config_path.expanduser().resolve(strict=False)
     if config_path.exists():
         config = AppConfig.from_file(config_path)
@@ -478,9 +493,26 @@ def _init_workspace(contest: str, config_path: Path, *, force: bool) -> AppConfi
                 f"config contest.name {config.contest_name!r} does not match requested init contest {contest!r}; "
                 "refusing to create an inconsistent workspace"
             )
+        if team_id is not None and config.team_id != team_id:
+            raise ValueError(
+                f"config contest.team_id {config.team_id!r} does not match requested init team {team_id!r}; "
+                "refusing to reuse a different team's local node"
+            )
+        if member_name is not None and config.member_name != member_name:
+            raise ValueError(
+                f"config member.name {config.member_name!r} does not match requested init member {member_name!r}; "
+                "use a separate config file for each local node"
+            )
     else:
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(yaml.safe_dump(default_config_mapping(contest), allow_unicode=True, sort_keys=False), encoding="utf-8")
+        config_path.write_text(
+            yaml.safe_dump(
+                default_config_mapping(contest, team_id=team_id, member_name=member_name or "local"),
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
         config = AppConfig.from_file(config_path)
     contest_root = config.incoming_contest_dir()
     manifest = contest_root / "contest.md"

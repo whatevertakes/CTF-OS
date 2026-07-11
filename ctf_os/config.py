@@ -29,7 +29,12 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     return loaded
 
 
-def default_config_mapping(contest_name: str) -> dict[str, Any]:
+def default_config_mapping(
+    contest_name: str,
+    *,
+    team_id: str | None = None,
+    member_name: str = "local",
+) -> dict[str, Any]:
     """Return a runnable mock-safe configuration for ``ctf-os init``.
 
     Model routing is deliberately disabled in this generated starter config:
@@ -38,20 +43,25 @@ def default_config_mapping(contest_name: str) -> dict[str, Any]:
     """
     from .models import slugify
 
+    resolved_team_id = team_id or f"{slugify(contest_name)}-team"
+    resolved_member_name = member_name.strip() or "local"
     return {
         "mode": "local_node",
         "solver_mode": "cli_attempt_race",
         "contest": {
             "name": contest_name,
-            "team_id": f"{slugify(contest_name)}-team",
+            "team_id": resolved_team_id,
             "flag_patterns": [r"FLAG\{[^}\r\n]+\}"],
         },
         "member": {
-            "name": "local",
-            "display_name": "local",
+            "name": resolved_member_name,
+            "display_name": resolved_member_name,
             "owned_categories": ["pwn", "web", "rev", "crypto", "forensics", "misc", "cloud"],
         },
-        "paths": {"incoming": "incoming", "output": "output"},
+        "paths": {
+            "incoming": "incoming",
+            "output": f"output/{resolved_team_id}/{resolved_member_name}",
+        },
         "solvers": {"codex": {"enabled": True, "backend": "codex_cli", "command": "codex", "max_workers": 2}},
         "scheduler": {"max_concurrent_challenges": 2, "max_active_containers": 2,
                       "policy": "local_safe", "fairness": "challenge_round_robin"},
@@ -65,7 +75,12 @@ def default_config_mapping(contest_name: str) -> dict[str, Any]:
                     "precreate_on_queue": False, "max_containers": 2,
                     "command_timeout_sec": 30,
                     "default_limits": {"memory": "16g", "cpus": 2.0}},
-        "sync": {"enabled": True, "type": "file", "root": "sync"},
+        "sync": {
+            "enabled": True,
+            "type": "file",
+            "root": "sync",
+            "team_namespace": resolved_team_id,
+        },
         "flag_verification": {"auto_confirm_flags": False, "require_verifier_before_solved": True,
                               "ignore_placeholders": True},
         "watcher": {"poll_interval_sec": 2},

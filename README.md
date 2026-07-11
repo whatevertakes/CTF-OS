@@ -14,10 +14,10 @@ CTF-OS는 `incoming/{contest}/contest.md`에 선언한 승인된 CTF 대회와 �
 git clone https://github.com/whatevertakes/CTF-OS.git
 cd CTF-OS
 uv sync --frozen
-uv run ctf-os init "SCA CTF 2026" --config sca_config.yaml
+uv run ctf-os init "SCA CTF 2026" --config sca_config.yaml --team-id sca-jiwoong-team --member jiwoong
 ```
 
-`sca_config.yaml`에서 `contest.team_id`, `member.name`, 담당 카테고리를 설정합니다. 이어서 `incoming/SCA CTF 2026/contest.md`에 승인된 대회와 챌린지 메타데이터를 추가합니다.
+`--team-id`는 같은 팀원이 공유할 TeamSync 식별자이고, `--member`는 이 PC의 로컬 노드 식별자입니다. 초기화는 SQLite 출력 경로를 `output/<team-id>/<member>`로 자동 분리합니다. 이어서 `sca_config.yaml`에서 담당 카테고리를 설정하고, `incoming/SCA CTF 2026/contest.md`에 승인된 대회와 챌린지 메타데이터를 추가합니다.
 
 공용 sandbox 이미지를 준비하고 로컬 상태를 검증합니다.
 
@@ -64,9 +64,9 @@ contest:
   team_id: "sca-team-a"
 paths:
   incoming: "incoming"
-  output: "output/sca-team-a"
+  output: "output/sca-team-a/jiwoong"
 sync:
-  root: "sync/sca-team-a"
+  root: "sync"
   team_namespace: "sca-team-a"
 ```
 

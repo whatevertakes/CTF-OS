@@ -39,11 +39,13 @@ scripts/deploy_ctf_os.sh --config config.yaml --skip-image
 
 ```bash
 uv sync --frozen
-uv run ctf-os init "대회 이름" --config config.yaml
+uv run ctf-os init "대회 이름" --config config.yaml --team-id 팀-식별자 --member 내-이름
 # config.yaml 및 incoming/대회 이름/contest.md를 검토합니다.
 scripts/deploy_ctf_os.sh --config config.yaml
 uv run ctf-os doctor --config config.yaml --non-mock
 ```
+
+`--team-id`는 같은 팀원이 공유하고, `--member`는 각 PC에서 고유해야 합니다. 새 설정은 SQLite 상태를 `output/<team-id>/<member>/` 아래에 생성하므로, 같은 PC에서 여러 팀이나 노드를 준비해도 로컬 상태가 섞이지 않습니다.
 
 `config.yaml`, `incoming/`, `output/`, `sync/`, SQLite 파일, 로그, 자격 증명, 키, 플래그는 커밋하지 마세요. 배포 스크립트는 이 경로들을 삭제·초기화·복사·외부 전송하지 않습니다.
 

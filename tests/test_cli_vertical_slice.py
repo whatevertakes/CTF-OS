@@ -25,7 +25,7 @@ def _write_config(tmp_path: Path, *, sandbox_enabled: bool = False) -> AppConfig
 def test_config_paths_are_relative_to_config_and_invalid_mode_is_rejected(tmp_path: Path) -> None:
     config = _write_config(tmp_path)
     assert config.incoming_root == tmp_path / "incoming"
-    assert config.output_contest_dir() == tmp_path / "output" / "Demo"
+    assert config.output_contest_dir() == tmp_path / "output" / "demo-team" / "local" / "Demo"
 
     raw = default_config_mapping("Demo")
     raw["mode"] = "central_executor"
@@ -47,6 +47,31 @@ def test_init_does_not_overwrite_manifest_without_force(tmp_path: Path) -> None:
 
     assert main(["init", "Demo", "--config", str(config_path)]) == 2
     assert manifest.read_text(encoding="utf-8") == original
+
+
+def test_init_creates_team_and_member_isolated_local_paths(tmp_path: Path) -> None:
+    config_path = tmp_path / "sca_config.yaml"
+
+    assert main([
+        "init", "SCA CTF 2026", "--config", str(config_path),
+        "--team-id", "sca-jiwoong-team", "--member", "jiwoong",
+    ]) == 0
+
+    config = AppConfig.from_file(config_path)
+    assert config.team_id == "sca-jiwoong-team"
+    assert config.member_name == "jiwoong"
+    assert config.output_contest_dir() == tmp_path / "output" / "sca-jiwoong-team" / "jiwoong" / "SCA CTF 2026"
+    assert config.sync_root == tmp_path / "sync"
+    assert config.get_mapping("sync")["team_namespace"] == "sca-jiwoong-team"
+
+    assert main([
+        "init", "SCA CTF 2026", "--config", str(config_path),
+        "--team-id", "other-team", "--force",
+    ]) == 2
+    assert main([
+        "init", "SCA CTF 2026", "--config", str(config_path),
+        "--team-id", "sca-jiwoong-team", "--member", "someone-else", "--force",
+    ]) == 2
 
 
 def test_state_migrate_is_idempotent_and_uses_configured_local_database(tmp_path: Path, capsys) -> None:

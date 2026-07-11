@@ -3,7 +3,7 @@ solver_mode: cli_attempt_race
 
 paths:
   incoming: "incoming"
-  output: "output"
+  output: "output/sca-jiwoong-team/jiwoong"
 
 contest:
   name: "SCA CTF 2026"
