@@ -285,7 +285,7 @@ class LocalApplication:
                 writer = ArtifactWriter(self.config.output_root, item.manifest.name)
                 writer.prepare_challenge(challenge)
                 findings, failures, _commands = self._local_evidence(state, challenge.id)
-                race_plan = RacePlan.for_score(challenge.score or 0)
+                race_plan = RacePlan.for_score(challenge.score or 0, category=challenge.category)
                 ordered = StrategyReranker().rerank(race_plan.attempts, findings=findings, failures=failures)
                 plans.extend(PlannedAttempt(item, state, writer, race_attempt) for race_attempt in ordered)
 

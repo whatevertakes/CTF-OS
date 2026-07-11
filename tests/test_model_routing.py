@@ -23,28 +23,28 @@ def test_default_role_routes_to_sol_xhigh() -> None:
 
     assert selection.profile == "sol_xhigh"
     assert selection.model == "gpt-5.6-sol"
-    assert selection.reasoning_effort == "xhigh"
+    assert selection.reasoning_effort == "max"
     assert selection.fallback_model == "gpt-5.5"
 
 
-def test_easy_recon_routes_to_luna_medium() -> None:
+def test_easy_recon_routes_to_luna_high() -> None:
     router = ModelRouter.from_file(ROUTING_CONFIG)
 
     selection = router.select(difficulty="easy", attempt_kind="recon_fast")
 
-    assert selection.profile == "luna_medium"
+    assert selection.profile == "luna_high"
     assert selection.model == "gpt-5.6-luna"
-    assert selection.reasoning_effort == "medium"
+    assert selection.reasoning_effort == "high"
 
 
-def test_hard_exploit_main_routes_to_terra_xhigh() -> None:
+def test_hard_exploit_main_routes_to_sol_max() -> None:
     router = ModelRouter.from_file(ROUTING_CONFIG)
 
     selection = router.select(difficulty="hard", attempt_kind="exploit_main")
 
-    assert selection.profile == "terra_xhigh"
-    assert selection.model == "gpt-5.6-terra"
-    assert selection.reasoning_effort == "xhigh"
+    assert selection.profile == "sol_xhigh"
+    assert selection.model == "gpt-5.6-sol"
+    assert selection.reasoning_effort == "max"
 
 
 def test_fallback_preserves_configured_effort() -> None:
@@ -113,9 +113,9 @@ def test_codex_exec_argv_contains_model_and_reasoning(sterile_staging_factory) -
         "-C",
         str(staging.workdir),
         "-m",
-        "gpt-5.6-sol",
+        "gpt-5.6-terra",
     ]
-    assert 'model_reasoning_effort="xhigh"' in argv
+    assert 'model_reasoning_effort="max"' in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
     assert 'approval_policy="never"' in argv
     assert 'default_permissions="ctf_os_attempt"' in argv
@@ -141,7 +141,7 @@ def test_cli_model_route_json(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["model"] == "gpt-5.6-luna"
+    assert payload["model"] == "gpt-5.6-terra"
     assert payload["reasoning_effort"] == "high"
 
 

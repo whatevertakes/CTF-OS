@@ -1,24 +1,23 @@
-# Automatic routing matrix:
-# - easy / cheap work uses medium reasoning and falls back to GPT-5.5 medium;
-# - normal medium-difficulty work uses high reasoning and falls back to GPT-5.5 high;
-# - hard and final-review work uses xhigh reasoning and falls back to GPT-5.5 xhigh.
+# Solve-rate-first routing. Sol directly solves the strongest branch; it is not
+# reserved for supervision. Terra and Luna run complete independent attempts.
+# GPT-5.6 max is used where another reasoning step can change solve success.
 # Fallbacks name profiles, never an inferred "next" model.  Cooldowns are
 # profile/selection-scoped unless a profile explicitly declares cooldown_scope: model.
 
 model_profiles:
   sol_xhigh:
     model: "gpt-5.6-sol"
-    reasoning_effort: "xhigh"
+    reasoning_effort: "max"
     fallback: gpt55_xhigh
     use_for:
-      - architecture_design
-      - challenge_supervision
-      - hard_strategy
-      - final_verification
+      - primary_solver
+      - hard_solver
+      - stalled_branch_takeover
+      - final_exploit
 
   sol_review:
     model: "gpt-5.6-sol"
-    reasoning_effort: "xhigh"
+    reasoning_effort: "max"
     fallback: gpt55_xhigh
     use_for:
       - post_failure_supervisor_review
@@ -40,10 +39,10 @@ model_profiles:
 
   terra_xhigh:
     model: "gpt-5.6-terra"
-    reasoning_effort: "xhigh"
+    reasoning_effort: "max"
     fallback: gpt55_xhigh
     use_for:
-      - difficult_implementation
+      - independent_deep_solver
 
   terra_high:
     model: "gpt-5.6-terra"
@@ -62,14 +61,6 @@ model_profiles:
     use_for:
       - simple_implementation
 
-  luna_xhigh:
-    model: "gpt-5.6-luna"
-    reasoning_effort: "xhigh"
-    fallback: gpt55_xhigh
-    use_for:
-      - stubborn_log_reduction
-      - hard_fallback_analysis
-
   luna_high:
     model: "gpt-5.6-luna"
     reasoning_effort: "high"
@@ -82,10 +73,8 @@ model_profiles:
     reasoning_effort: "medium"
     fallback: gpt55_medium
     use_for:
-      - recon
-      - summarization
-      - cheap_parallel_attempt
-      - simple_tests
+      - fast_complete_solver
+      - independent_parallel_attempt
 
   gpt55_medium:
     model: "gpt-5.5"
@@ -110,11 +99,11 @@ default_roles:
   routine_supervisor: sol_medium
   architect: sol_xhigh
   implementer: terra_high
-  recon: luna_medium
+  recon: terra_high
   source: sol_xhigh
   fallback: sol_xhigh
   summarizer: luna_medium
-  verifier: terra_high
+  verifier: sol_high
   final_judge: sol_xhigh
 
 worker_policy:
@@ -122,7 +111,7 @@ worker_policy:
     - pwn
     - rev
     - crypto
-  cheap_recon_first: true
+  cheap_recon_first: false
   promote_to_sol_after_failures: 2
   promotion_profile: sol_review
   max_supervisor_plan_revisions: 5
@@ -130,22 +119,22 @@ worker_policy:
 
 model_policy:
   easy:
-    recon_fast: luna_medium
-    exploit_fast: terra_medium
-    verifier: luna_medium
-    summarizer: luna_medium
-  medium:
     recon_fast: luna_high
-    recon_deep: luna_high
-    exploit_main: terra_high
-    exploit_alt: terra_high
-    verifier: terra_medium
-    final_judge: sol_high
+    exploit_fast: terra_high
+    verifier: sol_high
+    summarizer: terra_medium
+  medium:
+    recon_fast: terra_high
+    recon_deep: terra_high
+    exploit_main: sol_xhigh
+    exploit_alt: terra_xhigh
+    verifier: sol_xhigh
+    final_judge: sol_xhigh
   hard:
     recon_deep: sol_xhigh
     source_deep: sol_xhigh
-    exploit_main: terra_xhigh
-    exploit_alt: sol_xhigh
-    fallback: luna_xhigh
+    exploit_main: sol_xhigh
+    exploit_alt: terra_xhigh
+    fallback: sol_xhigh
     verifier: sol_xhigh
     final_judge: sol_xhigh

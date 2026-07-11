@@ -7,7 +7,7 @@ from typing import Any, Iterable
 from .config import ConfigError, load_yaml
 
 
-ALLOWED_REASONING_EFFORTS = frozenset({"medium", "high", "xhigh"})
+ALLOWED_REASONING_EFFORTS = frozenset({"medium", "high", "xhigh", "max"})
 ALLOWED_MODELS = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"})
 ALLOWED_COOLDOWN_SCOPES = frozenset({"selection", "model"})
 

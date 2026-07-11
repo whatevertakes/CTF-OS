@@ -15,7 +15,7 @@ _SAFETY = """Safety invariants:
 - Do not write outside /work and /artifacts.
 - Original challenge files are mounted read-only at /workspace.
 - /work and /artifacts are both private to this one attempt; they are never shared challenge output.
-- Do not rely on, read, or name sibling attempts, host notes/evidence, final files, helpers, or tokens.
+- Do not access or name sibling attempt workspaces, files, helpers, or tokens. Injected known findings are coordinator hints only: validate them independently before use.
 - Run challenge commands through ctf-exec (for example: ctf-exec file /workspace/chall).
 - Do not invent flags or print placeholder flags."""
 
@@ -51,7 +51,7 @@ Challenge files:
 Remotes authorized by contest.md (and no others):
 {_items(context.allowed_remotes)}
 
-Known findings:
+Coordinator hints from earlier observable challenge events (independently validate before use):
 {_items(context.findings)}
 
 Failed strategies; do not repeat without a new, recorded reason:
@@ -65,7 +65,9 @@ Supervisor/operator guidance from this same local challenge:
 
 {_SAFETY}
 
-Emit concise external work records using these tags: {_TAGS}
-Do not emit private chain-of-thought. Begin by inspecting the workspace, then perform one ACTION at a time and record its observable result. Record a SHIFT when repeated commands or failures require a different strategy. A flag is only a candidate until independently verified.
+Solve the challenge end to end; optimize for a valid flag, not for a report. Never wait for reconnaissance or implementation from another worker. Execute the category strategy above as a closed loop: run a discriminating command, inspect its actual output, update the attack, and continue through verification. Use scripts and debuggers instead of mental simulation when possible. Keep this attempt's tool path distinct from its profile peers. Stop repeating a path when it produces no new state, primitive, decoded bytes, or constraint.
+
+Emit only concise machine-readable milestones using these tags: {_TAGS}
+Do not emit private chain-of-thought. Record commands and decisive observations, not narration. Record a SHIFT when a branch stalls. A flag is only a candidate until independently verified.
 
 Verification contract: if you emit [ARTIFACT] for a real replay/verify file, it must accept argv options --candidate, --challenge-id, --attempt-id, and --nonce. It may succeed only after reproducing the exact candidate, then print exactly one line in this form: [VERIFICATION_PROOF] {{"candidate":"...","challenge_id":"...","attempt_id":"...","nonce":"..."}}. Exit status 0 without that fresh proof is not verification."""

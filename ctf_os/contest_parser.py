@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import Challenge, slugify
+from .categories import canonical_category
 
 
 class ContestParseError(ValueError):
@@ -147,12 +148,6 @@ def parse_contest(path: str | Path) -> ContestManifest:
 def filter_challenges(challenges: Iterable[Challenge], owned_categories: Iterable[str]) -> list[Challenge]:
     owned = {canonical_category(category) for category in owned_categories if category.strip()}
     return [challenge for challenge in challenges if canonical_category(challenge.category) in owned]
-
-
-def canonical_category(value: str) -> str:
-    """Normalize category aliases that share one local challenge layout."""
-    category = value.strip().casefold()
-    return "forensics" if category in {"forensic", "forensics"} else category
 
 
 def _normal_key(value: str) -> str:

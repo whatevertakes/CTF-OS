@@ -40,21 +40,54 @@ def test_race_plan_profiles_limits_and_unique_ids() -> None:
 
 
 def test_prompt_is_diverse_injects_shared_records_and_has_safety_invariants() -> None:
-    plan = RacePlan.for_score(300, id_factory=lambda: "attempt", seed_factory=lambda: "seed")
+    plan = RacePlan.for_score(300, category="web", id_factory=lambda: "attempt", seed_factory=lambda: "seed")
     main, alt = plan.attempts[1:]
     main_prompt = PromptRenderer().render(_context(), main)
     alt_prompt = PromptRenderer().render(_context(), alt)
 
     assert main_prompt != alt_prompt
-    assert "strongest evidence-backed vulnerability" in main_prompt
-    assert "different input path" in alt_prompt
+    assert "curl/browser requests" in main_prompt
+    assert "disjoint vulnerability class" in alt_prompt
     assert "username looks interpolated" in alt_prompt
+    assert "independently validate before use" in alt_prompt
     assert "ctf-exec curl" in alt_prompt
     assert "https://ctf.example:8443" in alt_prompt
     assert "Only connect to remotes explicitly listed in contest.md" in alt_prompt
     assert "Do not access credentials, SSH keys, browser data, API keys, or personal files." in alt_prompt
     assert "Do not write outside /work and /artifacts." in alt_prompt
     assert all(f"[{tag}]" in alt_prompt for tag in ("PLAN", "HYPOTHESIS", "ACTION", "OBSERVATION", "FINDING", "FAIL", "SHIFT", "FLAG_CANDIDATE", "ARTIFACT", "TASK_DONE"))
+
+
+def test_category_plans_produce_distinct_executable_algorithms_and_aliases() -> None:
+    pwn = RacePlan.for_score(300, category="binary exploitation").attempts[1]
+    crypto = RacePlan.for_score(300, category="cryptography").attempts[1]
+    web = RacePlan.for_score(300, category="web").attempts[1]
+
+    assert pwn.category == "pwn" and "pwntools" in pwn.strategy_instruction
+    assert crypto.category == "crypto" and "Python/Sage/Z3" in crypto.strategy_instruction
+    assert web.category == "web" and "curl/browser" in web.strategy_instruction
+    assert len({pwn.strategy_instruction, crypto.strategy_instruction, web.strategy_instruction}) == 3
+
+
+def test_every_category_attempt_is_self_contained_and_has_category_verification() -> None:
+    expected = {
+        "pwn": "clean local process",
+        "rev": "original binary",
+        "crypto": "round-trip",
+        "web": "clean reproducible session",
+        "forensics": "independent parser",
+        "cloud": "effective permission",
+        "misc": "end-to-end solver",
+    }
+    for category, verification in expected.items():
+        plan = RacePlan.for_score(500, category=category)
+        assert all("self-contained solve attempt" in item.strategy_instruction for item in plan.attempts)
+        assert all(verification in item.strategy_instruction for item in plan.attempts)
+
+
+def test_compatibility_build_preserves_category() -> None:
+    plan = RacePlan.build(300, category="reverse engineering")
+    assert all(item.category == "rev" for item in plan.attempts)
 
 
 def test_tag_parser_keeps_structured_external_records_including_plan_and_hypothesis() -> None:

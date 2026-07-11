@@ -54,6 +54,17 @@ def test_contest_parser_metadata_stable_ids_and_owned_filter(tmp_path):
     assert [challenge.name for challenge in filter_challenges(manifest.challenges, ["PWN", "misc"])] == ["bof"]
 
 
+def test_owned_filter_uses_same_common_aliases_as_solver_planning() -> None:
+    challenges = [
+        Challenge(contest="Demo", category="binary exploitation", name="bof"),
+        Challenge(contest="Demo", category="reverse engineering", name="keygen"),
+        Challenge(contest="Demo", category="stego", name="pixels"),
+    ]
+    assert [item.name for item in filter_challenges(challenges, ["pwn", "rev", "forensics"])] == [
+        "bof", "keygen", "pixels"
+    ]
+
+
 @pytest.mark.parametrize("heading", ["### web/..", "### web/one/two", "### ../sqli"])
 def test_contest_parser_rejects_unsafe_challenge_paths(tmp_path, heading):
     path = tmp_path / "contest.md"

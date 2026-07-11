@@ -91,19 +91,19 @@ def test_structured_rate_limit_walks_one_bounded_configured_fallback_and_persist
 
     assert execution.status == "completed" and execution.token_usage == 7
     assert [(item.profile, item.model, item.reasoning_effort) for item in backend.selections] == [
-        ("luna_medium", "gpt-5.6-luna", "medium"),
-        ("gpt55_medium", "gpt-5.5", "medium"),
+        ("luna_high", "gpt-5.6-luna", "high"),
+        ("gpt55_high", "gpt-5.5", "high"),
     ]
     persisted = state.get_attempt(attempt.id)
     assert persisted and (persisted.model, persisted.model_profile, persisted.reasoning_effort) == (
-        "gpt-5.5", "gpt55_medium", "medium"
+        "gpt-5.5", "gpt55_high", "high"
     )
     events = {event.type: event for event in state.list_events(challenge_id=challenge.id)}
-    assert events["MODEL_COOLDOWN"].payload["profile"] == "luna_medium"
+    assert events["MODEL_COOLDOWN"].payload["profile"] == "luna_high"
     fallback = events["MODEL_FALLBACK"].payload
     assert fallback == {
-        "from_model": "gpt-5.6-luna", "from_profile": "luna_medium", "from_reasoning_effort": "medium",
-        "to_model": "gpt-5.5", "to_profile": "gpt55_medium", "to_reasoning_effort": "medium",
+        "from_model": "gpt-5.6-luna", "from_profile": "luna_high", "from_reasoning_effort": "high",
+        "to_model": "gpt-5.5", "to_profile": "gpt55_high", "to_reasoning_effort": "high",
     }
     assert state.model_in_cooldown(primary.model, selection_key=primary.cooldown_key)
 
@@ -212,9 +212,9 @@ def test_selection_cooldown_is_profile_aware_and_expiry_restores_primary(tmp_pat
     state = LocalState(tmp_path / "state.db", clock=lambda: now)
     config, app = _app(tmp_path, SequencedBackend([]))
     router = config.model_router()
-    easy = router.select(role="exploit", difficulty="easy", attempt_kind="exploit_fast")
-    normal = router.select(role="exploit", difficulty="medium", attempt_kind="exploit_main")
-    assert easy.model == normal.model == "gpt-5.6-terra"
+    easy = router.select(role="architect")
+    normal = router.select_promotion()
+    assert easy.model == normal.model == "gpt-5.6-sol"
     assert easy.cooldown_key != normal.cooldown_key
 
     state.set_model_cooldown(easy.model, selection_key=easy.cooldown_key, reason="rate limited", seconds=10, now=now)
@@ -237,5 +237,5 @@ def test_failed_local_attempt_threshold_promotes_next_route_to_explicit_sol_revi
     selected = app._select_model(state, challenge, RacePlan.for_score(1).attempts[0])
 
     assert selected and (selected.profile, selected.model, selected.reasoning_effort) == (
-        "sol_review", "gpt-5.6-sol", "xhigh"
+        "sol_review", "gpt-5.6-sol", "max"
     )
