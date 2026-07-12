@@ -472,7 +472,10 @@ def _init_workspace(
         if not created_config:
             raise FileExistsError(f"refusing to overwrite existing manifest without --force: {manifest}")
     contest_root.mkdir(parents=True, exist_ok=True)
-    for category in ("pwn", "rev", "web", "crypto", "misc", "forensic"):
+    for category in (
+        "pwn", "rev", "web", "crypto", "forensic", "forensics", "misc",
+        "cloud", "mobile", "windows", "password", "osint", "hardware",
+    ):
         (contest_root / category).mkdir(exist_ok=True)
     config.output_contest_dir().mkdir(parents=True, exist_ok=True)
     routing_path = config.model_routing_path
@@ -485,7 +488,9 @@ def _init_workspace(
     if not manifest.exists() or force:
         manifest.write_text(
             f"# 대회명: {contest}\n\n## 대회 정보\n- 팀: {config.team_id}\n\n## 문제 목록\n\n"
-            "<!-- Add one ### category/challenge section before parsing. -->\n",
+            "<!-- Add one section per authorized challenge using a level-3 heading named category/challenge.\n"
+            "Fields may include 점수, 원격 (exactly nc HOST PORT), 설명 and 힌트.\n"
+            "Only targets explicitly declared in this file are authorized. -->\n",
             encoding="utf-8",
         )
     return config

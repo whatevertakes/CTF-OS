@@ -1,7 +1,10 @@
-.PHONY: test benchmark-smoke benchmark-real benchmark-compare benchmark-compare-real validate-profiles smoke-profiles
+.PHONY: test team-bundle benchmark-smoke benchmark-real benchmark-compare benchmark-compare-real validate-profiles smoke-profiles
 
 test:
 	uv run pytest -q
+
+team-bundle:
+	scripts/build_team_bundle.sh
 
 validate-profiles:
 	uv run python scripts/validate_profiles.py

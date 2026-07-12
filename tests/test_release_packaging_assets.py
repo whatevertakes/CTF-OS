@@ -32,6 +32,7 @@ def test_sdist_manifest_declares_release_assets_and_packaging_tests() -> None:
         "include sandbox/profiles.yaml",
         "graft benchmarks",
         "include scripts/normalize_sdist.py",
+        "include scripts/build_team_bundle.sh",
         "recursive-include ctf_os/resources *.yaml Dockerfile.sandbox entrypoint.sh",
         "graft knowledge",
         "graft ctf_os/resources/knowledge",

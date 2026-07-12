@@ -27,3 +27,20 @@ verify authenticated filesystem-spool atomic publish and a
 `network={enabled=false` Codex profile. Then install only the wheel in a fresh
 virtual environment and smoke-test
 `ctf-os --help`, model routing, mock-safe `init`, and `doctor`.
+
+## Team source bundle
+
+For teammates who cannot clone during an event, build a source-only archive
+from an already committed revision:
+
+```bash
+make team-bundle
+cd dist/team-bundle
+sha256sum -c ctf-os-team-*.tar.gz.sha256
+```
+
+The deterministic archive is produced by `git archive`, so local configuration,
+SQLite, incoming challenges, output, credentials, flags, benchmark results and
+other ignored runtime data are not included. Docker images are deliberately not
+embedded because they are large and platform-specific; each teammate builds and
+verifies the sandbox locally with `scripts/deploy_ctf_os.sh`.

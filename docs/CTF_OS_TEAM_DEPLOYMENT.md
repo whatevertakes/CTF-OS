@@ -56,6 +56,22 @@ A팀과 B팀은 같은 대회 이름을 써도 됩니다. 단, `team_id`, 설정
 
 같은 저장소에서 다른 팀/노드도 시험하려면 기존 설정을 재사용하지 말고 다른 `--config`, `--team-id`, `--member` 조합으로 다시 `init`하세요. 이미 존재하는 설정과 다른 팀 또는 member를 `--force`로 바꾸는 것도 거부됩니다.
 
+### Git 접근이 어려운 팀원에게 전달
+
+인터넷 연결이 가능한 PC에서 commit된 source만 압축합니다.
+
+```bash
+make team-bundle
+cd dist/team-bundle
+sha256sum -c ctf-os-team-*.tar.gz.sha256
+```
+
+받은 팀원은 checksum을 확인한 뒤 압축을 풀고 일반 clone과 같은 방식으로
+`uv sync --frozen`, `ctf-os init`, `scripts/deploy_ctf_os.sh`를 실행합니다.
+bundle은 `git archive`로 만들기 때문에 `local.*.yaml`, incoming 문제, output,
+SQLite, credential, 실제 flag와 benchmark 결과를 포함하지 않습니다. Docker
+image도 포함하지 않으며 각 PC에서 현재 architecture에 맞게 다시 build합니다.
+
 ## 사람이 편집할 설정
 
 초기화 직후 설정 파일에서 아래만 검토합니다.

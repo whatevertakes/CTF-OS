@@ -9,6 +9,7 @@ include sandbox/profiles.yaml
 include Makefile
 include scripts/normalize_sdist.py
 include scripts/validate_profiles.py
+include scripts/build_team_bundle.sh
 graft benchmarks
 prune benchmarks/results
 recursive-include ctf_os/resources *.yaml Dockerfile.sandbox entrypoint.sh sandbox-tools.txt

@@ -1,141 +1,245 @@
 # CTF-OS
 
-CTF-OS는 각 PC에서 완전히 독립적으로 실행하는 로컬 CTF 풀이 도구입니다. 상태·발견 사항·플래그 이벤트는 해당 노드의 SQLite에만 저장하며 팀 공유 파일을 만들지 않습니다. 다른 PC의 프로세스를 실행하지 않으며 CTFd에 플래그를 자동 제출하지 않습니다.
+CTF-OS는 팀원 각자의 PC에서 독립적으로 실행되는 로컬 CTF 풀이 시스템입니다.
+문제를 세부 유형으로 분류하고, 전략별 Docker harness를 실행하며, 발견 사항에
+따라 계약을 재계획합니다. 상태와 artifact는 각 PC의 SQLite/output에만 남습니다.
 
-승인된 대회와 원격 대상만 `incoming/<대회 이름>/contest.md`에 적어 사용하세요.
+이 시스템이 하지 않는 일도 명확합니다.
 
-## Tactical engine
+- 다른 팀원 PC의 process나 상태를 제어하지 않습니다.
+- `contest.md`에 선언되지 않은 원격 대상에 접근하지 않습니다.
+- CTFd에 플래그를 자동 제출하지 않습니다.
+- 설정, SQLite, credential, 실제 flag를 Git이나 팀 bundle로 공유하지 않습니다.
 
-신규 설정은 versioned strategy/harness, 세부 유형 planner, 구조화 재계획,
-semantic loop detection과 capability preflight를 기본 활성화합니다. 기존
-`tool_strategy` 문자열과 plan 문장도 호환 경로로 읽습니다.
+## 5분 시작
+
+필요한 것은 Linux, Git, Docker, `uv`, 인증된 Codex CLI입니다. 모든 명령은
+저장소 루트에서 실행합니다.
 
 ```bash
-uv run ctf-os capabilities          # 실제 로컬 tool/version과 degraded profile
-uv run python scripts/validate_profiles.py
-make benchmark-smoke                # 실제 로컬 도구 + private verifier, 모델 호출 없음
-make benchmark-real                 # 인증된 Codex CLI + Docker 실제 실행
-make benchmark-compare              # 같은 seed의 legacy/tactical smoke 비교
+git clone https://github.com/whatevertakes/CTF-OS.git
+cd CTF-OS
+uv sync --frozen
+
+uv run ctf-os init "Next CTF 2026" \
+  --config local.next-a.jiwoong.yaml \
+  --team-id next-a \
+  --member jiwoong
+
+scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml
+uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock
 ```
 
-설정, strategy/planner 확장, schema v10 마이그레이션과 문제 해결은
-[전술 엔진 문서](docs/tactical-engine.md)를 참고하세요. 이 기능도 자동
-플래그 제출, allowlist 우회 또는 다른 PC 상태 제어를 추가하지 않습니다.
+초기화가 만든 `incoming/Next CTF 2026/contest.md`에 문제를 추가합니다.
 
-홈 캐시가 읽기 전용인 환경에서 `uv` 권한 오류가 나면, 현재 터미널에서
-`export UV_CACHE_DIR="${TMPDIR:-/tmp}/ctf-os-uv-cache-$UID"`를 한 번 실행하세요.
-`scripts/deploy_ctf_os.sh`는 이 안전한 기본값을 자동 적용합니다.
+```markdown
+# 대회명: Next CTF 2026
 
-## 가장 중요한 규칙
+## 대회 정보
+- 팀: next-a
 
-한 로컬 DB는 처음 사용한 `team_id + member.name + contest.name` 조합에 묶입니다. 기존 DB를 둔 채 이 셋 중 하나만 바꾸면 오류가 나는 것이 정상입니다.
+## 문제 목록
 
-- 같은 팀: 운영상 합의한 `contest.team_id`를 사용할 수 있지만 실행과 상태는 PC별로 독립적입니다.
-- 다른 팀: `contest.team_id`가 반드시 달라야 합니다.
-- 각 PC: `member.name`은 겹치지 않게 정하고 `paths.output`은 반드시 `<team_id>/<member>`로 끝나게 분리합니다. 맞지 않으면 새 DB를 만들기 전 설정 단계에서 거부됩니다.
-- 공유 금지: `output/`, `local_state.db`, Codex 로그인, Docker 컨테이너, 자격 증명과 플래그 파일은 PC 사이에 복사하지 않습니다.
-- 팀을 옮길 때: 기존 설정을 수정하지 말고 새 설정 파일과 새 output 경로를 만듭니다.
+### pwn/heap-school
+- 점수: 400
+- 원격: nc challenge.example 31337
+- 설명: 승인된 대회 문제
 
-## 1. 사람이 먼저 정할 값
+### web/login
+- 점수: 200
+- 설명: 로컬 파일로 제공되는 웹 문제
+```
 
-대회마다 아래 값을 팀 채널에 먼저 확정한 뒤 모든 PC에서 그대로 사용합니다.
+문제 파일은 `incoming/Next CTF 2026/<category>/<challenge>/` 아래에 둡니다.
+그다음 현재 PC 담당 문제만 queue에 넣고 실행합니다.
 
-| 값 | 누가 같아야 하나 | 예시 |
+```bash
+uv run ctf-os parse --config local.next-a.jiwoong.yaml
+uv run ctf-os tui --plain --config local.next-a.jiwoong.yaml
+uv run ctf-os run --config local.next-a.jiwoong.yaml
+```
+
+플래그 후보와 검증 결과는 로컬 화면에서 확인하고, 실제 제출은 사람이 합니다.
+
+## 팀이 먼저 맞출 세 값
+
+| 값 | 팀 규칙 | 예시 |
 | --- | --- | --- |
-| 대회 이름 | 같은 대회 참가자 전원 | `Next CTF 2026` |
-| `team_id` | 같은 참가 팀 2명 또는 4명 | `next-a` |
-| `member` | PC마다 고유 | `jiwoong` |
-| 설정 파일 | PC/팀 조합마다 별도 | `local.next-a.jiwoong.yaml` |
-| output | PC/팀 조합마다 별도 | `output/next-a/jiwoong` |
+| 대회 이름 | 같은 대회 참가자는 완전히 같은 철자 | `Next CTF 2026` |
+| `team_id` | 같은 참가 팀끼리 동일 | `next-a` |
+| `member.name` | PC마다 고유 | `jiwoong` |
 
-`team_id`, `member`, 대회 이름에는 `/`, `\`를 쓰지 말고 값 전체를 `.` 또는 `..`로 정하지 마세요.
+설정 파일은 `local.<team>.<member>.yaml`, output은
+`output/<team>/<member>`를 사용합니다. SQLite는 최초의
+`team_id + member + contest` 조합에 묶이므로 다른 대회나 다른 팀 설정으로
+기존 DB를 열면 안전하게 거부됩니다.
 
-## 2. 최초 1회 세팅
+팀원끼리 공유하는 것은 다음뿐입니다.
 
-아래 예시는 다음 대회의 A팀에 참가하는 `jiwoong` PC입니다. 따옴표 안의 대회 이름과 세 식별자는 실제 값으로 바꾸세요.
+- 같은 Git commit 또는 검증된 team source bundle
+- 같은 대회 이름, `team_id`, `contest.md` 문제 식별자
+- 사람이 합의한 문제 담당 범위
 
-| 명령 | 설명 |
+공유하지 않는 것은 `local.*.yaml`, `incoming/`, `output/`, SQLite, Codex 로그인,
+Docker runtime, credential, 실제 flag입니다.
+
+### KISIA four-member example
+
+| member | `team_id` | 담당 예시 | 로컬 설정 |
+| --- | --- | --- | --- |
+| `jiwoong` | `sca-jiwoong-team` | pwn, web | `local.sca-jiwoong-team.jiwoong.yaml` |
+| `jueon` | `sca-jiwoong-team` | rev, crypto | `local.sca-jiwoong-team.jueon.yaml` |
+| `hyunseok` | `sca-jiwoong-team` | forensics, misc | `local.sca-jiwoong-team.hyunseok.yaml` |
+| `howon` | `sca-jiwoong-team` | cloud, web | `local.sca-jiwoong-team.howon.yaml` |
+
+네 노드는 같은 코드를 사용하지만 설정, DB, output, worker는 완전히 분리됩니다.
+
+## 팀원별 설정
+
+`init` 후 `local.<team>.<member>.yaml`에서 주로 아래만 바꿉니다.
+
+```yaml
+contest:
+  name: "Next CTF 2026"
+  team_id: "next-a"
+  flag_patterns:
+    - "FLAG\\{[^}]+\\}"
+
+member:
+  name: "jiwoong"
+  owned_categories: [pwn, web]
+
+paths:
+  incoming: "incoming"
+  output: "output/next-a/jiwoong"
+
+model_routing:
+  enabled: true
+  config_path: "config/model-routing.yaml"
+```
+
+Sol은 계획·감독·검증, Terra는 일반 풀이와 구현, Luna는 recon과 저비용 시도를
+담당합니다. 실제 선택은 [model-routing.yaml](config/model-routing.yaml)에 따라
+자동으로 이루어집니다.
+
+## 대회 전 체크리스트
+
+각 팀원이 자기 PC에서 순서대로 실행합니다.
+
+```bash
+git status --short
+git pull --ff-only origin main
+scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml
+uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock
+uv run ctf-os capabilities
+uv run ctf-os parse --config local.next-a.jiwoong.yaml
+uv run ctf-os tui --plain --config local.next-a.jiwoong.yaml
+```
+
+- 네 PC가 같은 Git commit인지 확인합니다.
+- 같은 참가 팀의 `team_id`와 대회 이름이 같은지 확인합니다.
+- 각 `member.name`과 output 경로가 겹치지 않는지 확인합니다.
+- `contest.md`의 원격이 승인된 challenge endpoint인지 확인합니다.
+- `doctor --non-mock`이 성공하기 전에는 실제 worker를 실행하지 않습니다.
+
+## 대회 중 자주 쓰는 명령
+
+| 명령 | 용도 |
 | --- | --- |
-| `git clone https://github.com/whatevertakes/CTF-OS.git` | 코드를 처음 한 번 받습니다. |
-| `cd CTF-OS` | 저장소로 이동합니다. |
-| `uv sync --frozen` | 잠긴 버전 그대로 실행 환경을 설치합니다. |
-| `uv run ctf-os init "Next CTF 2026" --config local.next-a.jiwoong.yaml --team-id next-a --member jiwoong` | 이 PC 전용 설정·입력 폴더·output 경로를 만듭니다. |
+| `uv run ctf-os run --config <CONFIG>` | queue를 계속 처리 |
+| `uv run ctf-os run --once --config <CONFIG>` | 현재 queue를 한 번 처리 |
+| `uv run ctf-os tui --config <CONFIG>` | 로컬 진행 상황 확인 |
+| `uv run ctf-os tui --readonly --config <CONFIG>` | worker를 건드리지 않고 상태만 관찰 |
+| `uv run ctf-os pause <문제> --config <CONFIG>` | 현재 PC의 문제 중지 |
+| `uv run ctf-os resume <문제> --config <CONFIG>` | 중지한 문제 재개 |
+| `uv run ctf-os retry <문제> --config <CONFIG>` | 실패한 문제 재시도 |
+| `uv run ctf-os sandbox cleanup --config <CONFIG>` | 현재 team/member/contest container만 정리 |
 
-그다음 `local.next-a.jiwoong.yaml`에서 사람이 편집할 항목은 다음과 같습니다. `local.<team>.<member>.yaml` 이름은 로컬 설정임을 분명히 하며 Git에서 제외됩니다.
+## 대회가 바뀔 때
 
-- `member.owned_categories`: 이 PC가 맡을 카테고리
-- `contest.flag_patterns`: 실제 대회의 플래그 형식
-- `model_routing.enabled`: 실제 Codex 실행은 라우팅 파일을 검토한 뒤 `true`
-- `paths.output`: 자동 생성된 `output/next-a/jiwoong`처럼 마지막 두 폴더가 `team_id/member`인지 확인
+기존 설정의 대회 이름이나 `team_id`를 수정하지 않습니다. 새 대회마다 새 설정과
+새 output을 만듭니다.
 
-신규 설정에서는 `contest.team_id`만 정하면 됩니다. 기존 YAML의 `sync` 항목은 무시되며 제거해도 됩니다. 초기화 뒤에는 기존 설정의 `contest.team_id`, `member.name`, `contest.name`을 다른 노드 값으로 바꾸지 마세요.
+```bash
+uv run ctf-os init "Another CTF 2026" \
+  --config local.another-a.jiwoong.yaml \
+  --team-id another-a \
+  --member jiwoong
+```
 
-모델은 라우팅 파일에 따라 자동 선택합니다. Sol은 감독·전략·최종 검증, Terra는 구현과 일반 풀이, Luna는 정찰·요약·가벼운 병렬 시도를 맡는 것이 기본 운영 원칙입니다.
+이 방식이면 과거 대회의 DB와 artifact를 보존하면서 대회 수에 제한 없이 확장할
+수 있습니다. 4인 팀이 일시적으로 2+2로 나뉘는 경우에도 각 참가 팀에 새
+`team_id`와 설정 파일을 만들고, 이전 설정은 그대로 둡니다.
 
-팀에서 받은 동일한 `contest.md`를 `incoming/Next CTF 2026/contest.md`에 놓고, 문제를 `### category/name` 형식으로 작성합니다. `incoming/`은 Git으로 배포되지 않으므로 팀끼리 별도로 전달해야 합니다.
+자세한 운영 예시는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
 
-| 명령 | 설명 |
-| --- | --- |
-| `scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml` | DB 마이그레이션, sandbox 이미지 준비와 smoke test를 한 번에 수행합니다. |
-| `uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock` | Codex·Docker·이미지·broker와 경로가 실제 풀이 가능한지 검사합니다. |
+## 인터넷 없이 팀원에게 전달하기
 
-## 3. 실제 대회 직전
+commit된 source만 재현 가능한 gzip bundle로 만들 수 있습니다.
 
-| 명령 | 설명 |
-| --- | --- |
-| `git pull --ff-only origin main` | 최신 코드를 안전하게 받습니다. |
-| `scripts/deploy_ctf_os.sh --config local.next-a.jiwoong.yaml` | 의존성·DB·Docker 이미지를 다시 검증합니다. |
-| `uv run ctf-os doctor --config local.next-a.jiwoong.yaml --non-mock` | 실제 실행 전 필수 조건을 최종 확인합니다. |
-| `uv run ctf-os parse --config local.next-a.jiwoong.yaml` | `contest.md`에서 이 PC 담당 카테고리만 로컬 DB에 넣습니다. |
-| `uv run ctf-os tui --plain --config local.next-a.jiwoong.yaml` | 이 노드의 로컬 SQLite 상태를 한 번 출력합니다. |
+```bash
+make team-bundle
+cd dist/team-bundle
+sha256sum -c ctf-os-team-*.tar.gz.sha256
+tar -xzf ctf-os-team-*.tar.gz
+cd CTF-OS
+```
 
-어느 명령에서든 DB의 노드 정체성이 다르다는 오류가 나오면 DB를 덮어쓰지 마세요. 설정 파일의 `team_id`, `member`, 대회 이름과 output 경로를 확인하고 현재 노드용 새 설정으로 다시 초기화합니다. 자세한 복구 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)를 참고하세요.
+bundle에는 로컬 설정, DB, incoming 문제, output, credential, flag, benchmark 결과가
+들어가지 않습니다. Docker image는 크고 플랫폼 의존적이므로 포함하지 않으며,
+압축을 푼 각 PC에서 아래 명령으로 재현합니다.
 
-예전 설정의 `paths.output`이 단순히 `output`이라면 새 경로 검증에서 거부될 수 있습니다. 기존 YAML과 DB는 그대로 보존하고, 현재 대회에 `init --config local.<team>.<member>.yaml`을 실행해 새 노드를 만드세요.
+```bash
+uv sync --frozen
+scripts/deploy_ctf_os.sh --config local.<team>.<member>.yaml
+```
 
-## 4. 대회 중
+패키징 상세는 [release packaging 문서](docs/release-packaging.md)에 있습니다.
 
-| 명령 | 설명 |
-| --- | --- |
-| `uv run ctf-os run --config local.next-a.jiwoong.yaml` | 이 PC 담당 문제를 계속 처리합니다. |
-| `uv run ctf-os run --once --config local.next-a.jiwoong.yaml` | 현재 큐를 한 번만 처리하고 종료합니다. |
-| `uv run ctf-os tui --config local.next-a.jiwoong.yaml` | 이 노드의 로컬 진행 상태를 대시보드로 봅니다. |
-| `uv run ctf-os pause <문제명> --config local.next-a.jiwoong.yaml` | 이 PC의 문제 하나를 일시 정지합니다. |
-| `uv run ctf-os resume <문제명> --config local.next-a.jiwoong.yaml` | 정지한 문제를 이 PC 큐에 다시 넣습니다. |
-| `uv run ctf-os retry <문제명> --config local.next-a.jiwoong.yaml` | 실패한 문제를 명시적으로 다시 시도합니다. |
+## Tactical engine이 확장되는 위치
 
-플래그 후보는 사람이 검증하고 직접 제출해야 합니다.
+새 대회는 보통 코드 변경 없이 `contest.md`와 문제 파일만 추가하면 됩니다. 새로운
+유형이나 도구가 필요할 때는 아래 extension point만 확장합니다.
 
-## Tactical engine 검증
+| 확장 대상 | 파일 | 검증 |
+| --- | --- | --- |
+| 문제 subtype/evidence | [profiles.py](ctf_os/tactical_engine/profiles.py) | classifier test |
+| subtype 전문 planner | [planners.py](ctf_os/tactical_engine/planners.py) | planner coverage test |
+| strategy/harness/artifact | [strategies.py](ctf_os/tactical_engine/strategies.py) | strategy bootstrap test |
+| semantic replan rule | [rules.py](ctf_os/tactical_engine/rules.py) | parser/evaluator/idempotency test |
+| Docker capability profile | [Dockerfile.profiles](sandbox/Dockerfile.profiles) | `make smoke-profiles` |
+| 로컬 지식 | `knowledge/` | knowledge index/query test |
+| 실제 회귀 challenge | `benchmarks/fixtures/` | smoke/real benchmark |
 
-개발·배포 검증에서는 아래 명령으로 실제 profile과 종단 경로를 확인합니다.
-benchmark의 parent verifier는 정답을 worker/model/workspace에 전달하지 않고
-candidate hash와 검증 결과만 event/report에 남깁니다. 이 기능은 CTFd 자동
-제출을 하지 않습니다.
+strategy는 registry에 등록하고, subtype은 정확한 planner로 연결하며, artifact에는
+producer·hash·consumer provenance를 남깁니다. 큰 `if/elif`, prompt-only 전략,
+reference flag 주입은 extension으로 인정하지 않습니다.
 
-| 명령 | 설명 |
-| --- | --- |
-| `make test` | 전체 회귀 테스트 |
-| `make smoke-profiles` | base/pwn/web/forensics 이미지 build 및 mount·timeout·resource·network·cleanup smoke |
-| `make benchmark-smoke` | 외부 모델 없는 빠른 로컬 도구 E2E |
-| `make benchmark-real` | 실제 Codex+Docker pwn/forensics E2E |
-| `make benchmark-compare-real` | 같은 seed의 legacy/tactical 실제 모델 A/B |
+구조와 schema는 [tactical engine 문서](docs/tactical-engine.md)에 설명되어 있습니다.
 
-세부 구조, fixture 선택과 report schema는 [tactical engine 문서](docs/tactical-engine.md)를 참고하세요.
+## 개발 및 배포 검증
 
-## 4명 기본 운영과 다음 대회 2+2 운영
+```bash
+make test                   # 전체 테스트
+make validate-profiles      # registry/profile 정적 검증
+make smoke-profiles         # base/pwn/web/forensics build 및 runtime smoke
+make benchmark-smoke        # 외부 모델 없는 빠른 E2E
+make benchmark-real         # 실제 Codex + Docker E2E
+make benchmark-compare-real # 동일 seed legacy/tactical 측정
+```
 
-### KISIA four-member example · 평소 4인 팀
+benchmark parent verifier는 정답을 worker/model/workspace에 전달하지 않고 candidate
+hash와 검증 결과만 event/report에 남깁니다. benchmark도 flag를 자동 제출하지
+않습니다.
 
-평소에는 네 명이 `team_id: sca-jiwoong-team`을 공유하고, `member.name`과 담당 카테고리만 각자 다르게 둡니다.
+## 자주 막히는 문제
 
-| member | 담당 예시 |
-| --- | --- |
-| `jiwoong` | pwn, web |
-| `jueon` | rev, crypto |
-| `hyunseok` | forensics, misc |
-| `howon` | cloud, web3 |
+- `uv` cache 권한 오류: `export UV_CACHE_DIR="${TMPDIR:-/tmp}/ctf-os-uv-cache-$UID"`
+- DB identity 오류: 기존 DB를 수정하지 말고 현재 대회용 새 config/output 생성
+- `degraded` capability: `uv run ctf-os capabilities`에서 누락 도구와 fallback 확인
+- Docker image 변경: `scripts/deploy_ctf_os.sh --config <CONFIG> --rebuild-image`
+- 문제 수가 다름: `owned_categories`와 `contest.md`의 `category/name` 철자 확인
+- 원격 연결 거부: `contest.md`의 정확한 `nc HOST PORT` 선언과 allowlist 확인
 
-다음 대회만 두 팀으로 나뉜다면 A팀 2명은 `next-a`, B팀 2명은 `next-b`를 사용합니다. 각 PC는 설정 파일과 output을 분리합니다. 대회가 끝난 뒤 4명 운영으로 돌아갈 때는 기존 A/B 설정을 고치지 말고, 다음 대회용 `sca-jiwoong-team` 설정 파일을 새로 만드세요. 각 대회의 SQLite 기록은 그대로 보존됩니다.
-
-더 자세한 clone 점검표, 설정 예시와 오류 복구는 [CTF-OS 팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md)에 있습니다.
+운영 복구 절차는 [팀 배포 가이드](docs/CTF_OS_TEAM_DEPLOYMENT.md), 엔진 문제 해결은
+[tactical engine 문서](docs/tactical-engine.md)를 참고하세요.
