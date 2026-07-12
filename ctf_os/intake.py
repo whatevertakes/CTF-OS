@@ -23,6 +23,22 @@ class IntakeError(ValueError):
     """Raised for unsafe or malformed local contest intake data."""
 
 
+class ArchivePolicyError(IntakeError):
+    """A structured, operator-actionable archive admission failure."""
+
+    def __init__(self, message: str, *, code: str, archive: Path, member: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.archive = archive
+        self.member = member
+
+    def payload(self) -> dict[str, str]:
+        result = {"code": self.code, "archive": self.archive.name, "reason": str(self)}
+        if self.member:
+            result["member"] = self.member
+        return result
+
+
 @dataclass(frozen=True)
 class ZipExtractionLimits:
     """Hard caps applied before and during every archive extraction."""
@@ -47,6 +63,15 @@ class IntakeChallenge:
     challenge: Challenge
     workspace: Path
     archives: tuple[Path, ...]
+    attachments: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class IntakeAdmissionError:
+    manifest: ContestManifest
+    challenge: Challenge
+    reason: str
+    payload: dict[str, str]
 
 
 class IntakeService:
@@ -54,6 +79,7 @@ class IntakeService:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.admission_errors: list[IntakeAdmissionError] = []
 
     def discover_manifests(self) -> tuple[ContestManifest, ...]:
         """Find manifests belonging to this configured contest only.
@@ -84,6 +110,7 @@ class IntakeService:
         incoming tree.
         """
         result: list[IntakeChallenge] = []
+        self.admission_errors.clear()
         manifests = self.discover_manifests()
         if not manifests:
             path = self.config.incoming_contest_dir() / "contest.md"
@@ -100,20 +127,14 @@ class IntakeService:
             for challenge in ready:
                 archives = self.discover_archives(manifest, challenge)
                 source_dir = self.discover_source_directory(manifest, challenge)
-                unsupported = self.discover_unsupported_attachments(manifest, challenge)
-                if unsupported:
-                    names = ", ".join(path.name for path in unsupported)
-                    raise IntakeError(
-                        f"unsupported challenge attachment for {challenge.category}/{challenge.name}: {names}; "
-                        "use a matching .zip archive or a matching raw directory"
-                    )
+                attachments = self.discover_opaque_attachments(manifest, challenge)
                 try:
                     endpoints = parse_remote_endpoints(challenge.remote)
                 except RemotePolicyError as exc:
                     raise IntakeError(
                         f"invalid remote for {challenge.category}/{challenge.name}: {exc}"
                     ) from exc
-                if not archives and source_dir is None and not endpoints:
+                if not archives and not attachments and source_dir is None and not endpoints:
                     raise IntakeError(
                         f"challenge has no matching source or valid remote: {challenge.category}/{challenge.name}; "
                         f"expected {_category_root(manifest.path.parent, challenge.category) / challenge.name}.zip "
@@ -121,9 +142,29 @@ class IntakeService:
                         "check the contest.md heading and attachment path/name for a mismatch"
                     )
                 workspace = self.config.workspace_dir(manifest.name, challenge.slug)
-                if materialize:
-                    materialize_challenge_sources(archives, source_dir, workspace)
-                result.append(IntakeChallenge(manifest, challenge, workspace, archives))
+                try:
+                    if materialize:
+                        materialize_challenge_sources(
+                            archives, source_dir, workspace, attachments=attachments,
+                            zip_limits=ZipExtractionLimits(**self.config.zip_extraction_limits),
+                        )
+                    elif archives:
+                        _validate_archive_metadata(
+                            archives, ZipExtractionLimits(**self.config.zip_extraction_limits),
+                        )
+                except IntakeError as exc:
+                    payload = exc.payload() if isinstance(exc, ArchivePolicyError) else {
+                        "code": "INTAKE_POLICY_REJECTED", "reason": str(exc),
+                    }
+                    payload["resolution"] = (
+                        "review the named member and, only for an authorized challenge, raise "
+                        "intake.zip_limits in this contest's local config"
+                    )
+                    self.admission_errors.append(IntakeAdmissionError(
+                        manifest, challenge, str(exc), payload,
+                    ))
+                    continue
+                result.append(IntakeChallenge(manifest, challenge, workspace, archives, attachments))
         return tuple(result)
 
     @staticmethod
@@ -155,8 +196,13 @@ class IntakeService:
         return tuple(safe)
 
     @staticmethod
-    def discover_unsupported_attachments(manifest: ContestManifest, challenge: Challenge) -> tuple[Path, ...]:
-        """Reject matching archive formats that this safe extractor cannot inspect."""
+    def discover_opaque_attachments(manifest: ContestManifest, challenge: Challenge) -> tuple[Path, ...]:
+        """Return non-ZIP archives for analysis inside the attempt sandbox.
+
+        Host intake deliberately does not unpack these formats.  This avoids
+        making queue admission depend on host tools while letting 7z, rar and
+        tar-based CTF tasks reach the profile-specific extraction harness.
+        """
         contest_root = manifest.path.parent.resolve(strict=False)
         category_root = _category_root(contest_root, challenge.category)
         if not category_root.is_dir() or category_root.is_symlink():
@@ -199,9 +245,12 @@ def _category_root(contest_root: Path, category: str) -> Path:
     return direct
 
 
-def materialize_challenge_sources(archives: tuple[Path, ...], source_dir: Path | None, destination: Path) -> None:
+def materialize_challenge_sources(
+    archives: tuple[Path, ...], source_dir: Path | None, destination: Path, *,
+    attachments: tuple[Path, ...] = (), zip_limits: ZipExtractionLimits = DEFAULT_ZIP_LIMITS,
+) -> None:
     """Build one deterministic workspace from ZIP and/or plain challenge files."""
-    fingerprint = _source_fingerprint(archives, source_dir)
+    fingerprint = _source_fingerprint(archives + attachments, source_dir)
     marker = destination.parent / f".{destination.name}.source.sha256"
     if destination.is_dir() and not destination.is_symlink() and marker.is_file():
         if marker.read_text(encoding="ascii", errors="ignore").strip() == fingerprint:
@@ -211,9 +260,11 @@ def materialize_challenge_sources(archives: tuple[Path, ...], source_dir: Path |
     payload = outer / "payload"
     try:
         if archives:
-            extract_zips_safely(archives, payload)
+            extract_zips_safely(archives, payload, limits=zip_limits)
         else:
             payload.mkdir()
+        for attachment in attachments:
+            shutil.copyfile(attachment, payload / attachment.name, follow_symlinks=False)
         if source_dir is not None:
             _copy_plain_sources(source_dir, payload)
         _make_workspace_container_readable(payload)
@@ -404,14 +455,14 @@ def _validate_archive_metadata(archives: tuple[Path, ...], limits: ZipExtraction
                         continue
                     file_count += 1
                     if file_count > limits.max_files:
-                        raise IntakeError("ZIP archive exceeds file-count limit")
+                        raise ArchivePolicyError("ZIP archive exceeds file-count limit", code="ZIP_FILE_COUNT_LIMIT", archive=archive_path, member=member.filename)
                     if member.file_size > limits.max_file_bytes:
-                        raise IntakeError(f"ZIP member exceeds per-file limit: {member.filename!r}")
+                        raise ArchivePolicyError(f"ZIP member exceeds per-file limit: {member.filename!r}", code="ZIP_FILE_SIZE_LIMIT", archive=archive_path, member=member.filename)
                     if member.file_size and (member.compress_size <= 0 or member.file_size > member.compress_size * limits.max_compression_ratio):
-                        raise IntakeError(f"ZIP member exceeds compression-ratio limit: {member.filename!r}")
+                        raise ArchivePolicyError(f"ZIP member exceeds compression-ratio limit: {member.filename!r}", code="ZIP_COMPRESSION_RATIO_LIMIT", archive=archive_path, member=member.filename)
                     declared_total += member.file_size
                     if declared_total > limits.max_total_bytes:
-                        raise IntakeError("ZIP archive exceeds total expanded-byte limit")
+                        raise ArchivePolicyError("ZIP archive exceeds total expanded-byte limit", code="ZIP_TOTAL_SIZE_LIMIT", archive=archive_path, member=member.filename)
         except BadZipFile as exc:
             raise IntakeError(f"invalid ZIP archive: {archive_path}") from exc
 

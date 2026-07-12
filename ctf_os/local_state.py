@@ -71,8 +71,9 @@ _OperationResult = TypeVar("_OperationResult")
 
 
 _TRANSITIONS: dict[ChallengeStatus, frozenset[ChallengeStatus]] = {
-    ChallengeStatus.DISCOVERED: frozenset({ChallengeStatus.QUEUED, ChallengeStatus.PAUSED}),
-    ChallengeStatus.QUEUED: frozenset({ChallengeStatus.RUNNING, ChallengeStatus.PAUSED, ChallengeStatus.FAILED}),
+    ChallengeStatus.DISCOVERED: frozenset({ChallengeStatus.QUEUED, ChallengeStatus.INTAKE_BLOCKED, ChallengeStatus.PAUSED}),
+    ChallengeStatus.INTAKE_BLOCKED: frozenset({ChallengeStatus.QUEUED, ChallengeStatus.PAUSED}),
+    ChallengeStatus.QUEUED: frozenset({ChallengeStatus.RUNNING, ChallengeStatus.INTAKE_BLOCKED, ChallengeStatus.PAUSED, ChallengeStatus.FAILED}),
     ChallengeStatus.RUNNING: frozenset({ChallengeStatus.STUCK, ChallengeStatus.FLAG_CANDIDATE, ChallengeStatus.PAUSED, ChallengeStatus.FAILED}),
     ChallengeStatus.STUCK: frozenset({ChallengeStatus.HINTING, ChallengeStatus.RUNNING, ChallengeStatus.PAUSED, ChallengeStatus.FAILED}),
     ChallengeStatus.HINTING: frozenset({ChallengeStatus.RUNNING, ChallengeStatus.STUCK, ChallengeStatus.PAUSED, ChallengeStatus.FAILED}),

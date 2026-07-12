@@ -60,6 +60,7 @@ def slugify(value: str) -> str:
 
 class ChallengeStatus(StrEnum):
     DISCOVERED = "DISCOVERED"
+    INTAKE_BLOCKED = "INTAKE_BLOCKED"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     STUCK = "STUCK"

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from ctf_os.flag_detector import FlagDetector
 from ctf_os.solver_engine.context import ChallengeContextBuilder
+
+
+def test_missing_score_is_normalized_to_unknown_zero() -> None:
+    context = ChallengeContextBuilder().build({"id": "unscored", "category": "pwn", "score": None})
+    assert context.score == 0
 from ctf_os.solver_engine.mock_backend import MockBackend
 from ctf_os.solver_engine.parser import ActionObservationParser
 from ctf_os.solver_engine.prompt import PromptRenderer

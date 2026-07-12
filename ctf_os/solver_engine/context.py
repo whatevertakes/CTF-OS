@@ -42,8 +42,9 @@ class ChallengeContextBuilder:
     ) -> ChallengeContext:
         challenge_id = str(metadata.get("id") or metadata.get("slug") or metadata.get("title") or "challenge")
         title = str(metadata.get("title") or metadata.get("name") or challenge_id)
+        raw_score = metadata.get("score")
         try:
-            score = int(metadata.get("score", 0))
+            score = 0 if raw_score is None else int(raw_score)
         except (TypeError, ValueError) as exc:
             raise ValueError("challenge score must be an integer") from exc
         if score < 0:

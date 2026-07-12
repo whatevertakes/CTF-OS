@@ -142,6 +142,26 @@ def test_plain_tui_includes_attempt_node_and_operator_details(tmp_path: Path) ->
     assert "OPERATOR ORPHAN_CLEANUP: removed stale container orphan-1" in rendered
 
 
+def test_plain_tui_distinguishes_zero_unknown_and_intake_failure(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    state = LocalState(config.state_path())
+    zero = state.upsert_challenge(Challenge(contest="Demo", category="web", name="zero", score=0))
+    unknown = state.upsert_challenge(Challenge(contest="Demo", category="web", name="unknown", score=None))
+    state.transition_challenge_status(zero.id, ChallengeStatus.INTAKE_BLOCKED, event=Event(
+        team_id=config.team_id, member=config.member_name, contest="Demo", type="INTAKE_BLOCKED",
+        challenge_id=zero.id, message="ZIP member exceeds compression-ratio limit: 'OVMF_VARS.fd'",
+    ))
+
+    rendered = render_tui(config, state)
+
+    zero_line = next(line for line in rendered.splitlines() if " zero " in line)
+    unknown_line = next(line for line in rendered.splitlines() if " unknown " in line)
+    assert "| 0 " in zero_line
+    assert "| - " in unknown_line
+    assert "INTAKE_BLOCKED" in zero_line
+    assert "OVMF_VARS.fd" in rendered
+
+
 def test_init_rejects_mismatched_config_contest_even_with_force(tmp_path: Path, capsys) -> None:
     config = _config(tmp_path)
 

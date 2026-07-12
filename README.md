@@ -170,8 +170,17 @@ queue에 넣습니다.
 ## 설치 후 전원이 실행할 명령
 
 위 팀원별 블록에서 만든 shell을 그대로 사용 중이라면 설정의
-`member.owned_categories` 저장을 마친 뒤 다음을 실행합니다. 새 터미널을 열었다면 자기
-이름에 맞는 `CONFIG`를 다시 선언해야 합니다.
+`member.owned_categories` 저장을 마친 뒤, 실제 Codex worker를 쓸 PC는 같은 설정에서
+아래 값도 반드시 활성화합니다. `init`은 오입력을 막기 위해 이 값을 `false`로 만들기
+때문에 바꾸지 않으면 `doctor --non-mock`와 실제 `run`이 모두 명확히 실패합니다.
+
+```yaml
+model_routing:
+  enabled: true
+  config_path: "config/model-routing.yaml"
+```
+
+새 터미널을 열었다면 자기 이름에 맞는 `CONFIG`를 다시 선언한 뒤 실행합니다.
 
 ```bash
 scripts/deploy_ctf_os.sh --config "$CONFIG"
@@ -254,6 +263,14 @@ uv run ctf-os tui --plain --config "$CONFIG"
 | `uv run ctf-os resume <문제> --config <CONFIG>` | 중지한 문제 재개 |
 | `uv run ctf-os retry <문제> --config <CONFIG>` | 실패한 문제 재시도 |
 | `uv run ctf-os sandbox cleanup --config <CONFIG>` | 현재 team/member/contest container만 정리 |
+
+대용량 firmware·memory dump·고압축 archive는 host에서 ZIP만 안전하게 펼치고,
+`.7z`, `.rar`, `.tar.*`는 그대로 sandbox 작업공간에 전달합니다. ZIP 기본 안전값은
+파일 1,000개, 단일 파일 64MiB, 전체 256MiB, 압축률 100배입니다. OVMF sparse image처럼
+검토한 대회 파일만 로컬 설정의 `intake.zip_limits`에서 필요한 항목을 명시적으로
+올립니다. attempt의 `/work`·`/artifacts` 총량은
+`sandbox.storage_limit_bytes`와 `sandbox.storage_inode_limit`로 조정합니다. 경로 탈출,
+symlink member, 승인되지 않은 네트워크 대상은 크기 한도와 무관하게 계속 차단됩니다.
 
 ## 대회가 바뀔 때
 

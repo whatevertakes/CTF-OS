@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 import stat
-from zipfile import ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
 import yaml
 
 from ctf_os.application import IntakeBlockedError, LocalApplication, PrerequisiteError, RunReport
 from ctf_os.config import AppConfig, default_config_mapping
+from ctf_os.local_state import LocalState
 from ctf_os.watcher import PathPollingWatcher
 
 
@@ -54,8 +55,11 @@ def test_plain_challenge_directory_rejects_symlinks(tmp_path: Path) -> None:
     source.mkdir(parents=True)
     (source / "escape").symlink_to(tmp_path / "outside")
 
-    with pytest.raises(PrerequisiteError, match="symlink blocked"):
-        LocalApplication(config).parse()
+    assert LocalApplication(config).parse() == ()
+    state = LocalState.for_config(config)
+    challenge = state.list_challenges()[0]
+    assert challenge.status.value == "INTAKE_BLOCKED"
+    assert "symlink blocked" in state.list_events()[-1].message
 
 
 def test_forensic_and_forensics_share_one_source_layout(tmp_path: Path) -> None:
@@ -205,15 +209,85 @@ def test_valid_remote_only_challenge_can_queue_without_attachment(tmp_path: Path
 
 
 @pytest.mark.parametrize("name", ["sample.7z", "sample.tar.gz", "web-sample.tgz"])
-def test_matching_unsupported_archive_is_explicitly_blocked(tmp_path: Path, name: str) -> None:
+def test_matching_non_zip_archive_is_handed_to_sandbox_workspace(tmp_path: Path, name: str) -> None:
     config = _config(tmp_path)
     _manifest(tmp_path, "web")
     attachment = tmp_path / "incoming" / "Demo" / "web" / name
     attachment.parent.mkdir(parents=True)
     attachment.write_bytes(b"not silently ignored")
 
-    with pytest.raises(PrerequisiteError, match=r"unsupported challenge attachment.*use a matching \.zip"):
-        LocalApplication(config).parse()
+    item = LocalApplication(config).parse()[0]
+
+    assert item.attachments == (attachment,)
+    assert (item.workspace / name).read_bytes() == b"not silently ignored"
+
+
+def test_competition_zip_policy_accepts_legitimate_high_compression(tmp_path: Path) -> None:
+    raw = default_config_mapping("Demo")
+    raw["member"]["owned_categories"] = ["web"]
+    raw["sandbox"]["enabled"] = False
+    raw["intake"]["zip_limits"]["max_compression_ratio"] = 100_000
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = AppConfig.from_file(path)
+    _manifest(tmp_path, "web")
+    archive = tmp_path / "incoming" / "Demo" / "web" / "sample.zip"
+    archive.parent.mkdir(parents=True)
+    with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
+        bundle.writestr("large-zero-filled-image.raw", b"\0" * (2 * 1024 * 1024))
+
+    item = LocalApplication(config).parse()[0]
+
+    assert (item.workspace / "large-zero-filled-image.raw").stat().st_size == 2 * 1024 * 1024
+
+
+def test_operator_can_lower_zip_policy_per_contest(tmp_path: Path) -> None:
+    raw = default_config_mapping("Demo")
+    raw["member"]["owned_categories"] = ["web"]
+    raw["sandbox"]["enabled"] = False
+    raw["intake"]["zip_limits"]["max_total_bytes"] = 16
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = AppConfig.from_file(path)
+    _manifest(tmp_path, "web")
+    archive = tmp_path / "incoming" / "Demo" / "web" / "sample.zip"
+    archive.parent.mkdir(parents=True)
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr("payload", b"A" * 17)
+
+    assert LocalApplication(config).parse() == ()
+    state = LocalState.for_config(config)
+    assert state.list_challenges()[0].status.value == "INTAKE_BLOCKED"
+    assert "total expanded-byte limit" in state.list_events()[-1].message
+
+
+def test_blocked_zip_is_isolated_and_normal_sibling_still_queues(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    manifest = tmp_path / "incoming" / "Demo" / "contest.md"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "# 대회명: Demo\n\n### web/panopticon\n- 설명: OVMF package\n\n"
+        "### web/healthy\n- 설명: independent source\n",
+        encoding="utf-8",
+    )
+    archive = manifest.parent / "web" / "panopticon.zip"
+    archive.parent.mkdir(parents=True)
+    with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
+        bundle.writestr("deploy/OVMF_VARS.fd", b"\0" * 540_672)
+    healthy = manifest.parent / "web" / "healthy"
+    healthy.mkdir()
+    (healthy / "app.py").write_text("print('ready')\n", encoding="utf-8")
+
+    ready = LocalApplication(config).parse()
+    state = LocalState.for_config(config)
+    challenges = {item.name: item for item in state.list_challenges()}
+
+    assert [item.challenge.name for item in ready] == ["healthy"]
+    assert challenges["panopticon"].status.value == "INTAKE_BLOCKED"
+    assert challenges["healthy"].status.value == "QUEUED"
+    blocked = [event for event in state.list_events() if event.type == "INTAKE_BLOCKED"]
+    assert blocked[-1].payload["code"] == "ZIP_COMPRESSION_RATIO_LIMIT"
+    assert blocked[-1].payload["member"] == "deploy/OVMF_VARS.fd"
 
 
 def test_uppercase_zip_and_unix_executable_bit_are_preserved(tmp_path: Path) -> None:
@@ -247,5 +321,7 @@ def test_encrypted_zip_is_normalized_to_intake_error(tmp_path: Path) -> None:
     data[central + 8:central + 10] = (1).to_bytes(2, "little")
     archive.write_bytes(data)
 
-    with pytest.raises(PrerequisiteError, match=r"encrypted ZIP members are unsupported"):
-        LocalApplication(config).parse()
+    assert LocalApplication(config).parse() == ()
+    state = LocalState.for_config(config)
+    assert state.list_challenges()[0].status.value == "INTAKE_BLOCKED"
+    assert "encrypted ZIP members are unsupported" in state.list_events()[-1].message

@@ -69,6 +69,17 @@ def run_doctor(
         return DoctorReport(tuple(checks))
     checks.append(DoctorCheck("config", True, True, str(config.path)))
     non_mock = require_non_mock or (config.model_routing_enabled and config.sandbox_enabled)
+    routing_ok = config.model_routing_enabled
+    routing_detail = "enabled"
+    if routing_ok:
+        try:
+            config.model_router()
+            routing_detail = f"enabled and valid: {config.model_routing_path}"
+        except (ConfigError, OSError) as exc:
+            routing_ok, routing_detail = False, str(exc)
+    else:
+        routing_detail = "disabled; set model_routing.enabled: true before a non-mock run"
+    checks.append(DoctorCheck("model routing", routing_ok, non_mock, routing_detail))
 
     for label, root in (("incoming", config.incoming_root), ("output", config.output_root)):
         try:
@@ -98,11 +109,14 @@ def run_doctor(
 
     current_manifest = config.incoming_contest_dir() / "contest.md"
     try:
-        ready = IntakeService(config).collect(materialize=False)
+        service = IntakeService(config)
+        ready = service.collect(materialize=False)
+        blocked = service.admission_errors
         checks.append(DoctorCheck(
-            "contest intake", bool(ready), True,
-            f"{current_manifest}: {len(ready)} owned challenge(s) ready"
-            if ready else f"{current_manifest}: no owned challenges are ready",
+            "contest intake", bool(ready) and not blocked, True,
+            f"{current_manifest}: {len(ready)} owned challenge(s) ready, {len(blocked)} blocked"
+            + (f"; {blocked[0].reason}" if blocked else "")
+            if ready or blocked else f"{current_manifest}: no owned challenges are ready",
         ))
     except (ContestParseError, IntakeError, OSError) as exc:
         checks.append(DoctorCheck("contest intake", False, True, f"{current_manifest}: {exc}"))

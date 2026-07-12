@@ -205,16 +205,31 @@ class LocalApplication:
 
     def parse(self) -> tuple[IntakeChallenge, ...]:
         """Discover exact-manifest owned challenges and queue only this node's work."""
+        service = IntakeService(self.config)
         try:
             intake = tuple(
                 replace(item, challenge=replace(
                     item.challenge,
                     challenge_key=f"{self.config.team_id}:{item.challenge.challenge_key}",
                 ))
-                for item in IntakeService(self.config).collect()
+                for item in service.collect()
             )
         except (ContestParseError, IntakeError, PermissionError, OSError) as exc:
             raise IntakeBlockedError(f"queue blocked: contest.md intake failed: {exc}") from exc
+        for blocked in service.admission_errors:
+            state = LocalState.for_config(self.config, contest_name=blocked.manifest.name)
+            challenge = state.upsert_challenge(replace(
+                blocked.challenge,
+                challenge_key=f"{self.config.team_id}:{blocked.challenge.challenge_key}",
+            ))
+            event = self._event(
+                challenge, "INTAKE_BLOCKED", message=blocked.reason,
+                payload=blocked.payload,
+            )
+            if challenge.status in {ChallengeStatus.DISCOVERED, ChallengeStatus.QUEUED}:
+                state.transition_challenge_status(challenge.id, ChallengeStatus.INTAKE_BLOCKED, event=event)
+            elif challenge.status is ChallengeStatus.INTAKE_BLOCKED:
+                state.append_event(event)
         for item in intake:
             state = LocalState.for_config(
                 self.config, contest_name=item.manifest.name
@@ -223,7 +238,7 @@ class LocalApplication:
             challenge = state.upsert_challenge(item.challenge)
             if existing is None:
                 self._emit(state, challenge, "CHALLENGE_SEEN", message="local manifest discovery")
-            if challenge.status is ChallengeStatus.DISCOVERED:
+            if challenge.status in {ChallengeStatus.DISCOVERED, ChallengeStatus.INTAKE_BLOCKED}:
                 queued_event = self._event(challenge, "QUEUED", message="owned category queued locally")
                 challenge = state.transition_challenge_status(challenge.id, ChallengeStatus.QUEUED, event=queued_event)
                 self._flush_outbox(state)
@@ -405,7 +420,12 @@ class LocalApplication:
 
             self._flush_outbox(coordinator_state)
             return RunReport(len(intake), started, len(solved), mock_worker)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, (PrerequisiteError, IntakeBlockedError)):
+                self._emit_operator(
+                    coordinator_state, "STARTUP_FAILED", str(exc),
+                    payload={"error_type": type(exc).__name__, "reason": str(exc)},
+                )
             # Cancellation remains local to the handles this run created.  The
             # backend owns its child process group and reaps it in finally.
             for challenge_id in {handle.attempt.challenge_id for handle, _ in active.values()}:
@@ -971,6 +991,7 @@ class LocalApplication:
             max_containers=self.config.sandbox_max_containers,
         )
         memory, cpus = self.config.sandbox_limits
+        storage_bytes, storage_inodes = self.config.sandbox_storage_limits
         staging = ArtifactWriter.staging_for_workdir(attempt.workdir)
         strategy_id = (task.race_attempt.contract.execution.tool_strategy
                        if task.race_attempt.contract is not None else "fast_recon")
@@ -987,6 +1008,7 @@ class LocalApplication:
             scope=scope, attempt_id=attempt.id, workspace=task.intake.workspace,
             workdir=staging.workdir, artifacts=staging.artifacts,
             image=image, memory=memory, cpus=cpus, pids_limit=strategy.budget.processes,
+            storage_limit_bytes=storage_bytes, storage_inode_limit=storage_inodes,
             endpoints=endpoints,
         ))
         self._sandbox_by_attempt[attempt.id] = sandbox_pool

@@ -251,3 +251,20 @@ def test_doctor_is_mock_safe_when_sandbox_is_disabled(tmp_path: Path) -> None:
     report = run_doctor(config.path, which=lambda _: None)
     assert report.exit_code == 0
     assert any(check.name == "docker sandbox" and check.ok for check in report.checks)
+
+
+def test_non_mock_doctor_rejects_disabled_model_routing(tmp_path: Path) -> None:
+    config = _write_config(tmp_path, sandbox_enabled=True)
+    manifest = config.incoming_contest_dir() / "contest.md"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("# 대회명: Demo\n\n### web/login\n- 설명: ready\n", encoding="utf-8")
+    source = manifest.parent / "web" / "login"
+    source.mkdir(parents=True)
+    (source / "challenge.txt").write_text("ready\n", encoding="utf-8")
+
+    report = run_doctor(config.path, require_non_mock=True, which=lambda _: "/usr/bin/tool")
+
+    routing = next(check for check in report.checks if check.name == "model routing")
+    assert routing.required and not routing.ok
+    assert "model_routing.enabled: true" in routing.detail
+    assert report.exit_code == 1

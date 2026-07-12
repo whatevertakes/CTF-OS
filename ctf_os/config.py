@@ -62,6 +62,8 @@ def default_config_mapping(
             "incoming": "incoming",
             "output": f"output/{resolved_team_id}/{resolved_member_name}",
         },
+        "intake": {"zip_limits": {"max_files": 1_000, "max_file_bytes": 64 * 1024**2,
+                                   "max_total_bytes": 256 * 1024**2, "max_compression_ratio": 100}},
         "solvers": {"codex": {"enabled": True, "backend": "codex_cli", "command": "codex", "max_workers": 2}},
         "scheduler": {"max_concurrent_challenges": 2, "max_active_containers": 2,
                       "policy": "local_safe", "fairness": "challenge_round_robin"},
@@ -77,6 +79,7 @@ def default_config_mapping(
         "sandbox": {"enabled": True, "image": "ctf-os-sandbox:latest", "container_per_attempt": True,
                     "precreate_on_queue": False, "max_containers": 2,
                     "command_timeout_sec": 30,
+                    "storage_limit_bytes": 8 * 1024**3, "storage_inode_limit": 262_144,
                     "default_limits": {"memory": "16g", "cpus": 2.0}},
         "flag_verification": {"auto_confirm_flags": False, "require_verifier_before_solved": True,
                               "ignore_placeholders": True},
@@ -163,6 +166,19 @@ class AppConfig:
     @property
     def output_root(self) -> Path:
         return self.resolve_path(self.get_mapping("paths").get("output", "output"), field="paths.output")
+
+    @property
+    def zip_extraction_limits(self) -> dict[str, int]:
+        intake = self.get_mapping("intake")
+        raw = intake.get("zip_limits", {})
+        if not isinstance(raw, Mapping):
+            raise ConfigError("intake.zip_limits must be a mapping")
+        defaults = {"max_files": 1_000, "max_file_bytes": 64 * 1024**2,
+                    "max_total_bytes": 256 * 1024**2, "max_compression_ratio": 100}
+        values = {name: int(raw.get(name, default)) for name, default in defaults.items()}
+        for name, value in values.items():
+            _positive_int(value, f"intake.zip_limits.{name}")
+        return values
 
     def incoming_contest_dir(self, contest: str | None = None) -> Path:
         return self.incoming_root / _safe_component(contest or self.contest_name, "contest.name")
@@ -281,6 +297,13 @@ class AppConfig:
         return float(self.sandbox.get("command_timeout_sec", 30))
 
     @property
+    def sandbox_storage_limits(self) -> tuple[int, int]:
+        return (
+            _positive_int(self.sandbox.get("storage_limit_bytes", 8 * 1024**3), "sandbox.storage_limit_bytes"),
+            _positive_int(self.sandbox.get("storage_inode_limit", 262_144), "sandbox.storage_inode_limit"),
+        )
+
+    @property
     def sandbox_egress_policy(self) -> str:
         return str(self.sandbox.get("egress_policy", "manifest_exact_endpoints"))
 
@@ -393,6 +416,7 @@ class AppConfig:
         for key in ("incoming", "output"):
             if key in paths:
                 self.resolve_path(paths[key], field=f"paths.{key}")
+        _ = self.zip_extraction_limits
         output = self.output_root
         expected_suffix = (self.team_id, self.member_name)
         if len(output.parts) < 2 or output.parts[-2:] != expected_suffix:
@@ -437,6 +461,7 @@ class AppConfig:
                 _required_text(sandbox.get("image", "ctf-os-sandbox:latest"), "sandbox.image")
                 _positive_int(self.sandbox_max_containers, "sandbox.max_containers")
                 memory, cpus = self.sandbox_limits
+                _ = self.sandbox_storage_limits
                 _required_text(memory, "sandbox.default_limits.memory")
                 try:
                     if not math.isfinite(float(cpus)) or float(cpus) <= 0:

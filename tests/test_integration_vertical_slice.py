@@ -189,6 +189,43 @@ def test_mock_once_end_to_end_writes_synthetic_candidate_solved_event_and_artifa
     assert [event.type for event in state.list_events()]
     assert "SYNTHETIC SOLVED:" in render_tui(synthetic_config, state)
 
+
+def test_unscored_pwn_challenge_reaches_worker_execution(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    raw = yaml.safe_load(config.path.read_text(encoding="utf-8"))
+    raw["member"]["owned_categories"] = ["pwn"]
+    config.path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = AppConfig.from_file(config.path)
+    manifest = tmp_path / "incoming" / "Demo" / "contest.md"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        "# 대회명: Demo\n\n### pwn/unscored\n- 설명: authorized unscored binary\n",
+        encoding="utf-8",
+    )
+    source = manifest.parent / "pwn" / "unscored"
+    source.mkdir(parents=True)
+    (source / "chall").write_bytes(b"ELF fixture")
+
+    report = LocalApplication(config).run_once(mock_worker=True, auto_confirm_flags=True)
+
+    assert report.started_attempts >= 1
+    assert report.solved_challenges == 1
+
+
+def test_non_mock_startup_failure_is_persisted_for_readonly_tui(tmp_path: Path) -> None:
+    config = _config(tmp_path, routing=False, sandbox=True)
+    _manifest(tmp_path)
+
+    with pytest.raises(PrerequisiteError, match="model routing is disabled"):
+        LocalApplication(config).run_once(mock_worker=False)
+
+    state = LocalState.for_config(config)
+    failure = [event for event in state.list_events() if event.type == "STARTUP_FAILED"][-1]
+    assert failure.payload["error_type"] == "PrerequisiteError"
+    rendered = render_tui(config, state)
+    assert "OPERATOR STARTUP_FAILED" in rendered
+    assert "model routing is disabled" in rendered
+
     LocalApplication(config).parse()
     production_state = LocalState(config.state_path())
     production_challenge = production_state.list_challenges()[0]

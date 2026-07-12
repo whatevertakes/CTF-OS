@@ -26,6 +26,7 @@ from .models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Event, F
 _ACTIVE_ATTEMPT_STATUSES = frozenset({AttemptStatus.QUEUED, AttemptStatus.RUNNING})
 _OPERATOR_EVENT_TYPES = frozenset({
     "STALE_RECOVERY", "ORPHAN_CLEANUP", "SANDBOX_CLEANUP", "SANDBOX_CLEANUP_FAILED",
+    "STARTUP_FAILED", "INTAKE_BLOCKED",
 })
 _FLAG_EVENT_TYPES = frozenset({
     "FLAG_OBSERVED", "FLAG_CANDIDATE", "VERIFYING", "VERIFIER_UNAVAILABLE",
@@ -284,12 +285,12 @@ def render_tui(
         model = _model_text(latest_attempt)
         reason = _latest_message(
             events_by_challenge.get(challenge.id, ()),
-            {"PAUSED", "STUCK", "HINTING", "SUPERVISOR_UNAVAILABLE", "SUPERVISOR_HINT"},
+            {"PAUSED", "STUCK", "HINTING", "SUPERVISOR_UNAVAILABLE", "SUPERVISOR_HINT", "INTAKE_BLOCKED", "STARTUP_FAILED"},
         )
         rows.append((
             challenge.name,
             challenge.category,
-            str(challenge.score or "-"),
+            str(challenge.score if challenge.score is not None else "-"),
             challenge.assignee or "-",
             status,
             str(active),
