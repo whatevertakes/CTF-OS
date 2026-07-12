@@ -288,6 +288,18 @@ def test_application_uses_persistent_rag_only_refreshing_changed_sources(tmp_pat
 def test_readme_includes_kisia_four_member_local_ownership_example() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     assert "KISIA four-member example" in readme
-    for member in ("jiwoong", "jueon", "hyunseok", "howon"):
+    owners = {
+        "jiwoong": ("jiwoongchoi-norun", "[pwn, web]"),
+        "jueon": ("lee", "[rev, crypto]"),
+        "hyunseok": ("shyunseok1029", "[forensics, misc]"),
+        "howon": ("holymo-ly", "[cloud, web]"),
+    }
+    for member, (branch, categories) in owners.items():
         assert member in readme
+        assert branch in readme
+        assert f'--member {member}' in readme
+        assert f'local.${{TEAM_ID}}.{member}.yaml' in readme
+        assert categories in readme
     assert "sca-jiwoong-team" in readme
+    assert "대회 실행 브랜치는 전원 `main`" in readme
+    assert "자기 브랜치 → `main` PR" in readme
