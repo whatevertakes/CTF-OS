@@ -44,7 +44,7 @@ class StateError(ValueError):
     """Raised when a local-state database cannot be opened safely."""
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -246,6 +246,8 @@ class LocalState:
             self._migrate_v7_to_v8(conn)
         elif version == 8:
             self._migrate_v8_to_v9(conn)
+        elif version == 9:
+            self._migrate_v9_to_v10(conn)
         else:  # Defensive guard for future edits to CURRENT_SCHEMA_VERSION.
             raise StateError(f"no migration is registered from schema version {version}")
 
@@ -489,6 +491,41 @@ class LocalState:
             "CREATE INDEX IF NOT EXISTS idx_contract_tasks_priority "
             "ON contract_tasks(session_id, status, priority DESC, created_at)"
         )
+
+    @staticmethod
+    def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+        """Persist tactical profiles, artifact provenance and rule idempotency."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS problem_profiles (
+              challenge_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL,
+              category TEXT NOT NULL, subtype TEXT NOT NULL, profile_json TEXT NOT NULL,
+              confidence REAL NOT NULL, updated_at TEXT NOT NULL,
+              FOREIGN KEY(challenge_id) REFERENCES challenges(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tactical_artifacts (
+              id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL, attempt_id TEXT,
+              contract_id TEXT, artifact_type TEXT NOT NULL, path TEXT NOT NULL,
+              sha256 TEXT NOT NULL, parent_artifact_id TEXT, strategy_id TEXT NOT NULL,
+              strategy_version INTEGER NOT NULL, creation_event_id TEXT,
+              metadata_json TEXT NOT NULL, trust_state TEXT NOT NULL,
+              consumers_json TEXT NOT NULL, created_at TEXT NOT NULL,
+              FOREIGN KEY(challenge_id) REFERENCES challenges(id),
+              FOREIGN KEY(attempt_id) REFERENCES attempts(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS replan_rule_fires (
+              rule_id TEXT NOT NULL, event_id TEXT NOT NULL, challenge_id TEXT NOT NULL,
+              fire_count INTEGER NOT NULL, fired_at TEXT NOT NULL,
+              before_json TEXT NOT NULL, after_json TEXT NOT NULL,
+              PRIMARY KEY(rule_id, event_id),
+              FOREIGN KEY(challenge_id) REFERENCES challenges(id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tactical_artifacts_handoff ON tactical_artifacts(challenge_id, artifact_type, trust_state)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rule_fires_challenge ON replan_rule_fires(challenge_id, fired_at)")
 
     def _bind_team_identity(self, conn: sqlite3.Connection) -> None:
         """Bind node identity and normalize legacy keys without guessing ownership."""
@@ -924,10 +961,11 @@ class LocalState:
             raise KeyError(f"unknown contract task: {task_id}")
         desired = status if isinstance(status, ContractTaskStatus) else ContractTaskStatus(str(status).upper())
         allowed = {
-            ContractTaskStatus.PENDING: {ContractTaskStatus.RUNNING, ContractTaskStatus.SUCCEEDED, ContractTaskStatus.CANCELLED, ContractTaskStatus.FAILED},
-            ContractTaskStatus.RUNNING: {ContractTaskStatus.SUCCEEDED, ContractTaskStatus.FAILED, ContractTaskStatus.CANCELLED},
+            ContractTaskStatus.PENDING: {ContractTaskStatus.RUNNING, ContractTaskStatus.SUCCEEDED, ContractTaskStatus.CANCELLED, ContractTaskStatus.FAILED, ContractTaskStatus.PAUSED},
+            ContractTaskStatus.RUNNING: {ContractTaskStatus.SUCCEEDED, ContractTaskStatus.FAILED, ContractTaskStatus.CANCELLED, ContractTaskStatus.PAUSED},
             ContractTaskStatus.SUCCEEDED: set(), ContractTaskStatus.FAILED: set(),
             ContractTaskStatus.CANCELLED: set(),
+            ContractTaskStatus.PAUSED: {ContractTaskStatus.PENDING, ContractTaskStatus.RUNNING, ContractTaskStatus.CANCELLED},
         }
         if desired is not current.status and desired not in allowed[current.status]:
             raise StateTransitionError(f"invalid contract task transition: {current.status} -> {desired}")
@@ -1316,6 +1354,128 @@ class LocalState:
 
     record_event = append_event
 
+    def upsert_problem_profile(self, challenge_id: str, profile: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist one versioned profile atomically for incremental classification."""
+        version = profile.get("schema_version", 1)
+        if version != 1:
+            raise StateError(f"unsupported problem profile schema version {version}")
+        category, subtype = str(profile.get("category", "")), str(profile.get("subtype", ""))
+        confidence = profile.get("confidence", 0.0)
+        if not category or not subtype or isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise ValueError("profile requires category, subtype and confidence in [0,1]")
+        payload = json.dumps(dict(profile), ensure_ascii=False, sort_keys=True)
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO problem_profiles(challenge_id,schema_version,category,subtype,profile_json,confidence,updated_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(challenge_id) DO UPDATE SET schema_version=excluded.schema_version,"
+                "category=excluded.category,subtype=excluded.subtype,profile_json=excluded.profile_json,"
+                "confidence=excluded.confidence,updated_at=excluded.updated_at",
+                (challenge_id, version, category, subtype, payload, float(confidence), self._now()),
+            )
+        return dict(profile)
+
+    def get_problem_profile(self, challenge_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT profile_json FROM problem_profiles WHERE challenge_id=?", (challenge_id,)).fetchone()
+        return json.loads(row["profile_json"]) if row else None
+
+    def record_rule_fire(
+        self, *, rule_id: str, event_id: str, challenge_id: str,
+        before: Mapping[str, Any], after: Mapping[str, Any],
+    ) -> bool:
+        """Return False for an idempotent duplicate rule/event pair."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO replan_rule_fires(rule_id,event_id,challenge_id,fire_count,fired_at,before_json,after_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (rule_id, event_id, challenge_id, 1, self._now(),
+                 json.dumps(dict(before), sort_keys=True), json.dumps(dict(after), sort_keys=True)),
+            )
+            return cursor.rowcount == 1
+
+    def record_tactical_artifact(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        required = {"id", "challenge_id", "artifact_type", "path", "sha256", "strategy_id", "strategy_version"}
+        missing = required - set(manifest)
+        if missing:
+            raise ValueError(f"artifact manifest missing: {', '.join(sorted(missing))}")
+        values = dict(manifest)
+        with self._write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO tactical_artifacts(id,challenge_id,attempt_id,contract_id,artifact_type,path,sha256,"
+                "parent_artifact_id,strategy_id,strategy_version,creation_event_id,metadata_json,trust_state,consumers_json,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (values["id"], values["challenge_id"], values.get("attempt_id"), values.get("contract_id"),
+                 values["artifact_type"], values["path"], values["sha256"], values.get("parent_artifact_id"),
+                 values["strategy_id"], values["strategy_version"], values.get("creation_event_id"),
+                 json.dumps(values.get("content_metadata", {}), sort_keys=True), values.get("trust_state", "unverified"),
+                 json.dumps(values.get("consumers", []), sort_keys=True), self._now()),
+            )
+        return values
+
+    def promote_tactical_artifacts(
+        self, challenge_id: str, artifact_type: str, *, consumer: str | None = None,
+    ) -> tuple[str, ...]:
+        """Promote and optionally hand off matching artifacts without losing provenance."""
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT id, consumers_json FROM tactical_artifacts WHERE challenge_id=? AND artifact_type=?",
+                (challenge_id, artifact_type),
+            ).fetchall()
+            for row in rows:
+                consumers = json.loads(row["consumers_json"] or "[]")
+                if consumer and consumer not in consumers:
+                    consumers.append(consumer)
+                conn.execute(
+                    "UPDATE tactical_artifacts SET trust_state='promoted', consumers_json=? WHERE id=?",
+                    (json.dumps(consumers, sort_keys=True), row["id"]),
+                )
+        return tuple(str(row["id"]) for row in rows)
+
+    def handoff_tactical_artifacts(
+        self, *, challenge_id: str, producer_contract_id: str, filenames: Iterable[str],
+        consumer_contract_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        """Record concrete producer-to-consumer edges for snapshotted files."""
+        names = {Path(str(item)).name for item in filenames}
+        consumers = tuple(dict.fromkeys(str(item) for item in consumer_contract_ids if item))
+        if not names or not consumers:
+            return ()
+        updated: list[str] = []
+        with self._write() as conn:
+            rows = conn.execute(
+                "SELECT id, path, consumers_json FROM tactical_artifacts "
+                "WHERE challenge_id=? AND contract_id=?",
+                (challenge_id, producer_contract_id),
+            ).fetchall()
+            for row in rows:
+                if Path(str(row["path"])).name not in names:
+                    continue
+                current = list(json.loads(row["consumers_json"] or "[]"))
+                for consumer in consumers:
+                    if consumer not in current:
+                        current.append(consumer)
+                conn.execute(
+                    "UPDATE tactical_artifacts SET trust_state='promoted', consumers_json=? WHERE id=?",
+                    (json.dumps(current, sort_keys=True), row["id"]),
+                )
+                updated.append(str(row["id"]))
+        return tuple(updated)
+
+    def list_tactical_artifacts(self, challenge_id: str) -> list[dict[str, Any]]:
+        """Return persisted artifact manifests with decoded provenance edges."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tactical_artifacts WHERE challenge_id=? ORDER BY created_at, id",
+                (challenge_id,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["content_metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            item["consumers"] = json.loads(item.pop("consumers_json") or "[]")
+            result.append(item)
+        return result
+
     def append_fenced_event(
         self, event: Event, *, attempt_id: str, owner: str | None, fencing_token: int | None,
         now: datetime | str | None = None,
@@ -1500,6 +1660,11 @@ class LocalState:
                 "UPDATE flag_candidates SET verified=1, verification_status='VERIFIED', verification_reason='verification succeeded' WHERE id=?",
                 (candidate_id,),
             )
+            if self._table_exists(conn, "challenge_sessions"):
+                conn.execute(
+                    "UPDATE challenge_sessions SET status=?, updated_at=? WHERE challenge_id=?",
+                    (SessionStatus.COMPLETED.value, self._now(now), candidate["challenge_id"]),
+                )
             self._record_event_conn(conn, event)
         self._notify_committed_events((event,))
         return self.get_challenge(str(candidate["challenge_id"]))  # type: ignore[return-value]

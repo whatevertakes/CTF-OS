@@ -21,6 +21,7 @@ sync/*
 *.sqlite
 *.sqlite3
 *.log
+benchmarks/results/
 /config.yaml
 /local.*.yaml
 

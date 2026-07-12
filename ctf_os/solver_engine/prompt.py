@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .context import ChallengeContext
 from .category_planner import CategoryPlanner
 from .race_plan import RaceAttempt
+from ..tactical_engine.strategies import default_strategy_registry
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,8 @@ _SAFETY = """Safety invariants:
 - Original challenge files are mounted read-only at /workspace.
 - /work and /artifacts are both private to this one attempt; they are never shared challenge output.
 - Do not access or name sibling attempt workspaces, files, helpers, or tokens. Injected known findings are coordinator hints only: validate them independently before use.
-- Run challenge commands through ctf-exec (for example: ctf-exec file /workspace/chall).
+- Run challenge commands from the attempt directory through `./ctf-exec` (for example: `./ctf-exec file /workspace/chall`).
+- `ctf-exec` is intentionally not installed on PATH. Do not fall back to host commands; always invoke the exact `./ctf-exec` helper.
 - Do not invent flags or print placeholder flags."""
 
 _TAGS = "[PLAN] [HYPOTHESIS] [ACTION] [OBSERVATION] [FINDING] [FAIL] [SHIFT] [FLAG_CANDIDATE] [ARTIFACT] [TASK_DONE]"
@@ -74,6 +76,8 @@ Prompt family: {execution.prompt_family}
 Timeout: {execution.timeout_sec} seconds
 Tool strategy: {execution.tool_strategy}
 Scheduler priority: {execution.priority}
+
+{_strategy_policy(execution.tool_strategy)}
 
 Start executing. Every action must either test this branch or construct its solver.
 If the stop condition is reached, emit the decisive negative result and exact handoff;
@@ -133,3 +137,21 @@ Emit only concise machine-readable milestones using these tags: {_TAGS}
 Do not emit private chain-of-thought. Record commands and decisive observations, not narration. Record a SHIFT when a branch stalls. A flag is only a candidate until independently verified.
 
 Verification contract: if you emit [ARTIFACT] for a real replay/verify file, it must accept argv options --candidate, --challenge-id, --attempt-id, and --nonce. It may succeed only after reproducing the exact candidate, then print exactly one line in this form: [VERIFICATION_PROOF] {{"candidate":"...","challenge_id":"...","attempt_id":"...","nonce":"..."}}. Exit status 0 without that fresh proof is not verification."""
+
+
+def _strategy_policy(strategy_id: str) -> str:
+    spec = default_strategy_registry().get(strategy_id)
+    commands = "\n".join(f"- {item}" for item in spec.command_templates) or "- (none)"
+    outputs = "\n".join(f"- {item.type}: {item.glob}" for item in spec.output_artifacts) or "- (none)"
+    return f"""Executable tactical policy {spec.id}@{spec.version}:
+- capability profile: {spec.profile}
+- harness: {spec.harness.id} (/work/scripts/launch.sh)
+- tools after capability preflight: {', '.join(spec.exposed_tools)}
+- budget: timeout={spec.budget.timeout_sec}s cpu={spec.budget.cpus} memory={spec.budget.memory} processes={spec.budget.processes}
+- missing-capability fallback: {spec.fallback_strategy or '(explicit escalation)'}
+Command templates:
+{commands}
+Expected artifacts:
+{outputs}
+Read /work/strategy-manifest.json before acting. If required capabilities are
+missing, do not repeat a missing command; follow the recorded fallback."""

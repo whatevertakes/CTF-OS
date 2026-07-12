@@ -7,6 +7,7 @@ import json
 from typing import Any, Iterable
 
 from .context import ChallengeContext
+from ..tactical_engine.rules import ReplanRule, RuleParser, RuleValidationError
 
 
 _WORKERS = frozenset({"terra_high", "terra_xhigh", "luna_medium", "luna_high", "sol_high", "sol_xhigh"})
@@ -33,6 +34,8 @@ _SESSION_ROLES = frozenset({"recon", "exploit", "reverse", "fuzz_symbolic", "ver
 _TOOL_STRATEGIES = frozenset({
     "fast_recon", "exploit_build", "deep_analysis", "symbolic_math",
     "dynamic_analysis", "protocol_replay", "artifact_recovery", "independent_validation",
+    "browser_automation", "cloud_analysis", "mobile_analysis", "windows_analysis",
+    "password_cracking", "osint_collection",
 })
 
 
@@ -102,9 +105,16 @@ class SolvePlan:
     representation: str
     mode: str
     contracts: tuple[ExecutionContract, ...]
-    replan_when: str
-    escalate_when: str
+    replan_when: tuple[ReplanRule, ...] | str
+    escalate_when: tuple[ReplanRule, ...] | str
     approved_candidate: str | None = None
+
+    def __post_init__(self) -> None:
+        parser = RuleParser()
+        for name in ("replan_when", "escalate_when"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, (parser.parse(value),))
 
 
 class SolvePlanParser:
@@ -162,16 +172,28 @@ class SolvePlanParser:
             raise PlanParseError("direct mode requires exactly one contract")
         if mode == "parallel" and len(contracts) < 2:
             raise PlanParseError("parallel mode requires at least two contracts")
+        try:
+            replan_rules = self._parse_rules(raw["replan_when"])
+            escalation_rules = self._parse_rules(raw["escalate_when"])
+        except RuleValidationError as exc:
+            raise PlanParseError(str(exc)) from exc
         return SolvePlan(
             solve_target=_required_string(raw, "solve_target", "plan"),
             representation=representation,
             mode=mode,
             contracts=tuple(contracts),
-            replan_when=_required_string(raw, "replan_when", "plan"),
-            escalate_when=_required_string(raw, "escalate_when", "plan"),
+            replan_when=replan_rules,
+            escalate_when=escalation_rules,
             approved_candidate=(str(raw["approved_candidate"]).strip()
                                 if raw.get("approved_candidate") is not None else None),
         )
+
+    @staticmethod
+    def _parse_rules(raw: Any) -> tuple[ReplanRule, ...]:
+        values = raw if isinstance(raw, list) else [raw]
+        if not values:
+            raise RuleValidationError("rule list must not be empty")
+        return RuleParser().parse_many(values)
 
     @staticmethod
     def _parse_execution(raw: Any, where: str) -> BranchExecutionSpec:
@@ -289,7 +311,9 @@ luna_medium/medium, luna_high/high. Choose
 prompt_family from recon, implementation, deep_solve, takeover, verification.
 Choose tool_strategy from fast_recon, exploit_build, deep_analysis,
 symbolic_math, dynamic_analysis, protocol_replay, artifact_recovery,
-independent_validation. timeout_sec is 60..3600. priority is 1..100 and higher
+independent_validation, browser_automation, cloud_analysis, mobile_analysis,
+windows_analysis, password_cracking, or osint_collection. timeout_sec is
+60..3600. priority is 1..100 and higher
 priority branches are scheduled first.
 
 For a clear easy route prefer one short direct session. For difficult or
@@ -300,4 +324,4 @@ branch questions.
 If and only if the rolling summary contains a replay-verified candidate and
 you approve its evidence, set approved_candidate to that exact value.
 Return exactly one JSON object with these exact keys and no others:
-{{"solve_target":"...","representation":"state|protocol|validation|algebra|file-flow","mode":"direct|parallel|escalate","contracts":[{{"id":"A","session_role":"exploit|recon|reverse|fuzz_symbolic|verification|takeover","exclusive_scope":"...","objective":"...","first_decisive_action":"...","success_condition":"...","stop_condition":"...","handoff":"...","execution":{{"backend":"codex","model_profile":"terra_high","reasoning_effort":"high","prompt_family":"implementation","timeout_sec":1200,"tool_strategy":"exploit_build","priority":80}}}}],"replan_when":"new decisive result|two contracts terminate|contradiction","escalate_when":"two distinct branches fail or conceptual ambiguity remains","approved_candidate":null}}"""
+{{"solve_target":"...","representation":"state|protocol|validation|algebra|file-flow","mode":"direct|parallel|escalate","contracts":[{{"id":"A","session_role":"exploit|recon|reverse|fuzz_symbolic|verification|takeover","exclusive_scope":"...","objective":"...","first_decisive_action":"...","success_condition":"...","stop_condition":"...","handoff":"...","execution":{{"backend":"codex","model_profile":"terra_high","reasoning_effort":"high","prompt_family":"implementation","timeout_sec":1200,"tool_strategy":"exploit_build","priority":80}}}}],"replan_when":[{{"schema_version":1,"id":"finding-replan","priority":80,"when":{{"event":"finding.created"}},"actions":[{{"type":"spawn_plan","planner":"profile.current"}}],"cooldown_seconds":30,"max_fires":1}}],"escalate_when":[{{"schema_version":1,"id":"plateau-escalation","priority":70,"when":{{"field":"no_progress_duration","op":"gte","value":600}},"actions":[{{"type":"escalate","reason":"semantic plateau"}}],"cooldown_seconds":600,"max_fires":1}}],"approved_candidate":null}}"""

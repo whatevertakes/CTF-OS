@@ -41,7 +41,7 @@ def test_tui_candidate_and_verified_flag_are_distinct(tmp_path) -> None:
 
     candidate = challenge_view(state, item.id)
     assert candidate is not None
-    assert candidate.flag_text() == "? FLAG{candidate}"
+    assert candidate.flag_text() == "UNVERIFIED: FLAG{candidate}"
     assert candidate.status != ChallengeStatus.SOLVED.value
 
     claim = state.claim_attempt(
@@ -61,7 +61,7 @@ def test_tui_candidate_and_verified_flag_are_distinct(tmp_path) -> None:
     )
     verified = challenge_view(state, item.id)
     assert verified is not None
-    assert verified.flag_text() == "FLAG{candidate}"
+    assert verified.flag_text() == "VERIFIED: FLAG{candidate}"
     assert verified.status == "SOLVED"
 
 
@@ -102,8 +102,22 @@ def test_local_sqlite_event_projects_to_matching_challenge_key(tmp_path) -> None
 
     owned = challenge_view(state, target.id, event_state=projected)
     untouched = challenge_view(state, other.id, event_state=projected)
-    assert owned is not None and owned.flag_text() == "FLAG{local-owned}"
+    assert owned is not None and owned.flag_text() == "VERIFIED: FLAG{local-owned}"
     assert untouched is not None and untouched.flag_text() == "-"
+
+
+def test_raw_observation_projects_as_unverified_team_candidate(tmp_path) -> None:
+    state = LocalState(tmp_path / "state.db")
+    target = _challenge(state, "misc", "remote-observation")
+    projected = LocalEventState.from_events([Event(
+        team_id="demo-team", member="teammate", contest="Demo", type="FLAG_OBSERVED",
+        category="misc", challenge="remote-observation", challenge_id=target.id,
+        challenge_key=target.challenge_key, payload={"flag": "FLAG{remote-raw}"},
+    )])
+
+    view = challenge_view(state, target.id, event_state=projected)
+    assert view is not None
+    assert view.flag_text() == "UNVERIFIED: FLAG{remote-raw}"
 
 
 def test_textual_row_updates_by_challenge_id_not_visual_index_and_copy_is_full(tmp_path) -> None:
@@ -134,9 +148,9 @@ def test_textual_row_updates_by_challenge_id_not_visual_index_and_copy_is_full(t
             app.notify_challenge_changed(first.id, event)
             await pilot.pause()
 
-            assert str(table.get_cell(first.id, "flag")).startswith("? FLAG{")
+            assert str(table.get_cell(first.id, "flag")).startswith("UNVERIFIED: FLAG{")
             assert table.get_cell(second.id, "flag") == "-"
-            assert str(table.get_cell(first.id, "flag")).endswith("…")
+            assert table.get_cell(first.id, "flag") == f"UNVERIFIED: {long_flag}"
 
             row_index = table.get_row_index(first.id)
             table.move_cursor(row=row_index)
@@ -168,7 +182,7 @@ def test_background_safe_notification_updates_matching_row(tmp_path) -> None:
             notifier.join(timeout=2)
             assert not notifier.is_alive()
             table = app.query_one("#challenges", DataTable)
-            assert table.get_cell(item.id, "flag") == "? FLAG{thread-safe}"
+            assert table.get_cell(item.id, "flag") == "UNVERIFIED: FLAG{thread-safe}"
 
     asyncio.run(exercise())
 
@@ -205,7 +219,7 @@ def test_committed_flag_event_immediately_updates_only_matching_row_and_unsubscr
 
             table = app.query_one("#challenges", DataTable)
             assert refreshed == [target.id]
-            assert table.get_cell(target.id, "flag") == "? FLAG{instant}"
+            assert table.get_cell(target.id, "flag") == "UNVERIFIED: FLAG{instant}"
             assert table.get_cell(other.id, "flag") == "-"
 
         refreshed.clear()
@@ -215,5 +229,45 @@ def test_committed_flag_event_immediately_updates_only_matching_row_and_unsubscr
             challenge_key=target.challenge_key, payload={"flag": "FLAG{instant}"},
         ))
         assert refreshed == []
+
+    asyncio.run(exercise())
+
+
+def test_raw_observation_immediately_reaches_tui_without_waiting_for_poll(tmp_path) -> None:
+    async def exercise() -> None:
+        state = LocalState(tmp_path / "state.db")
+        target = _challenge(state, "web", "raw-stream")
+        _attempt(state, target, "raw-attempt")
+        config = _config(tmp_path)
+        config.raw["watcher"]["poll_interval_sec"] = 3600
+        app = CTFOSDashboard(config, state)
+
+        async with app.run_test():
+            candidate = FlagCandidate(
+                challenge_id=target.id, challenge_key=target.challenge_key,
+                attempt_id="raw-attempt", value="FLAG{seen-before-verification}",
+                verification_status="RAW_CANDIDATE",
+            )
+            claim = state.claim_attempt(
+                state.get_attempt("raw-attempt"), owner="owner", lease_seconds=30,
+                max_workers_total=1, max_workers_per_challenge=1,
+            )
+            assert claim.granted and claim.fencing_token
+            state.record_candidate(
+                candidate,
+                Event(
+                    team_id="demo-team", member="local", contest="Demo",
+                    type="FLAG_OBSERVED", category="web", challenge="raw-stream",
+                    challenge_id=target.id, challenge_key=target.challenge_key,
+                    attempt_id="raw-attempt", payload={"flag": candidate.value},
+                ),
+                owner="owner", fencing_token=claim.fencing_token,
+                promote_challenge_status=False,
+            )
+
+            table = app.query_one("#challenges", DataTable)
+            assert str(table.get_cell(target.id, "flag")).startswith("UNVERIFIED: FLAG{seen-before-verifi")
+            log = str(app.query_one("#event-log", Static).renderable)
+            assert "FLAG_OBSERVED: FLAG{seen-before-verification}" in log
 
     asyncio.run(exercise())

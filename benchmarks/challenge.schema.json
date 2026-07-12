@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CTF-OS tactical benchmark challenge",
+  "type": "object",
+  "required": ["id", "category", "subtype", "strategy", "fixture", "smoke"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+    "category": {"type": "string"},
+    "subtype": {"type": "string"},
+    "strategy": {"type": "string"},
+    "fixture": {"enum": ["archive", "password", "constraint", "binary", "http", "protocol", "mobile", "cloud"]},
+    "smoke": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

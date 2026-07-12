@@ -246,7 +246,7 @@ def test_tui_distinguishes_candidate_from_solved(tmp_path: Path, claimed_attempt
     candidate = FlagCandidate(challenge_id=challenge.id, attempt_id=attempt.id, value="FLAG{SOLVED}")
     event = Event(team_id="team", member="member", contest="Demo", type="FLAG_CANDIDATE", challenge_id=challenge.id, attempt_id=attempt.id)
     state.record_candidate(candidate, event, owner=attempt.lease_owner, fencing_token=attempt.fencing_token)
-    assert "? FLAG{SOLVED}" in render_tui(config, state)
+    assert "UNVERIFIED: FLAG{SOLVED}" in render_tui(config, state)
     state.transition_challenge_status(
         challenge.id, "VERIFYING", attempt_id=attempt.id,
         owner=attempt.lease_owner, fencing_token=attempt.fencing_token,
@@ -254,4 +254,4 @@ def test_tui_distinguishes_candidate_from_solved(tmp_path: Path, claimed_attempt
     solved = Event(team_id="team", member="member", contest="Demo", type="SOLVED", challenge_id=challenge.id, attempt_id=attempt.id)
     state.solve_verified(candidate_id=candidate.id, flag="FLAG{SOLVED}", event=solved,
                          owner=attempt.lease_owner, fencing_token=attempt.fencing_token)
-    assert "SOLVED: FLAG{SOLVED}" in render_tui(config, state)
+    assert "VERIFIED: FLAG{SOLVED}" in render_tui(config, state)

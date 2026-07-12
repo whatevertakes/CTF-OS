@@ -80,6 +80,39 @@ def test_contract_tasks_persist_proof_artifact_handoff_and_outcome(tmp_path):
     assert LocalState(state.path).get_contract_task(task.id) == finished
 
 
+def test_structured_artifact_handoff_records_producer_consumer_and_provenance(tmp_path):
+    state = LocalState(tmp_path / "state.db")
+    challenge = state.upsert_challenge(Challenge("CTF", "pwn", "heap-handoff"))
+    session = state.upsert_challenge_session(ChallengeSession(challenge.id, "gpt-5.6-sol"))
+    producer = state.upsert_contract_task(ContractTask(
+        session.id, challenge.id, "leak", "reverse", "obtain one-shot leak",
+        tool_strategy="dynamic_analysis",
+    ))
+    consumer = state.upsert_contract_task(ContractTask(
+        session.id, challenge.id, "exploit", "exploit", "consume promoted leak",
+        tool_strategy="exploit_build", depends_on=(producer.id,),
+    ))
+    artifact = state.record_tactical_artifact({
+        "id": "artifact-leak", "challenge_id": challenge.id,
+        "artifact_type": "structured_result", "path": "/artifacts/leak.json",
+        "sha256": "a" * 64, "contract_id": producer.id, "strategy_id": "dynamic_analysis",
+        "strategy_version": 1, "creation_event_id": "event-leak",
+        "content_metadata": {"finding_kind": "libc_leak"},
+    })
+
+    handed = state.handoff_tactical_artifacts(
+        challenge_id=challenge.id, producer_contract_id=producer.id,
+        filenames=("/artifacts/leak.json",), consumer_contract_ids=(consumer.id,),
+    )
+
+    assert handed == (artifact["id"],)
+    stored = state.list_tactical_artifacts(challenge.id)[0]
+    assert stored["sha256"] == "a" * 64
+    assert stored["contract_id"] == producer.id
+    assert stored["consumers"] == [consumer.id]
+    assert stored["trust_state"] == "promoted"
+
+
 def test_contract_task_cannot_cross_challenge_session_boundary(tmp_path):
     state = LocalState(tmp_path / "state.db")
     one = state.upsert_challenge(Challenge(contest="CTF", category="rev", name="one"))
@@ -98,7 +131,7 @@ def test_schema_v9_contains_session_tables(tmp_path):
     path = tmp_path / "state.db"
     LocalState(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION == 10
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}

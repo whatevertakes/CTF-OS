@@ -4,7 +4,7 @@ from .backend import SolverBackend
 from .category_planner import BranchExecutionSpec, CategoryPlanner, ExecutionContract, PlanParseError, SolvePlan, SolvePlanParser
 from .context import ChallengeContext, ChallengeContextBuilder
 from .knowledge import KnowledgeChunk, KnowledgeIndex, PlaybookSelector
-from .loop_detector import LoopDetector, LoopSignal
+from .loop_detector import LoopDetector, LoopSignal, ProgressSnapshot, SemanticLoopResult
 from .mock_backend import MockBackend
 from .parser import ActionObservationParser
 from .prompt import PromptRenderer, SessionHandoff
@@ -12,6 +12,7 @@ from .race_plan import ATTEMPT_PROFILES, AttemptProfile, RaceAttempt, RacePlan
 from .strategy_reranker import StrategyReranker
 from .types import BackendResult, SolverEvent
 from .verifier import VerificationResult, Verifier
+from .immutable_verifier import ParentOwnedVerifier, ParentVerificationResult
 
 __all__ = [
     "ATTEMPT_PROFILES",
@@ -30,6 +31,8 @@ __all__ = [
     "KnowledgeIndex",
     "LoopDetector",
     "LoopSignal",
+    "ProgressSnapshot",
+    "SemanticLoopResult",
     "MockBackend",
     "PlaybookSelector",
     "PromptRenderer",
@@ -41,4 +44,6 @@ __all__ = [
     "SolverEvent",
     "VerificationResult",
     "Verifier",
+    "ParentOwnedVerifier",
+    "ParentVerificationResult",
 ]

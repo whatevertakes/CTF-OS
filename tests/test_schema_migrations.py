@@ -260,8 +260,8 @@ def test_v3_to_v4_adds_nullable_codex_session_columns_without_losing_attempt_dat
 
     state = LocalState(path)
 
-    assert CURRENT_SCHEMA_VERSION == 9
-    assert _schema_version(path) == 9
+    assert CURRENT_SCHEMA_VERSION == 10
+    assert _schema_version(path) == 10
     assert {"session_id", "resume_id"} <= _table_columns(path, "attempts")
     attempt = state.get_attempt("attempt-legacy")
     assert attempt is not None

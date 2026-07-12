@@ -18,4 +18,4 @@ PYTHON: pwntools, pycryptodome, sympy, gmpy2, z3-solver, fpylll, angr,
         tqdm
 
 CTF-OS mounts challenge input at /workspace read-only, attempt-private files at
-/work, and challenge artifacts at /artifacts. Use ctf-exec for challenge commands.
+/work, and challenge artifacts at /artifacts. Use ./ctf-exec for challenge commands.

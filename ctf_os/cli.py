@@ -6,6 +6,7 @@ import argparse
 from importlib import resources
 import json
 from pathlib import Path
+import sqlite3
 import sys
 from threading import Event as ThreadEvent
 from typing import Callable, Sequence
@@ -13,6 +14,7 @@ from typing import Callable, Sequence
 import yaml
 
 from .application import LocalApplication, PrerequisiteError
+from .capabilities import render_capabilities
 from .config import AppConfig, ConfigError, default_config_mapping
 from .doctor import run_doctor
 from .local_state import CURRENT_SCHEMA_VERSION, LocalState
@@ -47,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "knowledge":
             return _knowledge_command(args)
+        if args.command == "capabilities":
+            print(render_capabilities(json_output=args.json))
+            return 0
 
         config = AppConfig.from_file(args.config)
         if args.command == "doctor":
@@ -55,6 +60,19 @@ def main(argv: list[str] | None = None) -> int:
             return report.exit_code
         if args.command == "state":
             state_path = config.state_path()
+            if args.dry_run:
+                version = 0
+                if state_path.is_file():
+                    connection = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True)
+                    try:
+                        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                    finally:
+                        connection.close()
+                if version > CURRENT_SCHEMA_VERSION:
+                    print(f"refusing future schema v{version}; supported v{CURRENT_SCHEMA_VERSION}", file=sys.stderr)
+                    return 1
+                print(f"migration check: {state_path} v{version} -> v{CURRENT_SCHEMA_VERSION}; no changes written")
+                return 0
             existed = state_path.is_file()
             LocalState.for_config(config)
             action = "migrated" if existed else "initialized"
@@ -192,6 +210,9 @@ def _build_parser() -> argparse.ArgumentParser:
     knowledge_query.add_argument("--trust", action="append", default=None, help="explicit trust filter; repeatable")
     knowledge_query.add_argument("--json", action="store_true", help="emit structured local results")
 
+    capabilities_parser = subparsers.add_parser("capabilities", help="probe tactical tools and degraded profiles")
+    capabilities_parser.add_argument("--json", action="store_true", help="emit a structured report")
+
     init_parser = subparsers.add_parser("init", help="create a local contest workspace")
     init_parser.add_argument("contest")
     init_parser.add_argument("--force", action="store_true")
@@ -209,6 +230,7 @@ def _build_parser() -> argparse.ArgumentParser:
     state_sub = state_parser.add_subparsers(dest="state_command", required=True)
     migrate_parser = state_sub.add_parser("migrate", help="apply idempotent local SQLite schema migrations")
     migrate_parser.add_argument("--config", default="config.yaml")
+    migrate_parser.add_argument("--dry-run", action="store_true", help="check schema versions without writing")
 
     run_parser = subparsers.add_parser("run", help="run this local node")
     run_parser.add_argument("--config", default="config.yaml")

@@ -70,6 +70,10 @@ def default_config_mapping(
         # These are deliberately coordinator-local timers.
         "coordinator": {"hint_after_sec": 600, "loop_check_sec": 120},
         "model_routing": {"enabled": False, "config_path": "config/model-routing.yaml"},
+        "solver": {"tactical_engine": {"enabled": True, "strategy_registry": "default",
+                    "semantic_replanning": True, "semantic_loop_detection": True,
+                    "subtype_planners": True, "capability_preflight": True,
+                    "legacy_fallback": True}},
         "sandbox": {"enabled": True, "image": "ctf-os-sandbox:latest", "container_per_attempt": True,
                     "precreate_on_queue": False, "max_containers": 2,
                     "command_timeout_sec": 30,
@@ -239,6 +243,26 @@ class AppConfig:
     @property
     def sandbox_image(self) -> str:
         return os.environ.get("CTF_OS_SANDBOX_IMAGE", str(self.sandbox.get("image", "ctf-os-sandbox:latest")))
+
+    def strategy_image(self, profile: str, declared_image: str) -> str:
+        """Resolve an optional profile image, retaining the legacy image by default."""
+        images = self.sandbox.get("profile_images", {})
+        if not isinstance(images, Mapping):
+            raise ConfigError("sandbox.profile_images must be a mapping")
+        value = images.get(profile, self.sandbox_image)
+        return _required_text(value, f"sandbox.profile_images.{profile}")
+
+    @property
+    def tactical_engine(self) -> dict[str, Any]:
+        solver = self.get_mapping("solver")
+        value = solver.get("tactical_engine", {})
+        if not isinstance(value, dict):
+            raise ConfigError("solver.tactical_engine must be a mapping")
+        return value
+
+    @property
+    def tactical_engine_enabled(self) -> bool:
+        return bool(self.tactical_engine.get("enabled", True))
 
     @property
     def sandbox_max_containers(self) -> int:
@@ -425,6 +449,17 @@ class AppConfig:
                     raise ConfigError("sandbox.egress_policy must be 'manifest_exact_endpoints'")
                 if sandbox.get("allow_private_egress", False):
                     raise ConfigError("sandbox.allow_private_egress is disabled: private, Docker-gateway, and host-service egress are unsafe")
+                profile_images = sandbox.get("profile_images", {})
+                if not isinstance(profile_images, Mapping):
+                    raise ConfigError("sandbox.profile_images must be a mapping")
+                for profile, image in profile_images.items():
+                    _required_text(image, f"sandbox.profile_images.{profile}")
+
+        tactical = self.tactical_engine
+        for field in ("enabled", "semantic_replanning", "semantic_loop_detection",
+                      "subtype_planners", "capability_preflight", "legacy_fallback"):
+            if field in tactical and not isinstance(tactical[field], bool):
+                raise ConfigError(f"solver.tactical_engine.{field} must be a boolean")
 
         routing = self.model_routing
         if routing and not isinstance(routing.get("enabled", True), bool):

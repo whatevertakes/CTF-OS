@@ -165,6 +165,23 @@ def test_custom_patterns_synthetic_isolation_and_active_attempt_reduction() -> N
     assert state.get("synthetic") is None
 
 
+def test_raw_flag_observation_projects_value_without_promoting_lifecycle() -> None:
+    projected = LocalEventState.from_events([
+        Event(
+            team_id="t", member="alice", contest="D", type="RUNNING",
+            challenge_id="c", attempt_id="a",
+        ),
+        Event(
+            team_id="t", member="alice", contest="D", type="FLAG_OBSERVED",
+            challenge_id="c", attempt_id="a", payload={"flag": "FLAG{raw}"},
+        ),
+    ]).get("c")
+
+    assert projected is not None
+    assert projected.candidate_flag == "FLAG{raw}"
+    assert projected.status == "RUNNING"
+
+
 def _runtime_config(tmp_path: Path) -> AppConfig:
     raw = default_config_mapping("Demo")
     raw["member"]["owned_categories"] = ["web", "misc"]

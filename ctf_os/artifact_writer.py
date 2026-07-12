@@ -26,6 +26,11 @@ MAX_AGGREGATE_LOG_BYTES = 8 * 1024 * 1024
 MAX_ATTEMPT_CAPTURE_BYTES = 1 * 1024 * 1024
 _STAGING_MARKER = ".ctf-os-sterile-attempt"
 _PRIVATE_CAPTURE = ".ctf-os-parent-capture.log"
+_HANDOFF_FILENAMES = frozenset({
+    "exploit.py", "replay.sh", "writeup.md", "solver.py",
+    "recon-manifest.json", "leak.json", "primitive.json", "finding.json",
+    "transcript.jsonl", "request.json", "endpoint.json", "token.json",
+})
 
 
 @dataclass(frozen=True)
@@ -339,7 +344,7 @@ class ArtifactWriter:
                                     continue
                                 source_root, components = match
                                 name = components[-1]
-                                if name not in {"exploit.py", "replay.sh", "writeup.md", "solver.py"}:
+                                if name not in _HANDOFF_FILENAMES:
                                     continue
                                 source_fd = _open_regular_at(work_fd if source_root == "work" else artifacts_fd, components)
                                 try:
@@ -401,7 +406,7 @@ class ArtifactWriter:
                                     destination_branch_fd = _open_or_create_dir(seed_fd, branch)
                                     try:
                                         for name in sorted(os.listdir(source_branch_fd)):
-                                            if name not in {"exploit.py", "solver.py", "replay.sh", "writeup.md"}:
+                                            if name not in _HANDOFF_FILENAMES:
                                                 continue
                                             try:
                                                 source_fd = _open_regular_at(source_branch_fd, (name,))

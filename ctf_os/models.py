@@ -91,6 +91,7 @@ class ContractTaskStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    PAUSED = "PAUSED"
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,6 +4,24 @@ CTF-OS는 각 PC에서 완전히 독립적으로 실행하는 로컬 CTF 풀이 
 
 승인된 대회와 원격 대상만 `incoming/<대회 이름>/contest.md`에 적어 사용하세요.
 
+## Tactical engine
+
+신규 설정은 versioned strategy/harness, 세부 유형 planner, 구조화 재계획,
+semantic loop detection과 capability preflight를 기본 활성화합니다. 기존
+`tool_strategy` 문자열과 plan 문장도 호환 경로로 읽습니다.
+
+```bash
+uv run ctf-os capabilities          # 실제 로컬 tool/version과 degraded profile
+uv run python scripts/validate_profiles.py
+make benchmark-smoke                # 실제 로컬 도구 + private verifier, 모델 호출 없음
+make benchmark-real                 # 인증된 Codex CLI + Docker 실제 실행
+make benchmark-compare              # 같은 seed의 legacy/tactical smoke 비교
+```
+
+설정, strategy/planner 확장, schema v10 마이그레이션과 문제 해결은
+[전술 엔진 문서](docs/tactical-engine.md)를 참고하세요. 이 기능도 자동
+플래그 제출, allowlist 우회 또는 다른 PC 상태 제어를 추가하지 않습니다.
+
 홈 캐시가 읽기 전용인 환경에서 `uv` 권한 오류가 나면, 현재 터미널에서
 `export UV_CACHE_DIR="${TMPDIR:-/tmp}/ctf-os-uv-cache-$UID"`를 한 번 실행하세요.
 `scripts/deploy_ctf_os.sh`는 이 안전한 기본값을 자동 적용합니다.
@@ -87,6 +105,23 @@ CTF-OS는 각 PC에서 완전히 독립적으로 실행하는 로컬 CTF 풀이 
 | `uv run ctf-os retry <문제명> --config local.next-a.jiwoong.yaml` | 실패한 문제를 명시적으로 다시 시도합니다. |
 
 플래그 후보는 사람이 검증하고 직접 제출해야 합니다.
+
+## Tactical engine 검증
+
+개발·배포 검증에서는 아래 명령으로 실제 profile과 종단 경로를 확인합니다.
+benchmark의 parent verifier는 정답을 worker/model/workspace에 전달하지 않고
+candidate hash와 검증 결과만 event/report에 남깁니다. 이 기능은 CTFd 자동
+제출을 하지 않습니다.
+
+| 명령 | 설명 |
+| --- | --- |
+| `make test` | 전체 회귀 테스트 |
+| `make smoke-profiles` | base/pwn/web/forensics 이미지 build 및 mount·timeout·resource·network·cleanup smoke |
+| `make benchmark-smoke` | 외부 모델 없는 빠른 로컬 도구 E2E |
+| `make benchmark-real` | 실제 Codex+Docker pwn/forensics E2E |
+| `make benchmark-compare-real` | 같은 seed의 legacy/tactical 실제 모델 A/B |
+
+세부 구조, fixture 선택과 report schema는 [tactical engine 문서](docs/tactical-engine.md)를 참고하세요.
 
 ## 4명 기본 운영과 다음 대회 2+2 운영
 

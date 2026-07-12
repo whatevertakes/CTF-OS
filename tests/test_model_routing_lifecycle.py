@@ -35,6 +35,15 @@ class SequencedBackend:
         return self.results.pop(0)
 
 
+class MirroredStreamingBackend:
+    """Model a Codex transcript present in both stream records and stdout."""
+
+    def run(self, request, **kwargs):
+        line = "[FINDING] confirmed internal endpoint /admin-7"
+        kwargs["on_output"](SimpleNamespace(line=line))
+        return CodexExecResult((), 0, line, "")
+
+
 def _app(tmp_path: Path, backend: SequencedBackend) -> tuple[AppConfig, LocalApplication]:
     raw = default_config_mapping("Demo")
     raw["model_routing"] = {"enabled": True, "config_path": str(ROUTING_CONFIG)}
@@ -135,6 +144,19 @@ def test_codex_result_session_and_resume_ids_are_persisted_while_the_lease_is_li
     assert (execution.session_id, execution.resume_id) == ("session-123", "resume-456")
     persisted = state.get_attempt(attempt.id)
     assert persisted and (persisted.session_id, persisted.resume_id) == ("session-123", "resume-456")
+
+
+def test_streamed_transcript_mirrored_in_stdout_is_processed_once(tmp_path: Path) -> None:
+    config, app = _app(tmp_path, MirroredStreamingBackend())  # type: ignore[arg-type]
+    state, challenge, task, attempt, primary = _live_task(tmp_path, app, config)
+
+    execution = app._execute_attempt(
+        task, challenge, attempt, ThreadEvent(), mock_worker=False, selection=primary,
+    )
+    # The live stream owns structured processing. _finish_attempt only parses
+    # stdout as a fallback when no stream records were observed.
+    assert len(execution.records) == 1
+    assert len([event for event in state.list_events(challenge_id=challenge.id) if event.type == "FINDING"]) == 1
 
 
 def test_sandbox_precreate_failure_never_emits_started_or_running_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

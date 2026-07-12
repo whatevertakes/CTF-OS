@@ -66,6 +66,7 @@ def _merge(events: tuple[Event, ...]) -> dict[str, LocalChallengeProjection]:
     for key, history in grouped.items():
         active_attempts: dict[str, str] = {}
         candidate: str | None = None
+        candidate_promoted = False
         solved: str | None = None
         lifecycle: Event | None = None
         for event in history:
@@ -81,8 +82,10 @@ def _merge(events: tuple[Event, ...]) -> dict[str, LocalChallengeProjection]:
                     item_key: member for item_key, member in active_attempts.items()
                     if member != event.member
                 }
-            if event.type == "FLAG_CANDIDATE":
+            if event.type in {"FLAG_OBSERVED", "FLAG_CANDIDATE"}:
                 candidate = _event_flag(event) or candidate
+            if event.type == "FLAG_CANDIDATE":
+                candidate_promoted = True
             if event.type == "SOLVED":
                 solved = _event_flag(event) or solved
                 active_attempts.clear()
@@ -92,7 +95,7 @@ def _merge(events: tuple[Event, ...]) -> dict[str, LocalChallengeProjection]:
         last = history[-1]
         has_solved = any(event.type == "SOLVED" for event in history)
         status = "SOLVED" if solved is not None or has_solved else (
-            "FLAG_CANDIDATE" if candidate is not None else
+            "FLAG_CANDIDATE" if candidate_promoted else
             "QUEUED" if lifecycle is not None and lifecycle.type == "RESUMED" else
             lifecycle.type if lifecycle is not None else last.type
         )

@@ -27,6 +27,10 @@ _ACTIVE_ATTEMPT_STATUSES = frozenset({AttemptStatus.QUEUED, AttemptStatus.RUNNIN
 _OPERATOR_EVENT_TYPES = frozenset({
     "STALE_RECOVERY", "ORPHAN_CLEANUP", "SANDBOX_CLEANUP", "SANDBOX_CLEANUP_FAILED",
 })
+_FLAG_EVENT_TYPES = frozenset({
+    "FLAG_OBSERVED", "FLAG_CANDIDATE", "VERIFYING", "VERIFIER_UNAVAILABLE",
+    "VERIFIER_REJECTED", "REPLAY_VERIFIED", "SOLVED",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +45,7 @@ class ChallengeView:
     active_attempts: int
     verified_flag: str | None
     latest_candidate: str | None
+    candidate_verification_status: str | None
     candidate_source_attempt: str | None
     solved_by_member: str | None
 
@@ -50,9 +55,10 @@ class ChallengeView:
 
     def flag_text(self, *, compact: bool = False, width: int = 36) -> str:
         if self.verified_flag:
-            value = self.verified_flag
+            value = f"VERIFIED: {self.verified_flag}"
         elif self.latest_candidate:
-            value = f"? {self.latest_candidate}"
+            label = _verification_label(self.candidate_verification_status)
+            value = f"{label}: {self.latest_candidate}"
         else:
             return "-"
         if compact and len(value) > width:
@@ -87,6 +93,7 @@ def challenge_view(
         active_attempts=sum(_attempt_is_active(attempt) for attempt in attempts),
         verified_flag=verified,
         latest_candidate=latest,
+        candidate_verification_status=candidate.verification_status if candidate and not verified else None,
         candidate_source_attempt=candidate.attempt_id if candidate else None,
         solved_by_member=getattr(projected, "solved_by_member", None) if projected else None,
     )
@@ -142,7 +149,7 @@ class CTFOSDashboard(App[None]):
             self._unsubscribe_local_events = None
 
     def _on_committed_event(self, event: Event) -> None:
-        if event.type not in {"FLAG_CANDIDATE", "VERIFYING", "SOLVED"}:
+        if event.type not in _FLAG_EVENT_TYPES:
             return
         challenge_id = event.challenge_id
         if challenge_id and self.local_state.get_challenge(challenge_id) is None:
@@ -169,7 +176,7 @@ class CTFOSDashboard(App[None]):
             for (_, column_key), value in zip(self._COLUMNS, values, strict=True):
                 table.update_cell(challenge_id, column_key, value)
         self._views[challenge_id] = view
-        if event is not None and event.type in {"FLAG_CANDIDATE", "VERIFYING", "SOLVED"}:
+        if event is not None and event.type in _FLAG_EVENT_TYPES:
             self._append_flag_event(event, view)
         self._refresh_detail_for_cursor()
 
@@ -200,7 +207,7 @@ class CTFOSDashboard(App[None]):
         return (
             view.name, view.category, str(view.score if view.score is not None else "-"),
             view.assignee or "-", view.status, str(view.active_attempts),
-            view.flag_text(compact=True),
+            view.flag_text(),
         )
 
     def _refresh_detail_for_cursor(self) -> None:
@@ -322,7 +329,7 @@ def render_tui(
     for event in events:
         if event.type in _OPERATOR_EVENT_TYPES:
             body.append(f"OPERATOR {event.type}: {event.message or '-'}")
-        if event.type in {"FLAG_CANDIDATE", "VERIFYING", "SOLVED"} and event.challenge_id:
+        if event.type in _FLAG_EVENT_TYPES and event.challenge_id:
             label = f"{event.category or '-'}/{event.challenge or event.challenge_id}"
             attempt = f"[{event.attempt_id}]" if event.attempt_id else ""
             flag = event.payload.get("flag") if isinstance(event.payload, dict) else None
@@ -356,27 +363,42 @@ def _flag_text(challenge: Challenge, candidates: list[FlagCandidate], team) -> s
     if challenge.synthetic:
         return f"SYNTHETIC SOLVED: {challenge.flag}" if challenge.flag else "SYNTHETIC"
     if challenge.flag:
-        return f"SOLVED: {challenge.flag}"
+        return f"VERIFIED: {challenge.flag}"
     candidate = _primary_candidate(candidates)
     if candidate:
-        return f"? {candidate.value}"
+        label = _verification_label(candidate.verification_status)
+        return f"{label}: {candidate.value}"
     if team and team.solved_flag:
-        return f"SOLVED: {team.solved_flag}"
+        return f"VERIFIED: {team.solved_flag}"
     if team and team.candidate_flag:
-        return f"? {team.candidate_flag}"
+        return f"UNVERIFIED: {team.candidate_flag}"
     return "-"
 
 
 def _primary_candidate(candidates: Iterable[FlagCandidate]) -> FlagCandidate | None:
-    active = [item for item in candidates if item.verification_status not in {"REJECTED", "UNAVAILABLE"}]
-    if not active:
+    available = list(candidates)
+    if not available:
         return None
-    return max(active, key=lambda item: (
+    priority = {
+        "VERIFIED": 6, "REPLAY_VERIFIED": 5, "VERIFYING": 4,
+        "CANDIDATE": 3, "RAW_CANDIDATE": 3, "UNAVAILABLE": 2, "REJECTED": 1,
+    }
+    return max(available, key=lambda item: (
         item.verified,
-        item.verification_status == "VERIFYING",
+        priority.get(item.verification_status, 0),
         item.confidence if item.confidence is not None else -1,
         item.created_at,
     ))
+
+
+def _verification_label(status: str | None) -> str:
+    return {
+        "VERIFYING": "VERIFYING",
+        "REPLAY_VERIFIED": "REPLAY VERIFIED",
+        "VERIFIED": "VERIFIED",
+        "REJECTED": "REJECTED",
+        "UNAVAILABLE": "VERIFICATION UNAVAILABLE",
+    }.get(status or "", "UNVERIFIED")
 
 
 def _attempt_detail(challenge: Challenge, attempt: Attempt, events: Iterable[Event], candidates: list[FlagCandidate]) -> str:

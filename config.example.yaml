@@ -50,6 +50,16 @@ model_routing:
   enabled: true
   config_path: "config/model-routing.yaml"
 
+solver:
+  tactical_engine:
+    enabled: true
+    strategy_registry: default
+    semantic_replanning: true
+    semantic_loop_detection: true
+    subtype_planners: true
+    capability_preflight: true
+    legacy_fallback: true
+
 supervision:
   enabled: true
   supervisor_model: supervisor
@@ -72,6 +82,8 @@ race_policy:
 sandbox:
   enabled: true
   image: "ctf-os-sandbox:latest"
+  # Optional profile-specific images. Omitted profiles safely use `image`.
+  profile_images: {}
   container_per_attempt: true
   precreate_on_queue: false
   max_containers: 2

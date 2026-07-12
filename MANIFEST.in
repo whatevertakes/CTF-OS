@@ -4,7 +4,13 @@ include config/model-routing.yaml
 include sandbox/Dockerfile.sandbox
 include sandbox/entrypoint.sh
 include sandbox/sandbox-tools.txt
+include sandbox/Dockerfile.profiles
+include sandbox/profiles.yaml
+include Makefile
 include scripts/normalize_sdist.py
+include scripts/validate_profiles.py
+graft benchmarks
+prune benchmarks/results
 recursive-include ctf_os/resources *.yaml Dockerfile.sandbox entrypoint.sh sandbox-tools.txt
 graft knowledge
 graft ctf_os/resources/knowledge
