@@ -1,5 +1,5 @@
 # Shared Python layer. Every dependency is pinned because images are built before a contest.
-requests==2.32.5
+requests==2.33.0
 httpx==0.28.1
 beautifulsoup4==4.13.4
 lxml==6.0.0
