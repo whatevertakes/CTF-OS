@@ -6,6 +6,7 @@
 set -euo pipefail
 
 : "${CTF_OS_ALLOWED_ENDPOINTS_JSON:=[]}"
+export HOME=/home/ctf
 
 apply_firewall() {
     local tool="$1" family="$2"

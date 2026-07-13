@@ -56,3 +56,43 @@ def test_path_and_category_safety(repo: Path) -> None:
     path.write_text("# Demo CTF\n### unknown/X\n", encoding="utf-8")
     with pytest.raises(ContestError, match="unsupported"):
         parse_contest(path)
+
+
+def test_unknown_fields_are_preserved_with_sensitive_typo_suggestions(repo: Path) -> None:
+    path = write_contest(repo, """# Demo CTF
+- Team: blue
+### web/App
+- Remtoe: https://example.test
+- Descriptiom: typo
+""")
+    manifest = parse_contest(path)
+    assert manifest.warnings[0].field == "Team"
+    warnings = manifest.challenges[0].warnings
+    assert [(warning.suggestion, warning.severity) for warning in warnings] == [
+        ("remote", "HIGH"), ("description", "HIGH"),
+    ]
+    payload = manifest.to_dict()
+    assert payload["challenges"][0]["warnings"][0]["line"] == 4
+
+
+@pytest.mark.parametrize("category", ["mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"])
+def test_extended_categories_use_generic_playbook_without_being_blocked(repo: Path, category: str) -> None:
+    manifest = parse_contest(write_contest(repo, f"# Demo CTF\n### {category}/X\n"))
+    challenge = manifest.challenges[0]
+    assert challenge.category == category
+    assert challenge.playbook_category == "misc"
+
+
+def test_input_profile_defaults_overrides_and_rejects_arbitrary_limits(repo: Path) -> None:
+    path = write_contest(repo, """# Demo CTF
+- Input Profile: large
+### forensic/Disk
+### misc/Small
+- 입력 프로필: standard
+""")
+    manifest = parse_contest(path)
+    assert manifest.input_profile == "large"
+    assert [challenge.input_profile for challenge in manifest.challenges] == ["large", "standard"]
+    path.write_text("# Demo CTF\n### forensic/Disk\n- Input Profile: huge\n", encoding="utf-8")
+    with pytest.raises(ContestError, match="allowed"):
+        parse_contest(path)

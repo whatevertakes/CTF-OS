@@ -5,7 +5,7 @@ from ctf_os.flags import matches_flag, verify_and_record
 
 
 def _root(tmp_path: Path) -> Path:
-    root = tmp_path / "challenge"
+    root = tmp_path / "output" / "demo" / "misc" / "challenge"
     root.mkdir(parents=True)
     (root / "STATE.json").write_text(json.dumps({"challenge_id": "abc", "status": "PREPARED"}))
     return root
@@ -37,8 +37,11 @@ def test_verified_offline_flag_writes_result_and_reproducer(tmp_path: Path) -> N
     result = verify_and_record(root, flag="DEMO{real}", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=False,
                                local_reproduced=True, remote_reproduced=False, independent_rerun=True,
                                reproduce_command="python exploit/solve.py")
-    assert result["ready_for_human_submission"]
+    assert not result["ready_for_human_submission"]
     assert (root / "RESULT.md").is_file() and (root / "reproduce.sh").stat().st_mode & 0o111
+    assert "ctf_os.agent_tools" in (root / "reproduce.sh").read_text()
+    assert "python exploit/solve.py" not in (root / "reproduce.sh").read_text()
+    assert json.loads((root / "REPRODUCE.json").read_text())["argv"] == ["python3", "exploit/solve.py"]
 
 
 def test_strict_verification_requires_distinct_recorded_receipts(tmp_path: Path) -> None:
@@ -46,8 +49,8 @@ def test_strict_verification_requires_distinct_recorded_receipts(tmp_path: Path)
     (root / "exploit").mkdir()
     (root / "exploit" / "solve.py").write_text("print('DEMO{real}')")
     receipts = [
-        {"event": "sandbox_exec", "branch": "local-a", "exit_code": 0, "stdout": "DEMO{real}"},
-        {"event": "sandbox_exec", "branch": "verify-b", "exit_code": 0, "stdout": "DEMO{real}"},
+        {"event": "replay_exec", "branch": "local-a", "exit_code": 0, "stdout": "DEMO{real}"},
+        {"event": "replay_exec", "branch": "verify-b", "exit_code": 0, "stdout": "DEMO{real}"},
     ]
     (root / "evidence.log").write_text("\n".join(json.dumps(item) for item in receipts) + "\n")
     result = verify_and_record(
@@ -78,8 +81,8 @@ def test_strict_receipts_are_input_bound_and_remote_requires_network_observation
     (root / "exploit").mkdir()
     (root / "exploit" / "solve.py").write_text("x")
     stale = [
-        {"event": "sandbox_exec", "branch": "a", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "old"},
-        {"event": "sandbox_exec", "branch": "b", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "old"},
+        {"event": "replay_exec", "branch": "a", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "old"},
+        {"event": "replay_exec", "branch": "b", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "old"},
     ]
     (root / "evidence.log").write_text("\n".join(json.dumps(item) for item in stale) + "\n")
     stale_result = verify_and_record(
@@ -91,9 +94,9 @@ def test_strict_receipts_are_input_bound_and_remote_requires_network_observation
     assert not stale_result["ready_for_human_submission"]
 
     receipts = [
-        {"event": "sandbox_exec", "branch": "a", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": []},
-        {"event": "sandbox_exec", "branch": "b", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": []},
-        {"event": "sandbox_exec", "branch": "fake-remote", "command": ["echo", "example.com"], "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": [{"host": "example.com"}], "authorized_network_observed": False},
+        {"event": "replay_exec", "branch": "a", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": []},
+        {"event": "replay_exec", "branch": "b", "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": []},
+        {"event": "replay_exec", "branch": "fake-remote", "command": ["echo", "example.com"], "exit_code": 0, "stdout": "DEMO{real}", "input_fingerprint": "new", "authorized_targets": [{"host": "example.com"}], "authorized_network_observed": False},
     ]
     (root / "evidence.log").write_text("\n".join(json.dumps(item) for item in receipts) + "\n")
     remote_result = verify_and_record(

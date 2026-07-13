@@ -10,7 +10,16 @@ _ALIASES = {
     "forensic": "forensic", "forensics": "forensic",
     "misc": "misc", "miscellaneous": "misc",
     "cloud": "cloud",
+    "mobile": "mobile", "android": "mobile", "ios": "mobile",
+    "osint": "osint", "open source intelligence": "osint",
+    "hardware": "hardware", "hw": "hardware",
+    "blockchain": "blockchain", "smart contract": "blockchain", "web3": "blockchain",
+    "jail": "jail", "sandbox escape": "jail", "pyjail": "jail",
+    "windows": "windows", "win": "windows",
+    "ai": "ai", "machine learning": "ai", "ml": "ai",
 }
+
+_GENERIC_CATEGORIES = frozenset({"mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"})
 
 
 def canonical_category(value: str) -> str:
@@ -22,3 +31,8 @@ def canonical_category(value: str) -> str:
 
 
 CATEGORIES = tuple(dict.fromkeys(_ALIASES.values()))
+
+
+def playbook_category(category: str) -> str:
+    """Return the compact built-in playbook used for a canonical category."""
+    return "misc" if category in _GENERIC_CATEGORIES else category

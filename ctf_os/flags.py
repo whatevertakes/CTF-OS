@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import shlex
 
 from .evidence import append_evidence
 from .workspace import atomic_json, atomic_text, state_lock
@@ -44,9 +45,14 @@ def matches_flag(flag: str, pattern: str | None) -> bool:
 def verify_and_record(
     root: Path, *, flag: str, pattern: str | None, has_remote: bool,
     local_reproduced: bool, remote_reproduced: bool, independent_rerun: bool,
-    reproduce_command: str,
+    reproduce_command: str | None = None,
+    reproduce_argv: list[str] | None = None,
+    image_profile: str = "base",
+    resource_profile: str = "standard",
+    service_required: bool = False,
+    remote_argv: list[str] | None = None,
     evidence_refs: dict[str, str] | None = None,
-    require_recorded_evidence: bool = False,
+    require_recorded_evidence: bool = True,
     remote_hosts: tuple[str, ...] = (),
     input_fingerprint: str | None = None,
 ) -> dict[str, object]:
@@ -79,10 +85,25 @@ def verify_and_record(
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
         atomic_json(state_path, state)
+        argv = reproduce_argv or _legacy_argv(reproduce_command)
+        contract = {
+            "schema_version": 1,
+            "image_profile": image_profile,
+            "resource_profile": resource_profile,
+            "service_required": service_required,
+            "argv": argv,
+            "expected_flag_pattern": pattern,
+            "input_fingerprint": input_fingerprint or state.get("input_fingerprint"),
+        }
+        if remote_argv:
+            contract["remote_argv"] = remote_argv
+        atomic_json(root / "REPRODUCE.json", contract)
+        repo, contest, selector = _replay_coordinates(root, state)
         reproduce = (
             "#!/usr/bin/env bash\nset -euo pipefail\n"
             "SCRIPT_DIR=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
-            "cd \"$SCRIPT_DIR\"\n" + reproduce_command.rstrip() + "\n"
+            f"exec uv run python -m ctf_os.agent_tools --repo {shlex.quote(str(repo))} "
+            f"replay {shlex.quote(selector)} --contest {shlex.quote(contest)}\n"
         )
         atomic_text(root / "reproduce.sh", reproduce)
         (root / "reproduce.sh").chmod(0o755)
@@ -102,6 +123,37 @@ def verify_and_record(
     return {"ready_for_human_submission": ready, "status": state["status"], "verification": verification, "result_path": str(root / "RESULT.md")}
 
 
+def _legacy_argv(command: str | None) -> list[str]:
+    """Migrate the old command field without ever embedding it in a shell script."""
+    if not command:
+        raise FlagVerificationError("structured reproduce argv is required")
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise FlagVerificationError(f"invalid reproduce command: {exc}") from exc
+    shell_tokens = {";", "&&", "||", "|", ">", ">>", "<", "2>", "&"}
+    if not argv or any(token in shell_tokens or "\n" in token or "\r" in token for token in argv):
+        raise FlagVerificationError("reproduce command must be a direct argv without shell operators")
+    if argv[0] == "python":
+        argv[0] = "python3"
+    return argv
+
+
+def _replay_coordinates(root: Path, state: dict[str, object]) -> tuple[Path, str, str]:
+    resolved = root.resolve()
+    try:
+        if resolved.parents[2].name != "output":
+            raise IndexError
+        repo = resolved.parents[3]
+        contest = resolved.parents[1].name
+    except IndexError as exc:
+        raise FlagVerificationError("challenge result is not below repository output/<contest>/<category>/<challenge>") from exc
+    selector = str(state.get("challenge_id", ""))
+    if not selector:
+        raise FlagVerificationError("STATE.json has no challenge_id")
+    return repo, contest, selector
+
+
 def _verify_evidence_receipts(
     path: Path, flag: str, refs: dict[str, str], has_remote: bool, remote_hosts: tuple[str, ...],
     input_fingerprint: str | None,
@@ -115,7 +167,7 @@ def _verify_evidence_receipts(
             except json.JSONDecodeError:
                 continue
             fingerprint_ok = input_fingerprint is None or record.get("input_fingerprint") == input_fingerprint
-            if record.get("event") == "sandbox_exec" and record.get("exit_code") == 0 and flag in str(record.get("stdout", "")) and fingerprint_ok:
+            if record.get("event") == "replay_exec" and record.get("exit_code") == 0 and flag in str(record.get("stdout", "")) and fingerprint_ok:
                 records.append(record)
     matches: dict[str, int | None] = {}
     used: set[int] = set()

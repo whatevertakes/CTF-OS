@@ -1,6 +1,4 @@
-# One source-of-truth image. Build the default practical base with:
-# docker build -f sandbox/Dockerfile.sandbox -t ctf-os-sandbox:latest .
-# Optional tools: --build-arg CTF_OS_PROFILE=rev-heavy|crypto-heavy|forensic-heavy.
+# One source-of-truth image. Build with CTF_OS_PROFILE=base|pwn|web|rev|crypto|forensic.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive TERM=xterm PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -8,8 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive TERM=xterm PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       bash ca-certificates curl netcat-openbsd socat jq \
-      file binutils xxd unzip zip p7zip-full \
-      gdb gdb-multiarch ltrace strace \
+      wget git ripgrep file binutils xxd unzip zip p7zip-full \
       gcc g++ make python3 python3-pip python3-venv \
       openssl iptables util-linux procps \
     && rm -rf /var/lib/apt/lists/*
@@ -21,9 +18,11 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/requir
 ARG CTF_OS_PROFILE=base
 RUN case "$CTF_OS_PROFILE" in \
       base) ;; \
-      rev-heavy) packages="radare2 default-jre-headless" ;; \
-      crypto-heavy) packages="sagemath" ;; \
-      forensic-heavy) packages="binwalk exiftool sleuthkit foremost testdisk tshark ffmpeg imagemagick" ;; \
+      pwn) packages="gdb gdb-multiarch ltrace strace patchelf qemu-user" ;; \
+      web) packages="nodejs npm php-cli sqlite3" ;; \
+      rev) packages="gdb gdb-multiarch radare2 default-jre-headless qemu-user" ;; \
+      crypto) packages="pari-gp libgmp-dev libmpfr-dev" ;; \
+      forensic) packages="binwalk exiftool sleuthkit foremost testdisk tshark ffmpeg sox imagemagick tesseract-ocr pngcheck" ;; \
       *) echo "unknown CTF_OS_PROFILE: $CTF_OS_PROFILE" >&2; exit 64 ;; \
     esac \
     && if [ -n "${packages:-}" ]; then \
@@ -31,6 +30,18 @@ RUN case "$CTF_OS_PROFILE" in \
          && apt-get install -y --no-install-recommends $packages \
          && rm -rf /var/lib/apt/lists/*; \
        fi
+
+# Python packages are intentionally shared: this keeps the category tags useful
+# even when Sol changes attack family without building during a contest.
+RUN if [ "$CTF_OS_PROFILE" = "rev" ]; then \
+      python3 -m pip install --break-system-packages --no-cache-dir angr; \
+    elif [ "$CTF_OS_PROFILE" = "crypto" ]; then \
+      python3 -m pip install --break-system-packages --no-cache-dir gmpy2 fpylll cysignals; \
+    elif [ "$CTF_OS_PROFILE" = "web" ]; then \
+      python3 -m pip install --break-system-packages --no-cache-dir flask fastapi pyjwt; \
+    elif [ "$CTF_OS_PROFILE" = "forensic" ]; then \
+      python3 -m pip install --break-system-packages --no-cache-dir volatility3 capstone==5.0.6; \
+    fi
 
 COPY sandbox/sandbox-tools.txt /tools.txt
 RUN groupadd --gid 1001 ctf \

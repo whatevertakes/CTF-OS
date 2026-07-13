@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import subprocess
 
 from ctf_os.challenge import resolve_selector
@@ -21,12 +22,21 @@ def test_offline_intake_to_solver_verification_smoke(repo: Path) -> None:
     exploit = solve_root / "exploit"
     exploit.mkdir()
     (exploit / "solve.py").write_text("print('SMOKE{offline-proof}')\n")
+    fingerprint = record["source_fingerprint"]
+    receipts = [
+        {"event": "replay_exec", "receipt_id": "local-one", "exit_code": 0, "stdout": "SMOKE{offline-proof}", "input_fingerprint": fingerprint},
+        {"event": "replay_exec", "receipt_id": "local-two", "exit_code": 0, "stdout": "SMOKE{offline-proof}", "input_fingerprint": fingerprint},
+    ]
+    (solve_root / "evidence.log").write_text("\n".join(json.dumps(item) for item in receipts) + "\n")
     verified = verify_and_record(
         solve_root, flag="SMOKE{offline-proof}", pattern=challenge.flag_pattern,
         has_remote=False, local_reproduced=True, remote_reproduced=False,
-        independent_rerun=True, reproduce_command="python exploit/solve.py",
+        independent_rerun=True, reproduce_argv=["python3", "/artifacts/exploit/solve.py"],
+        evidence_refs={"local": "local-one", "independent": "local-two"},
+        input_fingerprint=fingerprint,
     )
     assert verified["status"] == "READY_FOR_HUMAN_SUBMISSION"
     assert (solve_root / "evidence.log").is_file()
-    rerun = subprocess.run(["bash", str(solve_root / "reproduce.sh")], cwd=repo, capture_output=True, text=True, check=True)
-    assert rerun.stdout.strip() == "SMOKE{offline-proof}"
+    wrapper = (solve_root / "reproduce.sh").read_text()
+    assert "ctf_os.agent_tools" in wrapper and "replay" in wrapper
+    assert "solve.py" not in wrapper

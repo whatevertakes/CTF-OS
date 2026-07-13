@@ -1,53 +1,76 @@
 # CTF-OS
 
-CTF-OS는 사용자가 직접 연 Sol 세션을 위한 로컬 CTF 분석 도구입니다. Python은 `contest.md` 파싱, 안전한 문제 파일 준비, Docker 격리, 증거 기록, 플래그 검증만 수행하며 모델을 실행하지 않습니다.
-
-## 운영 흐름
+CTF-OS는 사용자가 직접 연 Sol 세션을 위한 로컬 CTF 분석 도구입니다. Python은 `contest.md` 파싱, 안전한 문제 준비, sandbox/service lifecycle, evidence, replay, flag 검증과 내부 eval만 담당하며 Codex나 다른 모델을 실행하지 않습니다.
 
 ```text
-문제 파일 + contest.md 작성
-→ 사람이 Sol 세션에서 intake 요청
-→ 사람이 새 Sol 세션에서 문제 선택 및 solve 요청
-→ Sol swarm/race가 검증된 플래그 후보 제공, 사람 제출
+문제 파일과 contest.md 작성
+→ Sol 세션에서 intake 해라
+→ 새 Sol 세션에서 N번 문제 풀어라
+→ 검증된 flag 후보 확인
+→ 사람이 제출
 ```
 
-사용자가 준비할 것은 `incoming/<대회명>/contest.md`와 카테고리별 문제 파일뿐입니다.
-
-```text
-incoming/<대회명>/
-  contest.md
-  pwn/<문제명>/ 또는 <문제명>.zip
-  web/<문제명>/
-  rev/  crypto/  forensic/  misc/  cloud/
-```
-
-권장 manifest:
+사용자 설정은 `incoming/<contest>/contest.md` 하나뿐입니다. `pwn`, `web`, `rev`, `crypto`, `forensic`, `misc`, `cloud` 외에 `mobile`, `osint`, `hardware`, `blockchain`, `jail`, `windows`, `ai`도 안전한 generic playbook으로 intake됩니다.
 
 ```markdown
 # 대회명: SCA CTF 2026
-
 - 날짜: 2026-07-19
 - 플래그 형식: SCA{...}
-
-## 문제 목록
+- 입력 프로필: standard
 
 ### pwn/NBB
-- 점수: 500
 - 설명: 문제 원문 설명
 - 원격: nc challenge.example 31337
-- 힌트: 선택사항
 ```
 
-저장소 루트에서 Sol 세션을 열고 `intake 해라`라고 요청합니다. 완료 목록에서 문제를 고른 뒤 그 세션을 닫고 새 Sol 세션을 열어 `1번 문제 풀어라` 또는 `pwn/NBB 풀어라`라고 요청합니다.
+입력 프로필은 `standard`, `large`, `large-forensic`만 허용합니다. 큰 프로필도 traversal, link, special-file 방어를 유지합니다. 알 수 없는 필드는 intake warning으로 나오며 `Remtoe` 같은 핵심 오타는 강한 suggestion을 냅니다.
 
-Intake 결과는 `output/<contest>/intake.json`과 `INTAKE.md`에 저장됩니다. 문제별 solve 결과에는 context, state, findings, evidence, exploit, reproduce script, result가 필요한 만큼 생성됩니다.
-
-Sandbox 기본 이미지는 다음처럼 한 번 빌드합니다.
+## 대회 전 준비
 
 ```bash
-docker build -f sandbox/Dockerfile.sandbox -t ctf-os-sandbox:latest .
+uv sync --frozen
+sandbox/build-images.sh
+uv run python -m ctf_os.agent_tools doctor
 ```
 
-무거운 도구는 `--build-arg CTF_OS_PROFILE=rev-heavy`, `crypto-heavy`, `forensic-heavy`로 필요할 때만 빌드합니다. 네트워크는 manifest에 선언된 public TCP 목적지로만 제한되며, HTTP(S)는 IP/port와 hostname mapping으로 제한됩니다. 공유 IP의 다른 virtual host까지 암호학적으로 구분하는 egress proxy는 구현하지 않았습니다.
+`sandbox/build-images.sh`는 단일 Dockerfile에서 다음 태그를 미리 빌드합니다.
 
-플래그 제출은 항상 사람이 직접 수행합니다.
+```text
+ctf-os-sandbox:base      common CLI/build/Python tools
+ctf-os-sandbox:pwn       gdb, qemu-user, patchelf, pwntools
+ctf-os-sandbox:web       Node/npm, PHP, SQLite, Flask/FastAPI/JWT
+ctf-os-sandbox:rev       radare2, Java, qemu-user, angr
+ctf-os-sandbox:crypto    PARI/GP, gmpy2, fpylll, z3, pycryptodome
+ctf-os-sandbox:forensic  binwalk, exiftool, sleuthkit, tshark, Volatility3, media/OCR
+```
+
+Ubuntu 24.04에서 full SageMath는 기본 패키지로 제공되지 않아 crypto image에 넣지 않았습니다. Sage 전용 문제가 확인된 경우에만 승인된 별도 image를 사용합니다. 모든 tag의 기본 probe 예시는 다음과 같습니다.
+
+```bash
+docker run --rm --network none ctf-os-sandbox:base python3 --version
+docker run --rm --network none ctf-os-sandbox:pwn gdb --version
+docker run --rm --network none ctf-os-sandbox:web node --version
+docker run --rm --network none ctf-os-sandbox:rev python3 -c 'import angr; print(angr.__version__)'
+docker run --rm --network none ctf-os-sandbox:crypto python3 -c 'import gmpy2,fpylll,z3,Crypto'
+docker run --rm --network none ctf-os-sandbox:forensic binwalk --help
+```
+
+## 내부 실행 계약
+
+Intake는 중요 파일만 `CONTEXT.md`에 넣고 full inventory는 on-demand JSON으로 분리합니다. category image와 `light`, `standard`, `heavy`, `large-forensic` resource profile을 추천합니다. Admission control은 light 3개, standard 2개, heavy 계열 1개와 host memory budget을 강제합니다.
+
+Dockerfile/Compose 문제는 Docker-in-Docker 없이 host sibling service로 실행됩니다. 각 문제의 label-scoped container와 `ctf-os-net-*` internal network만 만들며 host port와 egress를 제거합니다. privileged, Docker socket, host namespace/device/root 또는 repository 밖 bind, broad capability 등은 `NEEDS_REVIEW`로 차단합니다. 관련 JSON tool은 `service-plan/build/start/status/stop/cleanup`입니다.
+
+Sandbox command는 `/artifacts` 전체를 매번 복사하지 않습니다. `sandbox-export`가 명시적으로 내보내고 cleanup이 최종 export를 수행합니다. `sandbox-status`와 `sandbox-gc`는 active/stale 상태를 확인하고 label-scoped resource만 정리합니다.
+
+최종 solver는 `exploit/`와 구조화된 `REPRODUCE.json`에 저장합니다. `replay`가 current fingerprint를 확인하고 깨끗한 sandbox 두 개에서 독립 실행하며, remote 문제는 별도의 allowlisted sandbox와 firewall counter observation을 요구합니다. 생성되는 `reproduce.sh`는 이 내부 replay만 호출하고 host에서 exploit를 직접 실행하지 않습니다. 제출은 항상 사람이 합니다.
+
+## 내부 평가
+
+`eval/run_eval.py`는 사람이 연 Sol session에서 기록한 `solo`/`adaptive` receipt를 비교합니다. 모델을 시작하지 않으며 paired evidence가 solve rate, median time 또는 agent efficiency 개선을 보일 때만 개선으로 표시합니다.
+
+```bash
+uv run python eval/run_eval.py eval/results/*.json --output eval/summary.json
+```
+
+공유 IP의 다른 HTTP virtual host를 IP firewall만으로 완전히 분리할 수는 없습니다. HTTPS는 TLS SNI/인증서 검증을 solver가 유지해야 하며, organizer remote가 없는 환경에서는 remote replay 성능을 주장하지 않습니다.

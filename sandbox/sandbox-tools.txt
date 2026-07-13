@@ -1,11 +1,16 @@
 CTF-OS SANDBOX CAPABILITIES
 
-Base: file/binutils, gdb/strace/ltrace, curl/nc/socat, gcc/g++, Python,
-pwntools, pycryptodome, sympy, z3, capstone, unicorn, ROPgadget, requests.
+Base: bash/curl/wget/nc/socat/jq, file/binutils/xxd/strings, gcc/g++/make,
+Python, Git/ripgrep, pwntools, pycryptodome, sympy, z3, capstone,
+unicorn, ROPgadget, and requests.
 
-Optional build targets add rev, crypto, or forensic-heavy packages. Build only
-the profile a challenge needs. Nested container engines and Codex are absent.
+Category build targets add pwn, web, rev, crypto, or forensic packages. Nested
+container engines and Codex are absent.
+
+Crypto includes PARI/GP, gmpy2, fpylll/cysignals, z3, sympy, and pycryptodome. SageMath
+is intentionally not an Ubuntu 24.04 package dependency; use an approved
+separate image when a challenge specifically requires the full Sage runtime.
 
 Challenge input is mounted read-only at /challenge. /work and /artifacts are
-attempt-private, size-bounded tmpfs mounts. Files in /artifacts are safely
-exported to the selected branch after each internal sandbox command.
+attempt-private, size-bounded tmpfs mounts. Files in /artifacts are exported
+explicitly, on flag discovery, and before cleanup instead of after every command.

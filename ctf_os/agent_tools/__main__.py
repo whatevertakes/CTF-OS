@@ -8,10 +8,16 @@ import sys
 from ..challenge import SelectionError, resolve_selector
 from ..contest import ContestError, discover_contests, select_contest
 from ..evidence import append_finding
-from ..flags import verify_and_record
 from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
+from ..doctor import run_doctor
+from ..replay import run_replay
 from ..sandbox.network import parse_remotes, resolve_targets
-from ..sandbox.runtime import SandboxSpec, cleanup, create, execute
+from ..sandbox.resources import sandbox_gc, sandbox_status
+from ..sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts
+from ..service import (
+    ServiceSpec, service_build, service_cleanup, service_plan,
+    service_start, service_status, service_stop,
+)
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
 
 
@@ -34,7 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     sandbox_create.add_argument("selector")
     sandbox_create.add_argument("--contest")
     sandbox_create.add_argument("--branch", required=True)
-    sandbox_create.add_argument("--image", default="ctf-os-sandbox:latest")
+    sandbox_create.add_argument("--image")
+    sandbox_create.add_argument("--resource-profile")
+    sandbox_create.add_argument("--service", action="store_true", help=argparse.SUPPRESS)
     sandbox_exec = commands.add_parser("sandbox-exec")
     sandbox_exec.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_exec.add_argument("metadata")
@@ -43,6 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
     sandbox_cleanup = commands.add_parser("sandbox-cleanup")
     sandbox_cleanup.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_cleanup.add_argument("metadata")
+    sandbox_export = commands.add_parser("sandbox-export")
+    sandbox_export.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    sandbox_export.add_argument("metadata")
+    commands.add_parser("sandbox-status")
+    commands.add_parser("sandbox-gc")
+    commands.add_parser("doctor")
+    for name in ("service-plan", "service-build", "service-start", "service-status", "service-stop", "service-cleanup"):
+        service = commands.add_parser(name)
+        service.add_argument("selector")
+        service.add_argument("--contest")
+    replay = commands.add_parser("replay")
+    replay.add_argument("selector")
+    replay.add_argument("--contest")
     finding = commands.add_parser("record-finding")
     finding.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     finding.add_argument("selector")
@@ -51,18 +72,6 @@ def build_parser() -> argparse.ArgumentParser:
     finding.add_argument("--status", required=True, choices=("supported", "rejected", "inconclusive"))
     finding.add_argument("--summary", required=True)
     finding.add_argument("--evidence", required=True)
-    verify = commands.add_parser("verify-result")
-    verify.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    verify.add_argument("selector")
-    verify.add_argument("--contest")
-    verify.add_argument("--flag", required=True)
-    verify.add_argument("--local", action="store_true")
-    verify.add_argument("--remote", action="store_true")
-    verify.add_argument("--independent", action="store_true")
-    verify.add_argument("--reproduce-command", required=True)
-    verify.add_argument("--local-evidence", required=True, help="unique substring identifying a successful sandbox receipt")
-    verify.add_argument("--independent-evidence", required=True, help="unique substring identifying a different successful sandbox receipt")
-    verify.add_argument("--remote-evidence", help="unique substring identifying remote reproduction")
     return parser
 
 
@@ -82,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def dispatch(root: Path, args: argparse.Namespace) -> object:
+    if args.command == "doctor":
+        return run_doctor(root)
+    if args.command == "sandbox-status":
+        return sandbox_status()
+    if args.command == "sandbox-gc":
+        return sandbox_gc()
     if args.command == "inspect-contest":
         contest = select_contest(discover_contests(root / "incoming"), args.contest)
         return contest.to_dict()
@@ -111,12 +126,24 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         result = cleanup(metadata)
         _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "CLEANED", str(metadata["metadata_path"]))
         return result
+    if args.command == "sandbox-export":
+        return export_artifacts(_load_metadata(root, args.metadata))
 
     manifest, challenge, record = _load_challenge(root, args.contest, args.selector)
     solve_root = challenge_root(root, manifest, challenge)
     initialize_solve_files(solve_root, challenge)
     if args.command == "prepare-challenge":
-        return {"challenge": challenge.to_dict(), "context": record, "solve_root": str(solve_root)}
+        return _compact_prepare(challenge, record, solve_root)
+    if args.command.startswith("service-"):
+        spec = _service_spec(manifest, challenge, record, solve_root)
+        operation = {
+            "service-plan": service_plan, "service-build": service_build,
+            "service-start": service_start, "service-status": service_status,
+            "service-stop": service_stop, "service-cleanup": service_cleanup,
+        }[args.command]
+        return operation(spec)
+    if args.command == "replay":
+        return run_replay(root, manifest, challenge, record)
     if args.command == "sandbox-create":
         if record["status"] != "READY":
             raise ValueError(f"challenge is not READY: {record.get('blockers')}")
@@ -133,11 +160,28 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             raise ValueError("intake index prepared_input is outside the selected challenge workspace")
         if record.get("prepared_fingerprint") != prepared_tree_fingerprint(input_path):
             raise ValueError("prepared challenge input changed after intake; rerun intake")
+        image = args.image or str(record.get("recommended_image") or f"ctf-os-sandbox:{challenge.category if challenge.category in {'pwn', 'web', 'rev', 'crypto', 'forensic'} else 'base'}")
+        profile = args.resource_profile or str(record.get("recommended_resource_profile") or "standard")
+        targets = resolve_targets(parse_remotes(challenge.remotes))
+        service_network = None
+        endpoints: tuple[str, ...] = ()
+        if args.service:
+            service = _service_spec(manifest, challenge, record, solve_root)
+            status = service_status(service)
+            if not status.get("running"):
+                raise ValueError("challenge service is not running; call service-start first")
+            targets = ()
+            service_network = service.network
+            endpoints = tuple(
+                str(item["internal_target"]) for item in dict(record.get("service_plan") or {}).get("services", [])
+                if isinstance(item, dict) and item.get("internal_target")
+            )
         spec = SandboxSpec(
             contest_slug=manifest.slug, challenge_id=challenge.id, branch=args.branch,
             source=expected_source, branch_root=branch_root,
             input_fingerprint=str(record["source_fingerprint"]),
-            targets=resolve_targets(parse_remotes(challenge.remotes)), image=args.image,
+            targets=targets, image=image, resource_profile=profile,
+            service_network=service_network, local_endpoints=endpoints,
         )
         metadata = create(spec)
         try:
@@ -148,26 +192,52 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return metadata
     if args.command == "record-finding":
         return append_finding(solve_root, args.branch, args.summary, args.evidence, args.status)
-    if args.command == "verify-result":
-        (solve_root / "exploit").mkdir(exist_ok=True)
-        state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
-        if state.get("input_fingerprint") != record.get("source_fingerprint"):
-            raise ValueError("STATE.json is not bound to the current intake fingerprint; rerun intake")
-        evidence_refs = {"local": args.local_evidence, "independent": args.independent_evidence}
-        if challenge.remotes:
-            if not args.remote_evidence:
-                raise ValueError("remote challenge verification requires --remote-evidence")
-            evidence_refs["remote"] = args.remote_evidence
-        return verify_and_record(
-            solve_root, flag=args.flag, pattern=challenge.flag_pattern,
-            has_remote=bool(challenge.remotes), local_reproduced=args.local,
-            remote_reproduced=args.remote, independent_rerun=args.independent,
-            reproduce_command=args.reproduce_command,
-            evidence_refs=evidence_refs, require_recorded_evidence=True,
-            remote_hosts=tuple(target.host for target in parse_remotes(challenge.remotes)),
-            input_fingerprint=str(record["source_fingerprint"]),
-        )
     raise ValueError(f"unsupported internal command: {args.command}")
+
+
+def _service_spec(manifest, challenge, record: dict[str, object], solve_root: Path) -> ServiceSpec:
+    plan = record.get("service_plan")
+    if not isinstance(plan, dict) or not plan.get("kind"):
+        raise ValueError("intake found no Dockerfile/Compose challenge service plan")
+    return ServiceSpec(
+        contest_slug=manifest.slug, challenge_id=challenge.id,
+        source=solve_root / "input", workspace=solve_root, service_plan=plan,
+    )
+
+
+def _compact_prepare(challenge, record: dict[str, object], solve_root: Path) -> dict[str, object]:
+    files = list(record.get("files") or [])
+    priority_names = set(record.get("priority_files") or [])
+    priority = [item for item in files if isinstance(item, dict) and item.get("path") in priority_names]
+    if not priority:
+        priority = [item for item in files[:20] if isinstance(item, dict)]
+    return {
+        "challenge": challenge.to_dict(),
+        "priority_files": priority,
+        "important_metadata": {
+            "file_count": record.get("file_count", len(files)),
+            "total_size": record.get("total_size", sum(int(item.get("size", 0)) for item in files if isinstance(item, dict))),
+            "subtype": record.get("subtype"), "runtime": record.get("runtime", []),
+        },
+        "initial_attack_surface": record.get("attack_surface", []),
+        "recommended_image": record.get("recommended_image", "ctf-os-sandbox:base"),
+        "recommended_resource_profile": record.get("recommended_resource_profile", "standard"),
+        "service_plan": record.get("service_plan", {}),
+        "state_summary": _state_summary(solve_root),
+        "read_on_demand": [
+            str(solve_root / "inventory.json"), str(solve_root / "evidence.log"),
+            str(solve_root / "findings.jsonl"), str(solve_root / "workers"),
+        ],
+        "solve_root": str(solve_root),
+    }
+
+
+def _state_summary(solve_root: Path) -> dict[str, object]:
+    path = solve_root / "STATE.json"
+    if not path.is_file():
+        return {}
+    state = json.loads(path.read_text(encoding="utf-8"))
+    return {key: state.get(key) for key in ("status", "flag_candidate", "branches", "input_fingerprint", "updated_at")}
 
 
 def _load_challenge(root: Path, contest_selector: str | None, selector: str):

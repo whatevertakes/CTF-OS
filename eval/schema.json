@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CTF-OS internal evaluation receipt",
+  "type": "object",
+  "required": ["fixture", "mode", "solved", "verified_flag", "elapsed_seconds", "child_agents", "cleanup_success"],
+  "properties": {
+    "fixture": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["solo", "adaptive"]},
+    "solved": {"type": "boolean"},
+    "verified_flag": {"type": "boolean"},
+    "elapsed_seconds": {"type": "number", "minimum": 0},
+    "time_to_first_hypothesis": {"type": ["number", "null"], "minimum": 0},
+    "time_to_exploit": {"type": ["number", "null"], "minimum": 0},
+    "time_to_flag": {"type": ["number", "null"], "minimum": 0},
+    "child_agents": {"type": "integer", "minimum": 0},
+    "branches_created": {"type": "integer", "minimum": 0},
+    "branches_ended": {"type": "integer", "minimum": 0},
+    "sandbox_commands": {"type": "integer", "minimum": 0},
+    "context_bytes": {"type": "integer", "minimum": 0},
+    "evidence_bytes": {"type": "integer", "minimum": 0},
+    "duplicate_work_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "false_flags": {"type": "integer", "minimum": 0},
+    "local_replay": {"type": ["boolean", "null"]},
+    "remote_replay": {"type": ["boolean", "null"]},
+    "cleanup_success": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}
