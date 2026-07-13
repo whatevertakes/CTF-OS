@@ -11,6 +11,7 @@ from ..evidence import append_finding
 from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
 from ..doctor import run_doctor
 from ..replay import run_replay
+from ..problems import sync_contest_manifest
 from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import sandbox_gc, sandbox_status
@@ -111,6 +112,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "sandbox-gc":
         return sandbox_gc()
     if args.command == "inspect-contest":
+        sync_contest_manifest(root, args.contest)
         contest = select_contest(discover_contests(root / "incoming"), args.contest)
         return contest.to_dict()
     if args.command == "intake":

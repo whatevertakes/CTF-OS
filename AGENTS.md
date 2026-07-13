@@ -4,7 +4,7 @@ CTF-OS is a support toolkit for the Sol session the user opened in this reposito
 
 ## User manifest and scope
 
-- `incoming/<contest>/contest.md` is the only user configuration.
+- `incoming/<contest>/problems.txt` is the only user-maintained contest input. `contest.md` is an internal manifest generated from it by Intake.
 - Work only on challenge files under that contest and remotes explicitly declared there.
 - Never access credentials, SSH keys, browser data, personal files, host configuration, or unrelated networks.
 - Never automate CTFd login or flag submission. Give a verified candidate to the human.

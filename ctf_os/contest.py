@@ -1,4 +1,4 @@
-"""Parse the only user-maintained manifest: ``incoming/<contest>/contest.md``."""
+"""Parse the internal Intake manifest: ``incoming/<contest>/contest.md``."""
 
 from __future__ import annotations
 

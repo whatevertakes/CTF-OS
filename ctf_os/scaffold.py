@@ -5,6 +5,8 @@ from __future__ import annotations
 import unicodedata
 from pathlib import Path
 
+from .problems import problems_template
+
 
 DEFAULT_CATEGORIES = ("pwn", "rev", "web", "forensic", "misc", "crypto")
 
@@ -29,27 +31,26 @@ def initialize_contest(root: Path, name: str) -> dict[str, object]:
         _ensure_directory(category_path)
         category_paths.append(str(category_path))
 
-    manifest = contest_root / "contest.md"
-    created_manifest = False
-    if manifest.exists() or manifest.is_symlink():
-        if manifest.is_symlink() or not manifest.is_file():
-            raise ValueError(f"contest manifest path is unsafe: {manifest}")
+    problems = contest_root / "problems.txt"
+    created_problems = False
+    if problems.exists() or problems.is_symlink():
+        if problems.is_symlink() or not problems.is_file():
+            raise ValueError(f"problems.txt path is unsafe: {problems}")
     else:
-        template = _contest_template(contest_name)
         try:
-            with manifest.open("x", encoding="utf-8") as handle:
-                handle.write(template)
+            with problems.open("x", encoding="utf-8") as handle:
+                handle.write(problems_template(contest_name))
         except FileExistsError:
-            if manifest.is_symlink() or not manifest.is_file():
-                raise ValueError(f"contest manifest path is unsafe: {manifest}")
+            if problems.is_symlink() or not problems.is_file():
+                raise ValueError(f"problems.txt path is unsafe: {problems}")
         else:
-            created_manifest = True
+            created_problems = True
 
     return {
         "contest": contest_name,
         "contest_path": str(contest_root),
-        "manifest_path": str(manifest),
-        "manifest_created": created_manifest,
+        "problems_path": str(problems),
+        "problems_created": created_problems,
         "categories": list(DEFAULT_CATEGORIES),
         "category_paths": category_paths,
     }
@@ -61,27 +62,3 @@ def _ensure_directory(path: Path) -> None:
             raise ValueError(f"directory path is unsafe: {path}")
         return
     path.mkdir()
-
-
-def _contest_template(contest_name: str) -> str:
-    lines = [
-        f"# 대회명: {contest_name}",
-        "",
-        "- 날짜: 2026-01-01",
-        "- 플래그 형식: CTF{...}",
-        "- 입력 프로필: standard",
-        "",
-        "## 문제 등록",
-        "",
-        "날짜와 플래그 형식만 실제 값으로 바꾸고, 필요한 카드를 복사해 이 섹션 위에 붙여 넣으세요.",
-        "",
-    ]
-    for category in DEFAULT_CATEGORIES:
-        lines.extend([f"### {category} 등록 카드", "", "```markdown"])
-        lines.extend([
-            f"### {category}/문제명",
-            "- 설명: 문제 원문 설명",
-            "- 원격: nc host.example 31337",
-        ])
-        lines.extend(["```", ""])
-    return "\n".join(lines)

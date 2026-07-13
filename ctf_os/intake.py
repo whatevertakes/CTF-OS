@@ -17,6 +17,7 @@ import yaml
 
 from .archive import ArchiveError, ArchiveLimits, bounded_source_files, copy_tree_without_links, extract_archive
 from .contest import ChallengeSpec, ContestManifest, discover_contests, select_contest
+from .problems import sync_contest_manifest
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json, atomic_text, bind_input_fingerprint, challenge_root
 
@@ -32,6 +33,7 @@ _ARCHIVE_LIMITS = {
 
 def run_intake(repo: str | Path, contest_selector: str | None = None) -> dict[str, object]:
     root = Path(repo).resolve()
+    sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     records = [_inspect_challenge(root, manifest, challenge) for challenge in manifest.challenges]
     payload: dict[str, object] = {
