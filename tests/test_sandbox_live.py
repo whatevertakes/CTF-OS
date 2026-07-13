@@ -33,6 +33,8 @@ def test_live_ro_writes_network_timeout_and_cleanup(tmp_path: Path) -> None:
         assert network["exit_code"] != 0
     finally:
         cleanup(metadata)
+    assert (branch / "work" / "proof.txt").read_text().strip() == "work"
+    assert (branch / "context" / "session.json").is_file()
     assert subprocess.run(["docker", "inspect", metadata["name"]], capture_output=True).returncode != 0
 
     timeout_branch = tmp_path / "challenge" / "workers" / "timeout"

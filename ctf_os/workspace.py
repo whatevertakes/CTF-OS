@@ -77,6 +77,7 @@ def initialize_solve_files(root: Path, challenge: ChallengeSpec, input_fingerpri
             atomic_json(state, {
                 "schema_version": 1, "challenge_id": challenge.id, "status": "PREPARED",
                 "branches": [], "flag_candidate": None, "verification": {},
+                "replay_verdict": None,
                 "input_fingerprint": input_fingerprint,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
@@ -101,7 +102,10 @@ def bind_input_fingerprint(root: Path, challenge: ChallengeSpec, fingerprint: st
                 if not archive.exists():
                     atomic_text(archive, result.read_text(encoding="utf-8"))
                 atomic_text(result, "# Result invalidated\n\nChallenge input changed. Rerun and reverify the solver.\n")
-            state.update({"status": "PREPARED", "flag_candidate": None, "verification": {}, "branches": []})
+            state.update({
+                "status": "PREPARED", "flag_candidate": None, "verification": {},
+                "replay_verdict": None, "branches": [],
+            })
         state["input_fingerprint"] = fingerprint
         atomic_json(state_path, state)
 

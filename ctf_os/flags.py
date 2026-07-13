@@ -55,16 +55,38 @@ def verify_and_record(
     require_recorded_evidence: bool = True,
     remote_hosts: tuple[str, ...] = (),
     input_fingerprint: str | None = None,
+    local_success_marker: str | None = None,
+    remote_flag_candidate: str | None = None,
+    remote_exploit_confirmed: bool | None = None,
+    exploit_path_matched: bool = True,
+    same_flag_required: bool = False,
+    local_success_pattern: str | None = None,
+    remote_success_pattern: str | None = None,
 ) -> dict[str, object]:
-    pattern_match = matches_flag(flag, pattern)
+    local_marker = local_success_marker if local_success_marker is not None else (flag if local_reproduced else None)
+    remote_flag = remote_flag_candidate if remote_flag_candidate is not None else (flag if has_remote and remote_reproduced else None)
+    selected_flag = remote_flag or flag or local_marker or ""
+    pattern_match = matches_flag(selected_flag, pattern)
+    remote_pattern_match = bool(remote_flag and matches_flag(remote_flag, pattern))
+    remote_confirmed = remote_reproduced if remote_exploit_confirmed is None else remote_exploit_confirmed
     verification = {
         "local_reproduction": local_reproduced,
-        "remote_reproduction": remote_reproduced if has_remote else None,
+        "remote_reproduction": remote_confirmed if has_remote else None,
         "independent_rerun": independent_rerun, "flag_pattern": pattern_match,
-        "placeholder_rejected": not _is_placeholder(flag),
+        "placeholder_rejected": not _is_placeholder(selected_flag),
+        "local_reproduced": local_reproduced,
+        "local_success_marker": local_marker,
+        "remote_exploit_confirmed": remote_confirmed if has_remote else False,
+        "remote_flag_obtained": remote_pattern_match if has_remote else False,
+        "remote_flag_pattern_matched": remote_pattern_match if has_remote else False,
+        "remote_flag_candidate": remote_flag,
+        "same_flag_required": same_flag_required,
+        "same_flag": bool(local_marker and remote_flag and local_marker == remote_flag) if has_remote else None,
+        "exploit_path_matched": exploit_path_matched if has_remote else True,
     }
     recorded = _verify_evidence_receipts(
-        root / "evidence.log", flag, evidence_refs or {}, has_remote, remote_hosts, input_fingerprint,
+        root / "evidence.log", {"local": local_marker, "independent": local_marker, "remote": remote_flag},
+        evidence_refs or {}, has_remote, remote_hosts, input_fingerprint,
     )
     verification["recorded_evidence"] = recorded
     exploit_root = root / "exploit"
@@ -72,8 +94,41 @@ def verify_and_record(
         path.is_file() and not path.is_symlink() for path in exploit_root.rglob("*")
     )
     verification["exploit_present"] = exploit_present
-    evidence_ok = recorded["complete"] if require_recorded_evidence else True
-    ready = local_reproduced and independent_rerun and pattern_match and exploit_present and evidence_ok and (remote_reproduced if has_remote else True)
+    local_evidence_ok = all(recorded["matches"].get(kind) is not None for kind in ("local", "independent")) if require_recorded_evidence else True
+    remote_evidence_ok = recorded["matches"].get("remote") is not None if require_recorded_evidence and has_remote else True
+    local_exploit_confirmed = bool(local_reproduced and independent_rerun and local_marker and exploit_present and local_evidence_ok)
+    remote_exploit_proven = bool(has_remote and remote_confirmed and remote_evidence_ok)
+    remote_flag_obtained = bool(has_remote and remote_flag and remote_pattern_match and remote_evidence_ok)
+    same_flag_ok = not same_flag_required or bool(local_marker and remote_flag and local_marker == remote_flag)
+    if has_remote:
+        fully_verified = bool(local_exploit_confirmed and remote_exploit_proven and remote_flag_obtained and exploit_path_matched and same_flag_ok)
+        if fully_verified:
+            verdict = "FULLY_VERIFIED"
+        elif remote_flag_obtained:
+            verdict = "REMOTE_FLAG_OBTAINED"
+        elif remote_exploit_proven:
+            verdict = "REMOTE_EXPLOIT_CONFIRMED"
+        elif local_exploit_confirmed:
+            verdict = "LOCAL_EXPLOIT_CONFIRMED"
+        elif local_reproduced:
+            verdict = "LOCAL_REPRODUCED"
+        else:
+            verdict = "BLOCKED"
+    else:
+        fully_verified = local_exploit_confirmed and pattern_match
+        verdict = (
+            "FULLY_VERIFIED" if fully_verified else
+            "LOCAL_EXPLOIT_CONFIRMED" if local_exploit_confirmed else
+            "LOCAL_REPRODUCED" if local_reproduced else "BLOCKED"
+        )
+    verification.update({
+        "local_exploit_confirmed": local_exploit_confirmed,
+        "remote_exploit_confirmed": remote_exploit_proven,
+        "remote_flag_obtained": remote_flag_obtained,
+        "fully_verified": fully_verified,
+        "verdict": verdict,
+    })
+    ready = fully_verified
     state_path = root / "STATE.json"
     with state_lock(root):
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -81,7 +136,8 @@ def verify_and_record(
             raise FlagVerificationError("challenge input fingerprint changed during verification")
         state.update({
             "status": "READY_FOR_HUMAN_SUBMISSION" if ready else "VERIFICATION_REQUIRED",
-            "flag_candidate": flag, "verification": verification,
+            "flag_candidate": selected_flag or None, "verification": verification,
+            "replay_verdict": verdict,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
         atomic_json(state_path, state)
@@ -94,9 +150,14 @@ def verify_and_record(
             "argv": argv,
             "expected_flag_pattern": pattern,
             "input_fingerprint": input_fingerprint or state.get("input_fingerprint"),
+            "same_flag_required": same_flag_required,
         }
         if remote_argv:
             contract["remote_argv"] = remote_argv
+        if local_success_pattern:
+            contract["local_success_pattern"] = local_success_pattern
+        if remote_success_pattern:
+            contract["remote_success_pattern"] = remote_success_pattern
         atomic_json(root / "REPRODUCE.json", contract)
         repo, contest, selector = _replay_coordinates(root, state)
         reproduce = (
@@ -109,18 +170,19 @@ def verify_and_record(
         (root / "reproduce.sh").chmod(0o755)
         result = [
             f"# Result — {state.get('challenge_id', 'challenge')}", "",
-            f"- Status: **{state['status']}**", f"- Flag candidate: `{flag}`", "",
+            f"- Status: **{state['status']}**", f"- Replay verdict: **{verdict}**",
+            f"- Flag candidate: `{selected_flag}`", "",
             "## Verification", "",
             f"- Local reproduction: {'success' if local_reproduced else 'not verified'}",
-            f"- Remote reproduction: {'success' if remote_reproduced else ('not required' if not has_remote else 'not verified')}",
+            f"- Remote reproduction: {'success' if remote_confirmed else ('not required' if not has_remote else 'not verified')}",
             f"- Independent rerun: {'success' if independent_rerun else 'not verified'}",
             f"- Flag pattern: {'match' if pattern_match else 'mismatch'}", "",
             "## Reproduce", "", f"`bash {root / 'reproduce.sh'}`", "",
             "The human must submit the flag manually. No submission was attempted.",
         ]
         atomic_text(root / "RESULT.md", "\n".join(result) + "\n")
-        append_evidence(root / "evidence.log", "result_verification", {"flag_candidate": flag, "ready": ready, "verification": verification})
-    return {"ready_for_human_submission": ready, "status": state["status"], "verification": verification, "result_path": str(root / "RESULT.md")}
+        append_evidence(root / "evidence.log", "result_verification", {"flag_candidate": selected_flag or None, "ready": ready, "verification": verification})
+    return {"ready_for_human_submission": ready, "status": state["status"], "verdict": verdict, "verification": verification, "result_path": str(root / "RESULT.md")}
 
 
 def _legacy_argv(command: str | None) -> list[str]:
@@ -155,7 +217,7 @@ def _replay_coordinates(root: Path, state: dict[str, object]) -> tuple[Path, str
 
 
 def _verify_evidence_receipts(
-    path: Path, flag: str, refs: dict[str, str], has_remote: bool, remote_hosts: tuple[str, ...],
+    path: Path, expected: dict[str, str | None], refs: dict[str, str], has_remote: bool, remote_hosts: tuple[str, ...],
     input_fingerprint: str | None,
 ) -> dict[str, object]:
     required = ["local", "independent"] + (["remote"] if has_remote else [])
@@ -167,7 +229,7 @@ def _verify_evidence_receipts(
             except json.JSONDecodeError:
                 continue
             fingerprint_ok = input_fingerprint is None or record.get("input_fingerprint") == input_fingerprint
-            if record.get("event") == "replay_exec" and record.get("exit_code") == 0 and flag in str(record.get("stdout", "")) and fingerprint_ok:
+            if record.get("event") == "replay_exec" and record.get("exit_code") == 0 and fingerprint_ok:
                 records.append(record)
     matches: dict[str, int | None] = {}
     used: set[int] = set()
@@ -175,10 +237,12 @@ def _verify_evidence_receipts(
         reference = refs.get(kind, "")
         found = None
         for index, record in enumerate(records):
+            candidate = expected.get(kind)
             serialized = json.dumps(record, ensure_ascii=False, sort_keys=True)
             configured_hosts = {str(item.get("host")) for item in record.get("authorized_targets", []) if isinstance(item, dict)}
             remote_ok = kind != "remote" or (record.get("authorized_network_observed") is True and bool(configured_hosts.intersection(remote_hosts)))
-            if index not in used and reference and reference in serialized and remote_ok:
+            candidate_ok = candidate in str(record.get("stdout", "")) if candidate else kind == "remote"
+            if index not in used and reference and reference in serialized and remote_ok and candidate_ok:
                 found = index
                 break
         matches[kind] = found

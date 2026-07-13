@@ -7,13 +7,17 @@ contest/challenge.  It never enumerates or removes unlabelled Docker objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from .workspace import atomic_json, atomic_text
 
@@ -23,6 +27,31 @@ Runner = Callable[[Sequence[str], int], subprocess.CompletedProcess[str]]
 
 class ServiceError(RuntimeError):
     """An actionable, deterministic challenge-service failure."""
+
+
+class ServiceBusy(ServiceError):
+    """A lifecycle mutation could not acquire or take ownership of a service."""
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceActor:
+    """Identity presented to the host-side lifecycle controller.
+
+    Callers which predate service ownership are treated as the active parent Sol
+    session.  Native child sessions must explicitly use ``role="child"``; that
+    role is rejected in this module before Docker is invoked.
+    """
+
+    session_id: str = "sol-main"
+    role: str = "sol"
+    parent_session_id: str | None = None
+    process_id: int = 0
+    lease_seconds: int = 300
+    recover_stale: bool = False
+
+    @property
+    def pid(self) -> int:
+        return self.process_id or os.getpid()
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +88,18 @@ class ServiceSpec:
     @property
     def metadata_path(self) -> Path:
         return self.runtime_root / "service.json"
+
+    @property
+    def ownership_path(self) -> Path:
+        return self.runtime_root / "SERVICE_OWNER.json"
+
+    @property
+    def lifecycle_lock_path(self) -> Path:
+        return self.runtime_root / ".lifecycle.lock"
+
+    @property
+    def stable_alias(self) -> str:
+        return "challenge-service"
 
     @property
     def labels(self) -> dict[str, str]:
@@ -115,87 +156,137 @@ def service_plan(spec: ServiceSpec, *, runner: Runner | None = None, docker: str
     }
 
 
-def service_build(spec: ServiceSpec, *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def service_build(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     runner = runner or _run
-    checked = service_plan(spec, runner=runner, docker=docker)
-    _require_safe(checked)
-    _prepare_runtime_root(spec)
-    kind = str(checked["kind"])
-    if kind == "dockerfile":
-        request = _runtime_request(spec)
-        context = _scoped_path(spec.source, request.get("build_context", "."), "build context", must_dir=True)
-        dockerfile = _scoped_path(spec.source, request.get("dockerfile", "Dockerfile"), "Dockerfile", must_file=True)
-        image = f"{spec.project}:local"
-        argv = [docker, "build", "--file", str(dockerfile), "--tag", image]
-        for key, value in sorted(_build_args(request.get("build_args")).items()):
-            argv.extend(["--build-arg", f"{key}={value}"])
-        for key, value in spec.labels.items():
-            argv.extend(["--label", f"{key}={value}"])
-        argv.append(str(context))
-    else:
-        compose = _compose_file(spec)
-        override = _write_compose_override(spec, dict(checked.get("resolved_compose") or {}))
-        argv = _compose_argv(spec, compose, override, docker) + ["build"]
-    result = runner(argv, spec.build_timeout)
-    _log(spec, "build", argv, result)
-    if result.returncode:
-        raise ServiceError(f"challenge service build failed: {_detail(result)}")
-    metadata = _metadata(spec, checked, image=(image if kind == "dockerfile" else None), status="BUILT")
-    atomic_json(spec.metadata_path, metadata)
-    return metadata
+    active = actor or ServiceActor()
+    with _lifecycle(spec, active, "build", runner, docker):
+        checked = service_plan(spec, runner=runner, docker=docker)
+        _require_safe(checked)
+        kind = str(checked["kind"])
+        if kind == "dockerfile":
+            request = _runtime_request(spec)
+            context = _scoped_path(spec.source, request.get("build_context", "."), "build context", must_dir=True)
+            dockerfile = _scoped_path(spec.source, request.get("dockerfile", "Dockerfile"), "Dockerfile", must_file=True)
+            image = f"{spec.project}:local"
+            argv = [docker, "build", "--file", str(dockerfile), "--tag", image]
+            for key, value in sorted(_build_args(request.get("build_args")).items()):
+                argv.extend(["--build-arg", f"{key}={value}"])
+            for key, value in spec.labels.items():
+                argv.extend(["--label", f"{key}={value}"])
+            argv.append(str(context))
+        else:
+            compose = _compose_file(spec)
+            override = _write_compose_override(spec, dict(checked.get("resolved_compose") or {}))
+            argv = _compose_argv(spec, compose, override, docker) + ["build"]
+        result = runner(argv, spec.build_timeout)
+        _log(spec, "build", argv, result)
+        if result.returncode:
+            raise ServiceError(f"challenge service build failed: {_detail(result)}")
+        metadata = _metadata(spec, checked, image=(image if kind == "dockerfile" else None), status="BUILT")
+        atomic_json(spec.metadata_path, metadata)
+        _update_ownership(spec, active, "BUILT")
+        return metadata
 
 
-def service_start(spec: ServiceSpec, *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def service_start(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     runner = runner or _run
-    checked = service_plan(spec, runner=runner, docker=docker)
-    _require_safe(checked)
-    _prepare_runtime_root(spec)
-    _ensure_network(spec, runner, docker)
-    kind = str(checked["kind"])
-    if kind == "dockerfile":
-        image = f"{spec.project}:local"
-        name = f"{spec.project}-main"
-        request = _runtime_request(spec)
-        argv = [
-            docker, "run", "--detach", "--name", name,
-            "--network", spec.network, "--network-alias", _dockerfile_alias(request),
-            "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
-            "--memory", spec.memory, "--cpus", str(spec.cpus),
-            "--pids-limit", str(spec.pids), "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m",
-        ]
-        for key, value in spec.labels.items():
-            argv.extend(["--label", f"{key}={value}"])
-        for key, value in sorted(_runtime_environment(request.get("environment")).items()):
-            argv.extend(["--env", f"{key}={value}"])
-        argv.append(image)
-        command = request.get("command")
-        if isinstance(command, list) and all(isinstance(item, str) for item in command):
-            argv.extend(command)
-    else:
-        compose = _compose_file(spec)
-        override = _write_compose_override(spec, dict(checked.get("resolved_compose") or {}))
-        argv = _compose_argv(spec, compose, override, docker) + ["up", "--detach", "--no-build", "--wait", "--wait-timeout", str(spec.start_timeout)]
-    result = runner(argv, spec.start_timeout + 30)
-    _log(spec, "start", argv, result)
-    if result.returncode:
-        # Only our labelled objects are eligible for rollback.
-        try:
-            service_cleanup(spec, runner=runner, docker=docker)
-        except ServiceError as cleanup_error:
-            raise ServiceError(f"challenge service start failed: {_detail(result)}; rollback failed: {cleanup_error}")
-        raise ServiceError(f"challenge service start failed: {_detail(result)}")
-    current = service_status(spec, runner=runner, docker=docker)
-    metadata = _metadata(spec, checked, image=(f"{spec.project}:local" if kind == "dockerfile" else None), status="RUNNING")
-    metadata["containers"] = current["containers"]
-    atomic_json(spec.metadata_path, metadata)
-    return metadata
+    active = actor or ServiceActor()
+    with _lifecycle(spec, active, "start", runner, docker):
+        checked = service_plan(spec, runner=runner, docker=docker)
+        _require_safe(checked)
+        existing = service_status(spec, actor=active, runner=runner, docker=docker)
+        if existing.get("running"):
+            metadata = _metadata(
+                spec, checked,
+                image=(f"{spec.project}:local" if checked["kind"] == "dockerfile" else None),
+                status="RUNNING",
+            )
+            metadata["containers"] = existing["containers"]
+            metadata["already_running"] = True
+            atomic_json(spec.metadata_path, metadata)
+            _update_ownership(spec, active, "RUNNING")
+            return metadata
+        _ensure_network(spec, runner, docker)
+        kind = str(checked["kind"])
+        if kind == "dockerfile":
+            image = f"{spec.project}:local"
+            name = f"{spec.project}-main"
+            request = _runtime_request(spec)
+            argv = [
+                docker, "run", "--detach", "--name", name,
+                "--network", spec.network,
+                "--network-alias", _dockerfile_alias(request),
+                "--network-alias", spec.stable_alias,
+                "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+                "--memory", spec.memory, "--cpus", str(spec.cpus),
+                "--pids-limit", str(spec.pids), "--tmpfs", "/tmp:rw,nosuid,nodev,size=128m",
+            ]
+            for key, value in spec.labels.items():
+                argv.extend(["--label", f"{key}={value}"])
+            for key, value in sorted(_runtime_environment(request.get("environment")).items()):
+                argv.extend(["--env", f"{key}={value}"])
+            argv.append(image)
+            command = request.get("command")
+            if isinstance(command, list) and all(isinstance(item, str) for item in command):
+                argv.extend(command)
+        else:
+            compose = _compose_file(spec)
+            override = _write_compose_override(spec, dict(checked.get("resolved_compose") or {}))
+            argv = _compose_argv(spec, compose, override, docker) + ["up", "--detach", "--no-build", "--wait", "--wait-timeout", str(spec.start_timeout)]
+        result = runner(argv, spec.start_timeout + 30)
+        _log(spec, "start", argv, result)
+        if result.returncode:
+            # The lifecycle lock is already held. Use the internal cleanup path
+            # instead of recursively acquiring the same nonblocking lock.
+            try:
+                _service_cleanup_unlocked(spec, runner, docker)
+            except ServiceError as cleanup_error:
+                raise ServiceError(f"challenge service start failed: {_detail(result)}; rollback failed: {cleanup_error}")
+            raise ServiceError(f"challenge service start failed: {_detail(result)}")
+        current = service_status(spec, actor=active, runner=runner, docker=docker)
+        metadata = _metadata(spec, checked, image=(f"{spec.project}:local" if kind == "dockerfile" else None), status="RUNNING")
+        metadata["containers"] = current["containers"]
+        atomic_json(spec.metadata_path, metadata)
+        _update_ownership(spec, active, "RUNNING")
+        return metadata
 
 
-def service_status(spec: ServiceSpec, *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def service_status(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     runner = runner or _run
     _validate_spec(spec)
     containers = _labelled_objects(spec, runner, docker, "container")
     network = _inspect_network(spec, runner, docker)
+    logs = service_logs(spec, actor=actor, runner=runner, docker=docker)
+    owner = _read_ownership(spec)
+    return {
+        "project": spec.project,
+        "service_alias": spec.stable_alias,
+        "network": network,
+        "containers": containers,
+        "running": bool(containers) and all(item.get("state") == "running" for item in containers),
+        "healthy": bool(containers) and all(item.get("health") in {"healthy", "none"} for item in containers),
+        "logs": logs,
+        "ownership": owner,
+    }
+
+
+def service_logs(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, dict[str, object]]:
+    """Return scoped service logs. Child actors may call this read-only API."""
+    runner = runner or _run
+    _validate_spec(spec)
+    containers = _labelled_objects(spec, runner, docker, "container")
     logs: dict[str, dict[str, object]] = {}
     for container in containers:
         name = str(container["name"])
@@ -207,34 +298,86 @@ def service_status(spec: ServiceSpec, *, runner: Runner = None, docker: str = "d
             "stdout": (result.stdout or "")[-64_000:],
             "stderr": (result.stderr or "")[-64_000:],
         }
+    return logs
+
+
+def service_inspect(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
+    """Return exact-label runtime and ownership metadata without mutation."""
+    runner = runner or _run
+    _validate_spec(spec)
     return {
         "project": spec.project,
-        "network": network,
-        "containers": containers,
-        "running": bool(containers) and all(item.get("state") == "running" for item in containers),
-        "healthy": bool(containers) and all(item.get("health") in {"healthy", "none"} for item in containers),
-        "logs": logs,
+        "network": _inspect_network(spec, runner, docker),
+        "containers": _labelled_objects(spec, runner, docker, "container", include_stopped=True),
+        "ownership": _read_ownership(spec),
+        "service_alias": spec.stable_alias,
+        "metadata": _read_json(spec.metadata_path),
     }
 
 
-def service_stop(spec: ServiceSpec, *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def service_stop(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     runner = runner or _run
-    containers = _labelled_objects(spec, runner, docker, "container")
-    stopped: list[str] = []
-    for item in containers:
-        name = str(item["name"])
-        _verify_container_scope(spec, name, runner, docker)
-        result = runner([docker, "stop", "--time", "10", name], 30)
-        _log(spec, "stop", [docker, "stop", "--time", "10", name], result)
-        if result.returncode:
-            raise ServiceError(f"cannot stop scoped service container {name}: {_detail(result)}")
-        stopped.append(name)
-    return {"stopped": stopped}
+    active = actor or ServiceActor()
+    with _lifecycle(spec, active, "stop", runner, docker):
+        containers = _labelled_objects(spec, runner, docker, "container")
+        stopped: list[str] = []
+        for item in containers:
+            name = str(item["name"])
+            _verify_container_scope(spec, name, runner, docker)
+            result = runner([docker, "stop", "--time", "10", name], 30)
+            _log(spec, "stop", [docker, "stop", "--time", "10", name], result)
+            if result.returncode:
+                raise ServiceError(f"cannot stop scoped service container {name}: {_detail(result)}")
+            stopped.append(name)
+        _update_ownership(spec, active, "STOPPED")
+        return {"stopped": stopped}
 
 
-def service_cleanup(spec: ServiceSpec, *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def service_restart(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
+    """Restart exact-scope containers as one owner-locked lifecycle action."""
+    runner = runner or _run
+    active = actor or ServiceActor()
+    with _lifecycle(spec, active, "restart", runner, docker):
+        containers = _labelled_objects(spec, runner, docker, "container", include_stopped=True)
+        restarted: list[str] = []
+        for item in containers:
+            name = str(item["name"])
+            _verify_container_scope(spec, name, runner, docker)
+            argv = [docker, "restart", "--time", "10", name]
+            result = runner(argv, spec.start_timeout + 30)
+            _log(spec, "restart", argv, result)
+            if result.returncode:
+                raise ServiceError(f"cannot restart scoped service container {name}: {_detail(result)}")
+            restarted.append(name)
+        if not restarted:
+            raise ServiceError("challenge service is not present; build and start it before restart")
+        _update_ownership(spec, active, "RUNNING")
+        return {"restarted": restarted}
+
+
+def service_cleanup(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     """Remove only exact-label containers, volumes, images, and the scoped network."""
     runner = runner or _run
+    active = actor or ServiceActor()
+    with _lifecycle(spec, active, "cleanup", runner, docker):
+        result = _service_cleanup_unlocked(spec, runner, docker)
+        _update_ownership(spec, active, "CLEANED")
+        return result
+
+
+def _service_cleanup_unlocked(spec: ServiceSpec, runner: Runner, docker: str) -> dict[str, object]:
     _validate_spec(spec)
     removed: dict[str, list[str] | bool] = {"containers": [], "volumes": [], "images": [], "network": False}
     for item in _labelled_objects(spec, runner, docker, "container", include_stopped=True):
@@ -266,7 +409,10 @@ def service_cleanup(spec: ServiceSpec, *, runner: Runner = None, docker: str = "
     return {"removed": removed}
 
 
-def attach_analysis_sandbox(spec: ServiceSpec, sandbox: Mapping[str, object], *, runner: Runner = None, docker: str = "docker") -> dict[str, object]:
+def attach_analysis_sandbox(
+    spec: ServiceSpec, sandbox: Mapping[str, object], *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
     """Attach an exact-scope analysis sandbox to the private service network."""
     runner = runner or _run
     name = str(sandbox.get("name", ""))
@@ -276,24 +422,68 @@ def attach_analysis_sandbox(spec: ServiceSpec, sandbox: Mapping[str, object], *,
     if labels.get("ctf-os") != "true" or labels.get("ctf-os.contest") != spec.contest_slug or labels.get("ctf-os.challenge_id") != spec.challenge_id:
         raise ServiceError("analysis sandbox labels do not match the challenge service scope")
     _verify_labels(name, labels, runner, docker)
-    network = _inspect_network(spec, runner, docker)
-    if not network.get("owned") or not network.get("internal"):
-        raise ServiceError("private challenge network is missing, unowned, or not internal")
-    argv = [docker, "network", "connect", spec.network, name]
-    result = runner(argv, 30)
-    _log(spec, "attach-sandbox", argv, result)
-    if result.returncode and "already exists" not in result.stderr.casefold():
-        raise ServiceError(f"cannot attach analysis sandbox to service network: {_detail(result)}")
-    return {"container": name, "network": spec.network, "attached": result.returncode == 0}
+    with service_attachment(spec, actor=actor, runner=runner, docker=docker):
+        argv = [docker, "network", "connect", spec.network, name]
+        result = runner(argv, 30)
+        _log(spec, "attach-sandbox", argv, result)
+        if result.returncode and "already exists" not in result.stderr.casefold():
+            raise ServiceError(f"cannot attach analysis sandbox to service network: {_detail(result)}")
+        return {"container": name, "network": spec.network, "attached": result.returncode == 0}
+
+
+@contextmanager
+def service_attachment(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> Iterator[None]:
+    """Hold the lifecycle lock while Sol creates and probes an attached worker."""
+    active_runner = runner or _run
+    active = actor or ServiceActor()
+    _validate_spec(spec)
+    _validate_actor(active)
+    if active.role != "sol" or (
+        active.parent_session_id is not None and active.session_id != active.parent_session_id
+    ):
+        raise ServiceError("DENIED_SERVICE_ATTACHMENT: only the parent Sol session may attach a worker")
+    _prepare_runtime_root(spec)
+    descriptor = os.open(
+        spec.lifecycle_lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    lock = os.fdopen(descriptor, "a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ServiceBusy(_busy_message(spec, "attach-worker", _read_ownership(spec))) from exc
+        owner = _read_ownership(spec) or {}
+        if owner.get("owner_session_id") != active.session_id or owner.get("state") != "RUNNING":
+            raise ServiceBusy(_busy_message(spec, "attach-worker", owner))
+        network = _inspect_network(spec, active_runner, docker)
+        containers = _labelled_objects(spec, active_runner, docker, "container")
+        if not network.get("owned") or not network.get("internal"):
+            raise ServiceError("managed service attachment failed: network missing, unowned, or not internal")
+        if not containers or not all(item.get("state") == "running" for item in containers):
+            raise ServiceError("managed service attachment failed: service container is not running")
+        _update_ownership(spec, active, "RUNNING")
+        yield
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
 
 
 def _metadata(spec: ServiceSpec, checked: Mapping[str, object], *, image: str | None, status: str) -> dict[str, object]:
+    endpoints = _stable_endpoints(spec, checked.get("services", []))
     return {
         "schema_version": 1, "status": status, "kind": checked["kind"],
         "contest_slug": spec.contest_slug, "challenge_id": spec.challenge_id,
         "project": spec.project, "network": spec.network, "labels": spec.labels,
         "source": str(spec.source.resolve()), "workspace": str(spec.workspace.resolve()),
         "metadata_path": str(spec.metadata_path), "image": image,
+        "service_alias": spec.stable_alias, "service_endpoints": endpoints,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "services": checked.get("services", []),
     }
@@ -471,12 +661,17 @@ def _write_compose_override(spec: ServiceSpec, config: Mapping[str, object]) -> 
         raise ServiceError("cannot generate private-network override without Compose services")
     labels = "\n".join(f"      {json.dumps(key)}: {json.dumps(value)}" for key, value in spec.labels.items())
     blocks: list[str] = ["services:"]
-    for name in sorted(str(item) for item in services):
+    service_names = sorted(str(item) for item in services)
+    for ordinal, name in enumerate(service_names):
+        network_block = (
+            ["      default:", "        aliases:", f"          - {json.dumps(spec.stable_alias)}"]
+            if ordinal == 0 else ["      default: {}"]
+        )
         block = [
             f"  {json.dumps(name)}:",
             "    ports: !reset []",
             "    networks: !override",
-            "      default: {}",
+            *network_block,
             "    labels:", labels,
             f"    mem_limit: {json.dumps(spec.memory)}",
             f"    cpus: {spec.cpus}",
@@ -510,6 +705,188 @@ def _prepare_runtime_root(spec: ServiceSpec) -> None:
     if spec.runtime_root.is_symlink():
         raise ServiceError("service runtime path must not be a symlink")
     spec.runtime_root.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def _lifecycle(
+    spec: ServiceSpec, actor: ServiceActor, action: str, runner: Runner, docker: str,
+) -> Iterator[None]:
+    """Serialize and authorize one service mutation without waiting indefinitely."""
+    _validate_spec(spec)
+    _validate_actor(actor)
+    if actor.role != "sol" or (
+        actor.parent_session_id is not None and actor.session_id != actor.parent_session_id
+    ):
+        raise ServiceError(
+            "DENIED_SERVICE_LIFECYCLE\n\n"
+            "This challenge service is owned by the parent Sol session.\n"
+            "Child sessions may inspect and attach to the existing service,\n"
+            "but may not build, start, stop, restart, or clean it up."
+        )
+    _prepare_runtime_root(spec)
+    path = spec.lifecycle_lock_path
+    if path.is_symlink():
+        raise ServiceError("service lifecycle lock must not be a symlink")
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    lock = os.fdopen(descriptor, "a+")
+    try:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ServiceBusy(_busy_message(spec, action, _read_ownership(spec))) from exc
+        _claim_ownership(spec, actor, action, runner, docker)
+        try:
+            yield
+        except Exception:
+            _update_ownership(spec, actor, "ERROR")
+            raise
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
+
+
+def _claim_ownership(
+    spec: ServiceSpec, actor: ServiceActor, action: str, runner: Runner, docker: str,
+) -> None:
+    current = _read_ownership(spec)
+    if current and current.get("owner_session_id") != actor.session_id:
+        recoverable = False
+        if current.get("state") == "CLEANED":
+            containers = _labelled_objects(spec, runner, docker, "container", include_stopped=True)
+            recoverable = not containers
+        elif actor.recover_stale:
+            lease_expired = _lease_expired(current)
+            owner_alive = _pid_alive(current.get("owner_process_id"))
+            containers = _labelled_objects(spec, runner, docker, "container", include_stopped=True)
+            # Exact-label orphan containers may be taken over only for cleanup;
+            # build/start under a different configuration still fail closed.
+            recoverable = lease_expired and not owner_alive and (not containers or action == "cleanup")
+        if not recoverable:
+            raise ServiceBusy(_busy_message(spec, action, current))
+    _update_ownership(spec, actor, f"{action.upper()}ING")
+
+
+def _update_ownership(spec: ServiceSpec, actor: ServiceActor, state: str) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    existing = _read_ownership(spec) or {}
+    started = existing.get("started_at") if existing.get("owner_session_id") == actor.session_id else None
+    record: dict[str, object] = {
+        "schema_version": 1,
+        "challenge_id": spec.challenge_id,
+        "owner_session_id": actor.session_id,
+        "owner_role": actor.role,
+        "parent_session_id": actor.parent_session_id,
+        "owner_process_id": actor.pid,
+        "service_id": spec.project,
+        "network_id": spec.network,
+        "service_alias": spec.stable_alias,
+        "state": state,
+        "started_at": started or now.isoformat(),
+        "heartbeat_at": now.isoformat(),
+        "lease_expires_at": (now + timedelta(seconds=actor.lease_seconds)).isoformat(),
+        "recovery": {
+            "requires_expired_lease": True,
+            "requires_dead_owner_process": True,
+            "container_policy": "no containers, or exact-scope cleanup only",
+            "explicit_opt_in": "ServiceActor.recover_stale",
+        },
+    }
+    atomic_json(spec.ownership_path, record)
+    return record
+
+
+def _read_ownership(spec: ServiceSpec) -> dict[str, object] | None:
+    value = _read_json(spec.ownership_path)
+    return value if value else None
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ServiceError(f"invalid service runtime metadata: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise ServiceError(f"invalid service runtime metadata: {path.name}")
+    return value
+
+
+def _validate_actor(actor: ServiceActor) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", actor.session_id):
+        raise ServiceError("invalid service actor session id")
+    if actor.lease_seconds < 30 or actor.lease_seconds > 86_400:
+        raise ServiceError("service owner lease must be between 30 and 86400 seconds")
+    if actor.role not in {"sol", "child"}:
+        raise ServiceError("service actor role must be sol or child")
+
+
+def _lease_expired(owner: Mapping[str, object]) -> bool:
+    try:
+        expires = datetime.fromisoformat(str(owner.get("lease_expires_at", "")))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+    except ValueError:
+        return False
+
+
+def _pid_alive(raw_pid: object) -> bool:
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return False
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _busy_message(spec: ServiceSpec, action: str, owner: Mapping[str, object] | None) -> str:
+    owner = owner or {}
+    return (
+        "SERVICE_BUSY\n\n"
+        f"Owner: {owner.get('owner_session_id', 'unknown')}\n"
+        f"State: {owner.get('state', 'UNKNOWN')}\n"
+        f"Requested action: {action}\n\n"
+        "The current session is not permitted to mutate this service."
+    )
+
+
+def _stable_endpoints(spec: ServiceSpec, raw_services: object) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    if not isinstance(raw_services, list):
+        return result
+    for item in raw_services:
+        if not isinstance(item, Mapping):
+            continue
+        port = item.get("port")
+        original = str(item.get("internal_target", ""))
+        protocol = str(item.get("protocol") or ("http" if original.startswith("http") else "tcp"))
+        if isinstance(port, int) or (isinstance(port, str) and port.isdigit()):
+            port_number = int(port)
+            path = ""
+            if "://" in original:
+                parsed = urlsplit(original)
+                protocol = parsed.scheme or protocol
+                path = urlunsplit(("", "", parsed.path, parsed.query, parsed.fragment))
+            target = (
+                f"{protocol}://{spec.stable_alias}:{port_number}{path}"
+                if protocol in {"http", "https"} else f"{spec.stable_alias}:{port_number}"
+            )
+            result.append({
+                "alias": spec.stable_alias, "protocol": protocol, "port": port_number,
+                "path": path or None, "target": target,
+            })
+            break  # The stable alias is assigned only to the primary service.
+    return result
 
 
 def _ensure_network(spec: ServiceSpec, runner: Runner, docker: str) -> None:

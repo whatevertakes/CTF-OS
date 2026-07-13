@@ -12,7 +12,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from typing import Sequence
+from typing import Mapping, Sequence
+from urllib.parse import urlparse
 
 from ..evidence import append_evidence
 from .network import ResolvedTarget
@@ -40,6 +41,10 @@ class SandboxSpec:
     storage: str | None = None
     service_network: str | None = None
     local_endpoints: tuple[str, ...] = ()
+    session_id: str = "sol-main"
+    parent_session_id: str = "sol-main"
+    session_role: str = "sol"
+    service_context: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -76,11 +81,15 @@ class SandboxSpec:
             "ctf-os.resource_profile": self.resource_profile,
             "ctf-os.memory_bytes": str(parse_size_bytes(str(self.memory))),
             "ctf-os.storage_bytes": str(parse_size_bytes(str(self.storage))),
+            "ctf-os.session_id": self.session_id,
+            "ctf-os.parent_session_id": self.parent_session_id,
+            "ctf-os.session_role": self.session_role,
         }
 
 
 def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
     _validate_spec(spec)
+    context = (spec.branch_root / "context").resolve()
     policy = json.dumps([target.to_dict() for target in spec.targets], separators=(",", ":"))
     local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
     argv = [
@@ -91,15 +100,24 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         "--ulimit", "nofile=1024:1024", "--ulimit", "nproc=256:256",
         "--mount", f"type=bind,src={spec.source},dst=/challenge,readonly",
         "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        "--mount", f"type=bind,src={context},dst=/context,readonly",
         "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
         "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
         "--env", f"CTF_OS_ALLOWED_ENDPOINTS_JSON={policy}",
         "--env", f"CTF_OS_LOCAL_ENDPOINTS_JSON={local_policy}",
+        "--env", f"CTF_OS_SESSION_ID={spec.session_id}",
+        "--env", f"CTF_OS_PARENT_SESSION_ID={spec.parent_session_id}",
+        "--env", f"CTF_OS_SESSION_ROLE={spec.session_role}",
+        "--env", f"CTF_OS_CONTEST_SLUG={spec.contest_slug}",
+        "--env", f"CTF_OS_CHALLENGE_ID={spec.challenge_id}",
     ]
     for key, value in spec.runtime_labels.items():
         argv.extend(["--label", f"{key}={value}"])
     if spec.service_network:
-        argv.extend(["--network", spec.service_network])
+        # NET_ADMIN exists only while entrypoint installs the exact service-only
+        # egress policy; setpriv drops it before any worker command executes.
+        argv.extend(["--network", spec.service_network, "--cap-add", "NET_ADMIN"])
     elif spec.targets:
         argv.extend(["--network", "bridge", "--cap-add", "NET_ADMIN"])
         for target in spec.targets:
@@ -111,7 +129,7 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
 
 
 def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
-    spec.branch_root.mkdir(parents=True, exist_ok=True)
+    _prepare_branch_root(spec)
     metadata: dict[str, object] = {
         "schema_version": 1, "name": spec.name, "contest_slug": spec.contest_slug,
         "challenge_id": spec.challenge_id, "branch": spec.branch,
@@ -122,6 +140,14 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "resources": {"memory": spec.memory, "cpus": spec.cpus, "pids": spec.pids, "storage": spec.storage},
         "service_network": spec.service_network,
         "local_endpoints": list(spec.local_endpoints),
+        "session_id": spec.session_id,
+        "parent_session_id": spec.parent_session_id,
+        "session_role": spec.session_role,
+        "service_context": dict(spec.service_context or {}),
+        "work_path": str((spec.branch_root / "work").resolve()),
+        "evidence_path": str((spec.branch_root / "evidence").resolve()),
+        "logs_path": str((spec.branch_root / "logs").resolve()),
+        "context_path": str((spec.branch_root / "context").resolve()),
         "metadata_path": str(spec.branch_root / "sandbox.json"),
         "input_fingerprint": spec.input_fingerprint,
         "authorized_targets": [target.to_dict() for target in spec.targets],
@@ -147,10 +173,47 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
     return metadata
 
 
-def execute(metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str = "docker") -> dict[str, object]:
+def execute(
+    metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str = "docker",
+    session_id: str | None = None, session_role: str | None = None,
+) -> dict[str, object]:
+    _authorize_sandbox(metadata, session_id, session_role, "execute")
     branch_root = Path(str(metadata["branch_root"])).resolve()
     with _sandbox_lock(branch_root):
         return _execute_locked(metadata, command, timeout, docker=docker)
+
+
+def probe_service_connectivity(metadata: dict[str, object], *, docker: str = "docker") -> dict[str, object]:
+    """Prove that an attached worker can resolve and reach its managed service."""
+    endpoints = metadata.get("local_endpoints")
+    if not isinstance(endpoints, list) or not endpoints:
+        raise SandboxError("managed service attachment has no declared endpoint")
+    endpoint = str(endpoints[0])
+    host, port = _endpoint_host_port(endpoint)
+    code = (
+        "import socket,sys; "
+        "s=socket.create_connection((sys.argv[1],int(sys.argv[2])),5); "
+        "print('CTF_OS_SERVICE_CONNECTED',sys.argv[1],sys.argv[2]); s.close()"
+    )
+    result = execute(metadata, ["python3", "-c", code, host, str(port)], 10, docker=docker)
+    if result.get("exit_code") != 0 or "CTF_OS_SERVICE_CONNECTED" not in str(result.get("stdout", "")):
+        raise SandboxError(
+            f"managed service connectivity probe failed for {endpoint}: "
+            f"{str(result.get('stderr', '')).strip() or 'connection was not established'}"
+        )
+    return {"endpoint": endpoint, "host": host, "port": port, "connected": True}
+
+
+def _endpoint_host_port(endpoint: str) -> tuple[str, int]:
+    text = endpoint.strip()
+    if text.casefold().startswith("nc "):
+        parts = text.split()
+        if len(parts) == 3 and parts[2].isdigit():
+            return parts[1], int(parts[2])
+    parsed = urlparse(text if "://" in text else f"tcp://{text}")
+    if parsed.hostname and parsed.port:
+        return parsed.hostname, parsed.port
+    raise SandboxError(f"managed service endpoint has no host and port: {endpoint}")
 
 
 def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str) -> dict[str, object]:
@@ -179,11 +242,16 @@ def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout
     if cleanup_record is not None:
         record["cleanup"] = cleanup_record
     challenge_root = branch_root.parents[1]
+    append_evidence(branch_root / "logs" / "commands.jsonl", "sandbox_exec", record)
     append_evidence(challenge_root / "evidence.log", "sandbox_exec", {"branch": metadata["branch"], **record})
     return record
 
 
-def cleanup(metadata: dict[str, object], *, docker: str = "docker") -> dict[str, object]:
+def cleanup(
+    metadata: dict[str, object], *, docker: str = "docker",
+    session_id: str | None = None, session_role: str | None = None,
+) -> dict[str, object]:
+    _authorize_sandbox(metadata, session_id, session_role, "cleanup")
     branch_root = Path(str(metadata["branch_root"])).resolve()
     with _sandbox_lock(branch_root):
         return _cleanup_locked(metadata, docker=docker)
@@ -193,7 +261,8 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
     name = _metadata_name(metadata)
     inspect = _run([docker, "inspect", name, "--format", "{{json .Config.Labels}}"], timeout=20)
     export_record: dict[str, object] | None = None
-    export_error: str | None = None
+    retained_exports: dict[str, object] = {}
+    export_errors: dict[str, str] = {}
     if inspect.returncode == 0:
         try:
             labels = json.loads(inspect.stdout)
@@ -201,30 +270,61 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
             raise SandboxError("cannot verify sandbox labels before cleanup") from exc
         if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
             raise SandboxError("refusing cleanup: container labels do not match sandbox metadata")
-        try:
-            export_record = _export_artifacts(name, Path(str(metadata["branch_root"])).resolve() / "artifacts", docker=docker)
-        except Exception as exc:
-            # Cleanup must still remove a resource-expensive sandbox. Preserve an actionable
-            # export failure in the receipt/evidence instead of leaking the container.
-            export_error = str(exc)
+        branch_root = Path(str(metadata["branch_root"])).resolve()
+        exports = (
+            ("artifacts", branch_root / "artifacts", "/artifacts", "artifact"),
+            ("work", branch_root / "work", "/work", "work"),
+            ("evidence", branch_root / "evidence", "/evidence", "evidence"),
+        )
+        for key, destination, container_root, label in exports:
+            try:
+                exported = _export_artifacts(
+                    name, destination, docker=docker,
+                    container_root=container_root, label=label,
+                )
+                if key == "artifacts":
+                    export_record = exported
+                else:
+                    retained_exports[key] = exported
+            except Exception as exc:
+                # Try every independent tree before removing the expensive
+                # container; one malformed tree must not discard the others.
+                export_errors[key] = str(exc)
         removed = _run([docker, "rm", "--force", name], timeout=30)
         if removed.returncode:
             raise SandboxError(f"sandbox cleanup failed: {removed.stderr.strip()}")
     elif "no such object" not in inspect.stderr.casefold():
         raise SandboxError(f"cannot inspect sandbox before cleanup: {inspect.stderr.strip() or 'unknown Docker error'}")
     branch_root = Path(str(metadata["branch_root"])).resolve()
-    record: dict[str, object] = {"removed": inspect.returncode == 0, "container": name, "artifact_export": export_record}
-    if export_error is not None:
-        record["artifact_export_error"] = export_error
+    record: dict[str, object] = {
+        "removed": inspect.returncode == 0, "container": name,
+        "artifact_export": export_record, "retained_exports": retained_exports,
+    }
+    if "artifacts" in export_errors:
+        record["artifact_export_error"] = export_errors["artifacts"]
+    if export_errors:
+        record["export_errors"] = export_errors
     append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_cleanup", {"branch": metadata["branch"], **record})
     return record
 
 
-def export_artifacts(metadata: dict[str, object], *, docker: str = "docker") -> dict[str, object]:
+def export_artifacts(
+    metadata: dict[str, object], *, docker: str = "docker",
+    session_id: str | None = None, session_role: str | None = None,
+) -> dict[str, object]:
+    _authorize_sandbox(metadata, session_id, session_role, "export")
     branch_root = Path(str(metadata["branch_root"])).resolve()
     with _sandbox_lock(branch_root):
         name = _metadata_name(metadata)
         record = _export_artifacts(name, branch_root / "artifacts", docker=docker)
+        record["retained_exports"] = {
+            "work": _export_artifacts(
+                name, branch_root / "work", docker=docker, container_root="/work", label="work",
+            ),
+            "evidence": _export_artifacts(
+                name, branch_root / "evidence", docker=docker, container_root="/evidence", label="evidence",
+            ),
+        }
         append_evidence(
             branch_root.parents[1] / "evidence.log",
             "sandbox_export",
@@ -302,6 +402,13 @@ def _validate_spec(spec: SandboxSpec) -> None:
         raise SandboxError(f"prepared challenge input is missing or unsafe: {spec.source}")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", spec.branch):
         raise SandboxError("branch id must contain only letters, numbers, dot, underscore or dash")
+    for label, value in (("session id", spec.session_id), ("parent session id", spec.parent_session_id)):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+            raise SandboxError(f"{label} is invalid")
+    if spec.session_role not in {"sol", "child"}:
+        raise SandboxError("session role must be sol or child")
+    if spec.session_role == "child" and spec.session_id == spec.parent_session_id:
+        raise SandboxError("child session id must differ from its parent session id")
     if spec.cpus is None or spec.pids is None or spec.cpus <= 0 or spec.pids < 1:
         raise SandboxError("sandbox CPU and PID limits must be positive")
     try:
@@ -323,11 +430,62 @@ def _validate_spec(spec: SandboxSpec) -> None:
             raise SandboxError("local challenge endpoint is invalid")
 
 
+def _prepare_branch_root(spec: SandboxSpec) -> None:
+    """Create durable, worker-private host directories before Docker mounts them."""
+    if spec.branch_root.is_symlink():
+        raise SandboxError("worker root must not be a symlink")
+    spec.branch_root.mkdir(parents=True, exist_ok=True)
+    context_payload = {
+        "schema_version": 1,
+        "session_id": spec.session_id,
+        "parent_session_id": spec.parent_session_id,
+        "challenge_id": spec.challenge_id,
+        "role": spec.session_role,
+        "input": {"path": "/challenge", "read_only": True, "fingerprint": spec.input_fingerprint},
+        "work": {"path": "/work", "private": True},
+        "evidence": {"path": "/evidence", "private": True},
+        "managed_service": dict(spec.service_context or {}),
+    }
+    for name in ("work", "evidence", "logs", "context"):
+        path = spec.branch_root / name
+        if path.is_symlink():
+            raise SandboxError(f"worker {name} path must not be a symlink")
+        path.mkdir(exist_ok=True)
+        # These paths are mounted only into this worker container. World write is
+        # needed because the unprivileged container uid need not match the host uid.
+        path.chmod(0o777 if name in {"work", "evidence"} else (0o755 if name == "context" else 0o700))
+    context_file = spec.branch_root / "context" / "session.json"
+    _write_json(context_file, context_payload)
+    context_file.chmod(0o444)
+
+
 def _metadata_name(metadata: dict[str, object]) -> str:
     name = str(metadata.get("name", ""))
     if not re.fullmatch(r"ctf-os-[a-zA-Z0-9_.-]+", name):
         raise SandboxError("invalid sandbox metadata/container name")
     return name
+
+
+def _authorize_sandbox(
+    metadata: Mapping[str, object], session_id: str | None, session_role: str | None, action: str,
+) -> None:
+    """Enforce worker ownership when a model-facing caller identity is supplied."""
+    if session_id is None and session_role is None:
+        return  # Backwards-compatible trusted in-process controller path.
+    if session_role not in {"sol", "child"} or not session_id:
+        raise SandboxError("sandbox caller must provide a valid session id and role")
+    owner = str(metadata.get("session_id", ""))
+    parent = str(metadata.get("parent_session_id", ""))
+    if session_role == "sol":
+        if session_id != parent:
+            raise SandboxError(
+                f"DENIED_SANDBOX_ACCESS: Sol session {session_id} does not own worker parent scope {parent}"
+            )
+        return
+    if session_id != owner:
+        raise SandboxError(
+            f"DENIED_SANDBOX_ACCESS: child session {session_id} may not {action} worker sandbox owned by {owner}"
+        )
 
 
 def _run(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
@@ -367,7 +525,10 @@ def _firewall_counters(container: str, docker: str, targets: list[object]) -> di
     return {"target_packets": target_packets, "established_packets": established_packets}
 
 
-def _export_artifacts(container: str, destination: Path, *, docker: str) -> dict[str, object]:
+def _export_artifacts(
+    container: str, destination: Path, *, docker: str,
+    container_root: str = "/artifacts", label: str = "artifact",
+) -> dict[str, object]:
     if destination.is_symlink():
         raise SandboxError("artifact destination must not be a symlink")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -375,17 +536,17 @@ def _export_artifacts(container: str, destination: Path, *, docker: str) -> dict
         for existing in destination.rglob("*"):
             if existing.is_symlink() or (not existing.is_dir() and not existing.is_file()):
                 raise SandboxError(f"artifact destination contains a link/special file: {existing}")
-    staging = Path(tempfile.mkdtemp(prefix=".artifacts-", dir=destination.parent))
+    staging = Path(tempfile.mkdtemp(prefix=f".{label}-", dir=destination.parent))
     try:
         try:
             result = subprocess.run(
-                [docker, "exec", "--user", "1001:1001", container, "tar", "-C", "/artifacts", "-cf", "-", "."],
+                [docker, "exec", "--user", "1001:1001", container, "tar", "-C", container_root, "-cf", "-", "."],
                 capture_output=True, timeout=60, check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"artifact export failed: {exc}") from exc
+            raise SandboxError(f"{label} export failed: {exc}") from exc
         if result.returncode:
-            raise SandboxError(f"artifact export failed: {result.stderr.decode(errors='replace').strip()}")
+            raise SandboxError(f"{label} export failed: {result.stderr.decode(errors='replace').strip()}")
         files = 0
         total = 0
         members = 0
@@ -393,34 +554,34 @@ def _export_artifacts(container: str, destination: Path, *, docker: str) -> dict
             for member in archive:
                 members += 1
                 if members > 2_000:
-                    raise SandboxError("artifact export exceeds member limit")
+                    raise SandboxError(f"{label} export exceeds member limit")
                 relative_text = member.name.removeprefix("./")
                 if relative_text in {"", "."}:
                     continue
                 relative = Path(relative_text)
                 if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-                    raise SandboxError(f"artifact export rejected unsafe path: {member.name!r}")
+                    raise SandboxError(f"{label} export rejected unsafe path: {member.name!r}")
                 if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                    raise SandboxError(f"artifact export rejected link/special file: {member.name!r}")
+                    raise SandboxError(f"{label} export rejected link/special file: {member.name!r}")
                 target = staging / relative
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 if not member.isfile():
-                    raise SandboxError(f"artifact export rejected unsupported member: {member.name!r}")
+                    raise SandboxError(f"{label} export rejected unsupported member: {member.name!r}")
                 files += 1
                 total += member.size
                 if files > 2_000 or total > 512 * 1024 * 1024:
-                    raise SandboxError("artifact export exceeds file or byte limit")
+                    raise SandboxError(f"{label} export exceeds file or byte limit")
                 source = archive.extractfile(member)
                 if source is None:
-                    raise SandboxError(f"artifact export cannot read member: {member.name!r}")
+                    raise SandboxError(f"{label} export cannot read member: {member.name!r}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with source, target.open("xb") as output:
                     shutil.copyfileobj(source, output, length=1024 * 1024)
         if files > 2_000 or total > 512 * 1024 * 1024:
-            raise SandboxError("artifact export exceeds file or byte limit")
-        old = destination.parent / ".artifacts-old"
+            raise SandboxError(f"{label} export exceeds file or byte limit")
+        old = destination.parent / f".{label}-old"
         if old.exists():
             if old.is_symlink():
                 raise SandboxError("stale artifact backup is a symlink")

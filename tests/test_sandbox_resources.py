@@ -41,7 +41,8 @@ def test_profiles_apply_limits_and_local_network_is_distinct(tmp_path: Path) -> 
     assert (spec.memory, spec.cpus, spec.storage, spec.pids) == ("2g", 1.0, "1g", 128)
     argv = build_run_argv(spec)
     assert argv[argv.index("--network") + 1] == "ctf-os-net-demo-abc"
-    assert "NET_ADMIN" not in argv
+    assert "NET_ADMIN" in argv  # entrypoint needs it briefly to install service-only egress
+    assert "--bounding-set=-all" in Path("sandbox/entrypoint.sh").read_text()
     assert "ctf-os.kind=sandbox" in argv
     assert "ctf-os.resource_profile=light" in argv
 
@@ -167,6 +168,34 @@ def test_cleanup_exports_before_label_scoped_removal(monkeypatch, tmp_path: Path
     result = cleanup(metadata)
     assert result["removed"] is True
     assert calls.index("export") < next(index for index, call in enumerate(calls) if " rm --force " in f" {call} ")
+
+
+def test_cleanup_attempts_evidence_export_even_when_work_export_fails(monkeypatch, tmp_path: Path) -> None:
+    branch = tmp_path / "challenge" / "workers" / "recon"
+    branch.mkdir(parents=True)
+    metadata = _metadata(branch)
+    attempted = []
+
+    def fake_run(argv, timeout):
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(argv, 0, json.dumps(metadata["labels"]), "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def fake_export(*args, **kwargs):
+        label = kwargs.get("label", "artifact")
+        attempted.append(label)
+        if label == "work":
+            raise SandboxError("bad work tree")
+        return {"destination": label, "files": 1, "bytes": 1}
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    monkeypatch.setattr(runtime, "_export_artifacts", fake_export)
+
+    result = cleanup(metadata)
+
+    assert attempted == ["artifact", "work", "evidence"]
+    assert result["retained_exports"]["evidence"]["files"] == 1
+    assert result["export_errors"] == {"work": "bad work tree"}
 
 
 def test_evidence_and_findings_are_locked_under_concurrency(tmp_path: Path) -> None:

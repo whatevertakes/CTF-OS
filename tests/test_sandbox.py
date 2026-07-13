@@ -18,9 +18,73 @@ def test_sandbox_argv_has_ro_source_limits_and_no_host_socket(tmp_path: Path) ->
     joined = " ".join(argv)
     assert "dst=/challenge,readonly" in joined
     assert "--read-only" in argv and "--memory" in argv and "--cpus" in argv and "--pids-limit" in argv
-    assert "/work:rw" in joined and "/artifacts:rw" in joined
+    assert "/work:rw" in joined and "/evidence:rw" in joined
+    assert "dst=/context,readonly" in joined and "/artifacts:rw" in joined
     assert "docker.sock" not in joined and "--network none" in joined
     assert "team" not in joined and "member" not in joined
+
+
+def test_workers_receive_distinct_durable_private_paths(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    roots = [tmp_path / "output" / "workers" / branch for branch in ("worker-001", "worker-002")]
+    monkeypatch.setattr(runtime, "admit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "_run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "id", ""))
+
+    metadata = [runtime.create(SandboxSpec(
+        "demo", "abc123", root.name, source, root,
+        session_id=root.name, parent_session_id="sol-main", session_role="child",
+    )) for root in roots]
+
+    assert metadata[0]["work_path"] != metadata[1]["work_path"]
+    for root in roots:
+        assert all((root / name).is_dir() for name in ("work", "evidence", "logs", "context"))
+        context = (root / "context" / "session.json").read_text()
+        assert '"read_only": true' in context and '"private": true' in context
+        assert (root / "context" / "session.json").stat().st_mode & 0o777 == 0o444
+    (roots[0] / "work" / "proof.txt").write_text("one")
+    assert not (roots[1] / "work" / "proof.txt").exists()
+
+
+def test_service_connectivity_probe_uses_declared_stable_alias(monkeypatch) -> None:
+    commands = []
+
+    def fake_execute(metadata, command, timeout, docker="docker"):
+        commands.append(command)
+        return {"exit_code": 0, "stdout": "CTF_OS_SERVICE_CONNECTED challenge-service 8080\n", "stderr": ""}
+
+    monkeypatch.setattr(runtime, "execute", fake_execute)
+    result = runtime.probe_service_connectivity({"local_endpoints": ["http://challenge-service:8080"]})
+
+    assert result == {"endpoint": "http://challenge-service:8080", "host": "challenge-service", "port": 8080, "connected": True}
+    assert commands[0][-2:] == ["challenge-service", "8080"]
+
+
+def test_service_sandbox_installs_service_only_network_policy(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    spec = SandboxSpec(
+        "demo", "abc123", "worker-001", source, tmp_path / "workers" / "worker-001",
+        service_network="ctf-os-net-demo", local_endpoints=("http://challenge-service:3000",),
+    )
+    argv = build_run_argv(spec)
+    entrypoint = Path("sandbox/entrypoint.sh").read_text()
+
+    assert argv[argv.index("--network") + 1] == "ctf-os-net-demo"
+    assert "NET_ADMIN" in argv
+    assert "apply_local_firewall" in entrypoint
+    assert "CTF_OS_LOCAL_ENDPOINTS_JSON" in entrypoint
+
+
+def test_child_cannot_operate_a_sibling_sandbox(tmp_path: Path) -> None:
+    metadata = {
+        "session_id": "worker-001", "parent_session_id": "sol-main",
+        "branch_root": str(tmp_path), "name": "ctf-os-worker-001",
+    }
+    with pytest.raises(SandboxError, match="DENIED_SANDBOX_ACCESS"):
+        runtime.execute(metadata, ["true"], 1, session_id="worker-002", session_role="child")
+    # The parent controller remains able to operate every child sandbox.
+    runtime._authorize_sandbox(metadata, "sol-main", "sol", "execute")
 
 
 def test_authorized_url_and_nc_parse_and_private_targets_fail() -> None:

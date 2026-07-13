@@ -1,19 +1,30 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from ctf_os.service import (
+    ServiceActor,
+    ServiceBusy,
     ServiceError,
     ServiceSpec,
     attach_analysis_sandbox,
+    service_attachment,
     service_build,
     service_cleanup,
+    service_inspect,
+    service_logs,
     service_plan,
+    service_restart,
     service_start,
+    service_status,
+    service_stop,
 )
 
 
@@ -66,7 +77,7 @@ class FakeDocker:
         if args[1] == "rm":
             self.containers.pop(args[-1], None)
             return self.done(args)
-        if args[1] == "stop":
+        if args[1] in {"stop", "restart"}:
             return self.done(args)
         raise AssertionError(f"unexpected Docker call: {args}")
 
@@ -135,6 +146,24 @@ def test_runtime_accepts_intake_nested_dockerfile_shape(tmp_path: Path) -> None:
     run = next(call for call, _ in fake.calls if call[1] == "run")
     assert "PORT=31337" in build and "UNSET" not in build
     assert run[run.index("--network-alias") + 1] == "binary"
+
+
+def test_stable_endpoint_preserves_primary_http_path(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {
+        "kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile",
+        "services": [{
+            "name": "web", "port": 8080,
+            "internal_target": "http://web:8080/api/health?full=1",
+        }],
+    })
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+
+    started = service_start(spec, runner=FakeDocker())
+
+    assert started["service_endpoints"] == [{
+        "alias": "challenge-service", "protocol": "http", "port": 8080,
+        "path": "/api/health?full=1", "target": "http://challenge-service:8080/api/health?full=1",
+    }]
 
 
 def test_compose_override_removes_host_ports_and_forces_external_private_network(tmp_path: Path) -> None:
@@ -214,3 +243,174 @@ def test_attach_rejects_cross_challenge_sandbox_before_docker_mutation(tmp_path:
     with pytest.raises(ServiceError, match="do not match"):
         attach_analysis_sandbox(spec, sandbox, runner=fake)
     assert fake.calls == []
+
+
+def test_parent_sol_claims_owner_and_same_challenge_cannot_get_second_owner(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    owner = ServiceActor("sol-a")
+
+    service_build(spec, actor=owner, runner=fake)
+    record = json.loads(spec.ownership_path.read_text())
+    assert record["owner_session_id"] == "sol-a" and record["state"] == "BUILT"
+
+    with pytest.raises(ServiceBusy, match="Owner: sol-a"):
+        service_build(spec, actor=ServiceActor("sol-b"), runner=fake)
+    assert json.loads(spec.ownership_path.read_text())["owner_session_id"] == "sol-a"
+
+
+def test_concurrent_start_is_nonblocking_and_only_one_start_runs(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowDocker(FakeDocker):
+        def __call__(self, argv, timeout):
+            args = list(argv)
+            if args[1:3] == ["network", "create"]:
+                entered.set()
+                assert release.wait(5)
+            return super().__call__(args, timeout)
+
+    fake = SlowDocker()
+    actor = ServiceActor("sol-a")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(service_start, spec, actor=actor, runner=fake)
+        assert entered.wait(5)
+        second = pool.submit(service_start, spec, actor=actor, runner=fake)
+        with pytest.raises(ServiceBusy, match="SERVICE_BUSY"):
+            second.result(timeout=2)
+        release.set()
+        assert first.result(timeout=5)["status"] == "RUNNING"
+    assert sum(1 for call, _ in fake.calls if call[1] == "run") == 1
+
+
+def test_repeated_start_by_owner_reuses_running_service(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    owner = ServiceActor("sol-a")
+    service_start(spec, actor=owner, runner=fake)
+    second = service_start(spec, actor=owner, runner=fake)
+    assert second["already_running"] is True
+    assert sum(1 for call, _ in fake.calls if call[1] == "run") == 1
+
+
+def test_non_owner_cleanup_is_denied_without_docker_mutation(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    service_build(spec, actor=ServiceActor("sol-a"), runner=fake)
+    before = len(fake.calls)
+    with pytest.raises(ServiceBusy, match="Requested action: cleanup"):
+        service_cleanup(spec, actor=ServiceActor("sol-b"), runner=fake)
+    assert len(fake.calls) == before
+
+
+def test_stale_owner_recovery_requires_explicit_safe_path(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    spec.runtime_root.mkdir(parents=True)
+    stale = {
+        "schema_version": 1, "challenge_id": spec.challenge_id,
+        "owner_session_id": "dead-sol", "owner_process_id": 999_999_999,
+        "state": "STARTING",
+        "lease_expires_at": (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+    }
+    spec.ownership_path.write_text(json.dumps(stale))
+    fake = FakeDocker()
+    with pytest.raises(ServiceBusy, match="dead-sol"):
+        service_build(spec, actor=ServiceActor("new-sol"), runner=fake)
+
+    result = service_build(spec, actor=ServiceActor("new-sol", recover_stale=True), runner=fake)
+    assert result["status"] == "BUILT"
+    assert json.loads(spec.ownership_path.read_text())["owner_session_id"] == "new-sol"
+
+
+def test_stale_owner_container_allows_only_explicit_scoped_cleanup(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    service_start(spec, actor=ServiceActor("dead-sol"), runner=fake)
+    owner = json.loads(spec.ownership_path.read_text())
+    owner["owner_process_id"] = 999_999_999
+    owner["lease_expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    spec.ownership_path.write_text(json.dumps(owner))
+
+    with pytest.raises(ServiceBusy, match="dead-sol"):
+        service_build(spec, actor=ServiceActor("new-sol", recover_stale=True), runner=fake)
+    assert fake.containers
+
+    result = service_cleanup(spec, actor=ServiceActor("new-sol", recover_stale=True), runner=fake)
+    assert result["removed"]["containers"]
+    assert not fake.containers
+
+
+@pytest.mark.parametrize("operation", [service_build, service_start, service_stop, service_restart, service_cleanup])
+def test_child_lifecycle_mutations_are_denied_before_docker(tmp_path: Path, operation) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    child = ServiceActor("worker-1", role="child", parent_session_id="sol-main")
+    with pytest.raises(ServiceError, match="DENIED_SERVICE_LIFECYCLE"):
+        operation(spec, actor=child, runner=fake)
+    assert fake.calls == []
+
+
+def test_child_status_logs_and_inspect_are_allowed_and_restart_is_owner_only(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    owner = ServiceActor("sol-main")
+    service_start(spec, actor=owner, runner=fake)
+    child = ServiceActor("worker-1", role="child", parent_session_id="sol-main")
+
+    assert service_status(spec, actor=child, runner=fake)["running"] is True
+    assert service_logs(spec, actor=child, runner=fake)
+    assert service_inspect(spec, actor=child, runner=fake)["service_alias"] == "challenge-service"
+    assert service_restart(spec, actor=owner, runner=fake)["restarted"]
+
+
+def test_unknown_or_non_parent_actor_cannot_claim_sol_lifecycle(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+
+    with pytest.raises(ServiceError, match="role must be sol or child"):
+        service_start(spec, actor=ServiceActor("worker", role="attacker"), runner=fake)
+    with pytest.raises(ServiceError, match="DENIED_SERVICE_LIFECYCLE"):
+        service_start(
+            spec,
+            actor=ServiceActor("worker", role="sol", parent_session_id="sol-main"),
+            runner=fake,
+        )
+    assert fake.calls == []
+
+
+def test_worker_attachment_holds_lifecycle_lock_against_cleanup(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    owner = ServiceActor("sol-main")
+    service_start(spec, actor=owner, runner=fake)
+
+    with service_attachment(spec, actor=owner, runner=fake):
+        with pytest.raises(ServiceBusy, match="Requested action: cleanup"):
+            service_cleanup(spec, actor=owner, runner=fake)
+
+    assert service_cleanup(spec, actor=owner, runner=fake)["removed"]["containers"]
+
+
+def test_explicit_cleanup_releases_empty_service_for_a_new_sol_session(tmp_path: Path) -> None:
+    spec = _spec(tmp_path, {"kind": "dockerfile", "build_context": ".", "dockerfile": "Dockerfile"})
+    (spec.source / "Dockerfile").write_text("FROM scratch\n")
+    fake = FakeDocker()
+    service_start(spec, actor=ServiceActor("sol-old"), runner=fake)
+    service_cleanup(spec, actor=ServiceActor("sol-old"), runner=fake)
+
+    built = service_build(spec, actor=ServiceActor("sol-new"), runner=fake)
+
+    assert built["status"] == "BUILT"
+    assert json.loads(spec.ownership_path.read_text())["owner_session_id"] == "sol-new"

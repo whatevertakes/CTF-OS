@@ -107,3 +107,87 @@ def test_strict_receipts_are_input_bound_and_remote_requires_network_observation
         require_recorded_evidence=True, input_fingerprint="new", remote_hosts=("example.com",),
     )
     assert not remote_result["ready_for_human_submission"]
+
+
+def _write_split_receipts(root: Path, *, local: str | None, remote: str | None) -> dict[str, str]:
+    receipts = []
+    if local is not None:
+        receipts.extend([
+            {"event": "replay_exec", "receipt_id": "local-one", "exit_code": 0, "stdout": local, "input_fingerprint": "fp"},
+            {"event": "replay_exec", "receipt_id": "local-two", "exit_code": 0, "stdout": local, "input_fingerprint": "fp"},
+        ])
+    receipts.append({
+        "event": "replay_exec", "receipt_id": "remote-one", "exit_code": 0,
+        "stdout": remote or "remote path reached", "input_fingerprint": "fp",
+        "authorized_targets": [{"host": "example.com"}], "authorized_network_observed": True,
+    })
+    (root / "evidence.log").write_text("\n".join(json.dumps(item) for item in receipts) + "\n")
+    state = json.loads((root / "STATE.json").read_text())
+    state["input_fingerprint"] = "fp"
+    (root / "STATE.json").write_text(json.dumps(state))
+    (root / "exploit").mkdir()
+    (root / "exploit" / "solve.py").write_text("x")
+    return {"local": "local-one", "independent": "local-two", "remote": "remote-one"}
+
+
+def test_local_dummy_and_remote_real_flag_can_be_fully_verified(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    refs = _write_split_receipts(root, local="DEMO{dummy_flag}", remote="DEMO{actual_secret}")
+    result = verify_and_record(
+        root, flag="DEMO{actual_secret}", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=True,
+        local_reproduced=True, independent_rerun=True, remote_reproduced=True,
+        local_success_marker="DEMO{dummy_flag}", remote_flag_candidate="DEMO{actual_secret}",
+        exploit_path_matched=True, same_flag_required=False, reproduce_command="python exploit/solve.py",
+        evidence_refs=refs, remote_hosts=("example.com",), input_fingerprint="fp",
+    )
+    assert result["verdict"] == "FULLY_VERIFIED"
+    assert result["ready_for_human_submission"]
+    assert result["verification"]["same_flag"] is False
+
+
+def test_explicit_same_flag_policy_and_path_mismatch_prevent_full_verification(tmp_path: Path) -> None:
+    for suffix, same_required, path_matched in (("same", True, True), ("path", False, False)):
+        root = _root(tmp_path / suffix)
+        refs = _write_split_receipts(root, local="DEMO{dummy_flag}", remote="DEMO{actual_secret}")
+        result = verify_and_record(
+            root, flag="DEMO{actual_secret}", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=True,
+            local_reproduced=True, independent_rerun=True, remote_reproduced=True,
+            local_success_marker="DEMO{dummy_flag}", remote_flag_candidate="DEMO{actual_secret}",
+            exploit_path_matched=path_matched, same_flag_required=same_required,
+            reproduce_command="python exploit/solve.py", evidence_refs=refs,
+            remote_hosts=("example.com",), input_fingerprint="fp",
+        )
+        assert result["verdict"] == "REMOTE_FLAG_OBTAINED"
+        assert not result["ready_for_human_submission"]
+
+
+def test_remote_only_and_local_only_progress_have_distinct_verdicts(tmp_path: Path) -> None:
+    remote_root = _root(tmp_path / "remote")
+    remote_refs = _write_split_receipts(remote_root, local=None, remote="DEMO{actual_secret}")
+    remote = verify_and_record(
+        remote_root, flag="DEMO{actual_secret}", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=True,
+        local_reproduced=False, independent_rerun=False, remote_reproduced=True,
+        remote_flag_candidate="DEMO{actual_secret}", reproduce_command="python exploit/solve.py",
+        evidence_refs=remote_refs, remote_hosts=("example.com",), input_fingerprint="fp",
+    )
+    assert remote["verdict"] == "REMOTE_FLAG_OBTAINED"
+
+    remote_path_root = _root(tmp_path / "remote-path")
+    remote_path_refs = _write_split_receipts(remote_path_root, local=None, remote=None)
+    remote_path = verify_and_record(
+        remote_path_root, flag="", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=True,
+        local_reproduced=False, independent_rerun=False, remote_reproduced=True,
+        reproduce_command="python exploit/solve.py", evidence_refs=remote_path_refs,
+        remote_hosts=("example.com",), input_fingerprint="fp",
+    )
+    assert remote_path["verdict"] == "REMOTE_EXPLOIT_CONFIRMED"
+
+    local_root = _root(tmp_path / "local")
+    local_refs = _write_split_receipts(local_root, local="DEMO{dummy_flag}", remote=None)
+    local = verify_and_record(
+        local_root, flag="DEMO{dummy_flag}", pattern=r"\ADEMO\{[^}]+\}\Z", has_remote=True,
+        local_reproduced=True, independent_rerun=True, remote_reproduced=False,
+        local_success_marker="DEMO{dummy_flag}", reproduce_command="python exploit/solve.py",
+        evidence_refs=local_refs, remote_hosts=("example.com",), input_fingerprint="fp",
+    )
+    assert local["verdict"] == "LOCAL_EXPLOIT_CONFIRMED"

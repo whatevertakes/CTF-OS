@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -15,16 +17,21 @@ from ..problems import sync_contest_manifest
 from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import sandbox_gc, sandbox_status
-from ..sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts
+from ..sandbox.runtime import (
+    SandboxSpec, cleanup, create, execute, export_artifacts, probe_service_connectivity,
+)
 from ..service import (
-    ServiceSpec, service_build, service_cleanup, service_plan,
-    service_start, service_status, service_stop,
+    ServiceActor, ServiceSpec, service_build, service_cleanup, service_inspect,
+    service_attachment, service_logs, service_plan, service_restart, service_start,
+    service_status, service_stop,
 )
 from ..triage import finalize_triage, prepare_triage, require_final_triage
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
+from ..worker import merge_worker_result_files, save_worker_result
 
 
 def build_parser() -> argparse.ArgumentParser:
+    child_surface = os.environ.get("CTF_OS_SESSION_ROLE") == "child"
     parser = argparse.ArgumentParser(prog="python -m ctf_os.agent_tools", description="Internal JSON tools for the active Sol session")
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -55,44 +62,86 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
-    sandbox_create = commands.add_parser("sandbox-create")
-    sandbox_create.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sandbox_create.add_argument("selector")
-    sandbox_create.add_argument("--contest")
-    sandbox_create.add_argument("--branch", required=True)
-    sandbox_create.add_argument("--image")
-    sandbox_create.add_argument("--resource-profile")
-    sandbox_create.add_argument("--service", action="store_true", help=argparse.SUPPRESS)
+    if not child_surface:
+        sandbox_create = commands.add_parser("sandbox-create")
+        sandbox_create.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+        sandbox_create.add_argument("selector")
+        sandbox_create.add_argument("--contest")
+        sandbox_create.add_argument("--branch", required=True)
+        sandbox_create.add_argument("--image")
+        sandbox_create.add_argument("--resource-profile")
+        sandbox_create.add_argument(
+            "--service", action="store_true",
+            help="require attachment to the existing managed service (active services attach automatically)",
+        )
+        _add_session_args(sandbox_create, default_role="child")
     sandbox_exec = commands.add_parser("sandbox-exec")
     sandbox_exec.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_exec.add_argument("metadata")
     sandbox_exec.add_argument("--timeout", type=int, default=120)
     sandbox_exec.add_argument("argv", nargs=argparse.REMAINDER)
+    _add_session_args(sandbox_exec)
     sandbox_cleanup = commands.add_parser("sandbox-cleanup")
     sandbox_cleanup.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_cleanup.add_argument("metadata")
+    _add_session_args(sandbox_cleanup)
     sandbox_export = commands.add_parser("sandbox-export")
     sandbox_export.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_export.add_argument("metadata")
-    commands.add_parser("sandbox-status")
-    commands.add_parser("sandbox-gc")
+    _add_session_args(sandbox_export)
+    sandbox_status_parser = commands.add_parser("sandbox-status")
+    _add_session_args(sandbox_status_parser)
+    if not child_surface:
+        sandbox_gc_parser = commands.add_parser("sandbox-gc")
+        _add_session_args(sandbox_gc_parser)
     commands.add_parser("doctor")
-    for name in ("service-plan", "service-build", "service-start", "service-status", "service-stop", "service-cleanup"):
+    service_commands = (
+        ("service-plan", "service-status", "service-logs", "service-inspect")
+        if child_surface else
+        ("service-plan", "service-build", "service-start", "service-restart", "service-status",
+         "service-logs", "service-inspect", "service-stop", "service-cleanup")
+    )
+    for name in service_commands:
         service = commands.add_parser(name)
         service.add_argument("selector")
         service.add_argument("--contest")
-    replay = commands.add_parser("replay")
-    replay.add_argument("selector")
-    replay.add_argument("--contest")
-    finding = commands.add_parser("record-finding")
-    finding.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    finding.add_argument("selector")
-    finding.add_argument("--contest")
-    finding.add_argument("--branch", required=True)
-    finding.add_argument("--status", required=True, choices=("supported", "rejected", "inconclusive"))
-    finding.add_argument("--summary", required=True)
-    finding.add_argument("--evidence", required=True)
+        _add_session_args(service)
+    if not child_surface:
+        replay = commands.add_parser("replay")
+        replay.add_argument("selector")
+        replay.add_argument("--contest")
+        _add_session_args(replay)
+        finding = commands.add_parser("record-finding")
+        finding.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+        finding.add_argument("selector")
+        finding.add_argument("--contest")
+        finding.add_argument("--branch", required=True)
+        finding.add_argument("--status", required=True, choices=("supported", "rejected", "inconclusive"))
+        finding.add_argument("--summary", required=True)
+        finding.add_argument("--evidence", required=True)
+        _add_session_args(finding)
+    worker_result = commands.add_parser("worker-result-save")
+    worker_result.add_argument("selector")
+    worker_result.add_argument("--contest")
+    worker_result.add_argument("--branch", required=True)
+    worker_result.add_argument("--result-json", required=True)
+    _add_session_args(worker_result, default_role="child")
+    if not child_surface:
+        worker_merge = commands.add_parser("worker-results-merge")
+        worker_merge.add_argument("selector")
+        worker_merge.add_argument("--contest")
+        _add_session_args(worker_merge)
     return parser
+
+
+def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "sol") -> None:
+    parser.add_argument("--session-id", default=os.environ.get("CTF_OS_SESSION_ID"))
+    parser.add_argument(
+        "--session-role", choices=("sol", "child"),
+        default=os.environ.get("CTF_OS_SESSION_ROLE", default_role),
+    )
+    parser.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main"))
+    parser.add_argument("--recover-stale", action="store_true")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,6 +167,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "sandbox-status":
         return sandbox_status()
     if args.command == "sandbox-gc":
+        _require_sol(args, "Only the parent Sol session may garbage-collect managed sandboxes.")
         return sandbox_gc()
     if args.command == "inspect-contest":
         sync_contest_manifest(root, args.contest)
@@ -148,33 +198,47 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         command = list(args.argv)
         if command and command[0] == "--":
             command.pop(0)
-        result = execute(metadata, command, args.timeout)
+        session_id, role = _caller(args, metadata=metadata)
+        result = execute(metadata, command, args.timeout, session_id=session_id, session_role=role)
         if result["timed_out"]:
             _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "TIMED_OUT", str(metadata["metadata_path"]))
         return result
     if args.command == "sandbox-cleanup":
         metadata = _load_metadata(root, args.metadata)
-        result = cleanup(metadata)
+        session_id, role = _caller(args, metadata=metadata)
+        result = cleanup(metadata, session_id=session_id, session_role=role)
         _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "CLEANED", str(metadata["metadata_path"]))
         return result
     if args.command == "sandbox-export":
-        return export_artifacts(_load_metadata(root, args.metadata))
+        metadata = _load_metadata(root, args.metadata)
+        session_id, role = _caller(args, metadata=metadata)
+        return export_artifacts(metadata, session_id=session_id, session_role=role)
 
     manifest, challenge, record = _load_challenge(root, args.contest, args.selector)
+    if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
+        if (
+            os.environ.get("CTF_OS_CHALLENGE_ID") != challenge.id
+            or os.environ.get("CTF_OS_CONTEST_SLUG") != manifest.slug
+        ):
+            raise ValueError("DENIED_CHALLENGE_SCOPE: child session may access only its assigned challenge")
     solve_root = challenge_root(root, manifest, challenge)
     initialize_solve_files(solve_root, challenge)
     if args.command == "prepare-challenge":
         return _compact_prepare(challenge, record, solve_root)
     if args.command.startswith("service-"):
         spec = _service_spec(manifest, challenge, record, solve_root)
+        actor = _service_actor(args)
         operation = {
             "service-plan": service_plan, "service-build": service_build,
-            "service-start": service_start, "service-status": service_status,
-            "service-stop": service_stop, "service-cleanup": service_cleanup,
+            "service-start": service_start, "service-restart": service_restart,
+            "service-status": service_status, "service-logs": service_logs,
+            "service-inspect": service_inspect, "service-stop": service_stop,
+            "service-cleanup": service_cleanup,
         }[args.command]
-        return operation(spec)
+        return operation(spec) if args.command == "service-plan" else operation(spec, actor=actor)
     if args.command == "replay":
-        return run_replay(root, manifest, challenge, record)
+        _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
+        return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
     if args.command == "sandbox-create":
         if record["status"] != "READY":
             raise ValueError(f"challenge is not READY: {record.get('blockers')}")
@@ -195,34 +259,132 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         profile = args.resource_profile or str(record.get("recommended_resource_profile") or "standard")
         targets = resolve_targets(parse_remotes(challenge.remotes))
         service_network = None
+        attachment_service: ServiceSpec | None = None
         endpoints: tuple[str, ...] = ()
-        if args.service:
+        service_context: dict[str, object] = {
+            "exists": False, "state": "UNAVAILABLE", "attach_only": True,
+            "lifecycle_owner": args.parent_session_id,
+        }
+        plan = record.get("service_plan")
+        if isinstance(plan, dict) and plan.get("kind") in {"dockerfile", "compose"}:
             service = _service_spec(manifest, challenge, record, solve_root)
-            status = service_status(service)
-            if not status.get("running"):
-                raise ValueError("challenge service is not running; call service-start first")
-            targets = ()
-            service_network = service.network
-            endpoints = tuple(
-                str(item["internal_target"]) for item in dict(record.get("service_plan") or {}).get("services", [])
-                if isinstance(item, dict) and item.get("internal_target")
+            inspection = service_inspect(service, actor=_service_actor(args, child_default=True))
+            owner = inspection.get("ownership") if isinstance(inspection.get("ownership"), dict) else {}
+            containers = inspection.get("containers") if isinstance(inspection.get("containers"), list) else []
+            network = inspection.get("network") if isinstance(inspection.get("network"), dict) else {}
+            active = (
+                owner.get("state") == "RUNNING" and bool(containers)
+                and all(item.get("state") == "running" for item in containers if isinstance(item, dict))
+                and network.get("owned") is True and network.get("internal") is True
             )
+            service_context = {
+                "exists": bool(owner), "state": owner.get("state", "UNOWNED"),
+                "alias": service.stable_alias, "network": service.network,
+                "lifecycle_owner": owner.get("owner_session_id"), "attach_only": True,
+            }
+            if active:
+                if owner.get("owner_session_id") != args.parent_session_id:
+                    raise ValueError(
+                        f"managed service owner mismatch: expected {args.parent_session_id}, "
+                        f"found {owner.get('owner_session_id')}"
+                    )
+                metadata = inspection.get("metadata") if isinstance(inspection.get("metadata"), dict) else {}
+                endpoint_rows = metadata.get("service_endpoints") if isinstance(metadata.get("service_endpoints"), list) else []
+                endpoints = tuple(
+                    str(item["target"]) for item in endpoint_rows
+                    if isinstance(item, dict) and item.get("target")
+                )
+                if not endpoints:
+                    raise ValueError("active managed service has no stable endpoint metadata")
+                targets = ()
+                service_network = service.network
+                attachment_service = service
+                service_context["endpoints"] = endpoint_rows
+                service_context["service_url"] = endpoints[0]
+                service_context["instructions"] = (
+                    "Managed service is already running. You may inspect, connect, send requests, "
+                    "and run PoCs. Service lifecycle is owned by the parent Sol session; this worker is attach-only."
+                )
+            elif args.service or owner.get("state") == "RUNNING" or bool(containers):
+                reasons = []
+                if not owner: reasons.append("owner missing")
+                if owner and owner.get("state") != "RUNNING": reasons.append("service not running")
+                if owner.get("state") == "RUNNING" and not containers: reasons.append("service container missing")
+                if containers and not all(
+                    item.get("state") == "running" for item in containers if isinstance(item, dict)
+                ):
+                    reasons.append("service container not running")
+                if network.get("exists") is not True: reasons.append("network missing")
+                elif network.get("owned") is not True: reasons.append("network is not owned")
+                elif network.get("internal") is not True: reasons.append("network is not internal")
+                raise ValueError("managed service attachment failed: " + ", ".join(reasons or ["service unavailable"]))
+        elif args.service:
+            raise ValueError("managed service attachment failed: intake has no service plan")
+        session_id, session_role = _caller(args, branch=args.branch)
         spec = SandboxSpec(
             contest_slug=manifest.slug, challenge_id=challenge.id, branch=args.branch,
             source=expected_source, branch_root=branch_root,
             input_fingerprint=str(record["source_fingerprint"]),
             targets=targets, image=image, resource_profile=profile,
             service_network=service_network, local_endpoints=endpoints,
+            session_id=session_id, parent_session_id=args.parent_session_id,
+            session_role=session_role, service_context=service_context,
         )
-        metadata = create(spec)
-        try:
-            _update_branch_state(solve_root, args.branch, "RUNNING", str(metadata["metadata_path"]))
-        except Exception:
-            cleanup(metadata)
-            raise
+        guard = (
+            service_attachment(
+                attachment_service,
+                actor=ServiceActor(
+                    args.parent_session_id, role="sol", parent_session_id=args.parent_session_id,
+                ),
+            )
+            if attachment_service is not None else nullcontext()
+        )
+        with guard:
+            metadata = create(spec)
+            try:
+                if service_network:
+                    metadata["connectivity_probe"] = probe_service_connectivity(metadata)
+                    atomic_json(Path(str(metadata["metadata_path"])), metadata)
+                _update_branch_state(solve_root, args.branch, "RUNNING", str(metadata["metadata_path"]))
+            except Exception:
+                cleanup(metadata)
+                raise
         return metadata
     if args.command == "record-finding":
+        _require_sol(args, "Only the parent Sol session may merge shared findings; submit a worker result instead.")
         return append_finding(solve_root, args.branch, args.summary, args.evidence, args.status)
+    if args.command == "worker-result-save":
+        session_id, role = _caller(args, branch=args.branch)
+        if role != "child" or session_id != args.branch:
+            raise ValueError("worker result must be submitted by its matching child session")
+        try:
+            payload = json.loads(args.result_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--result-json must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("--result-json must contain a JSON object")
+        if (
+            payload.get("challenge_id") != challenge.id
+            or payload.get("parent_session_id") != args.parent_session_id
+            or payload.get("input_fingerprint") != record.get("source_fingerprint")
+        ):
+            raise ValueError("worker result challenge, parent session, or input fingerprint does not match the active solve")
+        worker_root = solve_root / "workers" / args.branch
+        sandbox_metadata = worker_root / "sandbox.json"
+        if sandbox_metadata.is_file():
+            export_artifacts(
+                _load_metadata(root, str(sandbox_metadata)),
+                session_id=session_id, session_role=role,
+            )
+        return save_worker_result(worker_root, payload)
+    if args.command == "worker-results-merge":
+        _require_sol(args, "Only the parent Sol session may merge worker results.")
+        paths = sorted((solve_root / "workers").glob("*/result.json"))
+        current_fingerprint = str(record["source_fingerprint"])
+        merged = merge_worker_result_files(paths, input_fingerprint=current_fingerprint)
+        merged_path = solve_root / "workers" / "MERGED_RESULTS.json"
+        atomic_json(merged_path, merged)
+        return {**merged, "merged_path": str(merged_path)}
     raise ValueError(f"unsupported internal command: {args.command}")
 
 
@@ -234,6 +396,46 @@ def _service_spec(manifest, challenge, record: dict[str, object], solve_root: Pa
         contest_slug=manifest.slug, challenge_id=challenge.id,
         source=solve_root / "input", workspace=solve_root, service_plan=plan,
     )
+
+
+def _caller(
+    args: argparse.Namespace, *, metadata: dict[str, object] | None = None, branch: str | None = None,
+) -> tuple[str, str]:
+    role = str(getattr(args, "session_role", "sol"))
+    configured = getattr(args, "session_id", None)
+    environment_role = os.environ.get("CTF_OS_SESSION_ROLE")
+    if environment_role == "child":
+        environment_id = os.environ.get("CTF_OS_SESSION_ID")
+        if role != "child" or not environment_id or configured != environment_id:
+            raise ValueError("DENIED_SESSION_IDENTITY: child session identity cannot be overridden")
+        return environment_id, "child"
+    if configured:
+        session_id = str(configured)
+    elif role == "child":
+        if not branch:
+            raise ValueError("child session calls require --session-id")
+        session_id = branch
+    else:
+        session_id = str(getattr(args, "parent_session_id", "sol-main"))
+    return session_id, role
+
+
+def _service_actor(args: argparse.Namespace, *, child_default: bool = False) -> ServiceActor:
+    role = str(getattr(args, "session_role", "sol"))
+    if child_default and getattr(args, "session_id", None) is None and role == "child" and not os.environ.get("CTF_OS_SESSION_ROLE"):
+        session_id = "sandbox-bootstrap"
+    else:
+        session_id, role = _caller(args)
+    return ServiceActor(
+        session_id=session_id, role=role, parent_session_id=str(args.parent_session_id),
+        recover_stale=bool(getattr(args, "recover_stale", False)),
+    )
+
+
+def _require_sol(args: argparse.Namespace, message: str) -> None:
+    session_id, role = _caller(args)
+    if role != "sol" or session_id != str(args.parent_session_id):
+        raise ValueError(f"DENIED_CONTROLLER_ACTION: {message}")
 
 
 def _compact_prepare(challenge, record: dict[str, object], solve_root: Path) -> dict[str, object]:
@@ -269,7 +471,9 @@ def _state_summary(solve_root: Path) -> dict[str, object]:
     if not path.is_file():
         return {}
     state = json.loads(path.read_text(encoding="utf-8"))
-    return {key: state.get(key) for key in ("status", "flag_candidate", "branches", "input_fingerprint", "updated_at")}
+    return {key: state.get(key) for key in (
+        "status", "replay_verdict", "flag_candidate", "branches", "input_fingerprint", "updated_at",
+    )}
 
 
 def _load_challenge(root: Path, contest_selector: str | None, selector: str):

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 : "${CTF_OS_ALLOWED_ENDPOINTS_JSON:=[]}"
+: "${CTF_OS_LOCAL_ENDPOINTS_JSON:=[]}"
 export HOME=/home/ctf
 
 apply_firewall() {
@@ -34,9 +35,42 @@ apply_firewall() {
     done < <(printf '%s' "$CTF_OS_ALLOWED_ENDPOINTS_JSON" | jq -r '.[] | [.ip, (.port|tostring), .protocol] | @tsv')
 }
 
+apply_local_firewall() {
+    local tool="$1" family="$2"
+    "$tool" -F OUTPUT
+    "$tool" -P OUTPUT DROP
+    "$tool" -A OUTPUT -o lo -j ACCEPT
+    "$tool" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    while IFS=$'\t' read -r host port; do
+        [ -n "$host" ] || continue
+        case "$port" in
+            ''|*[!0-9]*|0) exit 64 ;;
+        esac
+        while read -r ip; do
+            [ -n "$ip" ] || continue
+            if [ "$family" = "4" ]; then
+                case "$ip" in *:*) continue ;; esac
+                "$tool" -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+            elif [ "$family" = "6" ]; then
+                case "$ip" in *:*) ;; *) continue ;; esac
+                "$tool" -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
+            else
+                exit 64
+            fi
+        done < <(getent ahosts "$host" | awk '{print $1}' | sort -u)
+    done < <(
+        printf '%s' "$CTF_OS_LOCAL_ENDPOINTS_JSON" |
+            jq -r '.[] | capture("^(?:(?:https?|tcp)://)?(?<host>[^:/]+):(?<port>[0-9]+)$") | [.host, .port] | @tsv'
+    )
+}
+
 if [ "$CTF_OS_ALLOWED_ENDPOINTS_JSON" != "[]" ]; then
     apply_firewall iptables 4
     apply_firewall ip6tables 6
+elif [ "$CTF_OS_LOCAL_ENDPOINTS_JSON" != "[]" ]; then
+    apply_local_firewall iptables 4
+    apply_local_firewall ip6tables 6
 fi
 
 # `--bounding-set=-all` removes NET_ADMIN, SETUID, SETGID and SETPCAP before
