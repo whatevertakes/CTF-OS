@@ -2,6 +2,32 @@
 
 CTF-OS는 사용자가 직접 연 Sol 세션을 위한 로컬 CTF 분석 도구입니다. Python은 `contest.md` 파싱, 안전한 문제 준비, sandbox/service lifecycle, evidence, replay, flag 검증과 내부 eval만 담당하며 Codex나 다른 모델을 실행하지 않습니다.
 
+## 처음 시작하기
+
+이 저장소는 SSH 키가 이 private repository에 연결되어 있다는 전제입니다. HTTPS 주소 대신 아래 SSH 주소로 clone합니다.
+
+```bash
+git clone git@github.com:whatevertakes/CTF-OS.git
+cd CTF-OS
+```
+
+- `git clone ...` — CTF-OS 소스와 설정 파일을 현재 위치에 내려받습니다. 최초 한 번만 실행합니다.
+- `cd CTF-OS` — 내려받은 저장소 폴더로 이동합니다. 이후 명령은 모두 이 폴더에서 실행합니다.
+
+의존성과 sandbox 이미지를 준비한 다음, Codex에서 이 폴더를 열어 Sol 세션을 시작합니다.
+
+```bash
+uv sync --frozen
+sandbox/build-images.sh
+uv run python -m ctf_os.agent_tools doctor
+```
+
+- `uv sync --frozen` — lockfile에 고정된 Python 의존성을 설치합니다. lockfile과 달라지는 임의 업데이트는 하지 않습니다.
+- `sandbox/build-images.sh` — 문제 유형별 격리 Docker 이미지를 로컬에 미리 빌드합니다. 처음에는 다소 오래 걸릴 수 있습니다.
+- `uv run python -m ctf_os.agent_tools doctor` — Python, Docker, 이미지 등 CTF-OS 실행 환경이 준비됐는지 점검합니다. 오류가 있으면 대회를 시작하기 전에 해결합니다.
+
+준비가 끝나면 대회 파일을 `incoming/<contest>/` 아래에 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
+
 ```text
 문제 파일과 contest.md 작성
 → Sol 세션에서 intake 해라
@@ -24,14 +50,6 @@ CTF-OS는 사용자가 직접 연 Sol 세션을 위한 로컬 CTF 분석 도구�
 ```
 
 입력 프로필은 `standard`, `large`, `large-forensic`만 허용합니다. 큰 프로필도 traversal, link, special-file 방어를 유지합니다. 알 수 없는 필드는 intake warning으로 나오며 `Remtoe` 같은 핵심 오타는 강한 suggestion을 냅니다.
-
-## 대회 전 준비
-
-```bash
-uv sync --frozen
-sandbox/build-images.sh
-uv run python -m ctf_os.agent_tools doctor
-```
 
 `sandbox/build-images.sh`는 단일 Dockerfile에서 다음 태그를 미리 빌드합니다.
 
