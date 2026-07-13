@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_CATEGORIES = ("pwn", "rev", "web", "forensic", "misc", "crypto")
+_SLOT_COUNT = 4
 
 
 def initialize_contest(root: Path, name: str) -> dict[str, object]:
@@ -35,18 +36,7 @@ def initialize_contest(root: Path, name: str) -> dict[str, object]:
         if manifest.is_symlink() or not manifest.is_file():
             raise ValueError(f"contest manifest path is unsafe: {manifest}")
     else:
-        template = (
-            f"# 대회명: {contest_name}\n"
-            "- 입력 프로필: standard\n"
-            "\n"
-            "<!-- 선택 메타데이터: 날짜, 플래그 형식, 플래그 패턴\n"
-            "\n"
-            "문제를 추가할 때 아래 형식을 복사하세요.\n"
-            "### pwn/문제명\n"
-            "- 설명: 문제 설명\n"
-            "- 원격: nc example.com 31337\n"
-            "-->\n"
-        )
+        template = _contest_template(contest_name)
         try:
             with manifest.open("x", encoding="utf-8") as handle:
                 handle.write(template)
@@ -72,3 +62,37 @@ def _ensure_directory(path: Path) -> None:
             raise ValueError(f"directory path is unsafe: {path}")
         return
     path.mkdir()
+
+
+def _contest_template(contest_name: str) -> str:
+    lines = [
+        f"# 대회명: {contest_name}",
+        "- 날짜: YYYY-MM-DD",
+        "- 플래그 형식: FLAG{...}",
+        "- 입력 프로필: standard",
+        "",
+        "<!--",
+        "이 블록은 파서가 무시하는 등록 템플릿입니다.",
+        "실제 문제는 필요한 카드를 복사해 이 주석 블록 밖에 붙여 넣으세요.",
+        "문제 파일은 incoming/<대회명>/<카테고리>/<문제명>/ 아래에 둡니다.",
+        "원격이 없는 문제는 '- 원격:' 줄을 삭제하세요.",
+        "",
+    ]
+    for category in DEFAULT_CATEGORIES:
+        lines.append(f"## {category} 등록 카드 (최대 {_SLOT_COUNT}개 예시)")
+        for number in range(1, _SLOT_COUNT + 1):
+            lines.extend([
+                f"### {category}/문제명-{number}",
+                "- 설명: 문제 원문 설명",
+                "- 원격: nc host.example 31337",
+                "",
+            ])
+    lines.extend([
+        "## 추가 문제 복사용 카드",
+        "### 카테고리/문제명",
+        "- 설명: 문제 원문 설명",
+        "- 원격: nc host.example 31337",
+        "-->",
+        "",
+    ])
+    return "\n".join(lines)

@@ -17,6 +17,13 @@ def test_initialize_contest_creates_template_and_category_directories(repo: Path
     manifest = parse_contest(contest_root / "contest.md")
     assert manifest.name == "My CTF 2026"
     assert manifest.challenges == ()
+    template = (contest_root / "contest.md").read_text(encoding="utf-8")
+    assert "- 날짜: YYYY-MM-DD" in template
+    assert "- 플래그 형식: FLAG{...}" in template
+    for category in DEFAULT_CATEGORIES:
+        for number in range(1, 5):
+            assert f"### {category}/문제명-{number}" in template
+    assert "### 카테고리/문제명" in template
 
 
 def test_initialize_contest_is_idempotent_and_does_not_overwrite_manifest(repo: Path) -> None:
