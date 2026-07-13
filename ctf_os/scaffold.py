@@ -37,11 +37,11 @@ def initialize_contest(root: Path, name: str) -> dict[str, object]:
     else:
         template = (
             f"# 대회명: {contest_name}\n"
-            "- 날짜:\n"
-            "- 플래그 형식:\n"
             "- 입력 프로필: standard\n"
             "\n"
-            "<!-- 문제를 추가할 때 아래 형식을 복사하세요.\n"
+            "<!-- 선택 메타데이터: 날짜, 플래그 형식, 플래그 패턴\n"
+            "\n"
+            "문제를 추가할 때 아래 형식을 복사하세요.\n"
             "### pwn/문제명\n"
             "- 설명: 문제 설명\n"
             "- 원격: nc example.com 31337\n"

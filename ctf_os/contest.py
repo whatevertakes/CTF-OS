@@ -147,8 +147,18 @@ def parse_contest(path: str | Path) -> ContestManifest:
     warnings: list[ManifestWarning] = []
     field_warnings: list[ManifestWarning] | None = None
     last_key: str | None = None
+    in_html_comment = False
 
     for line_number, raw in enumerate(lines, 1):
+        stripped = raw.lstrip()
+        if in_html_comment:
+            if "-->" in raw:
+                in_html_comment = False
+            continue
+        if stripped.startswith("<!--"):
+            if "-->" not in stripped:
+                in_html_comment = True
+            continue
         if name is None:
             match = _TITLE.match(raw)
             if match:
@@ -186,9 +196,6 @@ def parse_contest(path: str | Path) -> ContestManifest:
         entries.append((heading, fields, field_warnings or []))
     if not name:
         raise ContestError("expected '# 대회명: <name>' or '# Contest: <name>'")
-    if not entries:
-        raise ContestError("contest.md has no '### category/name' challenge headings")
-
     contest_flag = _first(metadata, "flag_format")
     contest_pattern = _first(metadata, "flag_pattern") or (_format_pattern(contest_flag) if contest_flag else None)
     contest_input_profile = _input_profile(_first(metadata, "input_profile"), "contest")

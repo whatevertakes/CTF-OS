@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from ctf_os.contest import parse_contest
 from ctf_os.scaffold import DEFAULT_CATEGORIES, initialize_contest
 
 
@@ -13,7 +14,9 @@ def test_initialize_contest_creates_template_and_category_directories(repo: Path
     assert result["contest"] == "My CTF 2026"
     assert result["categories"] == list(DEFAULT_CATEGORIES)
     assert all((contest_root / category).is_dir() for category in DEFAULT_CATEGORIES)
-    assert (contest_root / "contest.md").read_text(encoding="utf-8").startswith("# 대회명: My CTF 2026\n")
+    manifest = parse_contest(contest_root / "contest.md")
+    assert manifest.name == "My CTF 2026"
+    assert manifest.challenges == ()
 
 
 def test_initialize_contest_is_idempotent_and_does_not_overwrite_manifest(repo: Path) -> None:
