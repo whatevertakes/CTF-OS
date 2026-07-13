@@ -53,7 +53,13 @@ uv run python -m ctf_os.agent_tools doctor
 
 그래도 일반 `docker pull`에서 `error getting credentials` 또는 `A specified logon session does not exist`가 발생하면 Docker Desktop을 재시작하거나 Docker Hub 로그인을 다시 설정합니다. 이 조치는 CTF-OS 빌드가 아니라 호스트 Docker의 credential helper 세션을 복구하기 위한 것입니다.
 
-준비가 끝나면 대회 파일을 `incoming/<contest>/` 아래에 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
+준비가 끝나면 아래 한 줄로 `incoming/<contest>/` 아래에 기본 카테고리 폴더(`pwn`, `rev`, `web`, `forensic`, `misc`, `crypto`)와 `contest.md`를 생성합니다. 기존 `contest.md`는 명령을 다시 실행해도 덮어쓰지 않습니다.
+
+```bash
+uv run python -m ctf_os.agent_tools init-contest "SCA"
+```
+
+생성된 카테고리 폴더에 문제 파일을 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
 
 ```text
 문제 파일과 contest.md 작성

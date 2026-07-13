@@ -11,6 +11,7 @@ from ..evidence import append_finding
 from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
 from ..doctor import run_doctor
 from ..replay import run_replay
+from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import sandbox_gc, sandbox_status
 from ..sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts
@@ -25,6 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m ctf_os.agent_tools", description="Internal JSON tools for the active Sol session")
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
+    init_contest = commands.add_parser("init-contest")
+    init_contest.add_argument("name")
     inspect = commands.add_parser("inspect-contest")
     inspect.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     inspect.add_argument("--contest")
@@ -91,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def dispatch(root: Path, args: argparse.Namespace) -> object:
+    if args.command == "init-contest":
+        return initialize_contest(root, args.name)
     if args.command == "doctor":
         return run_doctor(root)
     if args.command == "sandbox-status":
