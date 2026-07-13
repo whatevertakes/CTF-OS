@@ -1,5 +1,10 @@
 # Tactical execution engine
 
+> **Manual-workbench scope:** this engine now supplies subtype classification,
+> strategy contracts, capability requirements and Sol prompt context for one
+> human-selected Solve Session. It does not own a contest-wide queue, assign
+> challenges, retry work, or spawn workers outside `ctf-os solve <challenge>`.
+
 CTF-OS converts Sol's `tool_strategy` into a versioned local execution policy.
 The policy selects a capability profile/image, creates an attempt-private
 harness, preflights real executables, publishes command templates and expected

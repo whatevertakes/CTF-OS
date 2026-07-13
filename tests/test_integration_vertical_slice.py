@@ -14,7 +14,6 @@ from ctf_os.local_state import LocalState
 from ctf_os.models import Challenge, ChallengeStatus, Event, FlagCandidate
 from ctf_os.sandbox.docker_cli import DockerCli, RecordingCommandRunner
 from ctf_os.solver_engine.codex_cli_backend import CodexExecResult
-from ctf_os.tui import render_tui
 
 
 MANIFEST = """# 대회명: Demo
@@ -187,7 +186,6 @@ def test_mock_once_end_to_end_writes_synthetic_candidate_solved_event_and_artifa
     assert "FINDING" in (output / "notes.md").read_text(encoding="utf-8")
     # Synthetic mock fixtures remain in their private SQLite/output namespace.
     assert [event.type for event in state.list_events()]
-    assert "SYNTHETIC SOLVED:" in render_tui(synthetic_config, state)
 
 
 def test_unscored_pwn_challenge_reaches_worker_execution(tmp_path: Path) -> None:
@@ -212,7 +210,7 @@ def test_unscored_pwn_challenge_reaches_worker_execution(tmp_path: Path) -> None
     assert report.solved_challenges == 1
 
 
-def test_non_mock_startup_failure_is_persisted_for_readonly_tui(tmp_path: Path) -> None:
+def test_non_mock_startup_failure_is_persisted_without_starting_workers(tmp_path: Path) -> None:
     config = _config(tmp_path, routing=False, sandbox=True)
     _manifest(tmp_path)
 
@@ -222,10 +220,6 @@ def test_non_mock_startup_failure_is_persisted_for_readonly_tui(tmp_path: Path) 
     state = LocalState.for_config(config)
     failure = [event for event in state.list_events() if event.type == "STARTUP_FAILED"][-1]
     assert failure.payload["error_type"] == "PrerequisiteError"
-    rendered = render_tui(config, state)
-    assert "OPERATOR STARTUP_FAILED" in rendered
-    assert "model routing is disabled" in rendered
-
     LocalApplication(config).parse()
     production_state = LocalState(config.state_path())
     production_challenge = production_state.list_challenges()[0]
@@ -268,27 +262,3 @@ def test_nonmock_request_uses_automatic_model_route_and_never_uses_host_commands
         and event.payload.get("resume_id") == "resume-vertical"
         for event in worker_stopped
     )
-
-
-def test_tui_distinguishes_candidate_from_solved(tmp_path: Path, claimed_attempt) -> None:
-    config = _config(tmp_path)
-    state = LocalState(config.state_path())
-    challenge = state.upsert_challenge(Challenge(contest="Demo", category="web", name="login"))
-    state.transition_challenge_status(challenge.id, "QUEUED")
-    attempt = claimed_attempt(state, challenge, owner="owner-a", attempt_id="attempt-a")
-    state.transition_challenge_status(
-        challenge.id, "RUNNING", attempt_id=attempt.id,
-        owner=attempt.lease_owner, fencing_token=attempt.fencing_token,
-    )
-    candidate = FlagCandidate(challenge_id=challenge.id, attempt_id=attempt.id, value="FLAG{SOLVED}")
-    event = Event(team_id="team", member="member", contest="Demo", type="FLAG_CANDIDATE", challenge_id=challenge.id, attempt_id=attempt.id)
-    state.record_candidate(candidate, event, owner=attempt.lease_owner, fencing_token=attempt.fencing_token)
-    assert "UNVERIFIED: FLAG{SOLVED}" in render_tui(config, state)
-    state.transition_challenge_status(
-        challenge.id, "VERIFYING", attempt_id=attempt.id,
-        owner=attempt.lease_owner, fencing_token=attempt.fencing_token,
-    )
-    solved = Event(team_id="team", member="member", contest="Demo", type="SOLVED", challenge_id=challenge.id, attempt_id=attempt.id)
-    state.solve_verified(candidate_id=candidate.id, flag="FLAG{SOLVED}", event=solved,
-                         owner=attempt.lease_owner, fencing_token=attempt.fencing_token)
-    assert "VERIFIED: FLAG{SOLVED}" in render_tui(config, state)

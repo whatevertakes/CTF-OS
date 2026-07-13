@@ -22,7 +22,6 @@ from ctf_os.models import Attempt, AttemptStatus, Challenge, ChallengeStatus, Ev
 from ctf_os.sandbox.docker_cli import CommandResult, DockerCli
 from ctf_os.solver_engine.knowledge import KnowledgeIndex
 from ctf_os.solver_engine.race_plan import RacePlan
-from ctf_os.tui import render_tui
 
 
 def _config(
@@ -225,37 +224,6 @@ def test_supervisor_loop_check_and_quota_cooling_do_not_hot_loop(tmp_path: Path)
     assert [event.type for event in state.list_events(challenge_id=challenge.id)] == types
 
 
-def test_tui_shows_hinting_paused_reason_and_latest_supervisor_hint(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app = LocalApplication(config)
-    state = LocalState(config.state_path())
-    challenge = _challenge(state)
-    attempt = _running_attempt(app, state, challenge)
-    state.transition_challenge_status(
-        challenge.id, ChallengeStatus.STUCK, attempt_id=attempt.id,
-        owner=app._owner, fencing_token=attempt.fencing_token,
-    )
-    state.transition_challenge_status(
-        challenge.id, ChallengeStatus.HINTING, attempt_id=attempt.id,
-        owner=app._owner, fencing_token=attempt.fencing_token,
-    )
-    state.append_fenced_event(
-        Event(
-            team_id=config.team_id, member=config.member_name, contest="Demo", type="SUPERVISOR_HINT",
-            challenge_id=challenge.id, attempt_id=attempt.id,
-            message="try a local escaping baseline", payload={"hint": "try a local escaping baseline"},
-        ),
-        attempt_id=attempt.id, owner=app._owner, fencing_token=attempt.fencing_token,
-    )
-    rendered = render_tui(config, state)
-    assert "LOCAL_HINTING" in rendered
-    assert "try a local escaping baseline" in rendered
-    app.pause_challenge(challenge.name)
-    paused = render_tui(config, state)
-    assert "PAUSED" in paused
-    assert "operator paused locally owned challenge" in paused
-
-
 def test_application_uses_persistent_rag_only_refreshing_changed_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _config(tmp_path)
     root = tmp_path / "knowledge"
@@ -285,21 +253,11 @@ def test_application_uses_persistent_rag_only_refreshing_changed_sources(tmp_pat
     assert (root / "indexes" / ".ctf-os-runtime-sources.json").is_file()
 
 
-def test_readme_includes_kisia_four_member_local_ownership_example() -> None:
+def test_readme_documents_only_the_manual_workbench_operator_flow() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
-    assert "KISIA four-member example" in readme
-    owners = {
-        "jiwoong": ("jiwoongchoi-norun", "[pwn, web]"),
-        "jueon": ("lee", "[rev, crypto]"),
-        "hyunseok": ("shyunseok1029", "[forensics, misc]"),
-        "howon": ("holymo-ly", "[cloud, web]"),
-    }
-    for member, (branch, categories) in owners.items():
-        assert member in readme
-        assert branch in readme
-        assert f'--member {member}' in readme
-        assert f'local.${{TEAM_ID}}.{member}.yaml' in readme
-        assert categories in readme
-    assert "sca-jiwoong-team" in readme
-    assert "대회 실행 브랜치는 전원 `main`" in readme
-    assert "자기 브랜치 → `main` PR" in readme
+    assert "ctf-os intake" in readme
+    assert "ctf-os solve NBB" in readme
+    assert "대회 전체 자동 queue/scheduler" in readme
+    assert "CTFd polling" in readme
+    assert "별도 TUI는 없습니다" in readme
+    assert "실제 제출은" in readme

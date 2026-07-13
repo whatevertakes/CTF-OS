@@ -1,5 +1,5 @@
-mode: local_node
-solver_mode: cli_attempt_race
+mode: manual_workbench
+solver_mode: manual_solve_session
 
 paths:
   incoming: "incoming"
@@ -26,58 +26,22 @@ solvers:
     enabled: true
     backend: codex_cli
     command: "codex"
-    max_workers: 2
-
-scheduler:
-  max_concurrent_challenges: 2
-  max_active_containers: 2
-  policy: local_safe
-  fairness: challenge_round_robin
 
 worker_policy:
-  max_workers_total: 2
-  max_workers_per_challenge: 2
-  kill_others_on_verified_flag: true
-
-codex_models:
-  supervisor: "gpt-5.6-sol"
-  strong: "gpt-5.6-sol"
-  default: "gpt-5.6-terra"
-  fast: "gpt-5.6-luna"
-  fallback: "gpt-5.5"
+  # A human chooses the actual value on each solve command.
+  manual_max_subworkers_ceiling: 16
 
 model_routing:
   enabled: true
   config_path: "config/model-routing.yaml"
 
-solver:
-  tactical_engine:
+runtime_profiles:
+  standard:
     enabled: true
-    strategy_registry: default
-    semantic_replanning: true
-    semantic_loop_detection: true
-    subtype_planners: true
-    capability_preflight: true
-    legacy_fallback: true
-
-supervision:
-  enabled: true
-  supervisor_model: supervisor
-  # Local-only no-progress supervisor timing. These never dispatch work to a
-  # teammate or central service.
-  hint_after_sec: 600
-  loop_check_sec: 120
-  hint_timeout_sec: 90
-  review_interval_sec: 120
-  max_plan_revisions: 5
-  stop_repeated_failures: true
-
-race_policy:
-  diversity: strategy
-  same_backend_parallel_attempts: true
-  api_model_race: false
-  remote_worker_race: false
-  kill_local_attempts_on_solved: true
+  nested_podman_trusted_ctf:
+    # Explicit trusted-CTF opt-in only; intake.md records the extra risk.
+    enabled: false
+    trusted_ctf_only: true
 
 # Host-side ZIP materialization safety limits. Raise only the necessary field
 # for a reviewed, authorized CTF attachment such as an OVMF sparse image.
@@ -91,13 +55,7 @@ intake:
 sandbox:
   enabled: true
   image: "ctf-os-sandbox:latest"
-  # Optional profile-specific images. Omitted profiles safely use `image`.
-  profile_images: {}
-  container_per_attempt: true
-  precreate_on_queue: false
-  max_containers: 2
-  cleanup: true
-  preserve_failed_attempts: false
+  max_containers: 1
   # Every parent-owned Docker CLI invocation has a hard wall-clock bound.
   command_timeout_sec: 30
   # Total per-attempt /work + /artifacts budget, including broker mirroring.
@@ -109,11 +67,3 @@ sandbox:
   default_limits:
     memory: "16g"
     cpus: 2.0
-
-flag_verification:
-  auto_confirm_flags: false
-  require_verifier_before_solved: true
-  ignore_placeholders: true
-
-watcher:
-  poll_interval_sec: 2

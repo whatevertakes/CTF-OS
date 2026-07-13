@@ -8,25 +8,21 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
-from threading import Event as ThreadEvent
-from typing import Callable, Sequence
+from typing import Sequence
 
 import yaml
 
-from .application import LocalApplication, PrerequisiteError
 from .capabilities import render_capabilities
 from .config import AppConfig, ConfigError, default_config_mapping
 from .doctor import run_doctor
 from .local_state import CURRENT_SCHEMA_VERSION, LocalState
-from .local_event_state import LocalEventState
 from .model_routing import ModelRouter
 from .sandbox.docker_cli import DockerCli
 from .sandbox.exec import SandboxExecError, execute_attempt_command
 from .solver_engine.codex_cli_backend import CodexCliBackend, CodexExecRequest
 from .solver_engine.knowledge import KnowledgeChunk, KnowledgeIndex
 from .solver_engine.knowledge_import import audit_snapshot, import_snapshot
-from .tui import CTFOSDashboard, render_tui
-from .watcher import PathPollingWatcher
+from .workbench import ManualIntakeWorkbench, ManualSolveWorkbench, WorkbenchError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,6 +54,30 @@ def main(argv: list[str] | None = None) -> int:
             report = run_doctor(config.path, require_non_mock=args.non_mock)
             print(report.render())
             return report.exit_code
+        if args.command == "intake":
+            reports = ManualIntakeWorkbench(config).run()
+            for report in reports:
+                blockers = f" blockers={'; '.join(report.blockers)}" if report.blockers else ""
+                print(
+                    f"{report.status.upper():17} "
+                    f"{report.challenge.category}/{report.challenge.name} "
+                    f"-> {report.report_path}{blockers}"
+                )
+            print(f"intake complete: {len(reports)} challenge report(s); no solver started")
+            return 0 if all(report.status != "blocked" for report in reports) else 1
+        if args.command == "solve":
+            result = ManualSolveWorkbench(config).start(
+                args.challenge, lead=args.lead,
+                max_subworkers=args.max_subworkers, runtime=args.runtime,
+                priority=args.priority,
+            )
+            print(
+                f"manual solve session {result.status.lower()}: {args.challenge}; "
+                f"subworkers={len(result.subworkers)}/{args.max_subworkers}"
+            )
+            if result.reason:
+                print(result.reason)
+            return 0 if result.status in {"COMPLETED", "STOPPED", "PAUSED"} else 1
         if args.command == "state":
             state_path = config.state_path()
             if args.dry_run:
@@ -78,71 +98,25 @@ def main(argv: list[str] | None = None) -> int:
             action = "migrated" if existed else "initialized"
             print(f"{action} local state: {state_path} (schema v{CURRENT_SCHEMA_VERSION})")
             return 0
-        if args.command == "parse":
-            challenges = LocalApplication(config).parse()
-            print(f"queued {len(challenges)} owned challenge(s)")
-            return 0
         if args.command == "retry":
-            challenge = LocalApplication(config).retry_challenge(args.challenge)
-            print(f"requeued {challenge.name}")
+            path = ManualSolveWorkbench(config).set_state(args.challenge, "STOPPED")
+            print(f"session marked for explicit restart: {path}; run 'ctf-os solve {args.challenge}' yourself")
             return 0
         if args.command == "pause":
-            result = LocalApplication(config).pause_challenge(args.challenge)
-            if result.already_in_target_state:
-                print(f"already paused: {result.challenge.name}")
-            else:
-                details = []
-                if result.cancelled_attempt_ids:
-                    details.append(f"cancelled={len(result.cancelled_attempt_ids)}")
-                if result.released_container_ids:
-                    details.append(f"released={len(result.released_container_ids)}")
-                print(f"paused {result.challenge.name}" + (f" ({', '.join(details)})" if details else ""))
+            path = ManualSolveWorkbench(config).set_state(args.challenge, "PAUSED")
+            print(f"paused manual session: {path}")
             return 0
         if args.command == "resume":
-            result = LocalApplication(config).resume_challenge(args.challenge)
-            print(f"resumed {result.challenge.name}; queued for next local run")
+            path = ManualSolveWorkbench(config).set_state(args.challenge, "STOPPED")
+            print(f"session is ready for explicit restart: {path}; run 'ctf-os solve {args.challenge}' yourself")
             return 0
         if args.command == "run":
-            app = LocalApplication(config)
-            memory, cpus = config.sandbox_limits
-            print(f"Sandbox image: {config.sandbox_image}")
-            print(f"Max concurrent challenges: {config.max_concurrent_challenges}")
-            print(f"Max active containers: {config.sandbox_max_containers}")
-            print(f"Per-container memory hard limit: {memory.replace('g', ' GiB') if memory.casefold().endswith('g') else memory}")
-            print(f"Per-container CPU quota: {float(cpus):g} vCPU")
-            print(f"Theoretical maximum quota: {16 * config.sandbox_max_containers} GiB / {2 * config.sandbox_max_containers} vCPU")
-            print("Memory reservation: disabled")
-            dashboard_config = app.dashboard_config(mock_worker=args.mock_worker)
-            def status_update() -> None:
-                _print_dashboard(dashboard_config)
-            report = app.run(
-                once=args.once,
-                mock_worker=args.mock_worker,
-                auto_confirm_flags=args.auto_confirm_flags or config.auto_confirm_flags,
-                # A TTY gets live screen refresh.  Redirected/non-TTY output
-                # remains one deterministic final plain renderer instead of a
-                # stream of timing-dependent intermediate snapshots.
-                on_status=status_update if not args.no_tui and sys.stdout.isatty() else None,
+            print(
+                "ctf-os run no longer starts a contest-wide scheduler; use 'ctf-os intake', "
+                "then explicitly run 'ctf-os solve <challenge>'",
+                file=sys.stderr,
             )
-            if report is not None:
-                print(f"run complete: parsed={report.parsed_challenges} started={report.started_attempts} solved={report.solved_challenges}" + (" (synthetic mock)" if report.synthetic else ""))
-                if not args.no_tui:
-                    _print_dashboard(dashboard_config)
-            return 0
-        if args.command == "tui":
-            if args.readonly:
-                try:
-                    return _watch_readonly_tui(config)
-                except KeyboardInterrupt:
-                    return 0
-            if sys.stdout.isatty() and not args.plain and config.state_path().is_file():
-                state = LocalState.for_config(config)
-                CTFOSDashboard(
-                    config, state, event_state=LocalEventState.from_events(state.list_events()),
-                ).run()
-                return 0
-            _print_dashboard(config)
-            return 0
+            return 2
         if args.command == "sandbox":
             if args.sandbox_command == "exec":
                 command = _sandbox_command_argv(args.command_parts)
@@ -155,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             removed = _cleanup_local_containers(config, all_containers=args.all)
             print(f"removed {len(removed)} sandbox container(s)")
             return 0
-    except (ConfigError, PrerequisiteError, SandboxExecError, ValueError, OSError) as exc:
+    except (ConfigError, SandboxExecError, WorkbenchError, ValueError, OSError) as exc:
         print(f"ctf-os: {exc}", file=sys.stderr)
         return 2
     parser.error(f"unknown command: {args.command}")
@@ -213,6 +187,19 @@ def _build_parser() -> argparse.ArgumentParser:
     capabilities_parser = subparsers.add_parser("capabilities", help="probe tactical tools and degraded profiles")
     capabilities_parser.add_argument("--json", action="store_true", help="emit a structured report")
 
+    intake_parser = subparsers.add_parser("intake", help="write independent per-challenge intake reports; never solve")
+    intake_parser.add_argument("--config", default="config.yaml")
+
+    solve_parser = subparsers.add_parser("solve", help="start one human-selected challenge Solve Session")
+    solve_parser.add_argument("challenge", help="challenge name, category/name, slug, key, or id")
+    solve_parser.add_argument("--config", default="config.yaml")
+    solve_parser.add_argument("--lead", choices=("sol", "terra", "luna"), default="sol")
+    solve_parser.add_argument("--max-subworkers", type=int, default=3)
+    solve_parser.add_argument("--priority", choices=("low", "normal", "high"), default="normal")
+    solve_parser.add_argument(
+        "--runtime", choices=("standard", "nested_podman_trusted_ctf"), default="standard",
+    )
+
     init_parser = subparsers.add_parser("init", help="create a local contest workspace")
     init_parser.add_argument("contest")
     init_parser.add_argument("--force", action="store_true")
@@ -220,11 +207,9 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--team-id", help="local team label used for output and Docker isolation")
     init_parser.add_argument("--member", help="this local node's member identifier (default: local)")
 
-    for name, help_text in (("doctor", "check local prerequisites"), ("parse", "parse owned local challenges")):
-        command = subparsers.add_parser(name, help=help_text)
-        command.add_argument("--config", default="config.yaml")
-        if name == "doctor":
-            command.add_argument("--non-mock", action="store_true", help="fail unless Codex, Docker, image, and broker prerequisites are ready")
+    doctor_parser = subparsers.add_parser("doctor", help="check local prerequisites")
+    doctor_parser.add_argument("--config", default="config.yaml")
+    doctor_parser.add_argument("--non-mock", action="store_true", help="fail unless Codex, Docker, image, and broker prerequisites are ready")
 
     state_parser = subparsers.add_parser("state", help="manage this node's local SQLite state")
     state_sub = state_parser.add_subparsers(dest="state_command", required=True)
@@ -232,30 +217,20 @@ def _build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--config", default="config.yaml")
     migrate_parser.add_argument("--dry-run", action="store_true", help="check schema versions without writing")
 
-    run_parser = subparsers.add_parser("run", help="run this local node")
+    run_parser = subparsers.add_parser("run", help="deprecated: contest-global scheduler is removed")
     run_parser.add_argument("--config", default="config.yaml")
-    run_parser.add_argument("--once", action="store_true")
-    run_parser.add_argument("--mock-worker", action="store_true")
-    run_parser.add_argument("--auto-confirm-flags", action="store_true")
-    run_parser.add_argument("--no-tui", action="store_true")
 
-    retry_parser = subparsers.add_parser("retry", help="explicitly requeue one failed local challenge")
+    retry_parser = subparsers.add_parser("retry", help="mark one manual session for an explicit human restart")
     retry_parser.add_argument("challenge", help="local challenge name, slug, or id")
     retry_parser.add_argument("--config", default="config.yaml")
 
-    pause_parser = subparsers.add_parser("pause", help="pause one locally owned challenge")
+    pause_parser = subparsers.add_parser("pause", help="mark one human-selected manual session paused")
     pause_parser.add_argument("challenge", help="local challenge name, slug, or id")
     pause_parser.add_argument("--config", default="config.yaml")
 
-    resume_parser = subparsers.add_parser("resume", help="requeue one paused local challenge")
+    resume_parser = subparsers.add_parser("resume", help="mark one paused session ready for explicit restart")
     resume_parser.add_argument("challenge", help="local challenge name, slug, or id")
     resume_parser.add_argument("--config", default="config.yaml")
-
-    tui_parser = subparsers.add_parser("tui", help="render a deterministic local dashboard")
-    tui_parser.add_argument("--config", default="config.yaml")
-    tui_parser.add_argument("--readonly", action="store_true", help="poll the local dashboard read-only until Ctrl-C")
-    tui_parser.add_argument("--plain", action="store_true", help="use the deterministic plain/Rich-compatible fallback")
-
 
     sandbox_parser = subparsers.add_parser("sandbox", help="Docker-only sandbox commands")
     sandbox_sub = sandbox_parser.add_subparsers(dest="sandbox_command", required=True)
@@ -380,51 +355,6 @@ def _render_knowledge_chunk(chunk: KnowledgeChunk) -> str:
         f"[knowledge id={chunk.id} source={chunk.source} category={chunk.category} trust={chunk.trust}]\n"
         f"tags: {tags}\ntools: {tools}\nflags: {', '.join(chunk.flags) or '-'}\n{chunk.content}\n"
     )
-
-
-def _dashboard_text(config: AppConfig) -> str:
-    """Read status without claiming work or creating an empty state database."""
-    state = (
-        LocalState.for_config(config)
-        if config.state_path().is_file()
-        else None
-    )
-    events = state.list_events() if state is not None else ()
-    return render_tui(
-        config,
-        state,
-        event_state=LocalEventState.from_events(events),
-    )
-
-
-def _print_dashboard(config: AppConfig, *, printer: Callable[[str], None] = print) -> str:
-    dashboard = _dashboard_text(config)
-    if printer is print and sys.stdout.isatty():
-        print("\x1b[2J\x1b[H" + dashboard, flush=True)
-    else:
-        printer(dashboard)
-    return dashboard
-
-
-def _watch_readonly_tui(
-    config: AppConfig,
-    *,
-    stop_event: ThreadEvent | None = None,
-    printer: Callable[[str], None] = print,
-) -> int:
-    """Poll only the local SQLite file; never run or control workers."""
-    watcher = PathPollingWatcher(
-        (config.state_path(),),
-        interval_sec=config.poll_interval_sec,
-        include=lambda path: path.name.startswith("local_state.db"),
-    )
-    while True:
-        if watcher.changed():
-            _print_dashboard(config, printer=printer)
-        if stop_event is not None and stop_event.is_set():
-            return 0
-        if not watcher.wait(stop_event):
-            return 0
 
 
 def _init_workspace(

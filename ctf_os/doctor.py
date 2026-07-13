@@ -11,11 +11,12 @@ from typing import Callable
 
 from .config import AppConfig, ConfigError
 from .contest_parser import ContestParseError
-from .intake import IntakeError, IntakeService
+from .intake import IntakeError
 from .local_state import LocalState, StateError
 from .sandbox.docker_cli import DockerCli
 from .sandbox.broker import broker_transport_supported
 from .solver_engine.codex_cli_backend import CodexCliBackend
+from .workbench import ManualIntakeWorkbench, WorkbenchError
 
 
 @dataclass(frozen=True)
@@ -109,16 +110,17 @@ def run_doctor(
 
     current_manifest = config.incoming_contest_dir() / "contest.md"
     try:
-        service = IntakeService(config)
-        ready = service.collect(materialize=False)
-        blocked = service.admission_errors
+        reports = ManualIntakeWorkbench(config).run(materialize=False, write_reports=False)
+        ready = tuple(report for report in reports if report.status != "blocked")
+        blocked = tuple(report for report in reports if report.status == "blocked")
         checks.append(DoctorCheck(
-            "contest intake", bool(ready) and not blocked, True,
-            f"{current_manifest}: {len(ready)} owned challenge(s) ready, {len(blocked)} blocked"
-            + (f"; {blocked[0].reason}" if blocked else "")
+            "contest intake", bool(reports), True,
+            f"{current_manifest}: {len(ready)} owned challenge(s) ready or needs preparation, "
+            f"{len(blocked)} independently blocked"
+            + ("; run ctf-os intake for per-challenge reports" if blocked else "")
             if ready or blocked else f"{current_manifest}: no owned challenges are ready",
         ))
-    except (ContestParseError, IntakeError, OSError) as exc:
+    except (ContestParseError, IntakeError, WorkbenchError, OSError) as exc:
         checks.append(DoctorCheck("contest intake", False, True, f"{current_manifest}: {exc}"))
 
     codex_found = which(config.codex_command) is not None

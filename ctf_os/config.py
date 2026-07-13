@@ -35,19 +35,19 @@ def default_config_mapping(
     team_id: str | None = None,
     member_name: str = "local",
 ) -> dict[str, Any]:
-    """Return a runnable mock-safe configuration for ``ctf-os init``.
+    """Return a manual-workbench configuration for ``ctf-os init``.
 
     Model routing is deliberately disabled in this generated starter config:
     a real Codex run must be explicitly enabled with a reviewed routing file.
-    Mock runs remain fully local and do not need Docker or Codex.
+    Intake remains model-free; an actual Solve Session requires Docker and Codex.
     """
     from .models import slugify
 
     resolved_team_id = team_id or f"{slugify(contest_name)}-team"
     resolved_member_name = member_name.strip() or "local"
     return {
-        "mode": "local_node",
-        "solver_mode": "cli_attempt_race",
+        "mode": "manual_workbench",
+        "solver_mode": "manual_solve_session",
         "contest": {
             "name": contest_name,
             "team_id": resolved_team_id,
@@ -64,25 +64,18 @@ def default_config_mapping(
         },
         "intake": {"zip_limits": {"max_files": 1_000, "max_file_bytes": 64 * 1024**2,
                                    "max_total_bytes": 256 * 1024**2, "max_compression_ratio": 100}},
-        "solvers": {"codex": {"enabled": True, "backend": "codex_cli", "command": "codex", "max_workers": 2}},
-        "scheduler": {"max_concurrent_challenges": 2, "max_active_containers": 2,
-                      "policy": "local_safe", "fairness": "challenge_round_robin"},
-        "worker_policy": {"max_workers_total": 2, "max_workers_per_challenge": 2,
-                          "kill_others_on_verified_flag": True},
-        # These are deliberately coordinator-local timers.
-        "coordinator": {"hint_after_sec": 600, "loop_check_sec": 120},
+        "solvers": {"codex": {"enabled": True, "backend": "codex_cli", "command": "codex"}},
+        "worker_policy": {"manual_max_subworkers_ceiling": 16},
         "model_routing": {"enabled": False, "config_path": "config/model-routing.yaml"},
-        "solver": {"tactical_engine": {"enabled": True, "strategy_registry": "default",
-                    "semantic_replanning": True, "semantic_loop_detection": True,
-                    "subtype_planners": True, "capability_preflight": True,
-                    "legacy_fallback": True}},
-        "sandbox": {"enabled": True, "image": "ctf-os-sandbox:latest", "container_per_attempt": True,
-                    "precreate_on_queue": False, "max_containers": 2,
+        "runtime_profiles": {
+            "standard": {"enabled": True},
+            "nested_podman_trusted_ctf": {"enabled": False, "trusted_ctf_only": True},
+        },
+        "sandbox": {"enabled": True, "image": "ctf-os-sandbox:latest", "max_containers": 1,
                     "command_timeout_sec": 30,
                     "storage_limit_bytes": 8 * 1024**3, "storage_inode_limit": 262_144,
                     "default_limits": {"memory": "16g", "cpus": 2.0}},
-        "flag_verification": {"auto_confirm_flags": False, "require_verifier_before_solved": True,
-                              "ignore_placeholders": True},
+        # Read only by legacy library consumers; the manual CLI has no TUI.
         "watcher": {"poll_interval_sec": 2},
     }
 
@@ -394,10 +387,15 @@ class AppConfig:
         return ModelRouter.from_file(self.model_routing_path)
 
     def validate(self) -> None:
-        if self.raw.get("mode") != "local_node":
-            raise ConfigError("mode must be 'local_node'; central and remote execution are unsupported")
-        if self.raw.get("solver_mode", "cli_attempt_race") != "cli_attempt_race":
-            raise ConfigError("solver_mode must be 'cli_attempt_race'")
+        if self.raw.get("mode") not in {"manual_workbench", "local_node"}:
+            raise ConfigError(
+                "mode must be 'manual_workbench' (legacy 'local_node' is read-only compatible); "
+                "central and remote execution are unsupported"
+            )
+        if self.raw.get("solver_mode", "manual_solve_session") not in {
+            "manual_solve_session", "cli_attempt_race",
+        }:
+            raise ConfigError("solver_mode must be 'manual_solve_session'")
 
         contest = self.get_mapping("contest")
         member = self.get_mapping("member")
