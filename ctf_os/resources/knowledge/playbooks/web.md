@@ -6,7 +6,7 @@ Connect only to the URL in `contest.md`; do not crawl unrelated hosts, enumerate
 
 ## Hypotheses and tooling
 
-Start from observed data flow: authorization boundaries, server-side template use, database queries, file handling, redirects, and token validation. Use `curl` or an intercepting proxy with small, reversible probes. Test one hypothesis at a time for SQL injection, SSTI, traversal, SSRF, JWT/OIDC handling, or deserialization only where the challenge exposes a relevant input.
+Start from observed data flow: authorization boundaries, server-side template use, database queries, file handling, redirects, WebSockets, and token validation. Use `curl`, `httpx`, or short Python clients with small, reversible probes. Reproduce supplied Flask/FastAPI, Node, or PHP source locally; test SQL injection, SSTI, upload/traversal, SSRF, JWT, prototype pollution, or sandbox behavior only where the challenge exposes a relevant input.
 
 ## Validation and replay
 

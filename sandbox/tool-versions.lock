@@ -1,0 +1,28 @@
+# Directly fetched tools. Debian packages come from the pinned Debian 12 base family;
+# Python packages are pinned in sandbox/requirements*.txt.
+base_image=debian:12-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+radare2=5.9.8
+jadx=1.5.1
+upx=4.2.4
+wasmtime=24.0.0
+RsaCtfTool=7c98848f1945de3e67a420871e8672f5ad9aa5d5
+cado-nfs=90aec67f9a8f0badd0a20d1bbe4c1c2ed2e3c507
+stegseek=0.6
+zsteg=0.2.13
+waybackurls=8d27cf3e3031de01179e8ba9127e968eb01008e9
+one_gadget=1.10.0
+kubectl=1.33.3
+helm=3.18.4
+terraform=1.12.2
+opentofu=1.10.3
+oras=1.2.3
+cosign=2.5.0
+trivy=0.72.0
+syft=1.29.0
+grype=0.96.0
+opa=1.6.0
+conftest=0.61.2
+kustomize=5.7.1
+yq=4.45.4
+google-cloud-cli=532.0.0-0
+rootless_seccomp_base=moby/v24.0.9/profiles/seccomp/default.json

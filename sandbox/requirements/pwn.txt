@@ -1,0 +1,5 @@
+pwntools==4.14.1
+ROPGadget==7.7
+ropper==1.13.13
+angr==9.2.169
+keystone-engine==0.9.2

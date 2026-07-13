@@ -1,16 +1,26 @@
 CTF-OS SANDBOX CAPABILITIES
 
-Base: bash/curl/wget/nc/socat/jq, file/binutils/xxd/strings, gcc/g++/make,
-Python, Git/ripgrep, pwntools, pycryptodome, sympy, z3, capstone,
-unicorn, ROPgadget, and requests.
+All profiles inherit the pinned common Python/scientific/crypto layer and the
+shell, network, archive, binary inspection, tracing, compiler, Java, and Ruby
+toolchain declared in sandbox/install/common.sh.
 
-Category build targets add pwn, web, rev, crypto, or forensic packages. Nested
-container engines and Codex are absent.
+Images: base, pwn, web, rev, crypto, forensic, misc, osint, ai, cloud.
+The exact profile additions are the executable install scripts in
+sandbox/install/. Missing required commands or imports fail the image build and
+the same capability families are independently checked by `doctor`.
 
-Crypto includes PARI/GP, gmpy2, fpylll/cysignals, z3, sympy, and pycryptodome. SageMath
-is intentionally not an Ubuntu 24.04 package dependency; use an approved
-separate image when a challenge specifically requires the full Sage runtime.
+Runtime policy: /challenge is read-only; /work and /artifacts are worker-private
+tmpfs. Containers are read-only, non-root, capability-dropped, resource-limited,
+and have either no network or exact declared endpoint rules. Docker sockets,
+host filesystems, personal browser profiles, cloud credential directories,
+KVM/GPU/devices, host network/PID, and privileged mode are never mounted by the
+sandbox runtime. KVM, GPU, or physical device needs are reported NEEDS_REVIEW.
+Misc/cloud permit only the additional namespace, mount, and chroot syscalls
+needed by single-ID rootless Podman; capabilities, no-new-privileges, read-only
+root, private tmpfs storage, and network policy still apply.
 
-Challenge input is mounted read-only at /challenge. /work and /artifacts are
-attempt-private, size-bounded tmpfs mounts. Files in /artifacts are exported
-explicitly, on flag discovery, and before cleanup instead of after every command.
+OSINT is limited to public challenge targets and the remote allowlist. Cloud
+CLIs receive no ambient host credentials and store temporary configuration only
+inside /work. AI model files are inspected inside the sandbox on CPU; models are
+not downloaded implicitly and unsafe pickle/joblib artifacts are never loaded
+on the host.

@@ -1,4 +1,4 @@
-"""Pre-contest, read-mostly infrastructure checks with actionable fixes."""
+"""Pre-contest infrastructure and immutable image capability checks."""
 
 from __future__ import annotations
 
@@ -11,7 +11,91 @@ import tempfile
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute
 
 
-IMAGES = tuple(f"ctf-os-sandbox:{name}" for name in ("base", "pwn", "web", "rev", "crypto", "forensic"))
+PROFILES = ("base", "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud")
+IMAGES = tuple(f"ctf-os-sandbox:{name}" for name in PROFILES)
+
+_COMMON_ENV = (
+    "export HOME=/work/home XDG_CONFIG_HOME=/work/home/.config "
+    "XDG_CACHE_HOME=/work/home/.cache XDG_RUNTIME_DIR=/work/runtime TMPDIR=/work/tmp "
+    "AWS_SHARED_CREDENTIALS_FILE=/work/credentials/aws AWS_CONFIG_FILE=/work/credentials/aws-config "
+    "AZURE_CONFIG_DIR=/work/credentials/azure CLOUDSDK_CONFIG=/work/credentials/gcloud "
+    "KUBECONFIG=/work/credentials/kubeconfig; "
+    "mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" "
+    "\"$XDG_RUNTIME_DIR\" \"$TMPDIR\" /work/credentials; "
+)
+
+PROFILE_PROBES: dict[str, str] = {
+    "base": """
+command -v python3; command -v jq; command -v rg; command -v objdump; command -v strings; command -v readelf; command -v nmap
+python3 -c 'import requests,httpx,bs4,lxml,yaml,rich,numpy,scipy,PIL,networkx,sympy,z3,Crypto,cryptography,capstone,unicorn'
+python3 --version; jq --version; rg --version; objdump --version; nmap --version
+""",
+    "pwn": """
+for c in gdb gdb-multiarch qemu-aarch64 qemu-mips qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 patchelf checksec ROPgadget ropper one_gadget; do command -v "$c"; done
+python3 -c 'import pwn,angr,unicorn,capstone,keystone,z3'
+gdb --version; patchelf --version; checksec --help >/dev/null; ROPgadget --version; ropper --version; one_gadget --version
+qemu-aarch64 --version; qemu-mips --version; qemu-system-x86_64 --version
+""",
+    "web": """
+for c in node npm npx corepack php sqlite3 redis-cli psql mysql; do command -v "$c"; done
+node -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)'
+python3 -c 'import flask,fastapi,uvicorn,jwt,requests,httpx,websockets,dns'
+node --version; npm --version; php --version; sqlite3 --version
+""",
+    "rev": """
+(command -v r2 || command -v rizin)
+for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-mips qemu-riscv64; do command -v "$c"; done
+python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools'
+r2 -v; jadx --version; apktool --version; wasm-objdump --version; upx --version; wasmtime --version
+""",
+    "crypto": """
+for c in sage RsaCtfTool cado-nfs gp gap maxima; do command -v "$c"; done
+python3 -c 'import z3,gmpy2,Crypto,fpylll,cysignals,sympy,cryptography,ecdsa'
+sage -c 'assert 2^10 == 1024; assert GF(7)(3)^2 == 2'
+RsaCtfTool --help >/dev/null; cado-nfs --help >/dev/null; gp --version; gap --version; maxima --version
+""",
+    "forensic": """
+for c in vol mmls fls icat foremost exiftool binwalk tshark tcpdump testdisk photorec dcfldd steghide stegseek zsteg convert tesseract pngcheck ffmpeg sox; do command -v "$c"; done
+python3 -c 'import volatility3,scapy,pyshark,oletools,pdfminer,magic,PIL,numpy,scipy,capstone'
+vol -h >/dev/null; mmls -V; tshark --version; stegseek --version; zsteg -h >/dev/null; ffmpeg -version; sox --version
+""",
+    "misc": """
+for c in ffmpeg sox convert tesseract tshark binwalk exiftool dot parallel podman zbarimg php lua perl node npm; do command -v "$c"; done
+python3 -c 'import torch,sklearn,cv2,pandas,PIL,numpy,scipy,networkx,sympy,z3,scapy,qrcode; assert torch.tensor([2,3]).sum().item() == 5'
+ffmpeg -version; sox --version; convert -version; tesseract --version
+podman --storage-driver=vfs info --format '{{.Host.Security.Rootless}}' | grep -q true
+tar -cf /work/rootfs.tar --files-from /dev/null
+podman --storage-driver=vfs import /work/rootfs.tar localhost/ctf-os-smoke:local >/dev/null
+podman --storage-driver=vfs image inspect localhost/ctf-os-smoke:local --format '{{.RepoTags}}' | grep -q ctf-os-smoke
+""",
+    "osint": """
+for c in whois dig nslookup host traceroute chromium exiftool convert tesseract ffmpeg yt-dlp git-lfs pdftotext waybackurls; do command -v "$c"; done
+python3 -c 'import requests,httpx,bs4,lxml,playwright,PIL,cv2,pandas,whois,dns,geopy,exifread,pdfminer'
+chromium --headless --no-sandbox --disable-gpu --dump-dom 'data:text/html,<title>ctf-os</title>' | grep -q ctf-os
+""",
+    "ai": """
+for c in protoc h5dump ncdump dot jupyter; do command -v "$c"; done
+python3 - <<'PY'
+import numpy as np, onnx, onnxruntime as ort, torch, torchvision
+import sklearn, transformers, tokenizers, sentencepiece, safetensors, datasets, joblib, cv2, pandas
+from onnx import TensorProto, helper
+assert torch.tensor([2,3]).sum().item() == 5
+node=helper.make_node('Identity',['x'],['y'])
+graph=helper.make_graph([node],'smoke',[helper.make_tensor_value_info('x',TensorProto.FLOAT,[1])],[helper.make_tensor_value_info('y',TensorProto.FLOAT,[1])])
+model=helper.make_model(graph,opset_imports=[helper.make_opsetid('',17)],ir_version=9)
+session=ort.InferenceSession(model.SerializeToString(),providers=['CPUExecutionProvider'])
+assert session.run(None,{'x':np.array([7],dtype=np.float32)})[0][0] == 7
+PY
+""",
+    "cloud": """
+for c in aws az gcloud kubectl helm terraform tofu podman skopeo oras cosign trivy syft grype kustomize opa conftest checkov semgrep; do command -v "$c"; done
+aws --version; az version; gcloud --version; kubectl version --client=true; helm version --short; terraform version; tofu version
+podman --version; skopeo --version; oras version; cosign version; trivy --version; syft version; grype version; opa version; conftest --version; checkov --version; semgrep --version
+python3 -c 'import boto3,botocore,google.cloud.storage,google.auth,azure.identity,azure.storage.blob,kubernetes,yaml,requests,httpx,jinja2'
+test "${AWS_SHARED_CREDENTIALS_FILE:-/work/credentials/aws}" = /work/credentials/aws
+test ! -e "$HOME/.aws/credentials"; test ! -e "$HOME/.azure"; test ! -e "$HOME/.config/gcloud"; test ! -e "$HOME/.kube/config"
+""",
+}
 
 
 def _run(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -19,6 +103,21 @@ def _run(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
+
+
+def _image_probe(profile: str) -> subprocess.CompletedProcess[str]:
+    command = _COMMON_ENV + PROFILE_PROBES[profile]
+    argv = [
+        "docker", "run", "--rm", "--network", "none", "--read-only",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--user", "1001:1001",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777", "--tmpfs", "/work:rw,nosuid,nodev,size=1g,mode=1777",
+        "--tmpfs", "/artifacts:rw,nosuid,nodev,size=64m,mode=1777",
+    ]
+    if profile in {"misc", "cloud"}:
+        seccomp = Path(__file__).resolve().parents[1] / "sandbox" / "seccomp-rootless.json"
+        argv.extend(["--security-opt", f"seccomp={seccomp}"])
+    argv.extend(["--entrypoint", "sh", f"ctf-os-sandbox:{profile}", "-ec", command])
+    return _run(argv, timeout=180)
 
 
 def run_doctor(repo: Path) -> dict[str, object]:
@@ -38,57 +137,48 @@ def run_doctor(repo: Path) -> dict[str, object]:
     compose = _run(["docker", "compose", "version", "--short"])
     add("docker-compose", compose.returncode == 0, compose.stdout.strip() or compose.stderr.strip(), "install Docker Compose v2")
 
-    images = _run(["docker", "image", "inspect", *IMAGES]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "daemon unavailable")
-    add("category-images", images.returncode == 0, "all six tags present" if images.returncode == 0 else images.stderr.strip(), "run sandbox/build-images.sh")
-    if images.returncode == 0:
-        probes = {
-            "base": "command -v python3 && command -v jq && command -v rg",
-            "pwn": "command -v gdb && command -v patchelf && python3 -c 'import pwn'",
-            "web": "command -v node && command -v php && command -v sqlite3 && python3 -c 'import flask,fastapi,jwt'",
-            "rev": "command -v r2 && python3 -c 'import angr'",
-            "crypto": "command -v gp && python3 -c 'import gmpy2,fpylll,z3,Crypto'",
-            "forensic": "binwalk --help >/dev/null && command -v tshark && python3 -c 'import volatility3'",
-        }
-        for profile, command in probes.items():
-            smoke = _run(["docker", "run", "--rm", "--network", "none", f"ctf-os-sandbox:{profile}", "sh", "-c", command], timeout=60)
-            add(f"image-{profile}-tools", smoke.returncode == 0, smoke.stdout.strip() or smoke.stderr.strip() or "probe passed", f"rebuild ctf-os-sandbox:{profile}")
-        lifecycle_ok, lifecycle_detail = _sandbox_lifecycle_probe()
-        add("sandbox-lifecycle", lifecycle_ok, lifecycle_detail, "rebuild ctf-os-sandbox:base and run sandbox-gc")
+    if docker.returncode == 0:
+        for profile, image in zip(PROFILES, IMAGES, strict=True):
+            present = _run(["docker", "image", "inspect", image])
+            add(f"image-{profile}", present.returncode == 0, "tag present" if present.returncode == 0 else present.stderr.strip(), f"run sandbox/build-images.sh {profile}")
+            if present.returncode == 0:
+                smoke = _image_probe(profile)
+                streams = "\n".join(part.strip() for part in (smoke.stdout, smoke.stderr) if part.strip())
+                detail = streams or "all required binary/import/operation probes passed"
+                add(f"image-{profile}-tools", smoke.returncode == 0, detail[-8_000:], f"rebuild ctf-os-sandbox:{profile}")
+        if all(_run(["docker", "image", "inspect", image]).returncode == 0 for image in IMAGES):
+            lifecycle_ok, lifecycle_detail = _sandbox_lifecycle_probe()
+            add("sandbox-lifecycle", lifecycle_ok, lifecycle_detail, "rebuild ctf-os-sandbox:base and run sandbox-gc")
+        else:
+            add("sandbox-lifecycle", False, "one or more category images are missing", "run sandbox/build-images.sh")
     else:
-        add("sandbox-lifecycle", False, "category images missing", "run sandbox/build-images.sh")
+        for profile in PROFILES:
+            add(f"image-{profile}", False, "Docker daemon unavailable", f"run sandbox/build-images.sh {profile}")
+        add("sandbox-lifecycle", False, "Docker daemon unavailable", "start Docker and run sandbox/build-images.sh")
 
     disk = shutil.disk_usage(repo)
-    disk_ok = disk.free >= 10 * 1024**3
-    add("disk-space", disk_ok, f"{disk.free // 1024**3} GiB free", "free at least 10 GiB")
+    add("disk-space", disk.free >= 20 * 1024**3, f"{disk.free // 1024**3} GiB free", "free at least 20 GiB")
     memory_bytes = _available_memory()
     add("memory", memory_bytes >= 2 * 1024**3, f"{memory_bytes // 1024**3} GiB available", "free at least 2 GiB RAM")
     add("output-write", _write_probe(repo / "output"), str(repo / "output"), "make repository output/ writable and remove unsafe symlinks")
 
-    skill_files = [
-        repo / ".codex/skills/ctf-intake/SKILL.md",
-        repo / ".codex/skills/ctf-triage/SKILL.md",
-        repo / ".codex/skills/ctf-solve/SKILL.md",
-    ]
+    skill_files = [repo / f".codex/skills/{name}/SKILL.md" for name in ("ctf-intake", "ctf-triage", "ctf-solve")]
     playbooks = list((repo / "ctf_os/resources/knowledge/playbooks").glob("*.md"))
     add("skills", all(path.is_file() and not path.is_symlink() for path in skill_files), ", ".join(str(path) for path in skill_files), "restore the tracked skill files")
-    add("playbooks", len(playbooks) >= 7, f"{len(playbooks)} files", "restore ctf_os/resources/knowledge/playbooks")
+    add("playbooks", len(playbooks) >= 9, f"{len(playbooks)} files", "restore all nine category playbooks")
     add("service-runtime", importlib.util.find_spec("ctf_os.service") is not None, "ctf_os.service", "restore the service runtime module")
     add("replay-runtime", importlib.util.find_spec("ctf_os.replay") is not None, "ctf_os.replay", "restore the replay module")
 
     stale_containers = _run(["docker", "ps", "-aq", "--filter", "label=ctf-os=true"]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
     stale_networks = _run(["docker", "network", "ls", "-q", "--filter", "label=ctf-os=true"]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
     stale_count = len(stale_containers.stdout.split()) + len(stale_networks.stdout.split())
-    add(
-        "stale-resources", stale_count == 0, f"{stale_count} labeled Docker resources",
-        "run sandbox-gc for stale sandboxes; use the matching service-cleanup selector for challenge-service resources",
-    )
+    add("stale-resources", stale_count == 0, f"{stale_count} labeled Docker resources", "run sandbox-gc for stale sandboxes")
     return {"ok": all(bool(item["ok"]) for item in checks), "checks": checks}
 
 
 def _available_memory() -> int:
     try:
-        values = (Path("/proc/meminfo").read_text(encoding="ascii").splitlines())
-        line = next(line for line in values if line.startswith("MemAvailable:"))
+        line = next(line for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines() if line.startswith("MemAvailable:"))
         return int(line.split()[1]) * 1024
     except (OSError, StopIteration, ValueError):
         return 0
@@ -115,14 +205,11 @@ def _sandbox_lifecycle_probe() -> tuple[bool, str]:
         source.mkdir(parents=True)
         (source / "probe").write_text("ok", encoding="ascii")
         try:
-            metadata = create(SandboxSpec(
-                "doctor", "probe", "smoke", source, root / "workers" / "smoke",
-                image="ctf-os-sandbox:base", resource_profile="light",
-            ))
-            receipt = execute(metadata, ["sh", "-c", "test -r /challenge/probe && test -w /work"], 20)
+            metadata = create(SandboxSpec("doctor", "probe", "smoke", source, root / "workers" / "smoke", image="ctf-os-sandbox:base", resource_profile="light"))
+            receipt = execute(metadata, ["sh", "-c", "test -r /challenge/probe && ! test -w /challenge/probe && test -w /work && test -w /artifacts && test $(id -u) = 1001"], 20)
             cleaned = cleanup(metadata)
             ok = receipt["exit_code"] == 0 and cleaned["removed"] is True
-            return ok, "create/exec/final-export/cleanup passed" if ok else f"receipt={receipt}, cleanup={cleaned}"
+            return ok, "non-root create/ro-challenge/rw-work/rw-artifacts/exec/export/cleanup passed" if ok else f"receipt={receipt}, cleanup={cleaned}"
         except Exception as exc:
             if metadata is not None:
                 try:

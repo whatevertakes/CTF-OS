@@ -1,56 +1,81 @@
-# One source-of-truth image. Build with CTF_OS_PROFILE=base|pwn|web|rev|crypto|forensic.
-FROM ubuntu:24.04
-
-ENV DEBIAN_FRONTEND=noninteractive TERM=xterm PIP_DISABLE_PIP_VERSION_CHECK=1
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-      bash ca-certificates curl netcat-openbsd socat jq \
-      wget git ripgrep file binutils xxd unzip zip p7zip-full \
-      gcc g++ make python3 python3-pip python3-venv \
-      openssl iptables util-linux procps \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY sandbox/requirements.txt /tmp/requirements.txt
-RUN python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
-
+# syntax=docker/dockerfile:1.7
+# Single source of truth for CTF_OS_PROFILE=base|pwn|web|rev|crypto|forensic|misc|osint|ai|cloud.
 ARG CTF_OS_PROFILE=base
-RUN case "$CTF_OS_PROFILE" in \
-      base) ;; \
-      pwn) packages="gdb gdb-multiarch ltrace strace patchelf qemu-user" ;; \
-      web) packages="nodejs npm php-cli sqlite3" ;; \
-      rev) packages="gdb gdb-multiarch radare2 default-jre-headless qemu-user" ;; \
-      crypto) packages="pari-gp libgmp-dev libmpfr-dev" ;; \
-      forensic) packages="binwalk exiftool sleuthkit foremost testdisk tshark ffmpeg sox imagemagick tesseract-ocr pngcheck" ;; \
-      *) echo "unknown CTF_OS_PROFILE: $CTF_OS_PROFILE" >&2; exit 64 ;; \
-    esac \
-    && if [ -n "${packages:-}" ]; then \
-         apt-get update \
-         && apt-get install -y --no-install-recommends $packages \
-         && rm -rf /var/lib/apt/lists/*; \
-       fi
+FROM debian:12-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS common
 
-# Python packages are intentionally shared: this keeps the category tags useful
-# even when Sol changes attack family without building during a contest.
-RUN if [ "$CTF_OS_PROFILE" = "rev" ]; then \
-      python3 -m pip install --break-system-packages --no-cache-dir angr; \
-    elif [ "$CTF_OS_PROFILE" = "crypto" ]; then \
-      python3 -m pip install --break-system-packages --no-cache-dir gmpy2 fpylll cysignals; \
-    elif [ "$CTF_OS_PROFILE" = "web" ]; then \
-      python3 -m pip install --break-system-packages --no-cache-dir flask fastapi pyjwt; \
-    elif [ "$CTF_OS_PROFILE" = "forensic" ]; then \
-      python3 -m pip install --break-system-packages --no-cache-dir volatility3 capstone==5.0.6; \
-    fi
+ENV DEBIAN_FRONTEND=noninteractive \
+    TERM=xterm-256color \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-COPY sandbox/sandbox-tools.txt /tools.txt
+COPY sandbox/requirements.txt /opt/ctf-os/requirements/common.txt
+COPY sandbox/install/lib.sh sandbox/install/common.sh /opt/ctf-os/install/
+RUN chmod 0755 /opt/ctf-os/install/*.sh && /opt/ctf-os/install/common.sh
+
 RUN groupadd --gid 1001 ctf \
     && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash ctf \
     && mkdir -p /challenge /work /artifacts \
     && chown ctf:ctf /work /artifacts
-COPY sandbox/entrypoint.sh /usr/local/bin/ctf-os-entrypoint
-RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint
 
 WORKDIR /challenge
+
+FROM common AS profile-base
+
+FROM common AS profile-pwn
+COPY sandbox/requirements/pwn.txt /opt/ctf-os/requirements/pwn.txt
+COPY sandbox/install/pwn.sh /opt/ctf-os/install/pwn.sh
+RUN /opt/ctf-os/install/pwn.sh
+
+FROM common AS profile-web
+COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
+COPY sandbox/install/web.sh /opt/ctf-os/install/web.sh
+RUN /opt/ctf-os/install/web.sh
+
+FROM common AS profile-rev
+COPY sandbox/requirements/rev.txt /opt/ctf-os/requirements/rev.txt
+COPY sandbox/install/rev.sh /opt/ctf-os/install/rev.sh
+RUN /opt/ctf-os/install/rev.sh
+
+FROM common AS profile-crypto
+COPY sandbox/requirements/crypto.txt /opt/ctf-os/requirements/crypto.txt
+COPY sandbox/install/crypto.sh /opt/ctf-os/install/crypto.sh
+RUN /opt/ctf-os/install/crypto.sh
+RUN sage -c 'assert 2^10 == 1024; assert GF(7)(3)^2 == 2'
+
+FROM common AS profile-forensic
+COPY sandbox/requirements/forensic.txt /opt/ctf-os/requirements/forensic.txt
+COPY sandbox/install/forensic.sh /opt/ctf-os/install/forensic.sh
+RUN /opt/ctf-os/install/forensic.sh
+
+FROM common AS profile-misc
+COPY sandbox/requirements/misc.txt /opt/ctf-os/requirements/misc.txt
+COPY sandbox/install/misc.sh /opt/ctf-os/install/misc.sh
+RUN /opt/ctf-os/install/misc.sh
+
+FROM common AS profile-osint
+COPY sandbox/requirements/osint.txt /opt/ctf-os/requirements/osint.txt
+COPY sandbox/install/osint.sh /opt/ctf-os/install/osint.sh
+RUN /opt/ctf-os/install/osint.sh
+
+FROM common AS profile-ai
+COPY sandbox/requirements/ai.txt /opt/ctf-os/requirements/ai.txt
+COPY sandbox/install/ai.sh /opt/ctf-os/install/ai.sh
+RUN /opt/ctf-os/install/ai.sh
+
+FROM common AS profile-cloud
+COPY sandbox/requirements/cloud.txt /opt/ctf-os/requirements/cloud.txt
+COPY sandbox/install/cloud.sh /opt/ctf-os/install/cloud.sh
+RUN /opt/ctf-os/install/cloud.sh
+
+FROM profile-${CTF_OS_PROFILE} AS final
+ARG CTF_OS_PROFILE
+COPY sandbox/sandbox-tools.txt /tools.txt
+COPY sandbox/tool-versions.lock /opt/ctf-os/tool-versions.lock
+COPY sandbox/entrypoint.sh /usr/local/bin/ctf-os-entrypoint
+RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint
+LABEL org.ctf-os.sandbox="true" \
+      org.ctf-os.profile="${CTF_OS_PROFILE}" \
+      org.ctf-os.build-policy="pre-contest-pinned"
 ENTRYPOINT ["/usr/local/bin/ctf-os-entrypoint"]
 CMD ["sleep", "infinity"]

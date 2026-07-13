@@ -112,6 +112,14 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         "--env", f"CTF_OS_CONTEST_SLUG={spec.contest_slug}",
         "--env", f"CTF_OS_CHALLENGE_ID={spec.challenge_id}",
     ]
+    # Rootless Podman needs only namespace-management syscalls for local OCI
+    # inspection. Keep Docker's default deny list otherwise; mount and other
+    # CAP_SYS_ADMIN-gated syscalls remain blocked and every capability is still dropped.
+    if spec.image in {"ctf-os-sandbox:misc", "ctf-os-sandbox:cloud"}:
+        seccomp = Path(__file__).resolve().parents[2] / "sandbox" / "seccomp-rootless.json"
+        if not seccomp.is_file() or seccomp.is_symlink():
+            raise SandboxError("rootless Podman seccomp profile is missing or unsafe")
+        argv.extend(["--security-opt", f"seccomp={seccomp}"])
     for key, value in spec.runtime_labels.items():
         argv.extend(["--label", f"{key}={value}"])
     if spec.service_network:

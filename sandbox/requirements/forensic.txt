@@ -1,0 +1,6 @@
+volatility3==2.26.2
+scapy==2.6.1
+pyshark==0.6
+oletools==0.60.2
+pdfminer.six==20250506
+python-magic==0.4.27

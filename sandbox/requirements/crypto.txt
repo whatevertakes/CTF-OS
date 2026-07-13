@@ -1,0 +1,8 @@
+gmpy2==2.2.1
+fpylll==0.6.4
+cysignals==1.12.4
+ecdsa==0.19.1
+bitarray==3.7.2
+factordb-pycli==1.3.0
+tqdm==4.67.1
+Flask==3.1.1

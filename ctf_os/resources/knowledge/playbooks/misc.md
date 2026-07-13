@@ -6,7 +6,7 @@ Inventory every supplied file and the exact challenge text before choosing a cat
 
 ## Hypotheses and tooling
 
-Favor the simplest evidence-backed explanation: encoding layers, archive nesting, scripting mistakes, data formats, esoteric languages, constrained search, or a cross-category handoff. Use short scripts with fixed inputs and explicit bounds. Split independent hypotheses so failures are informative rather than repetitive.
+Favor the simplest evidence-backed branch: media transforms with `ffmpeg`/`sox`, image or QR/barcode inspection with ImageMagick/OpenCV/`zbarimg`, signal or numeric work with NumPy/SciPy, graph constraints with NetworkX/Graphviz, z3 constraints, custom protocols with Scapy, or ML-flavored artifacts with CPU PyTorch. Use short scripts with fixed inputs and explicit bounds. Podman is limited to rootless local container/image inspection; there is no Docker socket or privileged nested daemon.
 
 ## Validation and replay
 

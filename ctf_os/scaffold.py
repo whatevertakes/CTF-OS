@@ -8,7 +8,7 @@ from pathlib import Path
 from .problems import problems_template
 
 
-DEFAULT_CATEGORIES = ("pwn", "rev", "web", "forensic", "misc", "crypto")
+DEFAULT_CATEGORIES = ("pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud")
 
 
 def initialize_contest(root: Path, name: str) -> dict[str, object]:

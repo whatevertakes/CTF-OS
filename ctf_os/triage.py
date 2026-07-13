@@ -302,6 +302,8 @@ def _summarize_record(challenge: ChallengeSpec, record: dict[str, object]) -> di
     runtime, frameworks = _runtime_and_frameworks(record, files)
     elf_summary = _elf_summary(files)
     requirements = _special_requirements(record, files, runtime, elf_summary)
+    permissions = [str(value) for value in _list(record.get("special_permission_requirement")) if str(value).strip()]
+    requirements.extend(value for value in permissions if value not in requirements)
     setup = _setup(record, total_bytes, requirements)
     surfaces, matched_surfaces = _attack_surface(challenge, files, frameworks)
     clarity = _clarity(matched_surfaces, frameworks, file_count)
@@ -339,6 +341,9 @@ def _summarize_record(challenge: ChallengeSpec, record: dict[str, object]) -> di
         "attack_surface_clarity": clarity,
         "setup": setup,
         "recommended_sandbox": sandbox,
+        "recommended_tools": [str(value) for value in _list(record.get("recommended_tools"))],
+        "special_permission_requirement": permissions,
+        "needs_review": bool(record.get("needs_review")),
         "recommended_playbook": playbook,
         "baseline": baseline,
         "priority_score": None,
@@ -440,6 +445,8 @@ def _attack_surface(challenge: ChallengeSpec, files: list[dict[str, object]], fr
         "rev": ["entry and validation logic", "packing/anti-analysis checks"],
         "forensic": ["file signatures and metadata", "embedded/recovered objects"],
         "misc": ["file/protocol classification", "encoding/runtime constraints"],
+        "osint": ["public-source provenance", "DNS/metadata/OCR correlation"],
+        "ai": ["model format and preprocessing", "numeric/tokenizer reconstruction"],
         "cloud": ["identity/policy boundaries", "deployment manifests"],
     }
     matched = [label for label, terms in patterns.get(challenge.category, ()) if any(term in blob for term in terms)]
@@ -514,6 +521,12 @@ def _facts(item: dict[str, object]) -> list[dict[str, str]]:
     setup = _mapping(item.get("setup"))
     requirements = _list(setup.get("requirements"))
     add(f"Setup evidence: {_display(setup.get('cost', 'unknown'))} cost" + ("; " + ", ".join(str(value) for value in requirements) if requirements else "; no special runtime requirement detected") + ".")
+    tools = _list(item.get("recommended_tools"))
+    if tools:
+        add("Recommended installed tools: " + ", ".join(str(value) for value in tools) + ".")
+    permissions = _list(item.get("special_permission_requirement"))
+    if permissions:
+        add("NEEDS_REVIEW permission boundary: " + "; ".join(str(value) for value in permissions) + ".")
     remote_count = _integer(item.get("authorized_remote_count"))
     score = item.get("score")
     add(f"Authorized remote targets: {remote_count}; declared score: {score if score is not None else 'not provided'}.")

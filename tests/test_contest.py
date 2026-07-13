@@ -121,12 +121,18 @@ def test_fenced_examples_require_a_matching_fence_to_resume_parsing(repo: Path) 
     assert manifest.challenges == ()
 
 
-@pytest.mark.parametrize("category", ["mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"])
+@pytest.mark.parametrize("category", ["mobile", "hardware", "blockchain", "jail", "windows"])
 def test_extended_categories_use_generic_playbook_without_being_blocked(repo: Path, category: str) -> None:
     manifest = parse_contest(write_contest(repo, f"# Demo CTF\n### {category}/X\n"))
     challenge = manifest.challenges[0]
     assert challenge.category == category
     assert challenge.playbook_category == "misc"
+
+
+@pytest.mark.parametrize("category", ["osint", "ai", "cloud"])
+def test_first_class_extended_categories_have_dedicated_playbooks(repo: Path, category: str) -> None:
+    manifest = parse_contest(write_contest(repo, f"# Demo CTF\n### {category}/X\n"))
+    assert manifest.challenges[0].playbook_category == category
 
 
 def test_input_profile_defaults_overrides_and_rejects_arbitrary_limits(repo: Path) -> None:

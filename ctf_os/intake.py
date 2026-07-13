@@ -64,6 +64,8 @@ def _inspect_challenge(root: Path, manifest: ContestManifest, challenge: Challen
         "inventory_path": str(destination / "inventory.json"),
         "priority_files": [], "priority_file_metadata": [], "important_metadata": {},
         "recommended_image": "ctf-os-sandbox:base", "recommended_resource_profile": "light",
+        "recommended_profile": "base", "setup_cost": "low",
+        "special_permission_requirement": [], "needs_review": False,
         "containerized_challenge": False, "service_plan": {"kind": "none", "status": "UNAVAILABLE", "safe_to_start": False, "services": []},
         "workspace_path": str(destination), "prepared_input": str(destination / "input"),
         "source_fingerprint": None, "prepared_fingerprint": None,
@@ -279,21 +281,28 @@ def _preflight(challenge: ChallengeSpec, input_dir: Path, files: list[dict[str, 
         "cloud": ["identity and policy boundaries", "metadata/service endpoints", "deployment manifests"],
     }.get(category, ["file/protocol classification", "runtime and trust boundaries", "category-specific attack surface"])
     hypotheses = [f"Inspect {surface} first" for surface in surfaces[:2]]
-    tools = {
+    default_tools = {
         "pwn": ["file", "readelf", "checksec", "gdb", "pwntools"],
         "web": ["rg", "curl", "python", "docker compose (only if required)"],
         "rev": ["strings", "objdump", "gdb", "radare2/ghidra on demand"],
         "crypto": ["python", "sympy", "pycryptodome", "z3 on demand"],
         "forensic": ["file", "exiftool", "binwalk", "tshark on demand"],
-        "misc": ["file", "xxd", "python", "category-specific tools on demand"],
-        "cloud": ["jq", "curl", "manifest-specific client on demand"],
-    }.get(category, ["file", "rg", "xxd", "python", "specialized tools on demand"])
+        "misc": ["file", "xxd", "python3", "ffmpeg", "OpenCV", "zbarimg"],
+        "osint": ["whois", "dig", "httpx", "chromium", "exiftool", "tesseract", "yt-dlp"],
+        "ai": ["file", "binwalk", "PyTorch", "ONNX Runtime", "transformers", "tokenizers"],
+        "cloud": ["jq", "yq", "aws", "az", "gcloud", "kubectl", "helm", "terraform", "OPA", "checkov"],
+    }.get(category, ["file", "rg", "xxd", "python3"])
     service_plan = _service_plan(challenge, input_dir, dockerfiles, compose)
     priority_metadata = _priority_files(files)
     total_size = sum(int(item["size"]) for item in files)
     elf_count = sum(bool(item.get("elf")) for item in files)
     recommended_resource = _recommended_resource_profile(challenge, names, total_size, len(files), elf_count, bool(dockerfiles or compose))
-    recommended_image = _recommended_image(category)
+    recommended_profile, signal_tools = _recommended_profile(category, names, text_sample)
+    recommended_image = f"ctf-os-sandbox:{recommended_profile}"
+    tools = list(dict.fromkeys(default_tools + signal_tools))
+    special_permissions = _special_permissions(names, text_sample)
+    needs_review = bool(special_permissions) or str(service_plan.get("status")) == "NEEDS_REVIEW"
+    setup_cost = "high" if recommended_resource in {"heavy", "large-forensic"} else ("medium" if recommended_resource == "standard" else "low")
     return {
         "docker": {"dockerfiles": dockerfiles, "compose_files": compose, "dependency_files": dependency_files},
         "runtime": sorted(set(runtime)), "subtype": subtype,
@@ -306,19 +315,52 @@ def _preflight(challenge: ChallengeSpec, input_dir: Path, files: list[dict[str, 
             "dependency_files": dependency_files, "input_profile": challenge.input_profile,
         },
         "recommended_image": recommended_image,
+        "recommended_profile": recommended_profile,
         "recommended_resource_profile": recommended_resource,
+        "setup_cost": setup_cost,
+        "special_permission_requirement": special_permissions,
+        "needs_review": needs_review,
         "containerized_challenge": bool(dockerfiles or compose),
         "service_plan": service_plan,
     }
 
 
-def _recommended_image(category: str) -> str:
+def _recommended_profile(category: str, names: list[str], text_sample: str) -> tuple[str, list[str]]:
+    """Choose a category image without exposing a user-selectable sub-profile."""
     profile = {
         "pwn": "pwn", "jail": "pwn", "web": "web", "blockchain": "web",
         "rev": "rev", "mobile": "rev", "hardware": "rev", "windows": "rev",
-        "crypto": "crypto", "forensic": "forensic", "osint": "forensic",
+        "crypto": "crypto", "forensic": "forensic", "misc": "misc",
+        "osint": "osint", "ai": "ai", "cloud": "cloud",
     }.get(category, "base")
-    return f"ctf-os-sandbox:{profile}"
+    blob = " ".join(names) + " " + text_sample[:128_000].casefold()
+    suffixes = tuple(Path(name).suffix for name in names)
+    tools: list[str] = []
+    if any(token in blob for token in ("bzimage", "initramfs", "vmlinuz")):
+        profile, tools = "pwn", ["qemu-system", "cpio", "gdb-multiarch", "pahole"]
+    elif any(name.endswith((".apk", ".aab", ".dex", ".jar", ".wasm")) for name in names):
+        profile, tools = "rev", ["jadx", "apktool", "wasm-objdump", "wasmtime"]
+    elif any(name.endswith((".onnx", ".pt", ".pth", ".h5", ".hdf5", ".safetensors", ".joblib")) for name in names):
+        profile, tools = "ai", ["PyTorch", "ONNX Runtime", "transformers", "tokenizers", "h5dump"]
+    elif any(name.endswith((".tf", ".tfvars", "chart.yaml", "values.yaml")) or "kustomization" in name or "/templates/" in name for name in names):
+        profile, tools = "cloud", ["terraform", "kubectl", "helm", "OPA", "conftest", "checkov"]
+    elif category == "misc" and any(name.endswith((".wav", ".mp3", ".flac", ".mp4", ".avi", ".mkv")) or "qr" in name or "barcode" in name for name in names):
+        profile, tools = "misc", ["ffmpeg", "sox", "OpenCV", "zbarimg"]
+    elif category == "misc" and any(token in blob for token in ("domain", "geolocation", "map clue", "wayback", "username correlation")):
+        profile, tools = "osint", ["whois", "dig", "chromium", "tesseract", "exiftool"]
+    return profile, tools
+
+
+def _special_permissions(names: list[str], text_sample: str) -> list[str]:
+    blob = " ".join(names) + " " + text_sample[:128_000].casefold()
+    requirements: list[str] = []
+    if any(token in blob for token in ("/dev/kvm", "kvm", "hardware acceleration")):
+        requirements.append("KVM device access requires explicit human approval; QEMU TCG remains available")
+    if any(token in blob for token in ("/dev/tty", "/dev/usb", "serial device", "usb device")):
+        requirements.append("physical or special device access requires explicit human approval")
+    if any(token in blob for token in ("cuda", "/dev/nvidia", "gpu required")):
+        requirements.append("GPU/CUDA device access requires explicit human approval; CPU is the default")
+    return requirements
 
 
 def _recommended_resource_profile(
@@ -335,10 +377,10 @@ def _recommended_resource_profile(
         total_size >= 512 * 1024**2 or file_count >= 5_000
         or any(name.endswith(forensic_markers) for name in names)
         or any(marker in name for name in names for marker in heavy_tools)
-        or (challenge.category in {"rev", "crypto", "forensic"} and total_size >= 128 * 1024**2)
+        or (challenge.category in {"rev", "crypto", "forensic", "ai"} and total_size >= 128 * 1024**2)
     ):
         return "heavy"
-    if containerized or challenge.category in {"pwn", "web", "rev", "crypto", "forensic", "mobile", "windows"} or elf_count:
+    if containerized or challenge.category in {"pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud", "mobile", "windows"} or elf_count:
         return "standard"
     return "light"
 
@@ -659,6 +701,8 @@ def render_context(manifest: ContestManifest, record: dict[str, object]) -> str:
         f"- Full inventory: `{record['inventory_path']}`",
         f"- Recommended image: `{record.get('recommended_image')}`",
         f"- Recommended resource profile: `{record.get('recommended_resource_profile')}`",
+        f"- Setup cost: `{record.get('setup_cost')}`",
+        f"- NEEDS_REVIEW: `{bool(record.get('needs_review'))}`",
         "", f"## Priority files (top {CONTEXT_FILE_LIMIT})", "",
     ])
     for item in record.get("priority_file_metadata", []):
@@ -675,6 +719,8 @@ def render_context(manifest: ContestManifest, record: dict[str, object]) -> str:
     for service in service_plan.get("services", []):
         lines.append(f"- `{service.get('name')}` → {', '.join(service.get('internal_targets') or []) or 'no detected port'}")
     for reason in service_plan.get("review_reasons", []):
+        lines.append(f"- NEEDS_REVIEW: {reason}")
+    for reason in record.get("special_permission_requirement", []):
         lines.append(f"- NEEDS_REVIEW: {reason}")
     warning_values = list(record.get("warnings") or [])
     lines.extend(["", "## Manifest warnings", ""])

@@ -216,3 +216,37 @@ HEALTHCHECK CMD nc -z localhost 31337
     assert record["warnings"][0]["suggestion"] == "remote"
     intake_markdown = (repo / "output" / payload["contest"]["slug"] / "INTAKE.md").read_text()
     assert "Manifest warning: **HIGH**" in intake_markdown
+
+
+def test_intake_recommends_new_category_images_and_file_signal_overrides(repo: Path) -> None:
+    write_contest(repo, """# Demo CTF
+### osint/domain-clue
+### ai/model
+### cloud/chart
+### misc/apk-in-disguise
+""")
+    fixtures = {
+        ("osint", "domain-clue", "clue.txt"): "public domain and map clue",
+        ("ai", "model", "network.onnx"): "model",
+        ("cloud", "chart", "Chart.yaml"): "apiVersion: v2",
+        ("misc", "apk-in-disguise", "challenge.apk"): "apk",
+    }
+    for (category, name, filename), content in fixtures.items():
+        path = repo / "incoming" / "Demo CTF" / category / name
+        path.mkdir(parents=True)
+        (path / filename).write_text(content)
+    records = run_intake(repo)["challenges"]
+    assert [record["recommended_profile"] for record in records] == ["osint", "ai", "cloud", "rev"]
+    assert records[1]["recommended_image"] == "ctf-os-sandbox:ai"
+    assert "ONNX Runtime" in records[1]["recommended_tools"]
+    assert "jadx" in records[3]["recommended_tools"]
+
+
+def test_intake_marks_kvm_and_gpu_as_needs_review(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### ai/accelerated\n")
+    source = repo / "incoming" / "Demo CTF" / "ai" / "accelerated"
+    source.mkdir(parents=True)
+    (source / "README.txt").write_text("CUDA GPU required and /dev/kvm")
+    record = run_intake(repo)["challenges"][0]
+    assert record["needs_review"] is True
+    assert len(record["special_permission_requirement"]) == 2

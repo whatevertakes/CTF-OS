@@ -6,7 +6,7 @@ Operate only on challenge artifacts and make a hash before inspection. Identify 
 
 ## Hypotheses and tooling
 
-Use `exiftool`, `strings`, `binwalk`, `foremost`, `tshark`, `zsteg`, `steghide`, and format-specific parsers according to evidence. Check simple container, archive, image, audio, and packet structures before expensive carving. Treat metadata or a hidden stream as a hypothesis until its origin and decoding are repeatable.
+Branch by evidence family: Volatility for a memory image; Sleuth Kit (`mmls`, `fls`, `icat`), TestDisk/PhotoRec, or `foremost` for disks and deleted files; `tshark`/Scapy for PCAP; `binwalk` for firmware; `exiftool`, `zsteg`, `stegseek`, ImageMagick, and `tesseract` for metadata, stego, and OCR; `ffmpeg`/`sox` for media. Check container structure before carving and treat every hidden stream as a hypothesis until its offset and decoding are repeatable.
 
 ## Validation and replay
 

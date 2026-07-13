@@ -6,7 +6,7 @@ Analyze only provided binaries, bytecode, mobile packages, or source inside the 
 
 ## Hypotheses and tooling
 
-Map the input-to-check path before attempting a solve. Use `radare2`, Ghidra where available, `ltrace`, `strace`, debugger breakpoints, decompilation, and small Python helpers. Consider encoding, XOR, comparison logic, anti-debug checks, packed sections, symbolic constraints, or checksum routines only when static or dynamic evidence supports them.
+Map the input-to-check path before attempting a solve. Use `radare2`, `gdb-multiarch`, `ltrace`, `strace`, `angr`, and small Python helpers. Branch APK/JAR work to `jadx` and `apktool`, WebAssembly to `wabt` and `wasmtime`, .NET to Mono, and packed files to `upx`. Consider symbolic constraints or custom-VM lifting only when static or dynamic evidence supports them.
 
 ## Validation and replay
 

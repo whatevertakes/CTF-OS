@@ -155,8 +155,11 @@ def main(argv: list[str] | None = None) -> int:
             payload["candidates"] = list(exc.candidates)
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 2
-    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, sort_keys=True))
-    return 0
+    command_ok = not (
+        args.command == "doctor" and isinstance(result, dict) and result.get("ok") is False
+    )
+    print(json.dumps({"ok": command_ok, "result": result}, ensure_ascii=False, sort_keys=True))
+    return 0 if command_ok else 1
 
 
 def dispatch(root: Path, args: argparse.Namespace) -> object:
@@ -255,7 +258,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             raise ValueError("intake index prepared_input is outside the selected challenge workspace")
         if record.get("prepared_fingerprint") != prepared_tree_fingerprint(input_path):
             raise ValueError("prepared challenge input changed after intake; rerun intake")
-        image = args.image or str(record.get("recommended_image") or f"ctf-os-sandbox:{challenge.category if challenge.category in {'pwn', 'web', 'rev', 'crypto', 'forensic'} else 'base'}")
+        supported_profiles = {'pwn', 'web', 'rev', 'crypto', 'forensic', 'misc', 'osint', 'ai', 'cloud'}
+        image = args.image or str(record.get("recommended_image") or f"ctf-os-sandbox:{challenge.category if challenge.category in supported_profiles else 'base'}")
         profile = args.resource_profile or str(record.get("recommended_resource_profile") or "standard")
         targets = resolve_targets(parse_remotes(challenge.remotes))
         service_network = None

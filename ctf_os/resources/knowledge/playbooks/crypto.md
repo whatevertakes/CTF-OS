@@ -6,7 +6,7 @@ Keep all calculations on challenge-supplied ciphertexts, public parameters, and 
 
 ## Hypotheses and tooling
 
-Classify the construction before selecting an attack: RSA parameter relations, weak exponents, common modulus, reused randomness, stream/XOR reuse, ECB structure, LCG output, or a constraint system. Use Python big integers, Sage when supplied, `z3`, and reproducible algebraic scripts. A padding-oracle or online probe must be rate-conscious and limited to the listed CTF service.
+Classify the construction before selecting an attack: RSA parameter relations, weak exponents, common modulus, reused randomness, stream/XOR reuse, ECB structure, LCG output, lattice structure, polynomial systems, discrete log, or factorization. Use SageMath, `RsaCtfTool`, PARI/GP, `fpylll`, `z3`, or CADO-NFS according to the mathematical precondition. An online oracle must be rate-conscious and limited to the listed CTF service.
 
 ## Validation and replay
 

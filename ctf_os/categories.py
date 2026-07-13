@@ -19,7 +19,7 @@ _ALIASES = {
     "ai": "ai", "machine learning": "ai", "ml": "ai",
 }
 
-_GENERIC_CATEGORIES = frozenset({"mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"})
+_GENERIC_CATEGORIES = frozenset({"mobile", "hardware", "blockchain", "jail", "windows"})
 
 
 def canonical_category(value: str) -> str:

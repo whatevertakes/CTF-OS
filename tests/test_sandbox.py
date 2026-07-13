@@ -101,13 +101,33 @@ def test_branch_and_source_scope_are_validated(tmp_path: Path) -> None:
         build_run_argv(SandboxSpec("demo", "id", "../bad", tmp_path / "missing", tmp_path / "out"))
 
 
-def test_dockerfile_has_no_nested_container_codex_or_unpinned_clone() -> None:
+def test_dockerfile_has_ten_profiles_and_no_nested_daemon_or_unpinned_clone() -> None:
     text = Path("sandbox/Dockerfile.sandbox").read_text().casefold()
-    for forbidden in ("podman", "buildah", "git clone", "codex", "|| echo"):
+    for forbidden in ("docker.sock", "git clone", "codex", "|| true", "|| echo"):
         assert forbidden not in text
-    assert "ctf_os_profile=base" in text and "rev) packages=" in text
-    for profile in ("pwn", "web", "rev", "crypto", "forensic"):
-        assert f"{profile}) packages=" in text
+    assert "ctf_os_profile=base" in text
+    for profile in ("base", "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud"):
+        assert f"profile-{profile}" in text
+
+
+def test_runtime_isolates_mutable_credentials_in_work_tmpfs(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    argv = build_run_argv(SandboxSpec("demo", "id", "cloud", source, tmp_path / "out", image="ctf-os-sandbox:cloud"))
+    joined = " ".join(argv)
+    for forbidden in (".aws", ".azure", ".config/gcloud", "kubeconfig", "/dev/kvm", "/dev/nvidia", "--privileged", "--network host", "--pid host"):
+        assert forbidden not in joined
+    assert "seccomp-rootless.json" in joined
+    profile = Path("sandbox/seccomp-rootless.json").read_text(encoding="utf-8")
+    assert '"defaultAction": "SCMP_ACT_ERRNO"' in profile
+    assert '"mount"' in profile
+
+
+def test_rootless_seccomp_is_not_added_to_ordinary_profiles(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    argv = build_run_argv(SandboxSpec("demo", "id", "pwn", source, tmp_path / "out", image="ctf-os-sandbox:pwn"))
+    assert "seccomp-rootless.json" not in " ".join(argv)
 
 
 def test_remote_counters_only_count_exact_authorized_accept_rule(monkeypatch) -> None:

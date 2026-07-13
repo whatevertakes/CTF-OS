@@ -6,7 +6,7 @@ Use only challenge binaries and remotes explicitly listed in the local contest m
 
 ## Hypotheses and tooling
 
-Turn mitigations into testable hypotheses: ret2win or format-string disclosure, then an address leak for PIE or libc; only investigate heap behavior when the allocation path is evidenced. Use `gdb`, `pwndbg` when present, `readelf`, `objdump`, and `pwntools` against local copies first. Keep offsets, assumptions, and byte-order calculations in a small script rather than manual terminal history.
+Turn mitigations into testable hypotheses: ret2win or format-string disclosure, then an address leak for PIE or libc; only investigate heap behavior when the allocation path is evidenced. Use `gdb`/`gdb-multiarch`, `checksec`, `readelf`, `objdump`, `ROPgadget`/`ropper`, and `pwntools` against local copies first. For ARM/MIPS/RISC-V or kernel/initramfs inputs, branch to QEMU user or QEMU system TCG, `cpio`, and `pahole`; KVM or a physical device remains `NEEDS_REVIEW`.
 
 ## Validation and replay
 

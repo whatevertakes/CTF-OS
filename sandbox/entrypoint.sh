@@ -7,7 +7,24 @@ set -euo pipefail
 
 : "${CTF_OS_ALLOWED_ENDPOINTS_JSON:=[]}"
 : "${CTF_OS_LOCAL_ENDPOINTS_JSON:=[]}"
-export HOME=/home/ctf
+# All mutable tool state stays in the attempt-private tmpfs. This also prevents
+# accidental use of host browser/cloud/container credentials and profiles.
+export HOME=/work/home
+export XDG_CONFIG_HOME=/work/home/.config
+export XDG_CACHE_HOME=/work/home/.cache
+export XDG_RUNTIME_DIR=/work/runtime
+export TMPDIR=/work/tmp
+export AWS_SHARED_CREDENTIALS_FILE=/work/credentials/aws
+export AWS_CONFIG_FILE=/work/credentials/aws-config
+export AZURE_CONFIG_DIR=/work/credentials/azure
+export CLOUDSDK_CONFIG=/work/credentials/gcloud
+export KUBECONFIG=/work/credentials/kubeconfig
+# Create worker-owned state directly as ctf. This avoids granting CAP_CHOWN;
+# the short-lived UID/GID switching capabilities are dropped below.
+setpriv --reuid=ctf --regid=ctf --init-groups -- sh -c '
+  mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" /work/credentials
+  chmod 0700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" /work/credentials
+'
 
 apply_firewall() {
     local tool="$1" family="$2"

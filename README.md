@@ -17,19 +17,16 @@ CTF-OS는 사람이 연 Sol/Luna 세션을 위한 로컬 CTF 분석 도구입니
    uv sync --frozen
    ```
 
-3. 분석 sandbox 이미지를 빌드합니다.
+3. 대회 전에 10개 sandbox 이미지를 빌드하고 환경을 확인합니다.
 
    ```bash
    sandbox/build-images.sh
-   ```
-
-4. 환경을 확인합니다.
-
-   ```bash
    uv run python -m ctf_os.agent_tools doctor
    ```
 
-5. 대회 폴더를 만듭니다.
+   `uv sync --frozen`은 CTF-OS의 Python 의존성만 설치하며 Docker 이미지를 만들지 않습니다. 모든 profile build와 doctor가 PASS한 상태에서 대회를 시작합니다. 특정 이미지만 다시 만들 때는 `sandbox/build-images.sh pwn` 또는 `sandbox/build-images.sh osint ai cloud`를 사용합니다.
+
+4. 대회 폴더를 만듭니다.
 
    ```bash
    uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
