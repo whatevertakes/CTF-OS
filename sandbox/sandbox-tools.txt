@@ -1,21 +1,11 @@
-CTF SANDBOX TOOLS REFERENCE
-===========================
-All tools are pre-installed. This image is reused by every CTF-OS attempt.
+CTF-OS SANDBOX CAPABILITIES
 
-NETWORKING: nc, curl, wget, nmap, tshark, socat
-BINARY: file, strings, xxd, hexdump, binwalk, objdump, readelf, nm
-DEBUGGING: gdb, gdb-multiarch, ltrace, strace, radare2 (r2)
-STEG/IMAGE: steghide, stegseek, zsteg, exiftool, pngcheck, ImageMagick, tesseract
-FORENSICS: mmls, fls, icat, tsk_recover, fsstat, foremost, testdisk,
-           xfs_db, xfs_repair, dcfldd, volatility3
-MEDIA: ffmpeg, sox
-CRYPTO: openssl, SageMath (sage), RsaCtfTool, cado-nfs, flatter
-BUILD/ARCHIVE: gcc, g++, make, cmake, git, jq, zip, unzip
-CONTAINERS: podman, buildah, fuse-overlayfs, slirp4netns
-PYTHON: pwntools, pycryptodome, sympy, gmpy2, z3-solver, fpylll, angr,
-        capstone, unicorn, ROPgadget, Pillow, pytesseract, scipy, numpy,
-        requests, flask, volatility3, torch (CPU-only), keras, PyJWT, pyghidra,
-        tqdm
+Base: file/binutils, gdb/strace/ltrace, curl/nc/socat, gcc/g++, Python,
+pwntools, pycryptodome, sympy, z3, capstone, unicorn, ROPgadget, requests.
 
-CTF-OS mounts challenge input at /workspace read-only, attempt-private files at
-/work, and challenge artifacts at /artifacts. Use ./ctf-exec for challenge commands.
+Optional build targets add rev, crypto, or forensic-heavy packages. Build only
+the profile a challenge needs. Nested container engines and Codex are absent.
+
+Challenge input is mounted read-only at /challenge. /work and /artifacts are
+attempt-private, size-bounded tmpfs mounts. Files in /artifacts are safely
+exported to the selected branch after each internal sandbox command.

@@ -1,14 +1,9 @@
 [project]
 name = "ctf-os"
-version = "0.1.0"
-description = "Local-first multi-node CTF agent"
+version = "2.0.0"
+description = "Sol-native support tools for authorized CTF intake and solving"
 requires-python = ">=3.11"
-dependencies = [
-  "pyyaml>=6.0.2",
-]
-
-[project.scripts]
-ctf-os = "ctf_os.cli:main"
+dependencies = []
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -18,12 +13,10 @@ build-backend = "setuptools.build_meta"
 include = ["ctf_os*"]
 
 [tool.setuptools.package-data]
-ctf_os = ["resources/*.yaml", "resources/sandbox/*", "resources/knowledge/**/*.md", "resources/knowledge/**/*.json", "resources/knowledge/**/LICENSE", "resources/knowledge/**/.gitkeep"]
+ctf_os = ["resources/agent-policy.md", "resources/knowledge/playbooks/*.md"]
 
 [dependency-groups]
-dev = [
-  "pytest>=8.0",
-]
+dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CTF Intake"
+  short_description: "Prepare deep-ready CTF challenge context packs"
+  default_prompt: "Use $ctf-intake to inspect the selected contest and prepare its challenge context index."

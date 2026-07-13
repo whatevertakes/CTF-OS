@@ -10,13 +10,11 @@ build/
 dist/
 *.egg-info/
 
-# Member-local runtime state. Keep only scaffold placeholders in Git.
+# Generated intake/solve state. Keep only scaffold placeholders in Git.
 incoming/*
 output/*
-sync/*
 !incoming/.gitkeep
 !output/.gitkeep
-!sync/.gitkeep
 *.db
 *.sqlite
 *.sqlite3

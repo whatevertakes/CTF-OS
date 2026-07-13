@@ -1,0 +1,58 @@
+from pathlib import Path
+
+import pytest
+
+from ctf_os.challenge import SelectionError, resolve_selector
+from ctf_os.contest import ContestError, parse_contest
+from conftest import write_contest
+
+
+def test_korean_english_alias_multiline_override_and_stable_order(repo: Path) -> None:
+    path = write_contest(repo, """# 대회명: Demo CTF
+- 날짜: 2026-01-02
+- Flag Format: DEMO{...}
+## 문제 목록
+### pwn/한글 문제
+- 점수: 500
+- 설명: 첫 줄
+  둘째 줄
+- Remote: nc example.com 31337
+### web/Same
+- Description: web app
+- Flag Pattern: \\ADEMO\\{web-[0-9]+\\}\\Z
+""")
+    first = parse_contest(path)
+    second = parse_contest(path)
+    assert [c.number for c in first.challenges] == [1, 2]
+    assert first.challenges[0].description == "첫 줄\n둘째 줄"
+    assert first.challenges[0].score == 500
+    assert first.challenges[0].id == second.challenges[0].id
+    assert first.challenges[0].workspace_name.isascii()
+    assert first.challenges[1].flag_pattern == r"\ADEMO\{web-[0-9]+\}\Z"
+
+
+@pytest.mark.parametrize("selector", ["1", "01", "1번", "1번 문제", "pwn/한글 문제", "한글 문제"])
+def test_selectors(repo: Path, selector: str) -> None:
+    manifest = parse_contest(write_contest(repo, "# Demo CTF\n### pwn/한글 문제\n- 설명: x\n"))
+    assert resolve_selector(manifest.challenges, selector).number == 1
+
+
+def test_ambiguous_name_and_duplicates_are_rejected(repo: Path) -> None:
+    manifest = parse_contest(write_contest(repo, "# Demo CTF\n### pwn/Same\n### web/Same\n"))
+    with pytest.raises(SelectionError) as exc:
+        resolve_selector(manifest.challenges, "Same")
+    assert len(exc.value.candidates) == 2
+    duplicate = repo / "incoming" / "Other" / "contest.md"
+    duplicate.parent.mkdir()
+    duplicate.write_text("# Other\n### pwn/X\n### PWN/x\n", encoding="utf-8")
+    with pytest.raises(ContestError, match="duplicate"):
+        parse_contest(duplicate)
+
+
+def test_path_and_category_safety(repo: Path) -> None:
+    path = write_contest(repo, "# Demo CTF\n### pwn/../escape\n")
+    with pytest.raises(ContestError, match="unsafe"):
+        parse_contest(path)
+    path.write_text("# Demo CTF\n### unknown/X\n", encoding="utf-8")
+    with pytest.raises(ContestError, match="unsupported"):
+        parse_contest(path)

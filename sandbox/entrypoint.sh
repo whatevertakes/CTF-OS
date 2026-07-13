@@ -33,8 +33,10 @@ apply_firewall() {
     done < <(printf '%s' "$CTF_OS_ALLOWED_ENDPOINTS_JSON" | jq -r '.[] | [.ip, (.port|tostring), .protocol] | @tsv')
 }
 
-apply_firewall iptables 4
-apply_firewall ip6tables 6
+if [ "$CTF_OS_ALLOWED_ENDPOINTS_JSON" != "[]" ]; then
+    apply_firewall iptables 4
+    apply_firewall ip6tables 6
+fi
 
 # `--bounding-set=-all` removes NET_ADMIN, SETUID, SETGID and SETPCAP before
 # any worker command runs. The Docker exec builder separately forces `--user ctf`.

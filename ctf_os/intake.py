@@ -1,490 +1,349 @@
-"""Local contest discovery and safe challenge archive extraction."""
+"""Deep-ready, deterministic intake for every challenge in one contest."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import os
+from datetime import datetime, timezone
 import hashlib
-import shutil
-from pathlib import PurePosixPath
-import secrets
-import stat
-import tempfile
+import json
+import mimetypes
+import os
 from pathlib import Path
-from zipfile import BadZipFile, ZipFile, ZipInfo
+import shutil
+import subprocess
+import tempfile
 
-from .config import AppConfig
-from .contest_parser import ContestManifest, ContestParseError, canonical_category, parse_contest
-from .models import Challenge
-from .sandbox.network_policy import RemotePolicyError, parse_remote_endpoints
-
-
-class IntakeError(ValueError):
-    """Raised for unsafe or malformed local contest intake data."""
+from .archive import ArchiveError, ArchiveLimits, bounded_source_files, copy_tree_without_links, extract_archive
+from .contest import ChallengeSpec, ContestManifest, discover_contests, select_contest
+from .sandbox.network import parse_remotes
+from .workspace import atomic_json, atomic_text, bind_input_fingerprint, challenge_root
 
 
-class ArchivePolicyError(IntakeError):
-    """A structured, operator-actionable archive admission failure."""
-
-    def __init__(self, message: str, *, code: str, archive: Path, member: str | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.archive = archive
-        self.member = member
-
-    def payload(self) -> dict[str, str]:
-        result = {"code": self.code, "archive": self.archive.name, "reason": str(self)}
-        if self.member:
-            result["member"] = self.member
-        return result
+ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".7z", ".rar")
 
 
-@dataclass(frozen=True)
-class ZipExtractionLimits:
-    """Hard caps applied before and during every archive extraction."""
-
-    max_files: int = 1_000
-    max_file_bytes: int = 64 * 1024 * 1024
-    max_total_bytes: int = 256 * 1024 * 1024
-    max_compression_ratio: int = 100
-
-    def __post_init__(self) -> None:
-        if min(self.max_files, self.max_file_bytes, self.max_total_bytes, self.max_compression_ratio) < 1:
-            raise ValueError("ZIP extraction limits must be positive")
-
-
-DEFAULT_ZIP_LIMITS = ZipExtractionLimits()
-_TEMPLATE_VALUES = frozenset({"입력 예정", "미정", "todo", "tbd", "placeholder"})
-
-
-@dataclass(frozen=True)
-class IntakeChallenge:
-    manifest: ContestManifest
-    challenge: Challenge
-    workspace: Path
-    archives: tuple[Path, ...]
-    attachments: tuple[Path, ...] = ()
+def run_intake(repo: str | Path, contest_selector: str | None = None) -> dict[str, object]:
+    root = Path(repo).resolve()
+    manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
+    records = [_inspect_challenge(root, manifest, challenge) for challenge in manifest.challenges]
+    payload: dict[str, object] = {
+        "schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(),
+        "contest": manifest.to_dict(), "challenges": records,
+        "summary": {
+            "total": len(records), "ready": sum(r["status"] == "READY" for r in records),
+            "blocked": sum(r["status"] == "BLOCKED" for r in records),
+        },
+    }
+    contest_output = root / "output" / manifest.slug
+    atomic_json(contest_output / "intake.json", payload)
+    atomic_text(contest_output / "INTAKE.md", render_intake_markdown(payload))
+    return payload
 
 
-@dataclass(frozen=True)
-class IntakeAdmissionError:
-    manifest: ContestManifest
-    challenge: Challenge
-    reason: str
-    payload: dict[str, str]
-
-
-class IntakeService:
-    """Read human-supplied manifests without following archives out of workspace."""
-
-    def __init__(self, config: AppConfig) -> None:
-        self.config = config
-        self.admission_errors: list[IntakeAdmissionError] = []
-
-    def discover_manifests(self) -> tuple[ContestManifest, ...]:
-        """Find manifests belonging to this configured contest only.
-
-        The manifest path and the manifest identity must both match the exact
-        configured contest. Other incoming directories are deliberately never
-        parsed, even if their name or metadata happens to match.
-        """
-        contest_dir = self.config.incoming_contest_dir()
-        path = contest_dir / "contest.md"
-        if path.parent != contest_dir or path.name != "contest.md":  # defensive invariant for future config changes
-            raise IntakeError("configured manifest path is not incoming/<contest>/contest.md")
-        if not path.is_file() or path.is_symlink():
-            return ()
-        try:
-            manifest = parse_contest(path)
-        except ContestParseError:
-            raise
-        if path.parent.name != self.config.contest_name or manifest.name != self.config.contest_name:
-            raise IntakeError("contest directory name and contest.md name must both exactly match contest.name")
-        return (manifest,)
-
-    def collect(self, *, materialize: bool = True) -> tuple[IntakeChallenge, ...]:
-        """Validate owned challenges and optionally build their workspaces.
-
-        ``materialize=False`` is used by read-only diagnostics so doctor and
-        preflight checks exercise the exact queue gate without mutating the
-        incoming tree.
-        """
-        result: list[IntakeChallenge] = []
-        self.admission_errors.clear()
-        manifests = self.discover_manifests()
-        if not manifests:
-            path = self.config.incoming_contest_dir() / "contest.md"
-            raise IntakeError(f"contest manifest not found: {path}")
-        for manifest in manifests:
-            owned = manifest.owned_by(self.config.owned_categories)
-            ready = tuple(challenge for challenge in owned if not _is_template_challenge(challenge))
-            if owned and not ready:
-                names = ", ".join(f"{challenge.category}/{challenge.name}" for challenge in owned)
-                raise IntakeError(
-                    "template challenge is not ready to queue: "
-                    f"{names} has placeholder field(s): description; edit or remove the template entry"
-                )
-            for challenge in ready:
-                archives = self.discover_archives(manifest, challenge)
-                source_dir = self.discover_source_directory(manifest, challenge)
-                attachments = self.discover_opaque_attachments(manifest, challenge)
-                try:
-                    endpoints = parse_remote_endpoints(challenge.remote)
-                except RemotePolicyError as exc:
-                    raise IntakeError(
-                        f"invalid remote for {challenge.category}/{challenge.name}: {exc}"
-                    ) from exc
-                if not archives and not attachments and source_dir is None and not endpoints:
-                    raise IntakeError(
-                        f"challenge has no matching source or valid remote: {challenge.category}/{challenge.name}; "
-                        f"expected {_category_root(manifest.path.parent, challenge.category) / challenge.name}.zip "
-                        f"or {_category_root(manifest.path.parent, challenge.category) / challenge.name}/; "
-                        "check the contest.md heading and attachment path/name for a mismatch"
-                    )
-                workspace = self.config.workspace_dir(manifest.name, challenge.slug)
-                try:
-                    if materialize:
-                        materialize_challenge_sources(
-                            archives, source_dir, workspace, attachments=attachments,
-                            zip_limits=ZipExtractionLimits(**self.config.zip_extraction_limits),
-                        )
-                    elif archives:
-                        _validate_archive_metadata(
-                            archives, ZipExtractionLimits(**self.config.zip_extraction_limits),
-                        )
-                except IntakeError as exc:
-                    payload = exc.payload() if isinstance(exc, ArchivePolicyError) else {
-                        "code": "INTAKE_POLICY_REJECTED", "reason": str(exc),
-                    }
-                    payload["resolution"] = (
-                        "review the named member and, only for an authorized challenge, raise "
-                        "intake.zip_limits in this contest's local config"
-                    )
-                    self.admission_errors.append(IntakeAdmissionError(
-                        manifest, challenge, str(exc), payload,
-                    ))
-                    continue
-                result.append(IntakeChallenge(manifest, challenge, workspace, archives, attachments))
-        return tuple(result)
-
-    @staticmethod
-    def discover_archives(manifest: ContestManifest, challenge: Challenge) -> tuple[Path, ...]:
-        """Find archives specifically associated with one manifest challenge."""
-        contest_root = manifest.path.parent.resolve(strict=False)
-        category_root = _category_root(contest_root, challenge.category)
-        if not category_root.is_dir() or category_root.is_symlink():
-            return ()
-        wanted = {challenge.name.casefold(), challenge.slug.casefold()}
-        candidates = {
-            archive for archive in category_root.iterdir()
-            if archive.is_file() and archive.suffix.casefold() == ".zip" and archive.stem.casefold() in wanted
-        }
-        named_dir = category_root / challenge.name
-        if named_dir.is_dir() and not named_dir.is_symlink():
-            candidates.update(
-                path for path in named_dir.rglob("*")
-                if path.is_file() and not path.is_symlink() and path.suffix.casefold() == ".zip"
-            )
-        safe: list[Path] = []
-        for archive in sorted(candidates):
-            try:
-                archive.resolve(strict=False).relative_to(contest_root)
-            except ValueError as exc:
-                raise IntakeError(f"archive escapes contest workspace: {archive}") from exc
-            if archive.is_file() and not archive.is_symlink():
-                safe.append(archive)
-        return tuple(safe)
-
-    @staticmethod
-    def discover_opaque_attachments(manifest: ContestManifest, challenge: Challenge) -> tuple[Path, ...]:
-        """Return non-ZIP archives for analysis inside the attempt sandbox.
-
-        Host intake deliberately does not unpack these formats.  This avoids
-        making queue admission depend on host tools while letting 7z, rar and
-        tar-based CTF tasks reach the profile-specific extraction harness.
-        """
-        contest_root = manifest.path.parent.resolve(strict=False)
-        category_root = _category_root(contest_root, challenge.category)
-        if not category_root.is_dir() or category_root.is_symlink():
-            return ()
-        wanted = {challenge.name.casefold(), challenge.slug.casefold()}
-        unsupported_suffixes = (".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz")
-        found: list[Path] = []
-        for path in category_root.iterdir():
-            if not path.is_file() or path.is_symlink():
-                continue
-            lower = path.name.casefold()
-            for suffix in unsupported_suffixes:
-                if lower.endswith(suffix) and lower[:-len(suffix)] in wanted:
-                    found.append(path)
-                    break
-        return tuple(sorted(found))
-
-    @staticmethod
-    def discover_source_directory(manifest: ContestManifest, challenge: Challenge) -> Path | None:
-        contest_root = manifest.path.parent.resolve(strict=False)
-        named = _category_root(contest_root, challenge.category) / challenge.name
-        if named.is_symlink():
-            raise IntakeError(f"challenge source directory must not be a symlink: {named}")
-        return named if named.is_dir() else None
-
-
-def _is_template_challenge(challenge: Challenge) -> bool:
-    """Recognize untouched generated entries without rejecting ready siblings."""
-    description = (challenge.description or "").strip().casefold()
-    return description in _TEMPLATE_VALUES
-
-def _category_root(contest_root: Path, category: str) -> Path:
-    direct = contest_root / category
-    if direct.is_dir() or canonical_category(category) != "forensics":
-        return direct
-    for alias in ("forensics", "forensic"):
-        candidate = contest_root / alias
-        if candidate.is_dir() and not candidate.is_symlink():
-            return candidate
-    return direct
-
-
-def materialize_challenge_sources(
-    archives: tuple[Path, ...], source_dir: Path | None, destination: Path, *,
-    attachments: tuple[Path, ...] = (), zip_limits: ZipExtractionLimits = DEFAULT_ZIP_LIMITS,
-) -> None:
-    """Build one deterministic workspace from ZIP and/or plain challenge files."""
-    fingerprint = _source_fingerprint(archives + attachments, source_dir)
-    marker = destination.parent / f".{destination.name}.source.sha256"
-    if destination.is_dir() and not destination.is_symlink() and marker.is_file():
-        if marker.read_text(encoding="ascii", errors="ignore").strip() == fingerprint:
-            return
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    outer = Path(tempfile.mkdtemp(prefix=f".{destination.name}.materialize-", dir=destination.parent))
-    payload = outer / "payload"
+def _inspect_challenge(root: Path, manifest: ContestManifest, challenge: ChallengeSpec) -> dict[str, object]:
+    destination = challenge_root(root, manifest, challenge)
+    base: dict[str, object] = challenge.to_dict() | {
+        "status": "BLOCKED", "blockers": [], "authorized_targets": [],
+        "source_paths": [], "files": [], "archives": [], "docker": {},
+        "runtime": [], "subtype": None, "attack_surface": [], "hypotheses": [],
+        "recommended_tools": [], "read_paths": [], "context_path": str(destination / "CONTEXT.md"),
+        "workspace_path": str(destination), "prepared_input": str(destination / "input"),
+        "source_fingerprint": None, "prepared_fingerprint": None,
+    }
     try:
-        if archives:
-            extract_zips_safely(archives, payload, limits=zip_limits)
-        else:
-            payload.mkdir()
-        for attachment in attachments:
-            shutil.copyfile(attachment, payload / attachment.name, follow_symlinks=False)
-        if source_dir is not None:
-            _copy_plain_sources(source_dir, payload)
-        _make_workspace_container_readable(payload)
-        _replace_directory_atomically(payload, destination)
-        marker.write_text(fingerprint + "\n", encoding="ascii")
-    finally:
-        if outer.exists():
-            _remove_tree(outer)
+        base["authorized_targets"] = [target.to_dict() for target in parse_remotes(challenge.remotes)]
+        sources = _match_sources(manifest, challenge)
+        base["source_paths"] = [str(path) for path in sources]
+        if not sources and not challenge.remotes:
+            raise ValueError("contest.md entry has no matching directory/archive and no authorized remote")
+        input_dir, archive_records, fingerprint, prepared_fingerprint = _materialize(destination, challenge, sources)
+        base["archives"] = archive_records
+        base["source_fingerprint"] = fingerprint
+        base["prepared_fingerprint"] = prepared_fingerprint
+        files = [_inspect_file(input_dir, path) for path in _regular_files(input_dir)] if input_dir.exists() else []
+        base["files"] = files
+        preflight = _preflight(challenge, input_dir, files)
+        base.update(preflight)
+        base["read_paths"] = [str(manifest.path), str(destination / "CONTEXT.md"), str(input_dir)]
+        base["status"] = "READY"
+        destination.mkdir(parents=True, exist_ok=True)
+        bind_input_fingerprint(destination, challenge, fingerprint)
+        atomic_text(destination / "CONTEXT.md", render_context(manifest, base))
+    except Exception as exc:
+        base["blockers"] = [str(exc)]
+        destination.mkdir(parents=True, exist_ok=True)
+        atomic_text(destination / "CONTEXT.md", render_context(manifest, base))
+    return base
 
 
-def _copy_plain_sources(source: Path, destination: Path) -> None:
-    for path in sorted(source.rglob("*")):
-        relative = path.relative_to(source)
-        if path.is_symlink():
-            raise IntakeError(f"symlink blocked in challenge source: {relative}")
-        target = destination / relative
-        if path.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif path.is_file() and path.suffix.casefold() != ".zip":
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                raise IntakeError(f"duplicate challenge source target: {relative}")
-            shutil.copyfile(path, target, follow_symlinks=False)
-
-
-def _make_workspace_container_readable(root: Path) -> None:
-    """Expose only the read-only challenge copy to the unprivileged container UID."""
-    for path in (root, *sorted(root.rglob("*"))):
-        if path.is_symlink():
-            raise IntakeError(f"symlink blocked in materialized workspace: {path}")
-        if path.is_dir():
-            path.chmod(0o755)
-        elif path.is_file():
-            executable = bool(path.stat().st_mode & 0o111)
-            path.chmod(0o755 if executable else 0o644)
-
-
-def _source_fingerprint(archives: tuple[Path, ...], source_dir: Path | None) -> str:
-    digest = hashlib.sha256()
-    paths = list(archives)
-    if source_dir is not None:
-        paths.extend(path for path in sorted(source_dir.rglob("*")) if not path.is_dir())
-    for path in paths:
-        if path.is_symlink():
-            raise IntakeError(f"symlink blocked in challenge source: {path}")
-        if not path.is_file():
+def _match_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> list[Path]:
+    category_root = manifest.path.parent / challenge.category
+    if not category_root.exists() and challenge.category == "forensic":
+        alias = manifest.path.parent / "forensics"
+        category_root = alias if alias.exists() else category_root
+    if not category_root.is_dir() or category_root.is_symlink():
+        return []
+    wanted = {challenge.name.casefold(), challenge.workspace_name.casefold()}
+    matches: list[Path] = []
+    for entry in category_root.iterdir():
+        if entry.is_symlink():
             continue
-        digest.update(str(path).encode("utf-8", errors="surrogateescape"))
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(64 * 1024), b""):
-                digest.update(chunk)
+        if entry.is_dir() and entry.name.casefold() in wanted:
+            matches.append(entry)
+            continue
+        if entry.is_file():
+            lower = entry.name.casefold()
+            for suffix in ARCHIVE_SUFFIXES:
+                if lower.endswith(suffix) and lower[:-len(suffix)] in wanted:
+                    matches.append(entry)
+                    break
+    return sorted(matches, key=lambda path: path.name.casefold())
+
+
+def _materialize(destination: Path, challenge: ChallengeSpec, sources: list[Path]) -> tuple[Path, list[dict[str, object]], str, str]:
+    fingerprint = _source_fingerprint(challenge, sources)
+    input_dir = destination / "input"
+    marker = destination / ".input-fingerprint"
+    if input_dir.is_symlink() or marker.is_symlink():
+        raise ArchiveError("prepared input or fingerprint marker must not be a symlink")
+    if input_dir.is_dir() and marker.is_file() and marker.read_text() == fingerprint:
+        metadata_path = destination / ".archive-metadata.json"
+        cached = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else _archive_metadata(sources)
+        return input_dir, cached, fingerprint, prepared_tree_fingerprint(input_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".input-", dir=destination))
+    archives: list[dict[str, object]] = []
+    try:
+        for source in sources:
+            if source.is_dir():
+                copy_tree_without_links(source, staging)
+            else:
+                lower = source.name.casefold()
+                if lower.endswith((".7z", ".rar")):
+                    raise ArchiveError(f"{source.name}: safe built-in extraction is unavailable; unpack it into a named directory")
+                members = extract_archive(source, staging)
+                archives.append({"path": str(source), "sha256": _sha256(source), "members": members, "extracted": True})
+            prepared_tree_fingerprint(staging)
+        _make_read_only(staging)
+        old = destination / ".old-input"
+        if old.exists():
+            _remove_generated_tree(old)
+        if input_dir.exists():
+            os.replace(input_dir, old)
+        os.replace(staging, input_dir)
+        if old.exists():
+            _remove_generated_tree(old)
+        atomic_text(marker, fingerprint)
+        atomic_json(destination / ".archive-metadata.json", archives)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return input_dir, archives, fingerprint, prepared_tree_fingerprint(input_dir)
+
+
+def _source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
+    digest = hashlib.sha256(json.dumps(challenge.to_dict(), ensure_ascii=False, sort_keys=True).encode())
+    for source in sources:
+        digest.update(source.name.encode())
+        if source.is_file():
+            digest.update(bytes.fromhex(_sha256(source)))
+        else:
+            total = 0
+            limits = ArchiveLimits()
+            for path in bounded_source_files(source, limits):
+                size = path.stat().st_size
+                if size > limits.max_file_bytes:
+                    raise ArchiveError(f"source file exceeds size limit: {path.relative_to(source)}")
+                total += size
+                if total > limits.max_total_bytes:
+                    raise ArchiveError("source directory exceeds total size limit")
+                digest.update(path.relative_to(source).as_posix().encode())
+                digest.update(bytes.fromhex(_sha256(path)))
     return digest.hexdigest()
 
 
-def extract_zip_safely(
-    archive: str | Path,
-    destination: str | Path,
-    *,
-    limits: ZipExtractionLimits = DEFAULT_ZIP_LIMITS,
-) -> tuple[Path, ...]:
-    """Safely extract one archive through a fresh staging directory."""
-    return extract_zips_safely((Path(archive),), destination, limits=limits)
+def current_source_fingerprint(manifest: ContestManifest, challenge: ChallengeSpec) -> str:
+    return _source_fingerprint(challenge, _match_sources(manifest, challenge))
 
 
-def extract_zips_safely(
-    archives: tuple[Path, ...] | list[Path],
-    destination: str | Path,
-    *,
-    limits: ZipExtractionLimits = DEFAULT_ZIP_LIMITS,
-) -> tuple[Path, ...]:
-    """Stream archives into a fresh staging tree, then atomically replace.
+def prepared_tree_fingerprint(root: Path) -> str:
+    digest = hashlib.sha256()
+    total = 0
+    limits = ArchiveLimits()
+    for path in bounded_source_files(root, limits):
+        size = path.stat().st_size
+        if size > limits.max_file_bytes:
+            raise ArchiveError(f"prepared file exceeds size limit: {path.relative_to(root)}")
+        total += size
+        if total > limits.max_total_bytes:
+            raise ArchiveError("prepared input exceeds total size limit")
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(bytes.fromhex(_sha256(path)))
+    return digest.hexdigest()
 
-    Metadata caps reject obvious ZIP bombs early, but copied-byte counters are
-    authoritative because malicious archives can lie about sizes. Existing
-    workspaces remain untouched if any member fails validation or streaming.
-    """
-    if not archives:
-        return ()
-    archive_paths = tuple(Path(archive) for archive in archives)
-    for archive_path in archive_paths:
-        if not archive_path.is_file() or archive_path.is_symlink():
-            raise IntakeError(f"challenge archive is not a regular file: {archive_path}")
-    destination_path = Path(destination)
-    if destination_path.exists() and destination_path.is_symlink():
-        raise IntakeError(f"workspace must not be a symlink: {destination_path}")
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    if destination_path.parent.is_symlink():
-        raise IntakeError(f"workspace parent must not be a symlink: {destination_path.parent}")
-    stage: Path | None = Path(tempfile.mkdtemp(prefix=f".{destination_path.name}.extract-", dir=destination_path.parent))
-    written_relatives: list[Path] = []
+
+def _archive_metadata(sources: list[Path]) -> list[dict[str, object]]:
+    return [{"path": str(path), "sha256": _sha256(path), "extracted": True} for path in sources if path.is_file()]
+
+
+def _regular_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    result: list[Path] = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ArchiveError(f"symlink found in prepared input: {path}")
+        if path.is_file():
+            result.append(path)
+    return sorted(result, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _inspect_file(root: Path, path: Path) -> dict[str, object]:
+    kind = _command_output(["file", "-b", str(path)]) or "unknown"
+    mime = _command_output(["file", "-b", "--mime-type", str(path)]) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    record: dict[str, object] = {
+        "path": path.relative_to(root).as_posix(), "size": path.stat().st_size,
+        "sha256": _sha256(path), "mime": mime, "kind": kind,
+    }
+    with path.open("rb") as handle:
+        magic = handle.read(4)
+    if magic == b"\x7fELF":
+        header = _command_output(["readelf", "-h", str(path)], limit=64_000)
+        program = _command_output(["readelf", "-W", "-l", str(path)], limit=64_000)
+        dynamic = _command_output(["readelf", "-W", "-d", str(path)], limit=64_000)
+        record["elf"] = {
+            "architecture": _readelf_value(header, "Machine"),
+            "type": _readelf_value(header, "Type"),
+            "nx": "GNU_STACK" in program and "RWE" not in program,
+            "pie": "DYN" in (_readelf_value(header, "Type") or ""),
+            "relro": "full" if "BIND_NOW" in dynamic else ("partial" if "GNU_RELRO" in program else "none"),
+            "stripped": "stripped" in kind.casefold(),
+        }
+    return record
+
+
+def _preflight(challenge: ChallengeSpec, input_dir: Path, files: list[dict[str, object]]) -> dict[str, object]:
+    names = [str(item["path"]).casefold() for item in files]
+    category = challenge.category
+    dockerfiles = [name for name in names if name.endswith("dockerfile") or "/dockerfile" in name]
+    compose = [name for name in names if name.endswith(("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"))]
+    dependency_files = [name for name in names if name.endswith(("requirements.txt", "pyproject.toml", "package.json", "go.mod", "cargo.toml", "gemfile"))]
+    text_sample = "\n".join(_small_text(path) for path in _regular_files(input_dir)[:100]) if input_dir.exists() else ""
+    runtime: list[str] = []
+    subtype = None
+    if any(name.endswith(".py") for name in names): runtime.append("python")
+    if "package.json" in names or any(name.endswith((".js", ".ts")) for name in names): runtime.append("node")
+    if any("flask" in line.casefold() for line in text_sample.splitlines()): subtype = "Flask web application"
+    elif "django" in text_sample.casefold(): subtype = "Django web application"
+    elif "express" in text_sample.casefold(): subtype = "Express web application"
+    elif category == "pwn" and any("elf" in str(item["kind"]).casefold() for item in files): subtype = "native ELF binary"
+    elif category == "rev": subtype = "binary/static reverse engineering"
+    elif category == "crypto": subtype = "cryptographic solver"
+    surfaces = {
+        "pwn": ["I/O protocol", "memory-corruption primitives", "mitigations and libc coupling"],
+        "web": ["routes and authentication", "source-to-sink data flow", "container/dependency trust boundaries"],
+        "rev": ["entry point and imports", "validation routine", "packing or anti-analysis"],
+        "crypto": ["parameters and entropy", "input/output equations", "known weak construction families"],
+        "forensic": ["file signatures and metadata", "embedded/recovered objects", "timeline and provenance"],
+        "misc": ["file/protocol classification", "encoding layers", "runtime restrictions"],
+        "cloud": ["identity and policy boundaries", "metadata/service endpoints", "deployment manifests"],
+    }[category]
+    hypotheses = [f"Inspect {surface} first" for surface in surfaces[:2]]
+    tools = {
+        "pwn": ["file", "readelf", "checksec", "gdb", "pwntools"],
+        "web": ["rg", "curl", "python", "docker compose (only if required)"],
+        "rev": ["strings", "objdump", "gdb", "radare2/ghidra on demand"],
+        "crypto": ["python", "sympy", "pycryptodome", "z3 on demand"],
+        "forensic": ["file", "exiftool", "binwalk", "tshark on demand"],
+        "misc": ["file", "xxd", "python", "category-specific tools on demand"],
+        "cloud": ["jq", "curl", "manifest-specific client on demand"],
+    }[category]
+    return {
+        "docker": {"dockerfiles": dockerfiles, "compose_files": compose, "dependency_files": dependency_files},
+        "runtime": sorted(set(runtime)), "subtype": subtype,
+        "attack_surface": surfaces, "hypotheses": hypotheses, "recommended_tools": tools,
+    }
+
+
+def _small_text(path: Path) -> str:
+    if path.stat().st_size > 512_000:
+        return ""
     try:
-        _validate_archive_metadata(archive_paths, limits)
-        total_written = 0
-        for archive_path in archive_paths:
-            with ZipFile(archive_path) as bundle:
-                for member in bundle.infolist():
-                    assert stage is not None
-                    target = _zip_target(stage, member)
-                    _reject_unsafe_member(member)
-                    if member.is_dir():
-                        target.mkdir(parents=True, exist_ok=True)
-                        continue
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    # A duplicate member cannot silently replace a previous
-                    # file, which makes multi-archive extraction deterministic.
-                    try:
-                        output = target.open("xb")
-                    except FileExistsError as exc:
-                        raise IntakeError(f"duplicate ZIP member target: {member.filename!r}") from exc
-                    file_written = 0
-                    with bundle.open(member, "r") as source, output:
-                        while True:
-                            chunk = source.read(64 * 1024)
-                            if not chunk:
-                                break
-                            file_written += len(chunk)
-                            total_written += len(chunk)
-                            if file_written > limits.max_file_bytes:
-                                raise IntakeError(f"ZIP member exceeds per-file limit: {member.filename!r}")
-                            if total_written > limits.max_total_bytes:
-                                raise IntakeError("ZIP extraction exceeds total expanded-byte limit")
-                            output.write(chunk)
-                    if _zip_member_is_executable(member):
-                        target.chmod(0o755)
-                    written_relatives.append(target.relative_to(stage))
-        _replace_directory_atomically(stage, destination_path)
-        stage = None  # replacement consumed this path; suppress cleanup below
-        return tuple(destination_path / relative for relative in written_relatives)
-    except BadZipFile as exc:
-        raise IntakeError(f"invalid ZIP archive: {archive_paths[0]}") from exc
-    except RuntimeError as exc:
-        raise IntakeError(
-            f"cannot extract ZIP archive {archive_path}: encrypted member or unsupported compression ({exc})"
-        ) from exc
-    finally:
-        if stage is not None and stage.exists():
-            _remove_tree(stage)
-
-
-def _zip_target(root: Path, member: ZipInfo) -> Path:
-    name = member.filename
-    if not name or "\x00" in name:
-        raise IntakeError("ZIP member has an empty or NUL path")
-    if "\\" in name:
-        raise IntakeError(f"unsafe ZIP member path: {name!r}")
-    candidate = PurePosixPath(name)
-    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
-        raise IntakeError(f"unsafe ZIP member path: {name!r}")
-    target = root.joinpath(*candidate.parts)
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise IntakeError(f"ZIP member escapes workspace: {name!r}") from exc
-    return target
-
-
-def _reject_unsafe_member(member: ZipInfo) -> None:
-    mode = member.external_attr >> 16
-    if stat.S_IFMT(mode) == stat.S_IFLNK:
-        raise IntakeError(f"ZIP symlink members are not allowed: {member.filename!r}")
-
-
-def _zip_member_is_executable(member: ZipInfo) -> bool:
-    """Honor only Unix executable bits; all other archive permissions are discarded."""
-    return member.create_system == 3 and bool((member.external_attr >> 16) & 0o111)
-
-
-def _ensure_no_symlink_parent(target: Path, root: Path) -> None:
-    parent = target.parent
-    while parent != root:
-        if parent.is_symlink():
-            raise IntakeError(f"workspace contains a symlinked archive path: {parent}")
-        parent = parent.parent
-
-
-def _validate_archive_metadata(archives: tuple[Path, ...], limits: ZipExtractionLimits) -> None:
-    file_count = 0
-    declared_total = 0
-    for archive_path in archives:
-        try:
-            with ZipFile(archive_path) as bundle:
-                for member in bundle.infolist():
-                    _reject_unsafe_member(member)
-                    _zip_target(Path("/safe-root"), member)
-                    if member.flag_bits & 0x1:
-                        raise IntakeError(f"encrypted ZIP members are unsupported: {member.filename!r}")
-                    if member.is_dir():
-                        continue
-                    file_count += 1
-                    if file_count > limits.max_files:
-                        raise ArchivePolicyError("ZIP archive exceeds file-count limit", code="ZIP_FILE_COUNT_LIMIT", archive=archive_path, member=member.filename)
-                    if member.file_size > limits.max_file_bytes:
-                        raise ArchivePolicyError(f"ZIP member exceeds per-file limit: {member.filename!r}", code="ZIP_FILE_SIZE_LIMIT", archive=archive_path, member=member.filename)
-                    if member.file_size and (member.compress_size <= 0 or member.file_size > member.compress_size * limits.max_compression_ratio):
-                        raise ArchivePolicyError(f"ZIP member exceeds compression-ratio limit: {member.filename!r}", code="ZIP_COMPRESSION_RATIO_LIMIT", archive=archive_path, member=member.filename)
-                    declared_total += member.file_size
-                    if declared_total > limits.max_total_bytes:
-                        raise ArchivePolicyError("ZIP archive exceeds total expanded-byte limit", code="ZIP_TOTAL_SIZE_LIMIT", archive=archive_path, member=member.filename)
-        except BadZipFile as exc:
-            raise IntakeError(f"invalid ZIP archive: {archive_path}") from exc
-
-
-def _replace_directory_atomically(stage: Path, destination: Path) -> None:
-    backup: Path | None = None
-    if destination.exists():
-        if not destination.is_dir() or destination.is_symlink():
-            raise IntakeError(f"workspace destination is not a regular directory: {destination}")
-        backup = destination.with_name(f".{destination.name}.previous-{secrets.token_hex(8)}")
-        os.replace(destination, backup)
-    try:
-        os.replace(stage, destination)
+        return path.read_text(encoding="utf-8", errors="ignore")[:64_000]
     except OSError:
-        if backup is not None and backup.exists() and not destination.exists():
-            os.replace(backup, destination)
-        raise
-    if backup is not None:
-        _remove_tree(backup)
+        return ""
 
 
-def _remove_tree(path: Path) -> None:
-    import shutil
+def _readelf_value(output: str, key: str) -> str | None:
+    for line in output.splitlines():
+        if line.strip().startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip()
+    return None
 
-    shutil.rmtree(path, ignore_errors=True)
+
+def _command_output(argv: list[str], *, limit: int = 16_000) -> str:
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    return result.stdout[:limit].strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _make_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    root.chmod(0o555)
+
+
+def _remove_generated_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.chmod(0o644)
+    root.chmod(0o755)
+    shutil.rmtree(root)
+
+
+def render_context(manifest: ContestManifest, record: dict[str, object]) -> str:
+    challenge = f"{record['category']}/{record['name']}"
+    lines = [f"# Context — {challenge}", "", f"- Number: {int(record['number']):02d}", f"- Stable ID: `{record['id']}`", f"- Status: **{record['status']}**", f"- Contest: {manifest.name}"]
+    for label, key in (("Score", "score"), ("Description", "description"), ("Hint", "hint"), ("Flag format", "flag_format")):
+        if record.get(key) is not None:
+            lines.append(f"- {label}: {record[key]}")
+    lines.extend(["", "## Authorized targets", ""])
+    targets = record.get("authorized_targets") or []
+    lines.extend(f"- `{target['declared']}`" for target in targets) if targets else lines.append("- None")
+    lines.extend(["", "## Prepared evidence", "", f"- Input: `{record['prepared_input']}`", f"- Fingerprint: `{record.get('source_fingerprint')}`"])
+    for item in record.get("files", []):
+        details = item.get("elf")
+        lines.append(f"- `{item['path']}` — {item['size']} bytes — `{item['sha256']}` — {item['kind']}" + (f" — ELF {details}" if details else ""))
+    for heading, key in (("Initial attack surface", "attack_surface"), ("Initial hypotheses", "hypotheses"), ("Recommended tools", "recommended_tools"), ("Blockers", "blockers"), ("Solve session read paths", "read_paths")):
+        lines.extend(["", f"## {heading}", ""])
+        values = record.get(key) or []
+        lines.extend(f"- {value}" for value in values) if values else lines.append("- None")
+    return "\n".join(lines) + "\n"
+
+
+def render_intake_markdown(payload: dict[str, object]) -> str:
+    contest = payload["contest"]
+    lines = [f"# {contest['name']} — Intake", ""]
+    for record in payload["challenges"]:
+        lines.extend([f"## [{int(record['number']):02d}] {record['status']} — {record['category']}/{record['name']}", ""])
+        files = record.get("source_paths") or []
+        targets = record.get("authorized_targets") or []
+        lines.append(f"- Input: {', '.join(Path(path).name for path in files) if files else 'none'}")
+        lines.append(f"- Remote: {', '.join(target['declared'] for target in targets) if targets else 'none'}")
+        lines.append(f"- Estimated: {record.get('subtype') or record['category']}")
+        direction = (record.get("hypotheses") or record.get("blockers") or ["none"])[0]
+        lines.append(f"- Initial direction: {direction}")
+        lines.append(f"- Solve selector: {int(record['number']):02d} or {record['category']}/{record['name']}")
+        lines.append("")
+    return "\n".join(lines)

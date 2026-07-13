@@ -1,29 +1,28 @@
-# CTF-OS Agent Instructions
+# CTF-OS — Sol-native operating contract
 
-This repository implements CTF-OS, a local-first multi-node CTF agent.
+CTF-OS is a support toolkit for the Sol session the user opened in this repository. The current Sol session is the orchestrator. Python provides parsing, safe file preparation, sandboxing, evidence, and flag verification only; it must never start Codex or own the reasoning loop.
 
-## Operating model
+## User manifest and scope
 
-- No central executor, remote worker stealing, shared Codex account, or CTFd auto-submit.
-- Each member runs a local node on their own PC.
-- Nodes do not share runtime state; each member coordinates assignments directly.
-- Challenge commands run through per-attempt Docker containers whenever possible.
+- `incoming/<contest>/contest.md` is the only user configuration.
+- Work only on challenge files under that contest and remotes explicitly declared there.
+- Never access credentials, SSH keys, browser data, personal files, host configuration, or unrelated networks.
+- Never automate CTFd login or flag submission. Give a verified candidate to the human.
 
-## Model routing
+## Intake request
 
-- Sol (`gpt-5.6-sol`): architecture, supervision, strategy, final verification.
-- Terra (`gpt-5.6-terra`): implementation and normal solver work.
-- Luna (`gpt-5.6-luna`): recon, summarization, and cheap parallel attempts.
+For “intake 해라”, “대회 문제 읽어라”, “문제 목록 준비해라”, or a named contest intake request, load `.codex/skills/ctf-intake/SKILL.md`. Intake is a dedicated session: inspect all challenges, generate `output/<contest>/intake.json` and `INTAKE.md`, print the numbered status list, then stop. Fast bounded triage is allowed; do not start the solve race.
 
-## Safety
+## Solve request
 
-- Work only on authorized CTF challenges and remotes declared in `incoming/{contest}/contest.md`.
-- Never access credentials, personal files, unrelated networks, or host configuration from solver workers.
-- Workers write only to `/work` and `/artifacts`.
-- Do not invent flags or publish placeholders as real findings.
+For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm requests, load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge in a new session. Resolve `1`, `01`, `1번`, exact category/name, or unambiguous name through the internal tool. Never guess an ambiguous challenge or contest.
 
-## Engineering
+## Native swarm
 
-- Prefer `uv`; retain SQLite local state on each node.
-- Keep Docker cleanup label-scoped to the local member/team/challenge.
-- Add focused tests for parser, state, events, sandbox, model routing, and mock worker flows.
+Use Codex runtime native delegation, never shell/subprocess model launchers or broker protocols. Begin with about three non-overlapping branches when useful: reconnaissance, reproduction/implementation, and alternate deep analysis. Sol compares evidence, cross-pollinates results, ends weak branches, changes attack families, and takes over stalled high-value work. Use Luna/Terra/Sol role guidance when exact model selection is available; otherwise separate roles without claiming pinning.
+
+## Sandbox and evidence
+
+Invoke internal JSON tools with `uv run python -m ctf_os.agent_tools ...`. Challenge input is read-only at `/challenge`; only attempt-private `/work` and `/artifacts` are writable. Use one sandbox per branch, declared remotes only, bounded time/resources, and always clean up. Record important commands/output in `evidence.log`; append supported, rejected, and inconclusive hypotheses to `FINDINGS.md`/`findings.jsonl`.
+
+Do not mark a problem solved from a flag-looking string. Require clean local reproduction, an independent rerun, flag-pattern match, and authorized remote reproduction when a remote exists. Only then use `READY_FOR_HUMAN_SUBMISSION`; submission remains manual.

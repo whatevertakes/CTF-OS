@@ -1,9 +1,0 @@
-CTF SANDBOX TOOLS REFERENCE
-===========================
-NETWORKING: nc curl wget nmap tshark socat
-BINARY/DEBUG: file strings xxd binwalk objdump readelf nm gdb gdb-multiarch ltrace strace radare2
-FORENSICS/STEG: exiftool steghide stegseek zsteg pngcheck ImageMagick tesseract foremost testdisk sleuthkit xfsprogs dcfldd volatility3
-CRYPTO: openssl sage RsaCtfTool cado-nfs flatter z3 fpylll
-MEDIA/BUILD: ffmpeg sox gcc g++ make cmake git jq zip unzip
-CONTAINERS: podman buildah fuse-overlayfs slirp4netns
-PYTHON: pwntools pycryptodome sympy gmpy2 requests Pillow pytesseract scipy numpy angr capstone unicorn ROPgadget tqdm flask volatility3 torch-cpu keras PyJWT pyghidra
