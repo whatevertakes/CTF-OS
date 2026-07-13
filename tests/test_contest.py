@@ -106,6 +106,21 @@ def test_fenced_markdown_examples_do_not_create_challenges(repo: Path) -> None:
     assert manifest.challenges == ()
 
 
+def test_fenced_examples_require_a_matching_fence_to_resume_parsing(repo: Path) -> None:
+    path = write_contest(repo, """# Demo CTF
+
+````markdown
+### pwn/Example
+```
+### web/StillExample
+````
+""")
+
+    manifest = parse_contest(path)
+
+    assert manifest.challenges == ()
+
+
 @pytest.mark.parametrize("category", ["mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"])
 def test_extended_categories_use_generic_playbook_without_being_blocked(repo: Path, category: str) -> None:
     manifest = parse_contest(write_contest(repo, f"# Demo CTF\n### {category}/X\n"))

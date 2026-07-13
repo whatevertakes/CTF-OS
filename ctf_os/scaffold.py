@@ -7,7 +7,6 @@ from pathlib import Path
 
 
 DEFAULT_CATEGORIES = ("pwn", "rev", "web", "forensic", "misc", "crypto")
-_SLOT_COUNT = 4
 
 
 def initialize_contest(root: Path, name: str) -> dict[str, object]:
@@ -72,31 +71,17 @@ def _contest_template(contest_name: str) -> str:
         "- 플래그 형식: CTF{...}",
         "- 입력 프로필: standard",
         "",
-        "## 문제 등록 카드",
+        "## 문제 등록",
         "",
-        "날짜와 플래그 형식은 실제 값으로 바꾸세요. 아래 카드를 복사해 이 문서의 원하는 위치에 붙여 넣으면 됩니다.",
-        "문제 파일은 incoming/<대회명>/<카테고리>/<문제명>/ 아래에 둡니다.",
-        "원격이 없는 문제는 '- 원격:' 줄을 삭제하세요.",
+        "날짜와 플래그 형식만 실제 값으로 바꾸고, 필요한 카드를 복사해 이 섹션 위에 붙여 넣으세요.",
         "",
     ]
     for category in DEFAULT_CATEGORIES:
         lines.extend([f"### {category} 등록 카드", "", "```markdown"])
-        for number in range(1, _SLOT_COUNT + 1):
-            lines.extend([
-                f"### {category}/문제명-{number}",
-                "- 설명: 문제 원문 설명",
-                "- 원격: nc host.example 31337",
-                "",
-            ])
+        lines.extend([
+            f"### {category}/문제명",
+            "- 설명: 문제 원문 설명",
+            "- 원격: nc host.example 31337",
+        ])
         lines.extend(["```", ""])
-    lines.extend([
-        "### 추가 문제 복사용 카드",
-        "",
-        "```markdown",
-        "### 카테고리/문제명",
-        "- 설명: 문제 원문 설명",
-        "- 원격: nc host.example 31337",
-        "```",
-        "",
-    ])
     return "\n".join(lines)

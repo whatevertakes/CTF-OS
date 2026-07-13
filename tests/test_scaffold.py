@@ -22,9 +22,8 @@ def test_initialize_contest_creates_template_and_category_directories(repo: Path
     assert "- 플래그 형식: CTF{...}" in template
     assert "```markdown" in template
     for category in DEFAULT_CATEGORIES:
-        for number in range(1, 5):
-            assert f"### {category}/문제명-{number}" in template
-    assert "### 카테고리/문제명" in template
+        assert f"### {category}/문제명" in template
+    assert "문제명-2" not in template
 
 
 def test_initialize_contest_creates_a_missing_incoming_directory(tmp_path: Path) -> None:

@@ -148,7 +148,7 @@ def parse_contest(path: str | Path) -> ContestManifest:
     field_warnings: list[ManifestWarning] | None = None
     last_key: str | None = None
     in_html_comment = False
-    code_fence: str | None = None
+    code_fence: tuple[str, int] | None = None
 
     for line_number, raw in enumerate(lines, 1):
         stripped = raw.lstrip()
@@ -157,7 +157,8 @@ def parse_contest(path: str | Path) -> ContestManifest:
                 in_html_comment = False
             continue
         if code_fence:
-            if stripped.startswith(code_fence):
+            fence_character, fence_length = code_fence
+            if stripped.startswith(fence_character * fence_length):
                 code_fence = None
             continue
         if stripped.startswith("<!--"):
@@ -165,9 +166,11 @@ def parse_contest(path: str | Path) -> ContestManifest:
             if "-->" not in stripped:
                 in_html_comment = True
             continue
-        if stripped.startswith(("```", "~~~")):
+        fence = re.match(r"^(`{3,}|~{3,})", stripped)
+        if fence:
             last_key = None
-            code_fence = stripped[:3]
+            marker = fence.group(1)
+            code_fence = (marker[0], len(marker))
             continue
         if name is None:
             match = _TITLE.match(raw)

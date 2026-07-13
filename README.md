@@ -59,7 +59,7 @@ uv run python -m ctf_os.agent_tools doctor
 uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
 ```
 
-마지막 인자인 `"My CTF 2026"`만 실제 대회명으로 바꾸면 해당 이름으로 폴더와 manifest 제목이 만들어집니다. 생성된 `contest.md`는 즉시 유효하게 파싱됩니다. 상단의 날짜·플래그 형식만 실제 값으로 수정하고, HTML 주석 안에서 원하는 카테고리의 문제 등록 카드를 복사해 주석 밖에 붙여 넣으세요. 카테고리별 4개 예시와 추가 문제용 범용 카드가 있으며, 주석 안의 예시는 intake 대상이 아닙니다.
+마지막 인자인 `"My CTF 2026"`만 실제 대회명으로 바꾸면 해당 이름으로 폴더와 manifest 제목이 만들어집니다. 생성된 `contest.md`는 즉시 유효하게 파싱됩니다. 상단의 날짜·플래그 형식만 실제 값으로 수정하고, 필요한 카테고리의 한 장짜리 등록 카드를 복사해 `## 문제 등록` 위에 붙여 넣으세요. 코드 블록 안의 카드는 intake 대상이 아닙니다.
 
 ```text
 문제 파일과 contest.md 작성
