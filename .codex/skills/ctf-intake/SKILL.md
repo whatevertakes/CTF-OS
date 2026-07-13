@@ -15,4 +15,4 @@ Act as the intake lead in the currently open dedicated session. Do not begin a f
 
 For unusually broad inputs, use native delegation for at most 1–3 bounded, read-only triage tasks. Give each branch distinct files or categories and ask it to return evidence only. Model pinning is optional: use Sol/Terra/Luna roles when the runtime supports exact selection; otherwise use available native agents and state that the model was not pinned. Never use subprocesses, sockets, stdout protocols, or Python code to create model workers.
 
-Finish with the numbered list from `INTAKE.md`, including status, category/name, inputs, remote, estimate, initial direction, and selector. State the two saved index paths. Stop the intake session there; tell the user to open a new Sol session for one selected challenge.
+Finish with the numbered list from `INTAKE.md`, including status, category/name, inputs, remote, estimate, initial direction, and selector. State the two saved index paths. Stop the intake session there; tell the user to open a new Challenge Triage session before selecting a challenge to solve.

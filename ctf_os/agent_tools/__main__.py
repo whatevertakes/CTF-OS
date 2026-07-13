@@ -20,6 +20,7 @@ from ..service import (
     ServiceSpec, service_build, service_cleanup, service_plan,
     service_start, service_status, service_stop,
 )
+from ..triage import finalize_triage, prepare_triage, require_final_triage
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
 
 
@@ -43,6 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     intake = commands.add_parser("intake")
     intake.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     intake.add_argument("--contest")
+    triage_prepare = commands.add_parser("triage-prepare")
+    triage_prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    triage_prepare.add_argument("--contest")
+    triage_finalize = commands.add_parser("triage-finalize")
+    triage_finalize.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    triage_finalize.add_argument("--contest")
+    triage_finalize.add_argument("--assessments-json", required=True)
     prepare = commands.add_parser("prepare-challenge")
     prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     prepare.add_argument("selector")
@@ -127,6 +135,14 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 for r in payload["challenges"]
             ],
         }
+    if args.command == "triage-prepare":
+        return prepare_triage(root, args.contest)
+    if args.command == "triage-finalize":
+        try:
+            assessments = json.loads(args.assessments_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--assessments-json must be valid JSON") from exc
+        return finalize_triage(root, args.contest, assessments)
     if args.command == "sandbox-exec":
         metadata = _load_metadata(root, args.metadata)
         command = list(args.argv)
@@ -237,6 +253,7 @@ def _compact_prepare(challenge, record: dict[str, object], solve_root: Path) -> 
         "initial_attack_surface": record.get("attack_surface", []),
         "recommended_image": record.get("recommended_image", "ctf-os-sandbox:base"),
         "recommended_resource_profile": record.get("recommended_resource_profile", "standard"),
+        "triage_recommendation": record.get("triage_recommendation", {}),
         "service_plan": record.get("service_plan", {}),
         "state_summary": _state_summary(solve_root),
         "read_on_demand": [
@@ -276,7 +293,10 @@ def _load_challenge(root: Path, contest_selector: str | None, selector: str):
             raise ValueError("prepared challenge input is missing or unsafe; rerun intake")
         if records[0].get("prepared_fingerprint") != prepared_tree_fingerprint(prepared):
             raise ValueError("prepared challenge input changed after intake; rerun intake")
-    return manifest, challenge, records[0]
+    triage = require_final_triage(root, manifest, challenge)
+    record = dict(records[0])
+    record["triage_recommendation"] = triage.get("recommendation", {})
+    return manifest, challenge, record
 
 
 def _load_metadata(root: Path, value: str) -> dict[str, object]:

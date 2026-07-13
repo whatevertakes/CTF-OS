@@ -11,11 +11,15 @@ CTF-OS is a support toolkit for the Sol session the user opened in this reposito
 
 ## Intake request
 
-For “intake 해라”, “대회 문제 읽어라”, “문제 목록 준비해라”, or a named contest intake request, load `.codex/skills/ctf-intake/SKILL.md`. Intake is a dedicated session: inspect all challenges, generate `output/<contest>/intake.json` and `INTAKE.md`, print the numbered status list, then stop. Fast bounded triage is allowed; do not start the solve race.
+For “intake 해라”, “대회 문제 읽어라”, “문제 목록 준비해라”, or a named contest intake request, load `.codex/skills/ctf-intake/SKILL.md`. Intake is a dedicated session: inspect all challenges, generate `output/<contest>/intake.json` and `INTAKE.md`, print the numbered status list, then stop. Do not start the solve race or rank challenges there.
+
+## Challenge Triage request
+
+For “triage 해라”, “추천 풀이 순서 정해라”, “문제 우선순위 정해라”, or a named contest triage request after Intake, load `.codex/skills/ctf-triage/SKILL.md`. Challenge Triage is a dedicated no-solve session: use only the manifest and Intake-generated metadata, run `triage-prepare`, make the final ordinal order from the compact evidence facts, and run `triage-finalize`. It writes `output/<contest>/triage.json` and `TRIAGE.md`; show the READY/BLOCKED Board and stop. Never open original challenge input, create a sandbox, start a service, contact a remote, exploit, brute force, fuzz, use symbolic execution, or run a solver in this stage.
 
 ## Solve request
 
-For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm requests, load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge in a new session. Resolve `1`, `01`, `1번`, exact category/name, or unambiguous name through the internal tool. Never guess an ambiguous challenge or contest.
+For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm requests, load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge in a new session after a current finalized Challenge Triage Board exists. Resolve `1`, `01`, `1번`, exact category/name, or unambiguous name through the internal tool. Never guess an ambiguous challenge or contest.
 
 ## Native swarm
 

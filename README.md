@@ -33,6 +33,10 @@ CTF-OS는 사람이 연 Sol/Luna 세션을 위한 로컬 CTF 분석 도구입니
 
 6. `incoming/<contest>/problems.txt`에 문제 정보와 원격을 붙여 넣습니다. 생성된 파일의 주석 예시를 참고합니다.
 
-7. Luna에게 **“intake 해”**라고 요청합니다.
+7. Sol에게 **“intake 해”**라고 요청합니다.
 
 Intake는 `problems.txt`를 읽고 실제 파일을 확인한 뒤 `contest.md`를 생성 또는 갱신하고, parser 검증·intake·workspace 준비를 완료합니다. `contest.md`는 내부 manifest이며 사람이 수정하지 않습니다.
+
+8. 새 Sol 세션에서 **“triage 해”**라고 요청합니다.
+
+Challenge Triage는 Intake가 만든 inventory·ELF·archive·runtime·remote 메타데이터만 사용해 `output/<contest>/TRIAGE.md` Board와 `triage.json`을 만듭니다. 이 단계는 exploit, brute force, fuzzing, symbolic execution, solver 실행이나 remote 접속을 하지 않습니다. Board에서 추천 순서를 확인한 뒤 새 Sol 세션에서 **“1번 문제 풀어”**처럼 번호를 선택합니다.

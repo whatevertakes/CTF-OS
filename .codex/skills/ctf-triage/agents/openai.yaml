@@ -1,0 +1,4 @@
+interface:
+  display_name: "CTF Challenge Triage"
+  short_description: "Rank ready CTF challenges before solving"
+  default_prompt: "Use $ctf-triage to produce an evidence-backed solve-order board for the selected contest."

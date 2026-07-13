@@ -64,7 +64,11 @@ def run_doctor(repo: Path) -> dict[str, object]:
     add("memory", memory_bytes >= 2 * 1024**3, f"{memory_bytes // 1024**3} GiB available", "free at least 2 GiB RAM")
     add("output-write", _write_probe(repo / "output"), str(repo / "output"), "make repository output/ writable and remove unsafe symlinks")
 
-    skill_files = [repo / ".codex/skills/ctf-intake/SKILL.md", repo / ".codex/skills/ctf-solve/SKILL.md"]
+    skill_files = [
+        repo / ".codex/skills/ctf-intake/SKILL.md",
+        repo / ".codex/skills/ctf-triage/SKILL.md",
+        repo / ".codex/skills/ctf-solve/SKILL.md",
+    ]
     playbooks = list((repo / "ctf_os/resources/knowledge/playbooks").glob("*.md"))
     add("skills", all(path.is_file() and not path.is_symlink() for path in skill_files), ", ".join(str(path) for path in skill_files), "restore the tracked skill files")
     add("playbooks", len(playbooks) >= 7, f"{len(playbooks)} files", "restore ctf_os/resources/knowledge/playbooks")

@@ -9,9 +9,9 @@ The current user-opened Sol session is the sole lead orchestrator. Never run Cod
 
 ## Load and select
 
-1. Read root `AGENTS.md`, `contest.md`, `ctf_os/resources/agent-policy.md`, and the matching `ctf_os/resources/knowledge/playbooks/<playbook_category>.md` returned by intake (expanded categories safely use `misc.md`).
+1. Read root `AGENTS.md`, `contest.md`, the current `output/<contest>/TRIAGE.md`, `ctf_os/resources/agent-policy.md`, and the matching `ctf_os/resources/knowledge/playbooks/<playbook_category>.md` returned by intake (expanded categories safely use `misc.md`).
 2. Run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<name>'`.
-3. Stop on a stale/missing intake index, BLOCKED context, or ambiguous selector. Show candidates instead of choosing one.
+3. Stop on a stale/missing intake or Challenge Triage index, BLOCKED context, or ambiguous selector. Show candidates instead of choosing one.
 4. Start with the compact prepare result, `CONTEXT.md`, `STATE.json`, compact `FINDINGS.md`, and priority files. Treat `read_on_demand`, the full file inventory, `evidence.log`, and worker artifacts as indexes: open only the item needed to validate a specific claim. Never preload raw logs.
 
 ## Adaptive race

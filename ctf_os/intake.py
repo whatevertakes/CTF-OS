@@ -19,6 +19,7 @@ from .archive import ArchiveError, ArchiveLimits, bounded_source_files, copy_tre
 from .contest import ChallengeSpec, ContestManifest, discover_contests, select_contest
 from .problems import sync_contest_manifest
 from .sandbox.network import parse_remotes
+from .triage import invalidate_triage_outputs
 from .workspace import atomic_json, atomic_text, bind_input_fingerprint, challenge_root
 
 
@@ -45,6 +46,7 @@ def run_intake(repo: str | Path, contest_selector: str | None = None) -> dict[st
         },
     }
     contest_output = root / "output" / manifest.slug
+    invalidate_triage_outputs(root, manifest)
     atomic_json(contest_output / "intake.json", payload)
     atomic_text(contest_output / "INTAKE.md", render_intake_markdown(payload))
     return payload
@@ -147,7 +149,7 @@ def _materialize(destination: Path, challenge: ChallengeSpec, sources: list[Path
                 if lower.endswith((".7z", ".rar")):
                     raise ArchiveError(f"{source.name}: safe built-in extraction is unavailable; unpack it into a named directory")
                 members = extract_archive(source, staging, limits)
-                archives.append({"path": str(source), "sha256": _sha256(source), "members": members, "extracted": True})
+                archives.append({"path": str(source), "sha256": _sha256(source), "size": source.stat().st_size, "members": members, "extracted": True})
             prepared_tree_fingerprint(staging)
         _make_read_only(staging)
         old = destination / ".old-input"
@@ -211,7 +213,7 @@ def prepared_tree_fingerprint(root: Path) -> str:
 
 
 def _archive_metadata(sources: list[Path]) -> list[dict[str, object]]:
-    return [{"path": str(path), "sha256": _sha256(path), "extracted": True} for path in sources if path.is_file()]
+    return [{"path": str(path), "sha256": _sha256(path), "size": path.stat().st_size, "extracted": True} for path in sources if path.is_file()]
 
 
 def _regular_files(root: Path) -> list[Path]:
