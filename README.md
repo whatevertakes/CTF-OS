@@ -26,6 +26,10 @@ uv run python -m ctf_os.agent_tools doctor
 - `sandbox/build-images.sh` — 문제 유형별 격리 Docker 이미지를 로컬에 미리 빌드합니다. 처음에는 다소 오래 걸릴 수 있습니다.
 - `uv run python -m ctf_os.agent_tools doctor` — Python, Docker, 이미지 등 CTF-OS 실행 환경이 준비됐는지 점검합니다. 오류가 있으면 대회를 시작하기 전에 해결합니다.
 
+`sandbox/build-images.sh`는 공개 base image를 받는 동안 임시 빈 Docker 인증 설정을 자동으로 사용합니다. 따라서 Docker Desktop/WSL의 credential helper 세션이 끊겨 있어도 호스트의 `~/.docker/config.json`을 수정하지 않고 빌드하며, 임시 설정은 종료할 때 삭제합니다. 별도의 Docker 설정이 꼭 필요하면 `DOCKER_CONFIG=/path/to/config sandbox/build-images.sh`처럼 명시하면 그 설정을 그대로 사용합니다.
+
+그래도 일반 `docker pull`에서 `error getting credentials` 또는 `A specified logon session does not exist`가 발생하면 Docker Desktop을 재시작하거나 Docker Hub 로그인을 다시 설정합니다. 이 조치는 CTF-OS 빌드가 아니라 호스트 Docker의 credential helper 세션을 복구하기 위한 것입니다.
+
 준비가 끝나면 대회 파일을 `incoming/<contest>/` 아래에 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
 
 ```text
