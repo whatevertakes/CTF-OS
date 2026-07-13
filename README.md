@@ -2,6 +2,29 @@
 
 CTF-OS는 사용자가 직접 연 Sol 세션을 위한 로컬 CTF 분석 도구입니다. Python은 `contest.md` 파싱, 안전한 문제 준비, sandbox/service lifecycle, evidence, replay, flag 검증과 내부 eval만 담당하며 Codex나 다른 모델을 실행하지 않습니다.
 
+## 시작 전 준비 (특히 Docker 오류 방지)
+
+아래를 먼저 맞춘 뒤 clone과 설치를 진행하세요. CTF-OS는 **실행 중인 Docker daemon**, **Docker Compose v2**, 외부 공개 이미지 다운로드 권한을 사용합니다. Docker-in-Docker는 사용하지 않습니다.
+
+- **운영체제/가상화:** Linux를 권장합니다. Windows는 Docker Desktop을 설치하고 WSL 2 backend와 사용하는 WSL 배포판 integration을 켭니다. macOS/Windows에서는 Docker Desktop이 실행 중이어야 합니다. BIOS/UEFI에서 가상화가 꺼져 있으면 WSL2·Docker가 정상 동작하지 않습니다.
+- **Docker 권한:** Linux에서는 현재 사용자가 Docker socket에 접근할 수 있어야 합니다. `docker info`가 `permission denied`라면 Docker를 설치·기동한 뒤 `sudo usermod -aG docker "$USER"`를 실행하고, 로그아웃/로그인(또는 새 셸 세션) 후 다시 확인합니다. 매 명령에 `sudo docker`를 붙이는 방식은 피하세요.
+- **필수 도구:** `git`, Python 3.11 이상, `uv`, Docker Engine 또는 Docker Desktop, Docker Compose v2(`docker compose`)를 준비합니다. 예전 독립형 `docker-compose` 명령만 있는 환경은 지원하지 않습니다.
+- **자원:** 이미지와 분석 산출물을 위해 디스크 여유 공간 **최소 10GiB**, Docker에 할당된 사용 가능 메모리 **최소 2GiB**가 필요합니다. forensic/rev/여러 sandbox를 함께 쓸 계획이면 더 넉넉한 메모리를 권장합니다.
+- **네트워크/회사 프록시:** 최초 이미지 빌드에는 Docker Hub 등 공개 base image registry로 HTTPS(443) 연결이 필요합니다. 프록시·방화벽 환경이라면 Docker daemon/Desktop에도 프록시와 인증서를 설정해야 합니다. 브라우저나 셸의 프록시 설정만으로는 충분하지 않을 수 있습니다.
+
+clone하기 전에 아래 명령이 모두 성공하는지 확인합니다. 마지막 명령은 공개 image pull과 컨테이너 실행이 가능한지 확인하며, 종료 후 자동으로 삭제됩니다.
+
+```bash
+git --version
+python3 --version
+uv --version
+docker info
+docker compose version
+docker run --rm hello-world
+```
+
+`Cannot connect to the Docker daemon`은 Docker Engine/Desktop이 꺼진 상태이고, `permission denied while trying to connect to the Docker daemon socket`은 Linux Docker 권한 문제입니다. `docker compose: command not found`는 Compose v2 설치 또는 Docker Desktop/Engine 업데이트가 필요합니다. `no space left on device`가 나오면 Docker Desktop의 disk image 또는 호스트 디스크 공간을 먼저 확보하세요.
+
 ## 처음 시작하기
 
 이 저장소는 SSH 키가 이 private repository에 연결되어 있다는 전제입니다. HTTPS 주소 대신 아래 SSH 주소로 clone합니다.
