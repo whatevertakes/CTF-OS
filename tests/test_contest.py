@@ -91,6 +91,21 @@ def test_empty_manifest_and_html_comment_examples_do_not_create_challenges(repo:
     assert manifest.challenges == ()
 
 
+def test_fenced_markdown_examples_do_not_create_challenges(repo: Path) -> None:
+    path = write_contest(repo, """# Demo CTF
+
+```markdown
+### pwn/Example
+- 설명: this is documentation, not a challenge
+```
+""")
+
+    manifest = parse_contest(path)
+
+    assert manifest.name == "Demo CTF"
+    assert manifest.challenges == ()
+
+
 @pytest.mark.parametrize("category", ["mobile", "osint", "hardware", "blockchain", "jail", "windows", "ai"])
 def test_extended_categories_use_generic_playbook_without_being_blocked(repo: Path, category: str) -> None:
     manifest = parse_contest(write_contest(repo, f"# Demo CTF\n### {category}/X\n"))

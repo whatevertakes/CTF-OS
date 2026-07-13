@@ -67,19 +67,20 @@ def _ensure_directory(path: Path) -> None:
 def _contest_template(contest_name: str) -> str:
     lines = [
         f"# 대회명: {contest_name}",
-        "- 날짜: YYYY-MM-DD",
-        "- 플래그 형식: FLAG{...}",
+        "",
+        "- 날짜: 2026-01-01",
+        "- 플래그 형식: CTF{...}",
         "- 입력 프로필: standard",
         "",
-        "<!--",
-        "이 블록은 파서가 무시하는 등록 템플릿입니다.",
-        "실제 문제는 필요한 카드를 복사해 이 주석 블록 밖에 붙여 넣으세요.",
+        "## 문제 등록 카드",
+        "",
+        "날짜와 플래그 형식은 실제 값으로 바꾸세요. 아래 카드를 복사해 이 문서의 원하는 위치에 붙여 넣으면 됩니다.",
         "문제 파일은 incoming/<대회명>/<카테고리>/<문제명>/ 아래에 둡니다.",
         "원격이 없는 문제는 '- 원격:' 줄을 삭제하세요.",
         "",
     ]
     for category in DEFAULT_CATEGORIES:
-        lines.append(f"## {category} 등록 카드 (최대 {_SLOT_COUNT}개 예시)")
+        lines.extend([f"### {category} 등록 카드", "", "```markdown"])
         for number in range(1, _SLOT_COUNT + 1):
             lines.extend([
                 f"### {category}/문제명-{number}",
@@ -87,12 +88,15 @@ def _contest_template(contest_name: str) -> str:
                 "- 원격: nc host.example 31337",
                 "",
             ])
+        lines.extend(["```", ""])
     lines.extend([
-        "## 추가 문제 복사용 카드",
+        "### 추가 문제 복사용 카드",
+        "",
+        "```markdown",
         "### 카테고리/문제명",
         "- 설명: 문제 원문 설명",
         "- 원격: nc host.example 31337",
-        "-->",
+        "```",
         "",
     ])
     return "\n".join(lines)

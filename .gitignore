@@ -10,10 +10,9 @@ build/
 dist/
 *.egg-info/
 
-# Generated intake/solve state. Keep only scaffold placeholders in Git.
-incoming/*
+# Generated intake/solve state and user-supplied contest inputs.
+incoming/
 output/*
-!incoming/.gitkeep
 !output/.gitkeep
 *.db
 *.sqlite
