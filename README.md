@@ -56,10 +56,10 @@ uv run python -m ctf_os.agent_tools doctor
 준비가 끝나면 아래 한 줄로 `incoming/<contest>/` 아래에 기본 카테고리 폴더(`pwn`, `rev`, `web`, `forensic`, `misc`, `crypto`)와 `contest.md`를 생성합니다. 기존 `contest.md`는 명령을 다시 실행해도 덮어쓰지 않습니다.
 
 ```bash
-uv run python -m ctf_os.agent_tools init-contest "SCA"
+uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
 ```
 
-생성된 카테고리 폴더에 문제 파일을 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
+마지막 인자인 `"My CTF 2026"`만 실제 대회명으로 바꾸면 해당 이름으로 폴더와 manifest 제목이 만들어집니다. 생성된 카테고리 폴더에 문제 파일을 넣고 `contest.md`를 작성합니다. 이어서 Sol 세션에 **“intake 해라”**라고 요청해 전체 문제 목록을 준비하고, 새 Sol 세션에서 **“N번 문제 풀어라”**라고 요청해 한 문제씩 풉니다.
 
 ```text
 문제 파일과 contest.md 작성
@@ -72,9 +72,9 @@ uv run python -m ctf_os.agent_tools init-contest "SCA"
 사용자 설정은 `incoming/<contest>/contest.md` 하나뿐입니다. `pwn`, `web`, `rev`, `crypto`, `forensic`, `misc`, `cloud` 외에 `mobile`, `osint`, `hardware`, `blockchain`, `jail`, `windows`, `ai`도 안전한 generic playbook으로 intake됩니다.
 
 ```markdown
-# 대회명: SCA CTF 2026
+# 대회명: My CTF 2026
 - 날짜: 2026-07-19
-- 플래그 형식: SCA{...}
+- 플래그 형식: MYCTF{...}
 - 입력 프로필: standard
 
 ### pwn/NBB

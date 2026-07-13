@@ -26,8 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m ctf_os.agent_tools", description="Internal JSON tools for the active Sol session")
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
-    init_contest = commands.add_parser("init-contest")
-    init_contest.add_argument("name")
+    init_contest = commands.add_parser(
+        "init-contest",
+        help="create an incoming contest workspace",
+        description="Create a contest workspace using the contest name supplied by the user.",
+    )
+    init_contest.add_argument(
+        "name",
+        metavar="CONTEST_NAME",
+        help="contest directory and manifest name (for example: 'My CTF 2026')",
+    )
     inspect = commands.add_parser("inspect-contest")
     inspect.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     inspect.add_argument("--contest")
