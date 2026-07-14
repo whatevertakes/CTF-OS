@@ -251,11 +251,15 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
 def execute(
     metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str = "docker",
     session_id: str | None = None, session_role: str | None = None,
+    timeout_profile: str | None = None, retain_on_timeout: bool | None = None,
 ) -> dict[str, object]:
     _authorize_sandbox(metadata, session_id, session_role, "execute")
     branch_root = Path(str(metadata["branch_root"])).resolve()
     with _sandbox_lock(branch_root):
-        return _execute_locked(metadata, command, timeout, docker=docker)
+        return _execute_locked(
+            metadata, command, timeout, docker=docker,
+            timeout_profile=timeout_profile, retain_on_timeout=retain_on_timeout,
+        )
 
 
 def probe_service_connectivity(metadata: dict[str, object], *, docker: str = "docker") -> dict[str, object]:
@@ -291,19 +295,59 @@ def _endpoint_host_port(endpoint: str) -> tuple[str, int]:
     raise SandboxError(f"managed service endpoint has no host and port: {endpoint}")
 
 
-def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str) -> dict[str, object]:
+def _execute_locked(
+    metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str,
+    timeout_profile: str | None = None, retain_on_timeout: bool | None = None,
+) -> dict[str, object]:
     if not command or timeout < 1 or timeout > 1800:
         raise SandboxError("command is required and timeout must be between 1 and 1800 seconds")
     name = _metadata_name(metadata)
     branch_root = Path(str(metadata["branch_root"])).resolve()
+    prior_timeout = branch_root / "timeout-receipt.json"
+    if prior_timeout.is_file() and not prior_timeout.is_symlink():
+        try:
+            prior = json.loads(prior_timeout.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SandboxError("retained timeout receipt is malformed") from exc
+        if prior.get("status") == "TIMED_OUT_RETAINED":
+            prior_pgid = str(prior.get("exec_process_group_id") or "")
+            if prior_pgid.isdigit():
+                remaining = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
+            else:
+                raise SandboxError("retained timeout lacks a process-group receipt; Sol cleanup is required")
+            if remaining.stdout.split():
+                _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "kill -KILL -\"$1\" 2>/dev/null || true", "sh", prior_pgid], timeout=15)
+                checked = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
+                if checked.stdout.split():
+                    raise SandboxError("retained sandbox still has orphan worker processes; Sol cleanup is required")
+    execution_id = hashlib.sha256(f"{_utc_now()}:{os.getpid()}:{list(command)}".encode()).hexdigest()[:16]
+    pid_file = f"/tmp/ctf-os-exec-{execution_id}.pid"
     argv = [docker, "exec", "--user", "1001:1001", "--workdir", "/work"]
     for key, value in _metadata_allocation_env(metadata).items():
         argv.extend(["--env", f"{key}={value}"])
-    argv.extend([name, *command])
+    argv.extend([
+        name, "sh", "-c", "umask 077; echo $$ >\"$1\"; shift; exec setsid \"$@\"",
+        "ctf-os-exec", pid_file, *command,
+    ])
     before = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
     result = _run(argv, timeout=timeout)
     after = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") and result.returncode != 124 else None
-    cleanup_record = _cleanup_locked(metadata, docker=docker) if result.returncode == 124 else None
+    from ..timeouts import retain_sandbox_on_timeout
+    retained = result.returncode == 124 and retain_sandbox_on_timeout(timeout_profile, retain_on_timeout)
+    orphan_check = None
+    process_group_id = None
+    if retained:
+        pid_result = _run([docker, "exec", "--user", "0:0", name, "cat", pid_file], timeout=15)
+        process_group_id = pid_result.stdout.strip() if pid_result.returncode == 0 and pid_result.stdout.strip().isdigit() else None
+        if process_group_id:
+            terminated = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "kill -TERM -\"$1\" 2>/dev/null || true; sleep 1; kill -KILL -\"$1\" 2>/dev/null || true", "sh", process_group_id], timeout=15)
+            orphan_check = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", process_group_id], timeout=15)
+        else:
+            terminated = subprocess.CompletedProcess([], 1, "", "missing process group receipt")
+            orphan_check = subprocess.CompletedProcess([], 1, "", "missing process group receipt")
+        orphan_check = {"termination_exit_code": terminated.returncode, "remaining_pids": orphan_check.stdout.split()}
+    cleanup_record = _cleanup_locked(metadata, docker=docker) if result.returncode == 124 and not retained else None
+    timeout_status = "TIMED_OUT_RETAINED" if retained else "TIMED_OUT_CLEANED" if result.returncode == 124 else None
     record = {
         "command": list(command), "exit_code": result.returncode,
         "timed_out": result.returncode == 124, "stdout": result.stdout[-64_000:],
@@ -316,12 +360,33 @@ def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout
             and after["established_packets"] > before["established_packets"]
         ),
         "artifacts_exported": bool(cleanup_record and cleanup_record.get("artifact_export")),
+        "timeout_profile": timeout_profile, "timeout_status": timeout_status,
+        "container_retained": retained,
+        "exec_process_group_id": process_group_id,
     }
+    if orphan_check is not None:
+        record["orphan_process_check"] = orphan_check
     if cleanup_record is not None:
         record["cleanup"] = cleanup_record
     challenge_root = branch_root.parents[1]
     append_evidence(branch_root / "logs" / "commands.jsonl", "sandbox_exec", record)
     append_evidence(challenge_root / "evidence.log", "sandbox_exec", {"branch": metadata["branch"], **record})
+    if timeout_status:
+        receipt = branch_root / "timeout-receipt.json"
+        _write_json(receipt, {
+            "schema_version": 1, "status": timeout_status, "profile": timeout_profile,
+            "command": list(command), "container": name, "recorded_at": _utc_now(),
+            "retention_ttl_seconds": int(metadata.get("timeout_retention_ttl_seconds", 21600)),
+            "orphan_process_check": orphan_check,
+            "exec_process_group_id": process_group_id,
+        })
+        progress_dir = branch_root / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(progress_dir / "timeout-checkpoint.json", {
+            "schema_version": 1, "type": "TIMEOUT_CHECKPOINT", "status": timeout_status,
+            "profile": timeout_profile, "command": list(command), "recorded_at": _utc_now(),
+            "next_action": "continue a bounded slice in this sandbox" if retained else "recreate the sandbox before retry",
+        })
     return record
 
 

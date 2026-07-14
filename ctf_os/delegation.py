@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import hashlib
 from pathlib import Path
 import re
 from typing import Any
@@ -23,8 +24,9 @@ from .workspace import atomic_json, state_lock
 
 PLAN_SCHEMA_VERSION = 1
 BRANCH_STATUSES = frozenset({
-    "PLANNED", "ADMITTED", "RUNNING", "CHECKPOINTED", "SUPPORTED", "REFUTED",
-    "PARTIAL", "INCONCLUSIVE", "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE",
+    "PLANNED", "ADMITTED", "AWAITING_NATIVE_START", "RUNNING", "CHECKPOINTED",
+    "COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE",
+    "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE",
 })
 ADMISSION_EXCEPTIONS = frozenset({
     "independent-verification", "clean-room-verifier", "clean-room-verification",
@@ -263,11 +265,19 @@ def update_branch(
         if len(matches) != 1:
             raise DelegationError(f"unknown branch session_id: {session_id}")
         branch = matches[0]
+        if status == "RUNNING" and branch.get("native_delegation_required") and not branch.get("start_receipt"):
+            raise DelegationError("RUNNING requires a native start receipt; use branch-start-confirm")
+        terminal_statuses = {"COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE", "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE"}
+        if status in terminal_statuses and branch.get("native_delegation_required"):
+            result_path = solve_root / "workers" / session_id / "result.json"
+            checkpoint_dir = solve_root / "workers" / session_id / "checkpoints"
+            if not result_path.is_file() and not any(checkpoint_dir.glob("*.json")):
+                raise DelegationError("terminal branch requires result.json or a compact terminal checkpoint")
         branch["status"] = status
         now = utc_now()
         if status == "RUNNING" and branch["started_at"] is None:
             branch["started_at"] = now
-        if status in {"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE"}:
+        if status in terminal_statuses:
             branch["finished_at"] = now
         if observed_runtime_model is not None:
             branch["observed_runtime_model"] = _short(observed_runtime_model, "observed_runtime_model")
@@ -285,7 +295,119 @@ def update_branch(
             branch["pinning_verified"] = False
         plan["updated_at"] = now
         atomic_json(plan_path(solve_root), plan)
+    if status in terminal_statuses:
+        from .transitions import evaluate_race_transition
+        branch["race_transition"] = evaluate_race_transition(
+            solve_root, {"type": "BRANCH_TERMINAL", "event_id": f"{session_id}:{status}:{now}"},
+            session_id, input_fingerprint,
+        )
     return branch
+
+
+def prepare_branch_replacement(
+    solve_root: Path, *, input_fingerprint: str, superseded_branch_id: str,
+    candidate: BranchCandidate, kill_reason: str, distinct_mechanism_proof: str,
+    evidence_contract: Sequence[str], success_condition: str, kill_condition: str,
+    maximum_steps: int, budget_seconds: int, requested_model_role: str,
+    requested_reasoning: str,
+) -> dict[str, Any]:
+    """Atomically admit/register a replacement and persist its prompt intent."""
+    if not isinstance(maximum_steps, int) or not 1 <= maximum_steps <= 10000:
+        raise DelegationError("maximum_steps must be between 1 and 10000")
+    if not isinstance(budget_seconds, int) or not 1 <= budget_seconds <= 86400:
+        raise DelegationError("budget_seconds must be between 1 and 86400")
+    if not distinct_mechanism_proof.strip():
+        raise DelegationError("replacement requires distinct mechanism proof")
+    with state_lock(solve_root):
+        plan = _load_current_unlocked(solve_root, input_fingerprint)
+        old = next((row for row in plan["branches"] if row.get("session_id") == superseded_branch_id), None)
+        if old is None:
+            raise DelegationError("superseded branch does not exist")
+        if str(old.get("hypothesis_family", "")).casefold() == candidate.hypothesis_family.casefold():
+            raise DelegationError("replacement must use a genuinely different hypothesis family")
+        admission = admit_branch(plan, candidate, purpose="alternate-attack-family")
+        if not admission["admitted"]:
+            raise DelegationError(f"replacement admission denied: {admission['reason']}")
+        now = utc_now()
+        request_id = hashlib.sha256(f"{superseded_branch_id}:{candidate.session_id}:{now}".encode()).hexdigest()[:24]
+        prompt = {
+            "session_id": candidate.session_id, "parent_session_id": plan["parent_session_id"],
+            "challenge_id": plan["challenge_id"], "input_fingerprint": input_fingerprint,
+            "hypothesis_family": candidate.hypothesis_family, "hypothesis": candidate.hypothesis,
+            "objective": "Run a distinct decisive exploit experiment; then minimal PoC and declared remote",
+            "kill_reason": kill_reason, "distinct_mechanism_proof": distinct_mechanism_proof,
+        }
+        branch = {
+            **_candidate_dict(candidate), "evidence_contract": _string_list(evidence_contract, "evidence_contract", maximum=32),
+            "success_condition": _bounded(success_condition, "success_condition", 2000),
+            "kill_condition": _bounded(kill_condition, "kill_condition", 2000),
+            "maximum_steps": maximum_steps, "budget_seconds": budget_seconds,
+            "requested_model_role": _short(requested_model_role, "requested_model_role"),
+            "requested_reasoning": _short(requested_reasoning, "requested_reasoning"),
+            "observed_runtime_model": None, "observed_reasoning": None,
+            "runtime_observation_evidence": None, "pinning_verified": False,
+            "independent_verification": False, "purpose": "alternate-attack-family",
+            "admission": admission, "status": "AWAITING_NATIVE_START",
+            "created_at": now, "started_at": None, "finished_at": None,
+            "replacement_request_id": request_id, "superseded_branch_id": superseded_branch_id,
+            "kill_reason": _bounded(kill_reason, "kill_reason", 2000),
+            "distinct_mechanism_proof": _bounded(distinct_mechanism_proof, "distinct_mechanism_proof", 2000),
+            "prompt_packet": prompt, "native_delegation_required": True,
+            "expected_start_receipt": True,
+            "expected_sandbox_identity": f"workers/{candidate.session_id}/sandbox.json",
+            "start_receipt": None,
+        }
+        old["status"] = "REPLACED"; old["replacement_request_id"] = request_id; old["finished_at"] = now
+        plan["branches"].append(branch)
+        record = {
+            "replacement_request_id": request_id, "superseded_branch_id": superseded_branch_id,
+            "kill_reason": kill_reason, "new_session_id": candidate.session_id,
+            "new_hypothesis_family": candidate.hypothesis_family,
+            "distinct_mechanism_proof": distinct_mechanism_proof, "admission_decision": admission,
+            "branch_registration": True, "prompt_packet": prompt,
+            "native_delegation_required": True, "expected_start_receipt": True,
+            "expected_sandbox_identity": branch["expected_sandbox_identity"], "created_at": now,
+        }
+        plan.setdefault("admission_decisions", []).append({
+            "session_id": candidate.session_id, "candidate": _candidate_dict(candidate),
+            "purpose": "alternate-attack-family", "race_override_reason": None,
+            "evaluated_at": now, "result": admission, "replacement_request_id": request_id,
+        })
+        plan.setdefault("replacement_requests", []).append(record)
+        plan["updated_at"] = now
+        atomic_json(plan_path(solve_root), plan)
+    return record
+
+
+def confirm_branch_start(
+    solve_root: Path, *, input_fingerprint: str, replacement_request_id: str,
+    session_id: str, native_session_observed: str, runtime_observation_evidence: str,
+    sandbox_metadata_path: str,
+) -> dict[str, Any]:
+    if not all(str(value).strip() for value in (native_session_observed, runtime_observation_evidence, sandbox_metadata_path)):
+        raise DelegationError("branch start confirmation requires native, runtime, and sandbox evidence")
+    with state_lock(solve_root):
+        plan = _load_current_unlocked(solve_root, input_fingerprint)
+        branch = next((row for row in plan["branches"] if row.get("session_id") == session_id and row.get("replacement_request_id") == replacement_request_id), None)
+        if branch is None:
+            raise DelegationError("replacement request and session do not match")
+        expected = solve_root / str(branch.get("expected_sandbox_identity"))
+        supplied = Path(sandbox_metadata_path)
+        if not supplied.is_absolute(): supplied = solve_root / supplied
+        if supplied.resolve() != expected.resolve():
+            raise DelegationError("sandbox metadata path does not match expected sandbox identity")
+        if supplied.is_symlink() or not supplied.is_file():
+            raise DelegationError("sandbox metadata path is missing or unsafe")
+        receipt = {
+            "replacement_request_id": replacement_request_id, "session_id": session_id,
+            "native_session_observed": native_session_observed,
+            "runtime_observation_evidence": runtime_observation_evidence,
+            "sandbox_metadata_path": str(supplied), "started_at": utc_now(),
+        }
+        branch["start_receipt"] = receipt; branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
+        plan.setdefault("branch_start_receipts", []).append(receipt)
+        plan["updated_at"] = utc_now(); atomic_json(plan_path(solve_root), plan)
+    return receipt
 
 
 def load_templates(path: Path) -> dict[str, Any]:
@@ -344,7 +466,7 @@ def branch_utility(
         return {"session_id": session_id, "utility_score": None, "classification": "INSUFFICIENT_DATA", "recommendation": "Collect a bounded checkpoint or worker result before judging utility", "metrics": {}}
     counts = {name: 0 for name in (
         "supported_facts", "exploit_relevant_facts", "useful_artifacts",
-        "documentation_artifacts", "exploit_primitives", "flag_candidates",
+        "documentation_artifacts", "primitive_candidates", "exploit_primitives", "refuted_primitives", "flag_candidates",
         "rejected_hypotheses", "repeated_failures", "policy_violations",
         "repeated_commands", "tool_failures", "sibling_insights", "family_changes",
         "decisive_experiment_count", "failed_decisive_experiments",
@@ -358,7 +480,8 @@ def branch_utility(
             proximity = item_proximity
             last_increase_index = index
         decisive = bool(str(item.get("decisive_experiment_performed") or "").strip()) or kind in {
-            "EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+            "EXPLOIT_PRIMITIVE", "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED",
+            "EXPLOIT_PRIMITIVE_REFUTED", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
         }
         if decisive:
             counts["decisive_experiment_count"] += 1
@@ -375,7 +498,9 @@ def branch_utility(
                 counts["documentation_artifacts"] += max(1, len(item.get("artifacts", [])))
         if kind == "WORKING_POC":
             counts["useful_artifacts"] += max(1, len(item.get("artifacts", [])))
-        if kind == "EXPLOIT_PRIMITIVE": counts["exploit_primitives"] += 1
+        if kind in {"EXPLOIT_PRIMITIVE", "EXPLOIT_PRIMITIVE_CANDIDATE"}: counts["primitive_candidates"] += 1
+        if kind == "EXPLOIT_PRIMITIVE_CONFIRMED": counts["exploit_primitives"] += 1
+        if kind == "EXPLOIT_PRIMITIVE_REFUTED": counts["refuted_primitives"] += 1
         if kind in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}: counts["flag_candidates"] += 1
         if kind == "REJECTED_HYPOTHESIS": counts["rejected_hypotheses"] += 1
         if kind == "BLOCKER": counts["repeated_failures"] += 1
@@ -397,11 +522,17 @@ def branch_utility(
         if result_poc: proximity = max(proximity, .82)
         if result_remote: proximity = max(proximity, .92)
         if result.get("flag_candidates"): proximity = 1.0
+    if counts["refuted_primitives"] and not any(
+        str(item.get("type") or "").upper() == "EXPLOIT_PRIMITIVE_CONFIRMED"
+        for item in relevant[max(index for index, item in enumerate(relevant) if str(item.get("type") or "").upper() == "EXPLOIT_PRIMITIVE_REFUTED") + 1:]
+    ):
+        proximity = 0.0
     overlap = float(branch.get("admission", {}).get("maximum_overlap_score", 0.0))
     elapsed_ratio = _elapsed_ratio(branch, now or datetime.now(timezone.utc))
     information_events = sum(
         str(item.get("type") or "").upper() in {
-            "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE",
+            "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "EXPLOIT_PRIMITIVE_CANDIDATE",
+            "EXPLOIT_PRIMITIVE_CONFIRMED", "EXPLOIT_PRIMITIVE_REFUTED",
             "ARTIFACT_READY", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
         }
         for item in relevant
@@ -430,7 +561,7 @@ def branch_utility(
     research_drift = bool(drift_reasons)
     score = round(
         100.0 * counts["flag_candidates"] + 60.0 * working_poc + 70.0 * remote_ready
-        + 30.0 * counts["exploit_primitives"] + 40.0 * proximity
+        + 30.0 * counts["exploit_primitives"] + 4.0 * counts["primitive_candidates"] + 40.0 * proximity
         + 3.0 * counts["decisive_experiment_count"] + 2.0 * counts["exploit_relevant_facts"]
         - 8.0 * counts["failed_decisive_experiments"] - 4.0 * counts["repeated_failures"]
         - 3.0 * counts["repeated_commands"] - 3.0 * counts["tool_failures"]
@@ -440,9 +571,11 @@ def branch_utility(
     )
     if counts["flag_candidates"] or remote_ready or working_poc:
         classification, recommendation = "FLAG_PATH", "Run the minimal exploit or solver against the declared remote now and surface the flag"
+    elif counts["primitive_candidates"] and not counts["exploit_primitives"] and not research_drift:
+        classification, recommendation = "BUMP_AND_RETRY", "Run the stated positive/negative control once to confirm or refute the primitive candidate"
     elif counts["policy_violations"]:
         classification, recommendation = "DEAD_BRANCH", "Stop the out-of-scope branch and reuse its slot"
-    elif research_drift and proximity >= .45:
+    elif counts["exploit_primitives"] and (research_drift or elapsed_ratio >= 1.0 or steps_since_increase > 2):
         classification, recommendation = "SOL_TAKEOVER", "Sol should take over the proven primitive and finish the minimal PoC"
     elif research_drift:
         classification, recommendation = "REPLACE_ATTACK_FAMILY", "Replace research drift with a distinct executable exploit mechanism"
@@ -492,12 +625,18 @@ def _checkpoint_proximity(item: Mapping[str, Any]) -> float:
     if kind in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}: return 1.0
     if item.get("remote_ready") is True: return max(explicit_value, .92)
     if kind == "WORKING_POC" or item.get("working_poc_present") is True: return max(explicit_value, .82)
-    if kind == "EXPLOIT_PRIMITIVE":
+    if kind in {"EXPLOIT_PRIMITIVE", "EXPLOIT_PRIMITIVE_CANDIDATE"}:
+        # Legacy primitive rows are deliberately candidate-grade.  Summary
+        # wording and an optimistic explicit score cannot confirm a primitive.
+        return min(max(explicit_value, .2), .35)
+    if kind == "EXPLOIT_PRIMITIVE_CONFIRMED":
         summary = str(item.get("summary") or "").casefold()
         if any(term in summary for term in ("code execution", "rce", "shell", "arbitrary write")): return max(explicit_value, .72)
         if any(term in summary for term in ("arbitrary read", "address leak", "data leak", "auth bypass", "logic bypass")): return max(explicit_value, .62)
         if any(term in summary for term in ("input control", "crash", "oracle", "rip control", "pc control")): return max(explicit_value, .52)
         return max(explicit_value, .5)
+    if kind == "EXPLOIT_PRIMITIVE_REFUTED":
+        return 0.0
     if kind == "SERVICE_CRASHED" and str(item.get("decisive_experiment_performed") or "").strip():
         return max(explicit_value, .52)
     if item.get("remote_interaction_proved_primitive") is True:
@@ -532,7 +671,7 @@ def _research_drift_reasons(
     )
     if tail_information >= 3:
         reasons.append("three information events without exploit-proximity increase")
-    if proximity >= .45 and sum(bool(item.get("repeated_command")) for item in tail) >= 2:
+    if proximity >= .5 and sum(bool(item.get("repeated_command")) for item in tail) >= 2:
         reasons.append("repeated command family after primitive confirmation")
     return reasons
 

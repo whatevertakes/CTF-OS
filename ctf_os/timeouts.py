@@ -10,6 +10,18 @@ class TimeoutProfileError(ValueError):
     pass
 
 
+RETAIN_BY_DEFAULT = frozenset({
+    "decompile", "symbolic_slice", "fuzz_slice", "forensic_scan",
+    "crypto_heavy", "cracking_slice", "ai_inference",
+})
+
+
+def retain_sandbox_on_timeout(profile: str | None, explicit: bool | None = None) -> bool:
+    if explicit is not None:
+        return explicit
+    return bool(profile and profile in RETAIN_BY_DEFAULT)
+
+
 def load_timeout_profiles(path: Path | None = None) -> dict[str, int]:
     source = path or Path(__file__).parent / "resources" / "timeout-profiles.yaml"
     if source.is_symlink() or not source.is_file():

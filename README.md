@@ -60,14 +60,17 @@ Sol은 coordinator로 대기하지 않고 core primitive reasoning, 어려운 ex
 uv run python -m ctf_os.agent_tools race-plan-start 1 --contest my-ctf --tier 2
 uv run python -m ctf_os.agent_tools race-board 1 --contest my-ctf
 uv run python -m ctf_os.agent_tools race-event-publish 1 --contest my-ctf \
-  --type EXPLOIT_PRIMITIVE --summary 'byte oracle confirmed' --priority HIGH
+  --type EXPLOIT_PRIMITIVE_CONFIRMED --summary 'byte oracle confirmed' --priority HIGH \
+  --primitive-json '{"claimed_capability":"byte oracle","positive_assertion_receipt":"positive.json","negative_control_assertion_receipt":"negative.json","observed_result":"target differs from control","success_condition_satisfied":true,"kill_condition_evaluated":true,"artifact_or_command_receipt":"python3 oracle.py --control","next_poc_linking_experiment":"recover one byte"}'
 uv run python -m ctf_os.agent_tools race-insight-packet 1 --contest my-ctf \
   --target-session-id race-3-independent-full-solve
 ```
 
 `race-plan-start`는 fingerprint, admission, branch record와 짧은 prompt packet을 원자적으로 기록할 뿐 child를 만들지 않습니다. Sol이 native delegation을 수행합니다. Admission overlap 0.95는 advisory이고 exact duplicate/repeated session ID만 거부합니다. Requested model/reasoning은 pinning 증거가 아닙니다.
 
-Checkpoint는 보고서가 아니라 현재 exploit action을 전달합니다: leading hypothesis, decisive experiment, observed result, exploit proximity, artifact, next action, kill/continue/promote. `REMOTE_FLAG_OBTAINED`, `FLAG_CANDIDATE`, `WORKING_POC`, `EXPLOIT_PRIMITIVE`는 summary보다 먼저 게시합니다. Supported fact, rejected hypothesis, decompilation, 일반 artifact의 수만 늘어나는 것은 progress가 아닙니다.
+Checkpoint는 보고서가 아니라 현재 exploit action을 전달합니다: leading hypothesis, decisive experiment, observed result, exploit proximity, artifact, next action, kill/continue/promote. Primitive는 `CANDIDATE`, `CONFIRMED`, `REFUTED`로 분리하며 candidate는 confirmed progress가 아닙니다. Confirmed primitive와 plateau 등 high-value transition은 utility sweep, duplicate/stalled 정리 recommendation, 필수 Sol takeover packet을 자동 생성합니다. Scheduler는 long-compute opt-in이고 timeout sandbox 보존은 profile에 따릅니다. Supported fact, rejected hypothesis, decompilation, 일반 artifact의 수만 늘어나는 것은 progress가 아닙니다.
+
+`sandbox-exec`의 canonical syntax는 `sandbox-exec --metadata workers/<branch>/sandbox.json --timeout-profile quick_probe --session-id <branch> -- <command...>`입니다. Legacy positional metadata는 읽지만, `--` 뒤의 CTF-OS control option은 container command로 넘기지 않고 실행 전에 오류로 차단합니다.
 
 ## Sandbox, service, resource
 

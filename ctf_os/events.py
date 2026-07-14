@@ -11,16 +11,18 @@ from pathlib import Path
 from typing import Any
 
 from .delegation import utc_now
+from .primitives import validate_primitive
 from .workspace import atomic_json, state_lock
 
 
 EVENT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
+    "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED", "EXPLOIT_PRIMITIVE_REFUTED",
     "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 PRIORITIES = frozenset({"LOW", "NORMAL", "HIGH", "CRITICAL"})
-HIGH_TYPES = frozenset({"FLAG_CANDIDATE", "WORKING_POC", "EXPLOIT_PRIMITIVE"})
+HIGH_TYPES = frozenset({"FLAG_CANDIDATE", "WORKING_POC", "EXPLOIT_PRIMITIVE_CONFIRMED"})
 CRITICAL_TYPES = frozenset({"REMOTE_FLAG_OBTAINED"})
 TERMINAL_BRANCH_STATES = frozenset({"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TERMINATED", "ERROR", "STALE"})
 
@@ -43,6 +45,7 @@ class RaceEvent:
     created_at: str
     input_fingerprint: str
     challenge_id: str
+    primitive: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +55,7 @@ class RaceEvent:
             "useful_for": list(self.useful_for), "recommended_action": self.recommended_action,
             "created_at": self.created_at, "input_fingerprint": self.input_fingerprint,
             "challenge_id": self.challenge_id,
+            "primitive": self.primitive,
         }
 
 
@@ -61,6 +65,7 @@ def publish_event(
     evidence: Sequence[str] = (), artifacts: Sequence[str] = (),
     useful_for: Sequence[str] = (), recommended_action: str = "",
     event_id: str | None = None,
+    primitive: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_type = event_type.strip().upper()
     if normalized_type not in EVENT_TYPES:
@@ -73,6 +78,7 @@ def publish_event(
     elif normalized_type in HIGH_TYPES and normalized_priority in {"LOW", "NORMAL"}:
         normalized_priority = "HIGH"
     created = utc_now()
+    primitive_record = validate_primitive(normalized_type, primitive, legacy_ok=True)
     material = {
         "session_id": _short(session_id, "session_id", 128),
         "type": normalized_type, "summary": _short(summary, "summary", 4000),
@@ -81,6 +87,7 @@ def publish_event(
         "recommended_action": recommended_action.strip()[:2000],
         "input_fingerprint": _short(input_fingerprint, "input_fingerprint", 256),
         "challenge_id": _short(challenge_id, "challenge_id", 256),
+        "primitive": primitive_record,
     }
     identifier = event_id or hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
@@ -102,6 +109,10 @@ def publish_event(
     # rebalance request and priority signal without touching native sessions.
     from .resources.scheduler import note_race_event
     note_race_event(root, result)
+    from .transitions import evaluate_race_transition
+    result["race_transition"] = evaluate_race_transition(
+        root, result, session_id, input_fingerprint,
+    )
     return result
 
 

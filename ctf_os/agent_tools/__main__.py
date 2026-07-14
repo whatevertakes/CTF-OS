@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from ..doctor import run_doctor
 from ..delegation import (
     BranchCandidate, add_branch, branch_utility, init_plan, load_plan,
     record_admission, template_recommendation, update_branch,
+    prepare_branch_replacement, confirm_branch_start,
 )
 from ..events import (
     acknowledge_event, insight_packet, operator_hints, publish_event,
@@ -42,6 +44,7 @@ from ..service import (
 )
 from ..triage import finalize_triage, prepare_triage, require_final_triage
 from ..timeouts import timeout_seconds
+from ..transitions import control_loop_tick
 from ..tui import resource_panel
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
 from ..worker import (
@@ -158,6 +161,21 @@ def build_parser() -> argparse.ArgumentParser:
         utility = commands.add_parser("branch-utility")
         utility.add_argument("selector"); utility.add_argument("--contest"); utility.add_argument("--session-id", required=True)
         utility.add_argument("--session-role", choices=("sol", "child"), default="sol"); utility.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main")); utility.add_argument("--recover-stale", action="store_true")
+        replacement = commands.add_parser("branch-replacement-prepare")
+        _add_branch_candidate_args(replacement)
+        replacement.add_argument("--superseded-branch-id", required=True)
+        replacement.add_argument("--kill-reason", required=True); replacement.add_argument("--distinct-mechanism-proof", required=True)
+        replacement.add_argument("--evidence-contract", action="append", required=True)
+        replacement.add_argument("--success-condition", required=True); replacement.add_argument("--kill-condition", required=True)
+        replacement.add_argument("--maximum-steps", type=int, required=True); replacement.add_argument("--budget-seconds", type=int, required=True)
+        replacement.add_argument("--requested-model-role", required=True); replacement.add_argument("--requested-reasoning", required=True)
+        _add_delegation_controller_args(replacement)
+        start_confirm = commands.add_parser("branch-start-confirm")
+        start_confirm.add_argument("selector"); start_confirm.add_argument("--contest")
+        start_confirm.add_argument("--replacement-request-id", required=True); start_confirm.add_argument("--session-id", required=True)
+        start_confirm.add_argument("--native-session-observed", required=True); start_confirm.add_argument("--runtime-observation-evidence", required=True)
+        start_confirm.add_argument("--sandbox-metadata-path", required=True)
+        start_confirm.add_argument("--session-role", choices=("sol",), default="sol"); start_confirm.add_argument("--parent-session-id", default="sol-main"); start_confirm.add_argument("--recover-stale", action="store_true")
     if not child_surface:
         sandbox_create = commands.add_parser("sandbox-create")
         sandbox_create.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
@@ -173,9 +191,10 @@ def build_parser() -> argparse.ArgumentParser:
         _add_session_args(sandbox_create, default_role="child")
     sandbox_exec = commands.add_parser("sandbox-exec")
     sandbox_exec.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sandbox_exec.add_argument("metadata")
+    sandbox_exec.add_argument("--metadata", dest="metadata_option")
     sandbox_exec.add_argument("--timeout", type=int, default=300)
     sandbox_exec.add_argument("--timeout-profile")
+    sandbox_exec.add_argument("--retain-on-timeout", action=argparse.BooleanOptionalAction, default=None)
     sandbox_exec.add_argument("argv", nargs=argparse.REMAINDER)
     _add_session_args(sandbox_exec)
     sandbox_cleanup = commands.add_parser("sandbox-cleanup")
@@ -220,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     event_publish.add_argument("--summary", required=True); event_publish.add_argument("--evidence", action="append", default=[])
     event_publish.add_argument("--artifact", action="append", default=[]); event_publish.add_argument("--useful-for", default="")
     event_publish.add_argument("--recommended-action", default=""); event_publish.add_argument("--event-id")
+    event_publish.add_argument("--primitive-json")
     _add_session_args(event_publish)
     events_show = commands.add_parser("race-events-show")
     events_show.add_argument("selector"); events_show.add_argument("--contest"); events_show.add_argument("--since")
@@ -291,6 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--repeated-command", action="store_true")
     checkpoint.add_argument("--sibling-insight-applied", action="store_true")
     checkpoint.add_argument("--hypothesis-family-changed", action="store_true")
+    checkpoint.add_argument("--primitive-json")
     _add_session_args(checkpoint, default_role="child")
     if not child_surface:
         worker_merge = commands.add_parser("worker-results-merge")
@@ -377,7 +398,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return _rebalance_contest(root, args.contest, apply=args.apply)
     if args.command == "sandbox-gc":
         _require_sol(args, "Only the parent Sol session may garbage-collect managed sandboxes.")
-        return sandbox_gc()
+        expired = _cleanup_expired_timeout_retention(root, args.parent_session_id)
+        result = sandbox_gc()
+        result["expired_timeout_retention"] = expired
+        return result
     if args.command == "inspect-contest":
         sync_contest_manifest(root, args.contest)
         contest = select_contest(discover_contests(root / "incoming"), args.contest)
@@ -403,15 +427,37 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             raise ValueError("--assessments-json must be valid JSON") from exc
         return finalize_triage(root, args.contest, assessments)
     if args.command == "sandbox-exec":
-        metadata = _load_metadata(root, args.metadata)
-        command = list(args.argv)
+        misplaced = {
+            "--timeout", "--timeout-profile", "--session-id", "--session-role",
+            "--parent-session-id", "--recover-stale", "--metadata",
+            "--retain-on-timeout", "--no-retain-on-timeout",
+        }
+        if any(token in misplaced for token in args.argv):
+            raise ValueError(
+                "Invalid sandbox-exec option placement. Place --timeout-profile, --session-id, "
+                "and other CTF-OS options before `--`. Everything after `--` is the container command."
+            )
+        raw_command = list(args.argv)
+        metadata_path = args.metadata_option
+        if metadata_path is None and raw_command and raw_command[0] != "--":
+            metadata_path = raw_command.pop(0)  # backward-compatible positional metadata
+        if not metadata_path:
+            raise ValueError("sandbox-exec requires --metadata before `--`")
+        metadata = _load_metadata(root, metadata_path)
+        command = raw_command
         if command and command[0] == "--":
             command.pop(0)
         session_id, role = _caller(args, metadata=metadata)
         timeout = timeout_seconds(args.timeout_profile) if args.timeout_profile else args.timeout
-        result = execute(metadata, command, timeout, session_id=session_id, session_role=role)
+        result = execute(
+            metadata, command, timeout, session_id=session_id, session_role=role,
+            timeout_profile=args.timeout_profile, retain_on_timeout=args.retain_on_timeout,
+        )
         if result["timed_out"]:
-            _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "TIMED_OUT", str(metadata["metadata_path"]))
+            _update_branch_state(
+                Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]),
+                str(result.get("timeout_status") or "TIMED_OUT_CLEANED"), str(metadata["metadata_path"]),
+            )
         return result
     if args.command == "sandbox-cleanup":
         metadata = _load_metadata(root, args.metadata)
@@ -460,10 +506,12 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             progress = json.loads(args.progress_json)
             if not isinstance(progress, dict):
                 raise ValueError("--progress-json must contain an object")
-        return ledger.update(session_id, actor_session_id=session_id, actor_role=role, changes={
+        result = ledger.update(session_id, actor_session_id=session_id, actor_role=role, changes={
             "priority": args.priority, "workload_class": args.workload_class,
             "parallelizable": args.parallelizable, "progress": progress, "state": args.state,
         })
+        result["race_transition"] = control_loop_tick(solve_root, input_fingerprint=current_fingerprint, session_id=session_id)
+        return result
     if args.command == "resource-release":
         session_id, role = _caller(args)
         if role == "child" and session_id != os.environ.get("CTF_OS_SESSION_ID"):
@@ -492,7 +540,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             sample = next((row for row in samples if row.get("container") == container), None)
             if sample is None:
                 raise ValueError("no Docker utilization sample found for the requested sandbox")
-        return ledger.sample(session_id, sample)
+        observation = ledger.sample(session_id, sample)
+        if observation.get("classification") in {"CPU_STARVED", "MEMORY_STARVED", "GPU_STARVED", "STALLED_COMPUTE"}:
+            observation["race_transition"] = control_loop_tick(solve_root, input_fingerprint=current_fingerprint, session_id=session_id)
+        return observation
     if args.command in {"resource-plan", "scheduler-rebalance"}:
         _require_sol(args, "Only the parent Sol session may plan or apply global allocations.")
         state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
@@ -514,9 +565,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             ledger.reconcile_apply(plan, plan["applied_resizes"])
         elif args.command == "scheduler-rebalance":
             plan["apply_required"] = True
+        plan["race_transition"] = control_loop_tick(solve_root, input_fingerprint=current_fingerprint, session_id=remote_session)
         return plan
     if args.command.startswith("delegation-") or args.command in {
-        "branch-admit", "branch-utility", "race-plan-start", "race-board",
+        "branch-admit", "branch-utility", "branch-replacement-prepare", "branch-start-confirm", "race-plan-start", "race-board",
     }:
         _require_delegation_sol(args)
         if args.command == "race-plan-start":
@@ -528,6 +580,11 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 tier=args.tier, tier_reason=args.tier_reason, branch_specs=specs,
                 threshold=args.threshold,
             )
+            state_path = solve_root / "STATE.json"
+            with state_lock(solve_root):
+                race_state = json.loads(state_path.read_text(encoding="utf-8"))
+                race_state["status"] = "RACE_RUNNING"; race_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                atomic_json(state_path, race_state)
             _seed_race_resources(
                 ledger, board, manifest.slug, challenge.id, challenge.category,
                 args.parent_session_id, int(record.get("total_size", 0)),
@@ -542,6 +599,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             )
             return board
         if args.command == "race-board":
+            transition = control_loop_tick(solve_root, input_fingerprint=current_fingerprint)
             plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
             state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
             events = show_events(solve_root, input_fingerprint=current_fingerprint)
@@ -550,7 +608,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 resources = resource_panel(capacity, ResourceLedger(solve_root).load())
             except Exception as exc:
                 resources = {"available": False, "reason": str(exc)}
-            return race_board(plan, state=state, events=events, resources=resources)
+            board = race_board(plan, state=state, events=events, resources=resources)
+            board["race_transition"] = transition
+            return board
         if args.command == "delegation-plan-init":
             return init_plan(solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint, parent_session_id=args.parent_session_id, tier=args.tier, tier_reason=args.tier_reason)
         if args.command == "delegation-plan-show":
@@ -616,6 +676,24 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                         actor_role="sol", changes=changes,
                     )
             return advice
+        if args.command == "branch-replacement-prepare":
+            return prepare_branch_replacement(
+                solve_root, input_fingerprint=current_fingerprint,
+                superseded_branch_id=args.superseded_branch_id, candidate=_candidate_from_args(args),
+                kill_reason=args.kill_reason, distinct_mechanism_proof=args.distinct_mechanism_proof,
+                evidence_contract=args.evidence_contract, success_condition=args.success_condition,
+                kill_condition=args.kill_condition, maximum_steps=args.maximum_steps,
+                budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role,
+                requested_reasoning=args.requested_reasoning,
+            )
+        if args.command == "branch-start-confirm":
+            return confirm_branch_start(
+                solve_root, input_fingerprint=current_fingerprint,
+                replacement_request_id=args.replacement_request_id, session_id=args.session_id,
+                native_session_observed=args.native_session_observed,
+                runtime_observation_evidence=args.runtime_observation_evidence,
+                sandbox_metadata_path=args.sandbox_metadata_path,
+            )
     if args.command.startswith("service-"):
         spec = _service_spec(manifest, challenge, record, solve_root)
         actor = _service_actor(args)
@@ -647,12 +725,16 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return operation(spec) if args.command == "branch-service-plan" else operation(spec, actor=actor)
     if args.command == "race-event-publish":
         session_id, _role = _caller(args)
+        primitive = json.loads(args.primitive_json) if args.primitive_json else None
+        if primitive is not None and not isinstance(primitive, dict):
+            raise ValueError("--primitive-json must be a JSON object")
         return publish_event(
             solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
             session_id=session_id, event_type=args.type, priority=args.priority,
             summary=args.summary, evidence=args.evidence, artifacts=args.artifact,
             useful_for=_csv(args.useful_for), recommended_action=args.recommended_action,
             event_id=args.event_id,
+            primitive=primitive,
         )
     if args.command == "race-events-show":
         return {"events": show_events(
@@ -902,6 +984,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             metadata = _load_metadata(root, str(sandbox_metadata))
             if metadata.get("session_id") != session_id or metadata.get("input_fingerprint") != current_fingerprint:
                 raise ValueError("worker checkpoint sandbox identity or input fingerprint is stale")
+        primitive = json.loads(args.primitive_json) if args.primitive_json else None
+        if primitive is not None and not isinstance(primitive, dict):
+            raise ValueError("--primitive-json must be a JSON object")
         return save_worker_checkpoint(
             worker_root, parent_session_id=args.parent_session_id, challenge_id=challenge.id,
             input_fingerprint=current_fingerprint, checkpoint_type=args.type, summary=args.summary,
@@ -916,6 +1001,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             repeated_command=args.repeated_command,
             sibling_insight_applied=args.sibling_insight_applied,
             hypothesis_family_changed=args.hypothesis_family_changed,
+            primitive=primitive,
         )
     if args.command == "worker-results-merge":
         _require_sol(args, "Only the parent Sol session may merge worker results.")
@@ -1248,6 +1334,32 @@ def _update_branch_state(solve_root: Path, branch: str, status: str, metadata_pa
         branches.append({"id": branch, "status": status, "metadata_path": metadata_path})
         state["branches"] = sorted(branches, key=lambda item: item["id"])
         atomic_json(path, state)
+
+
+def _cleanup_expired_timeout_retention(root: Path, sol_session_id: str) -> list[dict[str, object]]:
+    """Clean retained timeout sandboxes whose conservative TTL has expired."""
+    cleaned: list[dict[str, object]] = []
+    for receipt_path in sorted((root / "output").glob("**/workers/*/timeout-receipt.json")):
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            continue
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            recorded = datetime.fromisoformat(str(receipt["recorded_at"]).replace("Z", "+00:00"))
+            ttl = int(receipt.get("retention_ttl_seconds", 21600))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if receipt.get("status") != "TIMED_OUT_RETAINED" or ttl < 1:
+            continue
+        if (datetime.now(timezone.utc) - recorded).total_seconds() < ttl:
+            continue
+        metadata_path = receipt_path.parent / "sandbox.json"
+        try:
+            metadata = _load_metadata(root, str(metadata_path))
+            result = cleanup(metadata, session_id=sol_session_id, session_role="sol")
+            cleaned.append({"metadata": str(metadata_path), **result})
+        except Exception as exc:
+            cleaned.append({"metadata": str(metadata_path), "removed": False, "error": str(exc)})
+    return cleaned
 
 
 def _csv(value: str) -> list[str]:

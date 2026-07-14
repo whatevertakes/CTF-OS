@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from .workspace import atomic_json, state_lock
+from .primitives import validate_primitive
 
 
 WORKER_RESULT_SCHEMA_VERSION = 1
@@ -19,6 +20,7 @@ WORKER_STATUSES = frozenset({
 CONFIDENCE_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
 CHECKPOINT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
+    "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED", "EXPLOIT_PRIMITIVE_REFUTED",
     "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
@@ -52,6 +54,12 @@ def save_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dict[st
                 "mutations": forbidden_mutations,
             })
     atomic_json(_safe_result_path(worker_root), normalized)
+    from .transitions import evaluate_race_transition
+    evaluate_race_transition(
+        worker_root.resolve().parents[1],
+        {"type": "CHILD_TERMINAL_RESULT", "result_id": f"{normalized['session_id']}:{normalized['finished_at']}"},
+        normalized["session_id"], normalized["input_fingerprint"],
+    )
     return normalized
 
 
@@ -140,6 +148,7 @@ def save_worker_checkpoint(
     working_poc_present: bool = False, remote_ready: bool = False,
     research_drift_detected: bool = False, repeated_command: bool = False,
     sibling_insight_applied: bool = False, hypothesis_family_changed: bool = False,
+    primitive: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Save a compact exploit-action checkpoint without changing schema v1.
 
@@ -163,6 +172,7 @@ def save_worker_checkpoint(
     next_action = _limited_optional_text(next_exploit_action, "next_exploit_action", 1000)
     proximity = _proximity(exploit_proximity)
     normalized_decision = _checkpoint_decision(decision)
+    primitive_record = validate_primitive(checkpoint_type, primitive, legacy_ok=True)
     booleans = {
         "working_poc_present": working_poc_present, "remote_ready": remote_ready,
         "research_drift_detected": research_drift_detected, "repeated_command": repeated_command,
@@ -203,12 +213,15 @@ def save_worker_checkpoint(
             "observed_result": result_text, "exploit_proximity": proximity,
             "next_exploit_action": next_action, "decision": normalized_decision,
             **booleans,
+            "primitive": primitive_record,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         target = checkpoints / f"{sequence:06d}.json"
         if target.is_symlink() or target.exists():
             raise WorkerResultError("checkpoint sequence path already exists or is unsafe")
         atomic_json(target, payload)
+    from .transitions import maybe_evaluate_checkpoint
+    maybe_evaluate_checkpoint(solve_root, payload)
     return payload
 
 

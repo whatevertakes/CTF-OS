@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -514,13 +515,11 @@ def progress_present(progress: Mapping[str, Any] | None, samples: Sequence[Mappi
     if progress:
         if progress.get("repeated_error") or progress.get("busy_loop") or progress.get("deadlock"):
             return False
-        if progress.get("progressing") is True:
-            return True
         # Compute liveness and flag-path movement are useful.  Fact, evidence,
         # checkpoint, or generic artifact counts alone are deliberately not
         # progress: scaling those signals rewards research drift.
         indicators = (
-            "step", "generation", "candidate_score", "coverage", "exploit_primitives",
+            "step", "generation", "candidate_score", "coverage",
             "subprocess_completed", "solver_output_timestamp", "constraint_reduction",
             "exploit_proximity", "flag_proximity", "decisive_experiment_count",
             "working_poc_present", "remote_ready", "remote_interactions",
@@ -663,9 +662,18 @@ def plan_allocations(
             underutilized = classification in {"UNDERUTILIZED", "IDLE"}
             if broken or underutilized or not req.elastic:
                 continue
-            flag_or_compute = bool(obs.get("flag_path")) or (
-                progressing and (req.workload_class in COMPUTE_WORKLOADS or req.workload_class == "exploit-development" or req.session_id == "sol-main")
-            )
+            long_compute = req.workload_class in COMPUTE_WORKLOADS
+            scale_signal = (
+                classification in {"CPU_STARVED", "MEMORY_STARVED", "GPU_STARVED"}
+            ) or bool(
+                isinstance(obs.get("progress"), Mapping) and any(
+                    obs["progress"].get(key) not in (None, 0, 0.0, "", False)
+                    for key in ("constraint_reduction", "coverage", "generation", "candidate_score", "deterministic_extraction_progress")
+                )
+            ) or bool(obs.get("explicit_long_compute"))
+            if not long_compute or not scale_signal:
+                continue
+            flag_or_compute = bool(obs.get("flag_path")) or progressing
             if resource == "memory":
                 target = req.max_memory_bytes if progressing and classification == "MEMORY_STARVED" else req.preferred_memory_bytes
                 if flag_or_compute and progressing and req.workload_class in MEMORY_WORKLOADS:
@@ -906,6 +914,8 @@ class ResourceLedger:
                 session_id = str(result.get("session_id", ""))
                 action = actions.get(session_id)
                 if not action or result.get("applied"):
+                    if result.get("applied"):
+                        state["observations"].setdefault(session_id, {}).pop("resize_circuit", None)
                     continue
                 previous = action.get("from") if isinstance(action.get("from"), Mapping) else {}
                 if previous and previous.get("cpus") is not None and previous.get("memory_bytes") is not None:
@@ -915,33 +925,56 @@ class ResourceLedger:
                     state["allocations"][session_id] = allocation
                 else:
                     state["allocations"].pop(session_id, None)
+                reason = str(result.get("reason") or "unknown resize failure")
+                signature = hashlib.sha256(reason.encode()).hexdigest()[:16]
+                obs = state["observations"].setdefault(session_id, {})
+                circuit = dict(obs.get("resize_circuit") or {})
+                count = int(circuit.get("count", 0)) + 1 if circuit.get("signature") == signature else 1
+                obs["resize_circuit"] = {
+                    "signature": signature, "reason": reason if count == 1 else circuit.get("reason", reason),
+                    "count": count, "state": "RESIZE_CIRCUIT_OPEN" if count >= 2 else "CLOSED",
+                    "opened_at": utc_now() if count >= 2 else None,
+                }
             state["last_apply_results"] = [dict(item) for item in results]
             state["updated_at"] = utc_now()
             atomic_json(self.state_path, state)
         for result in results:
             if not result.get("applied"):
-                self.append_history("RESIZE_FAILURE", str(result.get("session_id", "")), dict(result))
+                session_id = str(result.get("session_id", ""))
+                circuit = self.load().get("observations", {}).get(session_id, {}).get("resize_circuit", {})
+                event = "RESIZE_CIRCUIT_OPEN" if circuit.get("state") == "RESIZE_CIRCUIT_OPEN" else "RESIZE_FAILURE"
+                self.append_history(event, session_id, dict(result) if event == "RESIZE_FAILURE" else {"failure_signature": circuit.get("signature"), "count": circuit.get("count")})
 
     @staticmethod
     def _plan_from_state(state: Mapping[str, Any], capacity: HostCapacity | Mapping[str, Any], *, tier: int | None, remote_flag_session: str | None) -> dict[str, Any]:
         requests = [ResourceRequest.from_mapping(raw) for raw in state["requests"].values()]
-        return plan_allocations(
+        plan = plan_allocations(
             requests, capacity, current=state["allocations"], observations=state["observations"],
             remote_flag_session=remote_flag_session or state.get("remote_flag_session"), tier=tier,
         )
+        open_sessions = {
+            sid for sid, obs in state.get("observations", {}).items()
+            if isinstance(obs, Mapping) and isinstance(obs.get("resize_circuit"), Mapping)
+            and obs["resize_circuit"].get("state") == "RESIZE_CIRCUIT_OPEN"
+        }
+        plan["resize_actions"] = [row for row in plan["resize_actions"] if row.get("session_id") not in open_sessions]
+        for sid in sorted(open_sessions):
+            plan["preemption_recommendations"].append({"action": "RESIZE_CIRCUIT_OPEN", "session_id": sid, "retry_requires": "config/permission change or Sol override"})
+        return plan
 
     def flag_event(self, event: Mapping[str, Any]) -> None:
         event_type = str(event.get("type", ""))
         session_id = str(event.get("session_id", ""))
         management_events = {
-            "BLOCKER", "EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE",
+            "BLOCKER", "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED",
+            "EXPLOIT_PRIMITIVE_REFUTED", "WORKING_POC", "FLAG_CANDIDATE",
             "REMOTE_FLAG_OBTAINED", "SERVICE_CRASHED",
         }
         if event_type not in management_events:
             return
         with state_lock(self.root):
             state = self.load()
-            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
+            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE_CONFIRMED", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
                 state["requests"][session_id]["priority"] = "CRITICAL" if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"} else "HIGH"
                 state["requests"][session_id]["updated_at"] = utc_now()
                 obs = state["observations"].setdefault(session_id, {})
@@ -949,13 +982,13 @@ class ResourceLedger:
                     obs["flag_path"] = True
                 if event_type == "REMOTE_FLAG_OBTAINED":
                     state["remote_flag_session"] = session_id
-            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
+            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE_CONFIRMED", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
                 obs = state["observations"].setdefault(session_id, {})
                 progress = dict(obs.get("progress") or {})
                 progress["progressing"] = True
                 progress["last_event_type"] = event_type
                 progress["last_event_at"] = utc_now()
-                if event_type == "EXPLOIT_PRIMITIVE":
+                if event_type == "EXPLOIT_PRIMITIVE_CONFIRMED":
                     progress["exploit_primitives"] = int(progress.get("exploit_primitives", 0)) + 1
                     progress["exploit_proximity"] = max(float(progress.get("exploit_proximity", 0) or 0), .5)
                 if event_type == "WORKING_POC":
@@ -965,6 +998,10 @@ class ResourceLedger:
                     progress["exploit_proximity"] = 1.0
                     progress["flag_proximity"] = 1.0
                 obs["progress"] = progress
+            if session_id in state["requests"] and event_type == "EXPLOIT_PRIMITIVE_REFUTED":
+                state["requests"][session_id]["priority"] = "LOW"
+                obs = state["observations"].setdefault(session_id, {})
+                obs["progress"] = {"progressing": False, "exploit_proximity": 0.0, "primitive_refuted": True}
             state["rebalance_required"] = True
             state["rebalance_reason"] = f"race event {event_type}"
             state["updated_at"] = utc_now()

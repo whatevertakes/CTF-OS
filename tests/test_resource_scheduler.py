@@ -127,7 +127,7 @@ def test_progressing_lead_takes_idle_static_cpu() -> None:
         "dynamic-1": {"classification": "SATURATED", "progress": {"checkpoint": 1}},
     }
     plan = plan_allocations(requests, _capacity(), observations=observations)
-    assert plan["allocations"]["sol-main"]["cpus"] == 7
+    assert plan["allocations"]["sol-main"]["cpus"] == 4
     assert plan["allocations"]["static-1"]["cpus"] == 1
     assert plan["allocations"]["dynamic-1"]["cpus"] == 2
 
@@ -186,7 +186,7 @@ def test_network_progress_is_not_shrunk_as_underutilized() -> None:
     plan = plan_allocations([request], _capacity(), observations={
         "web-1": {"classification": "NETWORK_BOUND", "progress": {"remote_interactions": 3}},
     })
-    assert plan["allocations"]["web-1"]["cpus"] == request.preferred_cpus
+    assert plan["allocations"]["web-1"]["cpus"] == request.min_cpus
 
 
 def test_remote_flag_keeps_flag_path_and_at_most_one_verifier() -> None:

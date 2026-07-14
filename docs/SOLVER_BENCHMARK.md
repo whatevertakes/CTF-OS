@@ -1,5 +1,7 @@
 # Solver benchmark plan
 
+Benchmark runs distinguish primitive candidate/confirmed/refuted and measure confirmation-to-automatic-utility, duplicate cleanup, required Sol takeover, minimal PoC, and remote latency. Candidate-only claims do not count as progress. Scheduler comparisons use minimum allocation for ordinary lanes and opt-in elasticity only for evidenced long compute; timeout continuation records whether the selected profile retained or cleaned the sandbox.
+
 This benchmark measures whether competition policy reduces time-to-flag. Unit, policy, and integration tests prove implementation invariants only; passing them is not evidence that CTF solve rate or speed improved.
 
 ## Configurations

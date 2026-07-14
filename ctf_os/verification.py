@@ -150,6 +150,13 @@ def record_remote_flag(
             detect_capacity(workspace=root),
             remote_flag_session=branch_id if confidence == "HIGH" else None,
         )
+    from .transitions import evaluate_race_transition
+    transition = evaluate_race_transition(
+        root, {
+            "type": "REMOTE_FLAG_OBTAINED" if pattern_match else "FLAG_CANDIDATE",
+            "event_id": f"flag-receipt-{receipt_id}", "summary": "declared remote flag receipt",
+        }, branch_id, input_fingerprint,
+    )
     return {
         "state": state_name, "remote_state": "REMOTE_FLAG_OBTAINED" if pattern_match else "FLAG_CANDIDATE",
         "challenge_id": challenge_id, "flag": candidate, "confidence": confidence,
@@ -161,6 +168,7 @@ def record_remote_flag(
             "maximum_verifiers_to_keep": 1 if confidence == "HIGH" else None,
         },
         "automatic_submission_attempted": False,
+        "race_transition": transition,
     }
 
 

@@ -86,7 +86,8 @@ def test_event_bus_priority_idempotency_conflicts_packets_and_operator_hints(tmp
         event_type="EXPLOIT_PRIMITIVE", priority="LOW", summary="comparison bypass",
         useful_for=["dynamic"], event_id="event-1",
     )
-    assert event["priority"] == "HIGH"
+    # Deprecated primitive rows are readable but candidate-grade.
+    assert event["priority"] == "LOW"
     remote = publish_event(root, challenge_id="challenge", input_fingerprint="fp", session_id="flagger", event_type="REMOTE_FLAG_OBTAINED", summary="flag receipt ready", priority="LOW", event_id="remote-1", useful_for=["flag-verifier"])
     assert remote["priority"] == "CRITICAL"
     assert publish_event(

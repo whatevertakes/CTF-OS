@@ -228,6 +228,10 @@ def race_board(
         branch_resource = resource_branches.get(str(branch.get("session_id")), {}) if isinstance(resource_branches, Mapping) else {}
         branches.append({
             "session_id": branch.get("session_id"), "status": branch.get("status"),
+            "plan_state": branch.get("status") if branch.get("status") in {"PLANNED", "ADMITTED", "AWAITING_NATIVE_START"} else "ADMITTED",
+            "native_start_state": "CONFIRMED" if branch.get("start_receipt") or branch.get("started_at") else "AWAITING",
+            "sandbox_state": next((row.get("status") for row in (state or {}).get("branches", []) if row.get("id") == branch.get("session_id")), "NOT_CREATED"),
+            "result_state": "TERMINAL_RECORDED" if branch.get("finished_at") else "PENDING",
             "role": branch.get("role"), "hypothesis_family": branch.get("hypothesis_family"),
             "requested_model_role": branch.get("requested_model_role"),
             "requested_reasoning": branch.get("requested_reasoning"),

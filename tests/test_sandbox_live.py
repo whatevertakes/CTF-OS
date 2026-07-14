@@ -68,3 +68,40 @@ def test_live_running_resize_updates_limits_and_followup_environment(tmp_path: P
         assert environment["stdout"] == "1.5 1"
     finally:
         cleanup(metadata, session_id="sol-main", session_role="sol")
+
+
+def test_live_long_timeout_retains_progress_reuses_and_explicitly_cleans(tmp_path: Path) -> None:
+    branch = tmp_path / "challenge" / "workers" / "retained"
+    for name in ("work", "evidence", "artifacts", "logs"):
+        path = branch / name; path.mkdir(parents=True); path.chmod(0o777)
+    container = f"ctf-os-retain-live-{os.getpid()}"
+    labels = {"ctf-os": "true", "ctf-os.kind": "sandbox", "ctf-os.branch": "retained"}
+    run = subprocess.run([
+        "docker", "run", "--detach", "--name", container,
+        *[part for key, value in labels.items() for part in ("--label", f"{key}={value}")],
+        "--volume", f"{branch / 'work'}:/work", "--volume", f"{branch / 'evidence'}:/evidence",
+        "--volume", f"{branch / 'artifacts'}:/artifacts", "ctf-os-sandbox:base", "sleep", "infinity",
+    ], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    metadata = {
+        "name": container, "branch": "retained", "branch_root": str(branch),
+        "metadata_path": str(branch / "sandbox.json"), "labels": labels,
+        "session_id": "retained", "parent_session_id": "sol-main",
+        "resource_profile": "light", "resources": {"cpus": 1, "memory": "1g"},
+        "authorized_targets": [],
+    }
+    try:
+        timed = execute(
+            metadata, ["sh", "-c", "echo slice-one >/work/progress.txt; sleep 30"], 2,
+            timeout_profile="symbolic_slice", session_id="retained", session_role="child",
+        )
+        assert timed["timeout_status"] == "TIMED_OUT_RETAINED"
+        assert subprocess.run(["docker", "inspect", metadata["name"]], capture_output=True).returncode == 0
+        followup = execute(
+            metadata, ["cat", "/work/progress.txt"], 10,
+            timeout_profile="symbolic_slice", session_id="retained", session_role="child",
+        )
+        assert followup["exit_code"] == 0 and followup["stdout"].strip() == "slice-one"
+    finally:
+        cleanup(metadata, session_id="sol-main", session_role="sol")
+    assert subprocess.run(["docker", "inspect", metadata["name"]], capture_output=True).returncode != 0
