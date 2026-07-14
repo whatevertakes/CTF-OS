@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 from typing import Any
 
-from .workspace import atomic_json
+from .workspace import atomic_json, state_lock
 
 
 WORKER_RESULT_SCHEMA_VERSION = 1
@@ -17,6 +17,11 @@ WORKER_STATUSES = frozenset({
     "SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "ERROR", "FLAG_CANDIDATE",
 })
 CONFIDENCE_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
+CHECKPOINT_TYPES = frozenset({
+    "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
+    "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE",
+})
+CHECKPOINT_SCHEMA_VERSION = 1
 
 
 class WorkerResultError(ValueError):
@@ -97,11 +102,132 @@ def validate_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dic
         "started_at": _timestamp(payload["started_at"], "started_at"),
         "finished_at": _timestamp(payload["finished_at"], "finished_at"),
     }
+    # Backward-compatible clean-room metadata.  Old schema-v1 results remain
+    # valid, while verifiers can state their role without changing replay.
+    result["verifier_role"] = _nullable_text(payload.get("verifier_role"), "verifier_role")
+    independent = payload.get("independent_verification", False)
+    if not isinstance(independent, bool):
+        raise WorkerResultError("independent_verification must be a boolean")
+    result["independent_verification"] = independent
     if result["session_id"] != root.name:
         raise WorkerResultError("session_id must match the worker directory name")
     if _parse_timestamp(result["finished_at"]) < _parse_timestamp(result["started_at"]):
         raise WorkerResultError("finished_at must not be earlier than started_at")
     return result
+
+
+def save_worker_checkpoint(
+    worker_root: Path, *, parent_session_id: str, challenge_id: str,
+    input_fingerprint: str, checkpoint_type: str, summary: str,
+    evidence: list[str], artifacts: list[str], useful_for: list[str],
+    recommended_action: str, confidence: float,
+) -> dict[str, Any]:
+    """Atomically save a compact checkpoint in the matching private worker root."""
+
+    root = _safe_worker_root(worker_root)
+    if checkpoint_type not in CHECKPOINT_TYPES:
+        raise WorkerResultError(f"checkpoint type must be one of {sorted(CHECKPOINT_TYPES)}")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0.0 <= float(confidence) <= 1.0:
+        raise WorkerResultError("checkpoint confidence must be between 0 and 1")
+    compact_summary = _limited_text(summary, "summary", 1000)
+    action = _limited_optional_text(recommended_action, "recommended_action", 1000)
+    safe_evidence = _paths_limited(root, evidence, "evidence", maximum=16)
+    safe_artifacts = _paths_limited(root, artifacts, "artifacts", maximum=16)
+    targets = _short_strings(useful_for, "useful_for", maximum=16, item_limit=128)
+    solve_root = root.parents[1]
+    state_path = solve_root / "STATE.json"
+    if state_path.is_file() and not state_path.is_symlink():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkerResultError("challenge STATE.json is invalid") from exc
+        if state.get("input_fingerprint") != input_fingerprint:
+            raise WorkerResultError("checkpoint input fingerprint does not match current challenge state")
+    checkpoints = root / "checkpoints"
+    if checkpoints.is_symlink():
+        raise WorkerResultError("checkpoint directory must not be a symlink")
+    with state_lock(solve_root):
+        checkpoints.mkdir(parents=True, exist_ok=True)
+        existing = sorted(checkpoints.glob("*.json"))
+        sequence = 1
+        for path in existing:
+            loaded = load_worker_checkpoint(path)
+            sequence = max(sequence, int(loaded["sequence"]) + 1)
+        payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION, "session_id": root.name,
+            "parent_session_id": _identifier(parent_session_id, "parent_session_id"),
+            "challenge_id": _text(challenge_id, "challenge_id"),
+            "input_fingerprint": _identifier(input_fingerprint, "input_fingerprint"),
+            "sequence": sequence, "type": checkpoint_type, "summary": compact_summary,
+            "evidence": safe_evidence, "artifacts": safe_artifacts, "useful_for": targets,
+            "recommended_action": action, "confidence": float(confidence),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        target = checkpoints / f"{sequence:06d}.json"
+        if target.is_symlink() or target.exists():
+            raise WorkerResultError("checkpoint sequence path already exists or is unsafe")
+        atomic_json(target, payload)
+    return payload
+
+
+def load_worker_checkpoint(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or path.parent.is_symlink() or not path.is_file() or path.parent.name != "checkpoints":
+        raise WorkerResultError(f"worker checkpoint is missing or unsafe: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkerResultError(f"worker checkpoint is not valid JSON: {path}") from exc
+    if not isinstance(payload, Mapping):
+        raise WorkerResultError("worker checkpoint must be a JSON object")
+    root = _safe_worker_root(path.parent.parent)
+    required = {"schema_version", "session_id", "parent_session_id", "challenge_id", "input_fingerprint", "sequence", "type", "summary", "evidence", "artifacts", "useful_for", "recommended_action", "confidence", "created_at"}
+    missing = required.difference(payload)
+    if missing or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise WorkerResultError("worker checkpoint schema is incomplete or unsupported")
+    if payload.get("session_id") != root.name:
+        raise WorkerResultError("checkpoint session_id must match the worker directory")
+    if payload.get("type") not in CHECKPOINT_TYPES:
+        raise WorkerResultError("checkpoint contains an unsupported type")
+    if not isinstance(payload.get("sequence"), int) or payload["sequence"] < 1:
+        raise WorkerResultError("checkpoint sequence must be a positive integer")
+    expected_name = f"{payload['sequence']:06d}.json"
+    if path.name != expected_name:
+        raise WorkerResultError("checkpoint filename does not match sequence")
+    _limited_text(payload["summary"], "summary", 1000)
+    _paths_limited(root, payload["evidence"], "evidence", maximum=16)
+    _paths_limited(root, payload["artifacts"], "artifacts", maximum=16)
+    _short_strings(payload["useful_for"], "useful_for", maximum=16, item_limit=128)
+    _timestamp(payload["created_at"], "created_at")
+    if not isinstance(payload["confidence"], (int, float)) or isinstance(payload["confidence"], bool) or not 0 <= payload["confidence"] <= 1:
+        raise WorkerResultError("checkpoint confidence must be between 0 and 1")
+    return dict(payload)
+
+
+def collect_worker_checkpoints(
+    workers_root: Path, *, input_fingerprint: str, since_sequence: int = 0,
+) -> list[dict[str, Any]]:
+    if since_sequence < 0:
+        raise WorkerResultError("since_sequence must be non-negative")
+    rows: list[dict[str, Any]] = []
+    if not workers_root.exists():
+        return rows
+    if workers_root.is_symlink() or not workers_root.is_dir():
+        raise WorkerResultError("workers root is unsafe")
+    for path in sorted(workers_root.glob("*/checkpoints/*.json")):
+        item = load_worker_checkpoint(path)
+        if item["input_fingerprint"] == input_fingerprint and item["sequence"] > since_sequence:
+            rows.append(item)
+    rows.sort(key=lambda item: (item["created_at"], item["session_id"], item["sequence"]))
+    return rows
+
+
+def merge_worker_checkpoints(workers_root: Path, *, input_fingerprint: str) -> dict[str, Any]:
+    """Preserve every observation and make repeated merges byte-equivalent."""
+
+    rows = collect_worker_checkpoints(workers_root, input_fingerprint=input_fingerprint)
+    merged = {"schema_version": 1, "input_fingerprint": input_fingerprint, "checkpoints": rows}
+    atomic_json(workers_root / "MERGED_CHECKPOINTS.json", merged)
+    return merged
 
 
 def merge_worker_results(results: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -218,6 +344,32 @@ def _paths(root: Path, value: Any, field: str) -> list[str]:
             raise WorkerResultError(f"{field}[{index}] is not a regular file: {raw!r}")
         paths.append(relative.as_posix())
     return paths
+
+
+def _paths_limited(root: Path, value: Any, field: str, *, maximum: int) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise WorkerResultError(f"{field} must be an array with at most {maximum} entries")
+    return _paths(root, value, field)
+
+
+def _limited_text(value: Any, field: str, maximum: int) -> str:
+    text = _text(value, field)
+    if len(text) > maximum:
+        raise WorkerResultError(f"{field} must be at most {maximum} characters")
+    return text
+
+
+def _limited_optional_text(value: Any, field: str, maximum: int) -> str:
+    text = _optional_text(value, field)
+    if len(text) > maximum:
+        raise WorkerResultError(f"{field} must be at most {maximum} characters")
+    return text
+
+
+def _short_strings(value: Any, field: str, *, maximum: int, item_limit: int) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise WorkerResultError(f"{field} must be an array with at most {maximum} entries")
+    return [_limited_text(item, f"{field}[{index}]", item_limit) for index, item in enumerate(value)]
 
 
 def _flag_candidates(value: Any) -> list[Any]:

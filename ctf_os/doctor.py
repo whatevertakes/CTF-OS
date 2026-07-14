@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 
+from .delegation import DelegationError, load_templates
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute
 
 
@@ -166,6 +167,13 @@ def run_doctor(repo: Path) -> dict[str, object]:
     playbooks = list((repo / "ctf_os/resources/knowledge/playbooks").glob("*.md"))
     add("skills", all(path.is_file() and not path.is_symlink() for path in skill_files), ", ".join(str(path) for path in skill_files), "restore the tracked skill files")
     add("playbooks", len(playbooks) >= 9, f"{len(playbooks)} files", "restore all nine category playbooks")
+    template_path = repo / "ctf_os/resources/delegation-templates.yaml"
+    try:
+        templates = load_templates(template_path)
+        template_ok, template_detail = len(templates) >= 9, f"{len(templates)} categories"
+    except (DelegationError, OSError) as exc:
+        template_ok, template_detail = False, str(exc)
+    add("delegation-templates", template_ok, template_detail, "restore the validated delegation template resource")
     add("service-runtime", importlib.util.find_spec("ctf_os.service") is not None, "ctf_os.service", "restore the service runtime module")
     add("replay-runtime", importlib.util.find_spec("ctf_os.replay") is not None, "ctf_os.replay", "restore the replay module")
 

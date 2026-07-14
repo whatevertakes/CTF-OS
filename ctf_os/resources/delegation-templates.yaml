@@ -1,0 +1,45 @@
+pwn:
+  tier_1: [{role: primary-analysis, hypothesis_family: memory-corruption-triage}]
+  tier_2: [{role: static-primitive-analysis, hypothesis_family: corruption-primitive}, {role: dynamic-harness, hypothesis_family: runtime-state}]
+  tier_3: [{role: primitive-analysis, hypothesis_family: corruption-primitive}, {role: exploit-implementation, hypothesis_family: exploit-chain}, {role: alternate-attack-family, hypothesis_family: logic-or-format-alternate}]
+  tier_4: [{role: mitigation-bypass, hypothesis_family: advanced-mitigation-bypass}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+web:
+  tier_1: [{role: primary-analysis, hypothesis_family: request-flow}]
+  tier_2: [{role: source-audit, hypothesis_family: trust-boundary}, {role: dynamic-request-harness, hypothesis_family: request-differential}]
+  tier_3: [{role: source-to-sink, hypothesis_family: injection-chain}, {role: exploit-implementation, hypothesis_family: request-chain}, {role: alternate-attack-family, hypothesis_family: auth-or-logic-alternate}]
+  tier_4: [{role: protocol-analysis, hypothesis_family: parser-differential}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+rev:
+  tier_1: [{role: primary-analysis, hypothesis_family: validation-reconstruction}]
+  tier_2: [{role: deep-static-analysis, hypothesis_family: validation-reconstruction}, {role: dynamic-oracle, hypothesis_family: state-differential}]
+  tier_3: [{role: deep-static-analysis, hypothesis_family: validation-reconstruction}, {role: dynamic-oracle, hypothesis_family: state-differential}, {role: solver-implementation, hypothesis_family: independent-solver}]
+  tier_4: [{role: symbolic-analysis, hypothesis_family: symbolic-constraints}, {role: alternate-attack-family, hypothesis_family: alternate-obfuscation-family}]
+crypto:
+  tier_1: [{role: primary-analysis, hypothesis_family: construction-identification}]
+  tier_2: [{role: algebra-analysis, hypothesis_family: mathematical-weakness}, {role: oracle-harness, hypothesis_family: chosen-input-differential}]
+  tier_3: [{role: construction-analysis, hypothesis_family: mathematical-weakness}, {role: solver-implementation, hypothesis_family: independent-solver}, {role: alternate-attack-family, hypothesis_family: implementation-flaw}]
+  tier_4: [{role: advanced-cryptanalysis, hypothesis_family: lattice-or-algebra}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+forensic:
+  tier_1: [{role: primary-analysis, hypothesis_family: artifact-triage}]
+  tier_2: [{role: metadata-timeline, hypothesis_family: timeline-reconstruction}, {role: content-carving, hypothesis_family: hidden-content}]
+  tier_3: [{role: filesystem-analysis, hypothesis_family: artifact-recovery}, {role: network-analysis, hypothesis_family: traffic-reconstruction}, {role: alternate-attack-family, hypothesis_family: steganographic-channel}]
+  tier_4: [{role: cross-source-correlation, hypothesis_family: multi-artifact-correlation}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+misc:
+  tier_1: [{role: primary-analysis, hypothesis_family: challenge-mechanism}]
+  tier_2: [{role: mechanism-analysis, hypothesis_family: primary-mechanism}, {role: harness-implementation, hypothesis_family: behavioral-differential}]
+  tier_3: [{role: deep-analysis, hypothesis_family: primary-mechanism}, {role: solver-implementation, hypothesis_family: independent-solver}, {role: alternate-attack-family, hypothesis_family: alternate-mechanism}]
+  tier_4: [{role: constraint-analysis, hypothesis_family: advanced-constraints}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+osint:
+  tier_1: [{role: public-source-recon, hypothesis_family: public-attribution}]
+  tier_2: [{role: source-correlation, hypothesis_family: public-source-correlation}, {role: geolocation-analysis, hypothesis_family: public-geolocation}]
+  tier_3: [{role: timeline-correlation, hypothesis_family: public-timeline}, {role: media-analysis, hypothesis_family: public-media}, {role: alternate-attack-family, hypothesis_family: alternate-public-source}]
+  tier_4: [{role: cross-source-verifier, hypothesis_family: independent-verification}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+cloud:
+  tier_1: [{role: readonly-config-audit, hypothesis_family: configuration-exposure}]
+  tier_2: [{role: readonly-iam-analysis, hypothesis_family: permission-chain}, {role: readonly-service-analysis, hypothesis_family: service-exposure}]
+  tier_3: [{role: readonly-policy-analysis, hypothesis_family: permission-chain}, {role: local-emulation, hypothesis_family: exploit-reproduction}, {role: alternate-attack-family, hypothesis_family: metadata-or-config-alternate}]
+  tier_4: [{role: readonly-chain-analysis, hypothesis_family: multi-service-chain}, {role: clean-room-verifier, hypothesis_family: independent-verification}]
+ai:
+  tier_1: [{role: safe-model-inspection, hypothesis_family: model-format-triage}]
+  tier_2: [{role: safe-static-model-analysis, hypothesis_family: model-structure}, {role: sandboxed-inference-harness, hypothesis_family: inference-differential}]
+  tier_3: [{role: safe-model-analysis, hypothesis_family: model-structure}, {role: adversarial-input-analysis, hypothesis_family: input-manipulation}, {role: alternate-attack-family, hypothesis_family: pipeline-logic}]
+  tier_4: [{role: advanced-model-analysis, hypothesis_family: model-extraction-or-constraints}, {role: clean-room-verifier, hypothesis_family: independent-verification}]

@@ -33,10 +33,13 @@ def test_child_tool_surface_omits_shared_lifecycle_and_final_judgment(monkeypatc
     monkeypatch.setenv("CTF_OS_SESSION_ROLE", "child")
     commands = build_parser()._subparsers._group_actions[0].choices
 
-    assert {"service-status", "service-logs", "service-inspect", "worker-result-save"}.issubset(commands)
+    assert {"service-status", "service-logs", "service-inspect", "worker-result-save", "worker-checkpoint-save"}.issubset(commands)
     assert not {
         "service-build", "service-start", "service-restart", "service-stop", "service-cleanup",
         "sandbox-create", "sandbox-gc", "record-finding", "worker-results-merge", "replay",
+        "delegation-plan-init", "delegation-plan-show", "delegation-branch-add",
+        "delegation-branch-update", "branch-admit", "branch-utility",
+        "worker-checkpoints-merge", "worker-checkpoints-show",
     }.intersection(commands)
 
 

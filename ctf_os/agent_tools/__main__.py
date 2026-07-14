@@ -12,6 +12,10 @@ from ..contest import ContestError, discover_contests, select_contest
 from ..evidence import append_finding
 from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
 from ..doctor import run_doctor
+from ..delegation import (
+    BranchCandidate, add_branch, branch_utility, init_plan, load_plan,
+    record_admission, template_recommendation, update_branch,
+)
 from ..replay import run_replay
 from ..problems import sync_contest_manifest
 from ..scaffold import initialize_contest
@@ -27,7 +31,10 @@ from ..service import (
 )
 from ..triage import finalize_triage, prepare_triage, require_final_triage
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
-from ..worker import merge_worker_result_files, save_worker_result
+from ..worker import (
+    collect_worker_checkpoints, load_worker_result, merge_worker_checkpoints,
+    merge_worker_result_files, save_worker_checkpoint, save_worker_result,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +69,33 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
+    if not child_surface:
+        plan_init = commands.add_parser("delegation-plan-init")
+        plan_init.add_argument("selector"); plan_init.add_argument("--contest")
+        plan_init.add_argument("--tier", required=True, type=int); plan_init.add_argument("--tier-reason", required=True)
+        _add_session_args(plan_init)
+        plan_show = commands.add_parser("delegation-plan-show")
+        plan_show.add_argument("selector"); plan_show.add_argument("--contest"); _add_session_args(plan_show)
+        template_show = commands.add_parser("delegation-template-show")
+        template_show.add_argument("selector"); template_show.add_argument("--contest"); template_show.add_argument("--tier", required=True, type=int); _add_session_args(template_show)
+        admit = commands.add_parser("branch-admit")
+        _add_branch_candidate_args(admit); admit.add_argument("--threshold", type=float, default=.70); admit.add_argument("--purpose"); _add_delegation_controller_args(admit)
+        branch_add = commands.add_parser("delegation-branch-add")
+        _add_branch_candidate_args(branch_add)
+        branch_add.add_argument("--evidence-contract", action="append", required=True)
+        branch_add.add_argument("--success-condition", required=True); branch_add.add_argument("--kill-condition", required=True)
+        branch_add.add_argument("--maximum-steps", type=int, required=True); branch_add.add_argument("--budget-seconds", type=int, required=True)
+        branch_add.add_argument("--requested-model-role", required=True); branch_add.add_argument("--requested-reasoning", required=True)
+        branch_add.add_argument("--purpose"); _add_delegation_controller_args(branch_add)
+        branch_update = commands.add_parser("delegation-branch-update")
+        branch_update.add_argument("selector"); branch_update.add_argument("--contest"); branch_update.add_argument("--session-id", required=True)
+        branch_update.add_argument("--status", required=True); branch_update.add_argument("--observed-runtime-model"); branch_update.add_argument("--observed-reasoning")
+        branch_update.add_argument("--runtime-observation-evidence")
+        branch_update.add_argument("--pinning-verified", action="store_true", default=None); branch_update.add_argument("--session-role", choices=("sol", "child"), default="sol")
+        branch_update.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main")); branch_update.add_argument("--recover-stale", action="store_true")
+        utility = commands.add_parser("branch-utility")
+        utility.add_argument("selector"); utility.add_argument("--contest"); utility.add_argument("--session-id", required=True)
+        utility.add_argument("--session-role", choices=("sol", "child"), default="sol"); utility.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main")); utility.add_argument("--recover-stale", action="store_true")
     if not child_surface:
         sandbox_create = commands.add_parser("sandbox-create")
         sandbox_create.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
@@ -126,12 +160,34 @@ def build_parser() -> argparse.ArgumentParser:
     worker_result.add_argument("--branch", required=True)
     worker_result.add_argument("--result-json", required=True)
     _add_session_args(worker_result, default_role="child")
+    checkpoint = commands.add_parser("worker-checkpoint-save")
+    checkpoint.add_argument("selector"); checkpoint.add_argument("--contest")
+    checkpoint.add_argument("--type", required=True); checkpoint.add_argument("--summary", required=True)
+    checkpoint.add_argument("--evidence", action="append", default=[]); checkpoint.add_argument("--artifact", action="append", default=[])
+    checkpoint.add_argument("--useful-for", default=""); checkpoint.add_argument("--recommended-action", default=""); checkpoint.add_argument("--confidence", type=float, required=True)
+    _add_session_args(checkpoint, default_role="child")
     if not child_surface:
         worker_merge = commands.add_parser("worker-results-merge")
         worker_merge.add_argument("selector")
         worker_merge.add_argument("--contest")
         _add_session_args(worker_merge)
+        checkpoint_merge = commands.add_parser("worker-checkpoints-merge")
+        checkpoint_merge.add_argument("selector"); checkpoint_merge.add_argument("--contest"); _add_session_args(checkpoint_merge)
+        checkpoint_show = commands.add_parser("worker-checkpoints-show")
+        checkpoint_show.add_argument("selector"); checkpoint_show.add_argument("--contest"); checkpoint_show.add_argument("--since-sequence", type=int, default=0); _add_session_args(checkpoint_show)
     return parser
+
+
+def _add_branch_candidate_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("selector"); parser.add_argument("--contest"); parser.add_argument("--session-id", required=True)
+    parser.add_argument("--role", required=True); parser.add_argument("--hypothesis-family", required=True); parser.add_argument("--hypothesis", required=True)
+    parser.add_argument("--scope", required=True); parser.add_argument("--tool-strategy", required=True); parser.add_argument("--expected-artifact", action="append", required=True)
+
+
+def _add_delegation_controller_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--session-role", choices=("sol", "child"), default=os.environ.get("CTF_OS_SESSION_ROLE", "sol"))
+    parser.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main"))
+    parser.add_argument("--recover-stale", action="store_true")
 
 
 def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "sol") -> None:
@@ -228,6 +284,29 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     initialize_solve_files(solve_root, challenge)
     if args.command == "prepare-challenge":
         return _compact_prepare(challenge, record, solve_root)
+    current_fingerprint = str(record["source_fingerprint"])
+    if args.command.startswith("delegation-") or args.command in {"branch-admit", "branch-utility"}:
+        _require_delegation_sol(args)
+        if args.command == "delegation-plan-init":
+            return init_plan(solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint, parent_session_id=args.parent_session_id, tier=args.tier, tier_reason=args.tier_reason)
+        if args.command == "delegation-plan-show":
+            return load_plan(solve_root, input_fingerprint=current_fingerprint)
+        if args.command == "delegation-template-show":
+            return template_recommendation(Path(__file__).parents[1] / "resources" / "delegation-templates.yaml", category=challenge.category, tier=args.tier)
+        if args.command == "branch-admit":
+            candidate = _candidate_from_args(args)
+            return record_admission(solve_root, input_fingerprint=current_fingerprint, candidate=candidate, threshold=args.threshold, purpose=args.purpose)
+        if args.command == "delegation-branch-add":
+            candidate = _candidate_from_args(args)
+            return add_branch(solve_root, input_fingerprint=current_fingerprint, candidate=candidate, evidence_contract=args.evidence_contract, success_condition=args.success_condition, kill_condition=args.kill_condition, maximum_steps=args.maximum_steps, budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role, requested_reasoning=args.requested_reasoning, purpose=args.purpose)
+        if args.command == "delegation-branch-update":
+            return update_branch(solve_root, input_fingerprint=current_fingerprint, session_id=args.session_id, status=args.status, observed_runtime_model=args.observed_runtime_model, observed_reasoning=args.observed_reasoning, pinning_verified=args.pinning_verified, runtime_observation_evidence=args.runtime_observation_evidence)
+        if args.command == "branch-utility":
+            plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
+            checkpoints = collect_worker_checkpoints(solve_root / "workers", input_fingerprint=current_fingerprint)
+            result_path = solve_root / "workers" / args.session_id / "result.json"
+            result = load_worker_result(result_path) if result_path.is_file() else None
+            return branch_utility(plan, session_id=args.session_id, checkpoints=checkpoints, result=result)
     if args.command.startswith("service-"):
         spec = _service_spec(manifest, challenge, record, solve_root)
         actor = _service_actor(args)
@@ -381,6 +460,21 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 session_id=session_id, session_role=role,
             )
         return save_worker_result(worker_root, payload)
+    if args.command == "worker-checkpoint-save":
+        session_id, role = _caller(args)
+        if role != "child":
+            raise ValueError("worker checkpoint must be submitted by a child session")
+        if os.environ.get("CTF_OS_SESSION_ROLE") == "child" and session_id != os.environ.get("CTF_OS_SESSION_ID"):
+            raise ValueError("DENIED_SESSION_IDENTITY: child may write only its own checkpoint")
+        worker_root = solve_root / "workers" / session_id
+        if worker_root.name != session_id or not worker_root.is_dir():
+            raise ValueError("matching worker directory does not exist")
+        sandbox_metadata = worker_root / "sandbox.json"
+        if sandbox_metadata.is_file():
+            metadata = _load_metadata(root, str(sandbox_metadata))
+            if metadata.get("session_id") != session_id or metadata.get("input_fingerprint") != current_fingerprint:
+                raise ValueError("worker checkpoint sandbox identity or input fingerprint is stale")
+        return save_worker_checkpoint(worker_root, parent_session_id=args.parent_session_id, challenge_id=challenge.id, input_fingerprint=current_fingerprint, checkpoint_type=args.type, summary=args.summary, evidence=args.evidence, artifacts=args.artifact, useful_for=_csv(args.useful_for), recommended_action=args.recommended_action, confidence=args.confidence)
     if args.command == "worker-results-merge":
         _require_sol(args, "Only the parent Sol session may merge worker results.")
         paths = sorted((solve_root / "workers").glob("*/result.json"))
@@ -389,6 +483,13 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         merged_path = solve_root / "workers" / "MERGED_RESULTS.json"
         atomic_json(merged_path, merged)
         return {**merged, "merged_path": str(merged_path)}
+    if args.command == "worker-checkpoints-merge":
+        _require_sol(args, "Only the parent Sol session may merge worker checkpoints.")
+        merged = merge_worker_checkpoints(solve_root / "workers", input_fingerprint=current_fingerprint)
+        return {**merged, "merged_path": str(solve_root / "workers" / "MERGED_CHECKPOINTS.json")}
+    if args.command == "worker-checkpoints-show":
+        _require_sol(args, "Only the parent Sol session may show all worker checkpoints.")
+        return {"checkpoints": collect_worker_checkpoints(solve_root / "workers", input_fingerprint=current_fingerprint, since_sequence=args.since_sequence)}
     raise ValueError(f"unsupported internal command: {args.command}")
 
 
@@ -440,6 +541,12 @@ def _require_sol(args: argparse.Namespace, message: str) -> None:
     session_id, role = _caller(args)
     if role != "sol" or session_id != str(args.parent_session_id):
         raise ValueError(f"DENIED_CONTROLLER_ACTION: {message}")
+
+
+def _require_delegation_sol(args: argparse.Namespace) -> None:
+    """Check the controller without confusing a branch --session-id for caller identity."""
+    if os.environ.get("CTF_OS_SESSION_ROLE") == "child" or getattr(args, "session_role", "sol") != "sol":
+        raise ValueError("DENIED_CONTROLLER_ACTION: Only the parent Sol session may manage delegation plans and recommendations.")
 
 
 def _compact_prepare(challenge, record: dict[str, object], solve_root: Path) -> dict[str, object]:
@@ -553,6 +660,14 @@ def _update_branch_state(solve_root: Path, branch: str, status: str, metadata_pa
         branches.append({"id": branch, "status": status, "metadata_path": metadata_path})
         state["branches"] = sorted(branches, key=lambda item: item["id"])
         atomic_json(path, state)
+
+
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _candidate_from_args(args: argparse.Namespace) -> BranchCandidate:
+    return BranchCandidate.create(session_id=args.session_id, role=args.role, hypothesis_family=args.hypothesis_family, hypothesis=args.hypothesis, scope=_csv(args.scope), tool_strategy=_csv(args.tool_strategy), expected_artifacts=args.expected_artifact)
 
 
 if __name__ == "__main__":

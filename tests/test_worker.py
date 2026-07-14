@@ -7,10 +7,13 @@ import pytest
 
 from ctf_os.worker import (
     WorkerResultError,
+    collect_worker_checkpoints,
     load_worker_result,
+    merge_worker_checkpoints,
     merge_worker_result_files,
     merge_worker_results,
     save_worker_result,
+    save_worker_checkpoint,
     validate_worker_result,
 )
 
@@ -197,3 +200,59 @@ def test_merge_excludes_results_from_a_stale_input_fingerprint(tmp_path: Path) -
 
     assert [item["session_id"] for item in merged["results"]] == ["worker-current"]
     assert merged["flag_candidates"] == []
+
+
+def test_checkpoint_save_sequence_merge_and_idempotency(tmp_path: Path) -> None:
+    root = _worker(tmp_path)
+    kwargs = dict(parent_session_id="sol-main", challenge_id="abc", input_fingerprint="fingerprint-v1", checkpoint_type="SUPPORTED_FACT", summary="A compact supported fact", evidence=["evidence/trace.txt"], artifacts=["work/poc.py"], useful_for=["dynamic"], recommended_action="Probe a byte", confidence=.9)
+    first = save_worker_checkpoint(root, **kwargs)
+    second = save_worker_checkpoint(root, **kwargs)
+    assert (first["sequence"], second["sequence"]) == (1, 2)
+    merged1 = merge_worker_checkpoints(root.parent, input_fingerprint="fingerprint-v1")
+    merged2 = merge_worker_checkpoints(root.parent, input_fingerprint="fingerprint-v1")
+    assert merged1 == merged2
+    assert len(merged1["checkpoints"]) == 2
+
+
+def test_checkpoint_merge_preserves_conflicting_worker_observations(tmp_path: Path) -> None:
+    supported = _worker(tmp_path, "supported")
+    rejected = _worker(tmp_path, "rejected")
+    common = dict(parent_session_id="sol-main", challenge_id="abc", input_fingerprint="fingerprint-v1", evidence=[], artifacts=[], useful_for=[], recommended_action="Sol judges the conflict", confidence=.8)
+    save_worker_checkpoint(supported, checkpoint_type="SUPPORTED_FACT", summary="The guard is bypassable", **common)
+    save_worker_checkpoint(rejected, checkpoint_type="REJECTED_HYPOTHESIS", summary="The guard is not bypassable", **common)
+    merged = merge_worker_checkpoints(supported.parent, input_fingerprint="fingerprint-v1")
+    assert {(item["session_id"], item["type"]) for item in merged["checkpoints"]} == {("supported", "SUPPORTED_FACT"), ("rejected", "REJECTED_HYPOTHESIS")}
+
+
+def test_checkpoint_rejects_traversal_absolute_symlink_and_bad_fingerprint_filter(tmp_path: Path) -> None:
+    root = _worker(tmp_path)
+    base = dict(parent_session_id="sol-main", challenge_id="abc", input_fingerprint="fingerprint-v1", checkpoint_type="SUPPORTED_FACT", summary="fact", evidence=[], artifacts=[], useful_for=[], recommended_action="", confidence=.5)
+    for unsafe in ("../../secret", "/etc/passwd"):
+        with pytest.raises(WorkerResultError):
+            save_worker_checkpoint(root, **{**base, "evidence": [unsafe]})
+    outside = tmp_path / "outside"; outside.write_text("x")
+    (root / "evidence" / "link").symlink_to(outside)
+    with pytest.raises(WorkerResultError, match="symlink"):
+        save_worker_checkpoint(root, **{**base, "evidence": ["evidence/link"]})
+    save_worker_checkpoint(root, **base)
+    assert collect_worker_checkpoints(root.parent, input_fingerprint="other") == []
+    (tmp_path / "STATE.json").write_text(json.dumps({"input_fingerprint": "current"}))
+    with pytest.raises(WorkerResultError, match="fingerprint"):
+        save_worker_checkpoint(root, **base)
+
+
+def test_checkpoint_directory_symlink_is_rejected(tmp_path: Path) -> None:
+    root = _worker(tmp_path)
+    outside = tmp_path / "outside-checkpoints"; outside.mkdir()
+    (root / "checkpoints").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(WorkerResultError, match="symlink"):
+        save_worker_checkpoint(root, parent_session_id="sol-main", challenge_id="abc", input_fingerprint="fingerprint-v1", checkpoint_type="BLOCKER", summary="blocked", evidence=[], artifacts=[], useful_for=[], recommended_action="", confidence=.5)
+
+
+def test_worker_result_clean_room_extension_is_backward_compatible(tmp_path: Path) -> None:
+    root = _worker(tmp_path)
+    old = validate_worker_result(root, _result())
+    assert old["independent_verification"] is False and old["verifier_role"] is None
+    payload = _result(); payload["independent_verification"] = True; payload["verifier_role"] = "clean-room-verifier"
+    new = validate_worker_result(root, payload)
+    assert new["independent_verification"] is True

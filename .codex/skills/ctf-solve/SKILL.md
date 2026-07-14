@@ -18,6 +18,8 @@ The current user-opened Sol session is the sole lead orchestrator. Never run Cod
 
 Choose a difficulty tier after compact initial analysis. Use native delegation only when a branch condition below is met; the current Sol remains the attacker and integrator. If exact model selection exists, prefer Luna for broad/cheap recon, Terra for harnesses and implementation, and Sol for hard reasoning/takeover; otherwise assign roles without claiming model pinning.
 
+After choosing the tier, run `delegation-plan-init`, review `delegation-template-show`, and call `branch-admit` for every proposed child. Add an admitted record with `delegation-branch-add`, then create the child using Codex runtime native delegation and mark the record `RUNNING`. The add/admit tools never create a child, and requested model role/reasoning are not proof of pinning; leave observed fields `null` unless runtime evidence proves them. `sandbox-create` is only the execution environment for that already delegated child.
+
 - Tier 0 — trivial: 0 children; Sol handles obvious encoding, metadata, constants, and simple source bugs.
 - Tier 1 — easy: at most 1 child; delegate only the needed recon or implementation task.
 - Tier 2 — normal: at most 2 children; non-overlapping recon and implementation while Sol owns strategy.
@@ -31,6 +33,8 @@ Start with 1–2 branches by default and expand only when evidence justifies it.
 - Phase 3 exploit race: assign genuinely different primitives or implementation paths. Do not duplicate the same solver. Record failures too.
 - Phase 4 cross-pollination: require each worker to save its branch-private structured result, then let Sol merge and judge those results. Sol alone appends accepted claims with `record-finding`, sends useful discoveries to active branches, terminates low-value work, and takes over stalled high-value analysis.
 - Phase 5 verification: rerun from clean conditions. Use an independent branch or lead verification to distinguish the real challenge flag from examples/placeholders.
+
+During bounded execution a worker may call `worker-checkpoint-save` for a compact supported fact, rejected hypothesis, primitive, blocker, ready artifact, next experiment, or flag candidate. Sol periodically calls `worker-checkpoints-merge` and `branch-utility`, then alone decides continue, cross-pollinate, takeover, or termination. The utility command is deterministic advice and never controls a child lifecycle.
 
 Every branch assignment must state: `hypothesis`, exact `scope`, `expected_artifact`, `evidence_contract`, maximum steps/time, `success_condition`, `kill_condition`, and output directory. Each worker owns only `output/<contest>/<category>/<challenge>/workers/<branch-id>/` and its sandbox. They must not access another challenge, undeclared network target, host credentials, or user files.
 
@@ -59,6 +63,8 @@ Workers save `workers/<branch-id>/result.json` and return this compact shape, ne
 
 Use only `SUPPORTED`, `REFUTED`, `PARTIAL`, `INCONCLUSIVE`, `ERROR`, or `FLAG_CANDIDATE`. Keep `service_mutations` empty. Submit with `worker-result-save`, then have Sol call `worker-results-merge`; preserve conflicting observations for Sol instead of resolving them in a worker.
 
+For optional clean-room verification, use purpose `clean-room-verification` (an explicit admission overlap exception). Give the verifier only the final artifact, `REPRODUCE.json`, current fingerprint, and expected observable behavior by default. Do not provide raw attack transcripts or detailed solution notes. The verifier uses the same result schema plus optional `verifier_role` and `independent_verification`; it cannot replay or create a submission-ready verdict.
+
 Keep reports within roughly 800 tokens for Luna recon/verifiers, 1,200 for Terra implementation, and 1,500 for a Sol deep branch. Raw command output belongs only in `evidence.log` or a branch artifact. Cross-pollinate only confirmed facts, rejected hypotheses, exploit primitives, blockers, useful artifact paths, and the next recommended experiment. If no new evidence exists, do not spend another Sol turn restating the plan; use one Luna synthesis pass only when a long result truly needs compression.
 
 ## Sandbox and evidence
@@ -72,3 +78,5 @@ After `worker-results-merge`, Sol records judged material claims with `record-fi
 Call `replay '<selector>' --contest '<name>'`. It validates the fingerprint, runs two independent clean local receipts, keeps the local success marker separate from the remote flag, performs a distinct allowlisted remote replay, verifies actual remote firewall observations, and checks that local and remote use the same exploit path. Different local placeholder and remote real flags are valid by default. Only `FULLY_VERIFIED` may produce `READY_FOR_HUMAN_SUBMISSION`; path mismatch stops at `REMOTE_FLAG_OBTAINED` for Sol judgment. `reproduce.sh` remains a thin wrapper and never runs the exploit on the host.
 
 Return: problem, state, exact verified flag candidate if ready, local/remote/independent/pattern checks, reproduce path, core vulnerability, and the warning that submission is manual. Never claim SOLVED when verification is incomplete.
+
+Canonical tool order: `prepare-challenge` → compact evidence review → tier decision → `delegation-plan-init` → template review → `branch-admit` → `delegation-branch-add` → native delegation → status `RUNNING` → `sandbox-create` → bounded execution/checkpoint → checkpoint merge → utility review and Sol decision → result save/merge → Sol `record-finding` → optional clean-room verifier → final exploit → `REPRODUCE.json` → Sol-only `replay` → manual submission.

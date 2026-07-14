@@ -43,3 +43,21 @@ Intake는 `problems.txt`를 읽고 실제 파일을 확인한 뒤 `contest.md`�
 9. 새 Sol 세션에서 **“triage 해”**라고 요청합니다.
 
 Challenge Triage는 Intake가 만든 inventory·ELF·archive·runtime·remote 메타데이터만 사용해 `output/<contest>/TRIAGE.md` Board와 `triage.json`을 만듭니다. 이 단계는 exploit, brute force, fuzzing, symbolic execution, solver 실행이나 remote 접속을 하지 않습니다. Board에서 추천 순서를 확인한 뒤 새 Sol 세션에서 **“1번 문제 풀어”**처럼 번호를 선택합니다.
+
+## Worker orchestration
+
+Solve 세션은 `DELEGATION_PLAN.json`에 tier, branch 가설, 범위, 예산, admission 결과와 requested/observed runtime 정보를 원자적으로 기록합니다. `delegation-template-show`는 카테고리별 Tier 1–4 후보를 추천할 뿐 branch를 만들지 않습니다. `branch-admit`는 외부 모델 없이 가설군·정규화 토큰·scope·tool·artifact·role의 가중 overlap을 계산하며 기본 0.70 이상 중복을 거부합니다.
+
+`delegation-branch-add` 역시 child를 생성하지 않습니다. Sol이 Codex runtime native delegation으로 child를 만든 뒤 `sandbox-create`로 그 worker의 격리 실행 환경을 만듭니다. Worker는 자기 디렉터리에만 checkpoint/result를 저장하고, Sol만 전체 merge/show, shared finding, service lifecycle, utility 판단, 최종 replay를 수행합니다. Requested model role은 pinning 증명이 아니며 관측 근거가 없으면 observed 필드는 `null`입니다.
+
+권장 순서는 다음과 같습니다.
+
+```text
+prepare-challenge → delegation-plan-init → delegation-template-show → branch-admit
+→ delegation-branch-add → native child delegation → RUNNING → sandbox-create
+→ worker-checkpoint-save → worker-checkpoints-merge → branch-utility
+→ worker-result-save → worker-results-merge → record-finding
+→ optional clean-room verifier → REPRODUCE.json → replay → manual submission
+```
+
+Clean-room verifier는 overlap 예외가 가능하지만 최종 artifact, `REPRODUCE.json`, fingerprint, expected observable behavior만 기본 입력으로 받습니다. 성공 자체는 제출 가능 판정이 아니며 Sol의 clean replay가 계속 필요합니다. Cloud는 read-only allowlist, AI는 host pickle/joblib 역직렬화 금지, OSINT는 비인가 계정·credential·개인정보 수집 금지 정책을 그대로 유지합니다.
