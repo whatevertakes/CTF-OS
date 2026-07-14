@@ -19,6 +19,7 @@ from .evidence import append_evidence
 from .flags import matches_flag
 from .sandbox.network import Target, target_matches_observation
 from .workspace import atomic_json, atomic_text, state_lock
+from .resources.scheduler import ResourceLedger, detect_capacity
 
 
 FLAG_STATES = frozenset({
@@ -137,6 +138,18 @@ def record_remote_flag(
         "target": receipt.target, "network_observed": True,
         "input_fingerprint": input_fingerprint, "confidence": confidence,
     })
+    ledger = ResourceLedger(root)
+    if ledger.state_path.exists():
+        ledger.flag_event({
+            "type": "REMOTE_FLAG_OBTAINED" if pattern_match else "FLAG_CANDIDATE",
+            "session_id": branch_id, "event_id": f"flag-receipt-{receipt_id}",
+        })
+        # This only records allocations/releases and recommendations.  Native
+        # child termination remains an explicit Sol action.
+        ledger.rebalance(
+            detect_capacity(workspace=root),
+            remote_flag_session=branch_id if confidence == "HIGH" else None,
+        )
     return {
         "state": state_name, "remote_state": "REMOTE_FLAG_OBTAINED" if pattern_match else "FLAG_CANDIDATE",
         "challenge_id": challenge_id, "flag": candidate, "confidence": confidence,

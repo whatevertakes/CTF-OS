@@ -211,9 +211,11 @@ def race_board(
     resources: Mapping[str, Any] | None = None, service_status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     branches = []
+    resource_branches = resources.get("branches", {}) if isinstance(resources, Mapping) else {}
     for branch in plan.get("branches", []):
         branch_events = [row for row in events if row.get("session_id") == branch.get("session_id")]
         latest = branch_events[-1] if branch_events else None
+        branch_resource = resource_branches.get(str(branch.get("session_id")), {}) if isinstance(resource_branches, Mapping) else {}
         branches.append({
             "session_id": branch.get("session_id"), "status": branch.get("status"),
             "role": branch.get("role"), "hypothesis_family": branch.get("hypothesis_family"),
@@ -226,6 +228,7 @@ def race_board(
             "last_new_evidence_time": latest.get("created_at") if latest else None,
             "artifacts": sorted({item for row in branch_events for item in row.get("artifacts", [])}),
             "prompt_packet": branch.get("prompt_packet"),
+            "resources": branch_resource,
         })
     return {
         "challenge_id": plan.get("challenge_id"), "tier": plan.get("tier"),

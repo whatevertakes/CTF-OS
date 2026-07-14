@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import io
@@ -16,6 +17,9 @@ from typing import Mapping, Sequence
 from urllib.parse import urlparse
 
 from ..evidence import append_evidence
+from ..resources.scheduler import (
+    ResourceLedger, ResourceRequest, allocation_environment, default_request, parse_bytes,
+)
 from .network import ResolvedTarget
 from .resources import ResourceError, admit, admission_lock, parse_size_bytes, resource_profile
 
@@ -47,6 +51,10 @@ class SandboxSpec:
     service_context: Mapping[str, object] | None = None
     category: str | None = None
     gpu_enabled: bool = False
+    gpu_device: int | None = None
+    workload_class: str | None = None
+    resource_priority: str | None = None
+    resource_request_override: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -61,6 +69,13 @@ class SandboxSpec:
             object.__setattr__(self, "pids", profile.pids)
         if self.storage is None:
             object.__setattr__(self, "storage", profile.storage)
+        if self.workload_class is None:
+            object.__setattr__(self, "workload_class", {
+                "light": "quick-recon", "standard": "independent-full-solve",
+                "heavy": "custom-cpu-bound", "large-forensic": "forensic-extraction",
+            }.get(self.resource_profile, "independent-full-solve"))
+        if self.resource_priority is None:
+            object.__setattr__(self, "resource_priority", "NORMAL")
 
     @property
     def name(self) -> str:
@@ -86,7 +101,28 @@ class SandboxSpec:
             "ctf-os.session_id": self.session_id,
             "ctf-os.parent_session_id": self.parent_session_id,
             "ctf-os.session_role": self.session_role,
+            "ctf-os.workload_class": str(self.workload_class),
+            "ctf-os.resource_priority": str(self.resource_priority),
         }
+
+    @property
+    def resource_request(self) -> ResourceRequest:
+        if self.resource_request_override is not None:
+            return ResourceRequest.from_mapping(self.resource_request_override)
+        return default_request(
+            contest=self.contest_slug, challenge_id=self.challenge_id,
+            session_id=self.session_id, workload_class=str(self.workload_class),
+            priority=str(self.resource_priority),
+            overrides={
+                "min_cpus": min(float(self.cpus), float(self.cpus)),
+                "preferred_cpus": float(self.cpus), "max_cpus": max(float(self.cpus), float(self.cpus)),
+                "min_memory_bytes": parse_size_bytes(str(self.memory)),
+                "preferred_memory_bytes": parse_size_bytes(str(self.memory)),
+                "max_memory_bytes": parse_size_bytes(str(self.memory)),
+                "storage_bytes": parse_size_bytes(str(self.storage)),
+                "gpu_preferred": self.gpu_enabled, "gpu_memory_bytes": 4 * 1024**3 if self.gpu_enabled else 0,
+            },
+        )
 
 
 def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
@@ -94,6 +130,8 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
     context = (spec.branch_root / "context").resolve()
     policy = json.dumps([target.to_dict() for target in spec.targets], separators=(",", ":"))
     local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
+    allocation = {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}
+    resource_env = allocation_environment(allocation, spec.resource_request)
     argv = [
         docker, "run", "--detach", "--name", spec.name, "--read-only",
         "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -114,6 +152,8 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         "--env", f"CTF_OS_CONTEST_SLUG={spec.contest_slug}",
         "--env", f"CTF_OS_CHALLENGE_ID={spec.challenge_id}",
     ]
+    for key, value in resource_env.items():
+        argv.extend(["--env", f"{key}={value}"])
     category = (spec.category or spec.image.rsplit(":", 1)[-1]).casefold()
     if category in {"pwn", "rev", "misc"}:
         argv.extend([
@@ -126,7 +166,8 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
             if Path(device).exists():
                 argv.extend(["--device", f"{device}:{device}:rwm"])
     if category == "ai" and spec.gpu_enabled:
-        argv.extend(["--gpus", "all", "--env", "CTF_OS_GPU_ENABLED=1"])
+        selector = f"device={spec.gpu_device}" if spec.gpu_device is not None else "all"
+        argv.extend(["--gpus", selector, "--env", "CTF_OS_GPU_ENABLED=1"])
     # Rootless Podman needs only namespace-management syscalls for local OCI
     # inspection. Keep Docker's default deny list otherwise; mount and other
     # CAP_SYS_ADMIN-gated syscalls remain blocked and every capability is still dropped.
@@ -154,7 +195,7 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
 def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
     _prepare_branch_root(spec)
     metadata: dict[str, object] = {
-        "schema_version": 1, "name": spec.name, "contest_slug": spec.contest_slug,
+        "schema_version": 2, "name": spec.name, "contest_slug": spec.contest_slug,
         "challenge_id": spec.challenge_id, "branch": spec.branch,
         "source": str(spec.source), "branch_root": str(spec.branch_root),
         "labels": spec.labels, "image": spec.image,
@@ -169,6 +210,11 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "service_context": dict(spec.service_context or {}),
         "category": spec.category,
         "gpu_enabled": spec.gpu_enabled,
+        "gpu_device": spec.gpu_device,
+        "resource_request": spec.resource_request.to_dict(),
+        "allocation_env": allocation_environment(
+            {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}, spec.resource_request,
+        ),
         "work_path": str((spec.branch_root / "work").resolve()),
         "evidence_path": str((spec.branch_root / "evidence").resolve()),
         "logs_path": str((spec.branch_root / "logs").resolve()),
@@ -179,7 +225,11 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
     }
     try:
         with admission_lock():
-            admit(spec.resource_profile, requested_memory_bytes=parse_size_bytes(str(spec.memory)), docker=docker)
+            admit(
+                spec.resource_profile, requested_memory_bytes=parse_size_bytes(str(spec.memory)),
+                requested_cpus=float(spec.cpus), requested_storage_bytes=parse_size_bytes(str(spec.storage)),
+                docker=docker,
+            )
             result = _run(build_run_argv(spec, docker), timeout=120)
     except ResourceError as exc:
         raise SandboxError(str(exc)) from exc
@@ -246,7 +296,10 @@ def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout
         raise SandboxError("command is required and timeout must be between 1 and 1800 seconds")
     name = _metadata_name(metadata)
     branch_root = Path(str(metadata["branch_root"])).resolve()
-    argv = [docker, "exec", "--user", "1001:1001", "--workdir", "/work", name, *command]
+    argv = [docker, "exec", "--user", "1001:1001", "--workdir", "/work"]
+    for key, value in _metadata_allocation_env(metadata).items():
+        argv.extend(["--env", f"{key}={value}"])
+    argv.extend([name, *command])
     before = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
     result = _run(argv, timeout=timeout)
     after = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") and result.returncode != 124 else None
@@ -270,6 +323,81 @@ def _execute_locked(metadata: dict[str, object], command: Sequence[str], timeout
     append_evidence(branch_root / "logs" / "commands.jsonl", "sandbox_exec", record)
     append_evidence(challenge_root / "evidence.log", "sandbox_exec", {"branch": metadata["branch"], **record})
     return record
+
+
+def resize(
+    metadata: dict[str, object], *, cpus: float | None = None, memory: str | int | None = None,
+    docker: str = "docker", session_id: str | None = None, session_role: str | None = None,
+) -> dict[str, object]:
+    """Safely update a running sandbox and preserve the prior allocation on failure."""
+    _authorize_sandbox(metadata, session_id, session_role, "resize")
+    if cpus is None and memory is None:
+        raise SandboxError("sandbox resize requires --cpus and/or --memory")
+    if cpus is not None and cpus <= 0:
+        raise SandboxError("sandbox CPU allocation must be positive")
+    requested_memory = parse_bytes(memory) if memory is not None else None
+    if requested_memory is not None and requested_memory <= 0:
+        raise SandboxError("sandbox memory allocation must be positive")
+    branch_root = Path(str(metadata["branch_root"])).resolve()
+    with _sandbox_lock(branch_root):
+        name = _metadata_name(metadata)
+        before = _inspect_runtime(name, docker=docker)
+        labels = before.get("Config", {}).get("Labels", {}) or {}
+        if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
+            raise SandboxError("refusing resize: container labels do not match sandbox metadata")
+        host = before.get("HostConfig", {}) or {}
+        old_cpus = _host_cpus(host)
+        old_memory = int(host.get("Memory") or parse_size_bytes(str(metadata.get("resources", {}).get("memory", "1g"))))
+        usage = _container_memory_usage(name, docker=docker)
+        if requested_memory is not None and requested_memory < usage:
+            raise SandboxError(
+                f"refusing memory shrink below current usage: requested {requested_memory}, usage {usage}"
+            )
+        argv = [docker, "update"]
+        if cpus is not None:
+            argv.extend(["--cpus", str(cpus)])
+        if requested_memory is not None:
+            argv.extend(["--memory", str(requested_memory)])
+        argv.append(name)
+        result = _run(argv, timeout=60)
+        if result.returncode:
+            raise SandboxError(f"sandbox resize failed; previous allocation retained: {result.stderr.strip()}")
+        after = _inspect_runtime(name, docker=docker)
+        updated_host = after.get("HostConfig", {}) or {}
+        actual_cpus = _host_cpus(updated_host)
+        actual_memory = int(updated_host.get("Memory") or old_memory)
+        expected_cpus = cpus if cpus is not None else old_cpus
+        expected_memory = requested_memory if requested_memory is not None else old_memory
+        if abs(actual_cpus - expected_cpus) > .01 or actual_memory != expected_memory:
+            # Best-effort rollback to keep metadata and live state coherent.
+            _run([docker, "update", "--cpus", str(old_cpus), "--memory", str(old_memory), name], timeout=60)
+            raise SandboxError("sandbox resize verification failed; rolled back to previous allocation")
+        resources = dict(metadata.get("resources") or {})
+        resources["cpus"] = actual_cpus
+        resources["memory"] = str(actual_memory)
+        metadata["resources"] = resources
+        request_raw = metadata.get("resource_request")
+        request = ResourceRequest.from_mapping(request_raw if isinstance(request_raw, Mapping) else metadata)
+        allocation = {"cpus": actual_cpus, "memory_bytes": actual_memory}
+        metadata["allocation_env"] = allocation_environment(allocation, request)
+        metadata["schema_version"] = max(2, int(metadata.get("schema_version", 1)))
+        metadata_path = Path(str(metadata.get("metadata_path") or branch_root / "sandbox.json"))
+        if metadata_path.parent == branch_root:
+            _write_json(metadata_path, metadata)
+        context = branch_root / "context" / "allocation.json"
+        _write_json(context, {"schema_version": 1, "allocation": allocation, "environment": metadata["allocation_env"], "updated_at": _utc_now()})
+        context.chmod(0o444)
+        record = {
+            "container": name, "session_id": metadata.get("session_id"),
+            "before": {"cpus": old_cpus, "memory_bytes": old_memory},
+            "after": {"cpus": actual_cpus, "memory_bytes": actual_memory},
+            "memory_usage_bytes": usage, "verified": True, "at": _utc_now(),
+        }
+        append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_resize", record)
+        ledger = ResourceLedger(branch_root.parents[1])
+        if ledger.state_path.exists():
+            ledger.record_resize(str(metadata.get("session_id") or metadata.get("branch")), record)
+        return record
 
 
 def cleanup(
@@ -330,6 +458,9 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
     if export_errors:
         record["export_errors"] = export_errors
     append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_cleanup", {"branch": metadata["branch"], **record})
+    ledger = ResourceLedger(branch_root.parents[1])
+    if ledger.state_path.exists():
+        ledger.release(str(metadata.get("session_id") or metadata.get("branch")), "sandbox cleanup")
     return record
 
 
@@ -522,6 +653,63 @@ def _run(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(list(argv), 124, stdout, stderr + "\ncommand timed out")
     except FileNotFoundError as exc:
         raise SandboxError(f"required executable not found: {argv[0]}") from exc
+
+
+def _inspect_runtime(name: str, *, docker: str) -> dict[str, object]:
+    result = _run([docker, "inspect", name], timeout=30)
+    if result.returncode:
+        raise SandboxError(f"cannot inspect sandbox runtime: {result.stderr.strip()}")
+    try:
+        payload = json.loads(result.stdout)
+        raw = payload[0]
+    except (json.JSONDecodeError, IndexError, TypeError) as exc:
+        raise SandboxError("Docker returned malformed sandbox inspect data") from exc
+    if not isinstance(raw, dict):
+        raise SandboxError("Docker returned malformed sandbox inspect data")
+    return raw
+
+
+def _host_cpus(host: Mapping[str, object]) -> float:
+    nano = int(host.get("NanoCpus") or 0)
+    if nano:
+        return nano / 1_000_000_000
+    quota = int(host.get("CpuQuota") or 0)
+    period = int(host.get("CpuPeriod") or 0)
+    return quota / period if quota and period else 0.0
+
+
+def _container_memory_usage(name: str, *, docker: str) -> int:
+    result = _run([docker, "stats", "--no-stream", "--format", "{{json .}}", name], timeout=30)
+    if result.returncode or not result.stdout.strip():
+        raise SandboxError("cannot measure current memory usage before resize")
+    try:
+        raw = json.loads(result.stdout.splitlines()[0])
+    except json.JSONDecodeError as exc:
+        raise SandboxError("Docker returned malformed memory usage before resize") from exc
+    text = str(raw.get("MemUsage") or raw.get("Mem Usage") or "")
+    usage = text.split("/", 1)[0].strip()
+    match = re.fullmatch(r"([0-9.]+)\s*([kmgt]?i?b|b)", usage, re.I)
+    if not match:
+        raise SandboxError("Docker did not report current memory usage before resize")
+    unit = match.group(2).casefold().replace("ib", "").replace("b", "")
+    return int(float(match.group(1)) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[unit])
+
+
+def _metadata_allocation_env(metadata: Mapping[str, object]) -> dict[str, str]:
+    stored = metadata.get("allocation_env")
+    if isinstance(stored, Mapping) and stored:
+        return {str(key): str(value) for key, value in stored.items()}
+    resources = metadata.get("resources") if isinstance(metadata.get("resources"), Mapping) else {}
+    request_raw = metadata.get("resource_request")
+    request = ResourceRequest.from_mapping(request_raw if isinstance(request_raw, Mapping) else metadata)
+    return allocation_environment({
+        "cpus": float(resources.get("cpus") or request.preferred_cpus),
+        "memory_bytes": parse_bytes(resources.get("memory") or request.preferred_memory_bytes),
+    }, request)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, int]:

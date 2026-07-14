@@ -97,7 +97,12 @@ def publish_event(
                 raise RaceEventError("event_id already exists with conflicting content")
             return {**existing[event.event_id], "idempotent": True}
         _append_jsonl(path, event.to_dict())
-    return {**event.to_dict(), "idempotent": False}
+    result = {**event.to_dict(), "idempotent": False}
+    # Resource scheduling is event-driven, but remains advisory: this records a
+    # rebalance request and priority signal without touching native sessions.
+    from .resources.scheduler import note_race_event
+    note_race_event(root, result)
+    return result
 
 
 def show_events(

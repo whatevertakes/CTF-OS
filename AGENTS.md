@@ -53,6 +53,22 @@ Use timeout profiles: quick probe 60s, normal command 300s, decompile 900s, and 
 
 The shared `challenge-service` lifecycle remains Sol-only. A worker may build/start/restart/reset/log/inspect/stop only its own exact-label branch-private service via `branch-service-*`; it cannot mutate a sibling or shared service. Rootless nested runtimes are allowed when the challenge requires them, but the host Docker socket is never passed through.
 
+## Dynamic competition compute scheduler
+
+Do not leave useful host compute idle during an active solve. Allocate from workload evidence and runtime progress, not fixed profile labels. Legacy `light`, `standard`, `heavy`, and `large-forensic` names are compatibility inputs only; profile names, heavy mutual exclusion, and fixed concurrency are not admission gates.
+
+Before long computation, Sol runs `resource-status`, creates or updates a `resource-request`, and checks `resource-plan`. The scheduler detects the minimum effective host/Docker/cgroup/user CPU and memory limit, storage reserve, and NVIDIA runtime/VRAM; degraded observations never stop the solve. It guarantees minimums by flag/exploit/Sol/progress value, scales progressing flag-producing paths aggressively toward preferred/max, and never scales a broken loop merely because it consumes CPU. Low CPU plus network or I/O evidence is not treated as idle.
+
+New parallel solver/harness code must use the live allocation instead of a fixed worker count:
+
+```python
+import os
+
+workers = max(1, int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")))
+```
+
+Long runs use bounded timeout slices and publish progress counters/checkpoints/artifact changes. Run `scheduler-rebalance` after meaningful race events, new admission, plateau/replacement, GPU start/finish, completion, cleanup, and flags. `sandbox-resize` may change a running container's CPU and safely increase/shrink memory, but memory never shrinks below measured usage and only Sol applies global rebalance. Release completed worker resources immediately while retaining artifacts/evidence/history. Python reports resize, preemption, and race-width recommendations; Sol still owns native child lifecycle and keeps actively solving while compute is allocated.
+
 ## Flag fast path and adaptive verification
 
 States are `FLAG_CANDIDATE`, `LOCAL_FLAG_OBTAINED`, `REMOTE_FLAG_OBTAINED`, `SUBMISSION_RECOMMENDED`, `FULLY_VERIFIED`, and `SUBMITTED_BY_HUMAN`.

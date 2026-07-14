@@ -87,7 +87,32 @@ uv run python -m ctf_os.agent_tools sandbox-exec --timeout-profile symbolic_slic
   workers/x/sandbox.json -- python3 /work/solve.py
 ```
 
-Resource admission은 profile별 고정 concurrency나 heavy 단일 실행 제한 대신 Docker host의 memory/CPU 총량, 현재 reservation, host reserve(메모리 max(4GiB, 15%), CPU 최소 1~2개)를 사용합니다. 부족하면 high-value prefix만 admit하고 완료 sandbox를 정리해 slot을 재사용합니다.
+Resource admission은 profile별 고정 concurrency나 heavy 단일 실행 제한 대신 host/Docker/cgroup/user cap 중 최소 상한, 현재 CPU/RAM/storage/GPU reservation과 실측 utilization, host reserve(메모리 max(4GiB, 15%), CPU 1~2개, storage max(10GiB, 10%)), workload 가치와 progress를 사용합니다. `light`/`standard`/`heavy`/`large-forensic`는 기존 metadata 호환용이며 hard gate가 아닙니다. 지표 일부를 읽지 못하면 `observation_mode: DEGRADED`로 계속 동작합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools resource-status
+uv run python -m ctf_os.agent_tools resource-request 1 --contest my-ctf \
+  --workload-class symbolic-execution --priority HIGH
+uv run python -m ctf_os.agent_tools resource-plan 1 --contest my-ctf
+uv run python -m ctf_os.agent_tools resource-sample 1 --contest my-ctf \
+  --metadata output/my-ctf/rev/challenge/workers/symbolic-1/sandbox.json
+uv run python -m ctf_os.agent_tools scheduler-rebalance 1 --contest my-ctf
+uv run python -m ctf_os.agent_tools sandbox-resize \
+  output/my-ctf/rev/challenge/workers/symbolic-1/sandbox.json --cpus 8 --memory 14g
+uv run python -m ctf_os.agent_tools resource-history 1 --contest my-ctf
+```
+
+Scheduler는 CRITICAL/HIGH minimum을 먼저 보존하고 flag/exploit/Sol direct lane, progress가 확인된 symbolic/fuzz/crypto/forensic 계산을 preferred/max까지 확장합니다. 단순 CPU 포화만으로 확장하지 않으며 busy loop·반복 오류·checkpoint/artifact 정지는 `BUMP_AND_RETRY`/교체/takeover 권고로 전환합니다. 반대로 낮은 CPU와 network/IO progress가 함께 있으면 축소하지 않습니다. 완료/오류/교체/cleanup/remote flag 이후 자원은 즉시 release되고 evidence와 history는 남습니다.
+
+새로 작성하는 병렬 solver/harness는 고정 `max_workers` 대신 다음 값을 사용합니다.
+
+```python
+import os
+
+workers = max(1, int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")))
+```
+
+모든 sandbox는 allocated CPU/RAM/workload/priority와 OpenMP/BLAS/Rayon thread 환경을 받으며, resize 뒤의 `sandbox-exec`에는 최신 값이 전달됩니다. Sol은 scheduler가 계산을 배분하는 동안 계속 직접 공격하고 native child lifecycle은 계속 Sol만 관리합니다.
 
 Shared `challenge-service` lifecycle은 Sol 전용입니다. Crash/fuzz branch는 자기 session ID와 정확히 일치하는 `branch-service-*` instance를 build/start/restart/reset/log/inspect/stop/cleanup할 수 있으나 shared/sibling/host Docker는 조작할 수 없습니다.
 

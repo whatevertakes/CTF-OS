@@ -22,6 +22,8 @@ uv run python -m ctf_os.agent_tools race-plan-start '<selector>' \
 
 Immediately create every admitted child through Codex runtime native delegation using its returned prompt packet, mark it RUNNING, and create its sandbox. Requested role/model/reasoning are intent only; do not claim pinning without observed evidence.
 
+The race response includes a capacity-based resource plan. Before any long computation, run `resource-status`, register/override the branch with `resource-request`, and inspect `resource-plan`. Create native children for the capacity-admitted allocations first; keep unallocated packets as launch recommendations. Rebalance after meaningful events and release completed resources immediately. The scheduler only allocates compute; Sol keeps solving and owns every native lifecycle decision.
+
 ## Race tiers
 
 - Tier 0: Sol directly solves; optionally one implementation/verifier child.
@@ -76,6 +78,21 @@ Swap templates immediately when evidence favors a better family.
 Create worker sandboxes only after native delegation. Challenge input and `/context` are read-only; `/work`, `/evidence`, and `/artifacts` are private and writable. A worker accesses only its assigned challenge, declared targets, branch directory, sandbox, and branch-private service.
 
 Use `--timeout-profile quick_probe|normal_command|decompile|symbolic_slice|fuzz_slice|forensic_scan|crypto_heavy|cracking_slice|ai_inference`. Long work runs in 1800-second slices with progress artifacts/events between slices. GDB, angr, z3, Sage, fpylll, RsaCtfTool, hashcat/john, AFL++, binwalk, volatility, tshark, carving, long Python solvers, model inference, and media tooling are normal CTF tools when available.
+
+Do not leave useful host compute idle. Allocate from workload evidence and runtime progress rather than legacy profile labels. Scale progressing flag/exploit/symbolic/fuzz/crypto/forensic paths aggressively, but do not scale a busy loop, repeated error, deadlock, or output/artifact/checkpoint stall merely because it consumes CPU. A network-bound worker with new interactions/evidence is progressing even at low CPU.
+
+All newly generated parallel solvers and harnesses use the scheduler value instead of a hard-coded worker count:
+
+```python
+import os
+
+workers = max(
+    1,
+    int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")),
+)
+```
+
+The sandbox also provides `CTF_OS_ALLOCATED_CPUS`, `CTF_OS_ALLOCATED_MEMORY_BYTES`, `CTF_OS_WORKLOAD_CLASS`, `CTF_OS_RESOURCE_PRIORITY`, and standard BLAS/OpenMP/Rayon thread variables. After resize, subsequent `sandbox-exec` commands receive the latest allocation. Do not modify challenge-provided artifacts merely to retrofit this convention; use it in new solver/harness code.
 
 Pwn/rev/misc sandboxes automatically support ptrace/core and permissive seccomp where required. Forensic profiles may receive loop devices and `SYS_ADMIN` for read-only mounts. AI uses NVIDIA GPU pass-through when available. Never mount the host Docker socket, host root, SSH/browser profiles, personal kubeconfig/cloud config, or personal credentials.
 

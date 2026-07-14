@@ -73,7 +73,13 @@ def sandbox_status(*, docker: str = "docker") -> dict[str, object]:
     budget = _memory_budget(host_memory)
     reserved = sum(int(item["memory_bytes"]) for item in active)
     host_cpus = _docker_cpu_total(docker)
-    cpu_budget = max(0.0, host_cpus - min(2.0, max(1.0, host_cpus * .15)))
+    if host_cpus >= 8:
+        cpu_reserve = 2.0
+    elif host_cpus >= 4:
+        cpu_reserve = 1.0
+    else:
+        cpu_reserve = min(max(.25, host_cpus * .15), max(.25, host_cpus - .25))
+    cpu_budget = max(0.0, host_cpus - cpu_reserve)
     reserved_cpus = sum(float(item.get("cpus", 0.0)) for item in active)
     host_storage_free = shutil.disk_usage("/").free
     storage_budget = max(0, host_storage_free - max(10 * GIB, host_storage_free // 10))
@@ -113,7 +119,9 @@ def sandbox_status(*, docker: str = "docker") -> dict[str, object]:
 
 
 def admit(
-    profile_name: str, *, requested_memory_bytes: int | None = None, docker: str = "docker"
+    profile_name: str, *, requested_memory_bytes: int | None = None,
+    requested_cpus: float | None = None, requested_storage_bytes: int | None = None,
+    docker: str = "docker"
 ) -> dict[str, object]:
     requested = resource_profile(profile_name)
     memory_request = requested.memory_bytes if requested_memory_bytes is None else requested_memory_bytes
@@ -131,14 +139,20 @@ def admit(
         )
     reserved_cpus = float(status.get("reserved_cpus", 0.0))
     cpu_budget = float(status.get("admission_cpu_budget", float("inf")))
-    if reserved_cpus + requested.cpus > cpu_budget:
+    cpu_request = requested.cpus if requested_cpus is None else requested_cpus
+    if cpu_request <= 0:
+        raise ResourceError("sandbox admission CPU request must be positive")
+    if reserved_cpus + cpu_request > cpu_budget:
         raise ResourceError(
-            f"sandbox admission refused: {requested.cpus} CPUs requested but only "
+            f"sandbox admission refused: {cpu_request} CPUs requested but only "
             f"{max(0.0, cpu_budget - reserved_cpus):.2f} remain in the Docker host CPU budget"
         )
     reserved_storage = int(status.get("reserved_storage_bytes", 0))
     storage_budget = int(status.get("admission_storage_budget_bytes", 2**63 - 1))
-    if reserved_storage + requested.storage_bytes > storage_budget:
+    storage_request = requested.storage_bytes if requested_storage_bytes is None else requested_storage_bytes
+    if storage_request <= 0:
+        raise ResourceError("sandbox admission storage request must be positive")
+    if reserved_storage + storage_request > storage_budget:
         raise ResourceError("sandbox admission refused: insufficient aggregate Docker storage budget")
     return status
 
@@ -232,9 +246,11 @@ def _list_managed_sandboxes(*, docker: str, include_stopped: bool) -> list[dict[
             ):
                 continue
             state = raw.get("State", {}) or {}
-            memory = _positive_int(labels.get("ctf-os.memory_bytes"))
+            # Running resize changes HostConfig but Docker labels are immutable;
+            # prefer the live limit and retain the label as a legacy fallback.
+            memory = _positive_int(raw.get("HostConfig", {}).get("Memory"))
             if memory == 0:
-                memory = _positive_int(raw.get("HostConfig", {}).get("Memory"))
+                memory = _positive_int(labels.get("ctf-os.memory_bytes"))
             profile = labels.get("ctf-os.resource_profile")
             if profile not in RESOURCE_PROFILES:
                 if memory <= RESOURCE_PROFILES["light"].memory_bytes:
@@ -255,6 +271,9 @@ def _list_managed_sandboxes(*, docker: str, include_stopped: bool) -> list[dict[
                 "contest": str(labels.get("ctf-os.contest", "")),
                 "challenge_id": str(labels.get("ctf-os.challenge_id", "")),
                 "branch": str(labels.get("ctf-os.branch", "")),
+                "session_id": str(labels.get("ctf-os.session_id", labels.get("ctf-os.branch", ""))),
+                "workload_class": str(labels.get("ctf-os.workload_class", "")),
+                "priority": str(labels.get("ctf-os.resource_priority", "")),
             })
         except (IndexError, TypeError, json.JSONDecodeError) as exc:
             raise ResourceError(f"Docker returned malformed inspect data for {identifier}") from exc

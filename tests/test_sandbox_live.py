@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from ctf_os.sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts
+from ctf_os.sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts, resize
 
 
 pytestmark = pytest.mark.skipif(os.environ.get("CTF_OS_LIVE_DOCKER") != "1", reason="live Docker opt-in")
@@ -42,3 +42,29 @@ def test_live_ro_writes_network_timeout_and_cleanup(tmp_path: Path) -> None:
     timed = execute(timeout_meta, ["sleep", "30"], 1)
     assert timed["timed_out"]
     assert subprocess.run(["docker", "inspect", timeout_meta["name"]], capture_output=True).returncode != 0
+
+
+def test_live_running_resize_updates_limits_and_followup_environment(tmp_path: Path) -> None:
+    source = tmp_path / "challenge" / "input"
+    source.mkdir(parents=True)
+    branch = tmp_path / "challenge" / "workers" / "resize"
+    metadata = create(SandboxSpec(
+        "demo", "resize123", "resize", source, branch,
+        image="ctf-os-sandbox:base", resource_profile="light",
+        session_id="resize", parent_session_id="sol-main", session_role="child",
+        workload_class="custom-cpu-bound", resource_priority="HIGH",
+    ))
+    try:
+        receipt = resize(
+            metadata, cpus=1.5, memory="3g",
+            session_id="sol-main", session_role="sol",
+        )
+        assert receipt["verified"] is True
+        environment = execute(
+            metadata,
+            ["sh", "-c", "printf '%s %s' \"$CTF_OS_ALLOCATED_CPUS\" \"$CTF_OS_RECOMMENDED_WORKERS\""],
+            10, session_id="resize", session_role="child",
+        )
+        assert environment["stdout"] == "1.5 1"
+    finally:
+        cleanup(metadata, session_id="sol-main", session_role="sol")
