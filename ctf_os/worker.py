@@ -19,7 +19,7 @@ WORKER_STATUSES = frozenset({
 CONFIDENCE_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
 CHECKPOINT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
-    "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+    "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -134,8 +134,18 @@ def save_worker_checkpoint(
     input_fingerprint: str, checkpoint_type: str, summary: str,
     evidence: list[str], artifacts: list[str], useful_for: list[str],
     recommended_action: str, confidence: float,
+    current_exploit_hypothesis: str = "", decisive_experiment_performed: str = "",
+    observed_result: str = "", exploit_proximity: float = 0.0,
+    next_exploit_action: str = "", decision: str = "CONTINUE",
+    working_poc_present: bool = False, remote_ready: bool = False,
+    research_drift_detected: bool = False, repeated_command: bool = False,
+    sibling_insight_applied: bool = False, hypothesis_family_changed: bool = False,
 ) -> dict[str, Any]:
-    """Atomically save a compact checkpoint in the matching private worker root."""
+    """Save a compact exploit-action checkpoint without changing schema v1.
+
+    The original summary/evidence fields remain valid.  The optional execution
+    fields let utility judge movement toward a PoC/flag instead of report volume.
+    """
 
     root = _safe_worker_root(worker_root)
     if checkpoint_type not in CHECKPOINT_TYPES:
@@ -147,6 +157,20 @@ def save_worker_checkpoint(
     safe_evidence = _paths_limited(root, evidence, "evidence", maximum=16)
     safe_artifacts = _paths_limited(root, artifacts, "artifacts", maximum=16)
     targets = _short_strings(useful_for, "useful_for", maximum=16, item_limit=128)
+    hypothesis = _limited_optional_text(current_exploit_hypothesis, "current_exploit_hypothesis", 1000)
+    experiment = _limited_optional_text(decisive_experiment_performed, "decisive_experiment_performed", 1000)
+    result_text = _limited_optional_text(observed_result, "observed_result", 1000)
+    next_action = _limited_optional_text(next_exploit_action, "next_exploit_action", 1000)
+    proximity = _proximity(exploit_proximity)
+    normalized_decision = _checkpoint_decision(decision)
+    booleans = {
+        "working_poc_present": working_poc_present, "remote_ready": remote_ready,
+        "research_drift_detected": research_drift_detected, "repeated_command": repeated_command,
+        "sibling_insight_applied": sibling_insight_applied,
+        "hypothesis_family_changed": hypothesis_family_changed,
+    }
+    if any(not isinstance(value, bool) for value in booleans.values()):
+        raise WorkerResultError("checkpoint execution flags must be booleans")
     solve_root = root.parents[1]
     state_path = solve_root / "STATE.json"
     if state_path.is_file() and not state_path.is_symlink():
@@ -174,6 +198,11 @@ def save_worker_checkpoint(
             "sequence": sequence, "type": checkpoint_type, "summary": compact_summary,
             "evidence": safe_evidence, "artifacts": safe_artifacts, "useful_for": targets,
             "recommended_action": action, "confidence": float(confidence),
+            "current_exploit_hypothesis": hypothesis,
+            "decisive_experiment_performed": experiment,
+            "observed_result": result_text, "exploit_proximity": proximity,
+            "next_exploit_action": next_action, "decision": normalized_decision,
+            **booleans,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         target = checkpoints / f"{sequence:06d}.json"
@@ -210,6 +239,19 @@ def load_worker_checkpoint(path: Path) -> dict[str, Any]:
     _paths_limited(root, payload["evidence"], "evidence", maximum=16)
     _paths_limited(root, payload["artifacts"], "artifacts", maximum=16)
     _short_strings(payload["useful_for"], "useful_for", maximum=16, item_limit=128)
+    for field in (
+        "current_exploit_hypothesis", "decisive_experiment_performed", "observed_result",
+        "next_exploit_action",
+    ):
+        _limited_optional_text(payload.get(field, ""), field, 1000)
+    _proximity(payload.get("exploit_proximity", 0.0))
+    _checkpoint_decision(payload.get("decision", "CONTINUE"))
+    for field in (
+        "working_poc_present", "remote_ready", "research_drift_detected", "repeated_command",
+        "sibling_insight_applied", "hypothesis_family_changed",
+    ):
+        if not isinstance(payload.get(field, False), bool):
+            raise WorkerResultError(f"{field} must be a boolean")
     _timestamp(payload["created_at"], "created_at")
     if not isinstance(payload["confidence"], (int, float)) or isinstance(payload["confidence"], bool) or not 0 <= payload["confidence"] <= 1:
         raise WorkerResultError("checkpoint confidence must be between 0 and 1")
@@ -311,7 +353,7 @@ def _hypotheses(root: Path, value: Any) -> list[dict[str, Any]]:
     for index, item in enumerate(value):
         if not isinstance(item, Mapping):
             raise WorkerResultError(f"hypotheses[{index}] must be an object")
-        required = {"claim", "status", "confidence", "evidence", "commands", "kill_condition", "reopen_condition"}
+        required = {"claim", "status", "confidence", "evidence", "commands", "kill_condition"}
         missing = sorted(required.difference(item))
         if missing:
             raise WorkerResultError(f"hypotheses[{index}] is missing: {', '.join(missing)}")
@@ -328,7 +370,7 @@ def _hypotheses(root: Path, value: Any) -> list[dict[str, Any]]:
             "evidence": _paths(root, item["evidence"], f"hypotheses[{index}].evidence"),
             "commands": list(commands),
             "kill_condition": _nullable_text(item["kill_condition"], f"hypotheses[{index}].kill_condition"),
-            "reopen_condition": _nullable_text(item["reopen_condition"], f"hypotheses[{index}].reopen_condition"),
+            "reopen_condition": _nullable_text(item.get("reopen_condition"), f"hypotheses[{index}].reopen_condition"),
         })
     return hypotheses
 
@@ -377,6 +419,18 @@ def _limited_optional_text(value: Any, field: str, maximum: int) -> str:
     if len(text) > maximum:
         raise WorkerResultError(f"{field} must be at most {maximum} characters")
     return text
+
+
+def _proximity(value: Any) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0.0 <= float(value) <= 1.0:
+        raise WorkerResultError("exploit_proximity must be a number between 0 and 1")
+    return round(float(value), 4)
+
+
+def _checkpoint_decision(value: Any) -> str:
+    if not isinstance(value, str) or value.strip().upper() not in {"KILL", "CONTINUE", "PROMOTE"}:
+        raise WorkerResultError("checkpoint decision must be KILL, CONTINUE, or PROMOTE")
+    return value.strip().upper()
 
 
 def _short_strings(value: Any, field: str, *, maximum: int, item_limit: int) -> list[str]:

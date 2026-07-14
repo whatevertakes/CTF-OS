@@ -21,6 +21,7 @@ from .workspace import atomic_json, atomic_text, state_lock
 
 RACE_SCHEMA_VERSION = 1
 DEFAULT_WIDTH = {0: 0, 1: 2, 2: 3, 3: 4, 4: 4}
+PROMPT_PACKET_MAX_BYTES = 6000
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,9 @@ class RaceBranchSpec:
     evidence_contract: tuple[str, ...]
     success_condition: str
     kill_condition: str
+    decisive_experiment: str = "Run the cheapest experiment that can prove or kill the expected primitive"
+    minimal_poc_requirement: str = "Build the smallest executable input, request, or script that proves the primitive"
+    remote_transition_requirement: str = "Attempt the declared remote as soon as the PoC is plausible"
     maximum_steps: int = 80
     budget_seconds: int = 1800
     requested_model_role: str = "solver"
@@ -48,15 +52,15 @@ class RaceBranchSpec:
             session_id=str(raw.get("session_id") or f"race-{index + 1}"),
             role=str(raw.get("role") or "independent-full-solve"),
             hypothesis_family=str(raw.get("hypothesis_family") or "independent-full-solve"),
-            hypothesis=str(raw.get("hypothesis") or "Independently solve the challenge end to end"),
+            hypothesis=str(raw.get("hypothesis") or "Independently race for the shortest valid flag path"),
             scope=_strings(raw.get("scope") or ["challenge"]),
-            tool_strategy=_strings(raw.get("tool_strategy") or ["independent-analysis", "solver-implementation"]),
+            tool_strategy=_strings(raw.get("tool_strategy") or ["decisive-experiment", "minimal-poc", "remote-transition"]),
             expected_artifacts=_strings(raw.get("expected_artifacts") or [f"artifacts/solver-{index + 1}"]),
         )
         evidence = tuple(_strings(raw.get("evidence_contract") or [
-            "Publish confirmed facts and rejected hypotheses as race events",
-            "Preserve exact commands and artifact paths",
-            "Publish a remote flag immediately with its network receipt",
+            "Publish an exploit primitive or working PoC before any summary",
+            "Preserve the exact exploit command, minimal artifact, and flag provenance",
+            "Publish a flag candidate or remote flag immediately with its receipt",
         ]))
         steps = int(raw.get("maximum_steps", 80))
         budget = int(raw.get("budget_seconds", 1800))
@@ -67,8 +71,11 @@ class RaceBranchSpec:
             hypothesis_family=candidate.hypothesis_family, hypothesis=candidate.hypothesis,
             scope=candidate.scope, tool_strategy=candidate.tool_strategy,
             expected_artifacts=candidate.expected_artifacts, evidence_contract=evidence,
-            success_condition=str(raw.get("success_condition") or "Obtain a flag or a reusable exploit/solver primitive"),
-            kill_condition=str(raw.get("kill_condition") or "Exact scope violation, dead branch classification, or replacement by Sol"),
+            success_condition=str(raw.get("success_condition") or "The decisive experiment proves the primitive, produces a working PoC, or obtains the flag"),
+            kill_condition=str(raw.get("kill_condition") or "The decisive experiment refutes the primitive or a changed experiment still does not improve exploit proximity"),
+            decisive_experiment=str(raw.get("decisive_experiment") or "Run the cheapest experiment that can prove or kill the expected primitive"),
+            minimal_poc_requirement=str(raw.get("minimal_poc_requirement") or "Build the smallest executable input, request, or script that proves the primitive"),
+            remote_transition_requirement=str(raw.get("remote_transition_requirement") or "Attempt the declared remote as soon as the PoC is plausible"),
             maximum_steps=steps, budget_seconds=budget,
             requested_model_role=str(raw.get("requested_model_role") or raw.get("model_role") or "solver"),
             requested_reasoning=str(raw.get("requested_reasoning") or raw.get("reasoning") or "high"),
@@ -153,7 +160,7 @@ def start_race_plan(
         "sol_lane": {
             "session_id": parent_session_id, "role": "lead-attacker-and-race-coordinator",
             "required": True, "status": "RUNNING",
-            "instruction": "Pursue the highest-value deep solve path while coordinating the race.",
+            "instruction": "Drive the leading primitive into the smallest PoC and declared-remote attempt; coordinate only at high-value events.",
         },
         "created_at": now, "updated_at": now, "branches": [],
         "admission_decisions": [], "ledger_recoverable": True,
@@ -172,7 +179,10 @@ def start_race_plan(
         if not decision["admitted"]:
             rejected.append({"session_id": spec.session_id, "reason": decision["reason"]})
             continue
-        plan["branches"].append(_branch_payload(spec, decision, challenge_id, input_fingerprint, parent_session_id))
+        plan["branches"].append(_branch_payload(
+            spec, decision, challenge_id, input_fingerprint, parent_session_id,
+            tier=tier, tier_reason=tier_reason,
+        ))
     with state_lock(solve_root):
         current = plan_path(solve_root)
         if current.is_symlink():
@@ -241,7 +251,7 @@ def race_board(
         "service_status": dict(service_status or {"state": "UNKNOWN"}),
         "resource_use": dict(resources or {}),
         "native_children_created": False,
-        "next_action": "Sol must immediately create admitted children with native runtime delegation using each prompt_packet.",
+        "next_action": "Sol must launch admitted native children, then keep driving the leading exploit hypothesis toward a minimal PoC and remote attempt.",
     }
 
 
@@ -252,10 +262,13 @@ def _template_spec(row: Mapping[str, Any], *, index: int, category: str) -> Race
     return RaceBranchSpec.from_mapping({
         "session_id": f"race-{index + 1}-{role}", "role": role,
         "hypothesis_family": family,
-        "hypothesis": f"Pursue {family} as an independent first-to-flag path",
+        "hypothesis": _template_objective(category, role, family),
         "scope": ["challenge-input", "declared-targets"], "tool_strategy": tools,
         "expected_artifacts": [f"artifacts/{role}-solver", f"evidence/{role}-receipts.jsonl"],
         "requested_model_role": "recon" if index == 0 else "implementation" if index == 1 else "deep-solver",
+        "decisive_experiment": "Run one category-appropriate test that proves or kills this expected primitive",
+        "minimal_poc_requirement": "Produce the smallest executable exploit, solver, query, or extraction script",
+        "remote_transition_requirement": "Use the declared remote immediately when the primitive or solver is plausible",
         "requested_reasoning": "high", "purpose": "independent-full-solve" if "independent" in role else "parallel-race",
     }, index=index)
 
@@ -276,27 +289,51 @@ def _default_tools(category: str, role: str) -> list[str]:
 
 def _branch_payload(
     spec: RaceBranchSpec, admission: Mapping[str, Any], challenge_id: str,
-    fingerprint: str, parent_session_id: str,
+    fingerprint: str, parent_session_id: str, *, tier: int, tier_reason: str,
 ) -> dict[str, Any]:
     now = utc_now()
     packet = {
         "schema_version": 1, "session_id": spec.session_id,
         "parent_session_id": parent_session_id, "challenge_id": challenge_id,
         "input_fingerprint": fingerprint, "role": spec.role,
-        "hypothesis_family": spec.hypothesis_family, "hypothesis": spec.hypothesis,
+        "hypothesis_family": spec.hypothesis_family,
+        "primary_objective": "Obtain the first valid flag as quickly as possible",
+        "task_type": "Timed CTF solve; not a research task",
+        "leading_exploit_hypothesis": spec.hypothesis,
+        "hypothesis": spec.hypothesis,
+        "expected_primitive": spec.hypothesis,
+        "decisive_experiment": spec.decisive_experiment,
         "scope": list(spec.scope), "tool_strategy": list(spec.tool_strategy),
         "expected_artifacts": list(spec.expected_artifacts),
         "evidence_contract": list(spec.evidence_contract),
         "success_condition": spec.success_condition, "kill_condition": spec.kill_condition,
+        "minimal_poc_requirement": spec.minimal_poc_requirement,
+        "remote_transition_requirement": spec.remote_transition_requirement,
+        "maximum_active_hypotheses": 3,
+        "hypothesis_contract": [
+            "expected primitive", "cheapest decisive experiment", "success condition", "kill condition",
+        ],
         "budget_seconds": spec.budget_seconds, "maximum_steps": spec.maximum_steps,
+        "replacement_context": tier_reason if tier == 4 else None,
+        "replacement_requirement": (
+            "Use a genuinely different exploit mechanism and state why the prior family did not increase exploit proximity"
+            if tier == 4 else None
+        ),
         "instruction": (
-            "Solve independently and race for the first flag. Publish compact confirmed insights during long work. "
-            "Use only this challenge and declared targets. Immediately publish REMOTE_FLAG_OBTAINED with receipt and artifact."
+            "Race for the first valid flag; this is not a research task. Run the decisive experiment now, kill or promote "
+            "the hypothesis, build only the minimal PoC, and move to the declared remote as soon as plausible. Do not "
+            "perform comprehensive analysis. Publish WORKING_POC, EXPLOIT_PRIMITIVE, FLAG_CANDIDATE, or "
+            "REMOTE_FLAG_OBTAINED before any summary. Use only this challenge and declared targets."
         ),
     }
+    if len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > PROMPT_PACKET_MAX_BYTES:
+        raise DelegationError(f"prompt packet exceeds {PROMPT_PACKET_MAX_BYTES} bytes")
     return {
         **_candidate_payload(spec.candidate), "evidence_contract": list(spec.evidence_contract),
         "success_condition": spec.success_condition, "kill_condition": spec.kill_condition,
+        "decisive_experiment": spec.decisive_experiment,
+        "minimal_poc_requirement": spec.minimal_poc_requirement,
+        "remote_transition_requirement": spec.remote_transition_requirement,
         "maximum_steps": spec.maximum_steps, "budget_seconds": spec.budget_seconds,
         "requested_model_role": spec.requested_model_role,
         "requested_reasoning": spec.requested_reasoning,
@@ -306,6 +343,26 @@ def _branch_payload(
         "purpose": spec.purpose, "admission": dict(admission), "status": "ADMITTED",
         "prompt_packet": packet, "created_at": now, "started_at": None, "finished_at": None,
     }
+
+
+def _template_objective(category: str, role: str, family: str) -> str:
+    if "independent" in role:
+        return (
+            "Independently race for the shortest valid flag path; do not produce comprehensive analysis "
+            "or wait for sibling conclusions"
+        )
+    objectives = {
+        "pwn": "Prove one input-control primitive and immediately turn it into a minimal exploit",
+        "web": "Identify one reachable sink or bypass and attempt one exploit chain",
+        "rev": "Recover only the validation logic needed to construct an accepted input",
+        "crypto": "Identify the first attackable weakness and immediately implement it",
+        "forensic": "Locate the shortest deterministic extraction path to the requested answer",
+        "misc": "Test the leading mechanism and automate the shortest solution path",
+        "osint": "Test the smallest number of high-value pivots needed to verify the answer",
+        "cloud": "Prove one scoped permission or service chain and execute the minimal exploit",
+        "ai": "Test one model/input weakness and immediately implement the solver or inversion",
+    }
+    return f"{objectives.get(category, 'Test one concrete exploit mechanism and build the minimal PoC')} ({family})"
 
 
 def _candidate_payload(candidate: BranchCandidate) -> dict[str, Any]:

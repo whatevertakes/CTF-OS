@@ -1,13 +1,33 @@
-# Web playbook
+# Web exploit-first playbook
 
-## Scope and recon
+## 1. Fast recon budget
 
-Connect only to the URL in `contest.md`; do not crawl unrelated hosts, enumerate broad networks, or use credentials outside the challenge. Capture a baseline response, headers, redirects, cookies, routes linked by the application, and supplied source. Build a request ledger with method, path, parameters, status, and body digest.
+Use only the declared application. Budget three observations: (1) entrypoint plus the highest-value dataflow boundary in supplied source or visible route; (2) one baseline request preserving cookies/redirects; (3) one highest-value payload or source-to-sink test. Then choose an exploit chain; do not enumerate the application.
 
-## Hypotheses and tooling
+## 2. Highest-value exploit hypotheses
 
-Start from observed data flow: authorization boundaries, server-side template use, database queries, file handling, redirects, WebSockets, and token validation. Use `curl`, `httpx`, or short Python clients with small, reversible probes. Reproduce supplied Flask/FastAPI, Node, or PHP source locally; test SQL injection, SSTI, upload/traversal, SSRF, JWT, prototype pollution, or sandbox behavior only where the challenge exposes a relevant input.
+Choose at most three reachable chains involving auth/session bypass, injection, template execution, traversal/file read, unsafe upload, SSRF/OAST, token confusion, parser/serialization behavior, or business logic. Track only the auth/session steps required by that chain.
 
-## Validation and replay
+## 3. Cheapest decisive experiments
 
-Confirm impact with the smallest authorized request and a clean baseline comparison. Save redacted request/response pairs, source locations, and reproduction steps under `/artifacts`; never copy browser profiles, API keys, or personal secrets. If a probe only changes an error, record that observation and shift to the next evidenced hypothesis.
+Send one controlled comparison request that can prove or kill the sink/bypass: a quote/operator differential, template expression, traversal target, signed-token mutation, callback token, or role/ownership swap. Prefer a single reversible request over crawling.
+
+## 4. Immediate PoC criteria
+
+A minimal `curl`, raw request, or short Python client that proves read, bypass, callback, execution, or flag-relevant state change is a working PoC. Save the exact request/response rather than a taxonomy report.
+
+## 5. Remote transition criteria
+
+If source/local behavior makes the chain plausible, test the declared remote immediately. Remote-only auth, bot, OAST, session, and deployment behavior are part of the decisive experiment, not a final ceremony.
+
+## 6. Kill conditions
+
+Kill when the input cannot reach the suspected sink/boundary, the baseline differential disproves the assumption, or one payload-family change still produces no exploit-relevant effect. Then replace the mechanism, not merely the payload spelling.
+
+## 7. Common research-drift traps
+
+Do not enumerate every endpoint, audit all source after one reachable sink exists, build a vulnerability taxonomy, fuzz unrelated parameters, map the whole framework, or keep exploring bugs while a viable exploit chain is alive.
+
+## 8. Flag fast path
+
+Publish the bypass/read/execution primitive or working request first. Execute the smallest declared-remote chain, preserve the exact redacted receipt and exploit client, and surface the flag immediately.

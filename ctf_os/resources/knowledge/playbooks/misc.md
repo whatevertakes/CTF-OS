@@ -1,13 +1,33 @@
-# Misc playbook
+# Misc exploit-first playbook
 
-## Scope and recon
+## 1. Fast recon budget
 
-Inventory every supplied file and the exact challenge text before choosing a category. Use local-only inspection first, record file types, encodings, protocols, puzzle rules, and prior failed approaches. Keep experiments in `/work` and durable evidence in `/artifacts`.
+Budget three observations: (1) challenge rule plus targeted file/protocol type; (2) one normal input/output; (3) one highest-value mechanism differential. Then select the solver, extraction, protocol exploit, or inversion path. Do not inventory every supplied detail.
 
-## Hypotheses and tooling
+## 2. Highest-value exploit hypotheses
 
-Favor the simplest evidence-backed branch: media transforms with `ffmpeg`/`sox`, image or QR/barcode inspection with ImageMagick/OpenCV/`zbarimg`, signal or numeric work with NumPy/SciPy, graph constraints with NetworkX/Graphviz, z3 constraints, custom protocols with Scapy, or ML-flavored artifacts with CPU PyTorch. Use short scripts with fixed inputs and explicit bounds. Podman is limited to rootless local container/image inspection; there is no Docker socket or privileged nested daemon.
+Choose at most three concrete mechanisms supported by input: encoding/media transform, QR/barcode/OCR, signal/numeric inversion, graph/constraint solve, protocol state abuse, automation/race, or a narrowly evidenced ML behavior.
 
-## Validation and replay
+## 3. Cheapest decisive experiments
 
-Check a solution against all stated constraints and independently rerun it from saved inputs. Save the minimal solver, command, outputs, and assumptions. If an approach repeats the same failure, write a SHIFT note and move to a different class of hypothesis.
+Decode one layer, render one channel/frame, solve a reduced constraint set, send one state-changing packet, or automate one representative interaction. The result must prove/kill the mechanism.
+
+## 4. Immediate PoC criteria
+
+A bounded script or direct command that reproduces the required transform, protocol action, solver output, or answer is a working PoC. Keep it challenge-specific and minimal.
+
+## 5. Remote transition criteria
+
+Move to the declared service when the state machine or solver is plausible; remote interaction may be the decisive experiment. Use branch-private services for crash/restart loops.
+
+## 6. Kill conditions
+
+Kill when a representative input disproves the mechanism, constraints do not reduce, or one changed experiment repeats the same failure. Replace the mechanism class, not just the tool.
+
+## 7. Common research-drift traps
+
+Do not broadly inventory files/protocols after a leading mechanism exists, build a generic automation framework, document every failed transform, switch tools without changing the hypothesis, or insist on an independent full rerun before remote.
+
+## 8. Flag fast path
+
+Publish the primitive or working solver first, execute it on the declared target or supplied input, preserve the minimal artifact/receipt, and surface the flag immediately.

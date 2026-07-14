@@ -3,110 +3,73 @@ name: ctf-solve
 description: Competition-first solve of exactly one authorized CTF challenge with the current user-opened Sol session as lead attacker and a native first-to-flag race. Use for "1번 문제 풀어라", category/name, challenge names, deep solve, or swarm requests after Intake and Triage.
 ---
 
-# CTF solve — first-to-flag native race
+# CTF solve — exploit first
 
-The current user-opened Sol session is the lead attacker and race coordinator. Never run Codex or Claude from Python/a shell, call a model API, or submit a flag automatically.
+`ctf_os/resources/agent-policy.md` is authoritative and governs every step below. This is a timed CTF solve, not a research task: obtain the first valid flag, prefer the shortest executable exploit path, and explain later. The current user-opened Sol session is lead attacker. Never run Codex or Claude from Python/a shell, call a model API, or submit a flag automatically.
 
-## Select and start
+## Start with bounded observation
 
-1. Read root `AGENTS.md`, current `TRIAGE.md`, `ctf_os/resources/agent-policy.md`, and the challenge category playbook.
+1. Read root `AGENTS.md`, current `TRIAGE.md`, the authoritative agent policy, and only the selected category playbook.
 2. Run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'`.
-3. Stop only for ambiguous selection, stale/missing Intake/Triage, missing contest scope, an undeclared required target, required host credential, or out-of-scope action.
-4. Perform compact initial recon for at most roughly 60–90 seconds. Read priority inputs and compact state first; open raw logs/inventory only to validate a concrete hypothesis.
-5. Choose Tier 0–4 and run one atomic `race-plan-start`. Omit `--branch-spec` to use the aggressive category template, or supply evidence-driven JSON. The command records prompt packets but never creates native children.
+3. Stop only for ambiguous selection, stale/missing Intake/Triage, missing scope, an undeclared required target, required host credentials, or an out-of-scope action.
+4. Spend no more than roughly 60–90 seconds and no more than the category playbook's fast-recon command budget. Stop at the first concrete primitive even if budget remains. Read raw logs/inventories only for a current exploit hypothesis.
+5. At budget exhaustion, emit exactly this compact decision state:
+
+```text
+Leading exploit path:
+Decisive next experiment:
+Kill condition:
+Expected time to PoC: immediate | few experiments | long computation
+```
+
+Form at most three active exploit hypotheses. Each contains only `expected primitive`, `cheapest decisive experiment`, `success condition`, and `kill condition`; `reopen_condition` is optional. Run the cheapest decisive experiment now. Kill or promote before adding another hypothesis.
+
+## Start an evidence-driven race
+
+Choose Tier 0–4 and run one atomic `race-plan-start`. Prefer an evidence-driven `--branch-spec`; omit it only when evidence is too thin, because category templates are fallback lanes rather than the attack plan.
 
 ```bash
 uv run python -m ctf_os.agent_tools race-plan-start '<selector>' \
-  --contest '<contest>' --tier 2 --tier-reason '<compact evidence>'
+  --contest '<contest>' --tier 2 --tier-reason '<leading mechanisms and evidence>'
 ```
 
-Immediately create every admitted child through Codex runtime native delegation using its returned prompt packet, mark it RUNNING, and create its sandbox. Requested role/model/reasoning are intent only; do not claim pinning without observed evidence.
+- Tier 0: Sol directly drives the minimal exploit; optionally one implementation/verifier child.
+- Tier 1: two children plus Sol.
+- Tier 2: three children plus Sol.
+- Tier 3: four children plus Sol across distinct executable mechanisms.
+- Tier 4: terminate low-proximity work and replace it while keeping useful concurrency full. Record why proximity stalled and choose a genuinely different exploit mechanism.
 
-The race response includes a capacity-based resource plan. Before any long computation, run `resource-status`, register/override the branch with `resource-request`, and inspect `resource-plan`. Create native children for the capacity-admitted allocations first; keep unallocated packets as launch recommendations. Rebalance after meaningful events and release completed resources immediately. The scheduler only allocates compute; Sol keeps solving and owns every native lifecycle decision.
+Immediately create capacity-admitted children using Codex runtime native delegation, mark each RUNNING, then create its sandbox. `race-plan-start`, `branch-admit`, Python, and sandbox commands never create a child. Requested model/reasoning are intent only; observed fields stay null without runtime evidence.
 
-## Race tiers
+`independent-full-solve` means independently race for the shortest valid flag path. It does not mean comprehensive analysis: do not wait for siblings and preserve only evidence sufficient to exploit. Admission overlap remains advisory at 0.95; only a repeated session ID or materially exact duplicate is denied outside explicit race/verification exceptions.
 
-- Tier 0: Sol directly solves; optionally one implementation/verifier child.
-- Tier 1: two children by default plus Sol. Typical lanes: fast recon and implementation.
-- Tier 2: three children plus Sol. Typical lanes: static/recon, dynamic, implementation or independent full solve.
-- Tier 3: four children plus Sol across distinct attack families.
-- Tier 4: terminate low-value work and replace it with a new family while keeping available concurrency full; do not merely add a fifth child.
+## Execute the shortest loop
 
-Use the largest width the native runtime and aggregate resource budget permit. If constrained, retain exploit, deep reasoning, dynamic reproduction, broad recon, then verifier in that order.
-
-Independent strong solvers may overlap and independently solve end-to-end. `branch-admit` is advisory at 0.95 and denies only a repeated session ID or materially exact duplicate. Purposes `independent-full-solve`, `parallel-race`, `alternate-model-role`, `alternate-implementation`, `independent-verification`, `clean-room-verification`, and `plateau-escape` are overlap exceptions. Sol may record a race-value override without user confirmation.
-
-Sol must concurrently pursue the highest-value direct path: core exploit primitive, difficult dataflow/math, final solver synthesis, stalled branch takeover, remote exploit, or candidate judgment. Never wait as a message router.
-
-## Live insight bus
-
-During long work, publish `race-event-publish` events for supported facts, rejected hypotheses, exploit primitives, blockers, ready artifacts, next experiments, flag candidates, remote flags, service crashes, environment discoveries, or help requests. Publish compact facts and artifact/evidence references, never raw transcripts. `EXPLOIT_PRIMITIVE` and `FLAG_CANDIDATE` become HIGH; `REMOTE_FLAG_OBTAINED` becomes CRITICAL.
-
-Sol calls `race-events-show` after important child checkpoints, its own bounded experiments, service crashes, flag candidates, and plateau reports. Send `race-insight-packet` output to relevant active siblings and acknowledge applied events. Preserve contradictory facts instead of overwriting them. Record user guidance with `operator-hint-save` and forward it only to related active branches.
-
-Use `branch-utility` as advice:
-
-- `PROGRESSING`: continue and broadcast useful findings.
-- `NEEDS_SIBLING_INSIGHT`: inject the latest packet and continue.
-- `BUMP_AND_RETRY`: inject discoveries and retry once with changed strategy.
-- `REPLACE_ATTACK_FAMILY`: terminate the branch natively and delegate a new family.
-- `SOL_TAKEOVER`: Sol takes its artifact/evidence.
-- `FLAG_PATH`: prioritize resources and remote execution.
-- `DEAD_BRANCH`: reclaim the slot immediately.
-- `INSUFFICIENT_DATA`: collect a bounded checkpoint.
-
-Python recommends and emits packets only. Sol owns every native child lifecycle decision. One failed exploit, breakpoint, symbolic timeout, `INCONCLUSIVE`, replay failure, or wrong initial hypothesis never ends the challenge; record it and change family.
-
-## Category race templates
-
-Tier 2 starts three paths:
-
-- pwn: primitive discovery; dynamic exploit with GDB/cyclic/runtime state; independent full solve. Tier 3 adds alternate ROP/ret2libc/heap/format/race family.
-- rev: deep static recovery; dynamic state oracle; independent solver construction. Tier 3 adds symbolic/alternate deobfuscation.
-- web: source/dataflow; live runtime probing; independent exploit chain. Tier 3 adds alternate auth/session/serialization/template family.
-- crypto: mathematical structure; small-instance/known-answer experiment; independent solver. Tier 3 adds alternate algebra/lattice/factoring.
-- forensic: format/filesystem/timeline; metadata/carving/stego; independent automated extraction.
-- misc: broad protocol/file recon; implementation/automation; independent full solve.
-- OSINT: identity/pivot map; archive/metadata/search; independent verification.
-- cloud: IAM/RBAC identity graph; runtime/API enumeration; exploit-path implementation.
-- AI: model/file structure; I/O differential experiment; solver/adversarial implementation.
-
-Swap templates immediately when evidence favors a better family.
-
-## Execution
-
-Create worker sandboxes only after native delegation. Challenge input and `/context` are read-only; `/work`, `/evidence`, and `/artifacts` are private and writable. A worker accesses only its assigned challenge, declared targets, branch directory, sandbox, and branch-private service.
-
-Use `--timeout-profile quick_probe|normal_command|decompile|symbolic_slice|fuzz_slice|forensic_scan|crypto_heavy|cracking_slice|ai_inference`. Long work runs in 1800-second slices with progress artifacts/events between slices. GDB, angr, z3, Sage, fpylll, RsaCtfTool, hashcat/john, AFL++, binwalk, volatility, tshark, carving, long Python solvers, model inference, and media tooling are normal CTF tools when available.
-
-Do not leave useful host compute idle. Allocate from workload evidence and runtime progress rather than legacy profile labels. Scale progressing flag/exploit/symbolic/fuzz/crypto/forensic paths aggressively, but do not scale a busy loop, repeated error, deadlock, or output/artifact/checkpoint stall merely because it consumes CPU. A network-bound worker with new interactions/evidence is progressing even at low CPU.
-
-All newly generated parallel solvers and harnesses use the scheduler value instead of a hard-coded worker count:
-
-```python
-import os
-
-workers = max(
-    1,
-    int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")),
-)
+```text
+observe → at most 3 exploit hypotheses → cheapest decisive experiment
+→ kill or promote → smallest working PoC → local test when useful
+→ declared remote as soon as plausible → immediate flag display
 ```
 
-The sandbox also provides `CTF_OS_ALLOCATED_CPUS`, `CTF_OS_ALLOCATED_MEMORY_BYTES`, `CTF_OS_WORKLOAD_CLASS`, `CTF_OS_RESOURCE_PRIORITY`, and standard BLAS/OpenMP/Rayon thread variables. After resize, subsequent `sandbox-exec` commands receive the latest allocation. Do not modify challenge-provided artifacts merely to retrofit this convention; use it in new solver/harness code.
+Sol concurrently owns core primitive reasoning, difficult exploit-chain decisions, minimal PoC synthesis, promising-artifact takeover, remote execution, and flag judgment. Do not wait as a router. Do not return to broad recon while a viable path is alive.
 
-Pwn/rev/misc sandboxes automatically support ptrace/core and permissive seccomp where required. Forensic profiles may receive loop devices and `SYS_ADMIN` for read-only mounts. AI uses NVIDIA GPU pass-through when available. Never mount the host Docker socket, host root, SSH/browser profiles, personal kubeconfig/cloud config, or personal credentials.
+Workers publish `EXPLOIT_PRIMITIVE`, `WORKING_POC`, `FLAG_CANDIDATE`, or `REMOTE_FLAG_OBTAINED` before summaries. Other checkpoints are useful only when they state the current hypothesis, decisive experiment, observed result, proximity change, next exploit action, and kill/continue decision. Facts, rejected hypotheses, decompilation, source notes, generic artifacts, and new files are not progress by themselves.
 
-Sol owns the shared `challenge-service`. A child may use `branch-service-build/start/restart/reset/status/logs/inspect/stop/cleanup` only for its own branch-private instance. This is the preferred crash/fuzz loop.
+Use `branch-utility` after a blocker, primitive, working artifact, plateau, flag candidate, or termination—not after every command. Interpret it according to the authoritative policy: `PROGRESSING` requires real exploit-proximity gain; `BUMP_AND_RETRY` is one changed decisive experiment; `REPLACE_ATTACK_FAMILY` changes mechanism; `SOL_TAKEOVER` finishes a promising primitive; `FLAG_PATH` goes to remote now. Apply sibling packets only when they directly resolve the current blocker.
 
-Declared organizer targets may be public, private/VPN, IPv6, multi-host/port and tcp/udp/http(s)/tls/websocket/wss/dns/ssh/grpc/custom. Active scanning/exploitation stays on declared challenge targets. Public docs/packages/GitHub/artifacts and explicitly approved OAST callbacks are allowed. Metadata, Docker gateways, undeclared LANs, other challenges, and unrelated hosts remain blocked.
+Sol performs management only after branch creation, an explicit blocker, exploit primitive, working artifact, plateau, flag candidate, or child termination. Preserve conflicts, but do not merge low-value reports or inspect every event.
 
-Challenge-provided temporary/test credentials are allowed in worker-private secret storage. Cloud enumeration, role assume/impersonation, object writes, function/workload/job creation, and required IAM/RBAC mutation are allowed inside the manifest account/project/tenant and recorded in the branch mutation ledger. Never use ambient/personal credentials. Organizer virtual OSINT accounts are allowed only in the declared domain. Unsafe AI artifacts are inspected only inside the sandbox; never use `trust_remote_code=True`.
+## Sandboxes, long tools, and scope
 
-## First flag and verification
+Challenge input and `/context` are read-only; worker `/work`, `/evidence`, and `/artifacts` are private. A child may control only its exact branch-private service. Sol alone controls the shared service, global scheduler rebalance, and native child lifecycle. Category playbooks define the smallest allowed recon and exploit transition.
 
-When a branch obtains a candidate, publish it immediately. Sol validates that the target is declared, actual network observation and exact command output were preserved, the candidate matches the flag pattern, and an exploit artifact exists; then call `flag-receipt-save`.
+Quick probes and short PoCs run immediately. Do not repeat `resource-status`, `resource-request`, `resource-plan`, or rebalance before them. Use scheduler planning only before long symbolic execution, fuzzing, forensic scans, crypto/cracking, or AI inference; run those in bounded slices and continue only when exploit/solver proximity or necessary compute progress increases. New parallel harnesses use `CTF_OS_RECOMMENDED_WORKERS`.
 
-`REMOTE_FLAG_OBTAINED` plus those checks yields `SUBMISSION_RECOMMENDED` immediately. Print:
+Attack only the selected challenge and declared targets. Public/private/VPN/IPv6 and declared custom protocols are valid; cloud metadata, Docker gateways, undeclared LANs, unrelated hosts, other challenges, ambient credentials, and host SSH/browser/cloud/Docker data are forbidden. Preserve sandbox isolation and the branch mutation ledger.
+
+## Flag fast path
+
+When a branch obtains a candidate, publish it before any report. For a declared remote, preserve the exact command output, actual target observation, matching candidate, and existing exploit artifact, then call `flag-receipt-save`.
 
 ```text
 REMOTE FLAG OBTAINED
@@ -119,15 +82,4 @@ Recommendation: submit immediately
 Full clean replay: not required before human submission
 ```
 
-Stop low-value branches and keep at most one verifier. Do not wait for two clean replays and never submit to CTFd. The human submits while optional verification continues.
-
-Static rev/crypto may recommend submission from a solver artifact, known-answer/target behavior, and pattern. Forensic may use source fingerprint, deterministic extraction, provenance, and pattern. One-shot tasks preserve one successful exact receipt without forced repetition. `replay` remains the route to `FULLY_VERIFIED`, not a gate to showing the flag.
-
-Canonical order:
-
-```text
-prepare-challenge → compact recon → race-plan-start → native delegation + Sol deep solve
-→ sandbox-create → live events/insight → bump/replace/takeover → exploit artifact
-→ declared remote receipt → SUBMISSION_RECOMMENDED → immediate flag output
-→ manual human submission → optional verifier/replay → FULLY_VERIFIED
-```
+`SUBMISSION_RECOMMENDED` is immediate. Stop low-value branches, retain at most one optional verifier, and let the human submit. Static rev/crypto and deterministic forensic paths may use the policy's artifact/provenance fast path. Strict replay is optional and may later produce `FULLY_VERIFIED`; never delay flag display for it.

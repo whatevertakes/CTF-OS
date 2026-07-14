@@ -1,13 +1,33 @@
-# Cloud playbook
+# Cloud exploit-first playbook
 
-## Scope and recon
+## 1. Fast recon budget
 
-Cloud work is limited to challenge infrastructure, accounts/projects/tenants, credentials, and endpoints explicitly declared for the selected challenge. Never use ambient/personal credentials, enumerate unrelated accounts, or query host/cloud metadata outside the challenge target. Challenge-provided temporary credentials are normal solver inputs.
+Use only challenge-declared accounts/projects/tenants, endpoints, and temporary credentials. Budget three observations: (1) identify the supplied identity/config and trust boundary; (2) issue one baseline scoped API/policy query; (3) test one highest-value permission/service chain. Then execute the leading scoped exploit.
 
-## Hypotheses and tooling
+## 2. Highest-value exploit hypotheses
 
-Trace an observed trust boundary: bucket/object access, IAM/RBAC policy evaluation, signed URLs, workload identity, cloud metadata, registry/OCI content, Terraform, Kubernetes, Helm, or CI/CD configuration. Start statically with `checkov`, `semgrep`, OPA/`conftest`, `terraform`, `kubectl` client output, `helm template`, `skopeo`/`oras`, `trivy`, `syft`, or `grype`. Provider CLIs use only challenge-supplied temporary credentials stored under `/work`; no login is automatic.
+Prefer direct object access, assume-role/impersonation, signed URL/token misuse, workload identity, registry/OCI secret, CI/CD trust, Kubernetes/RBAC escalation, or function/workload execution when concrete configuration or API evidence supports it.
 
-## Validation and replay
+## 3. Cheapest decisive experiments
 
-Pursue the shortest authorized exploit path. Account enumeration, assume-role/service-account impersonation, object writes, function/workload/pod/job creation, and limited IAM/RBAC mutation are allowed when required inside the declared challenge scope. Log every mutation in the branch ledger, redact credentials, and avoid unbounded destructive cleanup. A valid scoped flag receipt is submission-ready without waiting for two clean replays.
+Evaluate one effective permission, fetch one likely object, simulate one role binding, inspect one referenced image/config, assume one declared role, or perform one reversible scoped action. Record required mutations in the branch ledger.
+
+## 4. Immediate PoC criteria
+
+A minimal provider CLI command or script that proves the permission chain, accesses the flag-bearing resource, or executes the scoped action is a working PoC. Do not build a full IAM graph unless the chain requires it.
+
+## 5. Remote transition criteria
+
+Challenge cloud APIs are the declared remote. Use them as soon as the permission hypothesis is plausible; do not delay for a full static policy audit. Credentials remain worker-private and redacted.
+
+## 6. Kill conditions
+
+Kill when the effective permission is denied for the hypothesized reason, the resource/trust edge is absent, or one alternate decisive call does not improve proximity. Replace identity, object, workload, or supply-chain mechanism explicitly.
+
+## 7. Common research-drift traps
+
+Do not enumerate every service/resource, map the full IAM/RBAC graph after a viable chain exists, run broad scanners by default, write a cloud posture report, generalize automation, or investigate unrelated accounts. Never query ambient/cloud metadata or use personal credentials.
+
+## 8. Flag fast path
+
+Publish the proven permission/execution primitive or working command first. Preserve the scoped API receipt, mutation ledger entry, minimal exploit, and exact flag output; recommend submission without waiting for replay.

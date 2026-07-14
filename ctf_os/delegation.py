@@ -343,14 +343,38 @@ def branch_utility(
     if not relevant and result is None:
         return {"session_id": session_id, "utility_score": None, "classification": "INSUFFICIENT_DATA", "recommendation": "Collect a bounded checkpoint or worker result before judging utility", "metrics": {}}
     counts = {name: 0 for name in (
-        "supported_facts", "useful_artifacts", "exploit_primitives", "flag_candidates",
+        "supported_facts", "exploit_relevant_facts", "useful_artifacts",
+        "documentation_artifacts", "exploit_primitives", "flag_candidates",
         "rejected_hypotheses", "repeated_failures", "policy_violations",
         "repeated_commands", "tool_failures", "sibling_insights", "family_changes",
+        "decisive_experiment_count", "failed_decisive_experiments",
     )}
-    for item in relevant:
-        kind = item.get("type")
-        if kind == "SUPPORTED_FACT": counts["supported_facts"] += 1
-        if kind == "ARTIFACT_READY": counts["useful_artifacts"] += max(1, len(item.get("artifacts", [])))
+    proximity = 0.0
+    last_increase_index: int | None = None
+    for index, item in enumerate(relevant):
+        kind = str(item.get("type") or "").upper()
+        item_proximity = _checkpoint_proximity(item)
+        if item_proximity > proximity:
+            proximity = item_proximity
+            last_increase_index = index
+        decisive = bool(str(item.get("decisive_experiment_performed") or "").strip()) or kind in {
+            "EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+        }
+        if decisive:
+            counts["decisive_experiment_count"] += 1
+        if str(item.get("decision") or "").upper() == "KILL" or item.get("failed_decisive_experiment") is True:
+            counts["failed_decisive_experiments"] += 1
+        if kind == "SUPPORTED_FACT":
+            counts["supported_facts"] += 1
+            if item.get("exploit_relevant") is True or item_proximity > 0:
+                counts["exploit_relevant_facts"] += 1
+        if kind == "ARTIFACT_READY":
+            if item.get("working_poc_present") or item.get("remote_ready") or item.get("exploit_relevant"):
+                counts["useful_artifacts"] += max(1, len(item.get("artifacts", [])))
+            else:
+                counts["documentation_artifacts"] += max(1, len(item.get("artifacts", [])))
+        if kind == "WORKING_POC":
+            counts["useful_artifacts"] += max(1, len(item.get("artifacts", [])))
         if kind == "EXPLOIT_PRIMITIVE": counts["exploit_primitives"] += 1
         if kind in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}: counts["flag_candidates"] += 1
         if kind == "REJECTED_HYPOTHESIS": counts["rejected_hypotheses"] += 1
@@ -360,24 +384,34 @@ def branch_utility(
         if item.get("hypothesis_family_changed"): counts["family_changes"] += 1
         counts["repeated_commands"] += int(item.get("repeated_command", False))
     if result:
-        counts["useful_artifacts"] += len(result.get("artifacts", []))
+        result_poc = bool(result.get("working_poc_present"))
+        result_remote = bool(result.get("remote_ready"))
+        if result_poc or result_remote:
+            counts["useful_artifacts"] += len(result.get("artifacts", []))
+        else:
+            counts["documentation_artifacts"] += len(result.get("artifacts", []))
         counts["flag_candidates"] += len(result.get("flag_candidates", []))
         counts["rejected_hypotheses"] += sum(1 for h in result.get("hypotheses", []) if h.get("status") == "REFUTED")
         counts["policy_violations"] += len(result.get("policy_violations", []))
         if result.get("status") == "ERROR": counts["repeated_failures"] += 1
+        if result_poc: proximity = max(proximity, .82)
+        if result_remote: proximity = max(proximity, .92)
+        if result.get("flag_candidates"): proximity = 1.0
     overlap = float(branch.get("admission", {}).get("maximum_overlap_score", 0.0))
     elapsed_ratio = _elapsed_ratio(branch, now or datetime.now(timezone.utc))
-    information_events = counts["supported_facts"] + counts["useful_artifacts"] + counts["exploit_primitives"] + counts["flag_candidates"] + counts["rejected_hypotheses"]
+    information_events = sum(
+        str(item.get("type") or "").upper() in {
+            "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE",
+            "ARTIFACT_READY", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+        }
+        for item in relevant
+    ) + int(bool(result and (
+        result.get("artifacts") or result.get("flag_candidates")
+        or any(h.get("status") in {"SUPPORTED", "REFUTED"} for h in result.get("hypotheses", []))
+    )))
     rate = _new_information_rate(relevant, result, information_events)
-    score = round(
-        3.0 * counts["supported_facts"] + 2.0 * counts["useful_artifacts"]
-        + 4.0 * counts["exploit_primitives"] + 5.0 * counts["flag_candidates"]
-        + counts["rejected_hypotheses"] - 2.0 * counts["repeated_failures"]
-        - 2.0 * overlap - 1.5 * elapsed_ratio - 5.0 * counts["policy_violations"], 3,
-    )
     observations = max(1, len(relevant) + (1 if result else 0))
     recent = relevant[-8:]
-    recent_supported = sum(item.get("type") == "SUPPORTED_FACT" for item in recent)
     blocker_summaries = Counter(
         str(item.get("summary", "")).strip().casefold()
         for item in recent if item.get("type") == "BLOCKER" and str(item.get("summary", "")).strip()
@@ -385,38 +419,122 @@ def branch_utility(
     same_error_repeats = max(blocker_summaries.values(), default=0)
     repeat_ratio = round(counts["repeated_commands"] / observations, 4)
     tool_failure_ratio = round(counts["tool_failures"] / observations, 4)
-    artifact_changed = counts["useful_artifacts"] > 0
-    flag_proximity = min(1.0, .55 * bool(counts["exploit_primitives"]) + .3 * artifact_changed + .15 * bool(counts["supported_facts"]))
-    if counts["flag_candidates"]:
-        classification, recommendation = "FLAG_PATH", "Prioritize this branch and surface a valid remote flag immediately"
+    steps_since_increase = len(relevant) if last_increase_index is None else len(relevant) - last_increase_index - 1
+    working_poc = any(
+        item.get("type") == "WORKING_POC" or item.get("working_poc_present") is True for item in relevant
+    ) or bool(result and result.get("working_poc_present"))
+    remote_ready = any(
+        item.get("type") == "REMOTE_FLAG_OBTAINED" or item.get("remote_ready") is True for item in relevant
+    ) or bool(result and result.get("remote_ready"))
+    drift_reasons = _research_drift_reasons(relevant, last_increase_index, proximity)
+    research_drift = bool(drift_reasons)
+    score = round(
+        100.0 * counts["flag_candidates"] + 60.0 * working_poc + 70.0 * remote_ready
+        + 30.0 * counts["exploit_primitives"] + 40.0 * proximity
+        + 3.0 * counts["decisive_experiment_count"] + 2.0 * counts["exploit_relevant_facts"]
+        - 8.0 * counts["failed_decisive_experiments"] - 4.0 * counts["repeated_failures"]
+        - 3.0 * counts["repeated_commands"] - 3.0 * counts["tool_failures"]
+        - 2.0 * counts["supported_facts"]
+        - 3.0 * counts["documentation_artifacts"] - 30.0 * research_drift
+        - 2.0 * overlap - 1.5 * elapsed_ratio - 20.0 * counts["policy_violations"], 3,
+    )
+    if counts["flag_candidates"] or remote_ready or working_poc:
+        classification, recommendation = "FLAG_PATH", "Run the minimal exploit or solver against the declared remote now and surface the flag"
     elif counts["policy_violations"]:
         classification, recommendation = "DEAD_BRANCH", "Stop the out-of-scope branch and reuse its slot"
-    elif counts["supported_facts"] + counts["exploit_primitives"] and rate >= 0.5:
-        classification, recommendation = "PROGRESSING", "Continue and broadcast compact confirmed insights"
-    elif counts["repeated_failures"] >= 3 and rate < .25 and counts["sibling_insights"]:
-        classification, recommendation = "REPLACE_ATTACK_FAMILY", "Replace this branch with a distinct attack family"
+    elif research_drift and proximity >= .45:
+        classification, recommendation = "SOL_TAKEOVER", "Sol should take over the proven primitive and finish the minimal PoC"
+    elif research_drift:
+        classification, recommendation = "REPLACE_ATTACK_FAMILY", "Replace research drift with a distinct executable exploit mechanism"
+    elif (same_error_repeats >= 2 or counts["repeated_failures"] >= 3) and counts["sibling_insights"]:
+        classification, recommendation = "REPLACE_ATTACK_FAMILY", "Sibling insight did not change the repeated failure; replace the attack family"
+    elif counts["failed_decisive_experiments"] >= 2 or (counts["decisive_experiment_count"] >= 3 and proximity == 0):
+        classification, recommendation = "REPLACE_ATTACK_FAMILY", "The family failed decisive experiments without improving exploit proximity"
     elif counts["repeated_failures"] >= 2 and not counts["sibling_insights"]:
-        classification, recommendation = "NEEDS_SIBLING_INSIGHT", "Inject the latest relevant insight packet and continue"
-    elif elapsed_ratio >= 1.0 and flag_proximity >= .5:
-        classification, recommendation = "SOL_TAKEOVER", "Sol should take over the promising artifact and evidence"
-    elif elapsed_ratio >= 1.0 or repeat_ratio >= .6 or tool_failure_ratio >= .6:
-        classification, recommendation = "BUMP_AND_RETRY", "Inject sibling findings and retry once with a changed tool strategy"
-    elif score > 0:
-        classification, recommendation = "PROGRESSING", "Continue with the next bounded experiment"
+        classification, recommendation = "NEEDS_SIBLING_INSIGHT", "Request only sibling evidence that directly resolves the current blocker"
+    elif counts["decisive_experiment_count"] == 0:
+        classification, recommendation = "INSUFFICIENT_DATA", "Run the cheapest decisive experiment before judging progress"
+    elif proximity >= .45 and (elapsed_ratio >= 1.0 or steps_since_increase > 2):
+        classification, recommendation = "SOL_TAKEOVER", "Sol should convert the promising primitive into the minimal PoC"
+    elif proximity > 0 and steps_since_increase <= 2:
+        classification, recommendation = "PROGRESSING", "Run the next one to three exploit-completing experiments"
+    elif counts["failed_decisive_experiments"] == 1 or elapsed_ratio >= 1.0 or repeat_ratio >= .6 or tool_failure_ratio >= .6:
+        classification, recommendation = "BUMP_AND_RETRY", "Retry this objective once with a different decisive experiment"
     else:
-        classification, recommendation = "BUMP_AND_RETRY", "Change the experiment or tool strategy and reassess"
+        classification, recommendation = "BUMP_AND_RETRY", "Change the decisive experiment once; do not broaden into research"
     metrics = {
         **counts, "elapsed_budget_ratio": round(elapsed_ratio, 4),
         "elapsed_seconds": round(elapsed_ratio * int(branch.get("budget_seconds", 0)), 3),
         "overlap_score": round(overlap, 4), "new_information_rate": rate,
         "repeated_command_ratio": repeat_ratio, "tool_failure_ratio": tool_failure_ratio,
-        "artifact_changed": artifact_changed, "hypothesis_family_changed": bool(counts["family_changes"]),
+        "artifact_changed": bool(counts["useful_artifacts"]),
+        "hypothesis_family_changed": bool(counts["family_changes"]),
         "sibling_insight_applied": bool(counts["sibling_insights"]),
-        "flag_proximity": round(flag_proximity, 4),
-        "recent_window_size": len(recent), "recent_supported_facts": recent_supported,
+        "exploit_proximity": round(proximity, 4), "flag_proximity": round(proximity, 4),
+        "time_or_steps_since_proximity_increase": steps_since_increase,
+        "working_poc_present": working_poc, "remote_ready": remote_ready,
+        "research_drift_detected": research_drift, "research_drift_reasons": drift_reasons,
+        "recent_window_size": len(recent),
+        "recent_supported_facts": sum(item.get("type") == "SUPPORTED_FACT" for item in recent),
         "same_error_repeat_count": same_error_repeats,
     }
     return {"session_id": session_id, "utility_score": score, "classification": classification, "recommendation": recommendation, "metrics": metrics}
+
+
+def _checkpoint_proximity(item: Mapping[str, Any]) -> float:
+    explicit = item.get("exploit_proximity")
+    explicit_value = (
+        float(explicit)
+        if isinstance(explicit, (int, float)) and not isinstance(explicit, bool) and 0 <= float(explicit) <= 1
+        else 0.0
+    )
+    kind = str(item.get("type") or "").upper()
+    if kind in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}: return 1.0
+    if item.get("remote_ready") is True: return max(explicit_value, .92)
+    if kind == "WORKING_POC" or item.get("working_poc_present") is True: return max(explicit_value, .82)
+    if kind == "EXPLOIT_PRIMITIVE":
+        summary = str(item.get("summary") or "").casefold()
+        if any(term in summary for term in ("code execution", "rce", "shell", "arbitrary write")): return max(explicit_value, .72)
+        if any(term in summary for term in ("arbitrary read", "address leak", "data leak", "auth bypass", "logic bypass")): return max(explicit_value, .62)
+        if any(term in summary for term in ("input control", "crash", "oracle", "rip control", "pc control")): return max(explicit_value, .52)
+        return max(explicit_value, .5)
+    if kind == "SERVICE_CRASHED" and str(item.get("decisive_experiment_performed") or "").strip():
+        return max(explicit_value, .52)
+    if item.get("remote_interaction_proved_primitive") is True:
+        return max(explicit_value, .65)
+    if item.get("constraint_reduction") or item.get("deterministic_extraction_progress"):
+        return max(explicit_value, .35)
+    return explicit_value
+
+
+def _research_drift_reasons(
+    checkpoints: Sequence[Mapping[str, Any]], last_increase_index: int | None, proximity: float,
+) -> list[str]:
+    reasons: list[str] = []
+    if any(item.get("research_drift_detected") is True for item in checkpoints):
+        reasons.append("explicit research-drift checkpoint")
+    drift_terms = (
+        "comprehensive", "full source review", "entire attack surface", "enumerate all",
+        "architecture document", "refactor", "framework", "reusable library", "understand everything",
+        "more understanding", "broad recon",
+    )
+    if any(
+        any(term in f"{item.get('summary', '')} {item.get('recommended_action', '')}".casefold() for term in drift_terms)
+        for item in checkpoints
+    ):
+        reasons.append("research-oriented action after a bounded solve should have started")
+    tail = checkpoints if last_increase_index is None else checkpoints[last_increase_index + 1:]
+    tail_information = sum(
+        str(item.get("type") or "").upper() in {
+            "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "ARTIFACT_READY", "ENVIRONMENT_DISCOVERY",
+        }
+        for item in tail
+    )
+    if tail_information >= 3:
+        reasons.append("three information events without exploit-proximity increase")
+    if proximity >= .45 and sum(bool(item.get("repeated_command")) for item in tail) >= 2:
+        reasons.append("repeated command family after primitive confirmation")
+    return reasons
 
 
 def _overlap(existing: Mapping[str, Any], candidate: BranchCandidate) -> tuple[float, dict[str, float], list[str]]:

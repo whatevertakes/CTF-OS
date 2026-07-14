@@ -516,11 +516,15 @@ def progress_present(progress: Mapping[str, Any] | None, samples: Sequence[Mappi
             return False
         if progress.get("progressing") is True:
             return True
+        # Compute liveness and flag-path movement are useful.  Fact, evidence,
+        # checkpoint, or generic artifact counts alone are deliberately not
+        # progress: scaling those signals rewards research drift.
         indicators = (
-            "step", "generation", "candidate_score", "coverage", "supported_facts",
-            "exploit_primitives", "artifact_hash", "checkpoints", "subprocess_completed",
-            "solver_output_timestamp", "constraint_reduction", "flag_proximity",
-            "remote_interactions", "evidence_count",
+            "step", "generation", "candidate_score", "coverage", "exploit_primitives",
+            "subprocess_completed", "solver_output_timestamp", "constraint_reduction",
+            "exploit_proximity", "flag_proximity", "decisive_experiment_count",
+            "working_poc_present", "remote_ready", "remote_interactions",
+            "deterministic_extraction_progress",
         )
         if any(progress.get(key) not in (None, 0, 0.0, "", False) for key in indicators):
             return True
@@ -929,26 +933,36 @@ class ResourceLedger:
     def flag_event(self, event: Mapping[str, Any]) -> None:
         event_type = str(event.get("type", ""))
         session_id = str(event.get("session_id", ""))
+        management_events = {
+            "BLOCKER", "EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE",
+            "REMOTE_FLAG_OBTAINED", "SERVICE_CRASHED",
+        }
+        if event_type not in management_events:
+            return
         with state_lock(self.root):
             state = self.load()
-            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
+            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
                 state["requests"][session_id]["priority"] = "CRITICAL" if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"} else "HIGH"
                 state["requests"][session_id]["updated_at"] = utc_now()
                 obs = state["observations"].setdefault(session_id, {})
-                if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
+                if event_type in {"WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
                     obs["flag_path"] = True
                 if event_type == "REMOTE_FLAG_OBTAINED":
                     state["remote_flag_session"] = session_id
-            if session_id in state["requests"] and event_type in {"SUPPORTED_FACT", "EXPLOIT_PRIMITIVE", "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED", "OPERATOR_HINT"}:
+            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
                 obs = state["observations"].setdefault(session_id, {})
                 progress = dict(obs.get("progress") or {})
                 progress["progressing"] = True
                 progress["last_event_type"] = event_type
                 progress["last_event_at"] = utc_now()
-                progress["evidence_count"] = int(progress.get("evidence_count", 0)) + 1
                 if event_type == "EXPLOIT_PRIMITIVE":
                     progress["exploit_primitives"] = int(progress.get("exploit_primitives", 0)) + 1
+                    progress["exploit_proximity"] = max(float(progress.get("exploit_proximity", 0) or 0), .5)
+                if event_type == "WORKING_POC":
+                    progress["working_poc_present"] = True
+                    progress["exploit_proximity"] = max(float(progress.get("exploit_proximity", 0) or 0), .82)
                 if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
+                    progress["exploit_proximity"] = 1.0
                     progress["flag_proximity"] = 1.0
                 obs["progress"] = progress
             state["rebalance_required"] = True

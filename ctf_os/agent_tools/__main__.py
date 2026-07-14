@@ -279,6 +279,18 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--type", required=True); checkpoint.add_argument("--summary", required=True)
     checkpoint.add_argument("--evidence", action="append", default=[]); checkpoint.add_argument("--artifact", action="append", default=[])
     checkpoint.add_argument("--useful-for", default=""); checkpoint.add_argument("--recommended-action", default=""); checkpoint.add_argument("--confidence", type=float, required=True)
+    checkpoint.add_argument("--current-exploit-hypothesis", default="")
+    checkpoint.add_argument("--decisive-experiment-performed", default="")
+    checkpoint.add_argument("--observed-result", default="")
+    checkpoint.add_argument("--exploit-proximity", type=float, default=0.0)
+    checkpoint.add_argument("--next-exploit-action", default="")
+    checkpoint.add_argument("--decision", choices=("KILL", "CONTINUE", "PROMOTE"), default="CONTINUE")
+    checkpoint.add_argument("--working-poc-present", action="store_true")
+    checkpoint.add_argument("--remote-ready", action="store_true")
+    checkpoint.add_argument("--research-drift-detected", action="store_true")
+    checkpoint.add_argument("--repeated-command", action="store_true")
+    checkpoint.add_argument("--sibling-insight-applied", action="store_true")
+    checkpoint.add_argument("--hypothesis-family-changed", action="store_true")
     _add_session_args(checkpoint, default_role="child")
     if not child_surface:
         worker_merge = commands.add_parser("worker-results-merge")
@@ -579,7 +591,18 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 if classification == "DEAD_BRANCH":
                     ledger.release(args.session_id, "branch utility DEAD_BRANCH")
                 else:
-                    progress: dict[str, object] = {"progressing": classification in {"PROGRESSING", "FLAG_PATH"}}
+                    metrics = advice.get("metrics") if isinstance(advice.get("metrics"), dict) else {}
+                    progress: dict[str, object] = {
+                        "progressing": classification in {"PROGRESSING", "FLAG_PATH"},
+                        **{
+                            key: metrics[key] for key in (
+                                "exploit_proximity", "decisive_experiment_count",
+                                "failed_decisive_experiments",
+                                "time_or_steps_since_proximity_increase",
+                                "working_poc_present", "remote_ready", "research_drift_detected",
+                            ) if key in metrics
+                        },
+                    }
                     changes: dict[str, object] = {
                         "utility_classification": classification,
                         "scheduler_recommendation": advice.get("recommendation"),
@@ -587,7 +610,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                     }
                     if classification == "FLAG_PATH":
                         changes["priority"] = "CRITICAL"
-                        progress["flag_proximity"] = 1.0
+                        progress["flag_proximity"] = metrics.get("exploit_proximity", 1.0)
                     ledger.update(
                         args.session_id, actor_session_id=args.parent_session_id,
                         actor_role="sol", changes=changes,
@@ -879,7 +902,21 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             metadata = _load_metadata(root, str(sandbox_metadata))
             if metadata.get("session_id") != session_id or metadata.get("input_fingerprint") != current_fingerprint:
                 raise ValueError("worker checkpoint sandbox identity or input fingerprint is stale")
-        return save_worker_checkpoint(worker_root, parent_session_id=args.parent_session_id, challenge_id=challenge.id, input_fingerprint=current_fingerprint, checkpoint_type=args.type, summary=args.summary, evidence=args.evidence, artifacts=args.artifact, useful_for=_csv(args.useful_for), recommended_action=args.recommended_action, confidence=args.confidence)
+        return save_worker_checkpoint(
+            worker_root, parent_session_id=args.parent_session_id, challenge_id=challenge.id,
+            input_fingerprint=current_fingerprint, checkpoint_type=args.type, summary=args.summary,
+            evidence=args.evidence, artifacts=args.artifact, useful_for=_csv(args.useful_for),
+            recommended_action=args.recommended_action, confidence=args.confidence,
+            current_exploit_hypothesis=args.current_exploit_hypothesis,
+            decisive_experiment_performed=args.decisive_experiment_performed,
+            observed_result=args.observed_result, exploit_proximity=args.exploit_proximity,
+            next_exploit_action=args.next_exploit_action, decision=args.decision,
+            working_poc_present=args.working_poc_present, remote_ready=args.remote_ready,
+            research_drift_detected=args.research_drift_detected,
+            repeated_command=args.repeated_command,
+            sibling_insight_applied=args.sibling_insight_applied,
+            hypothesis_family_changed=args.hypothesis_family_changed,
+        )
     if args.command == "worker-results-merge":
         _require_sol(args, "Only the parent Sol session may merge worker results.")
         paths = sorted((solve_root / "workers").glob("*/result.json"))

@@ -1,13 +1,33 @@
-# AI playbook
+# AI exploit-first playbook
 
-## Scope and first branches
+## 1. Fast recon budget
 
-Fingerprint the supplied model, tokenizer, tensor, dataset, or agent source before execution. Branch by artifact family: ONNX graph and operators, PyTorch/state dictionary, HDF5 or numeric arrays, tokenizer/config mismatch, adversarial image preprocessing, embedding reconstruction, or prompt/agent trust boundaries. CPU execution is the default.
+Keep untrusted models inside the sandbox. Budget three observations: (1) identify artifact format plus shapes/tokenizer/preprocessing; (2) inspect only the likely output/validation boundary; (3) run one input/output differential or small inversion test. Then implement the leading attack.
 
-## Evidence-led pivots
+## 2. Highest-value exploit hypotheses
 
-Inspect metadata with `file`, `strings`, `binwalk`, `protoc`, `h5dump`, and Graphviz before loading it. Prefer `safetensors` and state dictionaries; treat pickle/joblib and full PyTorch objects as untrusted and inspect/load them only inside the restricted sandbox. Use PyTorch, ONNX Runtime, transformers/tokenizers, OpenCV, NumPy, or z3 only when the format and hypothesis justify them. Never download an external model unless it is explicitly approved.
+Prefer concrete model/input weaknesses: preprocessing mismatch, exposed logits/embedding relation, adversarial boundary, inversion/reconstruction, tokenizer/config confusion, unsafe agent/tool trust, or narrowly evidenced model-file behavior. Never use `trust_remote_code=True`.
 
-## Validation
+## 3. Cheapest decisive experiments
 
-Record model hashes, shapes, dtypes, preprocessing, seeds, resource use, and the exact target observation. Use available Docker NVIDIA GPU/CUDA automatically for challenge inference, adversarial generation, inversion, embedding search, and bounded fine-tuning. Unsafe model formats stay inside the sandbox and `trust_remote_code=True` remains forbidden. A target-confirmed flag may be surfaced before a CPU replay.
+Change one feature/token/pixel, compare one logit/embedding, reconstruct a small known target, test one prompt/tool boundary, or inspect one graph/operator slice. The experiment must prove/kill the expected weakness.
+
+## 4. Immediate PoC criteria
+
+A short deterministic inference, adversarial, inversion, or agent-input script that produces the target behavior on a representative case is a working PoC. Scale it before documenting model architecture.
+
+## 5. Remote transition criteria
+
+Run against the declared inference/agent target once local behavior is plausible. Use scheduler/GPU planning only for genuinely long generation, search, inversion, or bounded fine-tuning—not for quick inference probes.
+
+## 6. Kill conditions
+
+Kill when preprocessing/output behavior disproves the weakness, the small test cannot improve the target metric, or a bounded long slice has no solver-linked progress. Switch the attack mechanism rather than adding architecture analysis.
+
+## 7. Common research-drift traps
+
+Do not document every layer/operator, benchmark the whole model, build a reusable adversarial framework, run broad hyperparameter searches without proximity signals, or download external models without explicit approval. Metadata alone is not progress.
+
+## 8. Flag fast path
+
+Publish solver-linked progress and `WORKING_POC` before reports. Preserve model/input hashes, minimal script, preprocessing, and exact target observation, then surface a matching flag before optional CPU replay.

@@ -308,7 +308,7 @@ def test_pwn_tier3_crash_private_restart_and_remote_flag_simulation(tmp_path: Pa
     specs = parse_branch_spec(None, category="pwn", tier=3, template_path=TEMPLATES)
     board = start_race_plan(root, challenge_id="pwn-race", input_fingerprint="pwn-fp", parent_session_id="sol-main", category="pwn", tier=3, tier_reason="hard pwn", branch_specs=specs)
     assert [row["role"] for row in board["active_branches"]] == [
-        "primitive-discovery", "dynamic-exploit", "independent-full-solve", "alternate-exploit-family",
+        "input-control-to-poc", "runtime-primitive-to-poc", "independent-full-solve", "alternate-exploit-mechanism",
     ]
     dynamic = board["active_branches"][1]["session_id"]
     crash = publish_event(root, challenge_id="pwn-race", input_fingerprint="pwn-fp", session_id=dynamic, event_type="SERVICE_CRASHED", summary="heap assertion", recommended_action="restart branch-private service")
@@ -329,7 +329,7 @@ def test_web_oast_tier2_blind_callback_simulation(tmp_path: Path) -> None:
     root = tmp_path / "web"; _state(root, "web-blind", "web-fp")
     specs = parse_branch_spec(None, category="web", tier=2, template_path=TEMPLATES)
     board = start_race_plan(root, challenge_id="web-blind", input_fingerprint="web-fp", parent_session_id="sol-main", category="web", tier=2, tier_reason="blind path", branch_specs=specs)
-    assert [row["role"] for row in board["active_branches"]] == ["source-and-dataflow", "live-runtime-probing", "independent-exploit-chain"]
+    assert [row["role"] for row in board["active_branches"]] == ["reachable-sink-to-exploit", "highest-value-payload-test", "independent-exploit-chain"]
     branch = board["active_branches"][1]["session_id"]
     oast = create_oast(root, challenge_id="web-blind", input_fingerprint="web-fp", branch_id=branch, provider_base="https://oast.example")
     callback = json.dumps({"events": [{"method": "GET", "source": "bot", "headers": {}, "body": "blind SSRF hit"}]}).encode()
@@ -342,7 +342,7 @@ def test_cloud_tier2_scoped_credential_iam_mutation_flag_simulation(tmp_path: Pa
     root = tmp_path / "cloud"; _state(root, "cloud-iam", "cloud-fp")
     specs = parse_branch_spec(None, category="cloud", tier=2, template_path=TEMPLATES)
     board = start_race_plan(root, challenge_id="cloud-iam", input_fingerprint="cloud-fp", parent_session_id="sol-main", category="cloud", tier=2, tier_reason="iam path", branch_specs=specs)
-    assert [row["role"] for row in board["active_branches"]] == ["iam-rbac-identity-graph", "runtime-api-enumeration", "exploit-path-implementation"]
+    assert [row["role"] for row in board["active_branches"]] == ["scoped-chain-to-exploit", "highest-value-api-test", "exploit-path-implementation"]
     branch = board["active_branches"][2]["session_id"]
     worker = root / "workers" / branch; worker.mkdir(parents=True)
     save_challenge_secret(worker, branch_id=branch, name="temporary-token", value="scoped", provenance="challenge-provided", challenge_id="cloud-iam")

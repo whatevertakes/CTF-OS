@@ -1,25 +1,73 @@
-# Competition-first native agent policy
+# Authoritative competition execution policy
 
-Sol is the lead attacker and race coordinator. Use native delegation aggressively, start multiple independent paths early, share confirmed insights quickly, replace stalled branches instead of giving up, and surface a remote flag immediately. Human submission is the competition oracle. Full replay improves confidence but does not delay the flag.
+This file is the authoritative solve policy. Precedence is: this policy, `.codex/skills/ctf-solve/SKILL.md`, the selected category playbook, `README.md`, then `AGENTS.md`. Lower documents route or specialize this contract; they do not redefine it.
 
-- Python never launches/supervises a model, invokes Codex/Claude, calls a model API, or submits a flag.
-- Tier 0 is Sol-first; Tier 1 starts two children; Tier 2 starts three; Tier 3 starts four; Tier 4 replaces low-value families while holding available concurrency full.
-- Sol always runs a separate high-value attack lane. It owns difficult reasoning, synthesis, takeover, remote execution, and candidate judgment.
-- `race-plan-start` atomically fingerprints the challenge, archives the prior plan, admits all non-exact-duplicate branches, records prompt packets, and returns the board. It does not create children.
-- Admission threshold 0.95 is advisory. Independent full solves, parallel races, alternate roles/implementations, verification, and plateau escape may overlap. Only repeated session IDs and materially exact duplicates are denied unless an explicit verification exception applies.
-- Requested role/model/reasoning are not observed pinning. Keep observed fields null without verifiable runtime evidence.
-- Publish compact live events rather than raw transcripts. `FLAG_CANDIDATE` and `EXPLOIT_PRIMITIVE` are HIGH; `REMOTE_FLAG_OBTAINED` is CRITICAL. Preserve conflicting observations.
-- Utility classifications guide Sol: continue progress, inject sibling insight, bump once, replace family, take over, prioritize a flag path, or reclaim a dead branch slot. Python never changes native lifecycle.
-- Use 60/300/900/1800-second tool profiles as progress slices. A failed command or worker is not a reason to abandon the challenge.
-- The dynamic scheduler is the only default resource policy. It uses the minimum effective host/Docker/cgroup/user limits, host reserve, aggregate CPU/RAM/storage/GPU reservations, measured utilization, workload parallelizability, and progress evidence; legacy profile labels never impose fixed concurrency or heavy mutual exclusion.
-- Do not leave useful host compute idle during an active solve. Scale progressing flag-producing paths aggressively, but never scale a broken loop merely because it consumes CPU. Preserve network/I/O-bound work when interactions and evidence progress.
-- Sol runs `resource-status`, `resource-request`, and `resource-plan` before long work, uses timeout slices with progress signals, and rebalances after meaningful race events. Release completed resources immediately while preserving artifacts/evidence/history.
-- Newly generated parallel solvers use `CTF_OS_RECOMMENDED_WORKERS`; sandbox CPU/RAM/thread environment follows the latest allocation. Only Sol applies `scheduler-rebalance`/global resize, and Python never kills a native reasoning session.
-- Shared service lifecycle is Sol-only. A child may mutate only its own exact branch-private service.
-- Category sandboxes automatically enable ptrace/core support, forensic loop mounting, or an available NVIDIA GPU as appropriate. Input/context are read-only and worker work/evidence/artifacts are private.
-- Organizer-declared public/private/VPN/IPv6 multi-target endpoints and tcp, udp, http(s), tls, websocket/wss, dns, ssh, grpc, and custom protocols are valid. Metadata, Docker gateways, undeclared LANs, other challenges, and unrelated hosts remain blocked.
-- Challenge-provided test credentials and scoped cloud/IAM/RBAC mutations are allowed and logged. Personal/ambient credentials and out-of-scope accounts are forbidden. Unsafe model deserialization stays inside the sandbox and `trust_remote_code=True` is forbidden.
-- OAST callbacks use an explicitly approved HTTPS provider and store redacted, size-bounded receipts.
-- A matching remote receipt plus exploit artifact produces `SUBMISSION_RECOMMENDED` immediately. Stop low-value branches and retain at most one verifier. CTFd submission is always manual.
+## Primary contract
 
-Minimum boundaries: selected challenge only; no host SSH/browser/personal cloud data; no host Docker socket/root mount; no metadata or undeclared private scanning; no automatic flag submission; native delegation only.
+```text
+This is a timed CTF solve, not vulnerability research,
+a comprehensive security assessment, or an academic investigation.
+
+The only primary objective is to obtain the first valid flag
+as quickly as possible.
+
+Prefer the shortest executable exploit path over complete understanding.
+Exploit first, explain later.
+```
+
+Time-to-first-valid-flag outranks analysis breadth, documentation quality, reusable artifacts, clean replay, and architectural understanding. A fact is not progress merely because it is new. It is progress only when it materially improves an exploit path, eliminates a costly uncertainty, or moves the solver toward a flag.
+
+Unless needed by the leading exploit path, do not enumerate the complete attack surface, classify every possible vulnerability, audit unrelated source, conduct generalized vulnerability research, build reusable frameworks/libraries, refactor for code quality, polish reports, fully verify before a plausible remote attempt, search for other bugs while a viable path is alive, study the whole problem structure, or document architecture. Preserve only the minimal command receipt, exploit artifact, flag provenance, and information needed for later replay.
+
+## Required execution loop
+
+```text
+observe
+→ form at most 3 concrete exploit hypotheses
+→ run the cheapest decisive experiment
+→ kill or promote the hypothesis
+→ build the smallest working PoC
+→ test locally when useful
+→ move to the declared remote as soon as plausible
+→ surface the flag immediately
+```
+
+Each active exploit hypothesis has only: `expected primitive`, `cheapest decisive experiment`, `success condition`, and `kill condition`. Add `reopen_condition` only when a concrete future observation would justify reopening it. Do not add a fourth active hypothesis until the current three are killed, promoted, or replaced. When the recon budget ends, state `Leading exploit path`, `Decisive next experiment`, `Kill condition`, and `Expected time to PoC` (`immediate`, `few experiments`, or `long computation`).
+
+## Race, utility, and replacement
+
+- Python records plans, prompt packets, events, evidence, artifacts, sandboxes, receipts, and recommendations. It never launches or supervises a model, calls a model API, changes a native child lifecycle, or submits a flag. Sol owns native delegation.
+- Category templates are fallback lanes, never an authoritative attack plan. Challenge evidence chooses the branch mechanism and may replace a template immediately.
+- `independent-full-solve` means: independently race for the shortest valid flag path; do not produce a comprehensive analysis, wait for siblings, or collect evidence beyond what the exploit needs.
+- Tier 0 is Sol-first; Tier 1 starts two children; Tier 2 three; Tier 3 four. Tier 4 keeps useful concurrency full by replacing a stalled family. A Tier 4 replacement records why proximity did not increase and uses a genuinely different exploit mechanism, not a new research topic.
+- Admission overlap is advisory at 0.95. Repeated session IDs and materially exact duplicates are denied; parallel/independent solves, alternate implementations, verification, and plateau escape remain exceptions. Requested model/reasoning are intent, not proof of pinning.
+
+Utility is exploit-proximity-first. High-value signals include actual input control, crash/oracle, address or data leak, auth/logic bypass, arbitrary read/write, code execution, solver-linked constraint reduction, deterministic extraction progress, a working PoC, remote proof of the primitive, remote readiness, and a flag candidate. Supported facts, rejected hypotheses, decompilation, source notes, architecture understanding, generic artifacts, repeated same-family commands, and unrelated files are never sufficient by themselves for `PROGRESSING`.
+
+- `PROGRESSING`: exploit or solver completion probability materially increased and the next one to three experiments can advance it.
+- `NEEDS_SIBLING_INSIGHT`: a specific blocker can be directly resolved by existing sibling evidence.
+- `BUMP_AND_RETRY`: retry the same objective once with a different decisive experiment.
+- `REPLACE_ATTACK_FAMILY`: information may be increasing, but exploit proximity is not; change mechanism.
+- `SOL_TAKEOVER`: a promising primitive/artifact exists, but the branch is not turning it into a PoC.
+- `FLAG_PATH`: a working PoC, remote-ready exploit, deterministic solver/extractor, or flag candidate is ready for immediate priority.
+- `DEAD_BRANCH`: the branch is repetitive, out of scope, broadening, or has lost an executable exploit path.
+- `INSUFFICIENT_DATA`: no minimum decisive experiment has been run.
+
+Track `exploit_proximity`, `decisive_experiment_count`, `failed_decisive_experiments`, `time_or_steps_since_proximity_increase`, `working_poc_present`, `remote_ready`, and `research_drift_detected` separately from `new_information_rate`. Research drift includes broad recon after a viable primitive, continued wide reading, analysis-only artifact growth, generalization/refactoring/framework work, three information events without proximity gain, or delaying a decisive experiment to “understand more.”
+
+## Sol and worker priorities
+
+Sol spends its time on core primitive reasoning, difficult exploit-chain choices, minimal PoC synthesis, takeover of promising artifacts, remote execution, and flag judgment. Sol checks or manages branches only after branch creation, an explicit blocker, exploit primitive, working artifact, plateau, flag candidate, or child termination. Do not merge low-value reports or inspect every event/checkpoint.
+
+During work, checkpoints center on: current exploit hypothesis, decisive experiment performed, observed result, exploit-proximity change, artifact path if any, next exploit action, and kill/continue/promote. Existing schema-v1 result and evidence fields remain compatible, but completeness is not a solve objective. Publish `REMOTE_FLAG_OBTAINED`, `FLAG_CANDIDATE`, `WORKING_POC`, and `EXPLOIT_PRIMITIVE` before any general summary or final report. Write a final worker result when the branch ends; do not pause exploitation to polish it.
+
+The dynamic scheduler allocates compute; it does not define solve progress. Short probes and quick PoCs run immediately without repeated `resource-status`, `resource-request`, `resource-plan`, or rebalance calls. Use scheduler planning before long symbolic execution, fuzzing, forensic scans, crypto/cracking, or AI computation, then inspect progress only at bounded slices. Scheduler management must never delay solver reasoning, a minimal PoC, remote execution, or flag display. New parallel harnesses use `CTF_OS_RECOMMENDED_WORKERS`.
+
+## Scope, isolation, and flag fast path
+
+- Attack exactly one selected challenge and only organizer-declared targets. Declared public/private/VPN/IPv6 and tcp, udp, http(s), tls, websocket/wss, dns, ssh, grpc, and custom endpoints are valid. Cloud metadata, Docker gateways, undeclared private LANs, other challenges, and unrelated hosts remain blocked.
+- Challenge input/context are read-only. Each worker has private writable `/work`, `/evidence`, and `/artifacts`. Never mount the host Docker socket/root, SSH keys, browser profiles, personal cloud credentials/kubeconfig, or personal files.
+- A child may mutate only its exact branch-private service. Shared challenge service lifecycle and global scheduler resize remain Sol-only.
+- Challenge-provided temporary credentials and required mutations are allowed only inside the declared challenge account/project/tenant and are logged/redacted. Personal or ambient credentials are forbidden. Unsafe AI artifacts remain sandboxed and `trust_remote_code=True` is forbidden.
+- A current declared-remote observation, exact command receipt, matching candidate, and existing exploit artifact yield `SUBMISSION_RECOMMENDED`. Print the exact flag immediately, stop low-value branches, and keep at most one optional verifier. Clean replay may later reach `FULLY_VERIFIED`; it is not a precondition.
+- Never submit to CTFd automatically. Human submission is the competition oracle.

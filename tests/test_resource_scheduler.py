@@ -255,6 +255,20 @@ def test_ledger_child_ownership_event_priority_sampling_and_release(tmp_path: Pa
     assert {row["event"] for row in ledger.history()} >= {"REQUEST", "SAMPLE", "RELEASE", "EVENT_REBALANCE_REQUIRED"}
 
 
+def test_information_only_event_does_not_claim_progress_or_request_rebalance(tmp_path: Path) -> None:
+    ledger = ResourceLedger(tmp_path)
+    request = _request("worker-1", "static-analysis")
+    ledger.request(request, actor_session_id="sol-main", actor_role="sol")
+    ledger.rebalance(_capacity())
+    publish_event(
+        tmp_path, challenge_id="challenge", input_fingerprint="fp", session_id="worker-1",
+        event_type="SUPPORTED_FACT", summary="new architecture note without exploit relevance",
+    )
+    state = ledger.load()
+    assert state["rebalance_required"] is False
+    assert state["observations"].get("worker-1", {}).get("progress", {}).get("progressing") is not True
+
+
 def test_dry_plan_preserves_baseline_and_failed_apply_restores_it(tmp_path: Path) -> None:
     ledger = ResourceLedger(tmp_path)
     request = _request("worker", "symbolic-execution")

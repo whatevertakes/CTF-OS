@@ -256,3 +256,30 @@ def test_worker_result_clean_room_extension_is_backward_compatible(tmp_path: Pat
     payload = _result(); payload["independent_verification"] = True; payload["verifier_role"] = "clean-room-verifier"
     new = validate_worker_result(root, payload)
     assert new["independent_verification"] is True
+
+
+def test_reopen_condition_is_optional_and_checkpoint_centers_exploit_action(tmp_path: Path) -> None:
+    root = _worker(tmp_path)
+    payload = _result()
+    del payload["hypotheses"][0]["reopen_condition"]  # type: ignore[index]
+    assert validate_worker_result(root, payload)["hypotheses"][0]["reopen_condition"] is None
+
+    checkpoint = save_worker_checkpoint(
+        root, parent_session_id="sol-main", challenge_id="abc",
+        input_fingerprint="fingerprint-v1", checkpoint_type="WORKING_POC",
+        summary="minimal request proves auth bypass", evidence=["evidence/trace.txt"],
+        artifacts=["work/poc.py"], useful_for=[], recommended_action="try declared remote",
+        confidence=.95, current_exploit_hypothesis="session confusion yields auth bypass",
+        decisive_experiment_performed="swap the signed session subject",
+        observed_result="admin response returned", exploit_proximity=.82,
+        next_exploit_action="run the same request on the declared remote", decision="PROMOTE",
+        working_poc_present=True, remote_ready=True,
+    )
+    assert checkpoint["type"] == "WORKING_POC"
+    assert checkpoint["current_exploit_hypothesis"]
+    assert checkpoint["decisive_experiment_performed"]
+    assert checkpoint["observed_result"]
+    assert checkpoint["exploit_proximity"] == .82
+    assert checkpoint["next_exploit_action"]
+    assert checkpoint["decision"] == "PROMOTE"
+    assert checkpoint["working_poc_present"] is True and checkpoint["remote_ready"] is True

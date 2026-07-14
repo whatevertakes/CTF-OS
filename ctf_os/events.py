@@ -16,11 +16,11 @@ from .workspace import atomic_json, state_lock
 
 EVENT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
-    "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+    "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 PRIORITIES = frozenset({"LOW", "NORMAL", "HIGH", "CRITICAL"})
-HIGH_TYPES = frozenset({"FLAG_CANDIDATE", "EXPLOIT_PRIMITIVE"})
+HIGH_TYPES = frozenset({"FLAG_CANDIDATE", "WORKING_POC", "EXPLOIT_PRIMITIVE"})
 CRITICAL_TYPES = frozenset({"REMOTE_FLAG_OBTAINED"})
 TERMINAL_BRANCH_STATES = frozenset({"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TERMINATED", "ERROR", "STALE"})
 
@@ -165,7 +165,7 @@ def insight_packet(
         "schema_version": 1, "target_session_id": target_session_id,
         "challenge_id": branch.get("prompt_packet", {}).get("challenge_id") if isinstance(branch, Mapping) else None,
         "input_fingerprint": input_fingerprint, "events": relevant[:limit],
-        "instruction": "Apply confirmed facts and primitives; preserve conflicts and independently validate in your branch.",
+        "instruction": "Apply only insights that shorten the leading exploit path; run the next decisive experiment and publish a working PoC or flag before narrative summary.",
         "generated_at": utc_now(),
     }
 
