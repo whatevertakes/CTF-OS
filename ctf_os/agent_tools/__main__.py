@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 from ..challenge import SelectionError, resolve_selector
+from ..challenge_scope import remove_challenge_secrets
 from ..contest import ContestError, discover_contests, select_contest
 from ..evidence import append_finding
 from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
@@ -16,25 +17,33 @@ from ..delegation import (
     BranchCandidate, add_branch, branch_utility, init_plan, load_plan,
     record_admission, template_recommendation, update_branch,
 )
+from ..events import (
+    acknowledge_event, insight_packet, operator_hints, publish_event,
+    save_operator_hint, show_events,
+)
+from ..race import parse_branch_spec, race_board, start_race_plan
+from ..oast import create_oast, oast_events, poll_oast
 from ..replay import run_replay
 from ..problems import sync_contest_manifest
 from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
-from ..sandbox.resources import sandbox_gc, sandbox_status
+from ..sandbox.resources import gpu_available, sandbox_gc, sandbox_status
 from ..sandbox.runtime import (
     SandboxSpec, cleanup, create, execute, export_artifacts, probe_service_connectivity,
 )
 from ..service import (
     ServiceActor, ServiceSpec, service_build, service_cleanup, service_inspect,
     service_attachment, service_logs, service_plan, service_restart, service_start,
-    service_status, service_stop,
+    service_reset, service_status, service_stop,
 )
 from ..triage import finalize_triage, prepare_triage, require_final_triage
+from ..timeouts import timeout_seconds
 from ..workspace import atomic_json, challenge_root, initialize_solve_files, state_lock
 from ..worker import (
     collect_worker_checkpoints, load_worker_result, merge_worker_checkpoints,
     merge_worker_result_files, save_worker_checkpoint, save_worker_result,
 )
+from ..verification import record_remote_flag
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
     if not child_surface:
+        race_start = commands.add_parser("race-plan-start")
+        race_start.add_argument("selector"); race_start.add_argument("--contest")
+        race_start.add_argument("--tier", required=True, type=int)
+        race_start.add_argument("--tier-reason", default="competition-first first-to-flag race")
+        race_start.add_argument("--branch-spec"); race_start.add_argument("--threshold", type=float, default=.95)
+        _add_session_args(race_start)
+        race_show = commands.add_parser("race-board")
+        race_show.add_argument("selector"); race_show.add_argument("--contest"); _add_session_args(race_show)
         plan_init = commands.add_parser("delegation-plan-init")
         plan_init.add_argument("selector"); plan_init.add_argument("--contest")
         plan_init.add_argument("--tier", required=True, type=int); plan_init.add_argument("--tier-reason", required=True)
@@ -79,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         template_show = commands.add_parser("delegation-template-show")
         template_show.add_argument("selector"); template_show.add_argument("--contest"); template_show.add_argument("--tier", required=True, type=int); _add_session_args(template_show)
         admit = commands.add_parser("branch-admit")
-        _add_branch_candidate_args(admit); admit.add_argument("--threshold", type=float, default=.70); admit.add_argument("--purpose"); _add_delegation_controller_args(admit)
+        _add_branch_candidate_args(admit); admit.add_argument("--threshold", type=float, default=.95); admit.add_argument("--purpose"); admit.add_argument("--race-override-reason"); _add_delegation_controller_args(admit)
         branch_add = commands.add_parser("delegation-branch-add")
         _add_branch_candidate_args(branch_add)
         branch_add.add_argument("--evidence-contract", action="append", required=True)
@@ -112,7 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     sandbox_exec = commands.add_parser("sandbox-exec")
     sandbox_exec.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     sandbox_exec.add_argument("metadata")
-    sandbox_exec.add_argument("--timeout", type=int, default=120)
+    sandbox_exec.add_argument("--timeout", type=int, default=300)
+    sandbox_exec.add_argument("--timeout-profile")
     sandbox_exec.add_argument("argv", nargs=argparse.REMAINDER)
     _add_session_args(sandbox_exec)
     sandbox_cleanup = commands.add_parser("sandbox-cleanup")
@@ -140,6 +158,57 @@ def build_parser() -> argparse.ArgumentParser:
         service.add_argument("selector")
         service.add_argument("--contest")
         _add_session_args(service)
+    private_service_commands = (
+        "branch-service-plan", "branch-service-build", "branch-service-start",
+        "branch-service-restart", "branch-service-status", "branch-service-logs",
+        "branch-service-reset", "branch-service-inspect", "branch-service-stop", "branch-service-cleanup",
+    )
+    for name in private_service_commands:
+        service = commands.add_parser(name)
+        service.add_argument("selector"); service.add_argument("--contest")
+        service.add_argument("--branch", required=True)
+        _add_session_args(service, default_role="child")
+
+    event_publish = commands.add_parser("race-event-publish")
+    event_publish.add_argument("selector"); event_publish.add_argument("--contest")
+    event_publish.add_argument("--type", required=True); event_publish.add_argument("--priority", default="NORMAL")
+    event_publish.add_argument("--summary", required=True); event_publish.add_argument("--evidence", action="append", default=[])
+    event_publish.add_argument("--artifact", action="append", default=[]); event_publish.add_argument("--useful-for", default="")
+    event_publish.add_argument("--recommended-action", default=""); event_publish.add_argument("--event-id")
+    _add_session_args(event_publish)
+    events_show = commands.add_parser("race-events-show")
+    events_show.add_argument("selector"); events_show.add_argument("--contest"); events_show.add_argument("--since")
+    events_show.add_argument("--priority", action="append", default=[]); events_show.add_argument("--type", action="append", default=[])
+    _add_session_args(events_show)
+    event_ack = commands.add_parser("race-events-ack")
+    event_ack.add_argument("selector"); event_ack.add_argument("--contest"); event_ack.add_argument("--event-id", required=True)
+    _add_session_args(event_ack)
+    packet = commands.add_parser("race-insight-packet")
+    packet.add_argument("selector"); packet.add_argument("--contest"); packet.add_argument("--target-session-id", required=True)
+    packet.add_argument("--limit", type=int, default=20); _add_session_args(packet)
+    oast_create = commands.add_parser("oast-create")
+    oast_create.add_argument("selector"); oast_create.add_argument("--contest")
+    oast_create.add_argument("--branch", required=True); oast_create.add_argument("--provider-url", required=True)
+    _add_session_args(oast_create)
+    oast_poll = commands.add_parser("oast-poll")
+    oast_poll.add_argument("selector"); oast_poll.add_argument("--contest"); oast_poll.add_argument("--oast-id", required=True)
+    _add_session_args(oast_poll)
+    oast_show = commands.add_parser("oast-events")
+    oast_show.add_argument("selector"); oast_show.add_argument("--contest"); oast_show.add_argument("--oast-id", required=True)
+    _add_session_args(oast_show)
+    if not child_surface:
+        hint = commands.add_parser("operator-hint-save")
+        hint.add_argument("selector"); hint.add_argument("--contest"); hint.add_argument("--summary", required=True)
+        hint.add_argument("--target", action="append", default=[]); _add_session_args(hint)
+        hints = commands.add_parser("operator-hints-show")
+        hints.add_argument("selector"); hints.add_argument("--contest"); _add_session_args(hints)
+        receipt = commands.add_parser("flag-receipt-save")
+        receipt.add_argument("selector"); receipt.add_argument("--contest"); receipt.add_argument("--branch", required=True)
+        receipt.add_argument("--host", required=True); receipt.add_argument("--port", type=int, required=True)
+        receipt.add_argument("--protocol", required=True); receipt.add_argument("--network-observed", action="store_true")
+        receipt.add_argument("--output", required=True); receipt.add_argument("--candidate", required=True)
+        receipt.add_argument("--exploit-artifact", required=True); receipt.add_argument("argv", nargs=argparse.REMAINDER)
+        _add_session_args(receipt)
     if not child_surface:
         replay = commands.add_parser("replay")
         replay.add_argument("selector")
@@ -258,7 +327,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         if command and command[0] == "--":
             command.pop(0)
         session_id, role = _caller(args, metadata=metadata)
-        result = execute(metadata, command, args.timeout, session_id=session_id, session_role=role)
+        timeout = timeout_seconds(args.timeout_profile) if args.timeout_profile else args.timeout
+        result = execute(metadata, command, timeout, session_id=session_id, session_role=role)
         if result["timed_out"]:
             _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "TIMED_OUT", str(metadata["metadata_path"]))
         return result
@@ -266,6 +336,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         metadata = _load_metadata(root, args.metadata)
         session_id, role = _caller(args, metadata=metadata)
         result = cleanup(metadata, session_id=session_id, session_role=role)
+        result["challenge_secrets_cleanup"] = remove_challenge_secrets(Path(str(metadata["branch_root"])))
         _update_branch_state(Path(str(metadata["branch_root"])).parents[1], str(metadata["branch"]), "CLEANED", str(metadata["metadata_path"]))
         return result
     if args.command == "sandbox-export":
@@ -285,8 +356,28 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "prepare-challenge":
         return _compact_prepare(challenge, record, solve_root)
     current_fingerprint = str(record["source_fingerprint"])
-    if args.command.startswith("delegation-") or args.command in {"branch-admit", "branch-utility"}:
+    if args.command.startswith("delegation-") or args.command in {
+        "branch-admit", "branch-utility", "race-plan-start", "race-board",
+    }:
         _require_delegation_sol(args)
+        if args.command == "race-plan-start":
+            template_path = Path(__file__).parents[1] / "resources" / "delegation-templates.yaml"
+            specs = parse_branch_spec(args.branch_spec, category=challenge.category, tier=args.tier, template_path=template_path)
+            return start_race_plan(
+                solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
+                parent_session_id=args.parent_session_id, category=challenge.category,
+                tier=args.tier, tier_reason=args.tier_reason, branch_specs=specs,
+                threshold=args.threshold,
+            )
+        if args.command == "race-board":
+            plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
+            state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+            events = show_events(solve_root, input_fingerprint=current_fingerprint)
+            try:
+                resources = sandbox_status()
+            except Exception as exc:
+                resources = {"available": False, "reason": str(exc)}
+            return race_board(plan, state=state, events=events, resources=resources)
         if args.command == "delegation-plan-init":
             return init_plan(solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint, parent_session_id=args.parent_session_id, tier=args.tier, tier_reason=args.tier_reason)
         if args.command == "delegation-plan-show":
@@ -295,7 +386,11 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             return template_recommendation(Path(__file__).parents[1] / "resources" / "delegation-templates.yaml", category=challenge.category, tier=args.tier)
         if args.command == "branch-admit":
             candidate = _candidate_from_args(args)
-            return record_admission(solve_root, input_fingerprint=current_fingerprint, candidate=candidate, threshold=args.threshold, purpose=args.purpose)
+            return record_admission(
+                solve_root, input_fingerprint=current_fingerprint, candidate=candidate,
+                threshold=args.threshold, purpose=args.purpose,
+                race_override_reason=args.race_override_reason,
+            )
         if args.command == "delegation-branch-add":
             candidate = _candidate_from_args(args)
             return add_branch(solve_root, input_fingerprint=current_fingerprint, candidate=candidate, evidence_contract=args.evidence_contract, success_condition=args.success_condition, kill_condition=args.kill_condition, maximum_steps=args.maximum_steps, budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role, requested_reasoning=args.requested_reasoning, purpose=args.purpose)
@@ -318,6 +413,85 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             "service-cleanup": service_cleanup,
         }[args.command]
         return operation(spec) if args.command == "service-plan" else operation(spec, actor=actor)
+    if args.command.startswith("branch-service-"):
+        session_id, role = _caller(args, branch=args.branch)
+        if session_id != args.branch and role == "child":
+            raise ValueError("DENIED_SERVICE_LIFECYCLE: child may operate only its own branch-private service")
+        spec = _service_spec(manifest, challenge, record, solve_root, branch_id=args.branch)
+        actor = ServiceActor(
+            session_id=session_id, role=role, parent_session_id=args.parent_session_id,
+            recover_stale=bool(args.recover_stale),
+        )
+        operation = {
+            "branch-service-plan": service_plan, "branch-service-build": service_build,
+            "branch-service-start": service_start, "branch-service-restart": service_restart,
+            "branch-service-reset": service_reset,
+            "branch-service-status": service_status, "branch-service-logs": service_logs,
+            "branch-service-inspect": service_inspect, "branch-service-stop": service_stop,
+            "branch-service-cleanup": service_cleanup,
+        }[args.command]
+        return operation(spec) if args.command == "branch-service-plan" else operation(spec, actor=actor)
+    if args.command == "race-event-publish":
+        session_id, _role = _caller(args)
+        return publish_event(
+            solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
+            session_id=session_id, event_type=args.type, priority=args.priority,
+            summary=args.summary, evidence=args.evidence, artifacts=args.artifact,
+            useful_for=_csv(args.useful_for), recommended_action=args.recommended_action,
+            event_id=args.event_id,
+        )
+    if args.command == "race-events-show":
+        return {"events": show_events(
+            solve_root, input_fingerprint=current_fingerprint, since=args.since,
+            priorities=args.priority, event_types=args.type,
+        )}
+    if args.command == "race-events-ack":
+        session_id, _role = _caller(args)
+        return acknowledge_event(
+            solve_root, event_id=args.event_id, session_id=session_id,
+            input_fingerprint=current_fingerprint,
+        )
+    if args.command == "race-insight-packet":
+        plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
+        return insight_packet(
+            solve_root, input_fingerprint=current_fingerprint,
+            target_session_id=args.target_session_id, plan=plan, limit=args.limit,
+        )
+    if args.command == "operator-hint-save":
+        _require_sol(args, "Only Sol may record and route operator hints.")
+        plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
+        return save_operator_hint(
+            solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
+            summary=args.summary, active_branches=plan.get("branches", []), targets=args.target,
+        )
+    if args.command == "operator-hints-show":
+        _require_sol(args, "Only Sol may list operator hints.")
+        return {"hints": operator_hints(solve_root, input_fingerprint=current_fingerprint)}
+    if args.command == "oast-create":
+        session_id, role = _caller(args, branch=args.branch)
+        if role == "child" and session_id != args.branch:
+            raise ValueError("DENIED_CHALLENGE_SCOPE: child may create OAST only for its own branch")
+        return create_oast(
+            solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
+            branch_id=args.branch, provider_base=args.provider_url,
+        )
+    if args.command == "oast-poll":
+        return poll_oast(solve_root, oast_id=args.oast_id, input_fingerprint=current_fingerprint)
+    if args.command == "oast-events":
+        return {"events": oast_events(solve_root, oast_id=args.oast_id, input_fingerprint=current_fingerprint)}
+    if args.command == "flag-receipt-save":
+        _require_sol(args, "Only Sol may set the shared submission recommendation.")
+        argv = list(args.argv)
+        if argv and argv[0] == "--":
+            argv.pop(0)
+        return record_remote_flag(
+            solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
+            branch_id=args.branch, declared_targets=parse_remotes(challenge.remotes),
+            observed_host=args.host, observed_port=args.port, observed_protocol=args.protocol,
+            network_observed=args.network_observed, output=args.output, candidate=args.candidate,
+            flag_pattern=challenge.flag_pattern, command_argv=argv,
+            exploit_artifact=args.exploit_artifact,
+        )
     if args.command == "replay":
         _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
         return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
@@ -412,6 +586,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             service_network=service_network, local_endpoints=endpoints,
             session_id=session_id, parent_session_id=args.parent_session_id,
             session_role=session_role, service_context=service_context,
+            category=challenge.category,
+            gpu_enabled=challenge.category == "ai" and gpu_available(),
         )
         guard = (
             service_attachment(
@@ -493,13 +669,17 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     raise ValueError(f"unsupported internal command: {args.command}")
 
 
-def _service_spec(manifest, challenge, record: dict[str, object], solve_root: Path) -> ServiceSpec:
+def _service_spec(
+    manifest, challenge, record: dict[str, object], solve_root: Path,
+    *, branch_id: str | None = None,
+) -> ServiceSpec:
     plan = record.get("service_plan")
     if not isinstance(plan, dict) or not plan.get("kind"):
         raise ValueError("intake found no Dockerfile/Compose challenge service plan")
     return ServiceSpec(
         contest_slug=manifest.slug, challenge_id=challenge.id,
         source=solve_root / "input", workspace=solve_root, service_plan=plan,
+        branch_id=branch_id,
     )
 
 

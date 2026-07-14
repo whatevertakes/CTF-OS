@@ -10,4 +10,4 @@ Inspect metadata with `file`, `strings`, `binwalk`, `protoc`, `h5dump`, and Grap
 
 ## Validation
 
-Record model hashes, shapes, dtypes, preprocessing, seeds, resource usage, and a minimal CPU replay. Confirm an adversarial or reconstruction result against the supplied pipeline rather than a substitute model. Large model memory requirements feed admission control; GPU/CUDA requests remain `NEEDS_REVIEW`.
+Record model hashes, shapes, dtypes, preprocessing, seeds, resource use, and the exact target observation. Use available Docker NVIDIA GPU/CUDA automatically for challenge inference, adversarial generation, inversion, embedding search, and bounded fine-tuning. Unsafe model formats stay inside the sandbox and `trust_remote_code=True` remains forbidden. A target-confirmed flag may be surfaced before a CPU replay.

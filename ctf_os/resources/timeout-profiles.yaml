@@ -1,0 +1,9 @@
+quick_probe: 60
+normal_command: 300
+decompile: 900
+symbolic_slice: 1800
+fuzz_slice: 1800
+forensic_scan: 1800
+crypto_heavy: 1800
+cracking_slice: 1800
+ai_inference: 1800

@@ -60,6 +60,7 @@ def problems_template(contest_name: str) -> str:
         "# pwn/문제명\n"
         "# 설명: 문제 원문 설명\n"
         "# 원격: nc host.example 31337\n"
+        "# 원격: {\"host\":\"10.10.20.15\",\"port\":31337,\"protocol\":\"tcp\",\"organizer_declared\":true}\n"
     )
 
 

@@ -10,6 +10,7 @@ import tempfile
 
 from .delegation import DelegationError, load_templates
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute
+from .timeouts import TimeoutProfileError, load_timeout_profiles
 
 
 PROFILES = ("base", "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud")
@@ -174,13 +175,24 @@ def run_doctor(repo: Path) -> dict[str, object]:
     except (DelegationError, OSError) as exc:
         template_ok, template_detail = False, str(exc)
     add("delegation-templates", template_ok, template_detail, "restore the validated delegation template resource")
+    try:
+        timeout_profiles = load_timeout_profiles(repo / "ctf_os/resources/timeout-profiles.yaml")
+        timeout_ok, timeout_detail = len(timeout_profiles) == 9, f"{len(timeout_profiles)} profiles"
+    except (TimeoutProfileError, OSError) as exc:
+        timeout_ok, timeout_detail = False, str(exc)
+    add("timeout-profiles", timeout_ok, timeout_detail, "restore the validated timeout profile resource")
     add("service-runtime", importlib.util.find_spec("ctf_os.service") is not None, "ctf_os.service", "restore the service runtime module")
     add("replay-runtime", importlib.util.find_spec("ctf_os.replay") is not None, "ctf_os.replay", "restore the replay module")
 
-    stale_containers = _run(["docker", "ps", "-aq", "--filter", "label=ctf-os=true"]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
-    stale_networks = _run(["docker", "network", "ls", "-q", "--filter", "label=ctf-os=true"]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
-    stale_count = len(stale_containers.stdout.split()) + len(stale_networks.stdout.split())
-    add("stale-resources", stale_count == 0, f"{stale_count} labeled Docker resources", "run sandbox-gc for stale sandboxes")
+    # Doctor owns sandbox health, not another active solve's shared service.
+    # Count only stopped worker sandboxes that sandbox-gc can safely remove;
+    # active race sandboxes and exact-label service lifecycles are not stale.
+    stale_sandboxes = _run([
+        "docker", "ps", "-aq", "--filter", "label=ctf-os=true",
+        "--filter", "label=ctf-os.kind=sandbox", "--filter", "status=exited",
+    ]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
+    stale_count = len(stale_sandboxes.stdout.split())
+    add("stale-resources", stale_count == 0, f"{stale_count} stopped sandbox resources", "run sandbox-gc for stopped sandboxes")
     return {"ok": all(bool(item["ok"]) for item in checks), "checks": checks}
 
 

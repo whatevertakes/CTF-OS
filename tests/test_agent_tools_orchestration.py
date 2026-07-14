@@ -34,6 +34,11 @@ def test_child_tool_surface_omits_shared_lifecycle_and_final_judgment(monkeypatc
     commands = build_parser()._subparsers._group_actions[0].choices
 
     assert {"service-status", "service-logs", "service-inspect", "worker-result-save", "worker-checkpoint-save"}.issubset(commands)
+    assert {
+        "branch-service-start", "branch-service-restart", "branch-service-reset", "branch-service-stop",
+        "race-event-publish", "race-events-show", "race-events-ack",
+        "oast-create", "oast-poll", "oast-events",
+    }.issubset(commands)
     assert not {
         "service-build", "service-start", "service-restart", "service-stop", "service-cleanup",
         "sandbox-create", "sandbox-gc", "record-finding", "worker-results-merge", "replay",
@@ -60,6 +65,22 @@ def test_worker_result_controller_commands_are_exposed() -> None:
     commands = parser._subparsers._group_actions[0].choices
 
     assert {"worker-result-save", "worker-results-merge"}.issubset(commands)
+
+
+def test_competition_first_cli_surface_is_exposed_without_native_launcher() -> None:
+    parser = build_parser()
+    commands = parser._subparsers._group_actions[0].choices
+    assert {
+        "race-plan-start", "race-board", "race-event-publish", "race-events-show",
+        "race-events-ack", "race-insight-packet", "operator-hint-save",
+        "operator-hints-show", "oast-create", "oast-poll", "oast-events",
+        "flag-receipt-save", "branch-service-restart",
+        "branch-service-reset",
+    }.issubset(commands)
+    args = parser.parse_args(["race-plan-start", "1", "--tier", "2"])
+    assert args.threshold == .95 and args.branch_spec is None
+    exec_args = parser.parse_args(["sandbox-exec", "--timeout-profile", "fuzz_slice", "sandbox.json", "--", "true"])
+    assert exec_args.timeout == 300 and exec_args.timeout_profile == "fuzz_slice"
 
 
 def _dispatch_fixture(tmp_path: Path, monkeypatch):

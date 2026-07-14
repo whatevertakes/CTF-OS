@@ -56,7 +56,7 @@ def test_profiles_apply_limits_and_local_network_is_distinct(tmp_path: Path) -> 
         )
 
 
-def test_admission_enforces_profile_and_host_memory(monkeypatch) -> None:
+def test_admission_uses_aggregate_host_budget_not_fixed_profile_limits(monkeypatch) -> None:
     base = {
         "active": [
             {"resource_profile": "standard", "memory_bytes": 4 * GIB},
@@ -66,8 +66,7 @@ def test_admission_enforces_profile_and_host_memory(monkeypatch) -> None:
         "admission_memory_budget_bytes": 24 * GIB,
     }
     monkeypatch.setattr(resources, "sandbox_status", lambda **kwargs: base)
-    with pytest.raises(ResourceError, match="limit 2"):
-        admit("standard")
+    assert admit("standard") is base
 
     memory_limited = {**base, "active": [], "reserved_memory_bytes": 7 * GIB, "admission_memory_budget_bytes": 8 * GIB}
     monkeypatch.setattr(resources, "sandbox_status", lambda **kwargs: memory_limited)

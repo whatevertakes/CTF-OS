@@ -58,14 +58,16 @@ def test_plan_rejects_invalid_tier_status_duplicate_and_stale_fingerprint(tmp_pa
     assert json.loads((root / "DELEGATION_PLAN.json").read_text())["branches"][0]["status"] == "STALE"
 
 
-def test_admission_rejects_semantic_duplicate_and_is_deterministic(tmp_path: Path) -> None:
+def test_admission_rejects_only_exact_duplicate_and_is_deterministic(tmp_path: Path) -> None:
     root = tmp_path / "solve"; make_plan(root); add(root, candidate())
-    duplicate = candidate("renamed", hypothesis="  reconstruct TARGET validation-expression! ")
+    duplicate = candidate("renamed", hypothesis="  reconstruct THE TARGET validation-expression! ")
     first = admit_branch(load_plan(root), duplicate)
     second = admit_branch(load_plan(root), duplicate)
     assert first == second
     assert first["admitted"] is False
-    assert first["maximum_overlap_score"] >= .70
+    assert first["exact_duplicate"] is True
+    near_duplicate = candidate("race", hypothesis="Reconstruct target validation expression independently")
+    assert admit_branch(load_plan(root), near_duplicate)["admitted"] is True
 
 
 def test_admission_allows_distinct_family_exception_and_threshold(tmp_path: Path) -> None:
@@ -75,7 +77,8 @@ def test_admission_allows_distinct_family_exception_and_threshold(tmp_path: Path
     duplicate = candidate("verify")
     assert admit_branch(load_plan(root), duplicate, purpose="independent-verification")["admitted"] is True
     assert "exception" in admit_branch(load_plan(root), duplicate, purpose="independent-verification")["reason"].casefold()
-    assert admit_branch(load_plan(root), dynamic, threshold=.01)["admitted"] is False
+    advisory = admit_branch(load_plan(root), dynamic, threshold=.01)
+    assert advisory["admitted"] is True and advisory["advisory_overlap"] is True
 
 
 def test_admission_rejects_empty_and_excessive_input() -> None:
@@ -94,8 +97,8 @@ def test_utility_is_advisory_and_responds_to_evidence_penalties_and_flags(tmp_pa
     flag = branch_utility(plan, session_id="static", checkpoints=[{"session_id": "static", "type": "FLAG_CANDIDATE"}], result=None)
     assert insufficient["classification"] == "INSUFFICIENT_DATA"
     assert positive["utility_score"] > negative["utility_score"]
-    assert negative["classification"] == "TERMINATE_CANDIDATE"
-    assert flag["classification"] == "COMPLETE"
+    assert negative["classification"] == "DEAD_BRANCH"
+    assert flag["classification"] == "FLAG_PATH"
     assert load_plan(root)["branches"][0]["status"] == "ADMITTED"
 
 

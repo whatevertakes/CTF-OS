@@ -77,7 +77,9 @@ def initialize_solve_files(root: Path, challenge: ChallengeSpec, input_fingerpri
             atomic_json(state, {
                 "schema_version": 1, "challenge_id": challenge.id, "status": "PREPARED",
                 "branches": [], "flag_candidate": None, "verification": {},
-                "replay_verdict": None,
+                "replay_verdict": None, "competition_state": None,
+                "remote_flag": None, "submission_recommended": False,
+                "remote_flag_receipt": None, "flag_history": [],
                 "input_fingerprint": input_fingerprint,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
@@ -94,7 +96,11 @@ def bind_input_fingerprint(root: Path, challenge: ChallengeSpec, fingerprint: st
     with state_lock(root):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         previous = state.get("input_fingerprint")
-        stale_result = state.get("flag_candidate") is not None or state.get("status") == "READY_FOR_HUMAN_SUBMISSION"
+        stale_result = state.get("flag_candidate") is not None or state.get("status") in {
+            "READY_FOR_HUMAN_SUBMISSION", "FLAG_CANDIDATE", "LOCAL_FLAG_OBTAINED",
+            "REMOTE_FLAG_OBTAINED", "SUBMISSION_RECOMMENDED", "FULLY_VERIFIED",
+            "SUBMITTED_BY_HUMAN",
+        }
         if previous not in {None, fingerprint} or (previous is None and stale_result):
             result = root / "RESULT.md"
             if result.is_file():
@@ -104,7 +110,9 @@ def bind_input_fingerprint(root: Path, challenge: ChallengeSpec, fingerprint: st
                 atomic_text(result, "# Result invalidated\n\nChallenge input changed. Rerun and reverify the solver.\n")
             state.update({
                 "status": "PREPARED", "flag_candidate": None, "verification": {},
-                "replay_verdict": None, "branches": [],
+                "replay_verdict": None, "branches": [], "competition_state": None,
+                "remote_flag": None, "submission_recommended": False,
+                "remote_flag_receipt": None, "flag_history": [],
             })
         state["input_fingerprint"] = fingerprint
         atomic_json(state_path, state)

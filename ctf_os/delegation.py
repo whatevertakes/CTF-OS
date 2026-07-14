@@ -7,6 +7,7 @@ persists Sol's plan and computes reproducible admission/utility advice.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -27,11 +28,13 @@ BRANCH_STATUSES = frozenset({
 })
 ADMISSION_EXCEPTIONS = frozenset({
     "independent-verification", "clean-room-verifier", "clean-room-verification",
-    "alternate-attack-family",
+    "alternate-attack-family", "independent-full-solve", "parallel-race",
+    "alternate-model-role", "alternate-implementation", "plateau-escape",
 })
 UTILITY_CLASSIFICATIONS = frozenset({
-    "CONTINUE", "CONTINUE_ONCE", "CROSS_POLLINATE", "SOL_TAKEOVER_CANDIDATE",
-    "TERMINATE_CANDIDATE", "COMPLETE", "INSUFFICIENT_DATA",
+    "PROGRESSING", "NEEDS_SIBLING_INSIGHT", "BUMP_AND_RETRY",
+    "REPLACE_ATTACK_FAMILY", "SOL_TAKEOVER", "FLAG_PATH", "DEAD_BRANCH",
+    "INSUFFICIENT_DATA",
 })
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -118,17 +121,21 @@ def load_plan(solve_root: Path, *, input_fingerprint: str | None = None) -> dict
 
 
 def admit_branch(
-    plan: Mapping[str, Any], candidate: BranchCandidate, *, threshold: float = 0.70,
-    purpose: str | None = None,
+    plan: Mapping[str, Any], candidate: BranchCandidate, *, threshold: float = 0.95,
+    purpose: str | None = None, race_override_reason: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(threshold, (int, float)) or not 0.0 <= float(threshold) <= 1.0:
         raise DelegationError("threshold must be between 0 and 1")
     normalized_purpose = purpose.strip().casefold() if isinstance(purpose, str) and purpose.strip() else None
     comparisons: list[dict[str, Any]] = []
     maximum = 0.0
+    duplicate_session = False
+    exact_duplicate = False
     for existing in plan.get("branches", []):
         if not isinstance(existing, Mapping) or existing.get("status") == "STALE":
             continue
+        duplicate_session = duplicate_session or existing.get("session_id") == candidate.session_id
+        exact_duplicate = exact_duplicate or _is_exact_duplicate(existing, candidate)
         score, components, reasons = _overlap(existing, candidate)
         maximum = max(maximum, score)
         comparisons.append({
@@ -137,37 +144,50 @@ def admit_branch(
         })
     comparisons.sort(key=lambda row: (-row["overlap_score"], str(row["session_id"])))
     exception = normalized_purpose in ADMISSION_EXCEPTIONS or candidate.role.casefold() in ADMISSION_EXCEPTIONS
-    admitted = maximum < float(threshold) or exception
-    if exception and maximum >= float(threshold):
+    override = bool(race_override_reason and race_override_reason.strip())
+    admitted = not duplicate_session and (not exact_duplicate or exception)
+    if duplicate_session:
+        reason = f"Duplicate branch session_id: {candidate.session_id}"
+    elif exception and maximum >= float(threshold):
         reason = f"Overlap exception allowed for explicit purpose: {normalized_purpose or candidate.role}"
-    elif admitted and comparisons:
-        reason = "Candidate is materially distinct under deterministic weighted comparison"
-    elif admitted:
-        reason = "No existing active branch to overlap"
+    elif exact_duplicate:
+        reason = "Exact duplicate branch: hypothesis, scope, tools, artifact, and role are identical"
+    elif override and maximum >= float(threshold):
+        reason = f"Race-value override recorded: {race_override_reason.strip()}"
+    elif comparisons:
+        reason = "Admitted for parallel race; overlap is advisory unless every material dimension is identical"
     else:
-        reason = f"Maximum overlap {maximum:.2f} meets or exceeds threshold {float(threshold):.2f}"
+        reason = "No existing active branch to overlap"
     return {
         "admitted": admitted, "novelty_score": round(1.0 - maximum, 4),
         "maximum_overlap_score": round(maximum, 4), "threshold": round(float(threshold), 4),
         "compared_with": comparisons, "reason": reason,
         "exception_purpose": normalized_purpose if exception else None,
+        "exact_duplicate": exact_duplicate, "duplicate_session_id": duplicate_session,
+        "race_override_reason": race_override_reason.strip() if override else None,
+        "advisory_overlap": maximum >= float(threshold) and admitted,
     }
 
 
 def record_admission(
     solve_root: Path, *, input_fingerprint: str, candidate: BranchCandidate,
-    threshold: float = 0.70, purpose: str | None = None,
+    threshold: float = 0.95, purpose: str | None = None,
+    race_override_reason: str | None = None,
 ) -> dict[str, Any]:
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
-        result = admit_branch(plan, candidate, threshold=threshold, purpose=purpose)
+        result = admit_branch(
+            plan, candidate, threshold=threshold, purpose=purpose,
+            race_override_reason=race_override_reason,
+        )
         decisions = [
             item for item in plan.get("admission_decisions", [])
             if not (isinstance(item, Mapping) and item.get("session_id") == candidate.session_id)
         ]
         decisions.append({
             "session_id": candidate.session_id, "candidate": _candidate_dict(candidate),
-            "purpose": purpose, "evaluated_at": utc_now(), "result": result,
+            "purpose": purpose, "race_override_reason": race_override_reason,
+            "evaluated_at": utc_now(), "result": result,
         })
         plan["admission_decisions"] = decisions
         plan["updated_at"] = utc_now()
@@ -198,9 +218,13 @@ def add_branch(
         # candidate cannot become a duplicate while Sol is opening another
         # native branch between admit and add.
         saved_result = decision.get("result") if isinstance(decision, Mapping) else None
-        saved_threshold = saved_result.get("threshold", .70) if isinstance(saved_result, Mapping) else .70
+        saved_threshold = saved_result.get("threshold", .95) if isinstance(saved_result, Mapping) else .95
         saved_purpose = decision.get("purpose") if isinstance(decision, Mapping) else purpose
-        admission = admit_branch(plan, candidate, threshold=float(saved_threshold), purpose=saved_purpose)
+        saved_override = decision.get("race_override_reason") if isinstance(decision, Mapping) else None
+        admission = admit_branch(
+            plan, candidate, threshold=float(saved_threshold), purpose=saved_purpose,
+            race_override_reason=saved_override,
+        )
         if not admission["admitted"]:
             raise DelegationError(f"branch admission denied: {admission['reason']}")
         now = utc_now()
@@ -321,15 +345,20 @@ def branch_utility(
     counts = {name: 0 for name in (
         "supported_facts", "useful_artifacts", "exploit_primitives", "flag_candidates",
         "rejected_hypotheses", "repeated_failures", "policy_violations",
+        "repeated_commands", "tool_failures", "sibling_insights", "family_changes",
     )}
     for item in relevant:
         kind = item.get("type")
         if kind == "SUPPORTED_FACT": counts["supported_facts"] += 1
         if kind == "ARTIFACT_READY": counts["useful_artifacts"] += max(1, len(item.get("artifacts", [])))
         if kind == "EXPLOIT_PRIMITIVE": counts["exploit_primitives"] += 1
-        if kind == "FLAG_CANDIDATE": counts["flag_candidates"] += 1
+        if kind in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}: counts["flag_candidates"] += 1
         if kind == "REJECTED_HYPOTHESIS": counts["rejected_hypotheses"] += 1
         if kind == "BLOCKER": counts["repeated_failures"] += 1
+        if kind == "ENVIRONMENT_DISCOVERY" and item.get("recommended_action") == "TOOL_FAILURE": counts["tool_failures"] += 1
+        if item.get("sibling_insight_applied"): counts["sibling_insights"] += 1
+        if item.get("hypothesis_family_changed"): counts["family_changes"] += 1
+        counts["repeated_commands"] += int(item.get("repeated_command", False))
     if result:
         counts["useful_artifacts"] += len(result.get("artifacts", []))
         counts["flag_candidates"] += len(result.get("flag_candidates", []))
@@ -346,21 +375,47 @@ def branch_utility(
         + counts["rejected_hypotheses"] - 2.0 * counts["repeated_failures"]
         - 2.0 * overlap - 1.5 * elapsed_ratio - 5.0 * counts["policy_violations"], 3,
     )
+    observations = max(1, len(relevant) + (1 if result else 0))
+    recent = relevant[-8:]
+    recent_supported = sum(item.get("type") == "SUPPORTED_FACT" for item in recent)
+    blocker_summaries = Counter(
+        str(item.get("summary", "")).strip().casefold()
+        for item in recent if item.get("type") == "BLOCKER" and str(item.get("summary", "")).strip()
+    )
+    same_error_repeats = max(blocker_summaries.values(), default=0)
+    repeat_ratio = round(counts["repeated_commands"] / observations, 4)
+    tool_failure_ratio = round(counts["tool_failures"] / observations, 4)
+    artifact_changed = counts["useful_artifacts"] > 0
+    flag_proximity = min(1.0, .55 * bool(counts["exploit_primitives"]) + .3 * artifact_changed + .15 * bool(counts["supported_facts"]))
     if counts["flag_candidates"]:
-        classification, recommendation = "COMPLETE", "Return the candidate to Sol for clean replay; do not submit automatically"
+        classification, recommendation = "FLAG_PATH", "Prioritize this branch and surface a valid remote flag immediately"
     elif counts["policy_violations"]:
-        classification, recommendation = "TERMINATE_CANDIDATE", "Sol should review the policy violation before any further execution"
+        classification, recommendation = "DEAD_BRANCH", "Stop the out-of-scope branch and reuse its slot"
     elif counts["supported_facts"] + counts["exploit_primitives"] and rate >= 0.5:
-        classification, recommendation = "CROSS_POLLINATE", "Merge the new fact and send only the compact checkpoint to relevant branches"
-    elif elapsed_ratio >= 1.0 and score <= 0:
-        classification, recommendation = "TERMINATE_CANDIDATE", "Budget is exhausted with low utility; Sol decides whether to terminate"
-    elif counts["repeated_failures"] >= 2 and rate < 0.5:
-        classification, recommendation = "SOL_TAKEOVER_CANDIDATE", "Sol should inspect the compact evidence and consider takeover"
+        classification, recommendation = "PROGRESSING", "Continue and broadcast compact confirmed insights"
+    elif counts["repeated_failures"] >= 3 and rate < .25 and counts["sibling_insights"]:
+        classification, recommendation = "REPLACE_ATTACK_FAMILY", "Replace this branch with a distinct attack family"
+    elif counts["repeated_failures"] >= 2 and not counts["sibling_insights"]:
+        classification, recommendation = "NEEDS_SIBLING_INSIGHT", "Inject the latest relevant insight packet and continue"
+    elif elapsed_ratio >= 1.0 and flag_proximity >= .5:
+        classification, recommendation = "SOL_TAKEOVER", "Sol should take over the promising artifact and evidence"
+    elif elapsed_ratio >= 1.0 or repeat_ratio >= .6 or tool_failure_ratio >= .6:
+        classification, recommendation = "BUMP_AND_RETRY", "Inject sibling findings and retry once with a changed tool strategy"
     elif score > 0:
-        classification, recommendation = "CONTINUE", "Continue for one bounded experiment"
+        classification, recommendation = "PROGRESSING", "Continue with the next bounded experiment"
     else:
-        classification, recommendation = "CONTINUE_ONCE", "Run one final bounded experiment, then reassess"
-    metrics = {**counts, "elapsed_budget_ratio": round(elapsed_ratio, 4), "overlap_score": round(overlap, 4), "new_information_rate": rate}
+        classification, recommendation = "BUMP_AND_RETRY", "Change the experiment or tool strategy and reassess"
+    metrics = {
+        **counts, "elapsed_budget_ratio": round(elapsed_ratio, 4),
+        "elapsed_seconds": round(elapsed_ratio * int(branch.get("budget_seconds", 0)), 3),
+        "overlap_score": round(overlap, 4), "new_information_rate": rate,
+        "repeated_command_ratio": repeat_ratio, "tool_failure_ratio": tool_failure_ratio,
+        "artifact_changed": artifact_changed, "hypothesis_family_changed": bool(counts["family_changes"]),
+        "sibling_insight_applied": bool(counts["sibling_insights"]),
+        "flag_proximity": round(flag_proximity, 4),
+        "recent_window_size": len(recent), "recent_supported_facts": recent_supported,
+        "same_error_repeat_count": same_error_repeats,
+    }
     return {"session_id": session_id, "utility_score": score, "classification": classification, "recommendation": recommendation, "metrics": metrics}
 
 
@@ -383,6 +438,19 @@ def _overlap(existing: Mapping[str, Any], candidate: BranchCandidate) -> tuple[f
     if components["expected_artifacts"]: reasons.append("expected artifact overlap")
     else: reasons.append("different expected artifact")
     return score, {key: round(value, 4) for key, value in components.items()}, reasons
+
+
+def _is_exact_duplicate(existing: Mapping[str, Any], candidate: BranchCandidate) -> bool:
+    """Reject only a race branch that is materially identical in every dimension."""
+    return bool(
+        _exact(existing.get("hypothesis_family"), candidate.hypothesis_family)
+        and _exact(existing.get("hypothesis"), candidate.hypothesis)
+        and _normalized_set(existing.get("scope", [])) == _normalized_set(candidate.scope)
+        and _normalized_set(existing.get("tool_strategy", [])) == _normalized_set(candidate.tool_strategy)
+        and {Path(str(item)).as_posix().casefold() for item in existing.get("expected_artifacts", [])}
+        == {Path(str(item)).as_posix().casefold() for item in candidate.expected_artifacts}
+        and _exact(existing.get("role"), candidate.role)
+    )
 
 
 def _candidate_dict(candidate: BranchCandidate) -> dict[str, Any]:

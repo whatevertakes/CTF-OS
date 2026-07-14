@@ -66,10 +66,11 @@ class ServiceSpec:
     pids: int = 256
     build_timeout: int = 900
     start_timeout: int = 180
+    branch_id: str | None = None
 
     @property
     def scope(self) -> str:
-        raw = f"{self.contest_slug}-{self.challenge_id}"
+        raw = f"{self.contest_slug}-{self.challenge_id}" + (f"-branch-{self.branch_id}" if self.branch_id else "")
         safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", raw).strip("-.").lower()
         return (safe[:60] + "-" + hashlib.sha256(raw.encode()).hexdigest()[:10])
 
@@ -83,7 +84,10 @@ class ServiceSpec:
 
     @property
     def runtime_root(self) -> Path:
-        return self.workspace / "service"
+        return (
+            self.workspace / "workers" / self.branch_id / "private-service"
+            if self.branch_id else self.workspace / "service"
+        )
 
     @property
     def metadata_path(self) -> Path:
@@ -99,17 +103,20 @@ class ServiceSpec:
 
     @property
     def stable_alias(self) -> str:
-        return "challenge-service"
+        return "branch-service" if self.branch_id else "challenge-service"
 
     @property
     def labels(self) -> dict[str, str]:
-        return {
+        labels = {
             "ctf-os": "true",
-            "ctf-os.kind": "challenge-service",
+            "ctf-os.kind": "branch-private-service" if self.branch_id else "challenge-service",
             "ctf-os.contest": self.contest_slug,
             "ctf-os.challenge_id": self.challenge_id,
             "ctf-os.service_scope": self.scope,
         }
+        if self.branch_id:
+            labels["ctf-os.branch"] = self.branch_id
+        return labels
 
 
 def service_plan(spec: ServiceSpec, *, runner: Runner | None = None, docker: str = "docker") -> dict[str, object]:
@@ -364,6 +371,19 @@ def service_restart(
         return {"restarted": restarted}
 
 
+def service_reset(
+    spec: ServiceSpec, *, actor: ServiceActor | None = None,
+    runner: Runner = None, docker: str = "docker",
+) -> dict[str, object]:
+    """Recreate an exact-scope service from its immutable challenge source."""
+    active_runner = runner or _run
+    active = actor or ServiceActor()
+    cleaned = service_cleanup(spec, actor=active, runner=active_runner, docker=docker)
+    built = service_build(spec, actor=active, runner=active_runner, docker=docker)
+    started = service_start(spec, actor=active, runner=active_runner, docker=docker)
+    return {"reset": True, "cleanup": cleaned, "build": built, "start": started}
+
+
 def service_cleanup(
     spec: ServiceSpec, *, actor: ServiceActor | None = None,
     runner: Runner = None, docker: str = "docker",
@@ -498,6 +518,8 @@ def _validate_spec(spec: ServiceSpec) -> None:
         raise ServiceError("invalid contest slug")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}", spec.challenge_id):
         raise ServiceError("invalid challenge id")
+    if spec.branch_id is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", spec.branch_id):
+        raise ServiceError("invalid branch-private service id")
     if spec.cpus <= 0 or spec.pids < 1 or not re.fullmatch(r"[1-9][0-9]*(?:[kKmMgG])?", spec.memory):
         raise ServiceError("service resource limits are invalid")
     if not (30 <= spec.build_timeout <= 3600 and 5 <= spec.start_timeout <= 600):
@@ -714,14 +736,19 @@ def _lifecycle(
     """Serialize and authorize one service mutation without waiting indefinitely."""
     _validate_spec(spec)
     _validate_actor(actor)
-    if actor.role != "sol" or (
-        actor.parent_session_id is not None and actor.session_id != actor.parent_session_id
-    ):
+    shared_denied = spec.branch_id is None and (
+        actor.role != "sol" or (
+            actor.parent_session_id is not None and actor.session_id != actor.parent_session_id
+        )
+    )
+    private_denied = spec.branch_id is not None and (
+        actor.session_id != spec.branch_id or actor.role not in {"child", "sol"}
+    )
+    if shared_denied or private_denied:
         raise ServiceError(
             "DENIED_SERVICE_LIFECYCLE\n\n"
-            "This challenge service is owned by the parent Sol session.\n"
-            "Child sessions may inspect and attach to the existing service,\n"
-            "but may not build, start, stop, restart, or clean it up."
+            "Shared challenge services are parent-Sol owned. A child may mutate only a "
+            "branch-private service whose branch id exactly matches its native session id."
         )
     _prepare_runtime_root(spec)
     path = spec.lifecycle_lock_path

@@ -10,4 +10,4 @@ Turn mitigations into testable hypotheses: ret2win or format-string disclosure, 
 
 ## Validation and replay
 
-Validate every primitive locally: demonstrate the overwrite or leak, confirm addresses from the intended build, and make one minimally scoped request to an authorized remote only after the local result is repeatable. Save the input, exploit script, protections observed, outputs, and a replay command. A crash or a plausible string is a finding, not a flag.
+Race primitive discovery, dynamic GDB exploitation, and an independent full solve. Publish leaks/overwrites immediately and use branch-private services for crash/restart loops. Save the exploit and exact remote receipt. A pattern-matching flag from the declared remote plus the exploit artifact is immediately submission-recommended; local repeatability and strict replay may follow.

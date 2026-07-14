@@ -1,7 +1,7 @@
 [project]
 name = "ctf-os"
-version = "2.1.0"
-description = "Sol-native support tools for authorized CTF intake and solving"
+version = "3.0.0"
+description = "Competition-first Sol-native race tools for authorized CTF solving"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0.2"]
 
@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 include = ["ctf_os*"]
 
 [tool.setuptools.package-data]
-ctf_os = ["resources/agent-policy.md", "resources/delegation-templates.yaml", "resources/knowledge/playbooks/*.md"]
+ctf_os = ["resources/agent-policy.md", "resources/delegation-templates.yaml", "resources/timeout-profiles.yaml", "resources/knowledge/playbooks/*.md"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

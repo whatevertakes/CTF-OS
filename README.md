@@ -1,63 +1,119 @@
 # CTF-OS
 
-CTF-OS는 사람이 연 Sol/Luna 세션을 위한 로컬 CTF 분석 도구입니다. 사람은 문제 파일과 `problems.txt`만 준비하고, Intake가 내부 `contest.md` manifest 생성·검증·workspace 준비를 처리합니다.
+CTF-OS는 사용자가 직접 연 Sol 세션을 lead attacker로 유지하면서, 제한 시간 안에 첫 flag를 얻도록 native solver race를 지원하는 로컬 CTF 도구입니다. Python은 model/API를 실행하지 않고 manifest, race ledger, sandbox, target policy, event bus, artifact, receipt와 replay만 담당합니다.
 
-## 시작
-
-1. 저장소를 clone합니다.
-
-   ```bash
-   git clone git@github.com:whatevertakes/CTF-OS.git
-   cd CTF-OS
-   ```
-
-2. 의존성을 설치합니다. Python 3.11 이상, `uv`, Docker Engine(실행 중)과 Docker Compose v2가 필요합니다.
-
-   ```bash
-   uv sync --frozen
-   ```
-
-3. 대회 전에 10개 sandbox 이미지를 빌드하고 환경을 확인합니다.
-
-   ```bash
-   sandbox/build-images.sh
-   uv run python -m ctf_os.agent_tools doctor
-   ```
-
-   `uv sync --frozen`은 CTF-OS의 Python 의존성만 설치하며 Docker 이미지를 만들지 않습니다. 모든 profile build와 doctor가 PASS한 상태에서 대회를 시작합니다. 특정 이미지만 다시 만들 때는 `sandbox/build-images.sh pwn` 또는 `sandbox/build-images.sh osint ai cloud`를 사용합니다.
-
-4. 대회 폴더를 만듭니다.
-
-   ```bash
-   uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
-   ```
-
-6. 문제 파일을 `incoming/<contest>/<category>/` 아래에 넣습니다.
-
-7. `incoming/<contest>/problems.txt`에 문제 정보와 원격을 붙여 넣습니다. 생성된 파일의 주석 예시를 참고합니다.
-
-8. Sol에게 **“intake 해”**라고 요청합니다.
-
-Intake는 `problems.txt`를 읽고 실제 파일을 확인한 뒤 `contest.md`를 생성 또는 갱신하고, parser 검증·intake·workspace 준비를 완료합니다. `contest.md`는 내부 manifest이며 사람이 수정하지 않습니다.
-
-9. 새 Sol 세션에서 **“triage 해”**라고 요청합니다.
-
-Challenge Triage는 Intake가 만든 inventory·ELF·archive·runtime·remote 메타데이터만 사용해 `output/<contest>/TRIAGE.md` Board와 `triage.json`을 만듭니다. 이 단계는 exploit, brute force, fuzzing, symbolic execution, solver 실행이나 remote 접속을 하지 않습니다. Board에서 추천 순서를 확인한 뒤 새 Sol 세션에서 **“1번 문제 풀어”**처럼 번호를 선택합니다.
-
-## Worker orchestration
-
-Solve 세션은 `DELEGATION_PLAN.json`에 tier, branch 가설, 범위, 예산, admission 결과와 requested/observed runtime 정보를 원자적으로 기록합니다. `delegation-template-show`는 카테고리별 Tier 1–4 후보를 추천할 뿐 branch를 만들지 않습니다. `branch-admit`는 외부 모델 없이 가설군·정규화 토큰·scope·tool·artifact·role의 가중 overlap을 계산하며 기본 0.70 이상 중복을 거부합니다.
-
-`delegation-branch-add` 역시 child를 생성하지 않습니다. Sol이 Codex runtime native delegation으로 child를 만든 뒤 `sandbox-create`로 그 worker의 격리 실행 환경을 만듭니다. Worker는 자기 디렉터리에만 checkpoint/result를 저장하고, Sol만 전체 merge/show, shared finding, service lifecycle, utility 판단, 최종 replay를 수행합니다. Requested model role은 pinning 증명이 아니며 관측 근거가 없으면 observed 필드는 `null`입니다.
-
-권장 순서는 다음과 같습니다.
+핵심 계약은 단순합니다.
 
 ```text
-prepare-challenge → delegation-plan-init → delegation-template-show → branch-admit
-→ delegation-branch-add → native child delegation → RUNNING → sandbox-create
-→ worker-checkpoint-save → worker-checkpoints-merge → branch-utility
-→ worker-result-save → worker-results-merge → record-finding
-→ optional clean-room verifier → REPRODUCE.json → replay → manual submission
+Sol is the lead attacker and race coordinator.
+Use native delegation aggressively.
+Start multiple independent paths early.
+Share confirmed insights quickly.
+Replace stalled branches instead of giving up.
+Surface a remote flag immediately.
+Human submission is the competition oracle.
+Full replay improves confidence but does not delay the flag.
 ```
 
-Clean-room verifier는 overlap 예외가 가능하지만 최종 artifact, `REPRODUCE.json`, fingerprint, expected observable behavior만 기본 입력으로 받습니다. 성공 자체는 제출 가능 판정이 아니며 Sol의 clean replay가 계속 필요합니다. Cloud는 read-only allowlist, AI는 host pickle/joblib 역직렬화 금지, OSINT는 비인가 계정·credential·개인정보 수집 금지 정책을 그대로 유지합니다.
+## 준비
+
+Python 3.11+, `uv`, 실행 중인 Docker Engine과 Compose v2가 필요합니다.
+
+```bash
+git clone git@github.com:whatevertakes/CTF-OS.git
+cd CTF-OS
+uv sync --frozen
+sandbox/build-images.sh
+uv run python -m ctf_os.agent_tools doctor
+uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
+```
+
+문제 파일을 `incoming/<contest>/<category>/`에 넣고 `incoming/<contest>/problems.txt`에 문제/target을 기록합니다. 이후 Sol에게 별도 세션에서 순서대로 “intake 해”, “triage 해”, “1번 문제 풀어”라고 요청합니다. Intake는 내부 `contest.md`와 workspace를 만들고, Triage는 원본을 열거나 exploit하지 않은 채 추천 Board만 만듭니다.
+
+## 실제 solve 흐름
+
+“1번 문제 풀어” 한 문장으로 다음이 기본 실행됩니다.
+
+```text
+prepare-challenge
+→ 60~90초 compact recon
+→ race tier 결정
+→ race-plan-start로 plan/admission/prompt packet 원자 생성
+→ Codex runtime native child 2~4개 즉시 위임
+→ child별 sandbox + Sol 자체 deep-solve lane
+→ live event/insight 공유
+→ plateau branch bump/교체 또는 Sol takeover
+→ 첫 declared-remote flag receipt
+→ SUBMISSION_RECOMMENDED와 정확한 flag 즉시 출력
+→ 사람이 제출
+→ 필요하면 verifier/replay로 FULLY_VERIFIED
+```
+
+Tier 1은 child 2개, Tier 2는 3개, Tier 3은 4개가 기본입니다. Tier 4는 child 수를 계속 늘리는 단계가 아니라 낮은 가치의 branch를 새 attack family로 교체하며 사용 가능한 concurrency를 유지하는 단계입니다. Sol도 coordinator로 기다리지 않고 항상 핵심 primitive, 어려운 분석, solver 결합, remote exploit 중 하나를 직접 수행합니다.
+
+## Race와 live insight CLI
+
+```bash
+uv run python -m ctf_os.agent_tools race-plan-start 1 --contest my-ctf --tier 2
+uv run python -m ctf_os.agent_tools race-board 1 --contest my-ctf
+uv run python -m ctf_os.agent_tools race-event-publish 1 --contest my-ctf \
+  --type EXPLOIT_PRIMITIVE --summary 'byte oracle confirmed' --priority HIGH
+uv run python -m ctf_os.agent_tools race-events-show 1 --contest my-ctf
+uv run python -m ctf_os.agent_tools race-insight-packet 1 --contest my-ctf \
+  --target-session-id race-3-independent-full-solve
+uv run python -m ctf_os.agent_tools operator-hint-save 1 --contest my-ctf \
+  --summary 'libc is 2.35; switch to heap path'
+```
+
+`race-plan-start`는 fingerprint를 검사하고 이전 plan을 STALE archive로 보존하며, exact duplicate만 거부하고, 모든 branch record와 native delegation prompt packet을 한 번에 기록합니다. 이 명령은 child를 생성하지 않습니다. Sol이 packet을 사용해 native delegation을 수행합니다.
+
+Admission overlap 기본값은 0.95이고 advisory입니다. `independent-full-solve`, parallel race, alternate role/implementation, verification, plateau escape는 중복 허용 목적입니다. Requested model/reasoning은 관측된 pinning이 아니며 evidence가 없으면 observed 필드는 `null`입니다.
+
+Event bus는 supported/rejected fact, primitive, blocker, artifact, next experiment, flag, service crash와 operator hint를 append-only로 보존합니다. 동일 event ID는 idempotent하고 충돌 facts는 병렬 보존됩니다. `branch-utility`는 `PROGRESSING`, `NEEDS_SIBLING_INSIGHT`, `BUMP_AND_RETRY`, `REPLACE_ATTACK_FAMILY`, `SOL_TAKEOVER`, `FLAG_PATH`, `DEAD_BRANCH`, `INSUFFICIENT_DATA`를 추천하지만 native child lifecycle은 Sol만 조정합니다.
+
+## Sandbox, service, resource
+
+Challenge/input와 context는 read-only이고 worker별 `/work`, `/evidence`, `/artifacts`만 writable입니다. Pwn/rev/misc는 ptrace/GDB/core와 필요한 permissive seccomp를, forensic은 read-only loop mount에 필요한 capability/device를, AI는 사용 가능한 NVIDIA GPU를 자동 적용합니다. Docker socket, host root, SSH key, browser profile, 개인 cloud/kubeconfig는 절대 mount하지 않습니다.
+
+긴 도구는 profile slice로 실행합니다.
+
+```text
+quick_probe 60s        normal_command 300s       decompile 900s
+symbolic/fuzz/forensic/crypto/cracking/AI slice 1800s
+```
+
+```bash
+uv run python -m ctf_os.agent_tools sandbox-exec --timeout-profile symbolic_slice \
+  workers/x/sandbox.json -- python3 /work/solve.py
+```
+
+Resource admission은 profile별 고정 concurrency나 heavy 단일 실행 제한 대신 Docker host의 memory/CPU 총량, 현재 reservation, host reserve(메모리 max(4GiB, 15%), CPU 최소 1~2개)를 사용합니다. 부족하면 high-value prefix만 admit하고 완료 sandbox를 정리해 slot을 재사용합니다.
+
+Shared `challenge-service` lifecycle은 Sol 전용입니다. Crash/fuzz branch는 자기 session ID와 정확히 일치하는 `branch-service-*` instance를 build/start/restart/reset/log/inspect/stop/cleanup할 수 있으나 shared/sibling/host Docker는 조작할 수 없습니다.
+
+## Target, OAST, Cloud/OSINT/AI
+
+Organizer-declared public/private/VPN/IPv6 target과 tcp, udp, http, https, tls, websocket, wss, dns, ssh, grpc, custom protocol, 여러 host/port를 지원합니다. Private target은 structured declaration의 `organizer_declared: true`가 필요합니다. Cloud metadata, Docker gateway, undeclared LAN, 다른 challenge target, unrelated host exploit/scan은 계속 차단됩니다.
+
+`oast-create`, `oast-poll`, `oast-events`는 명시적으로 승인된 HTTPS OAST provider의 blind XSS/SSRF/XXE/bot callback receipt를 challenge-local로 보존하며 cookie/token/credential을 redact합니다.
+
+문제가 제공한 임시/가상 credential은 worker-private storage에서 사용할 수 있습니다. 선언된 cloud account/project/tenant에서는 enumeration, role assume/impersonation, object/workload/function 작업과 exploit에 필요한 IAM/RBAC mutation을 ledger에 남기고 수행할 수 있습니다. 개인/ambient credential과 scope 밖 account는 금지됩니다. AI model은 sandbox 안에서 검사하며 host pickle/joblib 역직렬화와 `trust_remote_code=True`는 금지합니다.
+
+## Flag fast path
+
+`flag-receipt-save`는 현재 challenge의 declared target, 실제 network observation, exact command output, flag pattern과 existing exploit artifact를 검사합니다. 조건을 만족하면 두 번 replay를 기다리지 않고 즉시 다음을 반환하고 `RESULT.md`를 갱신합니다.
+
+```text
+REMOTE FLAG OBTAINED
+Flag: CTF{...}
+Confidence: HIGH
+State: SUBMISSION_RECOMMENDED
+Recommendation: submit immediately
+Full clean replay: not required before human submission
+```
+
+이때 저가치 branch 종료와 verifier 최대 1개 유지가 권고됩니다. 자동 CTFd submission은 존재하지 않습니다. 기존 strict `replay`는 더 높은 품질 상태 `FULLY_VERIFIED`를 만들지만 flag 공개나 사람 제출의 선행 gate가 아닙니다.
+
+## 보안 경계
+
+유지되는 경계는 challenge scope, read-only 원본, worker/challenge 격리, host SSH/browser/personal cloud 접근 금지, host Docker socket/root mount 금지, metadata/undeclared LAN/out-of-scope scan 금지, 자동 flag 제출 금지, Python model launcher/API 금지뿐입니다. 그 안에서는 실제 첫 flag 속도를 우선합니다.

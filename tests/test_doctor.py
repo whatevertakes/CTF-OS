@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from ctf_os.doctor import IMAGES, PROFILE_PROBES, _available_memory, _write_probe
+from ctf_os.timeouts import load_timeout_profiles
 
 
 def test_doctor_safe_local_probes(tmp_path: Path) -> None:
@@ -31,3 +32,8 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
     }
     for profile, required in expectations.items():
         assert all(value in PROFILE_PROBES[profile] for value in required)
+    assert load_timeout_profiles() == {
+        "quick_probe": 60, "normal_command": 300, "decompile": 900,
+        "symbolic_slice": 1800, "fuzz_slice": 1800, "forensic_scan": 1800,
+        "crypto_heavy": 1800, "cracking_slice": 1800, "ai_inference": 1800,
+    }

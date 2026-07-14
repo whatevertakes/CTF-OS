@@ -34,10 +34,10 @@ apply_firewall() {
     "$tool" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     # The host resolves every documented remote before Docker starts. The
-    # resulting JSON consists only of exact IP/port/TCP tuples.
+    # resulting JSON consists only of exact IP/port/transport tuples.
     while IFS=$'\t' read -r ip port protocol; do
         [ -n "$ip" ] || continue
-        [ "$protocol" = "tcp" ] || exit 64
+        case "$protocol" in tcp|udp) ;; *) exit 64 ;; esac
         case "$port" in
             ''|*[!0-9]*|0) exit 64 ;;
         esac
@@ -48,8 +48,8 @@ apply_firewall() {
         else
             exit 64
         fi
-        "$tool" -A OUTPUT -p tcp -d "$ip" --dport "$port" -j ACCEPT
-    done < <(printf '%s' "$CTF_OS_ALLOWED_ENDPOINTS_JSON" | jq -r '.[] | [.ip, (.port|tostring), .protocol] | @tsv')
+        "$tool" -A OUTPUT -p "$protocol" -d "$ip" --dport "$port" -j ACCEPT
+    done < <(printf '%s' "$CTF_OS_ALLOWED_ENDPOINTS_JSON" | jq -r '.[] | [.ip, (.port|tostring), .transport] | @tsv')
 }
 
 apply_local_firewall() {
@@ -78,7 +78,7 @@ apply_local_firewall() {
         done < <(getent ahosts "$host" | awk '{print $1}' | sort -u)
     done < <(
         printf '%s' "$CTF_OS_LOCAL_ENDPOINTS_JSON" |
-            jq -r '.[] | capture("^(?:(?:https?|tcp)://)?(?<host>[^:/]+):(?<port>[0-9]+)$") | [.host, .port] | @tsv'
+            jq -r '.[] | capture("^(?:(?:https?|tcp|tls|wss?|grpc)://)?(?<host>[^:/]+):(?<port>[0-9]+)$") | [.host, .port] | @tsv'
     )
 }
 

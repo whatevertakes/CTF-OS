@@ -45,6 +45,8 @@ class SandboxSpec:
     parent_session_id: str = "sol-main"
     session_role: str = "sol"
     service_context: Mapping[str, object] | None = None
+    category: str | None = None
+    gpu_enabled: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -112,10 +114,23 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         "--env", f"CTF_OS_CONTEST_SLUG={spec.contest_slug}",
         "--env", f"CTF_OS_CHALLENGE_ID={spec.challenge_id}",
     ]
+    category = (spec.category or spec.image.rsplit(":", 1)[-1]).casefold()
+    if category in {"pwn", "rev", "misc"}:
+        argv.extend([
+            "--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined",
+            "--ulimit", "core=-1:-1",
+        ])
+    if category == "forensic":
+        argv.extend(["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"])
+        for device in ("/dev/loop-control", "/dev/loop0", "/dev/loop1", "/dev/loop2", "/dev/loop3"):
+            if Path(device).exists():
+                argv.extend(["--device", f"{device}:{device}:rwm"])
+    if category == "ai" and spec.gpu_enabled:
+        argv.extend(["--gpus", "all", "--env", "CTF_OS_GPU_ENABLED=1"])
     # Rootless Podman needs only namespace-management syscalls for local OCI
     # inspection. Keep Docker's default deny list otherwise; mount and other
     # CAP_SYS_ADMIN-gated syscalls remain blocked and every capability is still dropped.
-    if spec.image in {"ctf-os-sandbox:misc", "ctf-os-sandbox:cloud"}:
+    if spec.image == "ctf-os-sandbox:cloud":
         seccomp = Path(__file__).resolve().parents[2] / "sandbox" / "seccomp-rootless.json"
         if not seccomp.is_file() or seccomp.is_symlink():
             raise SandboxError("rootless Podman seccomp profile is missing or unsafe")
@@ -152,6 +167,8 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "parent_session_id": spec.parent_session_id,
         "session_role": spec.session_role,
         "service_context": dict(spec.service_context or {}),
+        "category": spec.category,
+        "gpu_enabled": spec.gpu_enabled,
         "work_path": str((spec.branch_root / "work").resolve()),
         "evidence_path": str((spec.branch_root / "evidence").resolve()),
         "logs_path": str((spec.branch_root / "logs").resolve()),

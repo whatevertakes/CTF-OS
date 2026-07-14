@@ -19,7 +19,8 @@ WORKER_STATUSES = frozenset({
 CONFIDENCE_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
 CHECKPOINT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
-    "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE",
+    "ARTIFACT_READY", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+    "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 CHECKPOINT_SCHEMA_VERSION = 1
 
@@ -31,14 +32,15 @@ class WorkerResultError(ValueError):
 def save_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and atomically save one worker's result under its private root.
 
-    Reported service mutations are preserved for Sol's review.  They are also
-    converted into a policy violation instead of making the rest of the result
-    unusable.
+    Reported mutations are preserved for Sol's review. Branch-private service
+    and explicitly challenge-scoped cloud mutations are valid; shared service
+    mutations remain policy violations.
     """
 
     normalized = validate_worker_result(worker_root, payload)
     mutations = normalized["service_mutations"]
-    if mutations:
+    forbidden_mutations = [item for item in mutations if not _allowed_worker_mutation(item, worker_root.name)]
+    if forbidden_mutations:
         violations = normalized["policy_violations"]
         if not any(
             isinstance(item, Mapping) and item.get("code") == "SERVICE_MUTATION_REPORTED"
@@ -47,10 +49,21 @@ def save_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dict[st
             violations.append({
                 "code": "SERVICE_MUTATION_REPORTED",
                 "message": "A child worker reported a shared service lifecycle mutation.",
-                "mutations": mutations,
+                "mutations": forbidden_mutations,
             })
     atomic_json(_safe_result_path(worker_root), normalized)
     return normalized
+
+
+def _allowed_worker_mutation(value: Any, session_id: str) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    scope = str(value.get("scope") or value.get("service_scope") or "")
+    if scope == "branch-private":
+        return value.get("branch_id") == session_id and value.get("target") != "challenge-service"
+    if scope == "challenge-cloud":
+        return bool(value.get("account_scope") and value.get("ledger_event_id"))
+    return False
 
 
 def load_worker_result(path: Path) -> dict[str, Any]:

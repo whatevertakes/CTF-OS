@@ -10,4 +10,4 @@ Use `whois`, `dig`, `httpx`, `waybackurls`, and headless Chromium for public web
 
 ## Validation
 
-Corroborate identity or location clues with at least two independent public observations. Save redacted captures and commands, distinguish observation from inference, and stop at login walls or private systems rather than expanding access.
+Use public sources, archives, metadata, and organizer-provided virtual/test accounts in their declared domain. Personal credentials and real third-party account access remain forbidden. Save redacted captures, distinguish fact from inference, and publish high-value pivots immediately to sibling branches; an independent verifier is useful but not a universal pre-submission gate.

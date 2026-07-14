@@ -8,8 +8,9 @@ def test_skills_and_agents_define_sol_native_contract() -> None:
     agents = Path("AGENTS.md").read_text()
     assert "current user-opened Sol session" in solve
     assert "native delegation" in solve
-    assert "three non-overlapping" in solve
-    assert "READY_FOR_HUMAN_SUBMISSION" in solve
+    assert "Tier 2: three children" in solve
+    assert "SUBMISSION_RECOMMENDED" in solve
+    assert "Full clean replay: not required" in solve
     assert "Never run Codex" in solve
     assert "dedicated session" in intake and "new session" in agents
     assert "no-solve stage" in triage and "triage-finalize" in triage
@@ -22,3 +23,21 @@ def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:
         assert text not in python
     assert not Path("ctf_os/cli.py").exists()
     assert not Path("ctf_os/solver_engine").exists()
+
+
+def test_runtime_has_no_model_api_client_or_automatic_ctfd_submit() -> None:
+    python = "\n".join(path.read_text(errors="ignore").casefold() for path in Path("ctf_os").rglob("*.py"))
+    for forbidden in (
+        "openai(", "anthropic(", "genai.", "codex exec", "codex app-server",
+        "subprocess.run([\"codex\"", "subprocess.run([\"claude\"", "ctfd submit",
+    ):
+        assert forbidden not in python
+
+
+def test_competition_docs_preserve_minimum_boundaries() -> None:
+    text = (Path("AGENTS.md").read_text() + Path("ctf_os/resources/agent-policy.md").read_text()).casefold()
+    for required in (
+        "host docker socket", "ssh", "browser", "personal cloud", "cloud metadata",
+        "undeclared private", "never submit", "native delegation",
+    ):
+        assert required in text

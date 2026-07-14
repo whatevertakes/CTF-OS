@@ -136,6 +136,13 @@ def verify_and_record(
             raise FlagVerificationError("challenge input fingerprint changed during verification")
         state.update({
             "status": "READY_FOR_HUMAN_SUBMISSION" if ready else "VERIFICATION_REQUIRED",
+            "competition_state": "FULLY_VERIFIED" if fully_verified else (
+                "REMOTE_FLAG_OBTAINED" if remote_flag_obtained else
+                "LOCAL_FLAG_OBTAINED" if local_reproduced and pattern_match else
+                "FLAG_CANDIDATE" if selected_flag else None
+            ),
+            "submission_recommended": bool(remote_flag_obtained or fully_verified),
+            "remote_flag": remote_flag if remote_flag_obtained else state.get("remote_flag"),
             "flag_candidate": selected_flag or None, "verification": verification,
             "replay_verdict": verdict,
             "updated_at": datetime.now(timezone.utc).isoformat(),

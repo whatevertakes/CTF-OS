@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from typing import Iterator, Sequence
 
@@ -25,7 +26,7 @@ class ResourceProfile:
     cpus: float
     storage: str
     pids: int
-    max_concurrent: int
+    max_concurrent: int | None = None
 
     @property
     def memory_bytes(self) -> int:
@@ -40,10 +41,10 @@ class ResourceProfile:
 
 
 RESOURCE_PROFILES: dict[str, ResourceProfile] = {
-    "light": ResourceProfile("light", "2g", 1.0, "1g", 128, 3),
-    "standard": ResourceProfile("standard", "4g", 2.0, "2g", 256, 2),
-    "heavy": ResourceProfile("heavy", "10g", 2.0, "8g", 512, 1),
-    "large-forensic": ResourceProfile("large-forensic", "12g", 2.0, "12g", 512, 1),
+    "light": ResourceProfile("light", "2g", 1.0, "1g", 128),
+    "standard": ResourceProfile("standard", "4g", 2.0, "2g", 256),
+    "heavy": ResourceProfile("heavy", "12g", 5.0, "8g", 512),
+    "large-forensic": ResourceProfile("large-forensic", "16g", 5.0, "16g", 768),
 }
 
 
@@ -71,19 +72,25 @@ def sandbox_status(*, docker: str = "docker") -> dict[str, object]:
     host_memory = _docker_memory_total(docker)
     budget = _memory_budget(host_memory)
     reserved = sum(int(item["memory_bytes"]) for item in active)
+    host_cpus = _docker_cpu_total(docker)
+    cpu_budget = max(0.0, host_cpus - min(2.0, max(1.0, host_cpus * .15)))
+    reserved_cpus = sum(float(item.get("cpus", 0.0)) for item in active)
+    host_storage_free = shutil.disk_usage("/").free
+    storage_budget = max(0, host_storage_free - max(10 * GIB, host_storage_free // 10))
+    reserved_storage = sum(int(item.get("storage_bytes", 0)) for item in active)
     counts = {name: sum(item["resource_profile"] == name for item in active) for name in RESOURCE_PROFILES}
-    intensive = counts["heavy"] + counts["large-forensic"]
     availability: dict[str, dict[str, object]] = {}
     for name, profile in RESOURCE_PROFILES.items():
-        count_ok = counts[name] < profile.max_concurrent
-        if name in {"heavy", "large-forensic"}:
-            count_ok = count_ok and intensive < 1
         memory_ok = reserved + profile.memory_bytes <= budget
+        cpu_ok = reserved_cpus + profile.cpus <= cpu_budget
+        storage_ok = reserved_storage + profile.storage_bytes <= storage_budget
         availability[name] = {
-            "can_admit": count_ok and memory_ok,
+            "can_admit": memory_ok and cpu_ok and storage_ok,
             "active": counts[name],
-            "max_concurrent": profile.max_concurrent,
+            "max_concurrent": None,
             "memory_available": memory_ok,
+            "cpu_available": cpu_ok,
+            "storage_available": storage_ok,
         }
     return {
         "schema_version": 1,
@@ -94,6 +101,13 @@ def sandbox_status(*, docker: str = "docker") -> dict[str, object]:
         "reserved_memory_bytes": reserved,
         "host_memory_bytes": host_memory,
         "admission_memory_budget_bytes": budget,
+        "reserved_cpus": reserved_cpus,
+        "host_cpus": host_cpus,
+        "admission_cpu_budget": cpu_budget,
+        "reserved_storage_bytes": reserved_storage,
+        "host_storage_free_bytes": host_storage_free,
+        "admission_storage_budget_bytes": storage_budget,
+        "gpu_available": gpu_available(docker=docker),
         "availability": availability,
     }
 
@@ -107,19 +121,6 @@ def admit(
         raise ResourceError("sandbox admission memory request must be positive")
     status = sandbox_status(docker=docker)
     active = list(status["active"])
-    same_profile = sum(item["resource_profile"] == profile_name for item in active)
-    if same_profile >= requested.max_concurrent:
-        raise ResourceError(
-            f"sandbox admission refused: {profile_name} already has {same_profile} active "
-            f"container(s), limit {requested.max_concurrent}; inspect with sandbox-status or clean stale sandboxes"
-        )
-    if profile_name in {"heavy", "large-forensic"}:
-        intensive = sum(item["resource_profile"] in {"heavy", "large-forensic"} for item in active)
-        if intensive:
-            raise ResourceError(
-                "sandbox admission refused: a heavy/large-forensic sandbox is already active; "
-                "finish or clean it before starting another intensive sandbox"
-            )
     reserved = int(status["reserved_memory_bytes"])
     budget = int(status["admission_memory_budget_bytes"])
     if reserved + memory_request > budget:
@@ -128,7 +129,45 @@ def admit(
             f"sandbox admission refused: {memory_request} bytes requested but only {available} "
             "bytes remain in the Docker host memory budget; choose a lighter profile or clean a sandbox"
         )
+    reserved_cpus = float(status.get("reserved_cpus", 0.0))
+    cpu_budget = float(status.get("admission_cpu_budget", float("inf")))
+    if reserved_cpus + requested.cpus > cpu_budget:
+        raise ResourceError(
+            f"sandbox admission refused: {requested.cpus} CPUs requested but only "
+            f"{max(0.0, cpu_budget - reserved_cpus):.2f} remain in the Docker host CPU budget"
+        )
+    reserved_storage = int(status.get("reserved_storage_bytes", 0))
+    storage_budget = int(status.get("admission_storage_budget_bytes", 2**63 - 1))
+    if reserved_storage + requested.storage_bytes > storage_budget:
+        raise ResourceError("sandbox admission refused: insufficient aggregate Docker storage budget")
     return status
+
+
+def race_width(
+    desired: int, *, profile_names: Sequence[str], docker: str = "docker",
+) -> dict[str, object]:
+    """Fit the highest-value prefix of a race to the live aggregate budget."""
+    if desired < 0 or desired > len(profile_names):
+        raise ResourceError("desired race width is outside the supplied profile list")
+    status = sandbox_status(docker=docker)
+    memory_left = int(status["admission_memory_budget_bytes"]) - int(status["reserved_memory_bytes"])
+    cpu_left = float(status["admission_cpu_budget"]) - float(status["reserved_cpus"])
+    storage_left = int(status.get("admission_storage_budget_bytes", 2**63 - 1)) - int(status.get("reserved_storage_bytes", 0))
+    admitted: list[str] = []
+    for name in profile_names[:desired]:
+        profile = resource_profile(name)
+        if profile.memory_bytes <= memory_left and profile.cpus <= cpu_left and profile.storage_bytes <= storage_left:
+            admitted.append(name)
+            memory_left -= profile.memory_bytes
+            cpu_left -= profile.cpus
+            storage_left -= profile.storage_bytes
+    return {
+        "desired_width": desired, "admitted_width": len(admitted),
+        "profiles": admitted, "memory_remaining_bytes": memory_left,
+        "cpus_remaining": round(cpu_left, 3),
+        "storage_remaining_bytes": storage_left,
+        "shrink_required": len(admitted) < desired,
+    }
 
 
 def sandbox_gc(*, docker: str = "docker") -> dict[str, object]:
@@ -211,6 +250,8 @@ def _list_managed_sandboxes(*, docker: str, include_stopped: bool) -> list[dict[
                 "running": bool(state.get("Running", False)),
                 "resource_profile": str(profile),
                 "memory_bytes": memory,
+                "cpus": _container_cpus(raw),
+                "storage_bytes": _positive_int(labels.get("ctf-os.storage_bytes")),
                 "contest": str(labels.get("ctf-os.contest", "")),
                 "challenge_id": str(labels.get("ctf-os.challenge_id", "")),
                 "branch": str(labels.get("ctf-os.branch", "")),
@@ -236,9 +277,43 @@ def _docker_memory_total(docker: str) -> int:
 
 
 def _memory_budget(total: int) -> int:
-    # Leave both 20% and at least 1 GiB to the host/daemon. This is reservation admission,
+    # Leave 15% and at least 4 GiB to the host/daemon. This is reservation admission,
     # while Docker still enforces the per-container hard memory limit.
-    return max(0, total - max(GIB, total // 5))
+    return max(0, total - max(4 * GIB, int(total * .15)))
+
+
+def _docker_cpu_total(docker: str) -> float:
+    try:
+        result = _run([docker, "info", "--format", "{{json .NCPU}}"], timeout=20)
+    except ResourceError:
+        return float(os.cpu_count() or 1)
+    if result.returncode:
+        return float(os.cpu_count() or 1)
+    try:
+        value = float(json.loads(result.stdout.strip()))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        value = float(os.cpu_count() or 1)
+    return max(1.0, value)
+
+
+def _container_cpus(raw: dict[str, object]) -> float:
+    host = raw.get("HostConfig", {})
+    if not isinstance(host, dict):
+        return 0.0
+    nano = _positive_int(host.get("NanoCpus"))
+    if nano:
+        return nano / 1_000_000_000
+    quota = _positive_int(host.get("CpuQuota"))
+    period = _positive_int(host.get("CpuPeriod"))
+    return quota / period if quota and period else 0.0
+
+
+def gpu_available(*, docker: str = "docker") -> bool:
+    try:
+        result = _run([docker, "info", "--format", "{{json .Runtimes}}"], timeout=20)
+    except ResourceError:
+        return False
+    return (result.returncode == 0 and "nvidia" in result.stdout.casefold()) or Path("/dev/nvidia0").exists()
 
 
 def _positive_int(value: object) -> int:
