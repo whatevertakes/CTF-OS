@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 
 from .evidence import append_evidence
-from .workspace import atomic_json, atomic_text, state_lock
+from .workspace import (
+    atomic_json, atomic_text, challenge_workspace, ensure_run_mutable, is_run_root,
+    read_jsonl_strict, resolve_active_run, state_lock,
+)
 
 
 class FlagVerificationError(ValueError):
@@ -63,9 +67,27 @@ def verify_and_record(
     local_success_pattern: str | None = None,
     remote_success_pattern: str | None = None,
 ) -> dict[str, object]:
+    compatibility_root = root
+    root = resolve_active_run(root, input_fingerprint=input_fingerprint)
+    frozen_remote_state: dict[str, object] | None = None
+    try:
+        ensure_run_mutable(root)
+    except ValueError as exc:
+        try:
+            current = json.loads((root / "STATE.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise FlagVerificationError(str(exc)) from exc
+        if isinstance(current, dict) and current.get("remote_flag_receipt") and not current.get("sealed"):
+            frozen_remote_state = current
+        else:
+            raise FlagVerificationError(str(exc)) from exc
+    if root != compatibility_root.resolve(strict=False):
+        _adopt_legacy_verification_inputs(compatibility_root, root)
     local_marker = local_success_marker if local_success_marker is not None else (flag if local_reproduced else None)
     remote_flag = remote_flag_candidate if remote_flag_candidate is not None else (flag if has_remote and remote_reproduced else None)
     selected_flag = remote_flag or flag or local_marker or ""
+    if frozen_remote_state is not None and selected_flag != frozen_remote_state.get("flag_candidate"):
+        raise FlagVerificationError("replay cannot replace a receipt-bound remote flag candidate")
     pattern_match = matches_flag(selected_flag, pattern)
     remote_pattern_match = bool(remote_flag and matches_flag(remote_flag, pattern))
     remote_confirmed = remote_reproduced if remote_exploit_confirmed is None else remote_exploit_confirmed
@@ -128,21 +150,26 @@ def verify_and_record(
         "fully_verified": fully_verified,
         "verdict": verdict,
     })
+    # Strict replay may prove behavior, but a remote terminal/submission state is
+    # receipt-bound. Replay alone never manufactures REMOTE_FLAG_OBTAINED.
     ready = fully_verified
     state_path = root / "STATE.json"
     with state_lock(root):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if input_fingerprint is not None and state.get("input_fingerprint") != input_fingerprint:
             raise FlagVerificationError("challenge input fingerprint changed during verification")
+        remote_receipt_bound = bool(state.get("remote_flag_receipt"))
+        if has_remote and not remote_receipt_bound:
+            ready = False
         state.update({
             "status": "READY_FOR_HUMAN_SUBMISSION" if ready else "VERIFICATION_REQUIRED",
-            "competition_state": "FULLY_VERIFIED" if fully_verified else (
-                "REMOTE_FLAG_OBTAINED" if remote_flag_obtained else
+            "competition_state": "FULLY_VERIFIED" if fully_verified and (not has_remote or remote_receipt_bound) else (
+                "REMOTE_FLAG_OBTAINED" if remote_flag_obtained and remote_receipt_bound else
                 "LOCAL_FLAG_OBTAINED" if local_reproduced and pattern_match else
                 "FLAG_CANDIDATE" if selected_flag else None
             ),
-            "submission_recommended": bool(remote_flag_obtained or fully_verified),
-            "remote_flag": remote_flag if remote_flag_obtained else state.get("remote_flag"),
+            "submission_recommended": bool(ready or (remote_flag_obtained and remote_receipt_bound)),
+            "remote_flag": remote_flag if remote_flag_obtained and remote_receipt_bound else state.get("remote_flag"),
             "flag_candidate": selected_flag or None, "verification": verification,
             "replay_verdict": verdict,
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -189,7 +216,38 @@ def verify_and_record(
         ]
         atomic_text(root / "RESULT.md", "\n".join(result) + "\n")
         append_evidence(root / "evidence.log", "result_verification", {"flag_candidate": selected_flag or None, "ready": ready, "verification": verification})
+        if root != compatibility_root.resolve(strict=False):
+            # Non-authoritative compatibility outputs keep old direct callers
+            # working; all terminal state remains authoritative under runs/.
+            atomic_text(compatibility_root / "RESULT.md", (root / "RESULT.md").read_text(encoding="utf-8"))
+            atomic_json(
+                compatibility_root / "REPRODUCE.json",
+                json.loads((root / "REPRODUCE.json").read_text(encoding="utf-8")),
+            )
+            atomic_text(compatibility_root / "reproduce.sh", (root / "reproduce.sh").read_text(encoding="utf-8"))
+            (compatibility_root / "reproduce.sh").chmod(0o755)
+            if (compatibility_root / "STATE.json").is_file():
+                compatibility_state = dict(state)
+                compatibility_state["compatibility_view"] = True
+                compatibility_state["authoritative_state"] = str((root / "STATE.json").relative_to(compatibility_root))
+                atomic_json(compatibility_root / "STATE.json", compatibility_state)
     return {"ready_for_human_submission": ready, "status": state["status"], "verdict": verdict, "verification": verification, "result_path": str(root / "RESULT.md")}
+
+
+def _adopt_legacy_verification_inputs(workspace: Path, run: Path) -> None:
+    source_exploit = workspace / "exploit"
+    target_exploit = run / "exploit"
+    if source_exploit.is_dir() and not source_exploit.is_symlink() and not target_exploit.exists():
+        for item in source_exploit.rglob("*"):
+            if item.is_symlink():
+                raise FlagVerificationError("legacy exploit compatibility input contains a symlink")
+        shutil.copytree(source_exploit, target_exploit)
+    source_evidence = workspace / "evidence.log"
+    target_evidence = run / "evidence.log"
+    if source_evidence.is_file() and not source_evidence.is_symlink():
+        source_text = source_evidence.read_text(encoding="utf-8")
+        if source_text and (not target_evidence.is_file() or not target_evidence.read_text(encoding="utf-8")):
+            atomic_text(target_evidence, source_text)
 
 
 def _legacy_argv(command: str | None) -> list[str]:
@@ -209,7 +267,7 @@ def _legacy_argv(command: str | None) -> list[str]:
 
 
 def _replay_coordinates(root: Path, state: dict[str, object]) -> tuple[Path, str, str]:
-    resolved = root.resolve()
+    resolved = challenge_workspace(root) if is_run_root(root) else root.resolve()
     try:
         if resolved.parents[2].name != "output":
             raise IndexError
@@ -230,11 +288,11 @@ def _verify_evidence_receipts(
     required = ["local", "independent"] + (["remote"] if has_remote else [])
     records: list[dict[str, object]] = []
     if path.is_file():
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        try:
+            evidence_rows = read_jsonl_strict(path, "evidence ledger")
+        except ValueError as exc:
+            raise FlagVerificationError(str(exc)) from exc
+        for record in evidence_rows:
             fingerprint_ok = input_fingerprint is None or record.get("input_fingerprint") == input_fingerprint
             if record.get("event") == "replay_exec" and record.get("exit_code") == 0 and fingerprint_ok:
                 records.append(record)

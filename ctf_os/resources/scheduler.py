@@ -748,13 +748,31 @@ class ResourceLedger:
         self.history_path = self.root / "RESOURCE_HISTORY.jsonl"
 
     def load(self) -> dict[str, Any]:
+        identity: dict[str, Any] = {}
+        run_state = self.root / "STATE.json"
+        if run_state.is_file() and not run_state.is_symlink():
+            try:
+                state_identity = json.loads(run_state.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SchedulerError("run state is malformed while loading resources") from exc
+            if isinstance(state_identity, dict):
+                identity = {
+                    "run_id": state_identity.get("run_id"),
+                    "challenge_id": state_identity.get("challenge_id"),
+                    "input_fingerprint": state_identity.get("input_fingerprint"),
+                    "target_revision": state_identity.get("target_revision"),
+                }
         if not self.state_path.exists():
-            return {"schema_version": STATE_SCHEMA_VERSION, "requests": {}, "allocations": {}, "observations": {}, "released": {}, "rebalance_required": False}
+            return {"schema_version": STATE_SCHEMA_VERSION, **identity, "requests": {}, "allocations": {}, "observations": {}, "released": {}, "rebalance_required": False}
         if self.state_path.is_symlink() or not self.state_path.is_file():
             raise SchedulerError("resource state is missing or unsafe")
         raw = json.loads(self.state_path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise SchedulerError("resource state must be an object")
+        if identity.get("run_id") and raw.get("run_id") not in {None, identity["run_id"]}:
+            raise SchedulerError("resource state belongs to a different run")
+        for key, value in identity.items():
+            raw.setdefault(key, value)
         raw.setdefault("requests", {}); raw.setdefault("allocations", {}); raw.setdefault("observations", {}); raw.setdefault("released", {})
         return raw
 

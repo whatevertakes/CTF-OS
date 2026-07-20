@@ -16,6 +16,8 @@ class SelectionError(ValueError):
 
 
 def resolve_selector(challenges: tuple[ChallengeSpec, ...], selector: str) -> ChallengeSpec:
+    if "\n" in selector or "\r" in selector:
+        raise SelectionError("challenge selector must be one exact line")
     raw = unicodedata.normalize("NFKC", selector).strip()
     number = re.fullmatch(r"0*([1-9][0-9]*)\s*(?:번(?:\s*문제)?)?", raw)
     if number:

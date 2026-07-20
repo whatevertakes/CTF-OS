@@ -16,7 +16,10 @@ from typing import Any
 from .delegation import (
     BranchCandidate, DelegationError, admit_branch, load_templates, plan_path, utc_now,
 )
-from .workspace import atomic_json, atomic_text, state_lock
+from .workspace import (
+    append_jsonl_fsync, atomic_json, atomic_text, ensure_run_mutable,
+    read_jsonl_strict, state_lock,
+)
 
 
 RACE_SCHEMA_VERSION = 1
@@ -129,6 +132,7 @@ def start_race_plan(
     parent_session_id: str, category: str, tier: int, tier_reason: str,
     branch_specs: Sequence[RaceBranchSpec], threshold: float = .95,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     if tier not in range(0, 5):
         raise DelegationError("tier must be an integer from 0 through 4")
     state_file = solve_root / "STATE.json"
@@ -155,7 +159,10 @@ def start_race_plan(
     plan: dict[str, Any] = {
         "schema_version": 1, "race_schema_version": RACE_SCHEMA_VERSION,
         "race_id": request_id, "challenge_id": challenge_id,
-        "input_fingerprint": input_fingerprint, "parent_session_id": parent_session_id,
+        "input_fingerprint": input_fingerprint,
+        "run_id": current_state.get("run_id"),
+        "target_revision": int(current_state.get("target_revision") or 1),
+        "parent_session_id": parent_session_id,
         "tier": tier, "tier_reason": tier_reason, "race_mode": "competition-first",
         "sol_lane": {
             "session_id": parent_session_id, "role": "lead-attacker-and-race-coordinator",
@@ -182,6 +189,8 @@ def start_race_plan(
         plan["branches"].append(_branch_payload(
             spec, decision, challenge_id, input_fingerprint, parent_session_id,
             tier=tier, tier_reason=tier_reason,
+            run_id=current_state.get("run_id"),
+            target_revision=int(current_state.get("target_revision") or 1),
         ))
     with state_lock(solve_root):
         current = plan_path(solve_root)
@@ -193,10 +202,11 @@ def start_race_plan(
                 old = json.loads(raw_plan)
             except json.JSONDecodeError:
                 atomic_text(solve_root / f"DELEGATION_PLAN.corrupt-{request_id[:8]}.txt", raw_plan)
-                _append_ledger(solve_root, {
+                read_jsonl_strict(solve_root / "RACE_LEDGER.jsonl", "race plan ledger")
+                append_jsonl_fsync(solve_root / "RACE_LEDGER.jsonl", {
                     "event": "CORRUPT_PLAN_RECOVERED", "request_id": request_id,
                     "created_at": utc_now(),
-                })
+                }, label="race plan ledger")
             else:
                 for branch in old.get("branches", []):
                     if isinstance(branch, dict):
@@ -226,10 +236,35 @@ def race_board(
         branch_events = [row for row in events if row.get("session_id") == branch.get("session_id")]
         latest = branch_events[-1] if branch_events else None
         branch_resource = resource_branches.get(str(branch.get("session_id")), {}) if isinstance(resource_branches, Mapping) else {}
+        status = str(branch.get("status") or "PLANNED")
+        start_receipt = branch.get("start_receipt") or branch.get("native_start_receipt")
+        packet = branch.get("prompt_packet") if isinstance(branch.get("prompt_packet"), Mapping) else {}
+        identity_matches = bool(
+            not plan.get("run_id")
+            or (
+                packet.get("run_id") == plan.get("run_id")
+                and packet.get("challenge_id") == plan.get("challenge_id")
+                and packet.get("input_fingerprint") == plan.get("input_fingerprint")
+                and packet.get("target_revision") == plan.get("target_revision")
+            )
+        )
+        receipt_matches = bool(
+            start_receipt
+            and (
+                not plan.get("run_id")
+                or (
+                    start_receipt.get("run_id") == plan.get("run_id")
+                    and start_receipt.get("challenge_id") == plan.get("challenge_id")
+                    and start_receipt.get("input_fingerprint") == plan.get("input_fingerprint")
+                    and start_receipt.get("target_revision") == plan.get("target_revision")
+                )
+            )
+        )
+        input_available = branch.get("input_available") is not False
         branches.append({
             "session_id": branch.get("session_id"), "status": branch.get("status"),
-            "plan_state": branch.get("status") if branch.get("status") in {"PLANNED", "ADMITTED", "AWAITING_NATIVE_START"} else "ADMITTED",
-            "native_start_state": "CONFIRMED" if branch.get("start_receipt") or branch.get("started_at") else "AWAITING",
+            "plan_state": status,
+            "native_start_state": "CONFIRMED" if receipt_matches else "AWAITING",
             "sandbox_state": next((row.get("status") for row in (state or {}).get("branches", []) if row.get("id") == branch.get("session_id")), "NOT_CREATED"),
             "result_state": "TERMINAL_RECORDED" if branch.get("finished_at") else "PENDING",
             "role": branch.get("role"), "hypothesis_family": branch.get("hypothesis_family"),
@@ -243,19 +278,40 @@ def race_board(
             "artifacts": sorted({item for row in branch_events for item in row.get("artifacts", [])}),
             "prompt_packet": branch.get("prompt_packet"),
             "resources": branch_resource,
+            "input_available": input_available,
+            "identity_matches_current_run": identity_matches,
         })
+    planned_width = len(branches)
+    admitted_statuses = {
+        "CAPACITY_ADMITTED", "SANDBOX_READY", "AWAITING_NATIVE_START", "NATIVE_STARTED",
+        "RUNNING", "STOP_REQUESTED", "TERMINAL", "TERMINATED", "COMPLETED",
+        "SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "ERROR", "TIMED_OUT",
+        "START_FAILED", "SANDBOX_FAILED", "INPUT_UNAVAILABLE", "STALE",
+    }
+    admitted_width = sum(row["status"] in admitted_statuses for row in branches)
+    native_started_width = sum(row["native_start_state"] == "CONFIRMED" for row in branches)
+    running = [
+        row for row in branches
+        if row["status"] == "RUNNING" and row["native_start_state"] == "CONFIRMED"
+        and row["input_available"] and row["identity_matches_current_run"]
+    ]
+    legacy_view = not plan.get("run_id")
     return {
         "challenge_id": plan.get("challenge_id"), "tier": plan.get("tier"),
         "race_id": plan.get("race_id"), "race_start_time": plan.get("created_at"),
         "mode": "competition-first", "sol_lane": plan.get("sol_lane"),
-        "active_branches": branches, "rejected_exact_duplicates": list(rejected),
+        "planned_branches": branches,
+        "active_branches": branches if legacy_view else running,
+        "planned_width": planned_width, "admitted_width": admitted_width,
+        "native_started_width": native_started_width, "running_width": len(running),
+        "rejected_exact_duplicates": list(rejected),
         "flag_candidate": state.get("flag_candidate") if state else None,
         "remote_flag": state.get("remote_flag") if state else None,
         "submission_recommendation": state.get("submission_recommended", False) if state else False,
         "service_status": dict(service_status or {"state": "UNKNOWN"}),
         "resource_use": dict(resources or {}),
-        "native_children_created": False,
-        "next_action": "Sol must launch admitted native children, then keep driving the leading exploit hypothesis toward a minimal PoC and remote attempt.",
+        "native_children_created": native_started_width > 0,
+        "next_action": "Prepare capacity-admitted sandboxes and input receipts, then launch native children; Sol keeps driving the leading exploit path throughout startup.",
     }
 
 
@@ -294,12 +350,14 @@ def _default_tools(category: str, role: str) -> list[str]:
 def _branch_payload(
     spec: RaceBranchSpec, admission: Mapping[str, Any], challenge_id: str,
     fingerprint: str, parent_session_id: str, *, tier: int, tier_reason: str,
+    run_id: str | None, target_revision: int,
 ) -> dict[str, Any]:
     now = utc_now()
     packet = {
         "schema_version": 1, "session_id": spec.session_id,
         "parent_session_id": parent_session_id, "challenge_id": challenge_id,
-        "input_fingerprint": fingerprint, "role": spec.role,
+        "run_id": run_id, "input_fingerprint": fingerprint,
+        "target_revision": target_revision, "role": spec.role,
         "hypothesis_family": spec.hypothesis_family,
         "primary_objective": "Obtain the first valid flag as quickly as possible",
         "task_type": "Timed CTF solve; not a research task",
@@ -326,8 +384,8 @@ def _branch_payload(
         "instruction": (
             "Race for the first valid flag; this is not a research task. Run the decisive experiment now, kill or promote "
             "the hypothesis, build only the minimal PoC, and move to the declared remote as soon as plausible. Do not "
-            "perform comprehensive analysis. Publish WORKING_POC, EXPLOIT_PRIMITIVE, FLAG_CANDIDATE, or "
-            "REMOTE_FLAG_OBTAINED before any summary. Use only this challenge and declared targets."
+            "perform comprehensive analysis. Publish typed primitive, WORKING_POC, REMOTE_ATTEMPT, or FLAG_CANDIDATE "
+            "before any summary; create REMOTE_FLAG_OBTAINED only through a verified flag receipt. Use only this challenge and declared targets."
         ),
     }
     if len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > PROMPT_PACKET_MAX_BYTES:
@@ -344,7 +402,11 @@ def _branch_payload(
         "observed_runtime_model": None, "observed_reasoning": None,
         "runtime_observation_evidence": None, "pinning_verified": False,
         "independent_verification": spec.purpose in {"independent-verification", "clean-room-verification"},
-        "purpose": spec.purpose, "admission": dict(admission), "status": "ADMITTED",
+        "purpose": spec.purpose, "admission": dict(admission), "status": "PLANNED",
+        "native_delegation_required": True, "start_receipt": None,
+        "expected_sandbox_identity": f"workers/{spec.session_id}/sandbox.json",
+        "input_available": True,
+        "lifecycle_history": [{"status": "PLANNED", "created_at": now}],
         "prompt_packet": packet, "created_at": now, "started_at": None, "finished_at": None,
     }
 
@@ -381,14 +443,12 @@ def _candidate_payload(candidate: BranchCandidate) -> dict[str, Any]:
 def _append_ledger(root: Path, payload: Mapping[str, Any]) -> None:
     root.mkdir(parents=True, exist_ok=True)
     path = root / "RACE_LEDGER.jsonl"
-    if path.is_symlink():
-        raise DelegationError("race ledger must not be a symlink")
-    line = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        handle.write(line)
-        handle.flush()
-        os.fsync(handle.fileno())
+    with state_lock(root):
+        try:
+            read_jsonl_strict(path, "race plan ledger")
+            append_jsonl_fsync(path, payload, label="race plan ledger")
+        except ValueError as exc:
+            raise DelegationError(str(exc)) from exc
 
 
 def _strings(value: Any) -> list[str]:

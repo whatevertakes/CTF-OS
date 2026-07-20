@@ -15,6 +15,8 @@ from .flags import matches_flag, verify_and_record
 from .sandbox.network import parse_remotes, resolve_targets
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute, stage_artifacts
 from .service import ServiceActor, ServiceSpec, service_build, service_cleanup, service_start, service_status
+from .workspace import challenge_workspace, resolve_active_run
+from .workspace import atomic_json, atomic_text
 
 
 class ReplayError(RuntimeError):
@@ -69,8 +71,9 @@ def run_replay(
     repo: Path, manifest: ContestManifest, challenge: ChallengeSpec, record: Mapping[str, object],
     *, docker: str = "docker", service_actor: ServiceActor | None = None,
 ) -> dict[str, object]:
-    solve_root = Path(str(record["workspace_path"])).resolve()
+    workspace = Path(str(record["workspace_path"])).resolve()
     fingerprint = str(record["source_fingerprint"])
+    solve_root = resolve_active_run(workspace, input_fingerprint=fingerprint)
     contract = load_contract(solve_root, fingerprint)
     exploit = solve_root / "exploit"
     if not exploit.is_dir() or exploit.is_symlink() or not any(path.is_file() and not path.is_symlink() for path in exploit.rglob("*")):
@@ -94,7 +97,7 @@ def run_replay(
                 # Older intake records put the boolean at record level; plans need only a kind.
                 if not plan or not plan.get("kind"):
                     raise ReplayError("service_required is true but intake has no challenge service plan")
-            service = ServiceSpec(manifest.slug, challenge.id, solve_root / "input", solve_root, plan)
+            service = ServiceSpec(manifest.slug, challenge.id, workspace / "input", solve_root, plan)
             service_build(service, actor=actor, docker=docker)
             service_start(service, actor=actor, docker=docker)
             current = service_status(service, actor=actor, docker=docker)
@@ -187,6 +190,18 @@ def run_replay(
             evidence_refs=refs, require_recorded_evidence=True,
             remote_hosts=tuple(target.host for target in parse_remotes(challenge.remotes)), input_fingerprint=fingerprint,
         )
+        if solve_root != workspace:
+            for name in ("RESULT.md", "reproduce.sh"):
+                source = solve_root / name
+                if source.is_file() and not source.is_symlink():
+                    atomic_text(workspace / name, source.read_text(encoding="utf-8"))
+            if (workspace / "reproduce.sh").is_file():
+                (workspace / "reproduce.sh").chmod(0o755)
+            if (workspace / "STATE.json").is_file():
+                compatibility_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+                compatibility_state["compatibility_view"] = True
+                compatibility_state["authoritative_state"] = str((solve_root / "STATE.json").relative_to(workspace))
+                atomic_json(workspace / "STATE.json", compatibility_state)
         return {
             "flag_candidate": flag or None,
             "local_success_marker": local_marker,
@@ -212,7 +227,7 @@ def _one_replay(
     branch_root = solve_root / "workers" / branch
     sandbox = create(SandboxSpec(
         contest_slug=manifest.slug, challenge_id=challenge.id, branch=branch,
-        source=solve_root / "input", branch_root=branch_root,
+        source=challenge_workspace(solve_root) / "input", branch_root=branch_root,
         input_fingerprint=str(record["source_fingerprint"]), targets=tuple(targets),
         image=f"ctf-os-sandbox:{contract.get('image_profile', 'base')}",
         resource_profile=str(contract.get("resource_profile", "standard")),

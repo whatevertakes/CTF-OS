@@ -79,6 +79,7 @@ def test_corrupt_sibling_blocks_only_when_it_is_selected(repo: Path) -> None:
 
     a = _result(_prepare(repo, "misc/A"))
     a_root = Path(a["solve_root"])
+    a_run = Path(a["run_root"])
     a_before = (a_root / "CHALLENGE-PREFLIGHT.json").read_bytes()
     b = _prepare(repo, "misc/B")
 
@@ -90,7 +91,7 @@ def test_corrupt_sibling_blocks_only_when_it_is_selected(repo: Path) -> None:
     assert b_record["status"] == "BLOCKED"
     assert "damaged ZIP" in b_record["blockers"][0]
     assert (a_root / "CHALLENGE-PREFLIGHT.json").read_bytes() == a_before
-    assert json.loads((a_root / "STATE.json").read_text())["status"] == "PREPARED"
+    assert json.loads((a_run / "STATE.json").read_text())["status"] == "PREPARED"
 
 
 def test_parallel_prepare_uses_independent_challenge_locks_and_records(repo: Path) -> None:
@@ -124,10 +125,12 @@ def test_sibling_metadata_remote_and_source_changes_do_not_stale_selected_runtim
     b = _result(_prepare(repo, "misc/B"))
     a_root = Path(a["solve_root"])
     b_root = Path(b["solve_root"])
+    a_run = Path(a["run_root"])
+    b_run = Path(b["run_root"])
     a_preflight = (a_root / "CHALLENGE-PREFLIGHT.json").read_bytes()
-    a_state = (a_root / "STATE.json").read_bytes()
-    receipt = a_root / "flag-receipts" / "remote-a.json"
-    receipt.parent.mkdir()
+    a_state = (a_run / "STATE.json").read_bytes()
+    receipt = a_run / "flag-receipts" / "remote-a.json"
+    receipt.parent.mkdir(exist_ok=True)
     receipt.write_bytes(b'{"flag":"ISO{a}"}\n')
     b_before = json.loads((b_root / "CHALLENGE-PREFLIGHT.json").read_text())
     manifest_path = repo / "incoming" / "Isolation CTF" / "contest.md"
@@ -160,7 +163,7 @@ def test_sibling_metadata_remote_and_source_changes_do_not_stale_selected_runtim
     b_after = json.loads(Path(b_after_payload["preflight_record_path"]).read_text())
 
     assert (a_root / "CHALLENGE-PREFLIGHT.json").read_bytes() == a_preflight
-    assert (a_root / "STATE.json").read_bytes() == a_state
+    assert (a_run / "STATE.json").read_bytes() == a_state
     assert receipt.read_bytes() == b'{"flag":"ISO{a}"}\n'
     assert b_after["source_fingerprint"] != b_before["source_fingerprint"]
     assert b_after["challenge"]["description"] == "changed sibling B"
@@ -172,40 +175,47 @@ def test_selected_source_change_invalidates_only_selected_workspace(repo: Path) 
     b = _result(_prepare(repo, "misc/B"))
     a_root = Path(a["solve_root"])
     b_root = Path(b["solve_root"])
+    a_run = Path(a["run_root"])
+    b_run = Path(b["run_root"])
     a_before = json.loads((a_root / "CHALLENGE-PREFLIGHT.json").read_text())
-    a_state_path = a_root / "STATE.json"
+    a_state_path = a_run / "STATE.json"
     a_state = json.loads(a_state_path.read_text())
     a_state.update({"status": "SUBMISSION_RECOMMENDED", "flag_candidate": "ISO{old}"})
     a_state_path.write_text(json.dumps(a_state, sort_keys=True))
-    (a_root / "RESULT.md").write_text("old result", encoding="utf-8")
+    (a_run / "RESULT.md").write_text("old result", encoding="utf-8")
     protected = {}
     for relative, content in {
         "race-events.jsonl": "event\n",
         "flag-receipts/remote-b.json": '{"flag":"ISO{b}"}\n',
         "workers/race-b/result.json": '{"result":"b"}\n',
     }.items():
-        path = b_root / relative
+        path = b_run / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         protected[relative] = path.read_bytes()
-    for relative in (
-        "CHALLENGE-PREFLIGHT.json", "STATE.json", "evidence.log", "SOLVE-LAUNCH.json",
-    ):
-        protected[relative] = (b_root / relative).read_bytes()
+    protected["CHALLENGE-PREFLIGHT.json"] = (b_root / "CHALLENGE-PREFLIGHT.json").read_bytes()
+    protected["SOLVE-LAUNCH.json"] = (b_root / "SOLVE-LAUNCH.json").read_bytes()
+    protected["STATE.json"] = (b_run / "STATE.json").read_bytes()
+    protected["evidence.log"] = (b_run / "evidence.log").read_bytes()
     (repo / "incoming" / "Isolation CTF" / "misc" / "A" / "a.txt").write_text(
         "changed alpha", encoding="utf-8",
     )
 
     refreshed = _result(_prepare(repo, "misc/A"))
     a_after = json.loads(Path(refreshed["preflight_record_path"]).read_text())
-    state_after = json.loads(a_state_path.read_text())
+    new_run = Path(refreshed["run_root"])
+    state_after = json.loads((new_run / "STATE.json").read_text())
 
     assert a_after["source_fingerprint"] != a_before["source_fingerprint"]
     assert (a_root / "input" / "a.txt").read_text() == "changed alpha"
     assert state_after["status"] == "PREPARED" and state_after["flag_candidate"] is None
-    assert list(a_root.glob("RESULT.stale-*.md"))
+    assert a_state_path.exists()
+    assert json.loads(a_state_path.read_text())["flag_candidate"] == "ISO{old}"
+    assert (a_run / "RESULT.md").read_text() == "old result"
+    assert new_run != a_run
     for relative, before in protected.items():
-        assert (b_root / relative).read_bytes() == before
+        base = b_root if relative in {"CHALLENGE-PREFLIGHT.json", "SOLVE-LAUNCH.json"} else b_run
+        assert (base / relative).read_bytes() == before
 
 
 def test_prepare_and_launch_schema_have_no_contest_triage_fields(repo: Path) -> None:

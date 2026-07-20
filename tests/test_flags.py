@@ -141,7 +141,8 @@ def test_local_dummy_and_remote_real_flag_can_be_fully_verified(tmp_path: Path) 
         evidence_refs=refs, remote_hosts=("example.com",), input_fingerprint="fp",
     )
     assert result["verdict"] == "FULLY_VERIFIED"
-    assert result["ready_for_human_submission"]
+    assert not result["ready_for_human_submission"]
+    assert result["verification"]["fully_verified"] is True
     assert result["verification"]["same_flag"] is False
 
 

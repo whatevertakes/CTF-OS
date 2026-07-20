@@ -143,7 +143,10 @@ def _parse_target(value: str | Mapping[str, Any]) -> Target:
             organizer_declared=raw.get("organizer_declared") is True,
             callback=raw.get("callback") is True,
         )
-    if not isinstance(value, str) or value != value.strip() or not value:
+    if (
+        not isinstance(value, str) or value != value.strip() or not value
+        or "\n" in value or "\r" in value
+    ):
         raise NetworkPolicyError("remote must not be blank or have surrounding whitespace")
     raw_text = value
     if raw_text.startswith("{"):

@@ -21,7 +21,7 @@ from .contest import ChallengeSpec, ContestManifest
 from .sandbox.network import parse_remotes
 from .workspace import (
     atomic_json, atomic_text, bind_input_fingerprint, challenge_root, preflight_lock,
-    safe_under,
+    resolve_active_run, safe_under,
 )
 
 
@@ -185,7 +185,8 @@ def load_challenge_preflight(
     expected_targets = [target.to_dict() for target in parse_remotes(challenge.remotes)]
     if payload.get("authorized_targets") != expected_targets:
         raise ValueError("Challenge runtime state is stale because selected challenge scope changed or was tampered")
-    state_path = destination / "STATE.json"
+    run_root = resolve_active_run(destination, input_fingerprint=source_fingerprint)
+    state_path = run_root / "STATE.json"
     if state_path.is_symlink():
         raise ValueError("Challenge runtime state is not prepared: challenge state is a symlink")
     if state_path.exists():
@@ -263,16 +264,15 @@ def _inspect_challenge(
         base["read_paths"] = [str(manifest.path), str(destination / "CONTEXT.md")]
         base["read_on_demand"] = [str(input_dir), str(destination / "inventory.json")]
         if bind_solve_state:
+            run_root = bind_input_fingerprint(destination, challenge, fingerprint)
             base["read_paths"].extend([
-                str(destination / "STATE.json"), str(destination / "FINDINGS.md"),
+                str(run_root / "STATE.json"), str(run_root / "FINDINGS.md"),
             ])
             base["read_on_demand"].extend([
-                str(destination / "evidence.log"), str(destination / "workers"),
+                str(run_root / "evidence.log"), str(run_root / "workers"),
             ])
         base["status"] = "READY"
         destination.mkdir(parents=True, exist_ok=True)
-        if bind_solve_state:
-            bind_input_fingerprint(destination, challenge, fingerprint)
         atomic_text(destination / "CONTEXT.md", render_context(manifest, base))
     except Exception as exc:
         base["blockers"] = [str(exc)]

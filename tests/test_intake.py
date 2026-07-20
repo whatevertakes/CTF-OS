@@ -50,9 +50,11 @@ def test_admin_reintake_detects_changes_without_mutating_solve_workspace(repo: P
     (source / "value.txt").write_text("one")
     prepared = _prepare(repo)
     assert prepared.returncode == 0
-    solve_root = Path(json.loads(prepared.stdout)["result"]["solve_root"])
-    (solve_root / "RESULT.md").write_text("keep me")
-    state_before = (solve_root / "STATE.json").read_bytes()
+    prepared_payload = json.loads(prepared.stdout)["result"]
+    solve_root = Path(prepared_payload["solve_root"])
+    run_root = Path(prepared_payload["run_root"])
+    (run_root / "RESULT.md").write_text("keep me")
+    state_before = (run_root / "STATE.json").read_bytes()
     input_before = (solve_root / "input" / "value.txt").read_bytes()
     (source / "value.txt").write_text("two")
     admin = run_intake(repo)["challenges"][0]
@@ -62,8 +64,8 @@ def test_admin_reintake_detects_changes_without_mutating_solve_workspace(repo: P
     assert admin_root.parts[-3] == "admin-intake"
     assert (admin_root / "input" / "value.txt").read_text() == "two"
     assert oct((admin_root / "input" / "value.txt").stat().st_mode & 0o777) == "0o444"
-    assert (solve_root / "RESULT.md").read_text() == "keep me"
-    assert (solve_root / "STATE.json").read_bytes() == state_before
+    assert (run_root / "RESULT.md").read_text() == "keep me"
+    assert (run_root / "STATE.json").read_bytes() == state_before
     assert (solve_root / "input" / "value.txt").read_bytes() == input_before
     assert not list(solve_root.glob("RESULT.stale-*.md"))
 
@@ -120,6 +122,7 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert result.returncode == 0
     payload = json.loads(result.stdout)["result"]
     solve_root = Path(payload["solve_root"])
+    run_root = Path(payload["run_root"])
     preflight_path = Path(payload["preflight_record_path"])
     preflight = json.loads(preflight_path.read_text())
     launch = payload["solve_launch_context"]
@@ -139,9 +142,9 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert json.loads(launch_path.read_text()) == launch
     first_launch = launch_path.read_bytes()
     assert (solve_root / "input" / "value.txt").read_text() == "one"
-    assert (solve_root / "evidence.log").read_text() == ""
-    assert not (solve_root / "findings.jsonl").exists()
-    assert not (solve_root / "race-events.jsonl").exists()
+    assert (run_root / "evidence.log").read_text() == ""
+    assert not (run_root / "findings.jsonl").exists()
+    assert (run_root / "race-events.jsonl").read_text() == ""
     assert "dedicated Sol session" not in result.stdout
 
     repeated = _prepare(repo)
@@ -429,8 +432,10 @@ def test_solve_launch_refresh_preserves_terminal_state_and_flag_receipt(repo: Pa
     (source / "value.txt").write_text("trusted")
     first = _prepare(repo)
     assert first.returncode == 0
-    solve_root = Path(json.loads(first.stdout)["result"]["solve_root"])
-    state_path = solve_root / "STATE.json"
+    first_payload = json.loads(first.stdout)["result"]
+    solve_root = Path(first_payload["solve_root"])
+    run_root = Path(first_payload["run_root"])
+    state_path = run_root / "STATE.json"
     state = json.loads(state_path.read_text())
     state.update({
         "status": "SUBMISSION_RECOMMENDED",
@@ -439,15 +444,15 @@ def test_solve_launch_refresh_preserves_terminal_state_and_flag_receipt(repo: Pa
         "remote_flag_receipt": "flag-receipts/remote-preserve.json",
     })
     state_path.write_text(json.dumps(state, sort_keys=True))
-    receipt = solve_root / "flag-receipts" / "remote-preserve.json"
-    receipt.parent.mkdir()
+    receipt = run_root / "flag-receipts" / "remote-preserve.json"
+    receipt.parent.mkdir(exist_ok=True)
     receipt.write_text('{"flag": "DEMO{preserve}"}')
-    artifact = solve_root / "artifacts" / "solve.py"
+    artifact = run_root / "artifacts" / "solve.py"
     artifact.parent.mkdir()
     artifact.write_text("print('preserve')")
-    evidence = solve_root / "evidence.log"
+    evidence = run_root / "evidence.log"
     evidence.write_text("preserve evidence\n")
-    worker = solve_root / "workers" / "race-1" / "result.json"
+    worker = run_root / "workers" / "race-1" / "result.json"
     worker.parent.mkdir(parents=True)
     worker.write_text('{"result": "preserve"}')
     state_bytes = state_path.read_bytes()

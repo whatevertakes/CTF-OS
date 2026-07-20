@@ -6,24 +6,28 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 from .delegation import utc_now
 from .primitives import validate_primitive
-from .workspace import atomic_json, state_lock
+from .workspace import (
+    append_jsonl_fsync, atomic_json, ensure_run_mutable, read_jsonl_strict,
+    resolve_active_run, state_lock,
+)
 
 
 EVENT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
     "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED", "EXPLOIT_PRIMITIVE_REFUTED",
     "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+    "SUBMISSION_RECOMMENDED", "ACCEPTED",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 PRIORITIES = frozenset({"LOW", "NORMAL", "HIGH", "CRITICAL"})
 HIGH_TYPES = frozenset({"FLAG_CANDIDATE", "WORKING_POC", "EXPLOIT_PRIMITIVE_CONFIRMED"})
-CRITICAL_TYPES = frozenset({"REMOTE_FLAG_OBTAINED"})
+CRITICAL_TYPES = frozenset({"REMOTE_FLAG_OBTAINED", "SUBMISSION_RECOMMENDED", "ACCEPTED"})
+PROTECTED_TYPES = CRITICAL_TYPES
 TERMINAL_BRANCH_STATES = frozenset({"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TERMINATED", "ERROR", "STALE"})
 
 
@@ -46,6 +50,7 @@ class RaceEvent:
     input_fingerprint: str
     challenge_id: str
     primitive: dict[str, Any]
+    receipt_reference: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +61,7 @@ class RaceEvent:
             "created_at": self.created_at, "input_fingerprint": self.input_fingerprint,
             "challenge_id": self.challenge_id,
             "primitive": self.primitive,
+            "receipt_reference": self.receipt_reference,
         }
 
 
@@ -67,9 +73,90 @@ def publish_event(
     event_id: str | None = None,
     primitive: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    return _publish_event(
+        root, challenge_id=challenge_id, input_fingerprint=input_fingerprint,
+        session_id=session_id, event_type=event_type, summary=summary,
+        priority=priority, evidence=evidence, artifacts=artifacts,
+        useful_for=useful_for, recommended_action=recommended_action,
+        event_id=event_id, primitive=primitive, receipt_reference=None,
+    )
+
+
+def publish_verified_event(
+    root: Path, *, receipt: Mapping[str, Any], event_type: str, summary: str,
+) -> dict[str, Any]:
+    """Publish a protected event only from a stored, run-bound receipt."""
+
+    normalized = event_type.strip().upper()
+    if normalized not in {"REMOTE_FLAG_OBTAINED", "SUBMISSION_RECOMMENDED", "FLAG_CANDIDATE"}:
+        raise RaceEventError("verified receipt publisher supports only remote flag lifecycle events")
+    required = {
+        "receipt_id", "run_id", "challenge_id", "input_fingerprint", "target_revision",
+        "branch_id", "candidate_id", "candidate", "network_observed",
+    }
+    if required.difference(receipt) or receipt.get("network_observed") is not True:
+        raise RaceEventError("verified remote event requires a complete receipt")
+    root = resolve_active_run(
+        root, input_fingerprint=str(receipt["input_fingerprint"]),
+        target_revision=int(receipt["target_revision"]),
+    )
+    try:
+        run_state = json.loads((root / "STATE.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RaceEventError("verified remote event run state is malformed") from exc
+    expected_relative = f"flag-receipts/remote-{receipt['receipt_id']}.json"
+    state_receipt_field = (
+        "remote_candidate_receipt" if normalized == "FLAG_CANDIDATE" else "remote_flag_receipt"
+    )
+    if (
+        run_state.get("run_id") != receipt.get("run_id")
+        or run_state.get("challenge_id") != receipt.get("challenge_id")
+        or run_state.get(state_receipt_field) != expected_relative
+    ):
+        raise RaceEventError("verified remote receipt does not match the current run state")
+    receipt_path = root / "flag-receipts" / f"remote-{receipt['receipt_id']}.json"
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise RaceEventError("verified remote receipt is not stored in this run")
+    try:
+        saved = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RaceEventError("verified remote receipt is malformed") from exc
+    if saved != dict(receipt):
+        raise RaceEventError("verified remote receipt content does not match stored receipt")
+    reference = {
+        "receipt_id": receipt["receipt_id"], "candidate_id": receipt["candidate_id"],
+        "target_revision": receipt["target_revision"],
+        "path": str(receipt_path.relative_to(root)),
+    }
+    return _publish_event(
+        root, challenge_id=str(receipt["challenge_id"]),
+        input_fingerprint=str(receipt["input_fingerprint"]),
+        session_id=str(receipt["branch_id"]), event_type=normalized,
+        summary=summary, priority="CRITICAL" if normalized != "FLAG_CANDIDATE" else "HIGH",
+        evidence=[str(receipt_path.relative_to(root))], artifacts=[str(receipt["exploit_artifact"])],
+        useful_for=(), recommended_action="Human submission only after this verified receipt",
+        event_id=f"verified-{receipt['receipt_id']}-{normalized.lower()}",
+        primitive=None, receipt_reference=reference,
+    )
+
+
+def _publish_event(
+    root: Path, *, challenge_id: str, input_fingerprint: str, session_id: str,
+    event_type: str, summary: str, priority: str,
+    evidence: Sequence[str], artifacts: Sequence[str], useful_for: Sequence[str],
+    recommended_action: str, event_id: str | None,
+    primitive: Mapping[str, Any] | None,
+    receipt_reference: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if receipt_reference:
+        root = resolve_active_run(root, input_fingerprint=input_fingerprint)
+    else:
+        root = ensure_run_mutable(root)
     normalized_type = event_type.strip().upper()
     if normalized_type not in EVENT_TYPES:
         raise RaceEventError(f"event type must be one of {sorted(EVENT_TYPES)}")
+    if normalized_type in PROTECTED_TYPES and receipt_reference is None:
+        raise RaceEventError(f"{normalized_type} may be published only by a verified receipt path")
     normalized_priority = priority.strip().upper()
     if normalized_priority not in PRIORITIES:
         raise RaceEventError(f"priority must be one of {sorted(PRIORITIES)}")
@@ -88,6 +175,7 @@ def publish_event(
         "input_fingerprint": _short(input_fingerprint, "input_fingerprint", 256),
         "challenge_id": _short(challenge_id, "challenge_id", 256),
         "primitive": primitive_record,
+        "receipt_reference": dict(receipt_reference or {}),
     }
     identifier = event_id or hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
@@ -97,22 +185,35 @@ def publish_event(
         created_at=created, **material,
     )
     path = root / "race-events.jsonl"
+    idempotent = False
     with state_lock(root):
         existing = {row.get("event_id"): row for row in _read_jsonl(path)}
         if event.event_id in existing:
             if _without_time(existing[event.event_id]) != _without_time(event.to_dict()):
                 raise RaceEventError("event_id already exists with conflicting content")
-            return {**existing[event.event_id], "idempotent": True}
-        _append_jsonl(path, event.to_dict())
-    result = {**event.to_dict(), "idempotent": False}
+            event_record = existing[event.event_id]
+            idempotent = True
+        else:
+            event_record = event.to_dict()
+            _append_jsonl(path, event_record)
+    result = {**event_record, "idempotent": idempotent}
     # Resource scheduling is event-driven, but remains advisory: this records a
     # rebalance request and priority signal without touching native sessions.
     from .resources.scheduler import note_race_event
-    note_race_event(root, result)
+    post_commit_warnings: list[str] = []
+    try:
+        note_race_event(root, result)
+    except Exception as exc:
+        post_commit_warnings.append(f"scheduler event projection failed: {exc}")
+        append_jsonl_fsync(root / "scheduler-errors.jsonl", {
+            "event": "RACE_EVENT_SCHEDULER_UPDATE_FAILED",
+            "event_id": event.event_id, "error": str(exc), "created_at": utc_now(),
+        }, label="scheduler error ledger")
     from .transitions import evaluate_race_transition
     result["race_transition"] = evaluate_race_transition(
         root, result, session_id, input_fingerprint,
     )
+    result["post_commit_warnings"] = post_commit_warnings
     return result
 
 
@@ -120,6 +221,7 @@ def show_events(
     root: Path, *, input_fingerprint: str, since: str | None = None,
     priorities: Sequence[str] = (), event_types: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
+    root = resolve_active_run(root, input_fingerprint=input_fingerprint)
     rows = [row for row in _read_jsonl(root / "race-events.jsonl") if row.get("input_fingerprint") == input_fingerprint]
     wanted_priorities = {value.upper() for value in priorities}
     wanted_types = {value.upper() for value in event_types}
@@ -133,6 +235,7 @@ def show_events(
 
 
 def acknowledge_event(root: Path, *, event_id: str, session_id: str, input_fingerprint: str) -> dict[str, Any]:
+    root = resolve_active_run(root, input_fingerprint=input_fingerprint)
     matches = [row for row in show_events(root, input_fingerprint=input_fingerprint) if row.get("event_id") == event_id]
     if len(matches) != 1:
         raise RaceEventError("event does not exist in the active challenge fingerprint")
@@ -152,6 +255,7 @@ def insight_packet(
     root: Path, *, input_fingerprint: str, target_session_id: str,
     plan: Mapping[str, Any] | None = None, limit: int = 20,
 ) -> dict[str, Any]:
+    root = resolve_active_run(root, input_fingerprint=input_fingerprint)
     if not 1 <= limit <= 100:
         raise RaceEventError("insight packet limit must be from 1 through 100")
     events = show_events(root, input_fingerprint=input_fingerprint)
@@ -206,31 +310,17 @@ def operator_hints(root: Path, *, input_fingerprint: str) -> list[dict[str, Any]
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise RaceEventError("event ledger must not be a symlink")
-    descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        append_jsonl_fsync(path, payload, label="race event ledger")
+    except ValueError as exc:
+        raise RaceEventError(str(exc)) from exc
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    if path.is_symlink() or not path.is_file():
-        raise RaceEventError("event ledger is missing or unsafe")
-    rows = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise RaceEventError(f"event ledger line {line_number} is malformed") from exc
-        if not isinstance(row, dict):
-            raise RaceEventError(f"event ledger line {line_number} is not an object")
-        rows.append(row)
-    return rows
+    try:
+        return read_jsonl_strict(path, "race event ledger")
+    except ValueError as exc:
+        raise RaceEventError(str(exc)) from exc
 
 
 def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:

@@ -19,15 +19,28 @@ from typing import Any
 import yaml
 
 from .categories import playbook_category
-from .workspace import atomic_json, state_lock
+from .workspace import atomic_json, challenge_workspace, ensure_run_mutable, state_lock
 
 
 PLAN_SCHEMA_VERSION = 1
 BRANCH_STATUSES = frozenset({
-    "PLANNED", "ADMITTED", "AWAITING_NATIVE_START", "RUNNING", "CHECKPOINTED",
+    "PLANNED", "ADMITTED", "CAPACITY_ADMITTED", "SANDBOX_READY",
+    "AWAITING_NATIVE_START", "NATIVE_STARTED", "RUNNING", "CHECKPOINTED",
     "COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE",
-    "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE",
+    "FLAG_CANDIDATE", "STOP_REQUESTED", "TERMINAL", "START_FAILED",
+    "SANDBOX_FAILED", "INPUT_UNAVAILABLE", "TIMED_OUT", "TERMINATED", "ERROR", "STALE",
 })
+NATIVE_BRANCH_TRANSITIONS = {
+    "PLANNED": {"CAPACITY_ADMITTED", "START_FAILED", "SANDBOX_FAILED", "INPUT_UNAVAILABLE", "TERMINATED", "ERROR", "STALE"},
+    "CAPACITY_ADMITTED": {"SANDBOX_READY", "AWAITING_NATIVE_START", "START_FAILED", "SANDBOX_FAILED", "INPUT_UNAVAILABLE", "TERMINATED", "ERROR", "STALE"},
+    "SANDBOX_READY": {"AWAITING_NATIVE_START", "START_FAILED", "INPUT_UNAVAILABLE", "TERMINATED", "ERROR", "STALE"},
+    "AWAITING_NATIVE_START": {"NATIVE_STARTED", "RUNNING", "START_FAILED", "TIMED_OUT", "TERMINATED", "ERROR", "STALE"},
+    "NATIVE_STARTED": {"RUNNING", "STOP_REQUESTED", "TIMED_OUT", "TERMINATED", "ERROR"},
+    "RUNNING": {"CHECKPOINTED", "FLAG_CANDIDATE", "STOP_REQUESTED", "TERMINAL", "COMPLETED", "SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TIMED_OUT", "TERMINATED", "ERROR", "STALE"},
+    "CHECKPOINTED": {"RUNNING", "FLAG_CANDIDATE", "STOP_REQUESTED", "TERMINAL", "COMPLETED", "SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TIMED_OUT", "TERMINATED", "ERROR", "STALE"},
+    "FLAG_CANDIDATE": {"RUNNING", "STOP_REQUESTED", "TERMINAL", "COMPLETED", "SUPPORTED", "REFUTED", "TERMINATED", "ERROR"},
+    "STOP_REQUESTED": {"TERMINAL", "COMPLETED", "TERMINATED", "TIMED_OUT", "ERROR"},
+}
 ADMISSION_EXCEPTIONS = frozenset({
     "independent-verification", "clean-room-verifier", "clean-room-verification",
     "alternate-attack-family", "independent-full-solve", "parallel-race",
@@ -82,6 +95,7 @@ def init_plan(
     solve_root: Path, *, challenge_id: str, input_fingerprint: str,
     parent_session_id: str, tier: int, tier_reason: str,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     if not isinstance(tier, int) or tier not in range(0, 5):
         raise DelegationError("tier must be an integer from 0 through 4")
     now = utc_now()
@@ -176,6 +190,7 @@ def record_admission(
     threshold: float = 0.95, purpose: str | None = None,
     race_override_reason: str | None = None,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         result = admit_branch(
@@ -203,6 +218,7 @@ def add_branch(
     maximum_steps: int, budget_seconds: int, requested_model_role: str,
     requested_reasoning: str, purpose: str | None = None,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     if not isinstance(maximum_steps, int) or not 1 <= maximum_steps <= 10000:
         raise DelegationError("maximum_steps must be between 1 and 10000")
     if not isinstance(budget_seconds, int) or not 1 <= budget_seconds <= 86400:
@@ -257,6 +273,7 @@ def update_branch(
     observed_runtime_model: str | None = None, observed_reasoning: str | None = None,
     pinning_verified: bool | None = None, runtime_observation_evidence: str | None = None,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     if status not in BRANCH_STATUSES:
         raise DelegationError(f"status must be one of {sorted(BRANCH_STATUSES)}")
     with state_lock(solve_root):
@@ -265,9 +282,14 @@ def update_branch(
         if len(matches) != 1:
             raise DelegationError(f"unknown branch session_id: {session_id}")
         branch = matches[0]
+        current_status = str(branch.get("status") or "")
+        if branch.get("native_delegation_required") and status != current_status:
+            allowed = NATIVE_BRANCH_TRANSITIONS.get(current_status, set())
+            if status not in allowed:
+                raise DelegationError(f"invalid native branch transition: {current_status} -> {status}")
         if status == "RUNNING" and branch.get("native_delegation_required") and not branch.get("start_receipt"):
             raise DelegationError("RUNNING requires a native start receipt; use branch-start-confirm")
-        terminal_statuses = {"COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE", "FLAG_CANDIDATE", "TERMINATED", "ERROR", "STALE"}
+        terminal_statuses = {"COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE", "FLAG_CANDIDATE", "TERMINAL", "START_FAILED", "SANDBOX_FAILED", "INPUT_UNAVAILABLE", "TIMED_OUT", "TERMINATED", "ERROR", "STALE"}
         if status in terminal_statuses and branch.get("native_delegation_required"):
             result_path = solve_root / "workers" / session_id / "result.json"
             checkpoint_dir = solve_root / "workers" / session_id / "checkpoints"
@@ -384,13 +406,33 @@ def confirm_branch_start(
     session_id: str, native_session_observed: str, runtime_observation_evidence: str,
     sandbox_metadata_path: str,
 ) -> dict[str, Any]:
+    solve_root = ensure_run_mutable(solve_root)
     if not all(str(value).strip() for value in (native_session_observed, runtime_observation_evidence, sandbox_metadata_path)):
         raise DelegationError("branch start confirmation requires native, runtime, and sandbox evidence")
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
-        branch = next((row for row in plan["branches"] if row.get("session_id") == session_id and row.get("replacement_request_id") == replacement_request_id), None)
+        branch = next((
+            row for row in plan["branches"]
+            if row.get("session_id") == session_id
+            and (
+                row.get("replacement_request_id") == replacement_request_id
+                or (not row.get("replacement_request_id") and replacement_request_id in {"", "initial-race"})
+            )
+        ), None)
         if branch is None:
             raise DelegationError("replacement request and session do not match")
+        if branch.get("start_receipt"):
+            saved = branch["start_receipt"]
+            if (
+                saved.get("native_session_observed") == native_session_observed
+                and saved.get("runtime_observation_evidence") == runtime_observation_evidence
+            ):
+                return {**saved, "idempotent": True}
+            raise DelegationError("branch already has a conflicting native start receipt")
+        if branch.get("status") not in {"AWAITING_NATIVE_START", "SANDBOX_READY"}:
+            raise DelegationError("native start requires a sandbox-ready awaiting branch")
+        if branch.get("input_available") is False:
+            raise DelegationError("native start requires available challenge input")
         expected = solve_root / str(branch.get("expected_sandbox_identity"))
         supplied = Path(sandbox_metadata_path)
         if not supplied.is_absolute(): supplied = solve_root / supplied
@@ -400,13 +442,89 @@ def confirm_branch_start(
             raise DelegationError("sandbox metadata path is missing or unsafe")
         receipt = {
             "replacement_request_id": replacement_request_id, "session_id": session_id,
+            "run_id": plan.get("run_id"), "challenge_id": plan.get("challenge_id"),
+            "input_fingerprint": plan.get("input_fingerprint"),
+            "target_revision": plan.get("target_revision"),
             "native_session_observed": native_session_observed,
             "runtime_observation_evidence": runtime_observation_evidence,
             "sandbox_metadata_path": str(supplied), "started_at": utc_now(),
         }
-        branch["start_receipt"] = receipt; branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
+        branch["start_receipt"] = receipt
+        branch.setdefault("lifecycle_history", []).extend([
+            {"status": "NATIVE_STARTED", "created_at": receipt["started_at"], "receipt": receipt},
+            {"status": "RUNNING", "created_at": receipt["started_at"]},
+        ])
+        branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
         plan.setdefault("branch_start_receipts", []).append(receipt)
         plan["updated_at"] = utc_now(); atomic_json(plan_path(solve_root), plan)
+    return receipt
+
+
+def record_capacity_admission(
+    solve_root: Path, *, input_fingerprint: str, admitted_session_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Project scheduler admission without claiming a native child exists."""
+
+    solve_root = ensure_run_mutable(solve_root)
+    admitted = set(admitted_session_ids)
+    with state_lock(solve_root):
+        plan = _load_current_unlocked(solve_root, input_fingerprint)
+        changed = []
+        for branch in plan.get("branches", []):
+            if branch.get("session_id") in admitted and branch.get("status") == "PLANNED":
+                branch["status"] = "CAPACITY_ADMITTED"
+                stamp = utc_now()
+                branch["capacity_admitted_at"] = stamp
+                branch.setdefault("lifecycle_history", []).append({"status": "CAPACITY_ADMITTED", "created_at": stamp})
+                changed.append(str(branch["session_id"]))
+        plan["updated_at"] = utc_now()
+        atomic_json(plan_path(solve_root), plan)
+    return {"capacity_admitted": sorted(changed), "native_children_started": False}
+
+
+def record_branch_sandbox_ready(
+    solve_root: Path, *, input_fingerprint: str, session_id: str,
+    sandbox_metadata_path: str, input_available: bool,
+) -> dict[str, Any]:
+    """Record branch-private input/sandbox readiness before native start."""
+
+    solve_root = ensure_run_mutable(solve_root)
+    with state_lock(solve_root):
+        plan = _load_current_unlocked(solve_root, input_fingerprint)
+        branch = next((row for row in plan.get("branches", []) if row.get("session_id") == session_id), None)
+        if branch is None:
+            raise DelegationError("sandbox branch does not exist in the current plan")
+        if branch.get("status") not in {"CAPACITY_ADMITTED", "SANDBOX_READY", "AWAITING_NATIVE_START"}:
+            raise DelegationError("sandbox can be readied only after capacity admission")
+        supplied = Path(sandbox_metadata_path)
+        if not supplied.is_absolute():
+            supplied = solve_root / supplied
+        expected = solve_root / str(branch.get("expected_sandbox_identity"))
+        if supplied.resolve() != expected.resolve():
+            raise DelegationError("sandbox metadata path does not match expected sandbox identity")
+        if input_available and (supplied.is_symlink() or not supplied.is_file()):
+            raise DelegationError("sandbox metadata path is missing or unsafe")
+        prepared_input = challenge_workspace(solve_root) / "input"
+        if input_available and (prepared_input.is_symlink() or not prepared_input.is_dir()):
+            raise DelegationError("current challenge input is unavailable or unsafe")
+        stamp = utc_now()
+        receipt = {
+            "session_id": session_id, "sandbox_metadata_path": str(supplied),
+            "input_available": bool(input_available), "created_at": stamp,
+        }
+        if not input_available:
+            branch["status"] = "INPUT_UNAVAILABLE"
+            branch["finished_at"] = stamp
+        else:
+            branch["sandbox_ready_receipt"] = receipt
+            branch["input_available"] = True
+            branch.setdefault("lifecycle_history", []).extend([
+                {"status": "SANDBOX_READY", "created_at": stamp, "receipt": receipt},
+                {"status": "AWAITING_NATIVE_START", "created_at": stamp},
+            ])
+            branch["status"] = "AWAITING_NATIVE_START"
+        plan["updated_at"] = stamp
+        atomic_json(plan_path(solve_root), plan)
     return receipt
 
 

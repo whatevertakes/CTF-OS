@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .workspace import atomic_json, state_lock
+from .workspace import atomic_json, ensure_run_mutable, state_lock
 from .primitives import validate_primitive
 
 
@@ -21,7 +21,7 @@ CONFIDENCE_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
 CHECKPOINT_TYPES = frozenset({
     "SUPPORTED_FACT", "REJECTED_HYPOTHESIS", "EXPLOIT_PRIMITIVE", "BLOCKER",
     "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED", "EXPLOIT_PRIMITIVE_REFUTED",
-    "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED",
+    "ARTIFACT_READY", "WORKING_POC", "NEXT_EXPERIMENT", "FLAG_CANDIDATE",
     "SERVICE_CRASHED", "ENVIRONMENT_DISCOVERY", "NEED_HELP", "OPERATOR_HINT",
 })
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -39,7 +39,19 @@ def save_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dict[st
     mutations remain policy violations.
     """
 
+    solve_root = worker_root.resolve().parents[1]
     normalized = validate_worker_result(worker_root, payload)
+    modern_state = None
+    state_path = solve_root / "STATE.json"
+    if state_path.is_file() and not state_path.is_symlink():
+        try:
+            modern_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkerResultError("run STATE.json is malformed") from exc
+        if modern_state.get("input_fingerprint") != normalized["input_fingerprint"]:
+            raise WorkerResultError("worker result fingerprint does not match its run")
+        if modern_state.get("challenge_id") != normalized["challenge_id"]:
+            raise WorkerResultError("worker result challenge does not match its run")
     mutations = normalized["service_mutations"]
     forbidden_mutations = [item for item in mutations if not _allowed_worker_mutation(item, worker_root.name)]
     if forbidden_mutations:
@@ -54,12 +66,26 @@ def save_worker_result(worker_root: Path, payload: Mapping[str, Any]) -> dict[st
                 "mutations": forbidden_mutations,
             })
     atomic_json(_safe_result_path(worker_root), normalized)
-    from .transitions import evaluate_race_transition
-    evaluate_race_transition(
-        worker_root.resolve().parents[1],
-        {"type": "CHILD_TERMINAL_RESULT", "result_id": f"{normalized['session_id']}:{normalized['finished_at']}"},
-        normalized["session_id"], normalized["input_fingerprint"],
-    )
+    if isinstance(modern_state, dict) and modern_state.get("run_id"):
+        from .milestones import save_milestone
+        milestone = save_milestone(
+            solve_root, challenge_id=normalized["challenge_id"],
+            session_id=normalized["session_id"], input_fingerprint=normalized["input_fingerprint"],
+            target_revision=int(modern_state.get("target_revision") or 1),
+            event_type="CHILD_TERMINAL_RESULT", summary=normalized["summary"],
+            artifacts=[f"workers/{normalized['session_id']}/{value}" for value in normalized["artifacts"]],
+            exploit_proximity=.9 if normalized["flag_candidates"] else .2,
+            details={"status": normalized["status"]},
+        )
+        normalized["milestone_receipt_id"] = milestone["receipt_id"]
+        atomic_json(_safe_result_path(worker_root), normalized)
+    else:
+        from .transitions import evaluate_race_transition
+        evaluate_race_transition(
+            solve_root,
+            {"type": "CHILD_TERMINAL_RESULT", "result_id": f"{normalized['session_id']}:{normalized['finished_at']}"},
+            normalized["session_id"], normalized["input_fingerprint"],
+        )
     return normalized
 
 
@@ -149,6 +175,7 @@ def save_worker_checkpoint(
     research_drift_detected: bool = False, repeated_command: bool = False,
     sibling_insight_applied: bool = False, hypothesis_family_changed: bool = False,
     primitive: Mapping[str, Any] | None = None,
+    declared_remote: bool = False,
 ) -> dict[str, Any]:
     """Save a compact exploit-action checkpoint without changing schema v1.
 
@@ -157,6 +184,7 @@ def save_worker_checkpoint(
     """
 
     root = _safe_worker_root(worker_root)
+    ensure_run_mutable(root.parents[1])
     if checkpoint_type not in CHECKPOINT_TYPES:
         raise WorkerResultError(f"checkpoint type must be one of {sorted(CHECKPOINT_TYPES)}")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0.0 <= float(confidence) <= 1.0:
@@ -220,8 +248,33 @@ def save_worker_checkpoint(
         if target.is_symlink() or target.exists():
             raise WorkerResultError("checkpoint sequence path already exists or is unsafe")
         atomic_json(target, payload)
+    modern_state = None
+    if state_path.is_file() and not state_path.is_symlink():
+        modern_state = json.loads(state_path.read_text(encoding="utf-8"))
+    milestone_map = {
+        "EXPLOIT_PRIMITIVE_CANDIDATE": "PRIMITIVE_CANDIDATE",
+        "EXPLOIT_PRIMITIVE_CONFIRMED": "PRIMITIVE_CONFIRMED",
+        "EXPLOIT_PRIMITIVE_REFUTED": "PRIMITIVE_REFUTED",
+        "WORKING_POC": "WORKING_POC", "FLAG_CANDIDATE": "FLAG_CANDIDATE",
+    }
+    if isinstance(modern_state, dict) and modern_state.get("run_id") and checkpoint_type in milestone_map:
+        from .milestones import save_milestone
+        milestone = save_milestone(
+            solve_root, challenge_id=challenge_id, session_id=root.name,
+            input_fingerprint=input_fingerprint,
+            target_revision=int(modern_state.get("target_revision") or 1),
+            event_type=milestone_map[checkpoint_type], summary=compact_summary,
+            evidence=[f"workers/{root.name}/{value}" for value in safe_evidence],
+            artifacts=[f"workers/{root.name}/{value}" for value in safe_artifacts],
+            exploit_proximity=proximity,
+            details={"decision": normalized_decision, "observed_result": result_text},
+            declared_remote=declared_remote,
+        )
+        payload["milestone_receipt_id"] = milestone["receipt_id"]
+        atomic_json(target, payload)
     from .transitions import maybe_evaluate_checkpoint
-    maybe_evaluate_checkpoint(solve_root, payload)
+    if checkpoint_type not in milestone_map or not (isinstance(modern_state, dict) and modern_state.get("run_id")):
+        maybe_evaluate_checkpoint(solve_root, payload)
     return payload
 
 

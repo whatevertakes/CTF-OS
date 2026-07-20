@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 from ..challenge import SelectionError, resolve_selector
@@ -17,6 +18,7 @@ from ..delegation import (
     BranchCandidate, add_branch, branch_utility, init_plan, load_plan,
     record_admission, template_recommendation, update_branch,
     prepare_branch_replacement, confirm_branch_start,
+    record_branch_sandbox_ready, record_capacity_admission,
 )
 from ..events import (
     acknowledge_event, insight_packet, operator_hints, publish_event,
@@ -49,12 +51,20 @@ from ..triage import finalize_triage, prepare_triage
 from ..timeouts import timeout_seconds
 from ..transitions import control_loop_tick
 from ..tui import resource_panel
-from ..workspace import atomic_json, challenge_root, initialize_solve_files, safe_under, state_lock
+from ..workspace import (
+    atomic_json, challenge_root, challenge_workspace, initialize_solve_files,
+    safe_under, state_lock,
+)
 from ..worker import (
     collect_worker_checkpoints, load_worker_result, merge_worker_checkpoints,
     merge_worker_result_files, save_worker_checkpoint, save_worker_result,
 )
 from ..verification import record_remote_flag
+from ..candidates import record_candidate
+from ..control import acknowledge_control_action, load_control_actions
+from ..milestones import save_milestone
+from ..progress import heartbeat_long_compute, record_command
+from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -175,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_delegation_controller_args(replacement)
         start_confirm = commands.add_parser("branch-start-confirm")
         start_confirm.add_argument("selector"); start_confirm.add_argument("--contest")
-        start_confirm.add_argument("--replacement-request-id", required=True); start_confirm.add_argument("--session-id", required=True)
+        start_confirm.add_argument("--replacement-request-id", default="initial-race"); start_confirm.add_argument("--session-id", required=True)
         start_confirm.add_argument("--native-session-observed", required=True); start_confirm.add_argument("--runtime-observation-evidence", required=True)
         start_confirm.add_argument("--sandbox-metadata-path", required=True)
         start_confirm.add_argument("--session-role", choices=("sol",), default="sol"); start_confirm.add_argument("--parent-session-id", default="sol-main"); start_confirm.add_argument("--recover-stale", action="store_true")
@@ -244,6 +254,19 @@ def build_parser() -> argparse.ArgumentParser:
     event_publish.add_argument("--recommended-action", default=""); event_publish.add_argument("--event-id")
     event_publish.add_argument("--primitive-json")
     _add_session_args(event_publish)
+    milestone = commands.add_parser("milestone-save")
+    milestone.add_argument("selector"); milestone.add_argument("--contest"); milestone.add_argument("--type", required=True)
+    milestone.add_argument("--summary", required=True); milestone.add_argument("--evidence", action="append", default=[])
+    milestone.add_argument("--artifact", action="append", default=[]); milestone.add_argument("--output", default="")
+    milestone.add_argument("--exploit-proximity", type=float, default=0.0); milestone.add_argument("--details-json")
+    milestone.add_argument("--candidate"); milestone.add_argument("--source-type", default="STATIC_ANALYSIS")
+    milestone.add_argument("--validation-method", default="UNVALIDATED"); milestone.add_argument("--confidence", default="LOW")
+    milestone.add_argument("argv", nargs="*"); _add_session_args(milestone)
+    progress_command = commands.add_parser("progress-command")
+    progress_command.add_argument("selector"); progress_command.add_argument("--contest"); progress_command.add_argument("argv", nargs="*"); _add_session_args(progress_command)
+    heartbeat = commands.add_parser("long-compute-heartbeat")
+    heartbeat.add_argument("selector"); heartbeat.add_argument("--contest"); heartbeat.add_argument("--receipt-id", required=True)
+    heartbeat.add_argument("--artifact-changed", action="store_true"); heartbeat.add_argument("--completion-signal-observed", action="store_true"); _add_session_args(heartbeat)
     events_show = commands.add_parser("race-events-show")
     events_show.add_argument("selector"); events_show.add_argument("--contest"); events_show.add_argument("--since")
     events_show.add_argument("--priority", action="append", default=[]); events_show.add_argument("--type", action="append", default=[])
@@ -275,8 +298,22 @@ def build_parser() -> argparse.ArgumentParser:
         receipt.add_argument("--host", required=True); receipt.add_argument("--port", type=int, required=True)
         receipt.add_argument("--protocol", required=True); receipt.add_argument("--network-observed", action="store_true")
         receipt.add_argument("--output", required=True); receipt.add_argument("--candidate", required=True)
-        receipt.add_argument("--exploit-artifact", required=True); receipt.add_argument("argv", nargs=argparse.REMAINDER)
+        receipt.add_argument("--exploit-artifact", required=True); receipt.add_argument("argv", nargs="*")
         _add_session_args(receipt)
+        submission = commands.add_parser("submission-result")
+        submission.add_argument("selector"); submission.add_argument("--contest")
+        submission.add_argument("--run-id", required=True); submission.add_argument("--candidate-id", required=True)
+        submission.add_argument("--result", required=True, choices=("accepted", "wrong")); _add_session_args(submission)
+        native_stop = commands.add_parser("branch-native-stop")
+        native_stop.add_argument("selector"); native_stop.add_argument("--contest"); native_stop.add_argument("--run-id", required=True)
+        native_stop.add_argument("--branch", required=True); native_stop.add_argument("--receipt-json", required=True); _add_session_args(native_stop)
+        terminal_show = commands.add_parser("terminal-status")
+        terminal_show.add_argument("selector"); terminal_show.add_argument("--contest"); terminal_show.add_argument("--run-id"); _add_session_args(terminal_show)
+        control_show = commands.add_parser("control-actions-show")
+        control_show.add_argument("selector"); control_show.add_argument("--contest"); _add_session_args(control_show)
+        control_ack = commands.add_parser("control-action-ack")
+        control_ack.add_argument("selector"); control_ack.add_argument("--contest"); control_ack.add_argument("--action-id", required=True)
+        control_ack.add_argument("--status", required=True, choices=("applied", "declined", "superseded", "expired")); control_ack.add_argument("--receipt-json"); _add_session_args(control_ack)
     if not child_surface:
         replay = commands.add_parser("replay")
         replay.add_argument("selector")
@@ -351,7 +388,18 @@ def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "s
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    direct_argv_commands = {"milestone-save", "progress-command", "flag-receipt-save"}
+    separator = raw_argv.index("--") if "--" in raw_argv else -1
+    controls = raw_argv[:separator] if separator >= 0 else raw_argv
+    direct_command = next((name for name in direct_argv_commands if name in controls), None)
+    if separator >= 0 and direct_command is not None:
+        command_argv = raw_argv[separator + 1:]
+        args = parser.parse_args(controls)
+        args.argv = command_argv
+    else:
+        args = parser.parse_args(raw_argv)
     root = Path(args.repo).resolve()
     try:
         result = dispatch(root, args)
@@ -449,6 +497,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         if not metadata_path:
             raise ValueError("sandbox-exec requires --metadata before `--`")
         metadata = _load_metadata(root, metadata_path)
+        execution_state = json.loads((Path(str(metadata["branch_root"])).parents[1] / "STATE.json").read_text(encoding="utf-8"))
+        if execution_state.get("sealed"):
+            raise ValueError("sealed run is immutable; only terminal cleanup is allowed")
         command = raw_command
         if command and command[0] == "--":
             command.pop(0)
@@ -457,6 +508,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         result = execute(
             metadata, command, timeout, session_id=session_id, session_role=role,
             timeout_profile=args.timeout_profile, retain_on_timeout=args.retain_on_timeout,
+        )
+        result["progress_gate"] = record_command(
+            Path(str(metadata["branch_root"])).parents[1], session_id=session_id,
+            command_argv=command, category=str(metadata.get("category") or "misc"),
         )
         if result["timed_out"]:
             _update_branch_state(
@@ -478,11 +533,17 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
 
     if args.command == "prepare-challenge":
         manifest, challenge, record = _prepare_challenge_same_session(root, args.contest, args.selector)
-        solve_root = challenge_root(root, manifest, challenge)
-        initialize_solve_files(solve_root, challenge)
+        workspace = challenge_root(root, manifest, challenge)
+        solve_root = initialize_solve_files(workspace, challenge, str(record["source_fingerprint"]))
         launch_context = build_solve_launch_context(challenge, record)
+        launch_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+        launch_context["run_id"] = launch_state.get("run_id")
+        launch_context["target_revision"] = launch_state.get("target_revision")
         launch_path = save_solve_launch_context(solve_root, launch_context)
-        return _compact_prepare(challenge, record, solve_root, launch_context, launch_path)
+        compatibility_launch_path = save_solve_launch_context(workspace, launch_context)
+        prepared = _compact_prepare(challenge, record, solve_root, launch_context, compatibility_launch_path)
+        prepared["authoritative_solve_launch_path"] = str(launch_path)
+        return prepared
 
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
     if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
@@ -491,9 +552,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             or os.environ.get("CTF_OS_CONTEST_SLUG") != manifest.slug
         ):
             raise ValueError("DENIED_CHALLENGE_SCOPE: child session may access only its assigned challenge")
-    solve_root = challenge_root(root, manifest, challenge)
-    initialize_solve_files(solve_root, challenge)
     current_fingerprint = str(record["source_fingerprint"])
+    workspace = challenge_root(root, manifest, challenge)
+    solve_root = initialize_solve_files(workspace, challenge, current_fingerprint)
     ledger = ResourceLedger(solve_root)
     if args.command == "resource-request":
         session_id, role = _caller(args)
@@ -602,11 +663,20 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             )
             capacity = detect_capacity(workspace=root)
             resource_plan = ledger.rebalance(capacity, tier=args.tier)
+            capacity_receipt = record_capacity_admission(
+                solve_root, input_fingerprint=current_fingerprint,
+                admitted_session_ids=list(resource_plan.get("allocations", {}).keys()),
+            )
+            board = race_board(
+                load_plan(solve_root, input_fingerprint=current_fingerprint),
+                state=json.loads((solve_root / "STATE.json").read_text(encoding="utf-8")),
+                resources=resource_panel(capacity.to_dict(), ledger.load()),
+            )
             board["resource_plan"] = resource_plan
-            board["resource_use"] = resource_panel(capacity.to_dict(), ledger.load())
+            board["capacity_admission"] = capacity_receipt
             board["next_action"] = (
-                "Sol must immediately create capacity-admitted children with native delegation; "
-                "retain unallocated prompt packets as launch recommendations and continue the Sol deep-solve lane."
+                "Create each capacity-admitted branch sandbox and verify current input access, then use native "
+                "delegation and record its start receipt. Sol continues the deep-solve lane throughout startup."
             )
             return board
         if args.command == "race-board":
@@ -747,6 +817,43 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             event_id=args.event_id,
             primitive=primitive,
         )
+    if args.command == "milestone-save":
+        session_id, _role = _caller(args)
+        details = json.loads(args.details_json) if args.details_json else {}
+        if not isinstance(details, dict):
+            raise ValueError("--details-json must contain an object")
+        argv = list(args.argv)
+        if argv and argv[0] == "--": argv.pop(0)
+        state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+        receipt = save_milestone(
+            solve_root, challenge_id=challenge.id, session_id=session_id,
+            input_fingerprint=current_fingerprint, target_revision=int(state.get("target_revision") or 1),
+            event_type=args.type, summary=args.summary, evidence=args.evidence,
+            artifacts=args.artifact, command_argv=argv, output=args.output,
+            exploit_proximity=args.exploit_proximity, details=details,
+            declared_remote=bool(challenge.remotes),
+        )
+        if args.type.strip().upper() == "FLAG_CANDIDATE":
+            if not args.candidate:
+                raise ValueError("FLAG_CANDIDATE milestone requires --candidate")
+            receipt["candidate"] = record_candidate(
+                solve_root, session_id=session_id, candidate=args.candidate,
+                source_type=args.source_type, receipt_id=receipt["receipt_id"],
+                confidence=args.confidence, validation_method=args.validation_method,
+            )
+        return receipt
+    if args.command == "progress-command":
+        session_id, _role = _caller(args)
+        argv = list(args.argv)
+        if argv and argv[0] == "--": argv.pop(0)
+        return record_command(solve_root, session_id=session_id, command_argv=argv, category=challenge.category)
+    if args.command == "long-compute-heartbeat":
+        session_id, _role = _caller(args)
+        return heartbeat_long_compute(
+            solve_root, session_id=session_id, receipt_id=args.receipt_id,
+            artifact_changed=args.artifact_changed,
+            completion_signal_observed=args.completion_signal_observed,
+        )
     if args.command == "race-events-show":
         return {"events": show_events(
             solve_root, input_fingerprint=current_fingerprint, since=args.since,
@@ -798,6 +905,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             network_observed=args.network_observed, output=args.output, candidate=args.candidate,
             flag_pattern=challenge.flag_pattern, command_argv=argv,
             exploit_artifact=args.exploit_artifact,
+            target_revision=int(json.loads((solve_root / "STATE.json").read_text(encoding="utf-8")).get("target_revision") or 1),
         )
         if receipt.get("state") == "SUBMISSION_RECOMMENDED":
             resource_state = ledger.load()
@@ -805,6 +913,68 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 root, solve_root, resource_state.get("last_plan", {}), args.parent_session_id,
             )
         return receipt
+    if args.command == "submission-result":
+        _require_sol(args, "Only Sol may record the human submission result.")
+        terminal_run = safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
+        if terminal_run.is_symlink() or not terminal_run.is_dir():
+            raise ValueError("submission run does not exist in this challenge workspace")
+        terminal_ledger = ResourceLedger(terminal_run)
+        receipt = record_submission_result(
+            terminal_run, run_id=args.run_id, candidate_id=args.candidate_id, result=args.result,
+        )
+        if args.result == "accepted":
+            def release_resource(session_id: str):
+                resource_state = terminal_ledger.load()
+                observation = resource_state.get("observations", {}).get(session_id, {})
+                if session_id not in resource_state.get("requests", {}) or observation.get("state") == "RELEASED":
+                    return {"session_id": session_id, "released": True, "idempotent": True}
+                return terminal_ledger.release(
+                    session_id, "accepted run terminal convergence",
+                    actor_session_id=args.parent_session_id, actor_role="sol",
+                )
+            def clean_sandbox(metadata_path: Path, session_id: str):
+                metadata = _load_metadata(root, str(metadata_path))
+                return cleanup(metadata, session_id=args.parent_session_id, session_role="sol")
+            receipt["terminal_convergence"] = converge_terminal(
+                terminal_run, run_id=args.run_id,
+                sandbox_cleanup=clean_sandbox, resource_release=release_resource,
+            )
+            resource_state = terminal_ledger.load()
+            receipt["remaining_resource_release"] = [
+                {
+                    "session_id": session_id, "released": False,
+                    "reason": "terminal ordering or native termination is still pending",
+                }
+                for session_id in list(resource_state.get("requests", {}))
+                if resource_state.get("observations", {}).get(session_id, {}).get("state") != "RELEASED"
+            ]
+        return receipt
+    if args.command == "branch-native-stop":
+        _require_sol(args, "Sol owns native child termination receipts.")
+        payload = json.loads(args.receipt_json)
+        if not isinstance(payload, dict):
+            raise ValueError("--receipt-json must contain an object")
+        return record_native_stop(
+            solve_root, run_id=args.run_id, session_id=args.branch, native_receipt=payload,
+        )
+    if args.command == "terminal-status":
+        _require_sol(args, "Only Sol may inspect terminal convergence.")
+        selected = solve_root if not args.run_id else safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
+        return terminal_status(selected)
+    if args.command == "control-actions-show":
+        return {"actions": load_control_actions(solve_root)}
+    if args.command == "control-action-ack":
+        _require_sol(args, "Only Sol may acknowledge lifecycle actions.")
+        status = {
+            "applied": "ACKED_APPLIED", "declined": "ACKED_DECLINED",
+            "superseded": "SUPERSEDED", "expired": "EXPIRED",
+        }[args.status]
+        applied = json.loads(args.receipt_json) if args.receipt_json else None
+        if applied is not None and not isinstance(applied, dict):
+            raise ValueError("--receipt-json must contain an object")
+        return acknowledge_control_action(
+            solve_root, action_id=args.action_id, status=status, applied_receipt=applied,
+        )
     if args.command == "replay":
         _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
         return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
@@ -812,12 +982,12 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         if record["status"] != "READY":
             raise ValueError(f"challenge is not READY: {record.get('blockers')}")
         branch_root = solve_root / "workers" / args.branch
-        input_path = solve_root / "input"
+        input_path = workspace / "input"
         if input_path.is_symlink() or not input_path.is_dir():
             raise ValueError("prepared challenge input is missing or unsafe; run same-session preparation again")
         expected_source = input_path.resolve()
         try:
-            expected_source.relative_to(solve_root.resolve())
+            expected_source.relative_to(workspace.resolve())
         except ValueError as exc:
             raise ValueError("prepared challenge input escapes its challenge workspace") from exc
         if Path(str(record.get("prepared_input", ""))).resolve() != expected_source:
@@ -940,7 +1110,19 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 if service_network:
                     metadata["connectivity_probe"] = probe_service_connectivity(metadata)
                     atomic_json(Path(str(metadata["metadata_path"])), metadata)
-                _update_branch_state(solve_root, args.branch, "RUNNING", str(metadata["metadata_path"]))
+                _mirror_legacy_worker_metadata(workspace, solve_root, args.branch, metadata)
+                if (solve_root / "DELEGATION_PLAN.json").is_file():
+                    record_branch_sandbox_ready(
+                        solve_root, input_fingerprint=current_fingerprint,
+                        session_id=args.branch, sandbox_metadata_path=str(metadata["metadata_path"]),
+                        input_available=True,
+                    )
+                else:
+                    # Legacy compatibility view: a live sandbox is not proof
+                    # that a native child was started.
+                    _update_branch_state(
+                        solve_root, args.branch, "SANDBOX_READY", str(metadata["metadata_path"]),
+                    )
             except Exception:
                 cleanup(metadata)
                 raise
@@ -973,6 +1155,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 active_metadata,
                 session_id=session_id, session_role=role,
             )
+            _adopt_legacy_worker_exports(workspace, solve_root, args.branch)
         result = save_worker_result(worker_root, payload)
         terminal = str(payload.get("status", "")).upper() in {"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "ERROR"}
         if terminal and isinstance(active_metadata, dict) and all(key in active_metadata for key in ("name", "branch_root", "labels")):
@@ -1012,7 +1195,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             repeated_command=args.repeated_command,
             sibling_insight_applied=args.sibling_insight_applied,
             hypothesis_family_changed=args.hypothesis_family_changed,
-            primitive=primitive,
+            primitive=primitive, declared_remote=bool(challenge.remotes),
         )
     if args.command == "worker-results-merge":
         _require_sol(args, "Only the parent Sol session may merge worker results.")
@@ -1041,7 +1224,7 @@ def _service_spec(
         raise ValueError("intake found no Dockerfile/Compose challenge service plan")
     return ServiceSpec(
         contest_slug=manifest.slug, challenge_id=challenge.id,
-        source=solve_root / "input", workspace=solve_root, service_plan=plan,
+        source=challenge_workspace(solve_root) / "input", workspace=solve_root, service_plan=plan,
         branch_id=branch_id,
     )
 
@@ -1131,6 +1314,10 @@ def _rebalance_contest(root: Path, contest: str | None, *, apply: bool) -> dict[
     plans = []
     for path in state_paths:
         solve_root = path.parent
+        if (solve_root / "ACTIVE_RUN.json").is_file() and solve_root.parent.name != "runs":
+            # Legacy compatibility projections are non-authoritative; their
+            # resource ledger was migrated under the active run.
+            continue
         ledger = ResourceLedger(solve_root)
         state_path = solve_root / "STATE.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -1157,8 +1344,9 @@ def _seed_race_resources(
     ledger: ResourceLedger, board: dict[str, object], contest: str, challenge_id: str,
     category: str, sol_session_id: str, input_bytes: int,
 ) -> None:
+    branch_rows = board.get("planned_branches", board.get("active_branches", []))
     branch_ids = [
-        str(branch["session_id"]) for branch in board.get("active_branches", [])
+        str(branch["session_id"]) for branch in branch_rows
         if isinstance(branch, dict) and branch.get("session_id")
     ]
     ledger.begin_race([sol_session_id, *branch_ids])
@@ -1171,7 +1359,7 @@ def _seed_race_resources(
         sol_request, actor_session_id=sol_session_id, actor_role="sol",
         inference={"confidence": "ROLE", "evidence": ["Sol direct deep-solve lane"]},
     )
-    for branch in board.get("active_branches", []):
+    for branch in branch_rows:
         if not isinstance(branch, dict) or not branch.get("session_id"):
             continue
         packet = branch.get("prompt_packet") if isinstance(branch.get("prompt_packet"), dict) else {}
@@ -1241,6 +1429,7 @@ def _compact_prepare(
     launch_context: dict[str, object],
     launch_path: Path,
 ) -> dict[str, object]:
+    workspace = challenge_workspace(solve_root)
     priority = list(launch_context["priority_files"])
     important_metadata = dict(launch_context["important_metadata"])
     return {
@@ -1253,13 +1442,15 @@ def _compact_prepare(
         "service_plan": record.get("service_plan", {}),
         "state_summary": _state_summary(solve_root),
         "read_on_demand": [
-            str(solve_root / "inventory.json"), str(solve_root / "evidence.log"),
+            str(workspace / "inventory.json"), str(solve_root / "evidence.log"),
             str(solve_root / "findings.jsonl"), str(solve_root / "workers"),
         ],
         "solve_launch_path": str(launch_path),
         "solve_launch_context": launch_context,
-        "preflight_record_path": str(solve_root / "CHALLENGE-PREFLIGHT.json"),
-        "solve_root": str(solve_root),
+        "preflight_record_path": str(workspace / "CHALLENGE-PREFLIGHT.json"),
+        "solve_root": str(workspace),
+        "run_root": str(solve_root),
+        "run_id": launch_context.get("run_id"),
     }
 
 
@@ -1379,6 +1570,46 @@ def _csv(value: str) -> list[str]:
 
 def _candidate_from_args(args: argparse.Namespace) -> BranchCandidate:
     return BranchCandidate.create(session_id=args.session_id, role=args.role, hypothesis_family=args.hypothesis_family, hypothesis=args.hypothesis, scope=_csv(args.scope), tool_strategy=_csv(args.tool_strategy), expected_artifacts=args.expected_artifact)
+
+
+def _legacy_projection_enabled(workspace: Path) -> bool:
+    pointer = workspace / "ACTIVE_RUN.json"
+    if not pointer.is_file() or pointer.is_symlink() or not (workspace / "STATE.json").is_file():
+        return False
+    try:
+        return json.loads(pointer.read_text(encoding="utf-8")).get("legacy_compatibility_view") is True
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _mirror_legacy_worker_metadata(
+    workspace: Path, run: Path, branch: str, metadata: dict[str, object],
+) -> None:
+    if not _legacy_projection_enabled(workspace):
+        return
+    target = workspace / "workers" / branch / "sandbox.json"
+    projected = dict(metadata)
+    projected["compatibility_view"] = True
+    projected["authoritative_metadata_path"] = str(run / "workers" / branch / "sandbox.json")
+    atomic_json(target, projected)
+
+
+def _adopt_legacy_worker_exports(workspace: Path, run: Path, branch: str) -> None:
+    if not _legacy_projection_enabled(workspace):
+        return
+    source = workspace / "workers" / branch
+    target = run / "workers" / branch
+    if not source.is_dir() or source.is_symlink():
+        return
+    for item in source.rglob("*"):
+        if item.is_symlink():
+            raise ValueError("legacy worker compatibility export contains a symlink")
+        if item.is_file() and item.name != "sandbox.json":
+            relative = item.relative_to(source)
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                shutil.copy2(item, destination)
 
 
 if __name__ == "__main__":

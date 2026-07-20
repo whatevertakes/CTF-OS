@@ -10,14 +10,17 @@ from collections import Counter
 from collections.abc import Mapping
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 from .delegation import branch_utility, load_plan, utc_now
 from .primitives import PRIMITIVE_CONFIRMED, PRIMITIVE_REFUTED
 from .worker import collect_worker_checkpoints, load_worker_result
-from .workspace import atomic_json, state_lock
+from .workspace import (
+    atomic_json, challenge_workspace, ensure_run_mutable, is_run_root,
+    resolve_active_run, state_lock,
+)
+from .workspace import append_jsonl_fsync, read_jsonl_strict
 
 
 HIGH_VALUE_TYPES = frozenset({
@@ -26,6 +29,8 @@ HIGH_VALUE_TYPES = frozenset({
     "REMOTE_FLAG_OBTAINED", "CHILD_TERMINAL_RESULT", "BRANCH_TERMINAL",
     "BUDGET_50", "BUDGET_100", "PLATEAU_3", "DUPLICATE_BLOCKER_2",
     "DUPLICATE_COMMAND_FAMILY_2", "CONTROL_LOOP_TICK",
+    "DECISIVE_EXPERIMENT", "PRIMITIVE_CANDIDATE", "PRIMITIVE_CONFIRMED",
+    "PRIMITIVE_REFUTED", "REMOTE_ATTEMPT", "TYPED_BLOCKER", "LONG_COMPUTE",
 })
 
 
@@ -33,9 +38,19 @@ def evaluate_race_transition(
     solve_root: Path, triggering_event: Mapping[str, Any] | str,
     affected_session_id: str | None = None, input_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    root = solve_root.resolve()
+    root = resolve_active_run(solve_root, input_fingerprint=input_fingerprint)
     event = dict(triggering_event) if isinstance(triggering_event, Mapping) else {"type": str(triggering_event)}
     trigger = str(event.get("type") or event.get("trigger") or "").upper()
+    receipt_reference = event.get("receipt_reference") if isinstance(event.get("receipt_reference"), Mapping) else {}
+    if trigger in {"REMOTE_FLAG_OBTAINED", "SUBMISSION_RECOMMENDED", "ACCEPTED"}:
+        if not receipt_reference.get("receipt_id"):
+            raise ValueError(f"{trigger} transition requires a verified lifecycle receipt")
+        state = json.loads((root / "STATE.json").read_text(encoding="utf-8"))
+        expected = f"flag-receipts/remote-{receipt_reference['receipt_id']}.json"
+        if state.get("remote_flag_receipt") != expected:
+            raise ValueError("verified transition receipt does not match run state")
+    else:
+        ensure_run_mutable(root)
     event_key = str(event.get("event_id") or event.get("checkpoint_id") or event.get("result_id") or "")
     if not event_key:
         event_key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()[:24]
@@ -50,9 +65,8 @@ def evaluate_race_transition(
             "sol_takeover": None, "replacement_requests": [], "objective_rewrites": [],
             "branches_to_finalize": [], "branches_to_reclaim": [], "idempotent": False,
         }
-    try:
-        plan = load_plan(root, input_fingerprint=input_fingerprint)
-    except Exception:
+    delegation_path = root / "DELEGATION_PLAN.json"
+    if not delegation_path.exists() and not delegation_path.is_symlink():
         return {
             "transition_id": transition_id, "trigger": trigger, "triggered": False,
             "reason": "no current delegation plan", "evaluated_branches": [],
@@ -60,6 +74,13 @@ def evaluate_race_transition(
             "replacement_requests": [], "objective_rewrites": [],
             "branches_to_finalize": [], "branches_to_reclaim": [], "idempotent": False,
         }
+    # A present but malformed/stale plan is authoritative state corruption,
+    # not equivalent to an optional plan that has never been created.
+    plan = load_plan(root, input_fingerprint=input_fingerprint)
+    from .progress import load_solve_policy
+    maximum_verifiers = int(
+        load_solve_policy()["remote_transition"]["maximum_optional_verifiers"]
+    )
     fingerprint = input_fingerprint or str(plan.get("input_fingerprint", ""))
     checkpoints = collect_worker_checkpoints(root / "workers", input_fingerprint=fingerprint)
     # Race events participate in utility without duplicating worker checkpoints.
@@ -92,6 +113,7 @@ def evaluate_race_transition(
         }
         actions.append({"action": "SOL_TAKEOVER", **takeover})
         family = _branch_family(plan, affected_session_id)
+        verifier_kept = 0
         for branch in plan.get("branches", []):
             sid = str(branch.get("session_id", ""))
             duplicate_claim = any(
@@ -105,25 +127,53 @@ def evaluate_race_transition(
                     "session_id": sid, "objective": "Implement or link the confirmed primitive to a minimal PoC",
                     "reason": "duplicate primitive discovery is no longer useful",
                 })
+            elif sid != affected_session_id:
+                verifier = bool(branch.get("independent_verification"))
+                if verifier and verifier_kept < maximum_verifiers:
+                    verifier_kept += 1
+                else:
+                    actions.append({
+                        "action": "STOP_LOW_VALUE_BRANCH", "session_id": sid,
+                        "reason": "confirmed primitive converges the race on the leading path",
+                        "native_action_owner": "sol",
+                    })
     if refuted:
         for sid in dependent:
             actions.append({"action": "REVIEW_REQUIRED", "session_id": sid, "invalidated_primitive": claimed})
             replacements.append(_replacement_packet(plan, sid, "primitive refuted; choose a distinct mechanism"))
-    for sid, advice in utility.items():
-        classification = advice.get("classification")
-        if classification == "FLAG_PATH":
-            actions.append({"action": "FLAG_PATH", "session_id": sid, "maximum_optional_verifiers": 1})
-            reclaim.extend(other for other in evaluated if other != sid and other not in reclaim)
-        elif classification == "SOL_TAKEOVER" and takeover is None:
-            takeover = {"session_id": sid, "next_objective": "minimal PoC or exploit endgame", "native_action_owner": "sol", "required": True}
-            actions.append({"action": "SOL_TAKEOVER", **takeover})
-        elif classification == "REPLACE_ATTACK_FAMILY":
-            replacements.append(_replacement_packet(plan, sid, str(advice.get("recommendation", "plateau"))))
-        elif classification == "BUMP_AND_RETRY":
-            actions.append({"action": "BUMP_AND_RETRY", "session_id": sid, "maximum_retries": 1, "require_changed_decisive_experiment": True})
-        elif classification == "DEAD_BRANCH":
-            finalize.append(sid); reclaim.append(sid)
-            actions.append({"action": "FINALIZE_AND_RECLAIM", "session_id": sid, "native_action_owner": "sol"})
+    if trigger == "REMOTE_FLAG_OBTAINED":
+        verifier_kept = 0
+        for branch in plan.get("branches", []):
+            sid = str(branch.get("session_id", ""))
+            if not sid or sid == affected_session_id:
+                continue
+            if branch.get("independent_verification") and verifier_kept < maximum_verifiers:
+                verifier_kept += 1
+                continue
+            actions.append({
+                "action": "STOP_LOW_VALUE_BRANCH", "session_id": sid,
+                "reason": "verified remote flag obtained; retain at most one independent verifier",
+                "native_action_owner": "sol",
+            })
+    if trigger != "REMOTE_FLAG_OBTAINED":
+        for sid, advice in utility.items():
+            classification = advice.get("classification")
+            if classification == "FLAG_PATH":
+                actions.append({
+                    "action": "FLAG_PATH", "session_id": sid,
+                    "maximum_optional_verifiers": maximum_verifiers,
+                })
+                reclaim.extend(other for other in evaluated if other != sid and other not in reclaim)
+            elif classification == "SOL_TAKEOVER" and takeover is None:
+                takeover = {"session_id": sid, "next_objective": "minimal PoC or exploit endgame", "native_action_owner": "sol", "required": True}
+                actions.append({"action": "SOL_TAKEOVER", **takeover})
+            elif classification == "REPLACE_ATTACK_FAMILY":
+                replacements.append(_replacement_packet(plan, sid, str(advice.get("recommendation", "plateau"))))
+            elif classification == "BUMP_AND_RETRY":
+                actions.append({"action": "CONTINUE_WITH_EVIDENCE", "session_id": sid, "maximum_retries": 1, "require_changed_decisive_experiment": True})
+            elif classification == "DEAD_BRANCH":
+                finalize.append(sid); reclaim.append(sid)
+                actions.append({"action": "FINALIZE_AND_RECLAIM", "session_id": sid, "native_action_owner": "sol"})
     result = {
         "schema_version": 1, "transition_id": transition_id, "trigger": trigger,
         "triggering_event_id": event_key, "affected_session_id": affected_session_id,
@@ -136,13 +186,41 @@ def evaluate_race_transition(
         "branches_to_reclaim": sorted(set(reclaim)),
         "dependent_invalidations": dependent, "created_at": utc_now(), "idempotent": False,
     }
+    result["control_actions"] = _materialize_control_actions(root, result, event_key)
+    action_by_session_and_type = {
+        (row.get("session_id"), row.get("action_type")): row.get("action_id")
+        for row in result["control_actions"]
+    }
+    for rewrite in result["objective_rewrites"]:
+        rewrite["control_action_id"] = action_by_session_and_type.get((rewrite.get("session_id"), "RETARGET_TO_POC"))
+    if result.get("sol_takeover"):
+        result["sol_takeover"]["control_action_id"] = action_by_session_and_type.get((affected_session_id, "SOL_TAKEOVER"))
     with state_lock(root):
         if not _transition_by_id(root / "RACE_TRANSITIONS.jsonl", transition_id):
             _append_jsonl(root / "RACE_TRANSITIONS.jsonl", result)
             _apply_plan_recommendations(root, result)
             _project_state(root, trigger, result)
+            _project_legacy_transition_view(root, result)
     _apply_scheduler_recommendations(root, trigger, result)
     return result
+
+
+def _project_legacy_transition_view(root: Path, result: Mapping[str, Any]) -> None:
+    """Keep pre-run direct callers readable without making the view authoritative."""
+
+    if not is_run_root(root):
+        return
+    workspace = challenge_workspace(root)
+    legacy_state = workspace / "STATE.json"
+    if not legacy_state.is_file() or legacy_state.is_symlink():
+        return
+    projected = json.loads((root / "STATE.json").read_text(encoding="utf-8"))
+    projected["compatibility_view"] = True
+    projected["authoritative_state"] = str((root / "STATE.json").relative_to(workspace))
+    atomic_json(legacy_state, projected)
+    path = workspace / "RACE_TRANSITIONS.jsonl"
+    if not any(row.get("transition_id") == result.get("transition_id") for row in _read_jsonl(path)):
+        _append_jsonl(path, result)
 
 
 def maybe_evaluate_checkpoint(solve_root: Path, checkpoint: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -156,18 +234,33 @@ def maybe_evaluate_checkpoint(solve_root: Path, checkpoint: Mapping[str, Any]) -
 
 def control_loop_tick(solve_root: Path, *, input_fingerprint: str, session_id: str | None = None) -> dict[str, Any]:
     result = evaluate_race_transition(solve_root, {"type": "CONTROL_LOOP_TICK", "event_id": f"tick:{utc_now()}"}, session_id, input_fingerprint)
+    current_plan = (
+        load_plan(solve_root, input_fingerprint=input_fingerprint)
+        if result.get("utility_results") else {"branches": []}
+    )
     for sid, advice in result.get("utility_results", {}).items():
         ratio = float(advice.get("metrics", {}).get("elapsed_budget_ratio", 0) or 0)
-        branch = None
-        try:
-            branch = next(row for row in load_plan(solve_root, input_fingerprint=input_fingerprint).get("branches", []) if row.get("session_id") == sid)
-        except Exception:
-            pass
+        branch = next(
+            (row for row in current_plan.get("branches", []) if row.get("session_id") == sid),
+            None,
+        )
         stable = str((branch or {}).get("started_at") or (branch or {}).get("created_at") or "unknown")
         if ratio >= 1:
             evaluate_race_transition(solve_root, {"type": "BUDGET_100", "event_id": f"budget100:{sid}:{stable}"}, sid, input_fingerprint)
         elif ratio >= .5:
             evaluate_race_transition(solve_root, {"type": "BUDGET_50", "event_id": f"budget50:{sid}:{stable}"}, sid, input_fingerprint)
+    try:
+        from .progress import evaluate_remote_transition
+        progress_path = solve_root / "progress-state.json"
+        progress = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.is_file() else {}
+        sessions = set(progress.get("remote_transition", {}))
+        if session_id:
+            sessions.add(session_id)
+        result["remote_transitions"] = {
+            sid: evaluate_remote_transition(solve_root, session_id=sid) for sid in sorted(sessions)
+        }
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        result["remote_transition_error"] = str(exc)
     return result
 
 
@@ -239,6 +332,10 @@ def _apply_plan_recommendations(root: Path, result: Mapping[str, Any]) -> None:
     rewrites = {row.get("session_id"): row for row in result.get("objective_rewrites", [])}
     replacements = {row.get("session_id"): row for row in result.get("replacement_requests", [])}
     invalid = set(result.get("dependent_invalidations", []))
+    control_by_session: dict[str, list[Mapping[str, Any]]] = {}
+    for action in result.get("control_actions", []):
+        if isinstance(action, Mapping):
+            control_by_session.setdefault(str(action.get("session_id")), []).append(action)
     for branch in plan.get("branches", []):
         sid = branch.get("session_id")
         advice = utility.get(sid) if isinstance(utility, Mapping) else None
@@ -247,12 +344,28 @@ def _apply_plan_recommendations(root: Path, result: Mapping[str, Any]) -> None:
             branch["utility_evaluated_at"] = result.get("created_at")
         if sid in rewrites:
             branch["recommended_objective"] = rewrites[sid].get("objective")
-            branch["objective_rewrite_pending_sol_action"] = True
+            branch["objective_rewrite_pending_sol_action"] = rewrites[sid].get("control_action_id")
         if sid in replacements:
             branch["replacement_recommendation"] = replacements[sid]
         if sid in invalid:
             branch["review_required"] = True
             branch["invalidated_primitive"] = result.get("recommended_actions", [{}])[0].get("invalidated_primitive") if result.get("recommended_actions") else None
+        for action in control_by_session.get(str(sid), []):
+            if action.get("action_type") == "STOP_LOW_VALUE_BRANCH":
+                branch["stop_request_pending_action_id"] = action.get("action_id")
+                if branch.get("status") not in {"TERMINAL", "TERMINATED", "COMPLETED", "ERROR", "STALE"}:
+                    branch["status"] = "STOP_REQUESTED"
+                    branch["stop_requested_at"] = result.get("created_at")
+                    branch["native_action_owner"] = "sol"
+            if action.get("action_type") == "RETARGET_TO_POC":
+                branch["objective_rewrite_pending_sol_action"] = action.get("action_id")
+    if result.get("trigger") == "EXPLOIT_PRIMITIVE_CONFIRMED":
+        plan["leading_path"] = {
+            "session_id": result.get("affected_session_id"),
+            "primitive": (result.get("sol_takeover") or {}).get("claimed_capability"),
+            "transition_id": result.get("transition_id"),
+            "control_action_id": (result.get("sol_takeover") or {}).get("control_action_id"),
+        }
     plan["last_transition_id"] = result.get("transition_id")
     plan["updated_at"] = result.get("created_at")
     atomic_json(path, plan)
@@ -283,10 +396,14 @@ def _apply_scheduler_recommendations(root: Path, trigger: str, result: Mapping[s
             if trigger in {"WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"} and sid == affected: changes["priority"] = "CRITICAL"
             if trigger == "EXPLOIT_PRIMITIVE_REFUTED" and (sid == affected or sid in result.get("dependent_invalidations", [])): changes["priority"] = "LOW"
             ledger.update(sid, actor_session_id="sol-main", actor_role="sol", changes=changes)
-    except Exception:
+    except Exception as exc:
         # Transition advice remains authoritative and replayable even if the
         # optional resource ledger is absent or temporarily malformed.
-        return
+        append_jsonl_fsync(root / "scheduler-errors.jsonl", {
+            "event": "TRANSITION_SCHEDULER_UPDATE_FAILED", "trigger": trigger,
+            "transition_id": result.get("transition_id"), "error": str(exc),
+            "created_at": utc_now(),
+        }, label="scheduler error ledger")
 
 
 def _dedupe(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
@@ -296,8 +413,13 @@ def _dedupe(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
 def _read_checkpoint_dir(path: Path) -> list[dict[str, Any]]:
     rows = []
     for item in sorted(path.glob("*.json")) if path.is_dir() else []:
-        try: rows.append(json.loads(item.read_text(encoding="utf-8")))
-        except Exception: continue
+        try:
+            row = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"worker checkpoint is malformed: {item}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"worker checkpoint is not an object: {item}")
+        rows.append(row)
     return rows
 
 
@@ -306,18 +428,45 @@ def _transition_by_id(path: Path, transition_id: str) -> dict[str, Any] | None:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file() or path.is_symlink(): return []
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            row = json.loads(line)
-            if isinstance(row, dict): rows.append(row)
-        except json.JSONDecodeError: continue
-    return rows
+    return read_jsonl_strict(path, path.name)
 
 
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
-    descriptor = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(row), sort_keys=True, separators=(",", ":")) + "\n")
-        handle.flush(); os.fsync(handle.fileno())
+    append_jsonl_fsync(path, row, label=path.name)
+
+
+def _materialize_control_actions(
+    root: Path, result: Mapping[str, Any], triggering_evidence_id: str,
+) -> list[dict[str, Any]]:
+    from .control import create_control_action
+
+    progress_path = root / "progress-state.json"
+    try:
+        progress = json.loads(progress_path.read_text(encoding="utf-8")) if progress_path.is_file() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("progress state is malformed during control action generation") from exc
+    generations = progress.get("sessions", {}) if isinstance(progress, Mapping) else {}
+    requested: list[tuple[str, str, str, dict[str, Any]]] = []
+    mapping = {
+        "SOL_TAKEOVER": "SOL_TAKEOVER", "CONTINUE_WITH_EVIDENCE": "CONTINUE_WITH_EVIDENCE",
+        "STOP_LOW_VALUE_BRANCH": "STOP_LOW_VALUE_BRANCH", "FINALIZE_AND_RECLAIM": "STOP_REQUIRED",
+        "REVIEW_REQUIRED": "REVIEW_CANDIDATE_DEPENDENCY",
+    }
+    for action in result.get("recommended_actions", []):
+        kind = mapping.get(str(action.get("action")))
+        session_id = str(action.get("session_id") or result.get("affected_session_id") or "sol-main")
+        if kind:
+            requested.append((session_id, kind, str(action.get("reason") or action.get("next_objective") or action.get("action")), dict(action)))
+    for replacement in result.get("replacement_requests", []):
+        requested.append((str(replacement.get("session_id")), "REPLACE_ATTACK_FAMILY", str(replacement.get("kill_reason") or "replace plateaued family"), dict(replacement)))
+    for rewrite in result.get("objective_rewrites", []):
+        requested.append((str(rewrite.get("session_id")), "RETARGET_TO_POC", str(rewrite.get("reason")), dict(rewrite)))
+    records = []
+    for session_id, action_type, reason, metadata in requested:
+        generation = int(generations.get(session_id, {}).get("evidence_generation", 0)) if isinstance(generations, Mapping) else 0
+        records.append(create_control_action(
+            root, session_id=session_id, action_type=action_type, reason=reason,
+            triggering_evidence_id=triggering_evidence_id, evidence_generation=generation,
+            metadata=metadata,
+        ))
+    return records

@@ -48,6 +48,7 @@ Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ra
 ```text
 selected challenge resolution
 → challenge-local preflight
+→ fingerprint·target revision에 결합된 run 생성/선택
 → category command budget 안의 minimal recon
 → concrete exploit hypotheses 선택
 → decisive experiments 즉시 실행
@@ -56,7 +57,8 @@ selected challenge resolution
 → plausible해지는 즉시 declared remote 시도
 → exact flag와 SUBMISSION_RECOMMENDED 출력
 → 사람이 제출
-→ 필요할 때만 verifier/replay
+→ WRONG이면 exact candidate만 refute하고 계속 풀이
+→ ACCEPTED이면 branch stop·sandbox/resource cleanup·run seal
 ```
 
 Race의 목적은 여러 연구 관점을 모으는 것이 아닙니다. 서로 다른 exploit mechanism을 짧게 경쟁시키고, 새로운 정보가 생기더라도 exploit proximity가 증가하지 않는 branch를 빠르게 takeover 또는 교체하는 것입니다. Tier 1/2/3은 기본 child 2/3/4개이고, Tier 4는 stalled branch를 왜 flag에 가까워지지 못했는지 기록한 뒤 완전히 다른 mechanism으로 교체합니다. Category template는 증거가 부족할 때만 쓰는 fallback입니다.
@@ -75,7 +77,7 @@ uv run python -m ctf_os.agent_tools race-insight-packet 1 --contest my-ctf \
   --target-session-id race-3-independent-full-solve
 ```
 
-`race-plan-start`는 fingerprint, admission, branch record와 짧은 prompt packet을 원자적으로 기록할 뿐 child를 만들지 않습니다. Sol이 native delegation을 수행합니다. Admission overlap 0.95는 advisory이고 exact duplicate/repeated session ID만 거부합니다. Requested model/reasoning은 pinning 증거가 아닙니다.
+`race-plan-start`는 current run에 `PLANNED` branch와 짧은 prompt packet을 기록할 뿐 child를 만들지 않습니다. Capacity admission과 sandbox/input 확인 뒤 Sol이 native delegation 및 start receipt를 기록해야만 `RUNNING` width에 포함됩니다. Admission overlap 0.95는 advisory이고 exact duplicate/repeated session ID만 거부합니다. Requested model/reasoning은 pinning 증거가 아닙니다.
 
 Checkpoint는 보고서가 아니라 현재 exploit action을 전달합니다: leading hypothesis, decisive experiment, observed result, exploit proximity, artifact, next action, kill/continue/promote. Primitive는 `CANDIDATE`, `CONFIRMED`, `REFUTED`로 분리하며 candidate는 confirmed progress가 아닙니다. Confirmed primitive와 plateau 등 high-value transition은 utility sweep, duplicate/stalled 정리 recommendation, 필수 Sol takeover packet을 자동 생성합니다. Scheduler는 long-compute opt-in이고 timeout sandbox 보존은 profile에 따릅니다. Supported fact, rejected hypothesis, decompilation, 일반 artifact의 수만 늘어나는 것은 progress가 아닙니다.
 
