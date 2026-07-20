@@ -66,7 +66,7 @@ from ..control import apply_control_action, acknowledge_control_action, load_con
 from ..milestones import repair_run_projections, save_milestone
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
-from ..working_poc import commit_working_poc
+from ..working_poc import commit_working_poc, resolve_unknown_working_poc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -328,6 +328,17 @@ def build_parser() -> argparse.ArgumentParser:
         working_poc.add_argument("--operation-id", required=True)
         working_poc.add_argument("--timeout", type=int, default=300)
         working_poc.add_argument("argv", nargs=argparse.REMAINDER); _add_session_args(working_poc)
+        resolve_poc = commands.add_parser("working-poc-resolve-unknown")
+        resolve_poc.add_argument("selector"); resolve_poc.add_argument("--contest")
+        resolve_poc.add_argument("--run-id", required=True)
+        resolve_poc.add_argument("--operation-id", required=True)
+        resolve_poc.add_argument(
+            "--decision", required=True,
+            choices=("RECORD_RESULT", "ABANDON", "AUTHORIZE_RETRY"),
+        )
+        resolve_poc.add_argument("--receipt-json", required=True)
+        resolve_poc.add_argument("--new-operation-id")
+        _add_session_args(resolve_poc)
         submission = commands.add_parser("submission-result")
         submission.add_argument("selector"); submission.add_argument("--contest")
         submission.add_argument("--run-id", required=True); submission.add_argument("--candidate-id", required=True)
@@ -1006,6 +1017,19 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             flag_pattern=challenge.flag_pattern,
             success_condition=args.success_condition, kill_condition=args.kill_condition,
             operation_id=args.operation_id, timeout=args.timeout,
+        )
+    if args.command == "working-poc-resolve-unknown":
+        _require_sol(args, "Only Sol may resolve an unknown working PoC execution outcome.")
+        if args.run_id != solve_root.name:
+            raise ValueError("working-poc-resolve-unknown run ID is not the current exact run")
+        proof = json.loads(args.receipt_json)
+        if not isinstance(proof, dict):
+            raise ValueError("--receipt-json must contain an object")
+        return resolve_unknown_working_poc(
+            solve_root, operation_id=args.operation_id, decision=args.decision,
+            resolution_receipt=proof, new_operation_id=args.new_operation_id,
+            declared_targets=parse_remotes(challenge.remotes),
+            flag_pattern=challenge.flag_pattern,
         )
     if args.command == "submission-result":
         _require_sol(args, "Only Sol may record the human submission result.")

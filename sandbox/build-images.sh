@@ -14,14 +14,21 @@ if [[ ! -r /etc/os-release ]] || ! ( . /etc/os-release; [[ "${ID:-}" == "ubuntu"
   echo "Unsupported Linux distribution: sandbox images are supported on Ubuntu Linux x86_64 only." >&2
   exit 65
 fi
-if [[ "$(uname -r)" == *[Mm]icrosoft* || -n "${WSL_INTEROP:-}" ]]; then
-  echo "Unsupported host environment: sandbox image builds require native Ubuntu Linux x86_64." >&2
-  exit 65
-fi
 case "$(uname -m)" in
   x86_64|amd64) ;;
   *) echo "Unsupported host architecture: sandbox images require Ubuntu Linux x86_64." >&2; exit 65 ;;
 esac
+if [[ "$(uname -r)" == *[Mm]icrosoft* || -n "${WSL_INTEROP:-}" ]]; then
+  HOST_RUNTIME="WSL2_UBUNTU_X86_64"
+else
+  HOST_RUNTIME="NATIVE_UBUNTU_X86_64"
+fi
+
+repository_fstype="$(findmnt -T "$ROOT" -n -o FSTYPE 2>/dev/null || true)"
+if [[ "$ROOT" =~ ^/mnt/[[:alpha:]](/|$) || "$repository_fstype" == "drvfs" ]]; then
+  echo "WARNING: repository is on a Windows drvfs mount ($ROOT)." >&2
+  echo "For Docker build context, forensic extraction, receipt ledger, and atomic many-file operations, use the WSL2 Linux filesystem (for example /home/<user>/CTF-OS)." >&2
+fi
 
 contains_profile() {
   local wanted="$1" candidate
@@ -40,18 +47,41 @@ if [[ -z "${DOCKER_CONFIG:-}" ]]; then
   BUILD_DOCKER_CONFIG="$(mktemp -d "${TMPDIR:-/tmp}/ctf-os-docker-config.XXXXXX")"
   trap 'rm -rf -- "$BUILD_DOCKER_CONFIG"' EXIT
   printf '%s\n' '{"auths":{}}' >"$BUILD_DOCKER_CONFIG/config.json"
+  # DOCKER_CONFIG also controls the per-user CLI plugin directory. Preserve
+  # an installed Compose v2 binary while keeping registry credentials absent.
+  USER_HOME_DIR="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  for compose_candidate in \
+      "${USER_HOME_DIR:-/nonexistent}/.docker/cli-plugins/docker-compose" \
+      /usr/libexec/docker/cli-plugins/docker-compose \
+      /usr/local/libexec/docker/cli-plugins/docker-compose \
+      /usr/lib/docker/cli-plugins/docker-compose \
+      /usr/local/lib/docker/cli-plugins/docker-compose; do
+    [[ -x "$compose_candidate" ]] || continue
+    candidate_version="$("$compose_candidate" version --short 2>/dev/null || true)"
+    candidate_major="${candidate_version#v}"; candidate_major="${candidate_major%%.*}"
+    if [[ "$candidate_major" == "2" ]]; then
+      mkdir -p "$BUILD_DOCKER_CONFIG/cli-plugins"
+      ln -s "$(readlink -f "$compose_candidate")" "$BUILD_DOCKER_CONFIG/cli-plugins/docker-compose"
+      break
+    fi
+  done
   export DOCKER_CONFIG="$BUILD_DOCKER_CONFIG"
   echo "Using an isolated Docker configuration for public image pulls."
 fi
 
-if ! daemon="$(docker info --format '{{.ServerVersion}}' 2>&1)"; then
-  if [[ "$daemon" == *"permission denied"* || "$daemon" == *"Permission denied"* ]]; then
-    echo "Docker socket permission denied for the current user: $daemon" >&2
-  elif [[ "$daemon" == *"Cannot connect"* || "$daemon" == *"connection refused"* ]]; then
-    echo "Docker daemon is stopped or unreachable: $daemon" >&2
+if ! server_info="$(docker info --format '{{.ServerVersion}}|{{.OSType}}|{{.Architecture}}|{{.DockerRootDir}}' 2>&1)"; then
+  if [[ "$server_info" == *"permission denied"* || "$server_info" == *"Permission denied"* ]]; then
+    echo "Docker socket permission denied for the current user: $server_info" >&2
+  elif [[ "$server_info" == *"Cannot connect"* || "$server_info" == *"connection refused"* ]]; then
+    echo "Docker daemon is stopped or unreachable: $server_info" >&2
   else
-    echo "Docker daemon response error: $daemon" >&2
+    echo "Docker daemon response error: $server_info" >&2
   fi
+  exit 69
+fi
+IFS='|' read -r daemon docker_os docker_arch docker_root <<<"$server_info"
+if [[ -z "$daemon" || "$docker_os" != "linux" || ! "$docker_arch" =~ ^(x86_64|amd64)$ ]]; then
+  echo "Unsupported Docker server platform: ServerVersion=${daemon:-unknown} OSType=${docker_os:-unknown} Architecture=${docker_arch:-unknown}; Linux/amd64 is required." >&2
   exit 69
 fi
 
@@ -59,6 +89,12 @@ if ! compose="$(docker compose version --short 2>&1)"; then
   echo "Docker Compose v2 plugin is unavailable: $compose" >&2
   exit 69
 fi
+compose_major="${compose#v}"; compose_major="${compose_major%%.*}"
+if [[ "$compose_major" != "2" ]]; then
+  echo "Docker Compose v2 plugin is required (found: ${compose:-unknown})." >&2
+  exit 69
+fi
+docker build --help >/dev/null 2>&1 || { echo "docker build is unavailable for the current daemon/CLI." >&2; exit 69; }
 docker run --help >/dev/null 2>&1 || { echo "docker run is unavailable for the current daemon/CLI." >&2; exit 69; }
 
 free_kib="$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')"
@@ -67,7 +103,6 @@ if [[ ! "$free_kib" =~ ^[0-9]+$ ]] || (( free_kib < minimum_kib )); then
   echo "Insufficient disk space: the full toolchain build requires at least 20 GiB free (found $((free_kib / 1024 / 1024)) GiB)." >&2
   exit 70
 fi
-docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
 if [[ -n "$docker_root" && -d "$docker_root" ]]; then
   docker_free_kib="$(df -Pk "$docker_root" | awk 'NR==2 {print $4}')"
   if [[ ! "$docker_free_kib" =~ ^[0-9]+$ ]] || (( docker_free_kib < minimum_kib )); then
@@ -107,7 +142,10 @@ for profile in "${PROFILES[@]}"; do
 done
 
 echo
-echo "CTF-OS sandbox build summary (Docker $daemon; Compose $compose; Ubuntu Linux x86_64)"
+echo "CTF-OS sandbox build summary"
+echo "Host runtime: $HOST_RUNTIME"
+echo "Docker: ServerVersion=$daemon OSType=$docker_os Architecture=$docker_arch"
+echo "Compose: $compose"
 printf '%-10s %-6s %-20s %-12s %s\n' PROFILE STATUS IMAGE_ID SIZE TIME
 for detail in "${DETAILS[@]}"; do
   IFS='|' read -r profile status image_id size elapsed <<<"$detail"

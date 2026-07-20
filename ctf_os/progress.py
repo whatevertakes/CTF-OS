@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Mapping, Sequence
 
@@ -181,10 +182,18 @@ def heartbeat_long_compute(
             compute["last_artifact"] = observation.get("artifact")
             compute["last_observation"] = observation
             compute["verified_checkpoint"] = True
+            checkpoint = _record_long_compute_checkpoint(
+                run, session_id=session_id, receipt_id=receipt_id,
+                observation=observation, observed_at=now,
+                valid_until=now + timedelta(seconds=interval),
+            )
+            compute["verified_checkpoint_receipt_id"] = checkpoint["receipt_id"]
             verified_update = {
                 "receipt_id": receipt_id, "active": True, "process_valid": True,
                 "fresh_artifact_evidence": True, "observed_at": _format_time(now),
                 "valid_until_at": _format_time(now + timedelta(seconds=interval)),
+                "checkpoint_receipt_id": checkpoint["receipt_id"],
+                "artifact": observation.get("artifact"),
             }
         elif interval < 1 or (now - _parse_time(str(compute.get("last_heartbeat_at")))).total_seconds() > interval:
             compute["status"] = "REVIEW_REQUIRED"
@@ -335,11 +344,15 @@ def _observe_long_compute(details: Mapping[str, Any]) -> dict[str, Any]:
         and observed_argv == expected_argv
     )
     artifact = _container_file_observation(container, str(details.get("expected_output_artifact") or ""))
-    completion = _container_file_observation(container, str(details.get("expected_completion_signal") or ""))["exists"]
+    completion_marker = _container_file_observation(
+        container, str(details.get("expected_completion_signal") or ""),
+    )
+    completion = completion_marker["exists"]
     return {
         "container_identity": container_id, "process_valid": process_valid,
         "process_id": matched_pid, "observed_command_argv": observed_argv,
         "artifact": artifact, "completion_signal": completion,
+        "completion_marker": completion_marker,
     }
 
 
@@ -380,6 +393,37 @@ def _artifact_observation_changed(previous: Mapping[str, Any], current: Any) -> 
     return any(previous.get(key) != current.get(key) for key in ("exists", "size", "mtime_ns", "digest"))
 
 
+def _record_long_compute_checkpoint(
+    run: Path, *, session_id: str, receipt_id: str,
+    observation: Mapping[str, Any], observed_at: datetime, valid_until: datetime,
+) -> dict[str, Any]:
+    artifact = observation.get("artifact")
+    if not isinstance(artifact, Mapping) or not artifact.get("exists") or not artifact.get("digest"):
+        raise ProgressGateError("verified LONG_COMPUTE checkpoint lacks a real artifact digest")
+    run_state = _run_identity_state(run)
+    material = {
+        "run_id": run_state.get("run_id") or run.name,
+        "challenge_id": run_state.get("challenge_id"), "session_id": session_id,
+        "input_fingerprint": run_state.get("input_fingerprint"),
+        "target_revision": run_state.get("target_revision"),
+        "long_compute_receipt_id": receipt_id,
+        "container_identity": observation.get("container_identity"),
+        "process_id": observation.get("process_id"),
+        "observed_command_argv": observation.get("observed_command_argv"),
+        "artifact": dict(artifact), "observed_at": _format_time(observed_at),
+        "valid_until_at": _format_time(valid_until),
+    }
+    checkpoint_id = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode(),
+    ).hexdigest()[:24]
+    receipt = {
+        "schema_version": 1, "receipt_id": checkpoint_id, **material,
+        "process_valid": True, "fresh_artifact_evidence": True,
+    }
+    atomic_json(run / "long-compute-checkpoints" / f"{checkpoint_id}.json", receipt)
+    return receipt
+
+
 def _publish_verified_long_compute(
     run: Path, session_id: str, evidence: Mapping[str, Any],
 ) -> None:
@@ -397,6 +441,206 @@ def _publish_verified_long_compute(
             "event": "LONG_COMPUTE_VERIFIED_UPDATE_FAILED", "session_id": session_id,
             "error": str(exc)[:2000], "created_at": utc_now(),
         }, label="scheduler error ledger")
+
+
+def validate_long_compute_review_proof(
+    run: Path, *, action: Mapping[str, Any], proof: Mapping[str, Any],
+    long_compute_receipt: Mapping[str, Any], milestones: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Re-observe decision-specific evidence instead of trusting caller claims."""
+
+    progress_state = _load_state(run)
+    run_state = _run_identity_state(run)
+    session_id = str(action.get("session_id") or "")
+    receipt_id = str(long_compute_receipt.get("receipt_id") or "")
+    common = {
+        "run_id": run_state.get("run_id") or run.name,
+        "challenge_id": run_state.get("challenge_id"), "session_id": session_id,
+        "input_fingerprint": run_state.get("input_fingerprint"),
+        "target_revision": run_state.get("target_revision"),
+    }
+    for field, value in common.items():
+        if long_compute_receipt.get(field) != value:
+            raise ProgressGateError(f"LONG_COMPUTE receipt {field} mismatch")
+    if proof.get("long_compute_receipt_id") != receipt_id:
+        raise ProgressGateError("LONG_COMPUTE review receipt ID mismatch")
+    metadata = action.get("metadata") if isinstance(action.get("metadata"), Mapping) else {}
+    if metadata.get("long_compute_receipt_id") not in {None, receipt_id}:
+        raise ProgressGateError("LONG_COMPUTE review action references another receipt")
+    session = progress_state.get("sessions", {}).get(session_id)
+    compute = session.get("long_compute") if isinstance(session, Mapping) else None
+    if not isinstance(compute, Mapping) or compute.get("receipt_id") != receipt_id:
+        raise ProgressGateError("LONG_COMPUTE progress evidence is missing for this session")
+    details = long_compute_receipt.get("details")
+    if not isinstance(details, Mapping):
+        raise ProgressGateError("LONG_COMPUTE receipt details are malformed")
+    observation = _observe_long_compute(details)
+    decision = str(proof.get("decision") or "").upper()
+    binding = {
+        **common, "action_id": action.get("action_id"),
+        "long_compute_receipt_id": receipt_id, "decision": decision,
+        "observed_at": utc_now(), "live_observation": observation,
+    }
+
+    if decision == "CANCELLED":
+        termination = proof.get("process_termination_receipt")
+        if not isinstance(termination, Mapping):
+            raise ProgressGateError("CANCELLED requires a process termination receipt")
+        _validate_review_receipt_binding(termination, binding)
+        if not str(termination.get("receipt_id") or ""):
+            raise ProgressGateError("process termination receipt ID is missing")
+        if termination.get("container_identity") != details.get("container_identity"):
+            raise ProgressGateError("process termination container identity mismatch")
+        if termination.get("process_identity") != details.get("process_identity"):
+            raise ProgressGateError("process termination process identity mismatch")
+        termination_observation = termination.get("termination_observation")
+        if not isinstance(termination_observation, Mapping):
+            raise ProgressGateError("process termination observation is missing")
+        if termination_observation.get("process_valid") is not False:
+            raise ProgressGateError("process termination receipt does not observe termination")
+        if termination_observation.get("remaining_processes") != []:
+            raise ProgressGateError("CANCELLED still has remaining long-compute processes")
+        if observation.get("container_identity") != details.get("container_identity"):
+            raise ProgressGateError("CANCELLED container identity cannot be re-observed")
+        if observation.get("process_valid") is not False:
+            raise ProgressGateError("CANCELLED long-compute process is still running")
+        binding["process_termination_receipt"] = dict(termination)
+        return binding
+
+    if decision == "COMPLETED":
+        marker = observation.get("completion_marker")
+        artifact = observation.get("artifact")
+        if observation.get("process_valid") is not False:
+            raise ProgressGateError("COMPLETED long-compute process is still running")
+        if not isinstance(marker, Mapping) or marker.get("exists") is not True or not marker.get("digest"):
+            raise ProgressGateError("COMPLETED expected completion marker is missing")
+        if not isinstance(artifact, Mapping) or artifact.get("exists") is not True or not artifact.get("digest"):
+            raise ProgressGateError("COMPLETED final artifact observation is missing")
+        if proof.get("completion_marker_digest") != marker.get("digest"):
+            raise ProgressGateError("COMPLETED completion marker digest mismatch")
+        if proof.get("completion_marker_metadata") != dict(marker):
+            raise ProgressGateError("COMPLETED completion marker metadata mismatch")
+        if proof.get("final_artifact_observation") != dict(artifact):
+            raise ProgressGateError("COMPLETED final artifact observation mismatch")
+        binding["completion_marker"] = dict(marker)
+        binding["final_artifact"] = dict(artifact)
+        return binding
+
+    if decision == "CONTINUED_WITH_VALID_CHECKPOINT":
+        checkpoint_id = str(proof.get("verified_checkpoint_receipt_id") or "")
+        if not checkpoint_id or compute.get("verified_checkpoint_receipt_id") != checkpoint_id:
+            raise ProgressGateError("CONTINUED requires the current verified checkpoint receipt")
+        checkpoint = _load_checkpoint(run, checkpoint_id)
+        for field, value in {**common, "long_compute_receipt_id": receipt_id}.items():
+            if checkpoint.get(field) != value:
+                raise ProgressGateError(f"verified checkpoint {field} mismatch")
+        expires = _parse_time(str(checkpoint.get("valid_until_at") or ""))
+        if expires <= datetime.now(timezone.utc):
+            raise ProgressGateError("verified LONG_COMPUTE checkpoint is stale")
+        artifact = checkpoint.get("artifact")
+        if not isinstance(artifact, Mapping) or not all(
+            artifact.get(field) is not None for field in ("digest", "size", "mtime_ns")
+        ):
+            raise ProgressGateError("verified checkpoint lacks digest/size/mtime evidence")
+        if observation.get("process_valid") is not True:
+            raise ProgressGateError("CONTINUED long-compute process identity is not live")
+        if observation.get("container_identity") != checkpoint.get("container_identity"):
+            raise ProgressGateError("CONTINUED checkpoint container identity changed")
+        if observation.get("artifact") != dict(artifact):
+            raise ProgressGateError("CONTINUED checkpoint artifact is no longer current")
+        binding["verified_checkpoint_receipt"] = checkpoint
+        return binding
+
+    if decision == "FALLBACK_APPLIED":
+        fallback_id = str(proof.get("fallback_command_receipt_id") or "")
+        fallback = next((
+            row for row in milestones
+            if row.get("receipt_id") == fallback_id
+            and row.get("event_type") == "DECISIVE_EXPERIMENT"
+        ), None)
+        if fallback is None:
+            raise ProgressGateError("FALLBACK_APPLIED requires a fallback command receipt")
+        for field, value in common.items():
+            if fallback.get(field) != value:
+                raise ProgressGateError(f"fallback command receipt {field} mismatch")
+        argv = _argv(proof.get("fallback_argv", []))
+        command_digest = hashlib.sha256(
+            json.dumps(argv, separators=(",", ":")).encode(),
+        ).hexdigest()
+        if (
+            fallback.get("command_argv") != argv
+            or fallback.get("command_digest") != command_digest
+        ):
+            raise ProgressGateError("fallback command receipt exact argv mismatch")
+        fallback_details = fallback.get("details") if isinstance(fallback.get("details"), Mapping) else {}
+        if fallback_details.get("fallback_for_long_compute_receipt_id") != receipt_id:
+            raise ProgressGateError("fallback command receipt is not bound to this LONG_COMPUTE")
+        fallback_artifact = proof.get("fallback_artifact")
+        decisive_id = proof.get("decisive_experiment_receipt_id")
+        if fallback_artifact:
+            reference = str(fallback_artifact)
+            if reference not in fallback.get("artifacts", []):
+                raise ProgressGateError("fallback artifact is not bound to the command receipt")
+            path = safe_under(run, Path(reference))
+            if path.is_symlink() or not path.is_file():
+                raise ProgressGateError("fallback artifact is missing or unsafe")
+            if _sha256_file(path) != (fallback.get("artifact_digests") or {}).get(reference):
+                raise ProgressGateError("fallback artifact digest changed")
+        elif decisive_id != fallback_id:
+            raise ProgressGateError("fallback requires an artifact or decisive experiment receipt")
+        if observation.get("process_valid") is not False:
+            raise ProgressGateError("original LONG_COMPUTE process still runs after fallback")
+        binding["fallback_command_receipt"] = dict(fallback)
+        return binding
+
+    raise ProgressGateError("LONG_COMPUTE_REVIEW decision is invalid")
+
+
+def _validate_review_receipt_binding(
+    receipt: Mapping[str, Any], binding: Mapping[str, Any],
+) -> None:
+    for field in (
+        "run_id", "challenge_id", "session_id", "input_fingerprint",
+        "target_revision", "action_id", "long_compute_receipt_id",
+    ):
+        if receipt.get(field) != binding.get(field):
+            raise ProgressGateError(f"LONG_COMPUTE review evidence {field} mismatch")
+
+
+def _load_checkpoint(run: Path, receipt_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{24}", receipt_id):
+        raise ProgressGateError("verified checkpoint receipt ID is invalid")
+    path = run / "long-compute-checkpoints" / f"{receipt_id}.json"
+    if path.is_symlink() or not path.is_file():
+        raise ProgressGateError("verified checkpoint receipt is missing or unsafe")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProgressGateError("verified checkpoint receipt is malformed") from exc
+    if not isinstance(payload, dict) or payload.get("receipt_id") != receipt_id:
+        raise ProgressGateError("verified checkpoint receipt identity is malformed")
+    return payload
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _run_identity_state(run: Path) -> dict[str, Any]:
+    path = run / "STATE.json"
+    if path.is_symlink() or not path.is_file():
+        raise ProgressGateError("run state is missing or unsafe")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProgressGateError("run state is malformed") from exc
+    if not isinstance(payload, dict):
+        raise ProgressGateError("run state is not an object")
+    return payload
 
 
 def evaluate_progress_gate(

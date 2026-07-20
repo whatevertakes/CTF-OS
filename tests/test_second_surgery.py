@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +34,9 @@ from ctf_os.verification import record_remote_flag
 from ctf_os.workspace import (
     WorkspaceError, bind_input_fingerprint, recover_run_state, resolve_active_run,
 )
-from ctf_os.working_poc import WorkingPocError, commit_working_poc
+from ctf_os.working_poc import (
+    WorkingPocError, commit_working_poc, resolve_unknown_working_poc,
+)
 
 
 def _challenge(challenge_id: str = "challenge") -> SimpleNamespace:
@@ -615,6 +620,29 @@ def _commit_poc(
     )
 
 
+def _working_operation(run: Path) -> dict[str, object]:
+    paths = list((run / "working-poc-operations").glob("*.json"))
+    assert len(paths) == 1
+    return json.loads(paths[0].read_text())
+
+
+def _unknown_resolution_proof(run: Path) -> dict[str, object]:
+    operation = _working_operation(run)
+    material = operation["canonical_material"]
+    assert isinstance(material, dict)
+    return {
+        "run_id": run.name, "challenge_id": material["challenge_id"],
+        "session_id": material["session_id"],
+        "input_fingerprint": material["input_fingerprint"],
+        "target_revision": material["target_revision"],
+        "operation_id": operation["operation_id"],
+        "execution_attempt_id": operation["execution_attempt_id"],
+        "command_digest": material["command_digest"],
+        "artifact_digest": material["exploit_artifact_digest_before"],
+        "target_identity": material["target"],
+    }
+
+
 def test_working_poc_commit_executes_once_and_records_remote_flag(tmp_path: Path) -> None:
     _workspace, run, challenge = _run(tmp_path)
     local, metadata = _working_poc_inputs(run, challenge)
@@ -633,6 +661,195 @@ def test_working_poc_commit_executes_once_and_records_remote_flag(tmp_path: Path
     assert first["verified_flag"]["state"] == "SUBMISSION_RECOMMENDED"
     types = [row["event_type"] for row in load_milestones(run)]
     assert types.count("REMOTE_ATTEMPT") == 1 and types.count("WORKING_POC") == 1
+
+
+def test_working_poc_persists_execution_started_before_executor(tmp_path: Path) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+
+    def executor(*args, **kwargs):
+        operation = _working_operation(run)
+        assert operation["status"] == "EXECUTION_STARTED"
+        assert operation["execution_attempt_id"]
+        assert operation["command_digest"] == operation["canonical_material"]["command_digest"]
+        assert operation["artifact_digest"] == operation["canonical_material"]["exploit_artifact_digest_before"]
+        assert operation["target_identity"] == operation["canonical_material"]["target"]
+        return {
+            "exit_code": 0, "timed_out": False, "stdout": "no flag", "stderr": "",
+            "authorized_network_observed": True, "input_fingerprint": "fp",
+        }
+
+    _commit_poc(run, challenge, local, metadata, executor, operation_id="intent-first")
+
+
+def test_working_poc_started_crash_blocks_automatic_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    import ctf_os.working_poc as module
+    calls = 0
+
+    def executor(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("process died after sending remote request")
+
+    with pytest.raises(RuntimeError, match="process died"):
+        _commit_poc(run, challenge, local, metadata, executor, operation_id="crash-window")
+    result = _commit_poc(run, challenge, local, metadata, executor, operation_id="crash-window")
+    assert calls == 1
+    assert result["status"] == "EXECUTION_OUTCOME_UNKNOWN"
+    assert result["remote_command_executed"] is False
+    assert result["automatic_retry_blocked"] is True
+    assert result["manual_resolution_required"] is True
+    assert result["execution_attempt_id"]
+    assert _working_operation(run)["status"] == "EXECUTION_OUTCOME_UNKNOWN"
+
+
+def test_working_poc_execution_started_failpoint_is_unknown_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    import ctf_os.working_poc as module
+
+    def fail(boundary, phase, record):
+        if boundary == "execution_started":
+            raise RuntimeError("intent persisted then crash")
+    monkeypatch.setattr(module, "_working_poc_failpoint", fail)
+    with pytest.raises(RuntimeError, match="intent persisted"):
+        _commit_poc(
+            run, challenge, local, metadata,
+            lambda *args, **kwargs: pytest.fail("executor must not start"),
+            operation_id="intent-crash",
+        )
+    monkeypatch.setattr(module, "_working_poc_failpoint", lambda *args: None)
+    result = _commit_poc(
+        run, challenge, local, metadata,
+        lambda *args, **kwargs: pytest.fail("automatic retry must be blocked"),
+        operation_id="intent-crash",
+    )
+    assert result["status"] == "EXECUTION_OUTCOME_UNKNOWN"
+
+
+def test_working_poc_record_result_validates_receipt_and_repairs_projection(tmp_path: Path) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    with pytest.raises(RuntimeError, match="remote result lost"):
+        _commit_poc(
+            run, challenge, local, metadata,
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("remote result lost")),
+            operation_id="record-result",
+        )
+    _commit_poc(
+        run, challenge, local, metadata,
+        lambda *args, **kwargs: pytest.fail("unknown operation must not retry"),
+        operation_id="record-result",
+    )
+    proof = _unknown_resolution_proof(run)
+    stdout = "winner CTF{recorded}"
+    proof.update({
+        "exit_code": 0, "timed_out": False,
+        "authorized_network_observed": True,
+        "stdout": stdout, "stderr": "",
+        "stdout_digest": hashlib.sha256(stdout.encode()).hexdigest(),
+        "stderr_digest": hashlib.sha256(b"").hexdigest(),
+    })
+
+    result = resolve_unknown_working_poc(
+        run, operation_id="record-result", decision="RECORD_RESULT",
+        resolution_receipt=proof, declared_targets=parse_remotes(challenge.remotes),
+        flag_pattern=challenge.flag_pattern,
+    )
+
+    assert result["remote_command_executed"] is False
+    assert result["verified_flag"]["state"] == "SUBMISSION_RECOMMENDED"
+    assert _working_operation(run)["status"] == "COMPLETED"
+
+
+def test_working_poc_abandon_prevents_operation_reuse(tmp_path: Path) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    with pytest.raises(RuntimeError):
+        _commit_poc(
+            run, challenge, local, metadata,
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("lost")),
+            operation_id="abandon-one",
+        )
+    _commit_poc(run, challenge, local, metadata, lambda *a, **k: {}, operation_id="abandon-one")
+    proof = _unknown_resolution_proof(run)
+    resolved = resolve_unknown_working_poc(
+        run, operation_id="abandon-one", decision="ABANDON", resolution_receipt=proof,
+    )
+    assert resolved["status"] == "ABANDONED"
+    with pytest.raises(WorkingPocError, match="ABANDONED"):
+        _commit_poc(run, challenge, local, metadata, lambda *a, **k: {}, operation_id="abandon-one")
+
+
+def test_working_poc_authorize_retry_requires_new_operation_id(tmp_path: Path) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    with pytest.raises(RuntimeError):
+        _commit_poc(
+            run, challenge, local, metadata,
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("lost")),
+            operation_id="unknown-old",
+        )
+    _commit_poc(run, challenge, local, metadata, lambda *a, **k: {}, operation_id="unknown-old")
+    proof = _unknown_resolution_proof(run)
+    with pytest.raises(WorkingPocError, match="distinct new operation ID"):
+        resolve_unknown_working_poc(
+            run, operation_id="unknown-old", decision="AUTHORIZE_RETRY",
+            resolution_receipt=proof,
+        )
+    resolved = resolve_unknown_working_poc(
+        run, operation_id="unknown-old", decision="AUTHORIZE_RETRY",
+        resolution_receipt=proof, new_operation_id="authorized-new",
+    )
+    assert resolved["authorized_retry_operation_id"] == "authorized-new"
+    retry_records = [
+        json.loads(path.read_text())
+        for path in (run / "working-poc-operations").glob("*.json")
+    ]
+    retry = next(row for row in retry_records if row["operation_id"] == "authorized-new")
+    assert retry["supersedes_unknown_operation"] == "unknown-old"
+    assert retry["operator_authorization_receipt"]
+
+
+def test_concurrent_working_poc_calls_start_at_most_one_executor(tmp_path: Path) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def executor(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(5)
+        return {
+            "exit_code": 0, "timed_out": False, "stdout": "no flag", "stderr": "",
+            "authorized_network_observed": True, "input_fingerprint": "fp",
+        }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            _commit_poc, run, challenge, local, metadata, executor,
+            operation_id="concurrent-one",
+        )
+        assert entered.wait(5)
+        second = pool.submit(
+            _commit_poc, run, challenge, local, metadata, executor,
+            operation_id="concurrent-one",
+        )
+        second_result = second.result(timeout=5)
+        release.set()
+        first.result(timeout=5)
+    assert calls == 1
+    assert second_result["status"] == "EXECUTION_STARTED"
+    assert second_result["automatic_retry_blocked"] is True
 
 
 def test_working_poc_operation_conflict_and_undeclared_target_block(tmp_path: Path) -> None:
@@ -713,6 +930,69 @@ def test_working_poc_remote_receipt_failure_retries_without_command(
     assert calls == 1 and repaired["remote_attempt_receipt_id"]
 
 
+def test_working_poc_execution_recorded_failure_repairs_remote_without_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    import ctf_os.working_poc as module
+    calls = 0
+
+    def executor(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "exit_code": 0, "timed_out": False, "stdout": "no flag", "stderr": "",
+            "authorized_network_observed": True, "input_fingerprint": "fp",
+        }
+
+    fired = False
+    def fail_once(boundary, phase, record):
+        nonlocal fired
+        if not fired and boundary == "execution_record":
+            fired = True
+            raise RuntimeError("execution record boundary")
+    monkeypatch.setattr(module, "_working_poc_failpoint", fail_once)
+    with pytest.raises(RuntimeError, match="execution record"):
+        _commit_poc(run, challenge, local, metadata, executor, operation_id="repair-execution")
+    repaired = _commit_poc(run, challenge, local, metadata, executor, operation_id="repair-execution")
+    assert calls == 1
+    assert repaired["remote_command_executed"] is False
+    assert repaired["remote_attempt_receipt_id"]
+
+
+def test_working_poc_remote_recorded_failure_repairs_flag_projection_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    local, metadata = _working_poc_inputs(run, challenge)
+    import ctf_os.working_poc as module
+    calls = 0
+
+    def executor(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "exit_code": 0, "timed_out": False, "stdout": "winner CTF{projected}",
+            "stderr": "", "authorized_network_observed": True,
+            "input_fingerprint": "fp",
+        }
+
+    fired = False
+    def fail_once(boundary, phase, record):
+        nonlocal fired
+        if not fired and boundary == "flag_projection":
+            fired = True
+            raise RuntimeError("flag projection boundary")
+    monkeypatch.setattr(module, "_working_poc_failpoint", fail_once)
+    with pytest.raises(RuntimeError, match="flag projection"):
+        _commit_poc(run, challenge, local, metadata, executor, operation_id="repair-flag")
+    repaired = _commit_poc(run, challenge, local, metadata, executor, operation_id="repair-flag")
+    assert calls == 1
+    assert repaired["remote_command_executed"] is False
+    assert repaired["verified_flag"]["state"] == "SUBMISSION_RECOMMENDED"
+
+
 def test_working_poc_plain_command_error_is_not_mislabeled_target_down(tmp_path: Path) -> None:
     _workspace, run, challenge = _run(tmp_path)
     local, metadata = _working_poc_inputs(run, challenge)
@@ -757,11 +1037,13 @@ def _long_compute_metadata(run: Path, challenge: SimpleNamespace) -> None:
     }))
 
 
-def _long_compute_receipt(run: Path, challenge: SimpleNamespace):
+def _long_compute_receipt(
+    run: Path, challenge: SimpleNamespace, *, operation_id: str = "long-one",
+):
     return save_milestone(
         run, challenge_id=challenge.id, session_id="sol-main", input_fingerprint="fp",
         event_type="LONG_COMPUTE", summary="bounded solver",
-        command_argv=["python3", "solver.py"], operation_id="long-one",
+        command_argv=["python3", "solver.py"], operation_id=operation_id,
         details={
             "sandbox_metadata_path": "workers/sol-main/sandbox.json",
             "process_identity": {"process_group_id": 4321},
@@ -777,11 +1059,59 @@ def _long_compute_receipt(run: Path, challenge: SimpleNamespace):
 def _observed(*, digest=None, size=0, mtime=None, process=True, completion=False):
     return {
         "container_identity": "container-1", "process_valid": process,
+        "process_id": 4321 if process else None,
+        "observed_command_argv": ["python3", "solver.py"] if process else None,
         "artifact": {
             "exists": digest is not None, "size": size,
             "mtime_ns": mtime, "digest": digest,
         },
         "completion_signal": completion,
+        "completion_marker": {
+            "exists": completion, "size": 4 if completion else 0,
+            "mtime_ns": 9 if completion else None,
+            "digest": "marker-digest" if completion else None,
+        },
+    }
+
+
+def _long_review_action(run: Path, receipt: dict[str, object]) -> dict[str, object]:
+    progress = json.loads((run / "progress-state.json").read_text())
+    generation = progress["sessions"]["sol-main"]["evidence_generation"]
+    return create_control_action(
+        run, session_id="sol-main", action_type="LONG_COMPUTE_REVIEW",
+        reason="review bounded compute", triggering_evidence_id=str(receipt["receipt_id"]),
+        evidence_generation=generation,
+        metadata={"long_compute_receipt_id": receipt["receipt_id"]},
+    )
+
+
+def _long_review_proof(
+    run: Path, action: dict[str, object], receipt: dict[str, object], decision: str,
+) -> dict[str, object]:
+    proof = _control_proof(run, action)
+    proof.update({"decision": decision, "long_compute_receipt_id": receipt["receipt_id"]})
+    return proof
+
+
+def _termination_receipt(
+    proof: dict[str, object], receipt: dict[str, object], action: dict[str, object],
+) -> dict[str, object]:
+    details = receipt["details"]
+    assert isinstance(details, dict)
+    return {
+        "receipt_id": "termination-one",
+        **{
+            field: proof[field] for field in (
+                "run_id", "challenge_id", "session_id", "input_fingerprint",
+                "target_revision", "action_id", "long_compute_receipt_id",
+            )
+        },
+        "container_identity": details["container_identity"],
+        "process_identity": details["process_identity"],
+        "termination_observation": {
+            "process_valid": False, "remaining_processes": [],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        },
     }
 
 
@@ -834,6 +1164,142 @@ def test_long_compute_exit_or_maximum_duration_creates_review(
     )
     assert result["status"] == expected_status
     assert result["review_action"]["action_type"] == "LONG_COMPUTE_REVIEW"
+
+
+def test_long_compute_cancel_requires_termination_receipt_and_no_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    _long_compute_metadata(run, challenge)
+    import ctf_os.progress as progress_module
+    current = {"value": _observed()}
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: current["value"])
+    receipt = _long_compute_receipt(run, challenge)
+    action = _long_review_action(run, receipt)
+    proof = _long_review_proof(run, action, receipt, "CANCELLED")
+    current["value"] = _observed(process=False)
+    with pytest.raises(ControlActionError, match="termination receipt"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    proof["process_termination_receipt"] = _termination_receipt(proof, receipt, action)
+    current["value"] = _observed()
+    with pytest.raises(ControlActionError, match="still running"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    current["value"] = _observed(process=False)
+    applied = apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    again = apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    assert applied["status"] == "ACKED_APPLIED"
+    assert again["idempotent"] is True
+
+
+def test_long_compute_completed_requires_marker_and_stopped_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    _long_compute_metadata(run, challenge)
+    import ctf_os.progress as progress_module
+    current = {"value": _observed()}
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: current["value"])
+    receipt = _long_compute_receipt(run, challenge)
+    action = _long_review_action(run, receipt)
+    proof = _long_review_proof(run, action, receipt, "COMPLETED")
+    artifact = _observed(digest="final", size=12, mtime=8, process=False)["artifact"]
+    proof.update({
+        "completion_marker_digest": "marker-digest",
+        "completion_marker_metadata": _observed(completion=True)["completion_marker"],
+        "final_artifact_observation": artifact,
+    })
+    current["value"] = _observed(digest="final", size=12, mtime=8, process=False)
+    with pytest.raises(ControlActionError, match="completion marker is missing"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    current["value"] = _observed(digest="final", size=12, mtime=8, process=True, completion=True)
+    with pytest.raises(ControlActionError, match="still running"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    current["value"] = _observed(digest="final", size=12, mtime=8, process=False, completion=True)
+    applied = apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    assert applied["status"] == "ACKED_APPLIED"
+
+
+def test_long_compute_continued_rejects_stale_and_accepts_fresh_verified_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    _long_compute_metadata(run, challenge)
+    import ctf_os.progress as progress_module
+    current = {"value": _observed()}
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: current["value"])
+    receipt = _long_compute_receipt(run, challenge)
+    created = datetime.fromisoformat(str(receipt["created_at"]).replace("Z", "+00:00"))
+    current["value"] = _observed(digest="fresh", size=7, mtime=2)
+    heartbeat_long_compute(
+        run, session_id="sol-main", receipt_id=str(receipt["receipt_id"]),
+        observed_at=(created + timedelta(seconds=1)).isoformat(),
+    )
+    progress = json.loads((run / "progress-state.json").read_text())
+    checkpoint_id = progress["sessions"]["sol-main"]["long_compute"]["verified_checkpoint_receipt_id"]
+    action = _long_review_action(run, receipt)
+    proof = _long_review_proof(run, action, receipt, "CONTINUED_WITH_VALID_CHECKPOINT")
+    proof["verified_checkpoint_receipt_id"] = checkpoint_id
+    checkpoint_path = run / "long-compute-checkpoints" / f"{checkpoint_id}.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["valid_until_at"] = "2000-01-01T00:00:00Z"
+    checkpoint_path.write_text(json.dumps(checkpoint))
+    with pytest.raises(ControlActionError, match="checkpoint is stale"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    checkpoint["valid_until_at"] = "2999-01-01T00:00:00Z"
+    checkpoint_path.write_text(json.dumps(checkpoint))
+    applied = apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    assert applied["status"] == "ACKED_APPLIED"
+
+
+def test_long_compute_fallback_requires_bound_command_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _workspace, run, challenge = _run(tmp_path)
+    _long_compute_metadata(run, challenge)
+    import ctf_os.progress as progress_module
+    current = {"value": _observed()}
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: current["value"])
+    receipt = _long_compute_receipt(run, challenge)
+    fallback = save_milestone(
+        run, challenge_id=challenge.id, session_id="sol-main", input_fingerprint="fp",
+        target_revision=1, event_type="DECISIVE_EXPERIMENT",
+        summary="bounded direct fallback", command_argv=["python3", "fallback.py"],
+        output="fallback decided", operation_id="long-fallback",
+        details={
+            "decision": "PROMOTE",
+            "fallback_for_long_compute_receipt_id": receipt["receipt_id"],
+        },
+    )
+    action = _long_review_action(run, receipt)
+    proof = _long_review_proof(run, action, receipt, "FALLBACK_APPLIED")
+    proof.update({
+        "fallback_argv": ["python3", "fallback.py"],
+        "decisive_experiment_receipt_id": fallback["receipt_id"],
+    })
+    current["value"] = _observed(process=False)
+    with pytest.raises(ControlActionError, match="fallback command receipt"):
+        apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    proof["fallback_command_receipt_id"] = fallback["receipt_id"]
+    applied = apply_control_action(run, action_id=str(action["action_id"]), proof_receipt=proof)
+    assert applied["status"] == "ACKED_APPLIED"
+
+
+def test_long_compute_review_rejects_receipt_from_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctf_os.progress as progress_module
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: _observed())
+    _workspace1, run1, challenge1 = _run(tmp_path / "one")
+    _long_compute_metadata(run1, challenge1)
+    receipt1 = _long_compute_receipt(run1, challenge1, operation_id="other-run-long")
+    _workspace2, run2, challenge2 = _run(tmp_path / "two")
+    _long_compute_metadata(run2, challenge2)
+    receipt2 = _long_compute_receipt(run2, challenge2)
+    action = _long_review_action(run2, receipt2)
+    proof = _long_review_proof(run2, action, receipt2, "CANCELLED")
+    proof["long_compute_receipt_id"] = receipt1["receipt_id"]
+    with pytest.raises(ControlActionError, match="authoritative milestone"):
+        apply_control_action(run2, action_id=str(action["action_id"]), proof_receipt=proof)
 
 
 def test_scheduler_scales_only_verified_long_compute() -> None:

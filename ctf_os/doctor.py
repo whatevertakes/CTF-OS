@@ -102,9 +102,13 @@ test ! -e "$HOME/.aws/credentials"; test ! -e "$HOME/.azure"; test ! -e "$HOME/.
 }
 
 
-def _run(argv: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], timeout: int = 30, *, cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout)
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=timeout, cwd=cwd,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
@@ -126,6 +130,7 @@ def _image_probe(profile: str) -> subprocess.CompletedProcess[str]:
 
 def run_doctor(repo: Path) -> dict[str, object]:
     checks: list[dict[str, object]] = []
+    warnings: list[str] = []
 
     def add(name: str, ok: bool, detail: str, fix: str | None = None) -> None:
         item: dict[str, object] = {"name": name, "ok": ok, "detail": detail}
@@ -133,27 +138,60 @@ def run_doctor(repo: Path) -> dict[str, object]:
             item["fix"] = fix
         checks.append(item)
 
-    ubuntu = _ubuntu_release()
+    os_release = _os_release()
+    ubuntu = os_release.get("ID", "").casefold() == "ubuntu"
     machine = platform.machine().casefold()
     kernel_release = platform.release().casefold()
     wsl = "microsoft" in kernel_release or bool(os.environ.get("WSL_INTEROP"))
-    supported_host = (
-        platform.system() == "Linux" and ubuntu
-        and machine in {"x86_64", "amd64"} and not wsl
+    wsl_generation = _wsl_generation(kernel_release, wsl)
+    runtime_kind = "WSL2_UBUNTU" if wsl else "NATIVE_UBUNTU"
+    supported_host = _supported_host(
+        host_system=platform.system(), ubuntu=ubuntu, architecture=machine,
+        wsl_generation=wsl_generation,
     )
     add(
         "host-platform", bool(supported_host),
-        f"system={platform.system()} distribution={'ubuntu' if ubuntu else 'unsupported'} "
-        f"machine={platform.machine()} kernel={platform.release()} "
-        f"environment={'WSL_UNSUPPORTED' if wsl else 'native'}",
-        "use Ubuntu Linux x86_64 for the official competition runtime",
+        f"host_system={platform.system()} ubuntu_version={os_release.get('VERSION_ID') or 'unknown'} "
+        f"architecture={platform.machine()} runtime_kind={runtime_kind} "
+        f"kernel_release={platform.release()}",
+        "use WSL2 Ubuntu x86_64 (official) or native Ubuntu x86_64 (compatible)",
     )
+    if wsl:
+        add(
+            "wsl-version", wsl_generation != 1,
+            "WSL2 verified from the Microsoft WSL2 kernel"
+            if wsl_generation == 2 else (
+                "WSL1 kernel detected" if wsl_generation == 1
+                else "WSL marker present; version could not be distinguished, Docker daemon checks remain authoritative"
+            ),
+            "upgrade this Ubuntu distribution to WSL2",
+        )
+        systemd_available = _systemd_available()
+        detail = (
+            "available" if systemd_available else
+            "optional warning: systemd is not active; docker daemon is the authoritative runtime check"
+        )
+        add("systemd", True, detail)
+        if not systemd_available:
+            warnings.append(detail)
     for executable in ("python3", "uv", "docker"):
         path = shutil.which(executable)
         add(executable, bool(path), path or "not found", f"install {executable} and place it on PATH")
-    docker = _run(["docker", "info", "--format", "{{.ServerVersion}}"])
+    docker = _run([
+        "docker", "info", "--format",
+        "{{.ServerVersion}}|{{.OSType}}|{{.Architecture}}|{{.DockerRootDir}}",
+    ])
     docker_detail = docker.stdout.strip() or docker.stderr.strip()
     failure_kind = _docker_failure_kind(docker_detail)
+    docker_server_version = None
+    docker_server_os = None
+    docker_server_architecture = None
+    docker_root: Path | None = None
+    if docker.returncode == 0:
+        fields = docker.stdout.strip().split("|", 3)
+        if len(fields) == 4:
+            docker_server_version, docker_server_os, docker_server_architecture, root_value = fields
+            docker_root = Path(root_value) if root_value else None
     socket = Path("/var/run/docker.sock")
     socket_access = docker.returncode == 0 or (
         socket.exists() and os.access(socket, os.R_OK | os.W_OK)
@@ -171,8 +209,20 @@ def run_doctor(repo: Path) -> dict[str, object]:
         docker_detail if docker.returncode == 0 else failure_kind,
         "start Docker Engine or correct the reported daemon/socket error",
     )
+    server_platform_ok = (
+        docker.returncode == 0 and bool(docker_server_version)
+        and _docker_server_supported(docker_server_os, docker_server_architecture)
+    )
+    add(
+        "docker-server-platform", server_platform_ok,
+        f"ServerVersion={docker_server_version or 'unknown'} "
+        f"OSType={docker_server_os or 'unknown'} Architecture={docker_server_architecture or 'unknown'}",
+        "use a Docker Engine server running Linux/amd64",
+    )
     compose = _run(["docker", "compose", "version", "--short"])
-    add("docker-compose", compose.returncode == 0, compose.stdout.strip() or compose.stderr.strip(), "install Docker Compose v2")
+    compose_version = compose.stdout.strip() or compose.stderr.strip()
+    compose_ok = compose.returncode == 0 and _compose_v2(compose.stdout.strip())
+    add("docker-compose", compose_ok, compose_version, "install Docker Compose v2")
     build_command = _run(["docker", "build", "--help"])
     run_command = _run(["docker", "run", "--help"])
     add("docker-build-command", build_command.returncode == 0, "available" if build_command.returncode == 0 else build_command.stderr.strip(), "install a Docker CLI with docker build")
@@ -200,8 +250,6 @@ def run_doctor(repo: Path) -> dict[str, object]:
     disk = shutil.disk_usage(repo)
     add("disk-space", disk.free >= 20 * 1024**3, f"{disk.free // 1024**3} GiB free", "free at least 20 GiB")
     if docker.returncode == 0:
-        docker_root_result = _run(["docker", "info", "--format", "{{.DockerRootDir}}"])
-        docker_root = Path(docker_root_result.stdout.strip()) if docker_root_result.returncode == 0 and docker_root_result.stdout.strip() else None
         try:
             docker_disk = shutil.disk_usage(docker_root) if docker_root else None
         except OSError:
@@ -213,7 +261,34 @@ def run_doctor(repo: Path) -> dict[str, object]:
         )
     memory_bytes = _available_memory()
     add("memory", memory_bytes >= 2 * 1024**3, f"{memory_bytes // 1024**3} GiB available", "free at least 2 GiB RAM")
+    add("repository-write", _write_probe(repo), str(repo), "make the repository writable")
     add("output-write", _write_probe(repo / "output"), str(repo / "output"), "make repository output/ writable and remove unsafe symlinks")
+    filesystem = _repository_filesystem(repo)
+    if filesystem["windows_mount"]:
+        warning = (
+            "Docker build context, forensic extraction, receipt ledger, and many-file atomic operations "
+            "perform better on the WSL2 Linux filesystem; prefer /home/<user>/CTF-OS"
+        )
+        warnings.append(warning)
+        add("repository-filesystem", True, f"WARNING: {warning}; mount={filesystem['mount']} fstype={filesystem['fstype']}")
+    else:
+        add(
+            "repository-filesystem", True,
+            f"Linux filesystem mount={filesystem['mount']} fstype={filesystem['fstype']}",
+        )
+
+    if docker.returncode == 0 and server_platform_ok:
+        outbound_ok, outbound_detail = _docker_outbound_probe()
+        add("docker-container-outbound-network", outbound_ok, outbound_detail, "restore outbound Docker bridge connectivity")
+        bridge_ok, bridge_detail = _docker_bridge_probe()
+        add("docker-bridge-network", bridge_ok, bridge_detail, "allow Docker bridge network create/inspect/remove")
+        service_ok, service_detail = _compose_network_probe()
+        add("compose-service-network", service_ok, service_detail, "repair Docker Compose v2 service networking")
+    else:
+        for name in (
+            "docker-container-outbound-network", "docker-bridge-network", "compose-service-network",
+        ):
+            add(name, False, "Docker Linux/amd64 daemon unavailable", "restore the Docker Engine runtime first")
 
     skill_files = [repo / f".codex/skills/{name}/SKILL.md" for name in ("ctf-intake", "ctf-triage", "ctf-solve")]
     playbooks = list((repo / "ctf_os/resources/knowledge/playbooks").glob("*.md"))
@@ -250,19 +325,109 @@ def run_doctor(repo: Path) -> dict[str, object]:
         "NVIDIA tooling detected; GPU-required requests perform runtime validation"
         if nvidia else "not installed; CPU profiles including AI remain supported",
     )
-    return {"ok": all(bool(item["ok"]) for item in checks), "checks": checks}
+    return {
+        "ok": all(bool(item["ok"]) for item in checks),
+        "host_system": platform.system(),
+        "ubuntu_version": os_release.get("VERSION_ID"),
+        "architecture": platform.machine(),
+        "runtime_kind": runtime_kind,
+        "kernel_release": platform.release(),
+        "docker_server_version": docker_server_version,
+        "docker_server_os": docker_server_os,
+        "docker_server_architecture": docker_server_architecture,
+        "compose_version": compose.stdout.strip() if compose.returncode == 0 else None,
+        "warnings": warnings,
+        "checks": checks,
+    }
 
 
-def _ubuntu_release() -> bool:
+def _os_release() -> dict[str, str]:
     try:
-        values = {}
+        values: dict[str, str] = {}
         for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
             if "=" in line:
                 key, value = line.split("=", 1)
                 values[key] = value.strip().strip('"')
-        return values.get("ID", "").casefold() == "ubuntu"
+        return values
+    except OSError:
+        return {}
+
+
+def _ubuntu_release() -> bool:
+    return _os_release().get("ID", "").casefold() == "ubuntu"
+
+
+def _wsl_generation(kernel_release: str, detected: bool) -> int | None:
+    if not detected:
+        return None
+    lowered = kernel_release.casefold()
+    if "wsl2" in lowered or "microsoft-standard" in lowered:
+        return 2
+    if lowered.startswith("4.4.") and "microsoft" in lowered:
+        return 1
+    return None
+
+
+def _supported_host(
+    *, host_system: str, ubuntu: bool, architecture: str,
+    wsl_generation: int | None,
+) -> bool:
+    return (
+        host_system == "Linux" and ubuntu
+        and architecture.casefold() in {"x86_64", "amd64"}
+        and wsl_generation != 1
+    )
+
+
+def _docker_server_supported(os_type: str | None, architecture: str | None) -> bool:
+    return (
+        str(os_type).casefold() == "linux"
+        and str(architecture).casefold() in {"x86_64", "amd64"}
+    )
+
+
+def _systemd_available() -> bool:
+    try:
+        return Path("/run/systemd/system").is_dir() or Path("/proc/1/comm").read_text(
+            encoding="ascii",
+        ).strip() == "systemd"
     except OSError:
         return False
+
+
+def _compose_v2(value: str) -> bool:
+    normalized = value.strip().removeprefix("v")
+    return normalized.split(".", 1)[0] == "2"
+
+
+def _repository_filesystem(repo: Path) -> dict[str, object]:
+    resolved = repo.resolve()
+    mount = "/"
+    fstype = "unknown"
+    try:
+        rows = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        rows = []
+    best = -1
+    for row in rows:
+        fields = row.split()
+        if "-" not in fields or len(fields) < 7:
+            continue
+        separator = fields.index("-")
+        candidate = fields[4].replace("\\040", " ")
+        try:
+            resolved.relative_to(candidate)
+        except ValueError:
+            continue
+        if len(candidate) > best and separator + 1 < len(fields):
+            best = len(candidate)
+            mount = candidate
+            fstype = fields[separator + 1]
+    windows_path = len(resolved.parts) >= 3 and resolved.parts[1] == "mnt" and len(resolved.parts[2]) == 1
+    return {
+        "mount": mount, "fstype": fstype,
+        "windows_mount": windows_path or fstype.casefold() == "drvfs",
+    }
 
 
 def _docker_failure_kind(detail: str) -> str:
@@ -274,6 +439,59 @@ def _docker_failure_kind(detail: str) -> str:
     if not shutil.which("docker"):
         return "DOCKER_CLI_MISSING"
     return f"DAEMON_RESPONSE_ERROR: {detail or 'no daemon response'}"
+
+
+def _docker_outbound_probe() -> tuple[bool, str]:
+    result = _run([
+        "docker", "run", "--rm", "--network", "bridge",
+        "--entrypoint", "python3", "ctf-os-sandbox:base", "-c",
+        "import socket; s=socket.create_connection(('1.1.1.1',443),10); s.close()",
+    ], timeout=30)
+    detail = result.stdout.strip() or result.stderr.strip()
+    return result.returncode == 0, detail or "container reached an external TCP endpoint"
+
+
+def _docker_bridge_probe() -> tuple[bool, str]:
+    name = f"ctf-os-doctor-bridge-{os.getpid()}"
+    created = _run(["docker", "network", "create", "--driver", "bridge", name])
+    try:
+        inspected = _run([
+            "docker", "network", "inspect", "--format", "{{.Driver}}|{{.Internal}}", name,
+        ]) if created.returncode == 0 else created
+        ok = created.returncode == 0 and inspected.returncode == 0 and inspected.stdout.strip() == "bridge|false"
+        detail = inspected.stdout.strip() or inspected.stderr.strip() or created.stderr.strip()
+        return ok, detail or "bridge network create/inspect passed"
+    finally:
+        if created.returncode == 0:
+            _run(["docker", "network", "rm", name])
+
+
+def _compose_network_probe() -> tuple[bool, str]:
+    project = f"ctfosdoctor{os.getpid()}"
+    with tempfile.TemporaryDirectory(prefix="ctf-os-compose-doctor-") as temporary:
+        root = Path(temporary)
+        compose_file = root / "compose.yaml"
+        compose_file.write_text(
+            "services:\n"
+            "  probe:\n"
+            "    image: ctf-os-sandbox:base\n"
+            "    command: [\"sleep\", \"30\"]\n",
+            encoding="utf-8",
+        )
+        argv = [
+            "docker", "compose", "--project-name", project,
+            "--file", str(compose_file),
+        ]
+        started = _run([*argv, "up", "--detach", "--no-build"], timeout=60, cwd=root)
+        try:
+            network = _run([
+                "docker", "network", "inspect", "--format", "{{.Driver}}", f"{project}_default",
+            ]) if started.returncode == 0 else started
+            ok = started.returncode == 0 and network.returncode == 0 and network.stdout.strip() == "bridge"
+            detail = network.stdout.strip() or network.stderr.strip() or started.stderr.strip()
+            return ok, detail or "Compose service network create/inspect passed"
+        finally:
+            _run([*argv, "down", "--volumes", "--remove-orphans"], timeout=60, cwd=root)
 
 
 def _available_memory() -> int:

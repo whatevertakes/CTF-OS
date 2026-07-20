@@ -120,11 +120,7 @@ def apply_control_action(
         if current.get("status") != "PENDING":
             if current.get("status") == "ACKED_APPLIED":
                 saved = _application_receipt(run, action_id)
-                expected_saved = {
-                    "schema_version": 1, **proof,
-                    "action_type": current.get("action_type"),
-                }
-                if _without_time(saved) != expected_saved:
+                if _submitted_proof(saved) != proof:
                     raise ControlActionError("control action apply proof conflicts with prior receipt")
                 return {**current, "application_receipt": saved, "idempotent": True}
             raise ControlActionError("control action is already terminal")
@@ -139,15 +135,20 @@ def apply_control_action(
         for field, value in expected.items():
             if proof.get(field) != value:
                 raise ControlActionError(f"control action apply proof {field} mismatch")
-        _validate_action_proof(run, current, proof)
+        authoritative_evidence = _validate_action_proof(run, current, proof)
         receipt = {
             "schema_version": 1, **proof, "action_type": current.get("action_type"),
             "created_at": utc_now(),
         }
+        if authoritative_evidence is not None:
+            receipt["authoritative_evidence"] = authoritative_evidence
         receipt_path = run / "control-application-receipts" / f"{action_id}.json"
         if receipt_path.exists():
             saved = _application_receipt(run, action_id)
-            if _without_time(saved) != _without_time(receipt):
+            if (
+                _submitted_proof(saved) != proof
+                or saved.get("action_type") != current.get("action_type")
+            ):
                 raise ControlActionError("control action application receipt conflicts")
             receipt = saved
         else:
@@ -166,7 +167,7 @@ def apply_control_action(
 
 def _validate_action_proof(
     run: Path, action: Mapping[str, Any], proof: Mapping[str, Any],
-) -> None:
+) -> dict[str, Any] | None:
     action_type = str(action.get("action_type") or "")
     session_id = str(action.get("session_id") or "")
     plan = _json_optional(run / "DELEGATION_PLAN.json")
@@ -319,10 +320,17 @@ def _validate_action_proof(
             "CANCELLED", "CONTINUED_WITH_VALID_CHECKPOINT", "FALLBACK_APPLIED", "COMPLETED",
         }:
             raise ControlActionError("LONG_COMPUTE_REVIEW decision is invalid")
-        _require_milestone_reference(
+        long_compute = _require_milestone_reference(
             milestones, proof.get("long_compute_receipt_id"), {"LONG_COMPUTE"},
         )
-        return
+        try:
+            from .progress import ProgressGateError, validate_long_compute_review_proof
+            return validate_long_compute_review_proof(
+                run, action=action, proof=proof,
+                long_compute_receipt=long_compute, milestones=milestones,
+            )
+        except ProgressGateError as exc:
+            raise ControlActionError(str(exc)) from exc
 
     _require_milestone_reference(
         milestones, proof.get("evidence_receipt_id"),
@@ -382,8 +390,9 @@ def _required_text(value: Any, field: str) -> str:
     return text
 
 
-def _without_time(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if key != "created_at"}
+def _submitted_proof(value: Mapping[str, Any]) -> dict[str, Any]:
+    ignored = {"schema_version", "created_at", "action_type", "authoritative_evidence"}
+    return {key: item for key, item in value.items() if key not in ignored}
 
 
 def load_control_actions(root: Path, *, current_view: bool = True) -> list[dict[str, Any]]:

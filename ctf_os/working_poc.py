@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Iterator
+import uuid
 
 from .flags import matches_flag
 from .milestones import load_milestones, save_milestone
 from .sandbox.network import Target
 from .sandbox.runtime import execute
 from .verification import record_remote_flag
-from .workspace import atomic_json, resolve_active_run, safe_under
+from .workspace import atomic_json, resolve_active_run, safe_under, utc_now
 
 
 class WorkingPocError(RuntimeError):
@@ -89,26 +93,26 @@ def commit_working_poc(
         "kill_condition": _text(kill_condition, "kill_condition", 2000),
     }
     operation_path = _operation_path(run, operation)
-    existing = _load_operation(operation_path)
-    if existing is not None:
-        if existing.get("canonical_material") != material:
-            raise WorkingPocError(
-                "operation_id already exists with conflicting remote argv, target, or artifact digest"
-            )
-        if existing.get("status") == "COMPLETED":
-            response = existing.get("response")
-            if not isinstance(response, dict):
-                raise WorkingPocError("completed working PoC operation has no response")
-            return {**response, "idempotent": True, "remote_command_executed": False}
-        operation_record = existing
-    else:
-        operation_record = {
-            "schema_version": 1, "operation_id": operation,
-            "canonical_material": material, "status": "PREPARED",
-            "working_poc_receipt_id": None, "execution": None,
-            "remote_attempt_receipt_id": None, "response": None,
-        }
-        atomic_json(operation_path, operation_record)
+    with _operation_lock(run):
+        operation_record = _load_operation(operation_path)
+        if operation_record is None:
+            operation_record = {
+                "schema_version": 2, "operation_id": operation,
+                "canonical_material": material, "status": "PREPARED",
+                "working_poc_receipt_id": None, "execution_attempt_id": None,
+                "execution_started_at": None, "execution": None,
+                "remote_attempt_receipt_id": None, "response": None,
+                "resolution": None,
+            }
+            atomic_json(operation_path, operation_record)
+        else:
+            _validate_operation_material(operation_record, material)
+            terminal = _terminal_operation_response(operation_record)
+            if terminal is not None:
+                return terminal
+            uncertain = _handle_uncertain_operation(run, operation_path, operation_record)
+            if uncertain is not None:
+                return uncertain
 
     working_id = operation_record.get("working_poc_receipt_id")
     if working_id:
@@ -128,36 +132,100 @@ def commit_working_poc(
             },
             declared_remote=True, operation_id=f"{operation}:working-poc",
         )
-        operation_record["working_poc_receipt_id"] = working["receipt_id"]
-        operation_record["status"] = "WORKING_POC_RECORDED"
-        atomic_json(operation_path, operation_record)
+        with _operation_lock(run):
+            operation_record = _required_operation(operation_path, material)
+            terminal = _terminal_operation_response(operation_record)
+            if terminal is not None:
+                return terminal
+            uncertain = _handle_uncertain_operation(run, operation_path, operation_record)
+            if uncertain is not None:
+                return uncertain
+            if not operation_record.get("working_poc_receipt_id"):
+                operation_record["working_poc_receipt_id"] = working["receipt_id"]
+                operation_record["status"] = "WORKING_POC_RECORDED"
+                atomic_json(operation_path, operation_record)
+            else:
+                working = _milestone_by_id(
+                    run, str(operation_record["working_poc_receipt_id"]), "WORKING_POC",
+                )
 
-    execution = operation_record.get("execution")
     command_executed = False
-    if not isinstance(execution, Mapping):
-        result = dict(executor(
-            metadata, argv, timeout,
-            session_id=str(metadata.get("parent_session_id") or "sol-main"),
-            session_role="sol",
-        ))
-        command_executed = True
-        artifact_digest_after = _sha256(artifact)
-        execution = {
-            "command_argv": argv, "command_digest": material["command_digest"],
-            "exit_code": result.get("exit_code"), "timed_out": bool(result.get("timed_out")),
-            "stdout": str(result.get("stdout") or "")[-64_000:],
-            "stderr": str(result.get("stderr") or "")[-64_000:],
-            "authorized_network_observed": result.get("authorized_network_observed") is True,
-            "input_fingerprint": result.get("input_fingerprint"),
-            "exploit_artifact_digest_before": artifact_digest_before,
-            "exploit_artifact_digest_after": artifact_digest_after,
-        }
-        if execution["input_fingerprint"] != input_fingerprint:
-            raise WorkingPocError("remote execution receipt input fingerprint mismatch")
-        operation_record["execution"] = execution
-        operation_record["status"] = "EXECUTION_RECORDED"
-        atomic_json(operation_path, operation_record)
-        _working_poc_failpoint("execution_record", "after", operation_record)
+    execution_guard: BinaryIO | None = None
+    with _operation_lock(run):
+        operation_record = _required_operation(operation_path, material)
+        terminal = _terminal_operation_response(operation_record)
+        if terminal is not None:
+            return terminal
+        uncertain = _handle_uncertain_operation(run, operation_path, operation_record)
+        if uncertain is not None:
+            return uncertain
+        execution = operation_record.get("execution")
+        if not isinstance(execution, Mapping):
+            execution_guard = _try_execution_guard(run, operation)
+            if execution_guard is None:
+                raise WorkingPocError("working PoC execution guard is unexpectedly busy")
+            attempt_id = uuid.uuid4().hex
+            operation_record.update({
+                "status": "EXECUTION_STARTED",
+                "execution_attempt_id": attempt_id,
+                "execution_started_at": utc_now(),
+                "command_digest": material["command_digest"],
+                "artifact_digest": artifact_digest_before,
+                "target_identity": material["target"],
+            })
+            atomic_json(operation_path, operation_record)
+        else:
+            attempt_id = str(operation_record.get("execution_attempt_id") or "")
+
+    if execution_guard is not None:
+        try:
+            _working_poc_failpoint("execution_started", "after", operation_record)
+            result = dict(executor(
+                metadata, argv, timeout,
+                session_id=str(metadata.get("parent_session_id") or "sol-main"),
+                session_role="sol",
+            ))
+            command_executed = True
+            artifact_digest_after = _sha256(artifact)
+            stdout = str(result.get("stdout") or "")[-64_000:]
+            stderr = str(result.get("stderr") or "")[-64_000:]
+            execution = {
+                "execution_attempt_id": attempt_id,
+                "command_argv": argv, "command_digest": material["command_digest"],
+                "exit_code": result.get("exit_code"), "timed_out": bool(result.get("timed_out")),
+                "stdout": stdout, "stderr": stderr,
+                "stdout_digest": hashlib.sha256(stdout.encode()).hexdigest(),
+                "stderr_digest": hashlib.sha256(stderr.encode()).hexdigest(),
+                "authorized_network_observed": result.get("authorized_network_observed") is True,
+                "input_fingerprint": result.get("input_fingerprint"),
+                "exploit_artifact_digest_before": artifact_digest_before,
+                "exploit_artifact_digest_after": artifact_digest_after,
+                "target_identity": material["target"],
+                "recorded_at": utc_now(),
+            }
+            with _operation_lock(run):
+                operation_record = _required_operation(operation_path, material)
+                if operation_record.get("execution_attempt_id") != attempt_id:
+                    raise WorkingPocError("working PoC execution attempt identity changed")
+                if execution["input_fingerprint"] != input_fingerprint:
+                    operation_record["status"] = "EXECUTION_OUTCOME_UNKNOWN"
+                    operation_record["execution_validation_error"] = (
+                        "remote execution receipt input fingerprint mismatch"
+                    )
+                    atomic_json(operation_path, operation_record)
+                    raise WorkingPocError("remote execution receipt input fingerprint mismatch")
+                operation_record["execution"] = execution
+                operation_record["status"] = "EXECUTION_RECORDED"
+                atomic_json(operation_path, operation_record)
+            _working_poc_failpoint("execution_record", "after", operation_record)
+        finally:
+            _release_execution_guard(execution_guard)
+
+    with _operation_lock(run):
+        operation_record = _required_operation(operation_path, material)
+        execution = operation_record.get("execution")
+        if not isinstance(execution, Mapping):
+            raise WorkingPocError("working PoC execution outcome is not recorded")
 
     combined_output = str(execution.get("stdout") or "") + "\n" + str(execution.get("stderr") or "")
     remote_id = operation_record.get("remote_attempt_receipt_id")
@@ -180,9 +248,16 @@ def commit_working_poc(
                 "artifact_digest_after": execution.get("exploit_artifact_digest_after"),
             }, declared_remote=True, operation_id=f"{operation}:remote-attempt",
         )
-        operation_record["remote_attempt_receipt_id"] = remote_attempt["receipt_id"]
-        operation_record["status"] = "REMOTE_ATTEMPT_RECORDED"
-        atomic_json(operation_path, operation_record)
+        with _operation_lock(run):
+            operation_record = _required_operation(operation_path, material)
+            if not operation_record.get("remote_attempt_receipt_id"):
+                operation_record["remote_attempt_receipt_id"] = remote_attempt["receipt_id"]
+                operation_record["status"] = "REMOTE_ATTEMPT_RECORDED"
+                atomic_json(operation_path, operation_record)
+            else:
+                remote_attempt = _milestone_by_id(
+                    run, str(operation_record["remote_attempt_receipt_id"]), "REMOTE_ATTEMPT",
+                )
         _working_poc_failpoint("remote_receipt", "after", operation_record)
 
     candidates = _flag_candidates(combined_output, flag_pattern)
@@ -232,6 +307,8 @@ def commit_working_poc(
                 declared_remote=True, operation_id=f"{operation}:blocker",
             )
 
+    _working_poc_failpoint("flag_projection", "after", operation_record)
+
     response = {
         "run_id": run.name, "operation_id": operation,
         "working_poc_receipt_id": working["receipt_id"],
@@ -241,10 +318,308 @@ def commit_working_poc(
         "state": verified.get("state") if verified else "REMOTE_ATTEMPT",
         "idempotent": False, "remote_command_executed": command_executed,
     }
-    operation_record["status"] = "COMPLETED"
-    operation_record["response"] = response
-    atomic_json(operation_path, operation_record)
+    with _operation_lock(run):
+        operation_record = _required_operation(operation_path, material)
+        terminal = _terminal_operation_response(operation_record)
+        if terminal is not None:
+            return terminal
+        operation_record["status"] = "COMPLETED"
+        operation_record["response"] = response
+        atomic_json(operation_path, operation_record)
     return response
+
+
+def resolve_unknown_working_poc(
+    root: Path, *, operation_id: str, decision: str,
+    resolution_receipt: Mapping[str, Any], new_operation_id: str | None = None,
+    declared_targets: Sequence[Target] = (), flag_pattern: str | None = None,
+) -> dict[str, Any]:
+    """Resolve an uncertain remote attempt without ever replaying its operation ID."""
+
+    run = resolve_active_run(root)
+    operation = _text(operation_id, "operation_id", 256)
+    normalized = str(decision or "").strip().upper()
+    if normalized not in {"RECORD_RESULT", "ABANDON", "AUTHORIZE_RETRY"}:
+        raise WorkingPocError(
+            "unknown outcome decision must be RECORD_RESULT, ABANDON, or AUTHORIZE_RETRY"
+        )
+    path = _operation_path(run, operation)
+    proof = dict(resolution_receipt)
+    retry_operation = (
+        _text(new_operation_id, "new_operation_id", 256)
+        if new_operation_id is not None else None
+    )
+    with _operation_lock(run):
+        record = _load_operation(path)
+        if record is None:
+            raise WorkingPocError("unknown working PoC operation does not exist")
+        if record.get("status") not in {"EXECUTION_STARTED", "EXECUTION_OUTCOME_UNKNOWN"}:
+            raise WorkingPocError("working PoC operation is not awaiting unknown-outcome resolution")
+        guard = _try_execution_guard(run, operation)
+        if guard is None:
+            raise WorkingPocError("working PoC executor is still active; unknown outcome cannot be resolved")
+        try:
+            material = record.get("canonical_material")
+            if not isinstance(material, Mapping):
+                raise WorkingPocError("working PoC operation canonical material is malformed")
+            _validate_resolution_identity(run, record, proof)
+            execution: dict[str, Any] | None = None
+            if normalized == "RECORD_RESULT":
+                execution = _operator_execution(run, material, record, proof)
+            if normalized == "AUTHORIZE_RETRY" and (
+                retry_operation is None or retry_operation == operation
+            ):
+                raise WorkingPocError("AUTHORIZE_RETRY requires a distinct new operation ID")
+            resolution = _resolution_record(
+                run, record, normalized, proof, new_operation_id=retry_operation,
+            )
+            receipt_path = (
+                run / "working-poc-resolution-receipts" / f"{resolution['receipt_id']}.json"
+            )
+            atomic_json(receipt_path, resolution)
+            if normalized == "RECORD_RESULT":
+                assert execution is not None
+                record["execution"] = execution
+                record["status"] = "EXECUTION_RECORDED"
+            elif normalized == "ABANDON":
+                record["status"] = "ABANDONED"
+            else:
+                assert retry_operation is not None
+                retry_path = _operation_path(run, retry_operation)
+                if _load_operation(retry_path) is not None:
+                    raise WorkingPocError("authorized retry operation ID already exists")
+                retry_material = dict(material)
+                retry_material["operation_id"] = retry_operation
+                retry_record = {
+                    "schema_version": 2, "operation_id": retry_operation,
+                    "canonical_material": retry_material, "status": "PREPARED",
+                    "working_poc_receipt_id": None, "execution_attempt_id": None,
+                    "execution_started_at": None, "execution": None,
+                    "remote_attempt_receipt_id": None, "response": None,
+                    "resolution": None,
+                    "supersedes_unknown_operation": operation,
+                    "operator_authorization_receipt": str(receipt_path.relative_to(run)),
+                }
+                atomic_json(retry_path, retry_record)
+                record["status"] = "ABANDONED"
+                record["authorized_retry_operation_id"] = retry_operation
+            record["resolution"] = {
+                "decision": normalized,
+                "receipt_id": resolution["receipt_id"],
+                "path": str(receipt_path.relative_to(run)),
+            }
+            atomic_json(path, record)
+        finally:
+            _release_execution_guard(guard)
+
+    if normalized != "RECORD_RESULT":
+        return {
+            "run_id": run.name, "operation_id": operation, "status": record["status"],
+            "decision": normalized, "remote_command_executed": False,
+            "authorized_retry_operation_id": record.get("authorized_retry_operation_id"),
+            "operator_authorization_receipt": record["resolution"],
+        }
+
+    material = dict(record["canonical_material"])
+    metadata_path = Path(str((material.get("sandbox") or {}).get("metadata_path") or ""))
+    metadata = _json(metadata_path, "sandbox metadata")
+    return commit_working_poc(
+        run, challenge_id=str(material["challenge_id"]),
+        input_fingerprint=str(material["input_fingerprint"]),
+        target_revision=int(material["target_revision"]),
+        session_id=str(material["session_id"]), sandbox_metadata=metadata,
+        local_receipt_id=str(material["local_receipt_id"]),
+        exploit_artifact=str(material["exploit_artifact"]),
+        remote_argv=list(material["remote_argv"]), declared_targets=declared_targets,
+        target_index=int(material["target_index"]), flag_pattern=flag_pattern,
+        success_condition=str(material["success_condition"]),
+        kill_condition=str(material["kill_condition"]), operation_id=operation,
+        executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            WorkingPocError("resolved unknown operation attempted an automatic retry")
+        ),
+    )
+
+
+def _validate_operation_material(
+    record: Mapping[str, Any], material: Mapping[str, Any],
+) -> None:
+    if record.get("canonical_material") != material:
+        raise WorkingPocError(
+            "operation_id already exists with conflicting remote argv, target, or artifact digest"
+        )
+
+
+def _required_operation(path: Path, material: Mapping[str, Any]) -> dict[str, Any]:
+    record = _load_operation(path)
+    if record is None:
+        raise WorkingPocError("working PoC operation disappeared")
+    _validate_operation_material(record, material)
+    return record
+
+
+def _terminal_operation_response(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    if record.get("status") == "COMPLETED":
+        response = record.get("response")
+        if not isinstance(response, dict):
+            raise WorkingPocError("completed working PoC operation has no response")
+        return {**response, "idempotent": True, "remote_command_executed": False}
+    if record.get("status") == "ABANDONED":
+        raise WorkingPocError("working PoC operation is ABANDONED and cannot be reused")
+    return None
+
+
+def _handle_uncertain_operation(
+    run: Path, path: Path, record: dict[str, Any],
+) -> dict[str, Any] | None:
+    status = str(record.get("status") or "")
+    if status not in {"EXECUTION_STARTED", "EXECUTION_OUTCOME_UNKNOWN"}:
+        return None
+    guard = _try_execution_guard(run, str(record.get("operation_id") or ""))
+    if guard is None:
+        return _unknown_response(record, active=True)
+    try:
+        if status == "EXECUTION_STARTED":
+            record["status"] = "EXECUTION_OUTCOME_UNKNOWN"
+            record["outcome_marked_unknown_at"] = utc_now()
+            atomic_json(path, record)
+        return _unknown_response(record, active=False)
+    finally:
+        _release_execution_guard(guard)
+
+
+def _unknown_response(record: Mapping[str, Any], *, active: bool) -> dict[str, Any]:
+    return {
+        "run_id": (record.get("canonical_material") or {}).get("run_id"),
+        "operation_id": record.get("operation_id"),
+        "execution_attempt_id": record.get("execution_attempt_id"),
+        "status": "EXECUTION_STARTED" if active else "EXECUTION_OUTCOME_UNKNOWN",
+        "remote_command_executed": False,
+        "automatic_retry_blocked": True,
+        "manual_resolution_required": not active,
+        "executor_active": active,
+        "idempotent": True,
+    }
+
+
+@contextmanager
+def _operation_lock(run: Path) -> Iterator[None]:
+    lock_path = run / ".WORKING_POC.lock"
+    if lock_path.is_symlink():
+        raise WorkingPocError("working PoC operation lock is unsafe")
+    descriptor = os.open(
+        lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600,
+    )
+    with os.fdopen(descriptor, "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _try_execution_guard(run: Path, operation_id: str) -> BinaryIO | None:
+    digest = hashlib.sha256(operation_id.encode()).hexdigest()[:32]
+    path = run / "working-poc-operations" / f"{digest}.execution.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise WorkingPocError("working PoC execution guard is unsafe")
+    descriptor = os.open(
+        path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600,
+    )
+    handle = os.fdopen(descriptor, "a+b")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_execution_guard(handle: BinaryIO) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _validate_resolution_identity(
+    run: Path, record: Mapping[str, Any], proof: Mapping[str, Any],
+) -> None:
+    material = record.get("canonical_material")
+    if not isinstance(material, Mapping):
+        raise WorkingPocError("working PoC canonical material is malformed")
+    expected = {
+        "run_id": run.name, "challenge_id": material.get("challenge_id"),
+        "session_id": material.get("session_id"),
+        "input_fingerprint": material.get("input_fingerprint"),
+        "target_revision": material.get("target_revision"),
+        "operation_id": record.get("operation_id"),
+        "execution_attempt_id": record.get("execution_attempt_id"),
+        "command_digest": material.get("command_digest"),
+        "artifact_digest": material.get("exploit_artifact_digest_before"),
+        "target_identity": material.get("target"),
+    }
+    for field, value in expected.items():
+        if proof.get(field) != value:
+            raise WorkingPocError(f"unknown outcome resolution {field} mismatch")
+
+
+def _operator_execution(
+    run: Path, material: Mapping[str, Any], record: Mapping[str, Any],
+    proof: Mapping[str, Any],
+) -> dict[str, Any]:
+    exit_code = proof.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        raise WorkingPocError("RECORD_RESULT requires an integer exit status")
+    if not isinstance(proof.get("authorized_network_observed"), bool):
+        raise WorkingPocError("RECORD_RESULT requires a boolean network observation")
+    stdout = str(proof.get("stdout") or "")
+    stderr = str(proof.get("stderr") or "")
+    if len(stdout) > 64_000 or len(stderr) > 64_000:
+        raise WorkingPocError("RECORD_RESULT preserved output exceeds the execution receipt limit")
+    stdout_digest = hashlib.sha256(stdout.encode()).hexdigest()
+    stderr_digest = hashlib.sha256(stderr.encode()).hexdigest()
+    if proof.get("stdout_digest") != stdout_digest or proof.get("stderr_digest") != stderr_digest:
+        raise WorkingPocError("RECORD_RESULT stdout/stderr digest mismatch")
+    artifact_path = _artifact(run, str(material.get("exploit_artifact") or ""))
+    if _sha256(artifact_path) != material.get("exploit_artifact_digest_before"):
+        raise WorkingPocError("RECORD_RESULT exploit artifact no longer matches the attempted artifact")
+    artifact_after = proof.get("artifact_digest_after", proof.get("artifact_digest"))
+    if not isinstance(artifact_after, str) or not re.fullmatch(r"[0-9a-f]{64}", artifact_after):
+        raise WorkingPocError("RECORD_RESULT artifact digest is invalid")
+    return {
+        "execution_attempt_id": record.get("execution_attempt_id"),
+        "command_argv": list(material.get("remote_argv") or []),
+        "command_digest": material.get("command_digest"),
+        "exit_code": exit_code, "timed_out": proof.get("timed_out") is True,
+        "stdout": stdout, "stderr": stderr,
+        "stdout_digest": stdout_digest, "stderr_digest": stderr_digest,
+        "authorized_network_observed": proof["authorized_network_observed"],
+        "input_fingerprint": material.get("input_fingerprint"),
+        "exploit_artifact_digest_before": material.get("exploit_artifact_digest_before"),
+        "exploit_artifact_digest_after": artifact_after,
+        "target_identity": material.get("target"),
+        "recorded_at": utc_now(), "source": "OPERATOR_RECORD_RESULT",
+    }
+
+
+def _resolution_record(
+    run: Path, operation: Mapping[str, Any], decision: str,
+    proof: Mapping[str, Any], *, new_operation_id: str | None,
+) -> dict[str, Any]:
+    material = {
+        "run_id": run.name, "operation_id": operation.get("operation_id"),
+        "execution_attempt_id": operation.get("execution_attempt_id"),
+        "decision": decision, "proof": dict(proof),
+        "new_operation_id": new_operation_id,
+    }
+    receipt_id = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode(),
+    ).hexdigest()[:24]
+    return {
+        "schema_version": 1, "receipt_id": receipt_id, **material,
+        "created_at": utc_now(), "automatic_retry_performed": False,
+    }
 
 
 def _local_poc_receipt(

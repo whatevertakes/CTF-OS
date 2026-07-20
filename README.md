@@ -20,7 +20,9 @@ minimal observation
 
 ## 준비
 
-공식 대회 실행 환경은 Ubuntu Linux x86_64, Docker Engine, Docker Compose v2 plugin입니다. Python 3.11+와 `uv`도 필요합니다. GPU는 GPU-required workload가 있는 머신에서만 NVIDIA Container Toolkit으로 선택 설치합니다. 일반 `docker build`가 기준이며 Buildx는 필수가 아닙니다.
+Official competition runtime: **WSL2 Ubuntu x86_64 + Docker Engine + Docker Compose v2**. 팀 운영 기준의 host는 Windows 11입니다. 저장소는 Docker build context, forensic extraction, receipt ledger와 다수 파일의 원자적 동작 성능을 위해 `/home/<user>/CTF-OS` 같은 WSL2 Linux filesystem에 두는 것을 권장합니다. `/mnt/c`, `/mnt/d` 또는 다른 drvfs 위치는 경고만 발생하며 실행을 차단하지 않습니다. Native Ubuntu Linux x86_64는 compatible environment입니다.
+
+Docker Desktop 전용 기능은 요구하지 않습니다. WSL2 Ubuntu 안에서 `docker info`, `docker compose version`, `docker build`, `docker run`이 정상 동작하는 Docker Engine이면 됩니다. Python 3.11+와 `uv`도 필요합니다. GPU는 GPU-required workload가 있는 머신에서만 NVIDIA WSL2 GPU passthrough와 NVIDIA Container Toolkit을 선택 설치합니다. 일반 `docker build`가 기준이며 Buildx는 필수가 아닙니다. macOS, ARM64, multi-architecture image, host Podman runtime은 지원 범위가 아닙니다.
 
 ```bash
 git clone git@github.com:whatevertakes/CTF-OS.git
@@ -152,7 +154,7 @@ Full clean replay: not required before human submission
 
 저가치 branch를 중단하고 verifier는 최대 하나만 남길 수 있습니다. CTFd 자동 제출은 없으며 사람이 제출합니다. Strict replay는 나중에 `FULLY_VERIFIED`를 만들 수 있지만 flag 공개의 gate가 아닙니다.
 
-검증된 local PoC를 lead Sol이 declared remote에 한 번 명시적으로 연결할 때는 `working-poc-commit`을 사용합니다. 이 명령은 direct argv만 받고 sandbox ownership, fingerprint, target revision, local receipt와 artifact digest를 검증합니다. 같은 operation ID의 완료된 command는 다시 실행하지 않습니다.
+검증된 local PoC를 lead Sol이 declared remote에 한 번 명시적으로 연결할 때는 `working-poc-commit`을 사용합니다. 이 명령은 direct argv만 받고 sandbox ownership, fingerprint, target revision, local receipt와 artifact digest를 검증합니다. Remote executor 직전에 `EXECUTION_STARTED` intent와 attempt ID를 원자적으로 저장합니다. 완료된 operation은 재실행하지 않으며, intent 뒤 결과 저장 전에 중단된 operation은 `EXECUTION_OUTCOME_UNKNOWN`으로 고정하여 자동 재시도를 차단합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools working-poc-commit 1 --contest my-ctf \
@@ -162,6 +164,19 @@ uv run python -m ctf_os.agent_tools working-poc-commit 1 --contest my-ctf \
   --target-index 0 --success-condition 'flag in output' \
   --kill-condition 'remote rejects exploit' --operation-id remote-poc-v1 \
   -- python3 /artifacts/solve.py '<host>' '<port>'
+```
+
+Unknown outcome은 같은 operation ID에 `--force`를 붙여 재실행하지 않습니다. 운영자가 보존된 execution receipt를 검증해 projection을 계속하거나, 기존 operation을 폐기하거나, 새 operation ID에만 retry를 승인합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools working-poc-resolve-unknown 1 --contest my-ctf \
+  --run-id '<run-id>' --operation-id remote-poc-v1 \
+  --decision RECORD_RESULT --receipt-json '<exact-execution-receipt-json>'
+
+uv run python -m ctf_os.agent_tools working-poc-resolve-unknown 1 --contest my-ctf \
+  --run-id '<run-id>' --operation-id remote-poc-v1 \
+  --decision AUTHORIZE_RETRY --new-operation-id remote-poc-v2 \
+  --receipt-json '<operator-authorization-receipt-json>'
 ```
 
 Docker 회귀는 선택 profile build를 그대로 지원하며 실패한 profile 뒤에도 나머지를 빌드하고 마지막 summary에 성공/실패를 남깁니다. 실제 환경에서는 다음 marker로 image operation probe, sandbox lifecycle, service isolation을 각각 실행합니다.
