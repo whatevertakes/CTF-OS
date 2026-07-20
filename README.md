@@ -39,6 +39,16 @@ uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
 4. CTF-OS가 현재 문제만 challenge-local preflight로 안전하게 준비하고 즉시 exploit-first solve를 시작합니다.
 5. exact flag가 출력되면 사람이 제출합니다.
 
+문제가 아직 `problems.txt`에 없고 현재 Sol 세션에서만 전달된 경우에는 전체 manifest를 수정하지 않고 문제별 packet으로 준비할 수 있습니다.
+
+```bash
+uv run python -m ctf_os.agent_tools prepare-challenge misc/PromptOnly \
+  --contest "My CTF 2026" \
+  --session-input-json '{"category":"misc","name":"PromptOnly","description":"problem text","flag_format":"CTF{...}","remotes":["nc challenge.example 31337"],"source_paths":["uploads/challenge.bin"]}'
+```
+
+`source_paths`는 선택한 대회의 `incoming/<contest>/` 아래 경로만 허용됩니다. 정규화된 packet은 해당 문제 workspace의 `SESSION-INPUT.json`에 저장되고, 이후 runtime command는 같은 challenge-local 정의와 authorized target을 다시 사용합니다.
+
 Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ranking을 명시적으로 요청할 때만 쓰는 optional legacy/admin 도구입니다. Solve의 선행 단계나 readiness source가 아니며, 현재 운영은 전체 Board·난이도·성공확률로 개별 challenge를 유도하지 않습니다.
 
 ## 실제 solve 흐름

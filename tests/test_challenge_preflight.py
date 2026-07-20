@@ -6,6 +6,7 @@ import subprocess
 import zipfile
 
 from ctf_os.contest import discover_contests
+from ctf_os.preflight import _legacy_source_fingerprint
 from ctf_os.workspace import challenge_root
 from conftest import write_contest
 
@@ -228,3 +229,96 @@ def test_prepare_and_launch_schema_have_no_contest_triage_fields(repo: Path) -> 
         "recommendation bucket",
     ):
         assert forbidden not in rendered
+
+
+def test_legacy_fingerprint_migrates_terminal_run_without_losing_receipt(repo: Path) -> None:
+    _write_two_challenges(repo)
+    manifest = discover_contests(repo / "incoming")[0]
+    challenge = manifest.challenges[0]
+    source = repo / "incoming" / "Isolation CTF" / "misc" / "A"
+    workspace = challenge_root(repo, manifest, challenge)
+    workspace.mkdir(parents=True)
+    legacy_fingerprint = _legacy_source_fingerprint(challenge, [source])
+    (workspace / "STATE.json").write_text(json.dumps({
+        "challenge_id": challenge.id, "input_fingerprint": legacy_fingerprint,
+        "status": "SUBMISSION_RECOMMENDED", "flag_candidate": "ISO{legacy}",
+        "remote_flag_receipt": "flag-receipts/legacy.json",
+        "submission_recommended": True, "flag_history": [{"candidate": "ISO{legacy}"}],
+    }), encoding="utf-8")
+    receipts = workspace / "flag-receipts"
+    receipts.mkdir()
+    (receipts / "legacy.json").write_text('{"candidate":"ISO{legacy}"}\n', encoding="utf-8")
+
+    payload = _result(_prepare(repo, "misc/A"))
+    state = json.loads((Path(payload["run_root"]) / "STATE.json").read_text())
+    preflight = json.loads(Path(payload["preflight_record_path"]).read_text())
+
+    assert state["status"] == "SUBMISSION_RECOMMENDED"
+    assert state["flag_candidate"] == "ISO{legacy}"
+    assert state["input_fingerprint"] == preflight["source_fingerprint"]
+    assert state["fingerprint_scheme"] == preflight["fingerprint_scheme"] == "challenge-local-v2"
+    assert (Path(payload["run_root"]) / "flag-receipts" / "legacy.json").is_file()
+
+
+def test_prepare_recovers_missing_run_state_with_bound_fingerprint(repo: Path) -> None:
+    _write_two_challenges(repo)
+    first = _result(_prepare(repo, "misc/A"))
+    Path(first["run_root"]).joinpath("STATE.json").unlink()
+
+    repaired = _result(_prepare(repo, "misc/A"))
+    state = json.loads((Path(repaired["run_root"]) / "STATE.json").read_text())
+    record = json.loads(Path(repaired["preflight_record_path"]).read_text())
+    runtime = subprocess.run([
+        "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
+        "resource-history", "misc/A", "--contest", "Isolation CTF",
+    ], capture_output=True, text=True)
+
+    assert state["input_fingerprint"] == record["source_fingerprint"]
+    assert state["fingerprint_scheme"] == "challenge-local-v2"
+    assert runtime.returncode == 0, runtime.stdout + runtime.stderr
+
+
+def test_prepare_repairs_missing_or_tampered_preflight_companions(repo: Path) -> None:
+    _write_two_challenges(repo)
+    first = _result(_prepare(repo, "misc/A"))
+    workspace = Path(first["solve_root"])
+    (workspace / "inventory.json").unlink()
+    (workspace / "CONTEXT.md").write_text("tampered", encoding="utf-8")
+
+    _result(_prepare(repo, "misc/A"))
+    record = json.loads((workspace / "CHALLENGE-PREFLIGHT.json").read_text())
+    inventory = json.loads((workspace / "inventory.json").read_text())
+
+    assert inventory == {"schema_version": 1, "files": record["files"]}
+    assert (workspace / "CONTEXT.md").read_text() != "tampered"
+
+
+def test_session_input_prepares_unlisted_challenge_without_rewriting_manifest(repo: Path) -> None:
+    manifest_path = write_contest(repo, "# Session CTF\n", "Session CTF")
+    upload = manifest_path.parent / "uploads" / "prompt.bin"
+    upload.parent.mkdir()
+    upload.write_bytes(b"prompt supplied challenge")
+    before = manifest_path.read_bytes()
+    packet = json.dumps({
+        "category": "misc", "name": "PromptOnly", "description": "from current Sol session",
+        "flag_format": "SESS{...}", "remotes": ["nc 8.8.8.8 31337"],
+        "source_paths": ["uploads/prompt.bin"],
+    })
+    prepared = subprocess.run([
+        "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
+        "prepare-challenge", "misc/PromptOnly", "--contest", "Session CTF",
+        "--session-input-json", packet,
+    ], capture_output=True, text=True)
+    payload = _result(prepared)
+    workspace = Path(payload["solve_root"])
+    record = json.loads((workspace / "CHALLENGE-PREFLIGHT.json").read_text())
+    runtime = subprocess.run([
+        "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
+        "resource-history", "misc/PromptOnly", "--contest", "Session CTF",
+    ], capture_output=True, text=True)
+
+    assert manifest_path.read_bytes() == before
+    assert (workspace / "SESSION-INPUT.json").is_file()
+    assert (workspace / "input" / "prompt.bin").read_bytes() == b"prompt supplied challenge"
+    assert record["authorized_targets"][0]["host"] == "8.8.8.8"
+    assert runtime.returncode == 0, runtime.stdout + runtime.stderr

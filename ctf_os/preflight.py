@@ -19,8 +19,9 @@ import yaml
 from .archive import ArchiveError, ArchiveLimits, bounded_source_files, copy_tree_without_links, extract_archive
 from .contest import ChallengeSpec, ContestManifest
 from .sandbox.network import parse_remotes
+from .session_input import SESSION_INPUT_NAME, session_input_fingerprint, session_source_paths
 from .workspace import (
-    atomic_json, atomic_text, bind_input_fingerprint, challenge_root, preflight_lock,
+    CURRENT_FINGERPRINT_SCHEME, atomic_json, atomic_text, bind_input_fingerprint, challenge_root, preflight_lock,
     resolve_active_run, safe_under,
 )
 
@@ -127,6 +128,8 @@ def load_challenge_preflight(
         raise ValueError("Challenge runtime state is not prepared: local preflight record is unreadable") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != PREFLIGHT_SCHEMA_VERSION:
         raise ValueError("Challenge runtime state is not prepared: local preflight schema is invalid")
+    if payload.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
+        raise ValueError("Challenge runtime state is stale because its fingerprint scheme is unsupported")
     if any(key in payload for key in ("contest", "challenges", "summary")):
         raise ValueError("Challenge runtime state is not prepared: local preflight contains contest-wide data")
     selected = payload.get("challenge")
@@ -182,6 +185,20 @@ def load_challenge_preflight(
     prepared_fingerprint = _fingerprint(payload.get("prepared_fingerprint"), "prepared")
     if prepared_fingerprint != prepared_tree_fingerprint(prepared):
         raise ValueError("Challenge runtime state is stale because the prepared challenge input fingerprint changed")
+    inventory_path = destination / "inventory.json"
+    context_path = destination / "CONTEXT.md"
+    if inventory_path.is_symlink() or not inventory_path.is_file():
+        raise ValueError("Challenge runtime state is not prepared: inventory is missing or unsafe")
+    try:
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Challenge runtime state is not prepared: inventory is unreadable") from exc
+    if inventory != {"schema_version": 1, "files": payload["files"]}:
+        raise ValueError("Challenge runtime state is stale because inventory was changed")
+    if context_path.is_symlink() or not context_path.is_file():
+        raise ValueError("Challenge runtime state is not prepared: context is missing or unsafe")
+    if context_path.read_text(encoding="utf-8") != render_context(manifest, payload):
+        raise ValueError("Challenge runtime state is stale because context was changed")
     expected_targets = [target.to_dict() for target in parse_remotes(challenge.remotes)]
     if payload.get("authorized_targets") != expected_targets:
         raise ValueError("Challenge runtime state is stale because selected challenge scope changed or was tampered")
@@ -198,6 +215,8 @@ def load_challenge_preflight(
             raise ValueError("Challenge runtime state is not prepared: challenge state identity is invalid")
         if state.get("input_fingerprint") != source_fingerprint:
             raise ValueError("Challenge runtime state is stale because challenge state fingerprint changed")
+        if state.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
+            raise ValueError("Challenge runtime state is stale because challenge state fingerprint scheme changed")
     return dict(payload)
 
 
@@ -235,6 +254,7 @@ def _inspect_challenge(
         "containerized_challenge": False, "service_plan": {"kind": "none", "status": "UNAVAILABLE", "safe_to_start": False, "services": []},
         "workspace_path": str(destination), "prepared_input": str(destination / "input"),
         "source_fingerprint": None, "prepared_fingerprint": None,
+        "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
         "observation_hints": [], "recommended_environment": {},
     }
     try:
@@ -243,11 +263,14 @@ def _inspect_challenge(
         base["source_paths"] = [str(path) for path in sources]
         if not sources and not challenge.remotes:
             raise ValueError("contest.md entry has no matching directory/archive and no authorized remote")
+        session_fingerprint = session_input_fingerprint(destination / SESSION_INPUT_NAME)
         input_dir, archive_records, fingerprint, prepared_fingerprint = _materialize(
             destination, challenge, sources, force=force_materialize,
+            session_fingerprint=session_fingerprint,
         )
         base["archives"] = archive_records
         base["source_fingerprint"] = fingerprint
+        base["session_input_fingerprint"] = session_fingerprint
         base["prepared_fingerprint"] = prepared_fingerprint
         files = [_inspect_file(input_dir, path) for path in _regular_files(input_dir)] if input_dir.exists() else []
         base["files"] = files
@@ -264,7 +287,10 @@ def _inspect_challenge(
         base["read_paths"] = [str(manifest.path), str(destination / "CONTEXT.md")]
         base["read_on_demand"] = [str(input_dir), str(destination / "inventory.json")]
         if bind_solve_state:
-            run_root = bind_input_fingerprint(destination, challenge, fingerprint)
+            run_root = bind_input_fingerprint(
+                destination, challenge, fingerprint,
+                legacy_fingerprints=(_legacy_source_fingerprint(challenge, sources),),
+            )
             base["read_paths"].extend([
                 str(run_root / "STATE.json"), str(run_root / "FINDINGS.md"),
             ])
@@ -282,6 +308,9 @@ def _inspect_challenge(
 
 
 def _match_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> list[Path]:
+    session_sources = session_source_paths(manifest, challenge)
+    if session_sources is not None:
+        return session_sources
     category_root = manifest.path.parent / challenge.category
     if not category_root.exists() and challenge.category == "forensic":
         alias = manifest.path.parent / "forensics"
@@ -311,9 +340,10 @@ def _materialize(
     sources: list[Path],
     *,
     force: bool = False,
+    session_fingerprint: str | None = None,
 ) -> tuple[Path, list[dict[str, object]], str, str]:
     limits = _ARCHIVE_LIMITS[challenge.input_profile]
-    fingerprint = _source_fingerprint(challenge, sources)
+    fingerprint = _source_fingerprint(challenge, sources, session_fingerprint=session_fingerprint)
     input_dir = destination / "input"
     marker = destination / ".input-fingerprint"
     metadata_path = destination / ".archive-metadata.json"
@@ -344,8 +374,16 @@ def _materialize(
                 lower = source.name.casefold()
                 if lower.endswith((".7z", ".rar")):
                     raise ArchiveError(f"{source.name}: safe built-in extraction is unavailable; unpack it into a named directory")
-                members = extract_archive(source, staging, limits)
-                archives.append({"path": str(source), "sha256": _sha256(source), "size": source.stat().st_size, "members": members, "extracted": True})
+                if any(lower.endswith(suffix) for suffix in ARCHIVE_SUFFIXES):
+                    members = extract_archive(source, staging, limits)
+                    archives.append({"path": str(source), "sha256": _sha256(source), "size": source.stat().st_size, "members": members, "extracted": True})
+                else:
+                    if source.stat().st_size > limits.max_file_bytes:
+                        raise ArchiveError(f"source file exceeds size limit: {source.name}")
+                    target = staging / source.name
+                    if target.exists():
+                        raise ArchiveError(f"session source file name collision: {source.name}")
+                    shutil.copy2(source, target, follow_symlinks=False)
             prepared_tree_fingerprint(staging)
         _make_read_only(staging)
         if old.exists():
@@ -363,7 +401,9 @@ def _materialize(
     return input_dir, archives, fingerprint, prepared_tree_fingerprint(input_dir)
 
 
-def _source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
+def _source_fingerprint(
+    challenge: ChallengeSpec, sources: list[Path], *, session_fingerprint: str | None = None,
+) -> str:
     # Deliberately exclude ordinal selectors, score, and contest-wide metadata.
     # Renumbering or editing a sibling challenge must not stale this workspace.
     selected_identity_and_input = {
@@ -381,6 +421,9 @@ def _source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
     digest = hashlib.sha256(
         json.dumps(selected_identity_and_input, ensure_ascii=False, sort_keys=True).encode()
     )
+    if session_fingerprint is not None:
+        digest.update(b"session-input\0")
+        digest.update(bytes.fromhex(session_fingerprint))
     for source in sources:
         digest.update(b"file\0" if source.is_file() else b"directory\0")
         digest.update(source.name.encode())
@@ -401,8 +444,37 @@ def _source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
     return digest.hexdigest()
 
 
+def _legacy_source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
+    """Reproduce the pre challenge-local fingerprint only for safe migration."""
+
+    digest = hashlib.sha256(
+        json.dumps(challenge.to_dict(), ensure_ascii=False, sort_keys=True).encode()
+    )
+    for source in sources:
+        digest.update(source.name.encode())
+        if source.is_file():
+            digest.update(bytes.fromhex(_sha256(source)))
+        else:
+            limits = _ARCHIVE_LIMITS[challenge.input_profile]
+            total = 0
+            for path in bounded_source_files(source, limits):
+                size = path.stat().st_size
+                if size > limits.max_file_bytes:
+                    raise ArchiveError(f"source file exceeds size limit: {path.relative_to(source)}")
+                total += size
+                if total > limits.max_total_bytes:
+                    raise ArchiveError("source directory exceeds total size limit")
+                digest.update(path.relative_to(source).as_posix().encode())
+                digest.update(bytes.fromhex(_sha256(path)))
+    return digest.hexdigest()
+
+
 def current_source_fingerprint(manifest: ContestManifest, challenge: ChallengeSpec) -> str:
-    return _source_fingerprint(challenge, _match_sources(manifest, challenge))
+    destination = challenge_root(manifest.path.parents[2], manifest, challenge)
+    return _source_fingerprint(
+        challenge, _match_sources(manifest, challenge),
+        session_fingerprint=session_input_fingerprint(destination / SESSION_INPUT_NAME),
+    )
 
 
 def prepared_tree_fingerprint(root: Path) -> str:
@@ -425,7 +497,13 @@ def prepared_tree_fingerprint(root: Path) -> str:
 
 
 def _archive_metadata(sources: list[Path]) -> list[dict[str, object]]:
-    return [{"path": str(path), "sha256": _sha256(path), "size": path.stat().st_size, "extracted": True} for path in sources if path.is_file()]
+    return [
+        {
+            "path": str(path), "sha256": _sha256(path), "size": path.stat().st_size,
+            "extracted": any(path.name.casefold().endswith(suffix) for suffix in ARCHIVE_SUFFIXES),
+        }
+        for path in sources if path.is_file()
+    ]
 
 
 def _regular_files(root: Path) -> list[Path]:

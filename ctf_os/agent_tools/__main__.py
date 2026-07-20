@@ -32,6 +32,7 @@ from ..resources.scheduler import (
 from ..oast import create_oast, oast_events, poll_oast
 from ..replay import run_replay
 from ..problems import sync_contest_manifest
+from ..session_input import parse_session_input, resolve_session_challenge
 from ..preflight import (
     load_challenge_preflight, prepare_selected_challenge, prepared_tree_fingerprint,
 )
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
+    prepare.add_argument("--session-input-json")
     resource_status = commands.add_parser("resource-status")
     resource_status.add_argument("--contest")
     if not child_surface:
@@ -532,7 +534,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return export_artifacts(metadata, session_id=session_id, session_role=role)
 
     if args.command == "prepare-challenge":
-        manifest, challenge, record = _prepare_challenge_same_session(root, args.contest, args.selector)
+        manifest, challenge, record = _prepare_challenge_same_session(
+            root, args.contest, args.selector, args.session_input_json,
+        )
         workspace = challenge_root(root, manifest, challenge)
         solve_root = initialize_solve_files(workspace, challenge, str(record["source_fingerprint"]))
         launch_context = build_solve_launch_context(challenge, record)
@@ -991,7 +995,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         except ValueError as exc:
             raise ValueError("prepared challenge input escapes its challenge workspace") from exc
         if Path(str(record.get("prepared_input", ""))).resolve() != expected_source:
-            raise ValueError("intake index prepared_input is outside the selected challenge workspace")
+            raise ValueError("preflight record prepared_input is outside the selected challenge workspace")
         if record.get("prepared_fingerprint") != prepared_tree_fingerprint(input_path):
             raise ValueError("prepared challenge input changed after preparation; run same-session preparation again")
         supported_profiles = {'pwn', 'web', 'rev', 'crypto', 'forensic', 'misc', 'osint', 'ai', 'cloud'}
@@ -1059,7 +1063,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 elif network.get("internal") is not True: reasons.append("network is not internal")
                 raise ValueError("managed service attachment failed: " + ", ".join(reasons or ["service unavailable"]))
         elif args.service:
-            raise ValueError("managed service attachment failed: intake has no service plan")
+            raise ValueError("managed service attachment failed: challenge preparation has no service plan")
         session_id, session_role = _caller(args, branch=args.branch)
         resource_state = ledger.load()
         request_raw = resource_state.get("requests", {}).get(session_id)
@@ -1221,7 +1225,7 @@ def _service_spec(
 ) -> ServiceSpec:
     plan = record.get("service_plan")
     if not isinstance(plan, dict) or not plan.get("kind"):
-        raise ValueError("intake found no Dockerfile/Compose challenge service plan")
+        raise ValueError("challenge preparation found no Dockerfile/Compose service plan")
     return ServiceSpec(
         contest_slug=manifest.slug, challenge_id=challenge.id,
         source=challenge_workspace(solve_root) / "input", workspace=solve_root, service_plan=plan,
@@ -1464,12 +1468,16 @@ def _state_summary(solve_root: Path) -> dict[str, object]:
     )}
 
 
-def _prepare_challenge_same_session(root: Path, contest_selector: str | None, selector: str):
+def _prepare_challenge_same_session(
+    root: Path, contest_selector: str | None, selector: str,
+    session_input_json: str | None = None,
+):
     """Prepare only the selected challenge in the current Sol session."""
 
     sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-    challenge = resolve_selector(manifest.challenges, selector)
+    packet = parse_session_input(session_input_json) if session_input_json else None
+    challenge = resolve_session_challenge(root, manifest, selector, packet)
     try:
         record = prepare_selected_challenge(root, manifest, challenge)
     except Exception as exc:
@@ -1486,7 +1494,7 @@ def _load_challenge_strict(root: Path, contest_selector: str | None, selector: s
 
     sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-    challenge = resolve_selector(manifest.challenges, selector)
+    challenge = resolve_session_challenge(root, manifest, selector)
     return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
 
 

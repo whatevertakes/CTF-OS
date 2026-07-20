@@ -20,6 +20,8 @@ RUN_SCHEMA_VERSION = 3
 ACTIVE_RUN_SCHEMA_VERSION = 1
 RUN_MANIFEST_SCHEMA_VERSION = 1
 TARGET_REVISION_SCHEMA_VERSION = 1
+CURRENT_FINGERPRINT_SCHEME = "challenge-local-v2"
+LEGACY_FINGERPRINT_SCHEME = "challenge-v1"
 IMMUTABLE_RUN_STATUSES = frozenset({"ACCEPTED", "SEALED", "SOLVED", "SEALED_CLEAN"})
 LEGACY_RUN_FILES = (
     "STATE.json", "RESULT.md", "FINDINGS.md", "evidence.log", "findings.jsonl",
@@ -199,7 +201,7 @@ def initialize_solve_files(
 def bind_input_fingerprint(
     root: Path, challenge: ChallengeSpec, fingerprint: str, *,
     target_revision: int | None = None, requested_model: str = "",
-    requested_reasoning: str = "",
+    requested_reasoning: str = "", legacy_fingerprints: Sequence[str] = (),
 ) -> Path:
     """Bind a run without mutating or erasing any previous run generation."""
 
@@ -217,8 +219,25 @@ def bind_input_fingerprint(
         pointer = _active_pointer_unlocked(workspace)
         if pointer and pointer.get("input_fingerprint") == fingerprint and pointer.get("target_revision") == revision:
             run = workspace / "runs" / str(pointer["run_id"])
+            if not (run / "STATE.json").is_file():
+                return _create_run_unlocked(
+                    workspace, challenge=challenge, fingerprint=fingerprint,
+                    target_revision=revision, requested_model=requested_model,
+                    requested_reasoning=requested_reasoning,
+                )
             _validate_run_identity(run, fingerprint, revision)
+            _stamp_fingerprint_scheme(run, workspace)
             return run
+        if (
+            pointer and pointer.get("input_fingerprint") in set(legacy_fingerprints)
+            and pointer.get("target_revision") == revision
+        ):
+            return _migrate_fingerprint_run_unlocked(
+                workspace, challenge=challenge, pointer=pointer,
+                fingerprint=fingerprint, target_revision=revision,
+                requested_model=requested_model,
+                requested_reasoning=requested_reasoning,
+            )
         run = _create_run_unlocked(
             workspace, challenge=challenge, fingerprint=fingerprint,
             target_revision=revision, requested_model=requested_model,
@@ -369,6 +388,7 @@ def _create_run_unlocked(
             "remote_flag_receipt": None, "remote_candidate_receipt": None, "flag_history": [],
             "submission_history": [],
             "input_fingerprint": fingerprint, "target_revision": target_revision,
+            "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
             "created_at": now, "updated_at": now,
         })
         _ensure_run_files(run, challenge)
@@ -380,6 +400,7 @@ def _create_run_unlocked(
         "schema_version": ACTIVE_RUN_SCHEMA_VERSION, "run_id": run_id,
         "challenge_id": challenge.id, "input_fingerprint": fingerprint,
         "target_revision": target_revision, "updated_at": utc_now(),
+        "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
     }
     atomic_json(workspace / "ACTIVE_RUN.json", pointer)
     return run
@@ -421,6 +442,7 @@ def _migrate_legacy_unlocked(workspace: Path, challenge: ChallengeSpec | None = 
             "input_fingerprint": fingerprint,
             "target_revision": revision, "migrated_from_legacy": True,
             "sealed": bool(state.get("sealed") or state.get("status") in IMMUTABLE_RUN_STATUSES),
+            "fingerprint_scheme": state.get("fingerprint_scheme") or LEGACY_FINGERPRINT_SCHEME,
         })
         migrated.setdefault("flag_history", [])
         migrated.setdefault("submission_recommended", False)
@@ -465,6 +487,7 @@ def _migrate_legacy_unlocked(workspace: Path, challenge: ChallengeSpec | None = 
         "schema_version": ACTIVE_RUN_SCHEMA_VERSION, "run_id": run_id,
         "challenge_id": challenge_id, "input_fingerprint": fingerprint,
         "target_revision": revision, "legacy_compatibility_view": True,
+        "fingerprint_scheme": state.get("fingerprint_scheme") or LEGACY_FINGERPRINT_SCHEME,
         "updated_at": utc_now(),
     })
     return True
@@ -565,6 +588,72 @@ def _active_pointer_unlocked(workspace: Path) -> dict[str, Any] | None:
     if pointer.get("schema_version") != ACTIVE_RUN_SCHEMA_VERSION:
         raise WorkspaceError("ACTIVE_RUN.json has an unsupported schema_version")
     return pointer
+
+
+def _stamp_fingerprint_scheme(run: Path, workspace: Path) -> None:
+    state_path = run / "STATE.json"
+    state = _load_json_object(state_path, "run state")
+    if state.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
+        state["fingerprint_scheme"] = CURRENT_FINGERPRINT_SCHEME
+        state["updated_at"] = utc_now()
+        atomic_json(state_path, state)
+    pointer = _load_json_object(workspace / "ACTIVE_RUN.json", "active run pointer")
+    if pointer.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
+        pointer["fingerprint_scheme"] = CURRENT_FINGERPRINT_SCHEME
+        pointer["updated_at"] = utc_now()
+        atomic_json(workspace / "ACTIVE_RUN.json", pointer)
+
+
+def _migrate_fingerprint_run_unlocked(
+    workspace: Path, *, challenge: ChallengeSpec, pointer: Mapping[str, Any],
+    fingerprint: str, target_revision: int, requested_model: str,
+    requested_reasoning: str,
+) -> Path:
+    """Clone a byte-equivalent legacy run and atomically publish its v2 identity."""
+
+    source = safe_under(workspace / "runs", Path(_identifier(pointer.get("run_id"), "run_id")))
+    legacy_state = _validate_run_identity(source, str(pointer.get("input_fingerprint")), target_revision)
+    run_id = _content_run_id(challenge.id, fingerprint, target_revision)
+    target = safe_under(workspace / "runs", Path(run_id))
+    if target.exists():
+        _validate_run_identity(target, fingerprint, target_revision)
+    else:
+        target.mkdir(parents=True)
+        for path in sorted(source.iterdir(), key=lambda item: item.name):
+            destination = target / path.name
+            if path.is_symlink():
+                raise WorkspaceError(f"legacy fingerprint migration contains a symlink: {path}")
+            if path.is_dir():
+                _copy_tree_without_symlinks(path, destination)
+            elif path.name not in {"STATE.json", "RUN_MANIFEST.json"}:
+                _atomic_copy_file(path, destination)
+        migrated = dict(legacy_state)
+        migrated.update({
+            "schema_version": RUN_SCHEMA_VERSION, "run_id": run_id,
+            "input_fingerprint": fingerprint,
+            "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
+            "migrated_from_fingerprint": pointer.get("input_fingerprint"),
+            "updated_at": utc_now(),
+        })
+        atomic_json(target / "STATE.json", migrated)
+        atomic_json(target / "RUN_MANIFEST.json", _run_manifest(
+            workspace, challenge, run_id, fingerprint, target_revision,
+            requested_model=requested_model, requested_reasoning=requested_reasoning,
+        ))
+        _ensure_run_files(target, challenge)
+    atomic_json(workspace / "ACTIVE_RUN.json", {
+        "schema_version": ACTIVE_RUN_SCHEMA_VERSION, "run_id": run_id,
+        "challenge_id": challenge.id, "input_fingerprint": fingerprint,
+        "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
+        "target_revision": target_revision, "updated_at": utc_now(),
+        "migrated_from_run_id": pointer.get("run_id"),
+    })
+    if (workspace / "STATE.json").is_file():
+        projected = _load_json_object(target / "STATE.json", "run state")
+        projected["compatibility_view"] = True
+        projected["authoritative_state"] = str((target / "STATE.json").relative_to(workspace))
+        atomic_json(workspace / "STATE.json", projected)
+    return target
 
 
 def _validate_run_identity(
