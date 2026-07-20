@@ -16,6 +16,8 @@ from typing import Any
 from .delegation import (
     BranchCandidate, DelegationError, admit_branch, load_templates, plan_path, utc_now,
 )
+from .modes import SolveMode, resolve_solve_mode, validate_branch_intents
+from .race_lineage import plan_race_generation
 from .workspace import (
     append_jsonl_fsync, atomic_json, atomic_text, ensure_run_mutable,
     read_jsonl_strict, state_lock,
@@ -96,7 +98,19 @@ class RaceBranchSpec:
         )
 
 
-def parse_branch_spec(value: str | None, *, category: str, tier: int, template_path: Path) -> list[RaceBranchSpec]:
+def parse_branch_spec(
+    value: str | None, *, category: str, tier: int | None, template_path: Path,
+    mode: SolveMode | str | None = None,
+) -> list[RaceBranchSpec]:
+    selected_mode = resolve_solve_mode(mode, tier=tier)
+    if selected_mode is SolveMode.SOL_ONLY:
+        if value:
+            raise DelegationError("sol-only mode forbids child branch intents")
+        return []
+    if selected_mode is SolveMode.FIXED_RACE and value:
+        raise DelegationError("fixed-race branch contracts must come only from the frozen category template")
+    if selected_mode is SolveMode.ADAPTIVE_RACE and tier is None and value is None:
+        return []
     if value:
         path = Path(value)
         if path.exists():
@@ -116,12 +130,13 @@ def parse_branch_spec(value: str | None, *, category: str, tier: int, template_p
         if len(specs) != len(rows):
             raise DelegationError("every branch spec entry must be an object")
         return specs
-    if tier == 0:
-        return []
     templates = load_templates(template_path)
     selected = category if category in templates else "misc"
-    rows = templates[selected][f"tier_{tier}"]
-    width = DEFAULT_WIDTH[tier]
+    template_tier = 2 if selected_mode is SolveMode.FIXED_RACE else tier
+    if template_tier is None:
+        raise DelegationError("adaptive template compatibility requires an explicit legacy tier")
+    rows = templates[selected][f"tier_{template_tier}"]
+    width = 3 if selected_mode is SolveMode.FIXED_RACE else DEFAULT_WIDTH[tier]
     if len(rows) < width:
         raise DelegationError(f"race template {selected}.tier_{tier} has fewer than {width} branches")
     return [_template_spec(row, index=index, category=selected) for index, row in enumerate(rows[:width])]
@@ -129,12 +144,22 @@ def parse_branch_spec(value: str | None, *, category: str, tier: int, template_p
 
 def start_race_plan(
     solve_root: Path, *, challenge_id: str, input_fingerprint: str,
-    parent_session_id: str, category: str, tier: int, tier_reason: str,
+    parent_session_id: str, category: str, tier: int | None, tier_reason: str,
     branch_specs: Sequence[RaceBranchSpec], threshold: float = .95,
+    mode: SolveMode | str | None = None, frozen_template: bool | None = None,
 ) -> dict[str, Any]:
     solve_root = ensure_run_mutable(solve_root)
-    if tier not in range(0, 5):
+    if tier is not None and tier not in range(0, 5):
         raise DelegationError("tier must be an integer from 0 through 4")
+    selected_mode = resolve_solve_mode(mode, tier=tier)
+    if mode is None and tier == 0 and branch_specs:
+        # Historical direct API calls supplied an explicit branch contract with
+        # tier 0. Preserve them as an explicit adaptive intent; tier alone still
+        # maps to sol-only and never creates a child.
+        selected_mode = SolveMode.ADAPTIVE_RACE
+    frozen = bool(frozen_template) if frozen_template is not None else selected_mode is SolveMode.FIXED_RACE
+    if mode is not None:
+        validate_branch_intents(selected_mode, len(branch_specs), frozen_template=frozen)
     state_file = solve_root / "STATE.json"
     if state_file.is_symlink() or not state_file.is_file():
         raise DelegationError("challenge STATE.json is missing or unsafe")
@@ -147,7 +172,7 @@ def start_race_plan(
         or current_state.get("input_fingerprint") != input_fingerprint
     ):
         raise DelegationError("race plan challenge identity or input fingerprint mismatch")
-    if tier in {1, 2, 3} and len(branch_specs) < DEFAULT_WIDTH[tier]:
+    if mode is None and tier in {1, 2, 3} and len(branch_specs) < DEFAULT_WIDTH[tier]:
         raise DelegationError(f"tier {tier} race requires at least {DEFAULT_WIDTH[tier]} child branches")
     request_id = os.urandom(12).hex()
     _append_ledger(solve_root, {
@@ -163,7 +188,8 @@ def start_race_plan(
         "run_id": current_state.get("run_id"),
         "target_revision": int(current_state.get("target_revision") or 1),
         "parent_session_id": parent_session_id,
-        "tier": tier, "tier_reason": tier_reason, "race_mode": "competition-first",
+        "tier": tier, "tier_reason": tier_reason, "mode": selected_mode.value,
+        "race_mode": selected_mode.value,
         "sol_lane": {
             "session_id": parent_session_id, "role": "lead-attacker-and-race-coordinator",
             "required": True, "status": "RUNNING",
@@ -188,10 +214,11 @@ def start_race_plan(
             continue
         plan["branches"].append(_branch_payload(
             spec, decision, challenge_id, input_fingerprint, parent_session_id,
-            tier=tier, tier_reason=tier_reason,
+            tier=tier or 0, tier_reason=tier_reason,
             run_id=current_state.get("run_id"),
             target_revision=int(current_state.get("target_revision") or 1),
         ))
+    compatibility_archive: tuple[Path, dict[str, Any]] | None = None
     with state_lock(solve_root):
         current = plan_path(solve_root)
         if current.is_symlink():
@@ -208,15 +235,27 @@ def start_race_plan(
                     "created_at": utc_now(),
                 }, label="race plan ledger")
             else:
-                for branch in old.get("branches", []):
-                    if isinstance(branch, dict):
-                        branch["status"] = "STALE"
-                old["status"] = "STALE"
-                old["superseded_at"] = utc_now()
-                old["superseded_by_race_id"] = request_id
                 archive = solve_root / f"DELEGATION_PLAN.stale-{str(old.get('race_id') or old.get('input_fingerprint') or 'legacy')[:16]}-{request_id[:8]}.json"
-                atomic_json(archive, old)
-        atomic_json(current, plan)
+                compatibility_archive = (archive, old)
+    try:
+        projection = plan_race_generation(
+            solve_root, race_id=request_id, mode=selected_mode,
+            parent_session_id=parent_session_id, branches=plan["branches"],
+            legacy_tier=tier, tier_reason=tier_reason, frozen_template=frozen,
+            legacy_compatibility=mode is None,
+        )
+    except Exception:
+        raise
+    if compatibility_archive is not None:
+        archive, old = compatibility_archive
+        for branch in old.get("branches", []):
+            if isinstance(branch, dict):
+                branch["status"] = "STALE"
+        old["status"] = "STALE"
+        old["superseded_at"] = utc_now()
+        old["superseded_by_race_id"] = request_id
+        atomic_json(archive, old)
+    plan = json.loads(plan_path(solve_root).read_text(encoding="utf-8"))
     _append_ledger(solve_root, {
         "event": "RACE_PLAN_COMMITTED", "request_id": request_id,
         "admitted": [row["session_id"] for row in plan["branches"]],
@@ -295,14 +334,18 @@ def race_board(
         if row["status"] == "RUNNING" and row["native_start_state"] == "CONFIRMED"
         and row["input_available"] and row["identity_matches_current_run"]
     ]
-    legacy_view = not plan.get("run_id")
+    legacy_view = bool(plan.get("legacy_board_view")) or not plan.get("run_id")
     return {
         "challenge_id": plan.get("challenge_id"), "tier": plan.get("tier"),
         "race_id": plan.get("race_id"), "race_start_time": plan.get("created_at"),
-        "mode": "competition-first", "sol_lane": plan.get("sol_lane"),
+        "mode": plan.get("mode") or plan.get("race_mode") or "adaptive-race",
+        "sol_lane": plan.get("sol_lane") or {
+            "session_id": plan.get("parent_session_id"), "status": "RUNNING",
+        },
         "planned_branches": branches,
         "active_branches": branches if legacy_view else running,
-        "planned_width": planned_width, "admitted_width": admitted_width,
+        "planned_width": planned_width, "active_width": len(running),
+        "admitted_width": admitted_width,
         "native_started_width": native_started_width, "running_width": len(running),
         "rejected_exact_duplicates": list(rejected),
         "flag_candidate": state.get("flag_candidate") if state else None,
@@ -460,3 +503,5 @@ def _strings(value: Any) -> list[str]:
     if not rows or any(not row for row in rows):
         raise DelegationError("race branch list field must contain non-empty strings")
     return rows
+    if selected_mode is SolveMode.ADAPTIVE_RACE and tier is None and value is None:
+        return []

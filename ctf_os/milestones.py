@@ -277,6 +277,11 @@ def repair_receipt_projections(
 
 def repair_run_projections(root: Path, *, declared_remote: bool = False) -> dict[str, Any]:
     run = resolve_active_run(root)
+    lineage = None
+    if (run / "RACE_LINEAGE.jsonl").is_file():
+        from .race_lineage import recover_lineage_projections
+
+        lineage = recover_lineage_projections(run)
     try:
         current_state = _state(run)
     except MilestoneError:
@@ -313,6 +318,7 @@ def repair_run_projections(root: Path, *, declared_remote: bool = False) -> dict
         "run_id": run.name, "repaired_receipts": repaired,
         "deferred_immutable_receipts": deferred,
         "race_transitions": transitions,
+        "race_lineage": lineage,
         "remote_receipts": remote, "submission_receipts": submission,
     }
 
@@ -345,6 +351,28 @@ def _project_child_terminal_result(run: Path, receipt: Mapping[str, Any]) -> Non
 
     path = run / "DELEGATION_PLAN.json"
     if not path.exists() and not path.is_symlink():
+        return
+    if (run / "RACE_LINEAGE.jsonl").is_file():
+        from .race_lineage import append_lineage_event, lineage_state
+
+        session_id = str(receipt.get("session_id") or "")
+        branch = next((
+            row for row in lineage_state(run)["branches"]
+            if row.get("session_id") == session_id
+        ), None)
+        if branch is None:
+            raise MilestoneError("terminal result session does not exist in race lineage")
+        detail = receipt.get("details") if isinstance(receipt.get("details"), Mapping) else {}
+        outcome = str(detail.get("status") or "TERMINAL").upper()
+        append_lineage_event(
+            run, event="CHILD_TERMINAL_RESULT_RECORDED",
+            branch_id=str(branch["branch_id"]), referenced_receipt=receipt,
+            details={
+                "result_status": outcome,
+                "terminal_result_receipt_id": receipt.get("receipt_id"),
+                "terminal_result_receipt": dict(receipt),
+            },
+        )
         return
     with state_lock(run):
         if path.is_symlink() or not path.is_file():

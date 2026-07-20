@@ -3,7 +3,7 @@ name = "ctf-os"
 version = "3.0.0"
 description = "Competition-first Sol-native race tools for authorized CTF solving"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6.0.2"]
+dependencies = ["cryptography>=45.0.0", "PyYAML>=6.0.2"]
 
 [build-system]
 requires = ["setuptools>=68"]

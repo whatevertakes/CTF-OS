@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contest import ChallengeSpec
+from .modes import SolveMode, resolve_solve_mode
 from .preflight import prepared_input_bytes
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json
@@ -26,6 +27,7 @@ OBSERVATION_HINT_SEMANTICS = (
 def build_solve_launch_context(
     challenge: ChallengeSpec,
     record: dict[str, object],
+    *, mode: SolveMode | str | None = None, legacy_tier: int | None = None,
 ) -> dict[str, object]:
     """Project current selected-challenge evidence into bounded solve context."""
 
@@ -39,6 +41,7 @@ def build_solve_launch_context(
         maximum=MAX_OBSERVATION_HINTS,
         length=240,
     )
+    selected_mode = resolve_solve_mode(mode, tier=legacy_tier)
     context: dict[str, object] = {
         "schema_version": SOLVE_LAUNCH_SCHEMA_VERSION,
         "challenge_id": challenge.id,
@@ -54,6 +57,15 @@ def build_solve_launch_context(
         },
         "input_fingerprint": str(record.get("source_fingerprint") or ""),
         "objective": "FIRST_VALID_FLAG",
+        "solve_mode": selected_mode.value,
+        "legacy_tier": legacy_tier,
+        "sol_lane": {"status": "RUNNING", "session_id": "sol-main"},
+        "planned_child_width": 0,
+        "active_child_width": 0,
+        "bounded_observation": {
+            "status": "PENDING" if selected_mode is SolveMode.ADAPTIVE_RACE else "NOT_REQUIRED",
+            "minimum_seconds": 60, "maximum_seconds": 90,
+        },
         "authorized_targets": [_target(item) for item in targets],
         "authorized_target_count": target_count,
         "priority_files": files,
@@ -76,6 +88,11 @@ def build_solve_launch_context(
             "preflight_hints_are_not_confirmed_vulnerabilities": True,
             "discard_refuted_hints_immediately": True,
             "python_must_not_choose_tier_or_spawn_children": True,
+            "python_must_not_create_native_model_sessions": True,
+            "mode_is_authoritative": True,
+            "tier_is_legacy_resource_hint_only": True,
+            "fixed_race_requires_exactly_three_frozen_intents": True,
+            "adaptive_replacement_limit": 1,
             "observation_hint_semantics": OBSERVATION_HINT_SEMANTICS,
         },
     }

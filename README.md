@@ -62,7 +62,7 @@ Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ra
 ```text
 selected challenge resolution
 → challenge-local preflight
-→ fingerprint·target revision에 결합된 run 생성/선택
+→ deterministic challenge instance와 독립 attempt에 결합된 run 생성/선택
 → category command budget 안의 minimal recon
 → concrete exploit hypotheses 선택
 → decisive experiments 즉시 실행
@@ -75,14 +75,17 @@ selected challenge resolution
 → ACCEPTED이면 branch stop·sandbox/resource cleanup·run seal
 ```
 
-Race의 목적은 여러 연구 관점을 모으는 것이 아닙니다. 서로 다른 exploit mechanism을 짧게 경쟁시키고, 새로운 정보가 생기더라도 exploit proximity가 증가하지 않는 branch를 빠르게 takeover 또는 교체하는 것입니다. Tier 1/2/3은 기본 child 2/3/4개이고, Tier 4는 stalled branch를 왜 flag에 가까워지지 못했는지 기록한 뒤 완전히 다른 mechanism으로 교체합니다. Category template는 증거가 부족할 때만 쓰는 fallback입니다.
+Race의 목적은 여러 연구 관점을 모으는 것이 아닙니다. Authoritative runtime 개념은 tier 숫자가 아니라 `sol-only`, `fixed-race`, `adaptive-race` solve mode입니다. 일반 대회 기본값인 `adaptive-race`는 Sol만 `RUNNING`, active child width 0, 60~90초 bounded observation pending 상태로 즉시 시작합니다. 이후 증거와 capacity가 뒷받침하는 서로 다른 mechanism 0~3개만 계획하며 plateau/refutation 근거가 있을 때 replacement를 최대 한 번 허용합니다. `fixed-race`는 frozen category template의 정확히 세 child intent를 사용하고 width 변경과 replacement를 금지합니다. `sol-only`는 child를 계획하거나 시작하지 않습니다.
+
+Legacy tier는 삭제되지 않았지만 compatibility/resource envelope 또는 maximum-width hint일 뿐입니다. Tier 0은 `sol-only`, Tier 1~4는 `adaptive-race`로 결정적으로 매핑되며 tier 자체가 child 생성, active width, benchmark arm, model 또는 reasoning을 결정하지 않습니다. `--mode`와 `--tier`가 충돌하면 명령은 실패합니다. Category template는 `fixed-race`의 frozen treatment 또는 adaptive mode에서 증거가 아직 부족할 때만 쓰는 fallback입니다.
 
 Sol은 coordinator로 대기하지 않고 core primitive reasoning, 어려운 exploit-chain 결정, minimal PoC synthesis, artifact takeover, remote execution, flag judgment을 직접 수행합니다. `independent-full-solve`도 comprehensive analysis가 아니라 가장 짧은 flag 경로를 독립적으로 달리는 lane입니다.
 
 ## Race와 checkpoint CLI
 
 ```bash
-uv run python -m ctf_os.agent_tools race-plan-start 1 --contest my-ctf --tier 2
+uv run python -m ctf_os.agent_tools race-plan-start 1 --contest my-ctf \
+  --mode adaptive-race --branch-spec '<evidence-bound mechanisms JSON>'
 uv run python -m ctf_os.agent_tools race-board 1 --contest my-ctf
 uv run python -m ctf_os.agent_tools race-event-publish 1 --contest my-ctf \
   --type EXPLOIT_PRIMITIVE_CONFIRMED --summary 'byte oracle confirmed' --priority HIGH \
@@ -91,9 +94,22 @@ uv run python -m ctf_os.agent_tools race-insight-packet 1 --contest my-ctf \
   --target-session-id race-3-independent-full-solve
 ```
 
-`race-plan-start`는 current run에 `PLANNED` branch와 짧은 prompt packet을 기록할 뿐 child를 만들지 않습니다. Capacity admission과 sandbox/input 확인 뒤 Sol이 native delegation 및 start receipt를 기록해야만 `RUNNING` width에 포함됩니다. Admission overlap 0.95는 advisory이고 exact duplicate/repeated session ID만 거부합니다. Requested model/reasoning은 pinning 증거가 아닙니다.
+`race-plan-start`는 current run의 append-only `RACE_LINEAGE.jsonl`에 `PLANNED` branch와 짧은 prompt packet을 기록할 뿐 child를 만들지 않습니다. `PLANNED → CAPACITY_ADMITTED → SANDBOX_READY → AWAITING_NATIVE_START → NATIVE_STARTED → RUNNING`이 모두 exact receipt로 이어져야 active width에 포함됩니다. 계획 수와 active width는 항상 별도입니다. Initial/replacement branch는 같은 lifecycle을 사용하고, started branch는 native stop/terminal 및 cleanup/resource release receipt 없이 supersede할 수 없습니다. `DELEGATION_PLAN.json`과 `STATE.branches`는 lineage projection입니다. Python은 native child를 생성하거나 종료하지 않습니다.
 
-Milestone receipt는 authoritative source이고 progress, timing, candidate, STATE, race transition, control action, scheduler 및 compatibility 파일은 재생 가능한 projection입니다. `sequence`는 표시 순서일 뿐 identity가 아닙니다. 같은 canonical material은 같은 receipt를 반환하며, 별개의 동일 실험은 다른 `--operation-id`로 구분합니다. 같은 operation ID에 다른 command·output·artifact·details를 재사용하면 conflict입니다.
+Milestone receipt와 `RACE_LINEAGE.jsonl`은 각각 milestone과 branch lifecycle의 authoritative source이고 progress, timing, candidate, `DELEGATION_PLAN`, `STATE.branches`, race transition, control action, scheduler 및 compatibility 파일은 재생 가능한 projection입니다. `sequence`는 표시 순서일 뿐 identity가 아닙니다. 같은 canonical material은 같은 receipt를 반환하며, 별개의 동일 실험은 다른 `--operation-id`로 구분합니다. 같은 operation ID에 다른 command·output·artifact·details를 재사용하면 conflict입니다.
+
+## Attempt identity와 resume
+
+`challenge_instance_id`는 challenge ID, prepared input tree, metadata, target revision, flag metadata, optional local target image, transformation seed를 포함한 snapshot의 deterministic identity입니다. `attempt_id`는 실행마다 새로 발급되는 독립 identity이고 `run_id`는 두 identity에 결합됩니다. 새 attempt는 이전 ledger, candidate, evidence/artifact/work, worker/model/sandbox/container/port/cache identity를 상속하지 않으며 read-only challenge snapshot만 공유합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools attempt-start 1 --contest my-ctf --mode adaptive-race
+uv run python -m ctf_os.agent_tools attempt-list 1 --contest my-ctf
+uv run python -m ctf_os.agent_tools attempt-show 1 --contest my-ctf --run-id '<exact-run-id>'
+uv run python -m ctf_os.agent_tools attempt-resume 1 --contest my-ctf --run-id '<exact-run-id>'
+```
+
+기존 `prepare-challenge`는 compatibility상 current attempt를 resume합니다. 독립 실행은 `attempt-start` 또는 `prepare-challenge --fresh-attempt`를 사용하고 exact prior run은 `--resume-run-id`로 지정합니다. 기존 content-derived legacy run은 이동·삭제·수정하지 않으며 reader가 deterministic legacy attempt marker와 derived challenge instance를 제공합니다. Benchmark launcher는 `ACTIVE_RUN`을 읽지 않고 schedule의 exact fresh `attempt_id`와 반환된 `run_id`만 사용합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools milestone-save 1 --contest my-ctf \
@@ -189,4 +205,6 @@ CTF_OS_LIVE_SERVICE_TESTS=1 uv run pytest -q tests/test_service_live.py
 
 ## 성능 검증
 
-Unit test는 정책·회귀를 검증할 뿐 solve 성능의 증명이 아닙니다. Plain Sol, Sol-only, fixed race, evidence-driven race를 비교하는 실제 benchmark 계획과 time-to-flag 지표는 [`docs/SOLVER_BENCHMARK.md`](docs/SOLVER_BENCHMARK.md)에 정의되어 있습니다.
+Unit test는 정책·회귀를 검증할 뿐 solve 성능의 증명이 아닙니다. Signed read-only lock과 독립 attempt를 사용하는 plain Sol(A), CTF-OS sol-only(B), fixed-race(C), adaptive-race(D)의 matched benchmark 및 evaluator 계약은 [`docs/SOLVER_BENCHMARK.md`](docs/SOLVER_BENCHMARK.md)에 정의되어 있습니다. 144-run 결과가 수집되기 전 plain Sol 대비 우월성은 `INCONCLUSIVE`입니다.
+
+비-live CI는 `CTF-OS / unit-policy`, `attempt-lineage`, `benchmark-evaluator`, `compile` check로 full pytest, Second Surgery fault injection, working-PoC unknown outcome, LONG_COMPUTE proof, identity/lineage/lock/evaluator/schema migration, compileall과 repository policy를 검증합니다. Docker/WSL2 image·sandbox·service probe는 별도 manual self-hosted `CTF-OS Live` workflow입니다.

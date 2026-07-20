@@ -19,7 +19,14 @@ from typing import Any
 import yaml
 
 from .categories import playbook_category
-from .workspace import atomic_json, challenge_workspace, ensure_run_mutable, state_lock
+from .modes import SolveMode
+from .race_lineage import (
+    append_lineage_event, lineage_state, recover_lineage_projections,
+    record_start_failure,
+)
+from .workspace import (
+    atomic_json, challenge_workspace, ensure_run_mutable, read_jsonl_strict, state_lock,
+)
 
 
 PLAN_SCHEMA_VERSION = 1
@@ -276,6 +283,53 @@ def update_branch(
     solve_root = ensure_run_mutable(solve_root)
     if status not in BRANCH_STATUSES:
         raise DelegationError(f"status must be one of {sorted(BRANCH_STATUSES)}")
+    lineage_file = solve_root / "RACE_LINEAGE.jsonl"
+    if lineage_file.is_file():
+        result_path = solve_root / "workers" / session_id / "result.json"
+        checkpoint_dir = solve_root / "workers" / session_id / "checkpoints"
+        terminal_statuses = {
+            "COMPLETED", "SUPPORTED", "REFUTED", "REPLACED", "PARTIAL", "INCONCLUSIVE",
+            "FLAG_CANDIDATE", "TERMINAL", "START_FAILED", "SANDBOX_FAILED",
+            "INPUT_UNAVAILABLE", "TIMED_OUT", "TERMINATED", "ERROR", "STALE",
+        }
+        if status in terminal_statuses and status != "START_FAILED" and (
+            not result_path.is_file() and not any(checkpoint_dir.glob("*.json"))
+        ):
+            raise DelegationError("terminal branch requires result.json or a compact terminal checkpoint")
+        if status == "RUNNING":
+            raise DelegationError(
+                "invalid native branch transition: PLANNED -> RUNNING; "
+                "use branch-start-confirm with native start evidence"
+            )
+        if status == "START_FAILED":
+            record_start_failure(
+                solve_root, branch_id=session_id,
+                receipt={"status": status, "session_id": session_id},
+                reason=runtime_observation_evidence or "native start failed",
+            )
+        elif status in {"CHECKPOINTED", "STOP_REQUESTED"}:
+            append_lineage_event(
+                solve_root, event=status, branch_id=session_id,
+                details={
+                    "observed_runtime_model": observed_runtime_model,
+                    "observed_reasoning": observed_reasoning,
+                    "runtime_observation_evidence": runtime_observation_evidence,
+                    "pinning_verified": pinning_verified,
+                },
+            )
+        elif status in terminal_statuses:
+            append_lineage_event(
+                solve_root, event="CHILD_TERMINAL_RESULT_RECORDED", branch_id=session_id,
+                details={
+                    "result_status": status,
+                    "result_path": str(result_path.relative_to(solve_root)) if result_path.is_file() else None,
+                    "checkpoint_present": any(checkpoint_dir.glob("*.json")),
+                },
+            )
+        else:
+            raise DelegationError(f"lineage lifecycle status must use a dedicated receipt: {status}")
+        projected = recover_lineage_projections(solve_root)
+        return next(row for row in projected["branches"] if row["session_id"] == session_id)
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         matches = [item for item in plan["branches"] if item["session_id"] == session_id]
@@ -331,7 +385,7 @@ def prepare_branch_replacement(
     candidate: BranchCandidate, kill_reason: str, distinct_mechanism_proof: str,
     evidence_contract: Sequence[str], success_condition: str, kill_condition: str,
     maximum_steps: int, budget_seconds: int, requested_model_role: str,
-    requested_reasoning: str,
+    requested_reasoning: str, triggering_receipt_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomically admit/register a replacement and persist its prompt intent."""
     if not isinstance(maximum_steps, int) or not 1 <= maximum_steps <= 10000:
@@ -340,6 +394,75 @@ def prepare_branch_replacement(
         raise DelegationError("budget_seconds must be between 1 and 86400")
     if not distinct_mechanism_proof.strip():
         raise DelegationError("replacement requires distinct mechanism proof")
+    if (solve_root / "RACE_LINEAGE.jsonl").is_file():
+        current = lineage_state(solve_root)
+        old = next((row for row in current["branches"] if row.get("branch_id") == superseded_branch_id), None)
+        if old is None:
+            raise DelegationError("superseded branch does not exist")
+        mode = SolveMode(str(old["mode"]))
+        if mode is SolveMode.FIXED_RACE:
+            raise DelegationError("fixed-race forbids replacement")
+        if mode is SolveMode.SOL_ONLY:
+            raise DelegationError("sol-only mode has no replaceable child lanes")
+        replacements = [row for row in current["branches"] if row.get("supersedes_branch_id")]
+        if replacements:
+            raise DelegationError("adaptive-race permits at most one replacement")
+        if str(old.get("hypothesis_family", "")).casefold() == candidate.hypothesis_family.casefold():
+            raise DelegationError("replacement must use a genuinely different hypothesis family")
+        trigger_kind = _validate_replacement_trigger(
+            solve_root, branch_id=superseded_branch_id,
+            triggering_receipt_id=triggering_receipt_id,
+        )
+        now = utc_now()
+        request_id = hashlib.sha256(
+            f"{superseded_branch_id}:{candidate.session_id}:{now}".encode()
+        ).hexdigest()[:24]
+        contract = {
+            **_candidate_dict(candidate),
+            "branch_id": candidate.session_id,
+            "evidence_contract": _string_list(evidence_contract, "evidence_contract", maximum=32),
+            "success_condition": _bounded(success_condition, "success_condition", 2000),
+            "kill_condition": _bounded(kill_condition, "kill_condition", 2000),
+            "maximum_steps": maximum_steps, "budget_seconds": budget_seconds,
+            "requested_model_role": _short(requested_model_role, "requested_model_role"),
+            "requested_reasoning": _short(requested_reasoning, "requested_reasoning"),
+            "purpose": "alternate-attack-family", "replacement_request_id": request_id,
+            "supersedes_branch_id": superseded_branch_id,
+            "kill_reason": _bounded(kill_reason, "kill_reason", 2000),
+            "distinct_mechanism_proof": _bounded(
+                distinct_mechanism_proof, "distinct_mechanism_proof", 2000,
+            ),
+            "expected_sandbox_identity": f"workers/{candidate.session_id}/sandbox.json",
+        }
+        event = append_lineage_event(
+            solve_root, event="PLANNED", branch_id=candidate.session_id,
+            session_id=candidate.session_id, race_id=str(old["race_id"]),
+            generation=int(old["generation"]), lineage_id=str(old["lineage_id"]),
+            parent_branch_id=str(old.get("parent_branch_id") or "sol-main"),
+            supersedes_branch_id=superseded_branch_id,
+            hypothesis_family=candidate.hypothesis_family, mode=mode,
+            details={
+                "branch_contract": contract, "replacement_request_id": request_id,
+                "kill_reason": kill_reason,
+                "distinct_mechanism_proof": distinct_mechanism_proof,
+                "replacement_request_receipt": True,
+                "triggering_receipt_id": triggering_receipt_id,
+                "replacement_trigger_kind": trigger_kind,
+            },
+        )
+        return {
+            "replacement_request_id": request_id,
+            "superseded_branch_id": superseded_branch_id,
+            "new_session_id": candidate.session_id,
+            "new_hypothesis_family": candidate.hypothesis_family,
+            "kill_reason": kill_reason,
+            "distinct_mechanism_proof": distinct_mechanism_proof,
+            "triggering_receipt_id": triggering_receipt_id,
+            "replacement_trigger_kind": trigger_kind,
+            "lineage_event_id": event["lineage_event_id"],
+            "status": "PLANNED", "native_delegation_required": True,
+            "created_at": event["created_at"],
+        }
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         old = next((row for row in plan["branches"] if row.get("session_id") == superseded_branch_id), None)
@@ -401,6 +524,51 @@ def prepare_branch_replacement(
     return record
 
 
+def _validate_replacement_trigger(
+    solve_root: Path, *, branch_id: str, triggering_receipt_id: str | None,
+) -> str:
+    receipt_id = str(triggering_receipt_id or "").strip()
+    if not receipt_id:
+        raise DelegationError("adaptive replacement requires an exact plateau/refutation receipt ID")
+    milestones = read_jsonl_strict(
+        solve_root / "milestone-receipts.jsonl", "milestone receipt ledger",
+    )
+    refutation = next((
+        row for row in milestones
+        if row.get("receipt_id") == receipt_id
+        and row.get("event_type") == "PRIMITIVE_REFUTED"
+        and row.get("session_id") == branch_id
+    ), None)
+    if refutation is not None:
+        return "REFUTATION"
+    transitions = read_jsonl_strict(
+        solve_root / "RACE_TRANSITIONS.jsonl", "race transition ledger",
+    )
+    plateau = next((
+        row for row in transitions
+        if receipt_id in {str(row.get("transition_id") or ""), str(row.get("event_id") or "")}
+        and (
+            row.get("session_id") == branch_id
+            or any(
+                isinstance(item, Mapping) and item.get("session_id") == branch_id
+                for item in row.get("replacement_requests", []) or []
+            )
+        )
+    ), None)
+    if plateau is not None:
+        return "PLATEAU"
+    actions = read_jsonl_strict(solve_root / "control-actions.jsonl", "control action ledger")
+    action = next((
+        row for row in actions
+        if row.get("action_id") == receipt_id
+        and row.get("action_type") == "REPLACE_ATTACK_FAMILY"
+        and row.get("session_id") == branch_id
+    ), None)
+    if action is not None:
+        return "PLATEAU"
+    raise DelegationError("replacement trigger is not an authoritative plateau/refutation receipt")
+
+
 def confirm_branch_start(
     solve_root: Path, *, input_fingerprint: str, replacement_request_id: str,
     session_id: str, native_session_observed: str, runtime_observation_evidence: str,
@@ -409,6 +577,7 @@ def confirm_branch_start(
     solve_root = ensure_run_mutable(solve_root)
     if not all(str(value).strip() for value in (native_session_observed, runtime_observation_evidence, sandbox_metadata_path)):
         raise DelegationError("branch start confirmation requires native, runtime, and sandbox evidence")
+    lineage_enabled = (solve_root / "RACE_LINEAGE.jsonl").is_file()
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         branch = next((
@@ -449,14 +618,30 @@ def confirm_branch_start(
             "runtime_observation_evidence": runtime_observation_evidence,
             "sandbox_metadata_path": str(supplied), "started_at": utc_now(),
         }
-        branch["start_receipt"] = receipt
-        branch.setdefault("lifecycle_history", []).extend([
-            {"status": "NATIVE_STARTED", "created_at": receipt["started_at"], "receipt": receipt},
-            {"status": "RUNNING", "created_at": receipt["started_at"]},
-        ])
-        branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
-        plan.setdefault("branch_start_receipts", []).append(receipt)
-        plan["updated_at"] = utc_now(); atomic_json(plan_path(solve_root), plan)
+        if lineage_enabled:
+            pass
+        else:
+            branch["start_receipt"] = receipt
+        if not lineage_enabled:
+            branch.setdefault("lifecycle_history", []).extend([
+                {"status": "NATIVE_STARTED", "created_at": receipt["started_at"], "receipt": receipt},
+                {"status": "RUNNING", "created_at": receipt["started_at"]},
+            ])
+            branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
+            plan.setdefault("branch_start_receipts", []).append(receipt)
+            plan["updated_at"] = utc_now(); atomic_json(plan_path(solve_root), plan)
+    if lineage_enabled:
+        append_lineage_event(
+            solve_root, event="NATIVE_STARTED", branch_id=session_id,
+            referenced_receipt=receipt, details=receipt, project=False,
+        )
+        append_lineage_event(
+            solve_root, event="RUNNING", branch_id=session_id,
+            referenced_receipt={"native_start_receipt_id": hashlib.sha256(
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()},
+            details={"native_start_receipt": receipt},
+        )
     return receipt
 
 
@@ -467,6 +652,17 @@ def record_capacity_admission(
 
     solve_root = ensure_run_mutable(solve_root)
     admitted = set(admitted_session_ids)
+    if (solve_root / "RACE_LINEAGE.jsonl").is_file():
+        changed = []
+        current = lineage_state(solve_root)
+        for branch in current["current_branches"]:
+            if branch["session_id"] in admitted and branch["status"] == "PLANNED":
+                append_lineage_event(
+                    solve_root, event="CAPACITY_ADMITTED", branch_id=str(branch["branch_id"]),
+                    details={"resource_allocation_receipt": True},
+                )
+                changed.append(str(branch["session_id"]))
+        return {"capacity_admitted": sorted(changed), "native_children_started": False}
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         changed = []
@@ -489,6 +685,7 @@ def record_branch_sandbox_ready(
     """Record branch-private input/sandbox readiness before native start."""
 
     solve_root = ensure_run_mutable(solve_root)
+    lineage_enabled = (solve_root / "RACE_LINEAGE.jsonl").is_file()
     with state_lock(solve_root):
         plan = _load_current_unlocked(solve_root, input_fingerprint)
         branch = next((row for row in plan.get("branches", []) if row.get("session_id") == session_id), None)
@@ -512,7 +709,9 @@ def record_branch_sandbox_ready(
             "session_id": session_id, "sandbox_metadata_path": str(supplied),
             "input_available": bool(input_available), "created_at": stamp,
         }
-        if not input_available:
+        if lineage_enabled:
+            pass
+        elif not input_available:
             branch["status"] = "INPUT_UNAVAILABLE"
             branch["finished_at"] = stamp
         else:
@@ -523,8 +722,28 @@ def record_branch_sandbox_ready(
                 {"status": "AWAITING_NATIVE_START", "created_at": stamp},
             ])
             branch["status"] = "AWAITING_NATIVE_START"
-        plan["updated_at"] = stamp
-        atomic_json(plan_path(solve_root), plan)
+        if not lineage_enabled:
+            plan["updated_at"] = stamp
+            atomic_json(plan_path(solve_root), plan)
+    if lineage_enabled:
+        if not input_available:
+            record_start_failure(
+                solve_root, branch_id=session_id, receipt=receipt,
+                reason="challenge input unavailable",
+            )
+        else:
+            metadata_digest = hashlib.sha256(supplied.read_bytes()).hexdigest()
+            append_lineage_event(
+                solve_root, event="SANDBOX_READY", branch_id=session_id,
+                referenced_receipt=receipt,
+                details={**receipt, "sandbox_metadata_digest": metadata_digest},
+                project=False,
+            )
+            append_lineage_event(
+                solve_root, event="AWAITING_NATIVE_START", branch_id=session_id,
+                referenced_receipt={"sandbox_metadata_digest": metadata_digest},
+                details={"sandbox_metadata_digest": metadata_digest},
+            )
     return receipt
 
 

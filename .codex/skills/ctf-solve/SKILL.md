@@ -10,8 +10,8 @@ description: Competition-first solve of exactly one authorized CTF challenge wit
 ## Start with bounded observation
 
 1. The current user-opened session remains lead Sol from preparation through human submission feedback and cleanup. You are the main attacker, not a coordinator-only process. Read root `AGENTS.md`, the authoritative agent policy, and only the selected category playbook.
-2. Internally run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'` in this session. This is not a separate user step.
-3. Use the returned `solve_launch_context` and `run_root` as the authoritative launch context and active run for this selected challenge. Challenge-local intake/triage is only the minimum preparation needed to understand this problem; it is not a separate whole-contest phase. The run is bound to one input fingerprint and target revision. Do not load a whole-contest index or Board and do not require the user to run another command.
+2. Internally run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'` in this session. This compatibility command resumes the current attempt. Use `attempt-start` or `prepare-challenge --fresh-attempt` only when the user or benchmark contract requires an independent execution. This is not a separate user step.
+3. Use the returned `solve_launch_context`, exact `attempt_id`, and `run_root` as authoritative for this selected challenge. The deterministic `challenge_instance_id` identifies the snapshot; the fresh `attempt_id` identifies the execution; `run_id` binds both. Never resolve a benchmark attempt through `ACTIVE_RUN`. Challenge-local intake/triage is only the minimum preparation needed to understand this problem; it is not a separate whole-contest phase. Do not load a whole-contest index or Board and do not require the user to run another command.
 4. Directly observe the priority files and actual runtime results. Preflight observation hints only order inspection of this selected challenge. They are not confirmed vulnerabilities or exploit primitives. Discard a hint immediately when the first decisive experiment refutes it.
 5. Spend no more than roughly 60–90 seconds and no more than the category playbook's fast-recon command budget. Stop at the first concrete primitive even if budget remains. Read raw logs/inventories only for a current exploit hypothesis.
 6. Form at most three concrete active exploit hypotheses from direct file/runtime observation.
@@ -31,22 +31,27 @@ Expected time to PoC: immediate | few experiments | long computation
 
 Each active hypothesis contains only `expected primitive`, `cheapest decisive experiment`, `success condition`, and `kill condition`; `reopen_condition` is optional.
 
-## Start an evidence-driven race
+## Apply the explicit solve mode
 
-Choose Tier 0–4 and run one atomic `race-plan-start`. Prefer an evidence-driven `--branch-spec`; omit it only when evidence is too thin, because category templates are fallback lanes rather than the attack plan.
+Live competition defaults to `adaptive-race`, but that does not start children. Sol starts attacking immediately with active child width zero, performs the bounded 60–90 second observation above, then chooses 0–3 distinct evidence-backed mechanisms subject to capacity. Prefer an evidence-driven `--branch-spec`; omit it only when evidence is too thin, because category templates are fallback lanes rather than the adaptive attack plan.
 
 ```bash
 uv run python -m ctf_os.agent_tools race-plan-start '<selector>' \
-  --contest '<contest>' --tier 2 --tier-reason '<leading mechanisms and evidence>'
+  --contest '<contest>' --mode adaptive-race \
+  --branch-spec '<0-3 distinct evidence-bound mechanisms JSON>' \
+  --tier-reason '<leading mechanisms and evidence>'
 ```
 
-- Tier 0: Sol directly drives the minimal exploit; optionally one implementation/verifier child.
-- Tier 1: two children plus Sol.
-- Tier 2: three children plus Sol.
-- Tier 3: four children plus Sol across distinct executable mechanisms.
-- Tier 4: terminate low-proximity work and replace it while keeping useful concurrency full. Record why proximity stalled and choose a genuinely different exploit mechanism.
+- `sol-only`: Sol alone; do not call `race-plan-start`, request a child, or create branch intent.
+- `fixed-race`: exactly three frozen category-template child intents plus Sol, maximum model concurrency four, no width change, no replacement. If any child never reaches actual `RUNNING`, record environment failure/invalid treatment rather than silently continuing as a valid Sol-only result.
+- `adaptive-race`: Sol plus 0–3 distinct evidence-selected mechanisms, active width initially zero, and at most one replacement after an exact plateau/refutation receipt. A child start failure is recorded; live solving continues on the Sol lane.
+- Legacy tier is only compatibility/resource-envelope metadata: tier 0 maps to `sol-only`, tier 1–4 to `adaptive-race`. It never determines native children, running width, benchmark arm, model, or reasoning. Reject conflicting `--mode`/`--tier`.
 
-`race-plan-start` creates only `PLANNED` branches. Admit capacity, create the branch-private sandbox and confirm input access, then create the child with Codex runtime native delegation and record the native start receipt. Only a branch with that receipt, accessible current-run input, and status `RUNNING` counts toward running width. `race-plan-start`, `branch-admit`, Python, and sandbox commands never create a child. Sol immediately continues its own attack while children start or fail; never wait for child startup. Requested model/reasoning are intent only; observed fields stay null without runtime evidence.
+Older documentation used the phrase `Tier 2: three children`; it is retained here only as a migration warning and is not runtime behavior. Explicit mode and lineage receipts are authoritative.
+
+`race-plan-start` appends only `PLANNED` lineage events. Every initial or replacement branch uses `PLANNED → CAPACITY_ADMITTED → SANDBOX_READY → AWAITING_NATIVE_START → NATIVE_STARTED → RUNNING`. Only lineage branches whose latest lifecycle is `RUNNING` count toward active width. `race-plan-start`, `branch-admit`, Python, and sandbox commands never create a child; the current Sol session owns native delegation. Sol immediately continues its own attack while children start or fail; never wait for child startup. Requested model/reasoning are intent only; observed fields stay null without runtime evidence.
+
+`RACE_LINEAGE.jsonl` is authoritative. Never mark a live branch stale, superseded, or replaced without exact native stop/child terminal, sandbox cleanup, and resource release receipts. A replacement is planned through the same lifecycle and cannot be admitted while the superseded live branch would exceed capacity. A whole-plan restart must close every prior started branch before publishing the next generation. `DELEGATION_PLAN.json` and `STATE.branches` are recoverable projections; Python manages those receipts but Sol alone starts and stops native sessions.
 
 `independent-full-solve` means independently race for the shortest valid flag path. It does not mean comprehensive analysis: do not wait for siblings and preserve only evidence sufficient to exploit. Admission overlap remains advisory at 0.95; only a repeated session ID or materially exact duplicate is denied outside explicit race/verification exceptions.
 

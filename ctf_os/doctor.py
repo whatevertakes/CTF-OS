@@ -309,6 +309,18 @@ def run_doctor(repo: Path) -> dict[str, object]:
     add("timeout-profiles", timeout_ok, timeout_detail, "restore the validated timeout profile resource")
     add("service-runtime", importlib.util.find_spec("ctf_os.service") is not None, "ctf_os.service", "restore the service runtime module")
     add("replay-runtime", importlib.util.find_spec("ctf_os.replay") is not None, "ctf_os.replay", "restore the replay module")
+    benchmark_modules = (
+        "ctf_os.attempts", "ctf_os.race_lineage", "ctf_os.benchmark_lock",
+        "ctf_os.benchmark_manifest", "ctf_os.benchmark_schedule",
+        "ctf_os.benchmark_telemetry",
+    )
+    add(
+        "attempt-lineage-benchmark-runtime",
+        all(importlib.util.find_spec(name) is not None for name in benchmark_modules)
+        and importlib.util.find_spec("cryptography.hazmat.primitives.asymmetric.ed25519") is not None,
+        ", ".join(benchmark_modules) + ", Ed25519",
+        "run uv sync --frozen and restore attempt/lineage/benchmark runtime modules",
+    )
 
     # Doctor owns sandbox health, not another active solve's shared service.
     # Count only stopped worker sandboxes that sandbox-gc can safely remove;

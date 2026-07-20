@@ -14,10 +14,11 @@ from typing import Any, Iterator
 from .candidates import load_candidates
 from .control import create_control_action
 from .projections import apply_projection, ensure_projection_manifest, mark_not_required
+from .race_lineage import append_lineage_event, lineage_state, recover_lineage_projections
 from .workspace import (
     append_jsonl_fsync, atomic_json, atomic_text, challenge_workspace,
     read_jsonl_strict, recover_run_state, resolve_active_run, safe_under, state_lock,
-    update_run_manifest_timing, utc_now,
+    resolve_exact_run, update_run_manifest_timing, utc_now,
 )
 
 
@@ -65,6 +66,7 @@ def record_submission_result(
     receipt_id = hashlib.sha256(f"{run_id}\0{candidate_id}\0{normalized}".encode()).hexdigest()[:24]
     receipt_path = run / "flag-receipts" / f"submission-{receipt_id}.json"
     stop_sessions: list[str] = []
+    deferred_lineage_stops: list[tuple[str, bool]] = []
     wrong_was_active = False
     with state_lock(run):
         state = _state(run)
@@ -127,11 +129,13 @@ def record_submission_result(
             _mark_candidate_dependencies(run, candidate, candidate_id)
         else:
             _accepted_state(state, candidate, receipt)
-            _request_branch_stops_unlocked(run)
-            stop_sessions = [
-                str(row.get("session_id")) for row in _plan(run, missing_ok=True).get("branches", [])
-                if row.get("status") == "STOP_REQUESTED" and row.get("session_id")
-            ]
+            deferred_lineage_stops = _request_branch_stops_unlocked(run)
+            stop_sessions = [session for session, started in deferred_lineage_stops if started]
+            if not deferred_lineage_stops:
+                stop_sessions = [
+                    str(row.get("session_id")) for row in _plan(run, missing_ok=True).get("branches", [])
+                    if row.get("status") == "STOP_REQUESTED" and row.get("session_id")
+                ]
             atomic_text(run / "RESULT.md", _accepted_result(state, candidate, receipt))
         history = state.setdefault("submission_history", [])
         if not any(isinstance(row, Mapping) and row.get("receipt_id") == receipt_id for row in history):
@@ -142,6 +146,30 @@ def record_submission_result(
         state["updated_at"] = receipt["created_at"]
         atomic_json(run / "STATE.json", state)
     update_run_manifest_timing(run, "submission_result_at", receipt["created_at"])
+    for session_id, started in deferred_lineage_stops:
+        if started:
+            append_lineage_event(
+                run, event="STOP_REQUESTED", branch_id=session_id,
+                referenced_receipt=receipt,
+                details={"reason": "human submission ACCEPTED", "submission_receipt": receipt["receipt_id"]},
+            )
+        else:
+            branch = next(
+                row for row in lineage_state(run)["branches"] if row["branch_id"] == session_id
+            )
+            append_lineage_event(
+                run, event="SUPERSEDED", branch_id=session_id,
+                referenced_receipt=receipt,
+                details={"reason": "ACCEPTED_BEFORE_NATIVE_START", "not_started": True},
+                project=False,
+            )
+            lifecycle = {row["event"] for row in branch["lifecycle_history"]}
+            if not lifecycle.intersection({"CAPACITY_ADMITTED", "SANDBOX_READY"}):
+                append_lineage_event(
+                    run, event="TERMINAL", branch_id=session_id,
+                    referenced_receipt=receipt,
+                    details={"reason": "NOT_STARTED_SUPERSEDED"},
+                )
     if normalized == "WRONG":
         action = create_control_action(
             run, session_id=str(candidate.get("session_id") or "sol-main"),
@@ -247,7 +275,36 @@ def _repair_terminal_requests(run: Path, receipt: Mapping[str, Any]) -> None:
     if str(receipt.get("result") or "").upper() != "ACCEPTED":
         return
     with state_lock(run):
-        _request_branch_stops_unlocked(run)
+        pending = _request_branch_stops_unlocked(run)
+    for branch_id, started in pending:
+        if started:
+            branch = next(
+                row for row in lineage_state(run)["branches"] if row["branch_id"] == branch_id
+            )
+            if branch["status"] not in {"STOP_REQUESTED", "NATIVE_STOP_RECORDED", "CHILD_TERMINAL_RESULT_RECORDED", "TERMINAL"}:
+                append_lineage_event(
+                    run, event="STOP_REQUESTED", branch_id=branch_id,
+                    referenced_receipt=receipt,
+                    details={"reason": "repair accepted terminal request"},
+                )
+        else:
+            branch = next(
+                row for row in lineage_state(run)["branches"] if row["branch_id"] == branch_id
+            )
+            if branch["status"] not in {"SUPERSEDED", "TERMINAL"}:
+                append_lineage_event(
+                    run, event="SUPERSEDED", branch_id=branch_id,
+                    referenced_receipt=receipt,
+                    details={"reason": "ACCEPTED_BEFORE_NATIVE_START", "not_started": True},
+                    project=False,
+                )
+                lifecycle = {row["event"] for row in branch["lifecycle_history"]}
+                if not lifecycle.intersection({"CAPACITY_ADMITTED", "SANDBOX_READY"}):
+                    append_lineage_event(
+                        run, event="TERMINAL", branch_id=branch_id,
+                        referenced_receipt=receipt,
+                        details={"reason": "NOT_STARTED_SUPERSEDED"},
+                    )
 
 
 def _repair_submission_control(run: Path, receipt: Mapping[str, Any]) -> None:
@@ -304,6 +361,29 @@ def record_native_stop(
     run = _specific_run(root, run_id)
     if not native_receipt or {"session_id", "observed_at", "idempotent"}.intersection(native_receipt):
         raise SubmissionError("native stop receipt is empty or contains reserved lifecycle fields")
+    if (run / "RACE_LINEAGE.jsonl").is_file():
+        branch = next((
+            row for row in lineage_state(run)["branches"]
+            if row.get("session_id") == session_id
+        ), None)
+        if branch is None:
+            raise SubmissionError("branch does not exist in this run")
+        if not branch.get("native_started"):
+            raise SubmissionError("native stop receipt requires a previously started native branch")
+        if branch.get("native_stop_receipt"):
+            saved = branch["native_stop_receipt"]
+            return {**saved, "idempotent": True}
+        receipt = {"session_id": session_id, "observed_at": utc_now(), **dict(native_receipt)}
+        event = append_lineage_event(
+            run, event="NATIVE_STOP_RECORDED", branch_id=str(branch["branch_id"]),
+            referenced_receipt=receipt, details=receipt,
+        )
+        with state_lock(run):
+            _record_terminal_component_unlocked(
+                run, session_id=session_id, component="native", status="STOP_RECORDED",
+                related_receipt=receipt,
+            )
+        return {**receipt, "lineage_event_id": event["lineage_event_id"], "idempotent": False}
     with state_lock(run):
         plan = _plan(run)
         branch = next((row for row in plan.get("branches", []) if row.get("session_id") == session_id), None)
@@ -542,6 +622,21 @@ def converge_terminal(
             state["updated_at"] = utc_now()
             atomic_json(run / "STATE.json", state)
 
+        if (run / "RACE_LINEAGE.jsonl").is_file():
+            for session_id, (status, result) in sandbox_results.items():
+                if status != "CLEANED":
+                    continue
+                branch = next((
+                    row for row in lineage_state(run)["branches"]
+                    if row["session_id"] == session_id
+                ), None)
+                if branch and branch["status"] != "SANDBOX_CLEANED":
+                    append_lineage_event(
+                        run, event="SANDBOX_CLEANED", branch_id=str(branch["branch_id"]),
+                        referenced_receipt=result if isinstance(result, Mapping) else {"result": result},
+                        details={"cleanup_receipt": result},
+                    )
+
         resource_results: dict[str, tuple[str, dict[str, Any] | str]] = {}
         for session_id in resource_tasks:
             try:
@@ -552,10 +647,7 @@ def converge_terminal(
         with state_lock(run):
             state = _state(run)
             plan = _plan(run, missing_ok=True)
-            branches = {
-                str(branch.get("session_id")): branch for branch in plan.get("branches", [])
-                if branch.get("session_id")
-            }
+            branches, _sandbox_sessions, _resource_sessions, _released = _terminal_sessions(run, plan)
             cleanup_rows = state.setdefault("terminal_components", {})
             for session_id, (status, result) in resource_results.items():
                 component = cleanup_rows[session_id]
@@ -593,6 +685,56 @@ def converge_terminal(
                     related_receipt={"terminal_components": sorted(cleanup_rows)},
                 )
             atomic_json(run / "STATE.json", state)
+        if (run / "RACE_LINEAGE.jsonl").is_file():
+            for session_id, (status, result) in resource_results.items():
+                if status != "RELEASED":
+                    continue
+                branch = next((
+                    row for row in lineage_state(run)["branches"]
+                    if row["session_id"] == session_id
+                ), None)
+                if branch and branch["status"] != "RESOURCE_RELEASED":
+                    append_lineage_event(
+                        run, event="RESOURCE_RELEASED", branch_id=str(branch["branch_id"]),
+                        referenced_receipt=result if isinstance(result, Mapping) else {"result": result},
+                        details={"resource_release_receipt": result},
+                    )
+            current_lineage = lineage_state(run)
+            current_state = _state(run)
+            components = current_state.get("terminal_components", {})
+            for branch in current_lineage["branches"]:
+                component = components.get(branch["session_id"], {})
+                events = {row["event"] for row in branch["lifecycle_history"]}
+                if (
+                    component.get("resource") == "NOT_PRESENT"
+                    and "CAPACITY_ADMITTED" in events
+                    and "RESOURCE_RELEASED" not in events
+                ):
+                    append_lineage_event(
+                        run, event="RESOURCE_RELEASED", branch_id=str(branch["branch_id"]),
+                        referenced_receipt={
+                            "status": "NOT_REQUIRED", "reason": "no resource ledger allocation existed",
+                        },
+                        details={
+                            "resource_release_receipt": {
+                                "status": "NOT_REQUIRED",
+                                "reason": "no resource ledger allocation existed",
+                            },
+                        },
+                    )
+            current_lineage = lineage_state(run)
+            for branch in current_lineage["branches"]:
+                component = components.get(branch["session_id"], {})
+                converged = (
+                    component.get("native") in {"NOT_REQUIRED", "TERMINAL_RECORDED"}
+                    and component.get("sandbox") in {"NOT_PRESENT", "CLEANED"}
+                    and component.get("resource") in {"NOT_PRESENT", "RELEASED"}
+                )
+                if converged and branch["status"] != "TERMINAL":
+                    append_lineage_event(
+                        run, event="TERMINAL", branch_id=str(branch["branch_id"]),
+                        details={"reason": "NATIVE_SANDBOX_RESOURCE_CONVERGED"},
+                    )
     return terminal_status(run)
 
 
@@ -601,7 +743,11 @@ def _native_component_state(branch: Mapping[str, Any] | None) -> str:
         branch.get("start_receipt") or branch.get("native_start_receipt") or branch.get("started_at")
     ):
         return "NOT_REQUIRED"
-    if branch.get("native_stop_receipt") or branch.get("status") in TERMINAL_BRANCH_STATUSES:
+    if (
+        branch.get("native_stop_receipt") or branch.get("terminal_evidence_recorded")
+        or branch.get("status") in TERMINAL_BRANCH_STATUSES
+        or branch.get("status") in {"NATIVE_STOP_RECORDED", "CHILD_TERMINAL_RESULT_RECORDED"}
+    ):
         return "TERMINAL_RECORDED"
     return "TERMINATION_PENDING"
 
@@ -609,10 +755,17 @@ def _native_component_state(branch: Mapping[str, Any] | None) -> str:
 def _terminal_sessions(
     run: Path, plan: Mapping[str, Any],
 ) -> tuple[dict[str, Mapping[str, Any]], set[str], set[str], set[str]]:
-    branches = {
-        str(branch.get("session_id")): branch for branch in plan.get("branches", [])
-        if isinstance(branch, Mapping) and branch.get("session_id")
-    }
+    if (run / "RACE_LINEAGE.jsonl").is_file():
+        branches = {
+            str(branch.get("session_id")): branch
+            for branch in lineage_state(run).get("branches", [])
+            if branch.get("session_id")
+        }
+    else:
+        branches = {
+            str(branch.get("session_id")): branch for branch in plan.get("branches", [])
+            if isinstance(branch, Mapping) and branch.get("session_id")
+        }
     sandbox_sessions = {
         path.parent.name for path in (run / "workers").glob("*/sandbox.json")
         if path.is_file() and not path.is_symlink()
@@ -691,7 +844,13 @@ def _accepted_state(state: dict[str, Any], candidate: Mapping[str, Any], receipt
     })
 
 
-def _request_branch_stops_unlocked(run: Path) -> None:
+def _request_branch_stops_unlocked(run: Path) -> list[tuple[str, bool]]:
+    if (run / "RACE_LINEAGE.jsonl").is_file():
+        return [
+            (str(branch["branch_id"]), bool(branch["started"]))
+            for branch in lineage_state(run)["branches"]
+            if branch["status"] not in {"TERMINAL", "SUPERSEDED", "START_FAILED"}
+        ]
     plan = _plan(run, missing_ok=True)
     changed = False
     for branch in plan.get("branches", []):
@@ -716,6 +875,7 @@ def _request_branch_stops_unlocked(run: Path) -> None:
     if changed:
         plan["updated_at"] = utc_now()
         atomic_json(run / "DELEGATION_PLAN.json", plan)
+    return []
 
 
 def _mark_candidate_dependencies(run: Path, candidate: Mapping[str, Any], candidate_id: str) -> None:
@@ -731,13 +891,10 @@ def _mark_candidate_dependencies(run: Path, candidate: Mapping[str, Any], candid
 
 
 def _specific_run(root: Path, run_id: str) -> Path:
-    if resolve_active_run(root).name == run_id:
-        return resolve_active_run(root)
-    workspace = challenge_workspace(root)
-    run = safe_under(workspace / "runs", Path(run_id))
-    if run.is_symlink() or not run.is_dir():
-        raise SubmissionError("run_id does not exist in this challenge workspace")
-    return run
+    try:
+        return resolve_exact_run(root, run_id)
+    except Exception as exc:
+        raise SubmissionError("run_id does not exist in this challenge workspace") from exc
 
 
 def _state(run: Path) -> dict[str, Any]:

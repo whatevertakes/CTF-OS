@@ -9,6 +9,19 @@ from pathlib import Path
 import shutil
 import sys
 
+from ..benchmark_lock import verify_benchmark_lock
+from ..benchmark_manifest import (
+    RESOURCE_FIELDS as BENCHMARK_RESOURCE_FIELDS,
+    record_benchmark_outcome, record_resource_observation, record_runtime_observation,
+)
+from ..benchmark_runtime import start_benchmark_attempt, validate_benchmark_completion
+from ..benchmark_schedule import (
+    begin_schedule_entry, fail_schedule_entry, finish_schedule_entry, generate_schedule,
+)
+from ..benchmark_telemetry import (
+    finish_resource_telemetry, run_resource_telemetry_monitor,
+    run_target_health_monitor, sample_resource_telemetry, start_resource_telemetry,
+)
 from ..challenge import SelectionError, resolve_selector
 from ..challenge_scope import remove_challenge_secrets
 from ..contest import ContestError, discover_contests, select_contest
@@ -55,7 +68,8 @@ from ..transitions import control_loop_tick
 from ..tui import resource_panel
 from ..workspace import (
     atomic_json, challenge_root, challenge_workspace, initialize_solve_files,
-    recover_run_state, resolve_run_raw, safe_under, state_lock,
+    list_attempts, recover_run_state, resolve_run_raw, resume_attempt, safe_under,
+    resolve_exact_run, show_attempt, start_fresh_attempt, state_lock, target_revisions,
 )
 from ..worker import (
     collect_worker_checkpoints, load_worker_result, merge_worker_checkpoints,
@@ -64,6 +78,7 @@ from ..worker import (
 from ..verification import record_remote_flag
 from ..control import apply_control_action, acknowledge_control_action, load_control_actions
 from ..milestones import repair_run_projections, save_milestone
+from ..modes import SolveMode, resolve_solve_mode
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
@@ -97,12 +112,143 @@ def build_parser() -> argparse.ArgumentParser:
     triage_finalize.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     triage_finalize.add_argument("--contest")
     triage_finalize.add_argument("--assessments-json", required=True)
-    prepare = commands.add_parser("prepare-challenge")
+    prepare = commands.add_parser(
+        "prepare-challenge",
+        description=(
+            "Prepare one challenge and resume its current attempt by default. "
+            "Use --fresh-attempt for independent execution; live mode defaults to adaptive-race with zero active children."
+        ),
+    )
     prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
     prepare.add_argument("--session-input-json")
+    prepare.add_argument("--fresh-attempt", action="store_true")
+    prepare.add_argument("--resume-run-id")
+    prepare.add_argument("--attempt-id")
+    prepare.add_argument("--transformation-seed")
+    prepare.add_argument("--mode", choices=tuple(mode.value for mode in SolveMode))
+    prepare.add_argument("--tier", type=int, help="legacy resource/maximum-width hint only")
     if not child_surface:
+        attempt_start = commands.add_parser("attempt-start", help="start one isolated fresh attempt")
+        attempt_start.add_argument("selector"); attempt_start.add_argument("--contest")
+        attempt_start.add_argument("--attempt-id"); attempt_start.add_argument("--transformation-seed")
+        attempt_start.add_argument("--mode", choices=tuple(mode.value for mode in SolveMode))
+        attempt_start.add_argument("--tier", type=int, help="legacy resource/maximum-width hint only")
+        _add_session_args(attempt_start)
+        attempt_resume = commands.add_parser("attempt-resume", help="resume current or exact prior attempt")
+        attempt_resume.add_argument("selector"); attempt_resume.add_argument("--contest")
+        attempt_resume.add_argument("--run-id"); _add_session_args(attempt_resume)
+        attempt_list = commands.add_parser("attempt-list", help="list prior isolated attempts")
+        attempt_list.add_argument("selector"); attempt_list.add_argument("--contest"); _add_session_args(attempt_list)
+        attempt_show = commands.add_parser("attempt-show", help="show an exact prior attempt")
+        attempt_show.add_argument("selector"); attempt_show.add_argument("--contest")
+        attempt_show.add_argument("--run-id", required=True); _add_session_args(attempt_show)
+        benchmark_schedule = commands.add_parser("benchmark-schedule-create")
+        benchmark_schedule.add_argument("--challenges-json", required=True)
+        benchmark_schedule.add_argument("--randomization-seed", required=True)
+        benchmark_schedule.add_argument("--output")
+        benchmark_lock = commands.add_parser("benchmark-lock-verify")
+        benchmark_lock.add_argument("--lock", required=True); benchmark_lock.add_argument("--signature", required=True)
+        benchmark_lock.add_argument("--public-key", required=True); benchmark_lock.add_argument("--key-id", required=True)
+        benchmark_start = commands.add_parser(
+            "benchmark-start",
+            description=(
+                "Verify the signed lock and deterministic schedule, then create one exact fresh A/B/C/D attempt. "
+                "Tier is not a benchmark treatment and this command never launches a model session."
+            ),
+        )
+        benchmark_start.add_argument("selector"); benchmark_start.add_argument("--contest")
+        benchmark_start.add_argument("--schedule", required=True); benchmark_start.add_argument("--entry-id", required=True)
+        benchmark_start.add_argument("--lock", required=True); benchmark_start.add_argument("--signature", required=True)
+        benchmark_start.add_argument("--public-key", required=True); benchmark_start.add_argument("--key-id", required=True)
+        benchmark_start.add_argument("--target-image-digest", required=True)
+        benchmark_start.add_argument("--tool-image-digest", required=True)
+        benchmark_start.add_argument("--challenge-archive", required=True)
+        _add_session_args(benchmark_start)
+        benchmark_health = commands.add_parser("benchmark-health-monitor")
+        benchmark_health.add_argument("selector"); benchmark_health.add_argument("--contest")
+        benchmark_health.add_argument("--run-id", required=True)
+        benchmark_health.add_argument("--endpoint-revision", type=int, required=True)
+        benchmark_health.add_argument("--duration-seconds", type=float, required=True)
+        benchmark_health.add_argument("--cadence-seconds", type=float, default=60.0)
+        benchmark_health.add_argument("--timeout-seconds", type=float, default=10.0)
+        benchmark_health.add_argument("--semantic-success-token")
+        benchmark_health.add_argument("argv", nargs=argparse.REMAINDER)
+        _add_session_args(benchmark_health)
+        telemetry_start = commands.add_parser("benchmark-telemetry-start")
+        telemetry_start.add_argument("selector"); telemetry_start.add_argument("--contest")
+        telemetry_start.add_argument("--run-id", required=True)
+        telemetry_start.add_argument("--tracked-pid", type=int, action="append", default=[])
+        telemetry_start.add_argument("--network-namespace-pid", type=int)
+        telemetry_start.add_argument("--container-id", action="append", default=[])
+        _add_session_args(telemetry_start)
+        telemetry_sample = commands.add_parser("benchmark-telemetry-sample")
+        telemetry_sample.add_argument("selector"); telemetry_sample.add_argument("--contest")
+        telemetry_sample.add_argument("--run-id", required=True); _add_session_args(telemetry_sample)
+        telemetry_monitor = commands.add_parser("benchmark-telemetry-monitor")
+        telemetry_monitor.add_argument("selector"); telemetry_monitor.add_argument("--contest")
+        telemetry_monitor.add_argument("--run-id", required=True)
+        telemetry_monitor.add_argument("--duration-seconds", type=float, required=True)
+        telemetry_monitor.add_argument("--cadence-seconds", type=float, default=1.0)
+        telemetry_monitor.add_argument("--tracked-pid", type=int, action="append", default=[])
+        telemetry_monitor.add_argument("--network-namespace-pid", type=int)
+        telemetry_monitor.add_argument("--container-id", action="append", default=[])
+        _add_session_args(telemetry_monitor)
+        telemetry_finish = commands.add_parser("benchmark-telemetry-finish")
+        telemetry_finish.add_argument("selector"); telemetry_finish.add_argument("--contest")
+        telemetry_finish.add_argument("--run-id", required=True); _add_session_args(telemetry_finish)
+        benchmark_complete = commands.add_parser("benchmark-complete")
+        benchmark_complete.add_argument("selector"); benchmark_complete.add_argument("--contest")
+        benchmark_complete.add_argument("--run-id", required=True)
+        benchmark_complete.add_argument("--schedule", required=True)
+        benchmark_complete.add_argument("--entry-id", required=True)
+        _add_session_args(benchmark_complete)
+        benchmark_outcome = commands.add_parser("benchmark-outcome-record")
+        benchmark_outcome.add_argument("selector"); benchmark_outcome.add_argument("--contest")
+        benchmark_outcome.add_argument("--run-id", required=True)
+        benchmark_outcome.add_argument(
+            "--oracle-result", required=True,
+            choices=("ACCEPTED", "TIMEOUT", "UNSOLVED", "ENVIRONMENT_FAILURE"),
+        )
+        benchmark_outcome.add_argument(
+            "--cleanup-success", action=argparse.BooleanOptionalAction, required=True,
+        )
+        benchmark_outcome.add_argument(
+            "--terminal-correctness", action=argparse.BooleanOptionalAction, required=True,
+        )
+        benchmark_outcome.add_argument("--environment-failure", action="store_true")
+        benchmark_outcome.add_argument("--invalidation-reason")
+        benchmark_outcome.add_argument("--false-candidate-count", type=int, default=0)
+        benchmark_outcome.add_argument("--scope-violation-count", type=int, default=0)
+        benchmark_outcome.add_argument("--denied-out-of-scope-action-count", type=int, default=0)
+        benchmark_outcome.add_argument("--target-failure-duration-seconds", type=float, default=0)
+        benchmark_outcome.add_argument("--model-failure-duration-seconds", type=float, default=0)
+        benchmark_outcome.add_argument("--environment-failure-duration-seconds", type=float, default=0)
+        benchmark_outcome.add_argument(
+            "--latency-explained-by-target-or-model-queue",
+            action=argparse.BooleanOptionalAction,
+        )
+        benchmark_outcome.add_argument("--latency-explanation-evidence")
+        _add_session_args(benchmark_outcome)
+        runtime_observation = commands.add_parser("benchmark-runtime-observation-record")
+        runtime_observation.add_argument("selector"); runtime_observation.add_argument("--contest")
+        runtime_observation.add_argument("--run-id", required=True)
+        runtime_observation.add_argument("--observed-model", required=True)
+        runtime_observation.add_argument("--observed-reasoning", required=True)
+        runtime_observation.add_argument("--evidence", required=True)
+        _add_session_args(runtime_observation)
+        resource_observation = commands.add_parser("benchmark-resource-record")
+        resource_observation.add_argument("selector"); resource_observation.add_argument("--contest")
+        resource_observation.add_argument("--run-id", required=True)
+        resource_observation.add_argument("--field", choices=BENCHMARK_RESOURCE_FIELDS, required=True)
+        resource_observation.add_argument("--value", type=float)
+        resource_observation.add_argument(
+            "--observation-status", choices=("OBSERVED", "NOT_OBSERVABLE", "UNAVAILABLE"),
+            default="OBSERVED",
+        )
+        resource_observation.add_argument("--reason")
+        _add_session_args(resource_observation)
         repair_run_parser = commands.add_parser("repair-run")
         repair_run_parser.add_argument("selector"); repair_run_parser.add_argument("--contest")
         repair_run_parser.add_argument("--run-id"); _add_session_args(repair_run_parser)
@@ -150,9 +296,16 @@ def build_parser() -> argparse.ArgumentParser:
     resource_sample.add_argument("selector"); resource_sample.add_argument("--contest"); resource_sample.add_argument("--sample-json"); resource_sample.add_argument("--metadata")
     _add_session_args(resource_sample)
     if not child_surface:
-        race_start = commands.add_parser("race-plan-start")
+        race_start = commands.add_parser(
+            "race-plan-start",
+            description=(
+                "Append branch intents for an explicit solve mode. Only lineage RUNNING counts as active width; "
+                "legacy tier is a compatibility/resource hint."
+            ),
+        )
         race_start.add_argument("selector"); race_start.add_argument("--contest")
-        race_start.add_argument("--tier", required=True, type=int)
+        race_start.add_argument("--mode", choices=tuple(mode.value for mode in SolveMode))
+        race_start.add_argument("--tier", type=int, help="legacy resource/maximum-width hint only")
         race_start.add_argument("--tier-reason", default="competition-first first-to-flag race")
         race_start.add_argument("--branch-spec"); race_start.add_argument("--threshold", type=float, default=.95)
         _add_session_args(race_start)
@@ -188,6 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_branch_candidate_args(replacement)
         replacement.add_argument("--superseded-branch-id", required=True)
         replacement.add_argument("--kill-reason", required=True); replacement.add_argument("--distinct-mechanism-proof", required=True)
+        replacement.add_argument("--triggering-receipt-id", required=True)
         replacement.add_argument("--evidence-contract", action="append", required=True)
         replacement.add_argument("--success-condition", required=True); replacement.add_argument("--kill-condition", required=True)
         replacement.add_argument("--maximum-steps", type=int, required=True); replacement.add_argument("--budget-seconds", type=int, required=True)
@@ -545,6 +699,23 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         except json.JSONDecodeError as exc:
             raise ValueError("--assessments-json must be valid JSON") from exc
         return finalize_triage(root, args.contest, assessments)
+    if args.command == "benchmark-schedule-create":
+        challenges = json.loads(args.challenges_json)
+        if not isinstance(challenges, list):
+            raise ValueError("--challenges-json must contain an array")
+        schedule = generate_schedule(challenges, randomization_seed=args.randomization_seed)
+        if args.output:
+            output = Path(args.output).resolve()
+            if output.is_symlink():
+                raise ValueError("benchmark schedule output must not be a symlink")
+            atomic_json(output, schedule)
+            schedule["output"] = str(output)
+        return schedule
+    if args.command == "benchmark-lock-verify":
+        return verify_benchmark_lock(
+            Path(args.lock).resolve(), Path(args.signature).resolve(),
+            {args.key_id: Path(args.public_key).resolve()},
+        )
     if args.command == "sandbox-exec":
         misplaced = {
             "--timeout", "--timeout-profile", "--session-id", "--session-role",
@@ -598,21 +769,176 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return export_artifacts(metadata, session_id=session_id, session_role=role)
 
     if args.command == "prepare-challenge":
+        if args.resume_run_id and (
+            args.fresh_attempt or args.attempt_id or args.transformation_seed
+        ):
+            raise ValueError("--resume-run-id conflicts with fresh-attempt identity options")
+        selected_mode = resolve_solve_mode(args.mode, tier=args.tier)
         manifest, challenge, record = _prepare_challenge_same_session(
             root, args.contest, args.selector, args.session_input_json,
         )
         workspace = challenge_root(root, manifest, challenge)
-        solve_root = initialize_solve_files(workspace, challenge, str(record["source_fingerprint"]))
+        solve_root = (
+            resume_attempt(workspace, run_id=args.resume_run_id)
+            if args.resume_run_id else
+            initialize_solve_files(
+                workspace, challenge, str(record["source_fingerprint"]),
+                fresh_attempt=args.fresh_attempt, attempt_id=args.attempt_id,
+                transformation_seed=args.transformation_seed,
+                mode=selected_mode, legacy_tier=args.tier,
+            )
+        )
         repair_run_projections(solve_root, declared_remote=bool(challenge.remotes))
-        launch_context = build_solve_launch_context(challenge, record)
         launch_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+        launch_context = build_solve_launch_context(
+            challenge, record, mode=str(launch_state.get("solve_mode") or selected_mode.value),
+            legacy_tier=launch_state.get("legacy_tier"),
+        )
         launch_context["run_id"] = launch_state.get("run_id")
+        launch_context["attempt_id"] = launch_state.get("attempt_id")
+        launch_context["challenge_instance_id"] = launch_state.get("challenge_instance_id")
         launch_context["target_revision"] = launch_state.get("target_revision")
         launch_path = save_solve_launch_context(solve_root, launch_context)
         compatibility_launch_path = save_solve_launch_context(workspace, launch_context)
         prepared = _compact_prepare(challenge, record, solve_root, launch_context, compatibility_launch_path)
         prepared["authoritative_solve_launch_path"] = str(launch_path)
+        prepared["attempt_id"] = launch_state.get("attempt_id")
+        prepared["challenge_instance_id"] = launch_state.get("challenge_instance_id")
+        prepared["mode"] = launch_state.get("solve_mode")
         return prepared
+
+    if args.command == "attempt-start":
+        _require_sol(args, "Only Sol may start a fresh attempt.")
+        selected_mode = resolve_solve_mode(args.mode, tier=args.tier)
+        manifest, challenge, record = _prepare_challenge_same_session(
+            root, args.contest, args.selector, None,
+        )
+        workspace = challenge_root(root, manifest, challenge)
+        run = start_fresh_attempt(
+            workspace, challenge, str(record["source_fingerprint"]),
+            attempt_id=args.attempt_id, transformation_seed=args.transformation_seed,
+            mode=selected_mode, legacy_tier=args.tier,
+        )
+        return show_attempt(run, run_id=run.name)
+
+    if args.command in {"attempt-resume", "attempt-list", "attempt-show"}:
+        _require_sol(args, "Only Sol may resolve prior attempts.")
+        manifest, challenge, _record = _load_challenge_strict(root, args.contest, args.selector)
+        workspace = challenge_root(root, manifest, challenge)
+        if args.command == "attempt-list":
+            return {"attempts": list_attempts(workspace)}
+        if args.command == "attempt-show":
+            return show_attempt(workspace, run_id=args.run_id)
+        run = resume_attempt(workspace, run_id=args.run_id)
+        return show_attempt(run, run_id=run.name)
+
+    if args.command == "benchmark-start":
+        _require_sol(args, "Only Sol may prepare a benchmark attempt.")
+        manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
+        workspace = challenge_root(root, manifest, challenge)
+        schedule_path = Path(args.schedule).resolve()
+        schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+        execution_ledger = schedule_path.with_name("BENCHMARK_EXECUTION.jsonl")
+        begin_schedule_entry(schedule, args.entry_id, execution_ledger)
+        revisions = target_revisions(workspace)
+        if not revisions:
+            fail_schedule_entry(
+                schedule, args.entry_id, execution_ledger,
+                reason="benchmark start requires a prepared authoritative target revision ledger",
+            )
+            raise ValueError("benchmark start requires a prepared authoritative target revision ledger")
+        target_revision = int(revisions[-1]["target_revision"])
+        try:
+            return start_benchmark_attempt(
+                root, workspace, challenge,
+                input_fingerprint=str(record["source_fingerprint"]),
+                target_revision=target_revision, schedule=schedule,
+                schedule_entry_id=args.entry_id, lock_path=Path(args.lock).resolve(),
+                signature_path=Path(args.signature).resolve(),
+                public_keys={args.key_id: Path(args.public_key).resolve()},
+                target_image_digest=args.target_image_digest,
+                tool_image_digest=args.tool_image_digest,
+                challenge_archive_path=Path(args.challenge_archive).resolve(),
+            )
+        except Exception as exc:
+            fail_schedule_entry(schedule, args.entry_id, execution_ledger, reason=str(exc))
+            raise
+
+    if args.command in {
+        "benchmark-health-monitor", "benchmark-telemetry-start",
+        "benchmark-telemetry-sample", "benchmark-telemetry-monitor",
+        "benchmark-telemetry-finish", "benchmark-runtime-observation-record",
+        "benchmark-resource-record", "benchmark-outcome-record", "benchmark-complete",
+    }:
+        _require_sol(args, "Only Sol may operate exact benchmark telemetry/completion receipts.")
+        manifest, challenge, _record = _load_challenge_strict(root, args.contest, args.selector)
+        workspace = challenge_root(root, manifest, challenge)
+        run = resolve_exact_run(workspace, args.run_id)
+        if args.command == "benchmark-health-monitor":
+            return run_target_health_monitor(
+                run, probe_argv=args.argv, endpoint_revision=args.endpoint_revision,
+                duration_seconds=args.duration_seconds, cadence_seconds=args.cadence_seconds,
+                timeout_seconds=args.timeout_seconds,
+                semantic_success_token=args.semantic_success_token,
+            )
+        if args.command == "benchmark-telemetry-start":
+            return start_resource_telemetry(
+                run, tracked_pids=args.tracked_pid,
+                network_namespace_pid=args.network_namespace_pid,
+                container_ids=args.container_id,
+            )
+        if args.command == "benchmark-telemetry-sample":
+            return sample_resource_telemetry(run)
+        if args.command == "benchmark-telemetry-monitor":
+            return run_resource_telemetry_monitor(
+                run, duration_seconds=args.duration_seconds,
+                cadence_seconds=args.cadence_seconds, tracked_pids=args.tracked_pid,
+                network_namespace_pid=args.network_namespace_pid,
+                container_ids=args.container_id,
+            )
+        if args.command == "benchmark-telemetry-finish":
+            return finish_resource_telemetry(run)
+        if args.command == "benchmark-outcome-record":
+            return record_benchmark_outcome(
+                run, oracle_result=args.oracle_result,
+                cleanup_success=args.cleanup_success,
+                terminal_correctness=args.terminal_correctness,
+                environment_failure=args.environment_failure,
+                invalidation_reason=args.invalidation_reason,
+                false_candidate_count=args.false_candidate_count,
+                scope_violation_count=args.scope_violation_count,
+                denied_out_of_scope_action_count=args.denied_out_of_scope_action_count,
+                target_failure_duration_seconds=args.target_failure_duration_seconds,
+                model_failure_duration_seconds=args.model_failure_duration_seconds,
+                environment_failure_duration_seconds=args.environment_failure_duration_seconds,
+                latency_explained_by_target_or_model_queue=(
+                    args.latency_explained_by_target_or_model_queue
+                ),
+                latency_explanation_evidence=args.latency_explanation_evidence,
+            )
+        if args.command == "benchmark-runtime-observation-record":
+            return record_runtime_observation(
+                run, observed_model=args.observed_model,
+                observed_reasoning=args.observed_reasoning,
+                runtime_observation_evidence=args.evidence,
+            )
+        if args.command == "benchmark-resource-record":
+            if args.observation_status == "OBSERVED" and args.value is None:
+                raise ValueError("OBSERVED benchmark resource requires --value")
+            if args.observation_status != "OBSERVED" and args.value is not None:
+                raise ValueError("unobserved benchmark resource must not supply --value")
+            return record_resource_observation(
+                run, args.field, value=args.value,
+                observation_status=args.observation_status, reason=args.reason,
+            )
+        schedule_path = Path(args.schedule).resolve()
+        schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+        receipt = validate_benchmark_completion(run)
+        receipt["schedule_completion"] = finish_schedule_entry(
+            schedule, args.entry_id, schedule_path.with_name("BENCHMARK_EXECUTION.jsonl"),
+            completion_receipt=receipt,
+        )
+        return receipt
 
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
     if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
@@ -731,12 +1057,17 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         _require_delegation_sol(args)
         if args.command == "race-plan-start":
             template_path = Path(__file__).parents[1] / "resources" / "delegation-templates.yaml"
-            specs = parse_branch_spec(args.branch_spec, category=challenge.category, tier=args.tier, template_path=template_path)
+            selected_mode = resolve_solve_mode(args.mode, tier=args.tier)
+            specs = parse_branch_spec(
+                args.branch_spec, category=challenge.category, tier=args.tier,
+                template_path=template_path, mode=selected_mode,
+            )
             board = start_race_plan(
                 solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
                 parent_session_id=args.parent_session_id, category=challenge.category,
                 tier=args.tier, tier_reason=args.tier_reason, branch_specs=specs,
-                threshold=args.threshold,
+                threshold=args.threshold, mode=selected_mode,
+                frozen_template=selected_mode is SolveMode.FIXED_RACE,
             )
             state_path = solve_root / "STATE.json"
             with state_lock(solve_root):
@@ -853,6 +1184,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 kill_condition=args.kill_condition, maximum_steps=args.maximum_steps,
                 budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role,
                 requested_reasoning=args.requested_reasoning,
+                triggering_receipt_id=args.triggering_receipt_id,
             )
         if args.command == "branch-start-confirm":
             return confirm_branch_start(

@@ -13,12 +13,18 @@ import subprocess
 import tempfile
 from typing import Any, Iterator, Mapping, Sequence
 
+from .attempts import (
+    ATTEMPT_SCHEMA_VERSION, AttemptError, challenge_instance_id as derive_challenge_instance_id,
+    challenge_snapshot_digest as derive_challenge_snapshot_digest,
+    legacy_identity as derive_legacy_identity, run_id_for_attempt, safe_attempt_id,
+)
 from .contest import ChallengeSpec, ContestManifest
+from .modes import DEFAULT_LIVE_MODE, SolveMode, resolve_solve_mode
 
 
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 ACTIVE_RUN_SCHEMA_VERSION = 1
-RUN_MANIFEST_SCHEMA_VERSION = 1
+RUN_MANIFEST_SCHEMA_VERSION = 2
 TARGET_REVISION_SCHEMA_VERSION = 1
 CURRENT_FINGERPRINT_SCHEME = "challenge-local-v2"
 LEGACY_FINGERPRINT_SCHEME = "challenge-v1"
@@ -28,6 +34,9 @@ LEGACY_RUN_FILES = (
     "race-events.jsonl", "race-event-acks.json", "RACE_LEDGER.jsonl",
     "RACE_TRANSITIONS.jsonl", "DELEGATION_PLAN.json", "RESOURCE_STATE.json",
     "RESOURCE_HISTORY.jsonl", "REPRODUCE.json", "reproduce.sh",
+    "milestone-receipts.jsonl", "control-actions.jsonl", "terminal-components.jsonl",
+    "post-commit-errors.jsonl", "projection-errors.jsonl", "candidates.json",
+    "progress-state.json",
 )
 LEGACY_RUN_DIRECTORIES = ("flag-receipts", "workers", "exploit", "artifacts", "evidence")
 
@@ -184,6 +193,99 @@ def active_run_id(root: Path) -> str | None:
     return str(value) if value else None
 
 
+def resolve_exact_run(root: Path, run_id: str) -> Path:
+    """Resolve exactly one attempt and never consult ACTIVE_RUN.json as fallback."""
+
+    selected = _identifier(run_id, "run_id")
+    if is_run_root(root):
+        run = root.resolve(strict=False)
+        if run.name != selected:
+            raise WorkspaceError("exact run_id does not match supplied run root")
+    else:
+        run = safe_under(challenge_workspace(root) / "runs", Path(selected))
+    if run.is_symlink() or not run.is_dir():
+        raise WorkspaceError("exact run_id does not exist in this challenge workspace")
+    _recover_state_if_needed(run)
+    return run
+
+
+def resume_attempt(root: Path, *, run_id: str | None = None) -> Path:
+    """Resume current compatibility attempt, or an explicitly named attempt."""
+
+    return resolve_exact_run(root, run_id) if run_id is not None else resolve_active_run(root)
+
+
+def list_attempts(root: Path) -> list[dict[str, Any]]:
+    workspace = challenge_workspace(root)
+    runs = workspace / "runs"
+    if runs.is_symlink():
+        raise WorkspaceError("attempt directory must not be a symlink")
+    values: list[dict[str, Any]] = []
+    if not runs.is_dir():
+        return values
+    for path in sorted(runs.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_dir():
+            continue
+        try:
+            values.append(show_attempt(path, run_id=path.name))
+        except WorkspaceError as exc:
+            values.append({"run_id": path.name, "readable": False, "error": str(exc)})
+    return sorted(values, key=lambda row: (str(row.get("created_at") or ""), str(row["run_id"])))
+
+
+def show_attempt(root: Path, *, run_id: str) -> dict[str, Any]:
+    run = resolve_exact_run(root, run_id)
+    state = _load_json_object(run / "STATE.json", "run state")
+    manifest = _load_json_object(run / "RUN_MANIFEST.json", "run manifest")
+    identity = manifest.get("identity") if isinstance(manifest.get("identity"), Mapping) else {}
+    attempt_id = state.get("attempt_id") or identity.get("attempt_id")
+    instance_id = state.get("challenge_instance_id") or identity.get("challenge_instance_id")
+    legacy = not (attempt_id and instance_id)
+    if legacy:
+        snapshot = str(
+            state.get("challenge_snapshot_digest")
+            or hashlib.sha256(json.dumps({
+                "challenge_id": state.get("challenge_id"),
+                "input_fingerprint": state.get("input_fingerprint"),
+                "target_revision": state.get("target_revision"),
+            }, sort_keys=True).encode()).hexdigest()
+        )
+        derived = derive_legacy_identity(
+            challenge_id=str(state.get("challenge_id") or "legacy"),
+            input_fingerprint=str(state.get("input_fingerprint") or "UNBOUND"),
+            target_revision=int(state.get("target_revision") or 1),
+            snapshot_digest=snapshot,
+        )
+        attempt_id, instance_id = derived["attempt_id"], derived["challenge_instance_id"]
+    pending = bool(state.get("remote_flag_receipt") and state.get("competition_state") != "ACCEPTED")
+    return {
+        "schema_version": ATTEMPT_SCHEMA_VERSION,
+        "run_id": run.name, "attempt_id": attempt_id,
+        "challenge_instance_id": instance_id, "legacy_identity": legacy,
+        "status": state.get("status"), "sealed": bool(state.get("sealed")),
+        "pending_submission": pending, "created_at": state.get("created_at"),
+        "path": str(run), "readable": True,
+    }
+
+
+def start_fresh_attempt(
+    root: Path, challenge: ChallengeSpec, fingerprint: str, *,
+    target_revision: int | None = None, attempt_id: str | None = None,
+    transformation_seed: str | int | None = None,
+    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
+    requested_model: str = "", requested_reasoning: str = "",
+    publish_active: bool = True, local_target_image_digest: str | None = None,
+) -> Path:
+    return bind_input_fingerprint(
+        root, challenge, fingerprint, target_revision=target_revision,
+        requested_model=requested_model, requested_reasoning=requested_reasoning,
+        fresh_attempt=True, attempt_id=attempt_id,
+        transformation_seed=transformation_seed, mode=mode,
+        legacy_tier=legacy_tier, publish_active=publish_active,
+        local_target_image_digest=local_target_image_digest,
+    )
+
+
 def ensure_run_mutable(root: Path) -> Path:
     run = resolve_active_run(root, migrate=False)
     state_path = run / "STATE.json"
@@ -199,7 +301,10 @@ def ensure_run_mutable(root: Path) -> Path:
 def initialize_solve_files(
     root: Path, challenge: ChallengeSpec, input_fingerprint: str | None = None,
     *, target_revision: int | None = None, requested_model: str = "",
-    requested_reasoning: str = "",
+    requested_reasoning: str = "", fresh_attempt: bool = False,
+    attempt_id: str | None = None, transformation_seed: str | int | None = None,
+    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
+    publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
     """Create or resolve one immutable-generation solve run.
 
@@ -214,7 +319,7 @@ def initialize_solve_files(
     with state_lock(workspace):
         _migrate_legacy_unlocked(workspace, challenge=challenge)
         pointer = _active_pointer_unlocked(workspace)
-        if pointer:
+        if pointer and not fresh_attempt and attempt_id is None:
             active = workspace / "runs" / str(pointer["run_id"])
             if input_fingerprint in {None, pointer.get("input_fingerprint")} and (
                 target_revision is None or target_revision == pointer.get("target_revision")
@@ -228,7 +333,11 @@ def initialize_solve_files(
         return _create_run_unlocked(
             workspace, challenge=challenge, fingerprint=fingerprint,
             target_revision=revision, requested_model=requested_model,
-            requested_reasoning=requested_reasoning,
+            requested_reasoning=requested_reasoning, fresh_attempt=fresh_attempt,
+            attempt_id=attempt_id, transformation_seed=transformation_seed,
+            solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
+            legacy_tier=legacy_tier, publish_active=publish_active,
+            local_target_image_digest=local_target_image_digest,
         )
 
 
@@ -236,6 +345,10 @@ def bind_input_fingerprint(
     root: Path, challenge: ChallengeSpec, fingerprint: str, *,
     target_revision: int | None = None, requested_model: str = "",
     requested_reasoning: str = "", legacy_fingerprints: Sequence[str] = (),
+    fresh_attempt: bool = False, attempt_id: str | None = None,
+    transformation_seed: str | int | None = None,
+    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
+    publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
     """Bind a run without mutating or erasing any previous run generation."""
 
@@ -251,13 +364,20 @@ def bind_input_fingerprint(
             workspace, tuple(getattr(challenge, "remotes", ()) or ()), source="contest-manifest",
         )
         pointer = _active_pointer_unlocked(workspace)
-        if pointer and pointer.get("input_fingerprint") == fingerprint and pointer.get("target_revision") == revision:
+        if (
+            pointer and not fresh_attempt and attempt_id is None
+            and pointer.get("input_fingerprint") == fingerprint
+            and pointer.get("target_revision") == revision
+        ):
             run = workspace / "runs" / str(pointer["run_id"])
             if not (run / "STATE.json").is_file():
                 return _create_run_unlocked(
                     workspace, challenge=challenge, fingerprint=fingerprint,
                     target_revision=revision, requested_model=requested_model,
                     requested_reasoning=requested_reasoning,
+                    solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
+                    legacy_tier=legacy_tier, publish_active=publish_active,
+                    local_target_image_digest=local_target_image_digest,
                 )
             try:
                 _validate_run_identity(run, fingerprint, revision)
@@ -267,6 +387,8 @@ def bind_input_fingerprint(
             _stamp_fingerprint_scheme(run, workspace)
             return run
         if (
+            not fresh_attempt and attempt_id is None
+            and
             pointer and pointer.get("input_fingerprint") in set(legacy_fingerprints)
             and pointer.get("target_revision") == revision
         ):
@@ -279,7 +401,11 @@ def bind_input_fingerprint(
         run = _create_run_unlocked(
             workspace, challenge=challenge, fingerprint=fingerprint,
             target_revision=revision, requested_model=requested_model,
-            requested_reasoning=requested_reasoning,
+            requested_reasoning=requested_reasoning, fresh_attempt=fresh_attempt,
+            attempt_id=attempt_id, transformation_seed=transformation_seed,
+            solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
+            legacy_tier=legacy_tier, publish_active=publish_active,
+            local_target_image_digest=local_target_image_digest,
         )
         # A legacy STATE.json is retained only as a non-authoritative
         # compatibility projection. Fresh workspaces never create it.
@@ -308,6 +434,9 @@ def update_run_manifest_timing(root: Path, field: str, timestamp: str | None = N
     allowed = {
         "first_decisive_experiment_at", "primitive_confirmed_at", "working_poc_at",
         "first_remote_attempt_at", "flag_observed_at", "submission_result_at",
+        "first_meaningful_observation_at", "first_viable_hypothesis_at",
+        "first_primitive_confirmed_at", "first_working_poc_at",
+        "first_flag_candidate_at", "first_oracle_accepted_flag_at", "attempt_finished_at",
     }
     if field not in allowed:
         raise WorkspaceError(f"unsupported run timing field: {field}")
@@ -320,6 +449,17 @@ def update_run_manifest_timing(root: Path, field: str, timestamp: str | None = N
             raise WorkspaceError("run manifest timing section is malformed")
         if timing.get(field) is None:
             timing[field] = timestamp or utc_now()
+            canonical = {
+                "primitive_confirmed_at": "first_primitive_confirmed_at",
+                "working_poc_at": "first_working_poc_at",
+                "flag_observed_at": "first_flag_candidate_at",
+            }.get(field, field)
+            timestamps = manifest.get("timestamps")
+            if isinstance(timestamps, dict) and canonical in timestamps:
+                timestamps[canonical] = timing[field]
+                reasons = manifest.get("timestamp_missing_reasons")
+                if isinstance(reasons, dict):
+                    reasons[canonical] = None
             atomic_json(path, manifest)
 
 
@@ -403,11 +543,28 @@ def _workspace_lock(lock_path: Path, label: str) -> Iterator[None]:
 def _create_run_unlocked(
     workspace: Path, *, challenge: ChallengeSpec, fingerprint: str,
     target_revision: int, requested_model: str, requested_reasoning: str,
+    fresh_attempt: bool = False, attempt_id: str | None = None,
+    transformation_seed: str | int | None = None,
+    solve_mode: SolveMode = DEFAULT_LIVE_MODE, legacy_tier: int | None = None,
+    publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
-    run_id = _content_run_id(str(challenge.id), fingerprint, target_revision)
+    snapshot_digest = derive_challenge_snapshot_digest(
+        workspace, challenge, input_fingerprint=fingerprint,
+        target_revision=target_revision, transformation_seed=transformation_seed,
+        local_target_image_digest=local_target_image_digest,
+    )
+    instance_id = derive_challenge_instance_id(
+        challenge_id=str(challenge.id), input_fingerprint=fingerprint,
+        target_revision=target_revision, challenge_snapshot_digest=snapshot_digest,
+        transformation_seed=transformation_seed,
+    )
+    selected_attempt_id = safe_attempt_id(attempt_id)
+    run_id = run_id_for_attempt(instance_id, selected_attempt_id)
     run = safe_under(workspace / "runs", Path(run_id))
     if run.exists() and (run.is_symlink() or not run.is_dir()):
         raise WorkspaceError("run path exists but is not a safe directory")
+    if run.exists() and (fresh_attempt or attempt_id is not None):
+        raise WorkspaceError(f"duplicate attempt_id is rejected: {selected_attempt_id}")
     run.mkdir(parents=True, exist_ok=True)
     state_path = run / "STATE.json"
     if state_path.exists():
@@ -434,6 +591,8 @@ def _create_run_unlocked(
         now = utc_now()
         atomic_json(state_path, {
             "schema_version": RUN_SCHEMA_VERSION, "run_id": run_id,
+            "challenge_instance_id": instance_id, "attempt_id": selected_attempt_id,
+            "legacy_identity": False,
             "challenge_id": challenge.id, "status": "PREPARED", "sealed": False,
             "cleanup_state": "NOT_STARTED", "branches": [],
             "flag_candidate": None, "active_candidate_id": None, "candidates": [],
@@ -442,6 +601,11 @@ def _create_run_unlocked(
             "remote_flag_receipt": None, "remote_candidate_receipt": None, "flag_history": [],
             "submission_history": [],
             "input_fingerprint": fingerprint, "target_revision": target_revision,
+            "challenge_snapshot_digest": snapshot_digest,
+            "transformation_seed": "NONE" if transformation_seed is None else str(transformation_seed),
+            "solve_mode": solve_mode.value,
+            "legacy_tier": legacy_tier,
+            "active_child_width": 0, "planned_child_width": 0,
             "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
             "created_at": now, "updated_at": now,
         })
@@ -449,14 +613,19 @@ def _create_run_unlocked(
         atomic_json(run / "RUN_MANIFEST.json", _run_manifest(
             workspace, challenge, run_id, fingerprint, target_revision,
             requested_model=requested_model, requested_reasoning=requested_reasoning,
+            challenge_instance_id=instance_id, attempt_id=selected_attempt_id,
+            challenge_snapshot_digest=snapshot_digest,
+            transformation_seed=transformation_seed, solve_mode=solve_mode,
         ))
     pointer = {
         "schema_version": ACTIVE_RUN_SCHEMA_VERSION, "run_id": run_id,
         "challenge_id": challenge.id, "input_fingerprint": fingerprint,
         "target_revision": target_revision, "updated_at": utc_now(),
+        "challenge_instance_id": instance_id, "attempt_id": selected_attempt_id,
         "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
     }
-    atomic_json(workspace / "ACTIVE_RUN.json", pointer)
+    if publish_active:
+        atomic_json(workspace / "ACTIVE_RUN.json", pointer)
     return run
 
 
@@ -593,30 +762,106 @@ def _record_target_revision_unlocked(
 def _run_manifest(
     workspace: Path, challenge: Any, run_id: str, fingerprint: str,
     target_revision: int, *, requested_model: str, requested_reasoning: str,
+    challenge_instance_id: str | None = None, attempt_id: str | None = None,
+    challenge_snapshot_digest: str | None = None,
+    transformation_seed: str | int | None = None,
+    solve_mode: SolveMode = DEFAULT_LIVE_MODE,
 ) -> dict[str, Any]:
     commit, dirty = _repository_identity(workspace)
+    started = utc_now()
+    timestamps = {
+        "attempt_started_at": started,
+        "first_meaningful_observation_at": None,
+        "first_viable_hypothesis_at": None,
+        "first_decisive_experiment_at": None,
+        "first_primitive_confirmed_at": None,
+        "first_working_poc_at": None,
+        "first_remote_attempt_at": None,
+        "first_flag_candidate_at": None,
+        "first_oracle_accepted_flag_at": None,
+        "attempt_finished_at": None,
+        "submission_result_at": None,
+    }
+    missing_reasons = {
+        key: (None if value is not None else "NOT_YET_OBSERVED")
+        for key, value in timestamps.items()
+    }
+    unavailable = lambda reason: {
+        "value": None, "observation_status": "NOT_OBSERVABLE", "reason": reason,
+    }
     return {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "challenge_instance_id": challenge_instance_id,
+        "attempt_id": attempt_id,
+        "run_id": run_id,
+        "arm": "LIVE", "mode": solve_mode.value, "repetition": None,
+        "matched_block_id": None, "stratum": "LIVE_CONTEST",
+        "lock_digest": None, "configuration_digest": None,
+        "transformation_seed": "NONE" if transformation_seed is None else str(transformation_seed),
+        "identity": {
+            "challenge_instance_id": challenge_instance_id, "attempt_id": attempt_id,
+            "run_id": run_id, "legacy_identity": challenge_instance_id is None,
+        },
         "repository": {"commit_sha": commit, "dirty_diff_digest": dirty},
         "runtime": {
             "requested_model": requested_model, "observed_model": None,
             "requested_reasoning": requested_reasoning, "observed_reasoning": None,
+            "observed_model_missing_reason": "NOT_YET_OBSERVED",
+            "observed_reasoning_missing_reason": "NOT_YET_OBSERVED",
+            "runtime_observation_evidence": None,
         },
         "challenge": {
             "challenge_id": challenge.id, "run_id": run_id,
             "input_fingerprint": fingerprint, "target_revision": target_revision,
         },
         "environment": {
-            "container_digest": None,
-            "host_profile": {"system": platform.system(), "machine": platform.machine(), "cpu_count": os.cpu_count()},
+            "container_digest": None, "target_image_digest": None, "tool_image_digest": None,
+            "cli_build_hash": None,
+            "host_profile": {
+                "system": platform.system(), "kernel": platform.release(),
+                "machine": platform.machine(), "cpu_count": os.cpu_count(),
+            },
             "tool_versions": {"python": platform.python_version()},
+            "docker_server": unavailable("not observed during general attempt preparation"),
+            "network_profile": None, "time_limit_seconds": None,
+            "maximum_model_concurrency": 1 if solve_mode is SolveMode.SOL_ONLY else 4,
+            "random_seed": None,
         },
         "timing": {
-            "started_at": utc_now(), "first_decisive_experiment_at": None,
+            "started_at": started, "first_decisive_experiment_at": None,
             "primitive_confirmed_at": None, "working_poc_at": None,
             "first_remote_attempt_at": None, "flag_observed_at": None,
             "submission_result_at": None,
         },
+        "timestamps": timestamps,
+        "timestamp_missing_reasons": missing_reasons,
+        "outcome": {
+            "oracle_result": None, "solved": None, "censored": None,
+            "censor_time_seconds": None, "environment_failure": False,
+            "invalidation_reason": None, "cleanup_success": None,
+            "terminal_correctness": None,
+        },
+        "resource_consumption": {
+            "model_queue_seconds": unavailable("external model queue telemetry is not observable"),
+            "model_tokens": unavailable("external model token telemetry is not observable"),
+            "subscription_units": unavailable("subscription telemetry is not observable"),
+            "model_session_minutes": unavailable("external model session telemetry is not observable"),
+            "cpu_seconds": unavailable("resource monitor has not completed"),
+            "ram_gib_seconds": unavailable("resource monitor has not completed"),
+            "ram_peak_bytes": unavailable("resource monitor has not completed"),
+            "network_rx_bytes": unavailable("resource monitor has not completed"),
+            "network_tx_bytes": unavailable("resource monitor has not completed"),
+            "container_lifetime_seconds": unavailable("resource monitor has not completed"),
+            "child_session_count": {"value": 0, "observation_status": "OBSERVED", "reason": None},
+            "maximum_active_width": {"value": 0, "observation_status": "OBSERVED", "reason": None},
+        },
+        "target_health_intervals": [],
+        "target_health_probe_contract": {
+            "deterministic_host_process": True, "cadence_seconds": 60,
+            "required_at": ["RUN_START", "EVERY_60_SECONDS", "RUN_END"],
+            "creates_model_sessions": False,
+        },
+        "challenge_snapshot_digest": challenge_snapshot_digest,
     }
 
 
@@ -639,7 +884,7 @@ def _repository_identity(start: Path) -> tuple[str, str]:
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return "", ""
-    return commit, hashlib.sha256(status + b"\0" + diff).hexdigest()
+    return commit, "CLEAN" if not status and not diff else hashlib.sha256(status + b"\0" + diff).hexdigest()
 
 
 def _active_pointer_unlocked(workspace: Path) -> dict[str, Any] | None:
@@ -728,7 +973,7 @@ def _recover_state_if_needed(
             payload = json.loads(path.read_text(encoding="utf-8"))
             healthy = (
                 isinstance(payload, dict)
-                and payload.get("schema_version") == RUN_SCHEMA_VERSION
+                and payload.get("schema_version") in {1, 2, 3, RUN_SCHEMA_VERSION}
                 and payload.get("run_id") == run.name
             )
         except (OSError, json.JSONDecodeError):
@@ -899,6 +1144,9 @@ def _recover_run_state_unlocked(
 
     state: dict[str, Any] = {
         "schema_version": RUN_SCHEMA_VERSION, "run_id": run_id,
+        "challenge_instance_id": manifest.get("challenge_instance_id"),
+        "attempt_id": manifest.get("attempt_id"),
+        "legacy_identity": not bool(manifest.get("challenge_instance_id") and manifest.get("attempt_id")),
         "challenge_id": challenge_id, "status": "PREPARED", "sealed": False,
         "cleanup_state": "NOT_STARTED", "branches": _recovery_branches(run),
         "flag_candidate": None, "active_candidate_id": None,
@@ -916,6 +1164,12 @@ def _recover_run_state_unlocked(
         "remote_flag_receipt": None, "remote_candidate_receipt": None,
         "flag_history": [], "submission_history": [],
         "input_fingerprint": fingerprint, "target_revision": revision,
+        "challenge_snapshot_digest": manifest.get("challenge_snapshot_digest"),
+        "transformation_seed": manifest.get("transformation_seed", "NONE"),
+        "solve_mode": manifest.get("mode", "adaptive-race"),
+        "active_child_width": sum(
+            row.get("status") == "RUNNING" for row in _recovery_branches(run)
+        ),
         "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
         "created_at": started_at, "updated_at": started_at,
     }
@@ -1137,6 +1391,18 @@ def _validate_recovery_identities(
 
 
 def _recovery_branches(run: Path) -> list[dict[str, Any]]:
+    lineage = run / "RACE_LINEAGE.jsonl"
+    if lineage.is_file() and not lineage.is_symlink():
+        from .race_lineage import lineage_state
+
+        return [
+            {
+                "id": row.get("branch_id"), "branch_id": row.get("branch_id"),
+                "session_id": row.get("session_id"), "generation": row.get("generation"),
+                "status": row.get("status"), "mode": row.get("mode"),
+            }
+            for row in lineage_state(run).get("branches", [])
+        ]
     path = run / "DELEGATION_PLAN.json"
     if not path.exists():
         return []
@@ -1249,8 +1515,8 @@ def _validate_run_identity(
     run: Path, fingerprint: str | None, target_revision: int | None,
 ) -> dict[str, Any]:
     state = _load_json_object(run / "STATE.json", "run state")
-    if state.get("schema_version") != RUN_SCHEMA_VERSION:
-        raise WorkspaceError(f"run STATE.json schema_version must be {RUN_SCHEMA_VERSION}")
+    if state.get("schema_version") not in {1, 2, 3, RUN_SCHEMA_VERSION}:
+        raise WorkspaceError("run STATE.json has an unsupported schema_version")
     if state.get("run_id") != run.name:
         raise WorkspaceError("run state run_id does not match its directory")
     if fingerprint is not None and state.get("input_fingerprint") != fingerprint:
