@@ -32,11 +32,20 @@ _ARCHIVE_LIMITS = {
 }
 
 
-def run_intake(repo: str | Path, contest_selector: str | None = None) -> dict[str, object]:
+def run_intake(
+    repo: str | Path,
+    contest_selector: str | None = None,
+    *,
+    force_challenge_ids: set[str] | frozenset[str] | None = None,
+) -> dict[str, object]:
     root = Path(repo).resolve()
     sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-    records = [_inspect_challenge(root, manifest, challenge) for challenge in manifest.challenges]
+    forced = force_challenge_ids or frozenset()
+    records = [
+        _inspect_challenge(root, manifest, challenge, force_materialize=challenge.id in forced)
+        for challenge in manifest.challenges
+    ]
     payload: dict[str, object] = {
         "schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(),
         "contest": manifest.to_dict(), "challenges": records,
@@ -52,7 +61,13 @@ def run_intake(repo: str | Path, contest_selector: str | None = None) -> dict[st
     return payload
 
 
-def _inspect_challenge(root: Path, manifest: ContestManifest, challenge: ChallengeSpec) -> dict[str, object]:
+def _inspect_challenge(
+    root: Path,
+    manifest: ContestManifest,
+    challenge: ChallengeSpec,
+    *,
+    force_materialize: bool = False,
+) -> dict[str, object]:
     destination = challenge_root(root, manifest, challenge)
     base: dict[str, object] = challenge.to_dict() | {
         "status": "BLOCKED", "blockers": [], "authorized_targets": [],
@@ -76,7 +91,9 @@ def _inspect_challenge(root: Path, manifest: ContestManifest, challenge: Challen
         base["source_paths"] = [str(path) for path in sources]
         if not sources and not challenge.remotes:
             raise ValueError("contest.md entry has no matching directory/archive and no authorized remote")
-        input_dir, archive_records, fingerprint, prepared_fingerprint = _materialize(destination, challenge, sources)
+        input_dir, archive_records, fingerprint, prepared_fingerprint = _materialize(
+            destination, challenge, sources, force=force_materialize,
+        )
         base["archives"] = archive_records
         base["source_fingerprint"] = fingerprint
         base["prepared_fingerprint"] = prepared_fingerprint
@@ -128,15 +145,32 @@ def _match_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> list[
     return sorted(matches, key=lambda path: path.name.casefold())
 
 
-def _materialize(destination: Path, challenge: ChallengeSpec, sources: list[Path]) -> tuple[Path, list[dict[str, object]], str, str]:
+def _materialize(
+    destination: Path,
+    challenge: ChallengeSpec,
+    sources: list[Path],
+    *,
+    force: bool = False,
+) -> tuple[Path, list[dict[str, object]], str, str]:
     limits = _ARCHIVE_LIMITS[challenge.input_profile]
     fingerprint = _source_fingerprint(challenge, sources)
     input_dir = destination / "input"
     marker = destination / ".input-fingerprint"
-    if input_dir.is_symlink() or marker.is_symlink():
-        raise ArchiveError("prepared input or fingerprint marker must not be a symlink")
-    if input_dir.is_dir() and marker.is_file() and marker.read_text() == fingerprint:
-        metadata_path = destination / ".archive-metadata.json"
+    metadata_path = destination / ".archive-metadata.json"
+    old = destination / ".old-input"
+    if any(path.is_symlink() for path in (input_dir, marker, metadata_path, old)):
+        raise ArchiveError("prepared input metadata paths must not be symlinks")
+    if input_dir.exists() and not input_dir.is_dir():
+        raise ArchiveError("prepared input path must be a directory")
+    if marker.exists() and not marker.is_file():
+        raise ArchiveError("prepared input fingerprint marker must be a regular file")
+    if metadata_path.exists() and not metadata_path.is_file():
+        raise ArchiveError("prepared archive metadata must be a regular file")
+    if old.exists() and not old.is_dir():
+        raise ArchiveError("stale prepared input path must be a directory")
+    if input_dir.is_dir():
+        prepared_tree_fingerprint(input_dir)
+    if not force and input_dir.is_dir() and marker.is_file() and marker.read_text() == fingerprint:
         cached = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else _archive_metadata(sources)
         return input_dir, cached, fingerprint, prepared_tree_fingerprint(input_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -154,7 +188,6 @@ def _materialize(destination: Path, challenge: ChallengeSpec, sources: list[Path
                 archives.append({"path": str(source), "sha256": _sha256(source), "size": source.stat().st_size, "members": members, "extracted": True})
             prepared_tree_fingerprint(staging)
         _make_read_only(staging)
-        old = destination / ".old-input"
         if old.exists():
             _remove_generated_tree(old)
         if input_dir.exists():

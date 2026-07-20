@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,11 @@ from ctf_os.sandbox.resources import GIB, admit, race_width
 from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
 from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, _lifecycle
 import ctf_os.service as service_module
+from ctf_os.solve_launch import (
+    MAX_OBSERVATION_HINTS, MAX_PRIORITY_FILES, MAX_RECOMMENDED_TOOLS,
+    MAX_SETUP_REQUIREMENTS, MAX_SOLVE_LAUNCH_BYTES, MAX_TRIAGE_REASONS,
+    OBSERVATION_HINT_SEMANTICS, build_solve_launch_context, solve_launch_size,
+)
 from ctf_os.verification import FastFlagError, mark_fully_verified, record_remote_flag
 
 
@@ -34,6 +40,68 @@ def _state(root: Path, challenge_id: str = "challenge", fingerprint: str = "fp")
         "status": "PREPARED", "branches": [], "flag_candidate": None,
     }))
     (root / "evidence.log").touch()
+
+
+def test_solve_launch_context_is_bounded_and_hints_are_not_progress() -> None:
+    long_text = "관찰-" + "가" * 2_000
+    files = [
+        {
+            "path": f"path-{number}-{long_text}", "size": number,
+            "sha256": "a" * 64, "mime": long_text, "kind": long_text,
+        }
+        for number in range(40)
+    ]
+    challenge = SimpleNamespace(
+        id="stable-id", key="web/large", category="web", name="large", remotes=(),
+    )
+    record = {
+        "source_fingerprint": "f" * 64,
+        "files": files,
+        "priority_files": [item["path"] for item in files],
+        "important_metadata": {"file_count": len(files), "total_bytes": 123456},
+        "runtime": [long_text] * 20,
+        "subtype": long_text,
+        "initial_attack_surface": [long_text] * 30,
+        "recommended_image": long_text,
+        "recommended_resource_profile": long_text,
+        "service_plan": {
+            "kind": "compose", "status": "READY", "safe_to_start": True,
+            "review_reasons": [long_text] * 20,
+            "services": [
+                {
+                    "name": f"service-{number}", "image": long_text,
+                    "internal_targets": [long_text] * 20,
+                    "mapped_ports": [{"target": 8000, "published": 9000, "protocol": "tcp"}] * 20,
+                }
+                for number in range(20)
+            ],
+        },
+        "contest_triage": {
+            "recommendation": {"bucket": "priority", "rank": 1, "label": long_text},
+            "reasons": [{"fact_id": str(number), "text": long_text} for number in range(20)],
+            "baseline": {
+                "difficulty": long_text, "estimated_solve_time": long_text,
+                "success_probability": long_text,
+            },
+            "setup": {"cost": long_text, "requirements": [long_text] * 20},
+            "attack_surface_clarity": long_text,
+            "recommended_tools": [long_text] * 20,
+            "recommended_playbook": {"category": "web", "path": long_text},
+        },
+    }
+
+    context = build_solve_launch_context(challenge, record)
+
+    assert len(context["priority_files"]) == MAX_PRIORITY_FILES
+    assert len(context["observation_hints"]) == MAX_OBSERVATION_HINTS
+    assert len(context["contest_triage"]["reasons"]) == MAX_TRIAGE_REASONS
+    assert len(context["contest_triage"]["recommended_tools"]) == MAX_RECOMMENDED_TOOLS
+    assert len(context["contest_triage"]["setup"]["requirements"]) == MAX_SETUP_REQUIREMENTS
+    assert solve_launch_size(context) <= MAX_SOLVE_LAUNCH_BYTES
+    policy = context["execution_policy"]
+    assert policy["observation_hint_semantics"] == OBSERVATION_HINT_SEMANTICS
+    assert policy["triage_hints_are_not_confirmed_vulnerabilities"] is True
+    assert "primitive" not in context and "finding" not in context
 
 
 @pytest.mark.parametrize(("tier", "width"), [(1, 2), (2, 3), (3, 4)])

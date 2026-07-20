@@ -12,7 +12,13 @@ def test_skills_and_agents_define_sol_native_contract() -> None:
     assert "SUBMISSION_RECOMMENDED" in solve
     assert "Full clean replay: not required" in solve
     assert "Never run Codex" in solve
-    assert "dedicated session" in intake and "new session" in agents
+    assert "solve_launch_context" in solve
+    assert "observation-ordering hints only" in solve
+    assert "They are not confirmed vulnerabilities or exploit primitives" in solve
+    assert "A Triage recommendation, difficulty, or success estimate never substitutes" in solve
+    assert "dedicated session" in intake
+    assert "keep the current user-opened Sol session" in agents
+    assert "repairs missing or stale Intake in the same session" in agents
     assert "no-solve stage" in triage and "triage-finalize" in triage
 
 

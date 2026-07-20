@@ -1,6 +1,6 @@
 ---
 name: ctf-solve
-description: Competition-first solve of exactly one authorized CTF challenge with the current user-opened Sol session as lead attacker and a native first-to-flag race. Use for "1번 문제 풀어라", category/name, challenge names, deep solve, or swarm requests after Intake and Triage.
+description: Competition-first solve of exactly one authorized CTF challenge with the current user-opened Sol session as lead attacker and a native first-to-flag race. Use for "1번 문제 풀어라", category/name, challenge names, deep solve, or swarm requests.
 ---
 
 # CTF solve — exploit first
@@ -9,11 +9,18 @@ description: Competition-first solve of exactly one authorized CTF challenge wit
 
 ## Start with bounded observation
 
-1. Read root `AGENTS.md`, current `TRIAGE.md`, the authoritative agent policy, and only the selected category playbook.
-2. Run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'`.
-3. Stop only for ambiguous selection, stale/missing Intake/Triage, missing scope, an undeclared required target, required host credentials, or an out-of-scope action.
-4. Spend no more than roughly 60–90 seconds and no more than the category playbook's fast-recon command budget. Stop at the first concrete primitive even if budget remains. Read raw logs/inventories only for a current exploit hypothesis.
-5. At budget exhaustion, emit exactly this compact decision state:
+1. The current user-opened session remains lead Sol from preparation through remote flag acquisition. Read root `AGENTS.md`, the authoritative agent policy, and only the selected category playbook.
+2. Run `uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'` in this session.
+3. Use the returned `solve_launch_context` as the authoritative launch context for this selected challenge. It contains the current identity, input fingerprint, declared scope, bounded priority files, environment, and optional selected-challenge Triage fields. Do not load the full contest Board or require the user to run another command.
+4. Directly observe the priority files and actual runtime results. Triage and Intake attack surfaces are observation-ordering hints only. They are not confirmed vulnerabilities or exploit primitives. Discard a hint immediately when the first decisive experiment refutes it. A Triage recommendation, difficulty, or success estimate never substitutes for an exploit hypothesis based on actual evidence.
+5. Spend no more than roughly 60–90 seconds and no more than the category playbook's fast-recon command budget. Stop at the first concrete primitive even if budget remains. Read raw logs/inventories only for a current exploit hypothesis.
+6. Form at most three concrete active exploit hypotheses from direct file/runtime observation.
+7. Run the cheapest decisive experiment for the leading hypothesis, then kill or promote it before adding another.
+8. Move immediately to the smallest working PoC and the declared remote as soon as the path is plausible.
+
+`prepare-challenge` syncs the manifest and repairs missing or stale Intake state inside the same call. Do not ask the user to run Intake/Triage commands, open a preparation session, open a new solve session, or provide the challenge and remote again. Stop only when the selector is genuinely ambiguous; challenge input is missing, damaged, or cannot be prepared safely; scope is missing or requires an out-of-scope action; a required target is undeclared; required host credentials were not provided; or metadata is damaged or unsafe.
+
+At budget exhaustion, emit exactly this compact decision state:
 
 ```text
 Leading exploit path:
@@ -22,7 +29,7 @@ Kill condition:
 Expected time to PoC: immediate | few experiments | long computation
 ```
 
-Form at most three active exploit hypotheses. Each contains only `expected primitive`, `cheapest decisive experiment`, `success condition`, and `kill condition`; `reopen_condition` is optional. Run the cheapest decisive experiment now. Kill or promote before adding another hypothesis.
+Each active hypothesis contains only `expected primitive`, `cheapest decisive experiment`, `success condition`, and `kill condition`; `reopen_condition` is optional.
 
 ## Start an evidence-driven race
 

@@ -156,28 +156,72 @@ def finalize_triage(repo: str | Path, contest_selector: str | None, assessments:
     }
 
 
-def require_final_triage(repo: str | Path, manifest: ContestManifest, challenge: ChallengeSpec) -> dict[str, object]:
-    """Return the finalized entry or fail before a solve session starts."""
+def load_optional_final_triage(
+    repo: str | Path, manifest: ContestManifest, challenge: ChallengeSpec,
+) -> dict[str, object] | None:
+    """Return a current finalized entry without making Triage a solve gate.
+
+    A missing Board and an otherwise valid but stale Board are optional context.
+    Unsafe paths and malformed artifacts remain hard failures so optional loading
+    cannot hide metadata integrity problems.
+    """
 
     root = Path(repo).resolve()
     path = _output_dir(root, manifest) / "triage.json"
-    if not path.is_file() or path.is_symlink():
-        raise TriageError("Challenge Triage board not found; run the triage skill after Intake before solving")
+    if path.is_symlink():
+        raise TriageError(f"unsafe Challenge Triage index path: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise TriageError(f"Challenge Triage index is not a regular file: {path}")
+
     payload = _read_json(path, "Challenge Triage index")
-    if payload.get("phase") != "CHALLENGE_TRIAGE_FINALIZED":
-        raise TriageError("Challenge Triage index is incomplete; rerun triage-finalize")
-    source = _mapping(payload.get("source"))
-    if source.get("manifest_sha256") != manifest.fingerprint:
-        raise TriageError("contest.md changed after Challenge Triage; rerun Intake and Challenge Triage")
+    if (
+        payload.get("schema_version") != TRIAGE_SCHEMA_VERSION
+        or payload.get("phase") != "CHALLENGE_TRIAGE_FINALIZED"
+    ):
+        raise TriageError("Challenge Triage index has an invalid or incomplete schema")
+    source_value = payload.get("source")
+    if not isinstance(source_value, dict):
+        raise TriageError("Challenge Triage index source must be a JSON object")
+    source = source_value
+    if not isinstance(source.get("manifest_sha256"), str) or not isinstance(source.get("intake_sha256"), str):
+        raise TriageError("Challenge Triage index source fingerprints are missing or invalid")
+    if source["manifest_sha256"] != manifest.fingerprint:
+        return None
+
     _, intake_path = _load_intake(root, manifest)
-    if source.get("intake_sha256") != _sha256_path(intake_path):
-        raise TriageError("Intake changed after Challenge Triage; rerun Challenge Triage")
-    entries = [entry for entry in _dict_list(payload.get("challenges")) if entry.get("id") == challenge.id]
+    if source["intake_sha256"] != _sha256_path(intake_path):
+        return None
+
+    raw_entries = payload.get("challenges")
+    if not isinstance(raw_entries, list) or any(not isinstance(entry, dict) for entry in raw_entries):
+        raise TriageError("Challenge Triage index challenges must be a list of JSON objects")
+    entries = [entry for entry in raw_entries if entry.get("id") == challenge.id]
+    if not entries:
+        return None
     if len(entries) != 1:
-        raise TriageError("Challenge Triage index has no unique entry for the selected challenge; rerun Challenge Triage")
-    if entries[0].get("status") != "READY":
-        raise TriageError(f"selected challenge is not READY in Challenge Triage: {entries[0].get('reasons', [])}")
-    return entries[0]
+        raise TriageError("Challenge Triage index contains duplicate entries for the selected challenge")
+    entry = entries[0]
+    if (
+        entry.get("number") != challenge.number
+        or entry.get("key") != challenge.key
+        or entry.get("category") != challenge.category
+        or not isinstance(entry.get("recommendation"), dict)
+    ):
+        raise TriageError("Challenge Triage entry does not match the selected challenge schema")
+    return dict(entry)
+
+
+def require_final_triage(repo: str | Path, manifest: ContestManifest, challenge: ChallengeSpec) -> dict[str, object]:
+    """Return a current finalized entry for callers that explicitly require one."""
+
+    entry = load_optional_final_triage(repo, manifest, challenge)
+    if entry is None:
+        raise TriageError("No current finalized Challenge Triage entry is available")
+    if entry.get("status") != "READY":
+        raise TriageError(f"selected challenge is not READY in Challenge Triage: {entry.get('reasons', [])}")
+    return entry
 
 
 def invalidate_triage_outputs(repo: str | Path, manifest: ContestManifest) -> None:

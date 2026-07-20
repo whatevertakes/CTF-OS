@@ -3,6 +3,8 @@ import json
 import subprocess
 import zipfile
 
+import pytest
+
 from ctf_os.intake import run_intake
 from conftest import write_contest
 
@@ -94,24 +96,109 @@ def test_archive_traversal_blocks_only_that_challenge(repo: Path) -> None:
     assert not (repo / "escape").exists()
 
 
-def test_prepare_rejects_source_changes_after_intake(repo: Path) -> None:
+def _prepare(repo: Path, contest: str = "Demo CTF") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", contest],
+        capture_output=True, text=True,
+    )
+
+
+def test_prepare_bootstraps_missing_intake_in_the_same_call(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- 설명: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("one")
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)["result"]
+    assert payload["triage_available"] is False
+    assert payload["triage_recommendation"] == {}
+    intake_path = next((repo / "output").glob("*/intake.json"))
+    intake = json.loads(intake_path.read_text())
+    solve_root = Path(payload["solve_root"])
+    launch = payload["solve_launch_context"]
+    launch_path = Path(payload["solve_launch_path"])
+    assert launch["schema_version"] == 1
+    assert launch["challenge_id"] == payload["challenge"]["id"]
+    assert launch["challenge_key"] == payload["challenge"]["key"]
+    assert launch["input_fingerprint"] == intake["challenges"][0]["source_fingerprint"]
+    assert launch["objective"] == "FIRST_VALID_FLAG"
+    assert launch["contest_triage"]["available"] is False
+    assert launch["contest_triage"]["recommendation"] == {}
+    assert launch["execution_policy"]["same_session_required"] is True
+    assert launch["execution_policy"]["maximum_active_hypotheses"] == 3
+    assert launch_path == solve_root / "SOLVE-LAUNCH.json"
+    assert json.loads(launch_path.read_text()) == launch
+    first_launch = launch_path.read_bytes()
+    assert (solve_root / "input" / "value.txt").read_text() == "one"
+    assert (solve_root / "evidence.log").read_text() == ""
+    assert not (solve_root / "findings.jsonl").exists()
+    assert not (solve_root / "race-events.jsonl").exists()
+    assert "dedicated Sol session" not in result.stdout
+
+    repeated = _prepare(repo)
+    assert repeated.returncode == 0
+    assert launch_path.read_bytes() == first_launch
+
+
+def test_prepare_bootstraps_directly_from_user_problems_file(repo: Path) -> None:
+    contest = repo / "incoming" / "Demo CTF"
+    contest.mkdir()
+    (contest / "problems.txt").write_text(
+        "대회명: Demo CTF\n\nmisc/X\n설명: user supplied problem\n",
+        encoding="utf-8",
+    )
+    source = contest / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("one")
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    assert (contest / "contest.md").is_file()
+    assert len(list((repo / "output").glob("*/intake.json"))) == 1
+
+
+def test_solve_launch_includes_declared_target_and_priority_file(repo: Path) -> None:
+    write_contest(repo, """# Demo CTF
+### web/X
+- Description: remote app
+- Remote: nc example.com 31337
+""")
+    source = repo / "incoming" / "Demo CTF" / "web" / "X"
+    source.mkdir(parents=True)
+    (source / "app.py").write_text("print('ready')\n")
+
+    result = _prepare(repo)
+    assert result.returncode == 0
+    launch = json.loads(result.stdout)["result"]["solve_launch_context"]
+    assert launch["authorized_targets"][0]["host"] == "example.com"
+    assert launch["authorized_targets"][0]["port"] == 31337
+    assert launch["authorized_targets"][0]["protocol"] == "tcp"
+    assert any(item["path"] == "app.py" for item in launch["priority_files"])
+    assert launch["important_metadata"]["file_count"] == 1
+    assert launch["important_metadata"]["total_size"] > 0
+
+
+def test_prepare_repairs_source_changes_after_intake(repo: Path) -> None:
     write_contest(repo, "# Demo CTF\n### misc/X\n- 설명: x\n")
     source = repo / "incoming" / "Demo CTF" / "misc" / "X"
     source.mkdir(parents=True)
     target = source / "value.txt"
     target.write_text("one")
-    run_intake(repo)
+    old_fingerprint = run_intake(repo)["challenges"][0]["source_fingerprint"]
     target.write_text("changed")
-    result = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo CTF"],
-        capture_output=True, text=True,
-    )
-    payload = json.loads(result.stdout)
-    assert result.returncode == 2
-    assert "files changed" in payload["error"]
+    result = _prepare(repo)
+    payload = json.loads(result.stdout)["result"]
+    refreshed = json.loads(next((repo / "output").glob("*/intake.json")).read_text())
+    assert result.returncode == 0
+    assert refreshed["challenges"][0]["source_fingerprint"] != old_fingerprint
+    assert (Path(payload["solve_root"]) / "input" / "value.txt").read_text() == "changed"
 
 
-def test_prepare_rejects_tampered_materialized_input(repo: Path) -> None:
+def test_prepare_repairs_tampered_materialized_input(repo: Path) -> None:
     write_contest(repo, "# Demo CTF\n### misc/X\n- 설명: x\n")
     source = repo / "incoming" / "Demo CTF" / "misc" / "X"
     source.mkdir(parents=True)
@@ -120,12 +207,193 @@ def test_prepare_rejects_tampered_materialized_input(repo: Path) -> None:
     prepared = Path(record["prepared_input"]) / "value.txt"
     prepared.chmod(0o644)
     prepared.write_text("tampered")
-    result = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo CTF"],
-        capture_output=True, text=True,
-    )
+    result = _prepare(repo)
+    assert result.returncode == 0
+    assert prepared.read_text() == "trusted"
+
+
+def test_prepare_repairs_deleted_materialized_input(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- 설명: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    record = run_intake(repo)["challenges"][0]
+    prepared = Path(record["prepared_input"])
+    prepared.chmod(0o755)
+    for child in prepared.iterdir():
+        child.chmod(0o644)
+        child.unlink()
+    prepared.rmdir()
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    assert (prepared / "value.txt").read_text() == "trusted"
+
+
+@pytest.mark.parametrize(
+    ("initial", "changed"),
+    [
+        (
+            "# Demo CTF\n- Date: 2026-07-20\n### misc/X\n- Description: x\n",
+            "# Demo CTF\n- Date: 2026-07-21\n### misc/X\n- Description: x\n",
+        ),
+        (
+            "# Demo CTF\n### misc/X\n- Description: before\n",
+            "# Demo CTF\n### misc/X\n- Description: after\n",
+        ),
+    ],
+    ids=("contest-manifest", "challenge-description"),
+)
+def test_prepare_repairs_stale_manifest_and_description(repo: Path, initial: str, changed: str) -> None:
+    manifest_path = write_contest(repo, initial)
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    run_intake(repo)
+    manifest_path.write_text(changed)
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    index = json.loads(next((repo / "output").glob("*/intake.json")).read_text())
+    assert index["contest"]["manifest_sha256"]
+    assert index["challenges"][0]["description"] in {"x", "after"}
+
+
+def test_prepare_syncs_changed_problem_description_before_reintake(repo: Path) -> None:
+    contest = repo / "incoming" / "Demo CTF"
+    contest.mkdir()
+    problems = contest / "problems.txt"
+    problems.write_text("대회명: Demo CTF\n\nmisc/X\n설명: before\n", encoding="utf-8")
+    source = contest / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    run_intake(repo, "Demo CTF")
+    problems.write_text("대회명: Demo CTF\n\nmisc/X\n설명: after\n", encoding="utf-8")
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    index = json.loads(next((repo / "output").glob("*/intake.json")).read_text())
+    assert index["challenges"][0]["description"] == "after"
+
+
+def test_prepare_repairs_missing_selected_intake_record(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- Description: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    payload = run_intake(repo)
+    index_path = repo / "output" / payload["contest"]["slug"] / "intake.json"
+    index = json.loads(index_path.read_text())
+    index["challenges"] = []
+    index_path.write_text(json.dumps(index))
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    repaired = json.loads(index_path.read_text())
+    assert len(repaired["challenges"]) == 1
+    assert repaired["challenges"][0]["status"] == "READY"
+
+
+def test_prepare_reports_selected_challenge_blocker_without_session_handoff(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/Missing\n- Description: required file is absent\n")
+
+    result = _prepare(repo)
+    error = json.loads(result.stdout)["error"]
+
     assert result.returncode == 2
-    assert "prepared challenge input changed" in json.loads(result.stdout)["error"]
+    assert "The selected challenge remains BLOCKED" in error
+    assert "no matching directory/archive" in error
+    assert "dedicated Sol session" not in error
+    assert "triage-finalize" not in error
+
+
+def test_prepare_rejects_symlink_intake_index(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- Description: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    payload = run_intake(repo)
+    index_path = repo / "output" / payload["contest"]["slug"] / "intake.json"
+    backup = repo / "outside-intake.json"
+    backup.write_text(index_path.read_text())
+    index_path.unlink()
+    index_path.symlink_to(backup)
+
+    result = _prepare(repo)
+
+    assert result.returncode == 2
+    assert "symlink" in json.loads(result.stdout)["error"].casefold()
+
+
+def test_prepare_rejects_prepared_input_path_escape(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- Description: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    payload = run_intake(repo)
+    index_path = repo / "output" / payload["contest"]["slug"] / "intake.json"
+    index = json.loads(index_path.read_text())
+    index["challenges"][0]["prepared_input"] = str(repo / "outside")
+    index_path.write_text(json.dumps(index))
+
+    result = _prepare(repo)
+
+    assert result.returncode == 2
+    assert "prepared_input escapes" in json.loads(result.stdout)["error"]
+
+
+def test_prepare_rejects_symlink_solve_launch_file(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- Description: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    first = _prepare(repo)
+    assert first.returncode == 0
+    launch_path = Path(json.loads(first.stdout)["result"]["solve_launch_path"])
+    outside = repo / "outside-launch.json"
+    outside.write_text('{"outside": true}')
+    launch_path.unlink()
+    launch_path.symlink_to(outside)
+
+    result = _prepare(repo)
+
+    assert result.returncode == 2
+    assert "Solve Launch Context path must not be a symlink" in json.loads(result.stdout)["error"]
+    assert outside.read_text() == '{"outside": true}'
+
+
+def test_solve_launch_refresh_preserves_terminal_state_and_flag_receipt(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### misc/X\n- Description: x\n")
+    source = repo / "incoming" / "Demo CTF" / "misc" / "X"
+    source.mkdir(parents=True)
+    (source / "value.txt").write_text("trusted")
+    record = run_intake(repo)["challenges"][0]
+    solve_root = Path(record["workspace_path"])
+    state_path = solve_root / "STATE.json"
+    state = json.loads(state_path.read_text())
+    state.update({
+        "status": "SUBMISSION_RECOMMENDED",
+        "flag_candidate": "DEMO{preserve}",
+        "submission_recommended": True,
+        "remote_flag_receipt": "flag-receipts/remote-preserve.json",
+    })
+    state_path.write_text(json.dumps(state, sort_keys=True))
+    receipt = solve_root / "flag-receipts" / "remote-preserve.json"
+    receipt.parent.mkdir()
+    receipt.write_text('{"flag": "DEMO{preserve}"}')
+    state_bytes = state_path.read_bytes()
+    receipt_bytes = receipt.read_bytes()
+
+    result = _prepare(repo)
+
+    assert result.returncode == 0
+    assert (solve_root / "SOLVE-LAUNCH.json").is_file()
+    assert state_path.read_bytes() == state_bytes
+    assert receipt.read_bytes() == receipt_bytes
 
 
 def test_intake_builds_detailed_safe_compose_plan_and_compact_context(repo: Path) -> None:

@@ -106,7 +106,7 @@ def _dispatch_fixture(tmp_path: Path, monkeypatch):
         "service_plan": plan, "recommended_image": "ctf-os-sandbox:web",
         "recommended_resource_profile": "light",
     }
-    monkeypatch.setattr(agent_tools, "_load_challenge", lambda *args: (manifest, challenge, record))
+    monkeypatch.setattr(agent_tools, "_load_challenge_strict", lambda *args: (manifest, challenge, record))
     monkeypatch.setattr(agent_tools, "prepared_tree_fingerprint", lambda path: "prepared-fp")
     monkeypatch.setattr(agent_tools, "service_attachment", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(agent_tools, "service_inspect", lambda *args, **kwargs: {

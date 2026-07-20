@@ -18,7 +18,7 @@ For “intake 해라”, “대회 문제 읽어라”, “문제 목록 준비�
 
 For “triage 해라”, “추천 풀이 순서 정해라”, “문제 우선순위 정해라”, or a named triage request after Intake, load `.codex/skills/ctf-triage/SKILL.md`. Triage is a dedicated no-solve session using only Intake metadata. Run `triage-prepare`, decide the order, run `triage-finalize`, show the READY/BLOCKED Board, and stop.
 
-For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm request, open a new session and load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge after current finalized triage. Stop only for ambiguous selection/contest, missing scope, an undeclared external target, required host credentials, or an out-of-scope action.
+For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm request, keep the current user-opened Sol session and load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge; `prepare-challenge` repairs missing or stale Intake in the same session and uses current finalized Triage only when available. Stop only for ambiguous selection/contest, input or metadata that cannot be prepared safely, missing scope, an undeclared external target, required host credentials, or an out-of-scope action.
 
 ## Solve invariants
 
