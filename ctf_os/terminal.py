@@ -13,13 +13,30 @@ from typing import Any, Iterator
 
 from .candidates import load_candidates
 from .control import create_control_action
+from .projections import apply_projection, ensure_projection_manifest, mark_not_required
 from .workspace import (
-    atomic_json, atomic_text, challenge_workspace, resolve_active_run, safe_under,
-    state_lock, update_run_manifest_timing, utc_now,
+    append_jsonl_fsync, atomic_json, atomic_text, challenge_workspace,
+    read_jsonl_strict, recover_run_state, resolve_active_run, safe_under, state_lock,
+    update_run_manifest_timing, utc_now,
 )
 
 
 SUBMISSION_SCHEMA_VERSION = 1
+SUBMISSION_PROJECTIONS = (
+    "candidate_state", "result", "timing", "terminal_requests",
+    "control_action", "compatibility",
+)
+TERMINAL_COMPONENT_SCHEMA_VERSION = 1
+TERMINAL_COMPONENT_STATUSES = {
+    "native": frozenset({"STOP_REQUESTED", "STOP_RECORDED", "NOT_REQUIRED"}),
+    "sandbox": frozenset({
+        "CLEANUP_PENDING", "CLEANUP_STARTED", "CLEANED", "CLEANUP_FAILED", "NOT_PRESENT",
+    }),
+    "resource": frozenset({
+        "RELEASE_PENDING", "RELEASE_STARTED", "RELEASED", "RELEASE_FAILED", "NOT_PRESENT",
+    }),
+    "terminal": frozenset({"CONVERGENCE_COMPLETE"}),
+}
 ACTIVE_BRANCH_STATUSES = frozenset({
     "CAPACITY_ADMITTED", "SANDBOX_READY", "AWAITING_NATIVE_START", "NATIVE_STARTED",
     "RUNNING", "CHECKPOINTED",
@@ -39,6 +56,9 @@ def record_submission_result(
     root: Path, *, run_id: str, candidate_id: str, result: str,
 ) -> dict[str, Any]:
     run = _specific_run(root, run_id)
+    # A prior attempt may have committed the authoritative submission receipt
+    # but crashed before its STATE/candidate projections.
+    repair_submission_receipt_projections(run, suppress_errors=True)
     normalized = result.strip().upper()
     if normalized not in {"WRONG", "ACCEPTED"}:
         raise SubmissionError("submission result must be accepted or wrong")
@@ -86,13 +106,18 @@ def record_submission_result(
             receipt = {
                 "schema_version": SUBMISSION_SCHEMA_VERSION, "receipt_id": receipt_id,
                 "run_id": run_id, "challenge_id": state.get("challenge_id"),
+                "input_fingerprint": state.get("input_fingerprint"),
+                "target_revision": state.get("target_revision"),
+                "session_id": candidate.get("session_id") or "sol-main",
                 "candidate_id": candidate_id, "candidate": candidate.get("candidate"),
                 "result": normalized, "source": "human", "created_at": utc_now(),
                 "automatic_submission_attempted": False,
+                "required_projections": list(SUBMISSION_PROJECTIONS),
             }
         # Stage every dependent projection first and commit STATE.json last.
         if not receipt_preexisting:
             atomic_json(receipt_path, receipt)
+            _terminal_failpoint("submission", "RECEIPT_SAVED", receipt)
         candidate["status"] = "ACCEPTED" if normalized == "ACCEPTED" else "REFUTED"
         candidate["updated_at"] = receipt["created_at"]
         atomic_json(run / "candidates.json", candidate_payload)
@@ -128,7 +153,13 @@ def record_submission_result(
             triggering_evidence_id=receipt_id, evidence_generation=_evidence_generation(run, str(candidate.get("session_id") or "sol-main")),
             metadata={"candidate_id": candidate_id},
         )
-        return {**receipt, "state": state["status"], "control_action": action, "idempotent": False}
+        repaired = repair_submission_receipt_projections(
+            run, receipt_ids={receipt_id}, suppress_errors=True,
+        )
+        return {
+            **receipt, "state": state["status"], "control_action": action,
+            "post_commit_warnings": repaired["errors"], "idempotent": False,
+        }
     stop_actions = [
         create_control_action(
             run, session_id=session_id, action_type="STOP_REQUIRED",
@@ -139,10 +170,132 @@ def record_submission_result(
         )
         for session_id in stop_sessions
     ]
+    repaired = repair_submission_receipt_projections(
+        run, receipt_ids={receipt_id}, suppress_errors=True,
+    )
     return {
         **receipt, "state": "SEALED", "terminal_convergence": terminal_status(run),
-        "stop_actions": stop_actions, "idempotent": False,
+        "stop_actions": stop_actions, "post_commit_warnings": repaired["errors"],
+        "idempotent": False,
     }
+
+
+def repair_submission_receipt_projections(
+    root: Path, *, receipt_ids: set[str] | None = None,
+    suppress_errors: bool = False,
+) -> dict[str, Any]:
+    run = resolve_active_run(root)
+    repaired: list[str] = []
+    errors: list[str] = []
+    receipt_root = run / "flag-receipts"
+    for path in sorted(receipt_root.glob("submission-*.json")) if receipt_root.is_dir() else []:
+        receipt = _json(path, "submission receipt")
+        receipt_id = str(receipt.get("receipt_id") or "")
+        if receipt_ids is not None and receipt_id not in receipt_ids:
+            continue
+        required = list(receipt.get("required_projections") or SUBMISSION_PROJECTIONS)
+        ensure_projection_manifest(run, receipt, required)
+        result = str(receipt.get("result") or "").upper()
+        stages = [
+            ("candidate_state", lambda: recover_run_state(run, force=True)),
+            ("result", lambda r=receipt: _repair_submission_result(run, r)),
+            ("timing", lambda r=receipt: update_run_manifest_timing(
+                run, "submission_result_at", str(r.get("created_at")),
+            )),
+            ("terminal_requests", lambda r=receipt: _repair_terminal_requests(run, r)),
+            ("control_action", lambda r=receipt: _repair_submission_control(run, r)),
+            ("compatibility", lambda: _repair_submission_compatibility(run)),
+        ]
+        for name, callback in stages:
+            if result == "WRONG" and name in {"result", "terminal_requests"}:
+                mark_not_required(run, receipt, required, name)
+                continue
+            try:
+                _value, skipped = apply_projection(run, receipt, required, name, callback)
+                if not skipped and receipt_id not in repaired:
+                    repaired.append(receipt_id)
+            except Exception as exc:
+                message = f"{receipt_id}:{name}: {exc}"
+                errors.append(message[:2000])
+                append_jsonl_fsync(run / "post-commit-errors.jsonl", {
+                    "event": "SUBMISSION_RECEIPT_PROJECTION_FAILED",
+                    "receipt_id": receipt_id, "projection": name,
+                    "error": str(exc)[:2000], "created_at": utc_now(),
+                }, label="post-commit error ledger")
+                if not suppress_errors:
+                    raise SubmissionError(message) from exc
+    return {"run_id": run.name, "repaired_receipts": repaired, "errors": errors}
+
+
+def _repair_submission_result(run: Path, receipt: Mapping[str, Any]) -> None:
+    if str(receipt.get("result") or "").upper() != "ACCEPTED":
+        return
+    state = _state(run)
+    candidate = next((
+        row for row in load_candidates(run).get("candidates", [])
+        if row.get("candidate_id") == receipt.get("candidate_id")
+    ), None)
+    if candidate is None:
+        raise SubmissionError("accepted receipt candidate projection is missing")
+    content = _accepted_result(state, candidate, receipt)
+    path = run / "RESULT.md"
+    if not path.exists() or path.read_text(encoding="utf-8") != content:
+        atomic_text(path, content)
+
+
+def _repair_terminal_requests(run: Path, receipt: Mapping[str, Any]) -> None:
+    if str(receipt.get("result") or "").upper() != "ACCEPTED":
+        return
+    with state_lock(run):
+        _request_branch_stops_unlocked(run)
+
+
+def _repair_submission_control(run: Path, receipt: Mapping[str, Any]) -> None:
+    candidate = next((
+        row for row in load_candidates(run).get("candidates", [])
+        if row.get("candidate_id") == receipt.get("candidate_id")
+    ), None)
+    if candidate is None:
+        raise SubmissionError("submission control projection candidate is missing")
+    session_id = str(candidate.get("session_id") or "sol-main")
+    if str(receipt.get("result") or "").upper() == "ACCEPTED":
+        plan = _plan(run, missing_ok=True)
+        for branch in plan.get("branches", []):
+            if branch.get("status") == "STOP_REQUESTED" and branch.get("session_id"):
+                create_control_action(
+                    run, session_id=str(branch["session_id"]), action_type="STOP_REQUIRED",
+                    reason="human submission ACCEPTED; stop this run's native branch",
+                    triggering_evidence_id=str(receipt.get("receipt_id")),
+                    evidence_generation=_evidence_generation(run, str(branch["session_id"])),
+                    metadata={
+                        "run_id": run.name, "candidate_id": receipt.get("candidate_id"),
+                    },
+                )
+        return
+    create_control_action(
+        run, session_id=session_id, action_type="REVIEW_CANDIDATE_DEPENDENCY",
+        reason="human submission refuted candidate provenance",
+        triggering_evidence_id=str(receipt.get("receipt_id")),
+        evidence_generation=_evidence_generation(run, session_id),
+        metadata={"candidate_id": receipt.get("candidate_id")},
+    )
+
+
+def _repair_submission_compatibility(run: Path) -> None:
+    workspace = challenge_workspace(run)
+    path = workspace / "STATE.json"
+    if workspace == run or not path.is_file() or path.is_symlink():
+        return
+    state = _state(run)
+    projected = dict(state)
+    projected["compatibility_view"] = True
+    projected["authoritative_state"] = str((run / "STATE.json").relative_to(workspace))
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    if existing != projected:
+        atomic_json(path, projected)
 
 
 def record_native_stop(
@@ -171,7 +324,85 @@ def record_native_stop(
         branch["status"] = "TERMINAL"
         branch["finished_at"] = receipt["observed_at"]
         atomic_json(run / "DELEGATION_PLAN.json", plan)
+        _record_terminal_component_unlocked(
+            run, session_id=session_id, component="native", status="STOP_RECORDED",
+            related_receipt=receipt,
+        )
     return {**receipt, "idempotent": False}
+
+
+def record_terminal_component(
+    root: Path, *, session_id: str, component: str, status: str,
+    related_receipt: Mapping[str, Any] | None = None, error: str | None = None,
+) -> dict[str, Any]:
+    run = resolve_active_run(root)
+    with state_lock(run):
+        return _record_terminal_component_unlocked(
+            run, session_id=session_id, component=component, status=status,
+            related_receipt=related_receipt, error=error,
+        )
+
+
+def load_terminal_components(root: Path) -> list[dict[str, Any]]:
+    run = resolve_active_run(root)
+    rows = read_jsonl_strict(
+        run / "terminal-components.jsonl", "terminal component receipt ledger",
+    )
+    for row in rows:
+        component = str(row.get("component") or "")
+        if (
+            row.get("schema_version") != TERMINAL_COMPONENT_SCHEMA_VERSION
+            or component not in TERMINAL_COMPONENT_STATUSES
+            or row.get("status") not in TERMINAL_COMPONENT_STATUSES[component]
+        ):
+            raise SubmissionError("terminal component receipt ledger contains an unsupported row")
+    return rows
+
+
+def _record_terminal_component_unlocked(
+    run: Path, *, session_id: str, component: str, status: str,
+    related_receipt: Mapping[str, Any] | None = None, error: str | None = None,
+) -> dict[str, Any]:
+    normalized_component = str(component).strip().lower()
+    normalized_status = str(status).strip().upper()
+    if (
+        normalized_component not in TERMINAL_COMPONENT_STATUSES
+        or normalized_status not in TERMINAL_COMPONENT_STATUSES[normalized_component]
+    ):
+        raise SubmissionError("terminal component status is invalid")
+    session = str(session_id).strip()
+    if not session or len(session) > 128 or any(char in session for char in "/\\\0\r\n"):
+        raise SubmissionError("terminal component session_id is invalid")
+    state = _state(run)
+    related = dict(related_receipt or {}) or None
+    material = {
+        "run_id": state.get("run_id") or run.name,
+        "challenge_id": state.get("challenge_id"),
+        "input_fingerprint": state.get("input_fingerprint"),
+        "target_revision": state.get("target_revision"),
+        "session_id": session, "component": normalized_component,
+        "status": normalized_status, "related_receipt": related,
+        "error": str(error)[:2000] if error else None,
+    }
+    receipt_id = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode(),
+    ).hexdigest()[:24]
+    rows = read_jsonl_strict(
+        run / "terminal-components.jsonl", "terminal component receipt ledger",
+    )
+    existing = next((row for row in rows if row.get("receipt_id") == receipt_id), None)
+    if existing:
+        return {**existing, "idempotent": True}
+    record = {
+        "schema_version": TERMINAL_COMPONENT_SCHEMA_VERSION,
+        "receipt_id": receipt_id, **material, "created_at": utc_now(),
+    }
+    append_jsonl_fsync(
+        run / "terminal-components.jsonl", record,
+        label="terminal component receipt ledger",
+    )
+    _terminal_failpoint(normalized_component, normalized_status, record)
+    return {**record, "idempotent": False}
 
 
 def converge_terminal(
@@ -196,6 +427,14 @@ def converge_terminal(
                 })
                 branch = branches.get(session_id)
                 component["native"] = _native_component_state(branch)
+                _record_terminal_component_unlocked(
+                    run, session_id=session_id, component="native",
+                    status=(
+                        "STOP_RECORDED" if component["native"] == "TERMINAL_RECORDED"
+                        else "STOP_REQUESTED" if component["native"] == "TERMINATION_PENDING"
+                        else "NOT_REQUIRED"
+                    ),
+                )
                 native_ready = component["native"] in {"NOT_REQUIRED", "TERMINAL_RECORDED"}
                 metadata = run / "workers" / session_id / "sandbox.json"
                 if session_id not in sandbox_sessions and component.get("sandbox") in {
@@ -203,18 +442,43 @@ def converge_terminal(
                 }:
                     component["sandbox"] = "CLEANED"
                     component["sandbox_receipt"] = {"recovered": True, "reason": "sandbox metadata no longer exists"}
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="sandbox", status="CLEANED",
+                        related_receipt=component["sandbox_receipt"],
+                    )
                 if session_id in sandbox_sessions and component.get("sandbox") != "CLEANED":
                     if not native_ready or sandbox_cleanup is None:
                         component["sandbox"] = "CLEANUP_PENDING"
+                        _record_terminal_component_unlocked(
+                            run, session_id=session_id, component="sandbox", status="CLEANUP_PENDING",
+                        )
                     else:
                         component["sandbox"] = "CLEANUP_IN_PROGRESS"
+                        _record_terminal_component_unlocked(
+                            run, session_id=session_id, component="sandbox", status="CLEANUP_STARTED",
+                        )
                         sandbox_tasks.append((session_id, metadata))
+                elif session_id not in sandbox_sessions and component.get("sandbox") == "NOT_PRESENT":
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="sandbox", status="NOT_PRESENT",
+                    )
                 has_resource = session_id in resource_sessions
                 if session_id in released_resources and component.get("resource") != "RELEASED":
                     component["resource"] = "RELEASED"
                     component["resource_receipt"] = {"recovered": True, "reason": "resource ledger records RELEASED"}
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASED",
+                        related_receipt=component["resource_receipt"],
+                    )
                 if has_resource and component.get("resource") != "RELEASED":
                     component["resource"] = "RELEASE_PENDING"
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASE_PENDING",
+                    )
+                elif not has_resource and session_id not in released_resources:
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="NOT_PRESENT",
+                    )
             state["cleanup_state"] = "TERMINATION_PENDING"
             state["status"] = "SEALED"
             state["updated_at"] = utc_now()
@@ -241,8 +505,16 @@ def converge_terminal(
                 if status == "CLEANED":
                     component["sandbox_receipt"] = result
                     component.pop("sandbox_error", None)
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="sandbox", status="CLEANED",
+                        related_receipt=result if isinstance(result, Mapping) else None,
+                    )
                 else:
                     component["sandbox_error"] = result
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="sandbox", status="CLEANUP_FAILED",
+                        error=str(result),
+                    )
             for session_id, component in cleanup_rows.items():
                 component["native"] = _native_component_state(branches.get(session_id))
                 if session_id in released_resources and component.get("resource") != "RELEASED":
@@ -258,9 +530,15 @@ def converge_terminal(
                 )
                 if ordered_ready and resource_release is not None:
                     component["resource"] = "RELEASE_IN_PROGRESS"
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASE_STARTED",
+                    )
                     resource_tasks.append(session_id)
                 else:
                     component["resource"] = "RELEASE_PENDING"
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASE_PENDING",
+                    )
             state["updated_at"] = utc_now()
             atomic_json(run / "STATE.json", state)
 
@@ -285,8 +563,16 @@ def converge_terminal(
                 if status == "RELEASED":
                     component["resource_receipt"] = result
                     component.pop("resource_error", None)
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASED",
+                        related_receipt=result if isinstance(result, Mapping) else None,
+                    )
                 else:
                     component["resource_error"] = result
+                    _record_terminal_component_unlocked(
+                        run, session_id=session_id, component="resource", status="RELEASE_FAILED",
+                        error=str(result),
+                    )
             for session_id, branch in branches.items():
                 component = cleanup_rows.setdefault(session_id, {
                     "native": "NOT_REQUIRED", "sandbox": "NOT_PRESENT", "resource": "NOT_PRESENT",
@@ -301,6 +587,11 @@ def converge_terminal(
             state["cleanup_state"] = "SEALED_CLEAN" if clean else "TERMINATION_PENDING"
             state["status"] = "SEALED_CLEAN" if clean else "SEALED"
             state["updated_at"] = utc_now()
+            if clean:
+                _record_terminal_component_unlocked(
+                    run, session_id="run", component="terminal", status="CONVERGENCE_COMPLETE",
+                    related_receipt={"terminal_components": sorted(cleanup_rows)},
+                )
             atomic_json(run / "STATE.json", state)
     return terminal_status(run)
 
@@ -408,10 +699,19 @@ def _request_branch_stops_unlocked(run: Path) -> None:
         if status in ACTIVE_BRANCH_STATUSES or status in {"PLANNED", "ADMITTED", "AWAITING_NATIVE_START"}:
             if status in {"PLANNED", "ADMITTED", "AWAITING_NATIVE_START"} and not branch.get("started_at"):
                 branch["status"] = "TERMINATED"
+                _record_terminal_component_unlocked(
+                    run, session_id=str(branch.get("session_id")), component="native",
+                    status="NOT_REQUIRED", related_receipt={"reason": "branch never started"},
+                )
             else:
                 branch["status"] = "STOP_REQUESTED"
                 branch["stop_requested_at"] = utc_now()
                 branch["native_action_owner"] = "sol"
+                _record_terminal_component_unlocked(
+                    run, session_id=str(branch.get("session_id")), component="native",
+                    status="STOP_REQUESTED",
+                    related_receipt={"stop_requested_at": branch["stop_requested_at"]},
+                )
             changed = True
     if changed:
         plan["updated_at"] = utc_now()
@@ -482,3 +782,9 @@ def _evidence_generation(run: Path, session_id: str) -> int:
         return int(payload.get("sessions", {}).get(session_id, {}).get("evidence_generation", 0))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return 0
+
+
+def _terminal_failpoint(
+    component: str, status: str, receipt: Mapping[str, Any],
+) -> None:
+    """Private no-op seam used only by fault-injection tests."""

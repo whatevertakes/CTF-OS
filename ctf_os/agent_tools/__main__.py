@@ -34,7 +34,8 @@ from ..replay import run_replay
 from ..problems import sync_contest_manifest
 from ..session_input import parse_session_input, resolve_session_challenge
 from ..preflight import (
-    load_challenge_preflight, prepare_selected_challenge, prepared_tree_fingerprint,
+    load_challenge_preflight, prepare_selected_challenge, prepared_input_bytes,
+    prepared_tree_fingerprint,
 )
 from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
@@ -54,18 +55,18 @@ from ..transitions import control_loop_tick
 from ..tui import resource_panel
 from ..workspace import (
     atomic_json, challenge_root, challenge_workspace, initialize_solve_files,
-    safe_under, state_lock,
+    recover_run_state, resolve_run_raw, safe_under, state_lock,
 )
 from ..worker import (
     collect_worker_checkpoints, load_worker_result, merge_worker_checkpoints,
     merge_worker_result_files, save_worker_checkpoint, save_worker_result,
 )
 from ..verification import record_remote_flag
-from ..candidates import record_candidate
-from ..control import acknowledge_control_action, load_control_actions
-from ..milestones import save_milestone
+from ..control import apply_control_action, acknowledge_control_action, load_control_actions
+from ..milestones import repair_run_projections, save_milestone
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
+from ..working_poc import commit_working_poc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("selector")
     prepare.add_argument("--contest")
     prepare.add_argument("--session-input-json")
+    if not child_surface:
+        repair_run_parser = commands.add_parser("repair-run")
+        repair_run_parser.add_argument("selector"); repair_run_parser.add_argument("--contest")
+        repair_run_parser.add_argument("--run-id"); _add_session_args(repair_run_parser)
+        repair_projection_parser = commands.add_parser("repair-projections")
+        repair_projection_parser.add_argument("selector"); repair_projection_parser.add_argument("--contest")
+        repair_projection_parser.add_argument("--run-id"); _add_session_args(repair_projection_parser)
     resource_status = commands.add_parser("resource-status")
     resource_status.add_argument("--contest")
     if not child_surface:
@@ -225,7 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
     if not child_surface:
         sandbox_gc_parser = commands.add_parser("sandbox-gc")
         _add_session_args(sandbox_gc_parser)
-    commands.add_parser("doctor")
+    doctor_parser = commands.add_parser("doctor")
+    doctor_parser.add_argument("selector", nargs="?")
+    doctor_parser.add_argument("--contest")
+    doctor_parser.add_argument("--run-id")
+    doctor_parser.add_argument("--repair-run-projections", action="store_true")
+    _add_session_args(doctor_parser)
     service_commands = (
         ("service-plan", "service-status", "service-logs", "service-inspect")
         if child_surface else
@@ -263,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     milestone.add_argument("--exploit-proximity", type=float, default=0.0); milestone.add_argument("--details-json")
     milestone.add_argument("--candidate"); milestone.add_argument("--source-type", default="STATIC_ANALYSIS")
     milestone.add_argument("--validation-method", default="UNVALIDATED"); milestone.add_argument("--confidence", default="LOW")
+    milestone.add_argument("--operation-id")
     milestone.add_argument("argv", nargs="*"); _add_session_args(milestone)
     progress_command = commands.add_parser("progress-command")
     progress_command.add_argument("selector"); progress_command.add_argument("--contest"); progress_command.add_argument("argv", nargs="*"); _add_session_args(progress_command)
@@ -302,6 +316,18 @@ def build_parser() -> argparse.ArgumentParser:
         receipt.add_argument("--output", required=True); receipt.add_argument("--candidate", required=True)
         receipt.add_argument("--exploit-artifact", required=True); receipt.add_argument("argv", nargs="*")
         _add_session_args(receipt)
+        working_poc = commands.add_parser("working-poc-commit")
+        working_poc.add_argument("selector"); working_poc.add_argument("--contest")
+        working_poc.add_argument("--run-id", required=True); working_poc.add_argument("--branch", required=True)
+        working_poc.add_argument("--metadata", required=True)
+        working_poc.add_argument("--local-receipt-id", required=True)
+        working_poc.add_argument("--exploit-artifact", required=True)
+        working_poc.add_argument("--target-index", required=True, type=int)
+        working_poc.add_argument("--success-condition", required=True)
+        working_poc.add_argument("--kill-condition", required=True)
+        working_poc.add_argument("--operation-id", required=True)
+        working_poc.add_argument("--timeout", type=int, default=300)
+        working_poc.add_argument("argv", nargs=argparse.REMAINDER); _add_session_args(working_poc)
         submission = commands.add_parser("submission-result")
         submission.add_argument("selector"); submission.add_argument("--contest")
         submission.add_argument("--run-id", required=True); submission.add_argument("--candidate-id", required=True)
@@ -315,7 +341,11 @@ def build_parser() -> argparse.ArgumentParser:
         control_show.add_argument("selector"); control_show.add_argument("--contest"); _add_session_args(control_show)
         control_ack = commands.add_parser("control-action-ack")
         control_ack.add_argument("selector"); control_ack.add_argument("--contest"); control_ack.add_argument("--action-id", required=True)
-        control_ack.add_argument("--status", required=True, choices=("applied", "declined", "superseded", "expired")); control_ack.add_argument("--receipt-json"); _add_session_args(control_ack)
+        control_ack.add_argument("--status", required=True, choices=("declined", "superseded", "expired")); _add_session_args(control_ack)
+        control_apply = commands.add_parser("control-action-apply")
+        control_apply.add_argument("selector"); control_apply.add_argument("--contest")
+        control_apply.add_argument("--action-id", required=True)
+        control_apply.add_argument("--receipt-json", required=True); _add_session_args(control_apply)
     if not child_surface:
         replay = commands.add_parser("replay")
         replay.add_argument("selector")
@@ -392,7 +422,9 @@ def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "s
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    direct_argv_commands = {"milestone-save", "progress-command", "flag-receipt-save"}
+    direct_argv_commands = {
+        "milestone-save", "progress-command", "flag-receipt-save", "working-poc-commit",
+    }
     separator = raw_argv.index("--") if "--" in raw_argv else -1
     controls = raw_argv[:separator] if separator >= 0 else raw_argv
     direct_command = next((name for name in direct_argv_commands if name in controls), None)
@@ -422,7 +454,28 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "init-contest":
         return initialize_contest(root, args.name)
     if args.command == "doctor":
-        return run_doctor(root)
+        result = run_doctor(root)
+        if args.selector:
+            manifest = select_contest(discover_contests(root / "incoming"), args.contest)
+            challenge = resolve_session_challenge(root, manifest, args.selector)
+            selected = resolve_run_raw(
+                challenge_root(root, manifest, challenge), run_id=args.run_id,
+            )
+            if args.repair_run_projections:
+                _require_sol(args, "Only Sol may repair a selected run during doctor.")
+                state = recover_run_state(selected, force=True)
+                projection = repair_run_projections(
+                    selected, declared_remote=bool(challenge.remotes),
+                )
+                result["selected_run"] = {
+                    "run_id": selected.name, "state": state,
+                    "projection_repair": projection,
+                }
+            else:
+                result["selected_run"] = _doctor_selected_run(selected)
+        elif args.run_id or args.repair_run_projections:
+            raise ValueError("doctor run options require an exact challenge selector")
+        return result
     if args.command == "sandbox-status":
         return sandbox_status()
     if args.command == "resource-status":
@@ -539,6 +592,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         )
         workspace = challenge_root(root, manifest, challenge)
         solve_root = initialize_solve_files(workspace, challenge, str(record["source_fingerprint"]))
+        repair_run_projections(solve_root, declared_remote=bool(challenge.remotes))
         launch_context = build_solve_launch_context(challenge, record)
         launch_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
         launch_context["run_id"] = launch_state.get("run_id")
@@ -559,6 +613,23 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     current_fingerprint = str(record["source_fingerprint"])
     workspace = challenge_root(root, manifest, challenge)
     solve_root = initialize_solve_files(workspace, challenge, current_fingerprint)
+    if args.command in {"repair-run", "repair-projections"}:
+        _require_sol(args, "Only Sol may repair authoritative run projections.")
+        selected = (
+            solve_root if not args.run_id else
+            safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
+        )
+        if selected.is_symlink() or not selected.is_dir():
+            raise ValueError("repair run does not exist in this challenge workspace")
+        state = recover_run_state(selected, force=True)
+        if args.command == "repair-run":
+            return {"run_id": selected.name, "state": state}
+        return {
+            "run_id": selected.name, "state": state,
+            "projections": repair_run_projections(
+                selected, declared_remote=bool(challenge.remotes),
+            ),
+        }
     ledger = ResourceLedger(solve_root)
     if args.command == "resource-request":
         session_id, role = _caller(args)
@@ -571,7 +642,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         request = default_request(
             contest=manifest.slug, challenge_id=challenge.id, session_id=session_id,
             workload_class=str(inferred["workload_class"]), priority=args.priority,
-            input_bytes=int(record.get("total_size", 0)), gpu_required=args.gpu_required,
+            input_bytes=prepared_input_bytes(record), gpu_required=args.gpu_required,
             gpu_preferred=True if args.gpu_preferred else None, overrides=overrides,
         )
         return ledger.request(request, actor_session_id=session_id, actor_role=role, inference=inferred)
@@ -663,7 +734,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 atomic_json(state_path, race_state)
             _seed_race_resources(
                 ledger, board, manifest.slug, challenge.id, challenge.category,
-                args.parent_session_id, int(record.get("total_size", 0)),
+                args.parent_session_id, prepared_input_bytes(record),
             )
             capacity = detect_capacity(workspace=root)
             resource_plan = ledger.rebalance(capacity, tier=args.tier)
@@ -684,6 +755,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             )
             return board
         if args.command == "race-board":
+            repair_run_projections(solve_root, declared_remote=bool(challenge.remotes))
             transition = control_loop_tick(solve_root, input_fingerprint=current_fingerprint)
             plan = load_plan(solve_root, input_fingerprint=current_fingerprint)
             state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
@@ -836,15 +908,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             artifacts=args.artifact, command_argv=argv, output=args.output,
             exploit_proximity=args.exploit_proximity, details=details,
             declared_remote=bool(challenge.remotes),
+            operation_id=args.operation_id, candidate=args.candidate,
+            source_type=args.source_type, validation_method=args.validation_method,
+            confidence=args.confidence,
         )
-        if args.type.strip().upper() == "FLAG_CANDIDATE":
-            if not args.candidate:
-                raise ValueError("FLAG_CANDIDATE milestone requires --candidate")
-            receipt["candidate"] = record_candidate(
-                solve_root, session_id=session_id, candidate=args.candidate,
-                source_type=args.source_type, receipt_id=receipt["receipt_id"],
-                confidence=args.confidence, validation_method=args.validation_method,
-            )
         return receipt
     if args.command == "progress-command":
         session_id, _role = _caller(args)
@@ -917,6 +984,29 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 root, solve_root, resource_state.get("last_plan", {}), args.parent_session_id,
             )
         return receipt
+    if args.command == "working-poc-commit":
+        _require_sol(args, "Only Sol may explicitly commit a working PoC to the declared remote.")
+        if args.run_id != solve_root.name:
+            raise ValueError("working-poc-commit run ID is not the current exact run")
+        argv = list(args.argv)
+        if argv and argv[0] == "--":
+            argv.pop(0)
+        metadata = _load_metadata(root, args.metadata)
+        if str(metadata.get("branch")) != args.branch:
+            raise ValueError("working-poc-commit branch does not own the sandbox metadata")
+        state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
+        return commit_working_poc(
+            solve_root, challenge_id=challenge.id,
+            input_fingerprint=current_fingerprint,
+            target_revision=int(state.get("target_revision") or 1),
+            session_id=args.branch, sandbox_metadata=metadata,
+            local_receipt_id=args.local_receipt_id,
+            exploit_artifact=args.exploit_artifact, remote_argv=argv,
+            declared_targets=parse_remotes(challenge.remotes), target_index=args.target_index,
+            flag_pattern=challenge.flag_pattern,
+            success_condition=args.success_condition, kill_condition=args.kill_condition,
+            operation_id=args.operation_id, timeout=args.timeout,
+        )
     if args.command == "submission-result":
         _require_sol(args, "Only Sol may record the human submission result.")
         terminal_run = safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
@@ -964,21 +1054,25 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "terminal-status":
         _require_sol(args, "Only Sol may inspect terminal convergence.")
         selected = solve_root if not args.run_id else safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
+        recover_run_state(selected, force=True)
+        repair_run_projections(selected, declared_remote=bool(challenge.remotes))
         return terminal_status(selected)
     if args.command == "control-actions-show":
         return {"actions": load_control_actions(solve_root)}
     if args.command == "control-action-ack":
         _require_sol(args, "Only Sol may acknowledge lifecycle actions.")
         status = {
-            "applied": "ACKED_APPLIED", "declined": "ACKED_DECLINED",
-            "superseded": "SUPERSEDED", "expired": "EXPIRED",
+            "declined": "ACKED_DECLINED", "superseded": "SUPERSEDED", "expired": "EXPIRED",
         }[args.status]
-        applied = json.loads(args.receipt_json) if args.receipt_json else None
-        if applied is not None and not isinstance(applied, dict):
-            raise ValueError("--receipt-json must contain an object")
         return acknowledge_control_action(
-            solve_root, action_id=args.action_id, status=status, applied_receipt=applied,
+            solve_root, action_id=args.action_id, status=status,
         )
+    if args.command == "control-action-apply":
+        _require_sol(args, "Only Sol may apply lifecycle actions.")
+        proof = json.loads(args.receipt_json)
+        if not isinstance(proof, dict):
+            raise ValueError("--receipt-json must contain an object")
+        return apply_control_action(solve_root, action_id=args.action_id, proof_receipt=proof)
     if args.command == "replay":
         _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
         return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
@@ -1083,6 +1177,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             contest_slug=manifest.slug, challenge_id=challenge.id, branch=args.branch,
             source=expected_source, branch_root=branch_root,
             input_fingerprint=str(record["source_fingerprint"]),
+            target_revision=int(json.loads((solve_root / "STATE.json").read_text(encoding="utf-8")).get("target_revision") or 1),
+            input_bytes=prepared_input_bytes(record),
             targets=targets, image=image, resource_profile=profile,
             service_network=service_network, local_endpoints=endpoints,
             session_id=session_id, parent_session_id=args.parent_session_id,
@@ -1570,6 +1666,43 @@ def _cleanup_expired_timeout_retention(root: Path, sol_session_id: str) -> list[
         except Exception as exc:
             cleaned.append({"metadata": str(metadata_path), "removed": False, "error": str(exc)})
     return cleaned
+
+
+def _doctor_selected_run(run: Path) -> dict[str, object]:
+    """Read-only projection health for one explicitly selected exact run."""
+
+    state_path = run / "STATE.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state_health = "VALID" if isinstance(state, dict) else "CORRUPT"
+    except (OSError, json.JSONDecodeError):
+        state = None
+        state_health = "MISSING" if not state_path.exists() else "CORRUPT"
+    counts = {"PENDING": 0, "APPLIED": 0, "FAILED": 0, "NOT_REQUIRED": 0}
+    malformed: list[str] = []
+    projection_root = run / "receipt-projections"
+    for path in sorted(projection_root.glob("*.json")) if projection_root.is_dir() else []:
+        if path.is_symlink() or not path.is_file():
+            malformed.append(path.name)
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            rows = payload.get("projections") if isinstance(payload, dict) else None
+            if not isinstance(rows, dict):
+                raise ValueError("missing projections")
+            for row in rows.values():
+                status = row.get("status") if isinstance(row, dict) else None
+                if status not in counts:
+                    raise ValueError("invalid status")
+                counts[str(status)] += 1
+        except (OSError, json.JSONDecodeError, ValueError):
+            malformed.append(path.name)
+    return {
+        "run_id": run.name, "path": str(run), "state_health": state_health,
+        "state_status": state.get("status") if isinstance(state, dict) else None,
+        "projection_statuses": counts, "malformed_projection_manifests": malformed,
+        "repair_performed": False,
+    }
 
 
 def _csv(value: str) -> list[str]:

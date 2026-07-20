@@ -103,6 +103,9 @@ def _dispatch_fixture(tmp_path: Path, monkeypatch):
     record = {
         "status": "READY", "prepared_input": str(input_path.resolve()),
         "prepared_fingerprint": "prepared-fp", "source_fingerprint": "source-fp",
+        "files": [{"path": "app.py", "size": (input_path / "app.py").stat().st_size}],
+        "important_metadata": {"total_bytes": (input_path / "app.py").stat().st_size},
+        "authorized_targets": [],
         "service_plan": plan, "recommended_image": "ctf-os-sandbox:web",
         "recommended_resource_profile": "light",
     }

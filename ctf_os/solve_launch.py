@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .contest import ChallengeSpec
+from .preflight import prepared_input_bytes
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json
 
@@ -58,10 +59,7 @@ def build_solve_launch_context(
         "priority_files": files,
         "important_metadata": {
             "file_count": _integer(metadata.get("file_count"), len(all_files)),
-            "total_size": _integer(
-                metadata.get("total_bytes"),
-                sum(_integer(item.get("size")) for item in all_files),
-            ),
+            "total_bytes": prepared_input_bytes(record),
             "subtype": _text(record.get("subtype"), 240) if record.get("subtype") is not None else None,
             "runtime": _strings(record.get("runtime"), maximum=8, length=80),
         },

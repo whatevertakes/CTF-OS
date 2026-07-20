@@ -662,15 +662,19 @@ def plan_allocations(
             underutilized = classification in {"UNDERUTILIZED", "IDLE"}
             if broken or underutilized or not req.elastic:
                 continue
-            long_compute = req.workload_class in COMPUTE_WORKLOADS
-            scale_signal = (
-                classification in {"CPU_STARVED", "MEMORY_STARVED", "GPU_STARVED"}
-            ) or bool(
-                isinstance(obs.get("progress"), Mapping) and any(
-                    obs["progress"].get(key) not in (None, 0, 0.0, "", False)
-                    for key in ("constraint_reduction", "coverage", "generation", "candidate_score", "deterministic_extraction_progress")
-                )
-            ) or bool(obs.get("explicit_long_compute"))
+            progress = obs.get("progress") if isinstance(obs.get("progress"), Mapping) else {}
+            verified = (
+                progress.get("verified_long_compute")
+                if isinstance(progress.get("verified_long_compute"), Mapping) else {}
+            )
+            long_compute = (
+                req.workload_class in COMPUTE_WORKLOADS
+                and verified.get("active") is True
+                and verified.get("process_valid") is True
+                and verified.get("fresh_artifact_evidence") is True
+                and _fresh_long_compute_evidence(verified)
+            )
+            scale_signal = classification in {"CPU_STARVED", "MEMORY_STARVED", "GPU_STARVED"}
             if not long_compute or not scale_signal:
                 continue
             flag_or_compute = bool(obs.get("flag_path")) or progressing
@@ -737,6 +741,17 @@ def plan_allocations(
         "remaining": {"cpus": round(cpu_left, 3), "memory_bytes": memory_left, "storage_bytes": storage_left},
         "reason": "workload evidence, priority, measured utilization, progress, and aggregate host reserve",
     }
+
+
+def _fresh_long_compute_evidence(evidence: Mapping[str, Any]) -> bool:
+    value = evidence.get("valid_until_at")
+    if not isinstance(value, str):
+        return False
+    try:
+        expires = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return expires.tzinfo is not None and datetime.now(timezone.utc) <= expires.astimezone(timezone.utc)
 
 
 class ResourceLedger:
@@ -812,11 +827,23 @@ class ResourceLedger:
             atomic_json(self.state_path, state)
         self.append_history("RACE_RESOURCE_RESET", "sol-main", {"active_session_ids": sorted(active)})
 
-    def update(self, session_id: str, *, actor_session_id: str, actor_role: str, changes: Mapping[str, Any]) -> dict[str, Any]:
+    def update(
+        self, session_id: str, *, actor_session_id: str, actor_role: str,
+        changes: Mapping[str, Any], verified_long_compute: bool = False,
+    ) -> dict[str, Any]:
         if actor_role not in {"sol", "child"}:
             raise SchedulerError("resource update actor role must be sol or child")
         if actor_role == "child" and actor_session_id != session_id:
             raise SchedulerError("child may update only its own resource request")
+        progress_value = changes.get("progress")
+        if (
+            isinstance(progress_value, Mapping)
+            and "verified_long_compute" in progress_value
+            and not verified_long_compute
+        ):
+            raise SchedulerError(
+                "verified_long_compute may be published only by direct process/artifact observation"
+            )
         with state_lock(self.root):
             state = self.load()
             if session_id not in state["requests"]:

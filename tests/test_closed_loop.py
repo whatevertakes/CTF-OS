@@ -397,15 +397,35 @@ def test_command_drift_supported_fact_and_decisive_reset(tmp_path: Path) -> None
     assert not evaluate_progress_gate(run, session_id="sol-main", category="misc")["triggered"]
 
 
-def test_long_compute_is_bounded_by_heartbeat_and_maximum_duration(tmp_path: Path) -> None:
+def test_long_compute_is_bounded_by_verified_artifact_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _workspace, run, challenge = _run(tmp_path)
+    metadata = run / "workers" / "sol-main" / "sandbox.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(json.dumps({
+        "name": "ctf-os-long-compute", "branch": "sol-main",
+        "challenge_id": challenge.id, "input_fingerprint": "fp", "target_revision": 1,
+    }))
+    observations = iter([
+        {"container_identity": "container-1", "process_valid": True,
+         "artifact": {"exists": False, "size": 0, "mtime_ns": None, "digest": None},
+         "completion_signal": False},
+        {"container_identity": "container-1", "process_valid": True,
+         "artifact": {"exists": True, "size": 10, "mtime_ns": 2, "digest": "changed"},
+         "completion_signal": False},
+    ])
+    import ctf_os.progress as progress_module
+    monkeypatch.setattr(progress_module, "_observe_long_compute", lambda details: next(observations))
     receipt = save_milestone(
         run, challenge_id=challenge.id, session_id="sol-main", input_fingerprint="fp",
         event_type="LONG_COMPUTE", summary="bounded symbolic execution",
         command_argv=["angr", "solve.py"], exploit_proximity=.3,
         details={
-            "process_identity": "pid-receipt-1", "expected_output_artifact": "artifacts/model.json",
-            "expected_completion_signal": "model.json exists", "maximum_duration_seconds": 300,
+            "sandbox_metadata_path": "workers/sol-main/sandbox.json",
+            "process_identity": {"process_group_id": 1234},
+            "expected_output_artifact": "artifacts/model.json",
+            "expected_completion_signal": "artifacts/model.done", "maximum_duration_seconds": 300,
             "checkpoint_interval_seconds": 60, "resource_requirement": {"cpus": 2},
             "cancel_condition": "no constraint reduction", "fallback_plan": "manual backward slice",
         },

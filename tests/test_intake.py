@@ -190,7 +190,7 @@ def test_solve_launch_includes_declared_target_and_priority_file(repo: Path) -> 
     assert launch["authorized_targets"][0]["protocol"] == "tcp"
     assert any(item["path"] == "app.py" for item in launch["priority_files"])
     assert launch["important_metadata"]["file_count"] == 1
-    assert launch["important_metadata"]["total_size"] > 0
+    assert launch["important_metadata"]["total_bytes"] > 0
 
 
 def test_prepare_repairs_selected_source_changes_without_rewriting_intake(repo: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -161,6 +162,7 @@ def load_challenge_preflight(
         raise ValueError("Challenge runtime state is not prepared: local preflight files are invalid")
     if any(not isinstance(value, dict) for value in payload["authorized_targets"]):
         raise ValueError("Challenge runtime state is not prepared: local preflight authorized_targets are invalid")
+    prepared_input_bytes(payload)
     blockers = payload.get("blockers")
     if not isinstance(blockers, list) or any(not isinstance(value, str) for value in blockers):
         raise ValueError("Challenge runtime state is not prepared: local preflight blockers are invalid")
@@ -218,6 +220,36 @@ def load_challenge_preflight(
         if state.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
             raise ValueError("Challenge runtime state is stale because challenge state fingerprint scheme changed")
     return dict(payload)
+
+
+def prepared_input_bytes(record: Mapping[str, object]) -> int:
+    """Return the one authoritative prepared-input size after consistency checks."""
+
+    metadata = record.get("important_metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("prepared input important_metadata must be an object")
+    total = metadata.get("total_bytes")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        raise ValueError("prepared input total_bytes must be a non-negative integer")
+    files = record.get("files")
+    if not isinstance(files, list) or any(not isinstance(row, Mapping) for row in files):
+        raise ValueError("prepared input files must be an array of objects")
+    sizes: list[int] = []
+    for row in files:
+        size = row.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("prepared input file size must be a non-negative integer")
+        sizes.append(size)
+    observed = sum(sizes)
+    if total != observed:
+        raise ValueError(
+            f"prepared input total_bytes conflicts with file inventory: {total} != {observed}"
+        )
+    targets = record.get("authorized_targets")
+    remote_only = not files and isinstance(targets, list) and bool(targets)
+    if total == 0 and not remote_only:
+        raise ValueError("zero-byte prepared input is valid only for a remote-only challenge")
+    return total
 
 
 def _fingerprint(value: object, label: str) -> str:

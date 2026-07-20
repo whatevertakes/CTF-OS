@@ -110,7 +110,7 @@ def test_timeout_profile_retains_then_reuses_and_quick_cleans(monkeypatch: pytes
             return subprocess.CompletedProcess(argv, 1, "", "No such object")
         if any("ps -o pid=,stat= --sid" in str(part) for part in argv):
             return subprocess.CompletedProcess(argv, 0, "", "")
-        if argv[1:5] == ["exec", "--user", "0:0", "ctf-os-worker"] and "cat" in argv:
+        if argv[1:5] == ["exec", "--user", "1001:1001", "ctf-os-worker"] and "cat" in argv:
             return subprocess.CompletedProcess(argv, 0, "4242\n", "")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
     monkeypatch.setattr(runtime, "_run", fake_run)
@@ -154,7 +154,14 @@ def test_candidate_does_not_scale_and_three_samples_do(tmp_path: Path) -> None:
     capacity = {"cpu": {"usable": 10, "reserved": 0}, "memory": {"usable_bytes": 24 * GIB, "reserved_bytes": 0}, "storage": {"usable_bytes": 40 * GIB, "reserved_bytes": 0}, "gpu": {"devices": []}}
     candidate = plan_allocations([request], capacity, observations={"s": {"progress": {"primitive_candidate": True}}})
     assert candidate["allocations"]["s"]["cpus"] == request.min_cpus
-    starved = plan_allocations([request], capacity, observations={"s": {"classification": "CPU_STARVED", "progress": {"coverage": 10}}})
+    starved = plan_allocations([request], capacity, observations={"s": {
+        "classification": "CPU_STARVED",
+        "progress": {"verified_long_compute": {
+            "active": True, "process_valid": True,
+            "fresh_artifact_evidence": True,
+            "valid_until_at": "2999-01-01T00:00:00Z",
+        }},
+    }})
     assert starved["allocations"]["s"]["cpus"] > request.min_cpus
 
 
@@ -162,7 +169,14 @@ def test_resize_failure_circuit_breaker(tmp_path: Path) -> None:
     ledger = ResourceLedger(tmp_path)
     request = default_request(contest="c", challenge_id="x", session_id="s", workload_class="symbolic-execution")
     ledger.request(request, actor_session_id="sol-main", actor_role="sol")
-    state = ledger.load(); state["allocations"]["s"] = {"cpus": 2, "memory_bytes": 4 * GIB}; state["observations"]["s"].update({"classification": "CPU_STARVED", "progress": {"coverage": 1}})
+    state = ledger.load(); state["allocations"]["s"] = {"cpus": 2, "memory_bytes": 4 * GIB}; state["observations"]["s"].update({
+        "classification": "CPU_STARVED",
+        "progress": {"verified_long_compute": {
+            "active": True, "process_valid": True,
+            "fresh_artifact_evidence": True,
+            "valid_until_at": "2999-01-01T00:00:00Z",
+        }},
+    })
     (tmp_path / "RESOURCE_STATE.json").write_text(json.dumps(state))
     capacity = {"cpu": {"usable": 10, "reserved": 2}, "memory": {"usable_bytes": 24 * GIB, "reserved_bytes": 4 * GIB}, "storage": {"usable_bytes": 40 * GIB, "reserved_bytes": 0}, "gpu": {"devices": []}}
     for _ in range(2):

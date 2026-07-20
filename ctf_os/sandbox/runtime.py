@@ -36,6 +36,8 @@ class SandboxSpec:
     source: Path
     branch_root: Path
     input_fingerprint: str = "unbound"
+    target_revision: int = 1
+    input_bytes: int = 0
     targets: tuple[ResolvedTarget, ...] = ()
     image: str = "ctf-os-sandbox:base"
     resource_profile: str = "standard"
@@ -113,6 +115,7 @@ class SandboxSpec:
             contest=self.contest_slug, challenge_id=self.challenge_id,
             session_id=self.session_id, workload_class=str(self.workload_class),
             priority=str(self.resource_priority),
+            input_bytes=self.input_bytes,
             overrides={
                 "min_cpus": min(float(self.cpus), float(self.cpus)),
                 "preferred_cpus": float(self.cpus), "max_cpus": max(float(self.cpus), float(self.cpus)),
@@ -221,6 +224,7 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "context_path": str((spec.branch_root / "context").resolve()),
         "metadata_path": str(spec.branch_root / "sandbox.json"),
         "input_fingerprint": spec.input_fingerprint,
+        "target_revision": spec.target_revision,
         "authorized_targets": [target.to_dict() for target in spec.targets],
     }
     try:
@@ -312,12 +316,12 @@ def _execute_locked(
         if prior.get("status") == "TIMED_OUT_RETAINED":
             prior_pgid = str(prior.get("exec_process_group_id") or "")
             if prior_pgid.isdigit():
-                remaining = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
+                remaining = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
             else:
                 raise SandboxError("retained timeout lacks a process-group receipt; Sol cleanup is required")
             if remaining.stdout.split():
-                _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "kill -KILL -\"$1\" 2>/dev/null || true", "sh", prior_pgid], timeout=15)
-                checked = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
+                _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "kill -KILL -\"$1\" 2>/dev/null || true", "sh", prior_pgid], timeout=15)
+                checked = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
                 if checked.stdout.split():
                     raise SandboxError("retained sandbox still has orphan worker processes; Sol cleanup is required")
     execution_id = hashlib.sha256(f"{_utc_now()}:{os.getpid()}:{list(command)}".encode()).hexdigest()[:16]
@@ -325,8 +329,13 @@ def _execute_locked(
     argv = [docker, "exec", "--user", "1001:1001", "--workdir", "/work"]
     for key, value in _metadata_allocation_env(metadata).items():
         argv.extend(["--env", f"{key}={value}"])
+    # Docker exec commonly starts its process as a process-group leader.  A bare
+    # `setsid` then forks and lets that parent exit successfully, which loses the
+    # real command's exit status.  Force the fork, wait for the session child,
+    # and have that child record its own PID (also its PGID) before exec.
     argv.extend([
-        name, "sh", "-c", "umask 077; echo $$ >\"$1\"; shift; exec setsid \"$@\"",
+        name, "setsid", "--fork", "--wait", "sh", "-c",
+        "umask 077; echo $$ >\"$1\"; shift; exec \"$@\"",
         "ctf-os-exec", pid_file, *command,
     ])
     before = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
@@ -337,11 +346,11 @@ def _execute_locked(
     orphan_check = None
     process_group_id = None
     if retained:
-        pid_result = _run([docker, "exec", "--user", "0:0", name, "cat", pid_file], timeout=15)
+        pid_result = _run([docker, "exec", "--user", "1001:1001", name, "cat", pid_file], timeout=15)
         process_group_id = pid_result.stdout.strip() if pid_result.returncode == 0 and pid_result.stdout.strip().isdigit() else None
         if process_group_id:
-            terminated = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "kill -TERM -\"$1\" 2>/dev/null || true; sleep 1; kill -KILL -\"$1\" 2>/dev/null || true", "sh", process_group_id], timeout=15)
-            orphan_check = _run([docker, "exec", "--user", "0:0", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", process_group_id], timeout=15)
+            terminated = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "kill -TERM -\"$1\" 2>/dev/null || true; sleep 1; kill -KILL -\"$1\" 2>/dev/null || true", "sh", process_group_id], timeout=15)
+            orphan_check = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", process_group_id], timeout=15)
         else:
             terminated = subprocess.CompletedProcess([], 1, "", "missing process group receipt")
             orphan_check = subprocess.CompletedProcess([], 1, "", "missing process group receipt")

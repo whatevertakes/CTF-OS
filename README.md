@@ -20,7 +20,7 @@ minimal observation
 
 ## 준비
 
-Python 3.11+, `uv`, 실행 중인 Docker Engine과 Compose v2가 필요합니다.
+공식 대회 실행 환경은 Ubuntu Linux x86_64, Docker Engine, Docker Compose v2 plugin입니다. Python 3.11+와 `uv`도 필요합니다. GPU는 GPU-required workload가 있는 머신에서만 NVIDIA Container Toolkit으로 선택 설치합니다. 일반 `docker build`가 기준이며 Buildx는 필수가 아닙니다.
 
 ```bash
 git clone git@github.com:whatevertakes/CTF-OS.git
@@ -48,6 +48,8 @@ uv run python -m ctf_os.agent_tools prepare-challenge misc/PromptOnly \
 ```
 
 `source_paths`는 선택한 대회의 `incoming/<contest>/` 아래 경로만 허용됩니다. 정규화된 packet은 해당 문제 workspace의 `SESSION-INPUT.json`에 저장되고, 이후 runtime command는 같은 challenge-local 정의와 authorized target을 다시 사용합니다.
+
+Session packet merge는 JSON 필드의 존재 여부를 보존합니다. 생략한 필드는 기존 challenge, contest default, `standard` 순으로 상속하고, optional text의 명시적 `null`은 삭제, 빈 문자열은 오류입니다. 배열 생략은 상속, `[]`는 삭제입니다. `input_profile: "standard"`는 명시적 override입니다. `flag_format`을 바꾸고 `flag_pattern`을 생략하면 새 format에서 pattern을 결정적으로 재생성하고, 명시적 `flag_pattern: null`은 pattern을 삭제합니다. 입력과 remote가 모두 없어지는 packet은 preflight에서 `BLOCKED`입니다.
 
 Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ranking을 명시적으로 요청할 때만 쓰는 optional legacy/admin 도구입니다. Solve의 선행 단계나 readiness source가 아니며, 현재 운영은 전체 Board·난이도·성공확률로 개별 challenge를 유도하지 않습니다.
 
@@ -89,7 +91,27 @@ uv run python -m ctf_os.agent_tools race-insight-packet 1 --contest my-ctf \
 
 `race-plan-start`는 current run에 `PLANNED` branch와 짧은 prompt packet을 기록할 뿐 child를 만들지 않습니다. Capacity admission과 sandbox/input 확인 뒤 Sol이 native delegation 및 start receipt를 기록해야만 `RUNNING` width에 포함됩니다. Admission overlap 0.95는 advisory이고 exact duplicate/repeated session ID만 거부합니다. Requested model/reasoning은 pinning 증거가 아닙니다.
 
+Milestone receipt는 authoritative source이고 progress, timing, candidate, STATE, race transition, control action, scheduler 및 compatibility 파일은 재생 가능한 projection입니다. `sequence`는 표시 순서일 뿐 identity가 아닙니다. 같은 canonical material은 같은 receipt를 반환하며, 별개의 동일 실험은 다른 `--operation-id`로 구분합니다. 같은 operation ID에 다른 command·output·artifact·details를 재사용하면 conflict입니다.
+
+```bash
+uv run python -m ctf_os.agent_tools milestone-save 1 --contest my-ctf \
+  --type DECISIVE_EXPERIMENT --summary 'oracle differs from control' \
+  --operation-id oracle-positive-v1 -- python3 probe.py
+
+uv run python -m ctf_os.agent_tools repair-run 1 --contest my-ctf --run-id '<run-id>'
+uv run python -m ctf_os.agent_tools repair-projections 1 --contest my-ctf --run-id '<run-id>'
+```
+
+`repair-run`은 human submission, verified remote receipt, candidate, milestone, native/terminal/resource ledger와 run manifest에서 exact run의 `STATE.json`만 재구성합니다. 손상된 원본은 `STATE.corrupt-*.json`으로 보존합니다. `repair-projections`는 authoritative receipt의 `PENDING`/`FAILED` projection만 재생하며 `APPLIED`는 반복하지 않습니다.
+
 Checkpoint는 보고서가 아니라 현재 exploit action을 전달합니다: leading hypothesis, decisive experiment, observed result, exploit proximity, artifact, next action, kill/continue/promote. Primitive는 `CANDIDATE`, `CONFIRMED`, `REFUTED`로 분리하며 candidate는 confirmed progress가 아닙니다. Confirmed primitive와 plateau 등 high-value transition은 utility sweep, duplicate/stalled 정리 recommendation, 필수 Sol takeover packet을 자동 생성합니다. Scheduler는 long-compute opt-in이고 timeout sandbox 보존은 profile에 따릅니다. Supported fact, rejected hypothesis, decompilation, 일반 artifact의 수만 늘어나는 것은 progress가 아닙니다.
+
+Control action의 `applied`는 일반 acknowledgement로 만들 수 없습니다. `control-action-ack`는 declined/superseded/expired만 처리하고, 실제 run-local receipt가 있는 적용만 다음 명령으로 확정합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools control-action-apply 1 --contest my-ctf \
+  --action-id '<action-id>' --receipt-json '<exact-proof-json>'
+```
 
 `sandbox-exec`의 canonical syntax는 `sandbox-exec --metadata workers/<branch>/sandbox.json --timeout-profile quick_probe --session-id <branch> -- <command...>`입니다. Legacy positional metadata는 읽지만, `--` 뒤의 CTF-OS control option은 container command로 넘기지 않고 실행 전에 오류로 차단합니다.
 
@@ -103,7 +125,7 @@ Challenge input/context는 read-only이고 worker별 `/work`, `/evidence`, `/art
 symbolic execution / fuzzing / forensic scan / crypto or cracking / AI inference
 ```
 
-긴 계산은 1800초 bounded slice로 실행하고 exploit/solver proximity 또는 필요한 compute progress가 있을 때만 계속합니다. 새 병렬 solver/harness는 고정 worker 수 대신 다음 값을 사용합니다.
+긴 계산은 1800초 bounded slice로 실행하고 exploit/solver proximity 또는 필요한 compute progress가 있을 때만 계속합니다. `LONG_COMPUTE`는 sandbox/container/process identity, exact argv, branch-local artifact, completion marker, 최대 시간과 checkpoint 간격을 receipt에 결합합니다. Heartbeat caller의 boolean은 증거가 아니며 Python이 같은 process argv와 실제 artifact digest/size/mtime 변화를 직접 관찰한 경우에만 갱신됩니다. Scheduler scale-up도 유효기간 안의 이 검증 receipt가 있어야 합니다. 새 병렬 solver/harness는 고정 worker 수 대신 다음 값을 사용합니다.
 
 ```python
 import os
@@ -129,6 +151,26 @@ Full clean replay: not required before human submission
 ```
 
 저가치 branch를 중단하고 verifier는 최대 하나만 남길 수 있습니다. CTFd 자동 제출은 없으며 사람이 제출합니다. Strict replay는 나중에 `FULLY_VERIFIED`를 만들 수 있지만 flag 공개의 gate가 아닙니다.
+
+검증된 local PoC를 lead Sol이 declared remote에 한 번 명시적으로 연결할 때는 `working-poc-commit`을 사용합니다. 이 명령은 direct argv만 받고 sandbox ownership, fingerprint, target revision, local receipt와 artifact digest를 검증합니다. 같은 operation ID의 완료된 command는 다시 실행하지 않습니다.
+
+```bash
+uv run python -m ctf_os.agent_tools working-poc-commit 1 --contest my-ctf \
+  --run-id '<run-id>' --branch '<branch-id>' \
+  --metadata 'output/.../runs/<run-id>/workers/<branch-id>/sandbox.json' \
+  --local-receipt-id '<receipt-id>' --exploit-artifact 'exploit/solve.py' \
+  --target-index 0 --success-condition 'flag in output' \
+  --kill-condition 'remote rejects exploit' --operation-id remote-poc-v1 \
+  -- python3 /artifacts/solve.py '<host>' '<port>'
+```
+
+Docker 회귀는 선택 profile build를 그대로 지원하며 실패한 profile 뒤에도 나머지를 빌드하고 마지막 summary에 성공/실패를 남깁니다. 실제 환경에서는 다음 marker로 image operation probe, sandbox lifecycle, service isolation을 각각 실행합니다.
+
+```bash
+CTF_OS_LIVE_IMAGE_TESTS=1 uv run pytest -q tests/test_build_images_live.py
+CTF_OS_LIVE_SANDBOX_TESTS=1 uv run pytest -q tests/test_sandbox_live.py
+CTF_OS_LIVE_SERVICE_TESTS=1 uv run pytest -q tests/test_service_live.py
+```
 
 ## 성능 검증
 

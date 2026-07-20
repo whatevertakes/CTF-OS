@@ -21,6 +21,10 @@ from .workspace import (
     resolve_active_run, state_lock,
 )
 from .workspace import append_jsonl_fsync, read_jsonl_strict
+from .projections import apply_projection, ensure_projection_manifest
+
+
+TRANSITION_PROJECTIONS = ("control_action", "plan", "state", "compatibility", "scheduler")
 
 
 HIGH_VALUE_TYPES = frozenset({
@@ -57,7 +61,11 @@ def evaluate_race_transition(
     transition_id = hashlib.sha256(f"{trigger}:{event_key}:{affected_session_id or ''}".encode()).hexdigest()[:24]
     existing = _transition_by_id(root / "RACE_TRANSITIONS.jsonl", transition_id)
     if existing:
-        return {**existing, "idempotent": True}
+        projected = repair_transition_projections(root, existing)
+        return {
+            **existing, "control_actions": projected["control_actions"],
+            "idempotent": True,
+        }
     if trigger not in HIGH_VALUE_TYPES:
         return {
             "transition_id": transition_id, "trigger": trigger, "triggered": False,
@@ -176,6 +184,9 @@ def evaluate_race_transition(
                 actions.append({"action": "FINALIZE_AND_RECLAIM", "session_id": sid, "native_action_owner": "sol"})
     result = {
         "schema_version": 1, "transition_id": transition_id, "trigger": trigger,
+        "run_id": plan.get("run_id") or root.name,
+        "challenge_id": plan.get("challenge_id"),
+        "target_revision": plan.get("target_revision"),
         "triggering_event_id": event_key, "affected_session_id": affected_session_id,
         "input_fingerprint": fingerprint, "triggered": True,
         "evaluated_branches": evaluated, "utility_results": utility,
@@ -185,24 +196,161 @@ def evaluate_race_transition(
         "branches_to_finalize": sorted(set(finalize)),
         "branches_to_reclaim": sorted(set(reclaim)),
         "dependent_invalidations": dependent, "created_at": utc_now(), "idempotent": False,
+        "required_projections": list(TRANSITION_PROJECTIONS),
     }
-    result["control_actions"] = _materialize_control_actions(root, result, event_key)
-    action_by_session_and_type = {
-        (row.get("session_id"), row.get("action_type")): row.get("action_id")
-        for row in result["control_actions"]
-    }
-    for rewrite in result["objective_rewrites"]:
-        rewrite["control_action_id"] = action_by_session_and_type.get((rewrite.get("session_id"), "RETARGET_TO_POC"))
-    if result.get("sol_takeover"):
-        result["sol_takeover"]["control_action_id"] = action_by_session_and_type.get((affected_session_id, "SOL_TAKEOVER"))
     with state_lock(root):
         if not _transition_by_id(root / "RACE_TRANSITIONS.jsonl", transition_id):
             _append_jsonl(root / "RACE_TRANSITIONS.jsonl", result)
-            _apply_plan_recommendations(root, result)
-            _project_state(root, trigger, result)
-            _project_legacy_transition_view(root, result)
-    _apply_scheduler_recommendations(root, trigger, result)
-    return result
+    projected = repair_transition_projections(root, result)
+    return {**result, "control_actions": projected["control_actions"]}
+
+
+def repair_transition_projections(root: Path, result: Mapping[str, Any]) -> dict[str, Any]:
+    run = resolve_active_run(root)
+    receipt = {**dict(result), "receipt_id": result.get("transition_id")}
+    required = list(result.get("required_projections") or TRANSITION_PROJECTIONS)
+    ensure_projection_manifest(run, receipt, required)
+    applied: list[str] = []
+    controls, skipped = apply_projection(
+        run, receipt, required, "control_action",
+        lambda: _verify_transition_controls(run, result),
+    )
+    if skipped:
+        controls = _stored_transition_controls(run, result)
+    else:
+        applied.append("control_action")
+    projected = {**dict(result), "control_actions": controls}
+    action_by_session_and_type = {
+        (row.get("session_id"), row.get("action_type")): row.get("action_id")
+        for row in controls
+    }
+    projected["objective_rewrites"] = [dict(row) for row in result.get("objective_rewrites", [])]
+    for rewrite in projected["objective_rewrites"]:
+        rewrite["control_action_id"] = action_by_session_and_type.get(
+            (rewrite.get("session_id"), "RETARGET_TO_POC"),
+        )
+    if isinstance(result.get("sol_takeover"), Mapping):
+        projected["sol_takeover"] = dict(result["sol_takeover"])
+        projected["sol_takeover"]["control_action_id"] = action_by_session_and_type.get(
+            (result.get("affected_session_id"), "SOL_TAKEOVER"),
+        )
+    stages = (
+        ("plan", lambda: _apply_plan_recommendations(run, projected)),
+        ("state", lambda: _project_state(run, str(result.get("trigger") or ""), projected)),
+        ("compatibility", lambda: _project_legacy_transition_view(run, projected)),
+        ("scheduler", lambda: _apply_scheduler_recommendations(
+            run, str(result.get("trigger") or ""), projected, strict=True,
+        )),
+    )
+    for name, callback in stages:
+        _value, skipped = apply_projection(run, receipt, required, name, callback)
+        if not skipped:
+            applied.append(name)
+    return {
+        "transition_id": result.get("transition_id"), "applied": applied,
+        "control_actions": controls,
+    }
+
+
+def repair_run_transition_projections(
+    root: Path, *, suppress_errors: bool = False,
+) -> dict[str, Any]:
+    """Replay pending projections for standalone transition receipts too."""
+
+    run = resolve_active_run(root)
+    repaired: list[str] = []
+    errors: list[str] = []
+    for transition in _read_jsonl(run / "RACE_TRANSITIONS.jsonl"):
+        transition_id = str(transition.get("transition_id") or "")
+        if not transition_id:
+            raise ValueError("race transition ledger contains a receipt without transition_id")
+        receipt = {**transition, "receipt_id": transition_id}
+        required = list(transition.get("required_projections") or TRANSITION_PROJECTIONS)
+        manifest = ensure_projection_manifest(run, receipt, required)
+        if not any(
+            isinstance(row, Mapping) and row.get("status") in {"PENDING", "FAILED"}
+            for row in manifest.get("projections", {}).values()
+        ):
+            continue
+        try:
+            repair_transition_projections(run, transition)
+            repaired.append(transition_id)
+        except Exception as exc:
+            message = f"{transition_id}: {exc}"[:2000]
+            errors.append(message)
+            append_jsonl_fsync(run / "post-commit-errors.jsonl", {
+                "event": "RACE_TRANSITION_PROJECTION_FAILED",
+                "transition_id": transition_id, "error": str(exc)[:2000],
+                "created_at": utc_now(),
+            }, label="post-commit error ledger")
+            if not suppress_errors:
+                raise
+    return {"repaired_transitions": repaired, "errors": errors}
+
+
+def _verify_transition_controls(root: Path, result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    stored = {
+        str(row.get("action_id")) for row in result.get("control_actions", [])
+        if isinstance(row, Mapping)
+    }
+    from .control import load_control_actions
+    ledger_ids = {
+        str(row.get("action_id")) for row in load_control_actions(root, current_view=False)
+    }
+    if stored and stored <= ledger_ids:
+        return [dict(row) for row in result.get("control_actions", []) if isinstance(row, Mapping)]
+    expected = _materialize_control_actions(
+        root, result, str(result.get("triggering_event_id") or ""),
+    )
+    actual = {str(row.get("action_id")) for row in expected}
+    if stored and stored != actual:
+        raise ValueError("transition control action projection conflicts with transition receipt")
+    return expected
+
+
+def _stored_transition_controls(
+    root: Path, result: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    from .control import load_control_actions
+
+    expected = _expected_control_pairs(result)
+    rows = [
+        row for row in load_control_actions(root)
+        if (str(row.get("session_id")), str(row.get("action_type"))) in expected
+    ]
+    actual = {(str(row.get("session_id")), str(row.get("action_type"))) for row in rows}
+    if not expected <= actual:
+        raise ValueError(
+            "transition control action projection is APPLIED but its destination is missing"
+        )
+    return rows
+
+
+def _expected_control_pairs(result: Mapping[str, Any]) -> set[tuple[str, str]]:
+    mapping = {
+        "SOL_TAKEOVER": "SOL_TAKEOVER",
+        "CONTINUE_WITH_EVIDENCE": "CONTINUE_WITH_EVIDENCE",
+        "STOP_LOW_VALUE_BRANCH": "STOP_LOW_VALUE_BRANCH",
+        "FINALIZE_AND_RECLAIM": "STOP_REQUIRED",
+        "REVIEW_REQUIRED": "REVIEW_CANDIDATE_DEPENDENCY",
+    }
+    pairs = {
+        (
+            str(action.get("session_id") or result.get("affected_session_id") or "sol-main"),
+            mapping[str(action.get("action"))],
+        )
+        for action in result.get("recommended_actions", [])
+        if isinstance(action, Mapping) and str(action.get("action")) in mapping
+    }
+    pairs.update(
+        (str(row.get("session_id")), "REPLACE_ATTACK_FAMILY")
+        for row in result.get("replacement_requests", []) if isinstance(row, Mapping)
+    )
+    pairs.update(
+        (str(row.get("session_id")), "RETARGET_TO_POC")
+        for row in result.get("objective_rewrites", []) if isinstance(row, Mapping)
+    )
+    return pairs
 
 
 def _project_legacy_transition_view(root: Path, result: Mapping[str, Any]) -> None:
@@ -371,7 +519,9 @@ def _apply_plan_recommendations(root: Path, result: Mapping[str, Any]) -> None:
     atomic_json(path, plan)
 
 
-def _apply_scheduler_recommendations(root: Path, trigger: str, result: Mapping[str, Any]) -> None:
+def _apply_scheduler_recommendations(
+    root: Path, trigger: str, result: Mapping[str, Any], *, strict: bool = False,
+) -> None:
     try:
         from .resources.scheduler import ResourceLedger
         ledger = ResourceLedger(root)
@@ -404,6 +554,8 @@ def _apply_scheduler_recommendations(root: Path, trigger: str, result: Mapping[s
             "transition_id": result.get("transition_id"), "error": str(exc),
             "created_at": utc_now(),
         }, label="scheduler error ledger")
+        if strict:
+            raise
 
 
 def _dedupe(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:

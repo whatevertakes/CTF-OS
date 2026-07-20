@@ -136,7 +136,13 @@ def test_completed_recon_releases_and_expands_symbolic() -> None:
     requests = [_request("symbolic-1", "symbolic-execution"), _request("recon-1", "quick-recon")]
     plan = plan_allocations(
         requests, _capacity(), observations={
-            "symbolic-1": {"classification": "CPU_STARVED", "progress": {"coverage": 10}},
+            "symbolic-1": {"classification": "CPU_STARVED", "progress": {
+                "verified_long_compute": {
+                    "active": True, "process_valid": True,
+                    "fresh_artifact_evidence": True,
+                    "valid_until_at": "2999-01-01T00:00:00Z",
+                },
+            }},
             "recon-1": {"state": "COMPLETED"},
         },
     )
@@ -277,6 +283,15 @@ def test_dry_plan_preserves_baseline_and_failed_apply_restores_it(tmp_path: Path
     assert first["allocations"]["worker"]["cpus"] == 2
     for sample in _samples(cpu=2, allocated=2, progress=True):
         ledger.sample("worker", sample)
+    ledger.update(
+        "worker", actor_session_id="worker", actor_role="child",
+        changes={"progress": {"verified_long_compute": {
+            "active": True, "process_valid": True,
+            "fresh_artifact_evidence": True,
+            "valid_until_at": "2999-01-01T00:00:00Z",
+        }}},
+        verified_long_compute=True,
+    )
     dry = ledger.plan(_capacity(cpus=8, memory=20 * GIB))
     assert dry["allocations"]["worker"]["cpus"] > 2
     assert ledger.load()["allocations"]["worker"]["cpus"] == 2

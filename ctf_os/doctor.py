@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -131,13 +133,50 @@ def run_doctor(repo: Path) -> dict[str, object]:
             item["fix"] = fix
         checks.append(item)
 
+    ubuntu = _ubuntu_release()
+    machine = platform.machine().casefold()
+    kernel_release = platform.release().casefold()
+    wsl = "microsoft" in kernel_release or bool(os.environ.get("WSL_INTEROP"))
+    supported_host = (
+        platform.system() == "Linux" and ubuntu
+        and machine in {"x86_64", "amd64"} and not wsl
+    )
+    add(
+        "host-platform", bool(supported_host),
+        f"system={platform.system()} distribution={'ubuntu' if ubuntu else 'unsupported'} "
+        f"machine={platform.machine()} kernel={platform.release()} "
+        f"environment={'WSL_UNSUPPORTED' if wsl else 'native'}",
+        "use Ubuntu Linux x86_64 for the official competition runtime",
+    )
     for executable in ("python3", "uv", "docker"):
         path = shutil.which(executable)
         add(executable, bool(path), path or "not found", f"install {executable} and place it on PATH")
     docker = _run(["docker", "info", "--format", "{{.ServerVersion}}"])
-    add("docker-daemon", docker.returncode == 0, docker.stdout.strip() or docker.stderr.strip(), "start the Docker daemon")
+    docker_detail = docker.stdout.strip() or docker.stderr.strip()
+    failure_kind = _docker_failure_kind(docker_detail)
+    socket = Path("/var/run/docker.sock")
+    socket_access = docker.returncode == 0 or (
+        socket.exists() and os.access(socket, os.R_OK | os.W_OK)
+    )
+    add(
+        "docker-socket-access", socket_access,
+        "daemon access verified" if docker.returncode == 0 else (
+            f"{socket}: current user lacks read/write access"
+            if socket.exists() and not socket_access else f"{socket}: unavailable"
+        ),
+        "grant the current user Docker socket access; CTF-OS never invokes sudo",
+    )
+    add(
+        "docker-daemon", docker.returncode == 0,
+        docker_detail if docker.returncode == 0 else failure_kind,
+        "start Docker Engine or correct the reported daemon/socket error",
+    )
     compose = _run(["docker", "compose", "version", "--short"])
     add("docker-compose", compose.returncode == 0, compose.stdout.strip() or compose.stderr.strip(), "install Docker Compose v2")
+    build_command = _run(["docker", "build", "--help"])
+    run_command = _run(["docker", "run", "--help"])
+    add("docker-build-command", build_command.returncode == 0, "available" if build_command.returncode == 0 else build_command.stderr.strip(), "install a Docker CLI with docker build")
+    add("docker-run-command", run_command.returncode == 0, "available" if run_command.returncode == 0 else run_command.stderr.strip(), "install a Docker CLI with docker run")
 
     if docker.returncode == 0:
         for profile, image in zip(PROFILES, IMAGES, strict=True):
@@ -160,6 +199,18 @@ def run_doctor(repo: Path) -> dict[str, object]:
 
     disk = shutil.disk_usage(repo)
     add("disk-space", disk.free >= 20 * 1024**3, f"{disk.free // 1024**3} GiB free", "free at least 20 GiB")
+    if docker.returncode == 0:
+        docker_root_result = _run(["docker", "info", "--format", "{{.DockerRootDir}}"])
+        docker_root = Path(docker_root_result.stdout.strip()) if docker_root_result.returncode == 0 and docker_root_result.stdout.strip() else None
+        try:
+            docker_disk = shutil.disk_usage(docker_root) if docker_root else None
+        except OSError:
+            docker_disk = None
+        add(
+            "docker-data-root-space", bool(docker_disk and docker_disk.free >= 20 * 1024**3),
+            f"{docker_disk.free // 1024**3} GiB free at {docker_root}" if docker_disk else "Docker data-root cannot be inspected",
+            "free at least 20 GiB in Docker data-root",
+        )
     memory_bytes = _available_memory()
     add("memory", memory_bytes >= 2 * 1024**3, f"{memory_bytes // 1024**3} GiB available", "free at least 2 GiB RAM")
     add("output-write", _write_probe(repo / "output"), str(repo / "output"), "make repository output/ writable and remove unsafe symlinks")
@@ -193,7 +244,36 @@ def run_doctor(repo: Path) -> dict[str, object]:
     ]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
     stale_count = len(stale_sandboxes.stdout.split())
     add("stale-resources", stale_count == 0, f"{stale_count} stopped sandbox resources", "run sandbox-gc for stopped sandboxes")
+    nvidia = shutil.which("nvidia-smi")
+    add(
+        "gpu-optional", True,
+        "NVIDIA tooling detected; GPU-required requests perform runtime validation"
+        if nvidia else "not installed; CPU profiles including AI remain supported",
+    )
     return {"ok": all(bool(item["ok"]) for item in checks), "checks": checks}
+
+
+def _ubuntu_release() -> bool:
+    try:
+        values = {}
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip().strip('"')
+        return values.get("ID", "").casefold() == "ubuntu"
+    except OSError:
+        return False
+
+
+def _docker_failure_kind(detail: str) -> str:
+    lowered = detail.casefold()
+    if "permission denied" in lowered:
+        return f"SOCKET_PERMISSION_DENIED: {detail}"
+    if "cannot connect" in lowered or "connection refused" in lowered:
+        return f"DAEMON_STOPPED_OR_UNREACHABLE: {detail}"
+    if not shutil.which("docker"):
+        return "DOCKER_CLI_MISSING"
+    return f"DAEMON_RESPONSE_ERROR: {detail or 'no daemon response'}"
 
 
 def _available_memory() -> int:
@@ -231,9 +311,10 @@ def _sandbox_lifecycle_probe() -> tuple[bool, str]:
             ok = receipt["exit_code"] == 0 and cleaned["removed"] is True
             return ok, "non-root create/ro-challenge/rw-work/rw-artifacts/exec/export/cleanup passed" if ok else f"receipt={receipt}, cleanup={cleaned}"
         except Exception as exc:
+            cleanup_error = ""
             if metadata is not None:
                 try:
                     cleanup(metadata)
-                except Exception:
-                    pass
-            return False, str(exc)
+                except Exception as cleanup_exc:
+                    cleanup_error = f"; cleanup also failed: {cleanup_exc}"
+            return False, f"{exc}{cleanup_error}"

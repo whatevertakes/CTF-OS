@@ -9,7 +9,11 @@ import pytest
 from ctf_os.sandbox.runtime import SandboxSpec, cleanup, create, execute, export_artifacts, resize
 
 
-pytestmark = pytest.mark.skipif(os.environ.get("CTF_OS_LIVE_DOCKER") != "1", reason="live Docker opt-in")
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CTF_OS_LIVE_SANDBOX_TESTS") != "1"
+    and os.environ.get("CTF_OS_LIVE_DOCKER") != "1",
+    reason="live sandbox Docker opt-in",
+)
 
 
 def test_live_ro_writes_network_timeout_and_cleanup(tmp_path: Path) -> None:
@@ -71,25 +75,14 @@ def test_live_running_resize_updates_limits_and_followup_environment(tmp_path: P
 
 
 def test_live_long_timeout_retains_progress_reuses_and_explicitly_cleans(tmp_path: Path) -> None:
+    source = tmp_path / "challenge" / "input"
+    source.mkdir(parents=True)
     branch = tmp_path / "challenge" / "workers" / "retained"
-    for name in ("work", "evidence", "artifacts", "logs"):
-        path = branch / name; path.mkdir(parents=True); path.chmod(0o777)
-    container = f"ctf-os-retain-live-{os.getpid()}"
-    labels = {"ctf-os": "true", "ctf-os.kind": "sandbox", "ctf-os.branch": "retained"}
-    run = subprocess.run([
-        "docker", "run", "--detach", "--name", container,
-        *[part for key, value in labels.items() for part in ("--label", f"{key}={value}")],
-        "--volume", f"{branch / 'work'}:/work", "--volume", f"{branch / 'evidence'}:/evidence",
-        "--volume", f"{branch / 'artifacts'}:/artifacts", "ctf-os-sandbox:base", "sleep", "infinity",
-    ], capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
-    metadata = {
-        "name": container, "branch": "retained", "branch_root": str(branch),
-        "metadata_path": str(branch / "sandbox.json"), "labels": labels,
-        "session_id": "retained", "parent_session_id": "sol-main",
-        "resource_profile": "light", "resources": {"cpus": 1, "memory": "1g"},
-        "authorized_targets": [],
-    }
+    metadata = create(SandboxSpec(
+        "demo", "retain123", "retained", source, branch,
+        image="ctf-os-sandbox:base", resource_profile="light",
+        session_id="retained", parent_session_id="sol-main", session_role="child",
+    ))
     try:
         timed = execute(
             metadata, ["sh", "-c", "echo slice-one >/work/progress.txt; sleep 30"], 2,

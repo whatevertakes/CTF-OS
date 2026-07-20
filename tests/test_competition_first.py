@@ -59,7 +59,10 @@ def test_solve_launch_context_is_bounded_and_hints_are_not_progress() -> None:
         "source_fingerprint": "f" * 64,
         "files": files,
         "priority_files": [item["path"] for item in files],
-        "important_metadata": {"file_count": len(files), "total_bytes": 123456},
+        "important_metadata": {
+            "file_count": len(files),
+            "total_bytes": sum(item["size"] for item in files),
+        },
         "runtime": [long_text] * 20,
         "subtype": long_text,
         "initial_attack_surface": [long_text] * 30,

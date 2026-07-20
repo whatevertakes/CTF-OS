@@ -6,6 +6,23 @@ ALL_PROFILES=(base pwn web rev crypto forensic misc osint ai cloud)
 PROFILES=("$@")
 if (( ${#PROFILES[@]} == 0 )); then PROFILES=("${ALL_PROFILES[@]}"); fi
 
+[[ "$(uname -s)" == "Linux" ]] || {
+  echo "Unsupported host OS: sandbox images are supported on Ubuntu Linux x86_64 only." >&2
+  exit 65
+}
+if [[ ! -r /etc/os-release ]] || ! ( . /etc/os-release; [[ "${ID:-}" == "ubuntu" ]] ); then
+  echo "Unsupported Linux distribution: sandbox images are supported on Ubuntu Linux x86_64 only." >&2
+  exit 65
+fi
+if [[ "$(uname -r)" == *[Mm]icrosoft* || -n "${WSL_INTEROP:-}" ]]; then
+  echo "Unsupported host environment: sandbox image builds require native Ubuntu Linux x86_64." >&2
+  exit 65
+fi
+case "$(uname -m)" in
+  x86_64|amd64) ;;
+  *) echo "Unsupported host architecture: sandbox images require Ubuntu Linux x86_64." >&2; exit 65 ;;
+esac
+
 contains_profile() {
   local wanted="$1" candidate
   for candidate in "${ALL_PROFILES[@]}"; do [[ "$candidate" == "$wanted" ]] && return 0; done
@@ -28,15 +45,35 @@ if [[ -z "${DOCKER_CONFIG:-}" ]]; then
 fi
 
 if ! daemon="$(docker info --format '{{.ServerVersion}}' 2>&1)"; then
-  echo "Docker daemon is unavailable: $daemon" >&2
+  if [[ "$daemon" == *"permission denied"* || "$daemon" == *"Permission denied"* ]]; then
+    echo "Docker socket permission denied for the current user: $daemon" >&2
+  elif [[ "$daemon" == *"Cannot connect"* || "$daemon" == *"connection refused"* ]]; then
+    echo "Docker daemon is stopped or unreachable: $daemon" >&2
+  else
+    echo "Docker daemon response error: $daemon" >&2
+  fi
   exit 69
 fi
+
+if ! compose="$(docker compose version --short 2>&1)"; then
+  echo "Docker Compose v2 plugin is unavailable: $compose" >&2
+  exit 69
+fi
+docker run --help >/dev/null 2>&1 || { echo "docker run is unavailable for the current daemon/CLI." >&2; exit 69; }
 
 free_kib="$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')"
 minimum_kib=$((20 * 1024 * 1024))
 if [[ ! "$free_kib" =~ ^[0-9]+$ ]] || (( free_kib < minimum_kib )); then
   echo "Insufficient disk space: the full toolchain build requires at least 20 GiB free (found $((free_kib / 1024 / 1024)) GiB)." >&2
   exit 70
+fi
+docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+if [[ -n "$docker_root" && -d "$docker_root" ]]; then
+  docker_free_kib="$(df -Pk "$docker_root" | awk 'NR==2 {print $4}')"
+  if [[ ! "$docker_free_kib" =~ ^[0-9]+$ ]] || (( docker_free_kib < minimum_kib )); then
+    echo "Insufficient Docker data-root space: at least 20 GiB free is required." >&2
+    exit 70
+  fi
 fi
 
 export DOCKER_BUILDKIT=1
@@ -70,7 +107,7 @@ for profile in "${PROFILES[@]}"; do
 done
 
 echo
-echo "CTF-OS sandbox build summary (Docker $daemon)"
+echo "CTF-OS sandbox build summary (Docker $daemon; Compose $compose; Ubuntu Linux x86_64)"
 printf '%-10s %-6s %-20s %-12s %s\n' PROFILE STATUS IMAGE_ID SIZE TIME
 for detail in "${DETAILS[@]}"; do
   IFS='|' read -r profile status image_id size elapsed <<<"$detail"

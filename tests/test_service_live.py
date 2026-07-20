@@ -8,7 +8,11 @@ from ctf_os.sandbox.runtime import SandboxSpec, cleanup, create, execute
 from ctf_os.service import ServiceSpec, service_build, service_cleanup, service_start
 
 
-pytestmark = pytest.mark.skipif(os.environ.get("CTF_OS_LIVE_DOCKER") != "1", reason="live Docker opt-in")
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CTF_OS_LIVE_SERVICE_TESTS") != "1"
+    and os.environ.get("CTF_OS_LIVE_DOCKER") != "1",
+    reason="live service Docker opt-in",
+)
 
 
 def _assert_missing(kind: str, name: str) -> None:

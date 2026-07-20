@@ -32,6 +32,13 @@ def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    uname = bin_dir / "uname"
+    uname.write_text(
+        "#!/usr/bin/env sh\n"
+        "case \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; -r) echo 6.8.0-generic ;; *) echo Linux ;; esac\n",
+        encoding="utf-8",
+    )
+    uname.chmod(0o755)
     return bin_dir, log
 
 
@@ -41,6 +48,7 @@ def _run_build(tmp_path: Path, docker_config: Path | None = None, profiles: tupl
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["DOCKER_TEST_LOG"] = str(log)
     env["TMPDIR"] = str(tmp_path)
+    env.pop("WSL_INTEROP", None)
     if docker_config is None:
         env.pop("DOCKER_CONFIG", None)
     else:
@@ -88,6 +96,7 @@ def test_build_images_propagates_one_profile_failure_and_continues(tmp_path: Pat
         "PATH": f"{bin_dir}:{env['PATH']}", "DOCKER_TEST_LOG": str(log),
         "TMPDIR": str(tmp_path), "DOCKER_TEST_FAIL": "CTF_OS_PROFILE=web",
     })
+    env.pop("WSL_INTEROP", None)
     env.pop("DOCKER_CONFIG", None)
     result = subprocess.run(
         [str(BUILD_SCRIPT), "pwn", "web", "rev"], cwd=ROOT, env=env,

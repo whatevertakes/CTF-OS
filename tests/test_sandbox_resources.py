@@ -108,6 +108,26 @@ def test_execute_does_not_export_until_cleanup(monkeypatch, tmp_path: Path) -> N
     assert receipt["artifacts_exported"] is False
 
 
+def test_execute_waits_for_session_child_and_records_its_process_group(monkeypatch, tmp_path: Path) -> None:
+    branch = tmp_path / "challenge" / "workers" / "recon"
+    branch.mkdir(parents=True)
+    metadata = _metadata(branch)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, timeout):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 17, "", "command failed")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    receipt = execute(metadata, ["false"], 10)
+
+    assert receipt["exit_code"] == 17
+    exec_argv = calls[0]
+    marker = exec_argv.index("setsid")
+    assert exec_argv[marker:marker + 4] == ["setsid", "--fork", "--wait", "sh"]
+    assert "echo $$" in exec_argv[marker + 5]
+
+
 def test_explicit_export_records_receipt(monkeypatch, tmp_path: Path) -> None:
     branch = tmp_path / "challenge" / "workers" / "recon"
     branch.mkdir(parents=True)

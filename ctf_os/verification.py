@@ -15,9 +15,10 @@ from .candidates import build_candidate, load_candidates, upsert_candidate_paylo
 from .evidence import append_evidence
 from .flags import matches_flag
 from .sandbox.network import Target, target_matches_observation
+from .projections import apply_projection, ensure_projection_manifest
 from .workspace import (
     append_jsonl_fsync, atomic_json, atomic_text, challenge_workspace, resolve_active_run,
-    safe_under, state_lock, update_run_manifest_timing, utc_now,
+    recover_run_state, safe_under, state_lock, update_run_manifest_timing, utc_now,
 )
 
 
@@ -26,6 +27,10 @@ FLAG_STATES = frozenset({
     "SUBMISSION_RECOMMENDED", "FULLY_VERIFIED", "SUBMITTED_BY_HUMAN",
 })
 REMOTE_RECEIPT_SCHEMA_VERSION = 2
+REMOTE_PROJECTIONS = (
+    "candidate_state", "result", "evidence", "timing", "verified_event",
+    "scheduler", "compatibility",
+)
 
 
 class FastFlagError(ValueError):
@@ -41,6 +46,7 @@ def record_remote_flag(
 ) -> dict[str, Any]:
     compatibility_root = root.resolve(strict=False)
     run = resolve_active_run(root, input_fingerprint=input_fingerprint, target_revision=target_revision)
+    repair_remote_receipt_projections(run, suppress_errors=True)
     if not network_observed:
         raise FastFlagError("REMOTE_FLAG_OBTAINED requires an actual network observation")
     matches = [
@@ -96,6 +102,8 @@ def record_remote_flag(
             "command_argv": argv, "command_digest": command_digest,
             "output_digest": output_digest, "exploit_artifact": artifact,
             "exploit_artifact_digest": artifact_digest,
+            "confidence": confidence,
+            "validation_method": "REMOTE_SERVICE_ACCEPTANCE",
         }
         receipt_id = hashlib.sha256(
             json.dumps(receipt_material, sort_keys=True, separators=(",", ":")).encode(),
@@ -110,6 +118,7 @@ def record_remote_flag(
             "schema_version": REMOTE_RECEIPT_SCHEMA_VERSION, "receipt_id": receipt_id,
             **receipt_material, "candidate_id": candidate_record["candidate_id"],
             "network_observed": True, "output_excerpt": _bounded_excerpt(output, candidate),
+            "required_projections": list(REMOTE_PROJECTIONS),
             "created_at": utc_now(),
         }
         receipt_path = run / "flag-receipts" / f"remote-{receipt_id}.json"
@@ -160,6 +169,7 @@ def record_remote_flag(
         # Commit order keeps the terminal STATE projection last. A failure may
         # leave an orphan receipt, but never a receipt-less terminal state.
         atomic_json(receipt_path, receipt)
+        _verification_failpoint("remote_receipt", "after", receipt)
         atomic_json(run / "candidates.json", candidate_payload)
         atomic_text(run / "RESULT.md", _fast_result(
             challenge_id, state_name, candidate, confidence, receipt_path, run, matches[0],
@@ -173,37 +183,148 @@ def record_remote_flag(
             compatibility["authoritative_state"] = str((run / "STATE.json").relative_to(workspace))
             atomic_json(workspace / "STATE.json", compatibility)
         state = projected_state
-    append_evidence(run / "evidence.log", "remote_flag_receipt", {
-        "receipt_id": receipt_id, "candidate_id": candidate_record["candidate_id"],
-        "branch_id": branch_id, "candidate": candidate, "target": receipt["observed_target"],
-        "network_observed": True, "run_id": run_id,
-        "input_fingerprint": input_fingerprint, "target_revision": revision,
-        "confidence": confidence,
-    })
-    update_run_manifest_timing(run, "flag_observed_at", receipt["created_at"])
-    from .events import publish_verified_event
-    event: dict[str, Any] = {}
-    post_commit_warnings: list[str] = []
-    try:
-        event = publish_verified_event(
-            run, receipt=receipt,
-            event_type="REMOTE_FLAG_OBTAINED" if pattern_match else "FLAG_CANDIDATE",
-            summary="declared remote flag receipt",
-        )
-    except Exception as exc:
-        post_commit_warnings.append(f"verified event projection failed: {exc}")
-        append_jsonl_fsync(run / "post-commit-errors.jsonl", {
-            "event": "FLAG_RECEIPT_EVENT_PROJECTION_FAILED", "receipt_id": receipt_id,
-            "error": str(exc), "created_at": utc_now(),
-        }, label="post-commit error ledger")
-    _optional_scheduler_update(run, branch_id, confidence, receipt_id)
+    repaired = repair_remote_receipt_projections(run, receipt_ids={receipt_id}, suppress_errors=True)
+    post_commit_warnings = repaired["errors"]
     response = _response(
         run, state_name, challenge_id, candidate, confidence, receipt_path,
         matches[0], branch_id, candidate_record["candidate_id"], idempotent=False,
     )
-    response["race_transition"] = event.get("race_transition")
+    response["race_transition"] = repaired.get("race_transition")
     response["post_commit_warnings"] = post_commit_warnings
     return response
+
+
+def repair_remote_receipt_projections(
+    root: Path, *, receipt_ids: set[str] | None = None,
+    suppress_errors: bool = False,
+) -> dict[str, Any]:
+    run = resolve_active_run(root)
+    repaired: list[str] = []
+    errors: list[str] = []
+    last_transition = None
+    receipt_root = run / "flag-receipts"
+    for path in sorted(receipt_root.glob("remote-*.json")) if receipt_root.is_dir() else []:
+        receipt = _load_json(path, "remote flag receipt")
+        receipt_id = str(receipt.get("receipt_id") or "")
+        if not receipt_id and receipt.get("schema_version") is None and receipt.get("flag"):
+            # Pre-v2 compatibility files carried only a displayed flag and
+            # have no canonical evidence identity to replay. Preserve them,
+            # but never promote them as authoritative receipts.
+            continue
+        if receipt_ids is not None and receipt_id not in receipt_ids:
+            continue
+        required = list(receipt.get("required_projections") or REMOTE_PROJECTIONS)
+        ensure_projection_manifest(run, receipt, required)
+        stages = (
+            ("candidate_state", lambda r=receipt: recover_run_state(run, force=True)),
+            ("result", lambda r=receipt, p=path: _repair_remote_result(run, p, r)),
+            ("evidence", lambda r=receipt: _repair_remote_evidence(run, r)),
+            ("timing", lambda r=receipt: update_run_manifest_timing(
+                run, "flag_observed_at", str(r.get("created_at")),
+            )),
+            ("verified_event", lambda r=receipt: _repair_verified_event(run, r)),
+            ("scheduler", lambda r=receipt: _optional_scheduler_update(
+                run, str(r.get("branch_id") or ""),
+                str(r.get("confidence") or "LOW"), receipt_id, strict=True,
+            )),
+            ("compatibility", lambda: _repair_remote_compatibility(run)),
+        )
+        for name, callback in stages:
+            try:
+                value, skipped = apply_projection(run, receipt, required, name, callback)
+                if name == "verified_event" and isinstance(value, Mapping):
+                    last_transition = value.get("race_transition")
+                if not skipped and receipt_id not in repaired:
+                    repaired.append(receipt_id)
+            except Exception as exc:
+                message = f"{receipt_id}:{name}: {exc}"
+                errors.append(message[:2000])
+                append_jsonl_fsync(run / "post-commit-errors.jsonl", {
+                    "event": "FLAG_RECEIPT_PROJECTION_FAILED", "receipt_id": receipt_id,
+                    "projection": name, "error": str(exc)[:2000], "created_at": utc_now(),
+                }, label="post-commit error ledger")
+                if not suppress_errors:
+                    raise FastFlagError(message) from exc
+    return {
+        "run_id": run.name, "repaired_receipts": repaired,
+        "errors": errors, "race_transition": last_transition,
+    }
+
+
+def _repair_remote_result(run: Path, receipt_path: Path, receipt: Mapping[str, Any]) -> None:
+    state = _load_state(run)
+    if state.get("competition_state") == "ACCEPTED":
+        return
+    observed = receipt.get("observed_target") if isinstance(receipt.get("observed_target"), Mapping) else {}
+    target = Target(
+        declared=str(observed.get("declared") or ""), host=str(observed.get("host") or ""),
+        port=int(observed.get("port") or 0), scheme=str(observed.get("protocol") or "tcp"),
+        organizer_declared=True,
+    )
+    confidence = str(receipt.get("confidence") or "LOW").upper()
+    state_name = "SUBMISSION_RECOMMENDED" if confidence == "HIGH" else "FLAG_CANDIDATE"
+    content = _fast_result(
+        str(receipt.get("challenge_id") or ""), state_name,
+        str(receipt.get("candidate") or ""), confidence, receipt_path, run,
+        target, str(receipt.get("candidate_id") or ""),
+    )
+    destination = run / "RESULT.md"
+    if destination.exists() and destination.read_text(encoding="utf-8") == content:
+        return
+    if destination.exists():
+        existing = destination.read_text(encoding="utf-8")
+        if existing.strip() and not existing.startswith("# Remote flag"):
+            raise FastFlagError("RESULT.md conflicts with remote receipt projection")
+    atomic_text(destination, content)
+
+
+def _repair_remote_evidence(run: Path, receipt: Mapping[str, Any]) -> None:
+    receipt_id = str(receipt.get("receipt_id") or "")
+    path = run / "evidence.log"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise FastFlagError("evidence log is malformed during projection repair") from exc
+            if isinstance(row, Mapping) and row.get("event") == "remote_flag_receipt" and row.get("receipt_id") == receipt_id:
+                return
+    append_evidence(path, "remote_flag_receipt", {
+        "receipt_id": receipt_id, "candidate_id": receipt.get("candidate_id"),
+        "branch_id": receipt.get("branch_id"), "candidate": receipt.get("candidate"),
+        "target": receipt.get("observed_target"), "network_observed": True,
+        "run_id": receipt.get("run_id"),
+        "input_fingerprint": receipt.get("input_fingerprint"),
+        "target_revision": receipt.get("target_revision"),
+        "confidence": receipt.get("confidence"),
+    })
+
+
+def _repair_verified_event(run: Path, receipt: Mapping[str, Any]) -> dict[str, Any]:
+    from .events import publish_verified_event
+    confidence = str(receipt.get("confidence") or "LOW").upper()
+    return publish_verified_event(
+        run, receipt=receipt,
+        event_type="REMOTE_FLAG_OBTAINED" if confidence == "HIGH" else "FLAG_CANDIDATE",
+        summary="declared remote flag receipt",
+    )
+
+
+def _repair_remote_compatibility(run: Path) -> None:
+    workspace = challenge_workspace(run)
+    path = workspace / "STATE.json"
+    if workspace == run or not path.is_file() or path.is_symlink():
+        return
+    state = _load_state(run)
+    projected = dict(state)
+    projected["compatibility_view"] = True
+    projected["authoritative_state"] = str((run / "STATE.json").relative_to(workspace))
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    if existing != projected:
+        atomic_json(path, projected)
 
 
 def mark_fully_verified(root: Path, *, input_fingerprint: str) -> dict[str, Any]:
@@ -226,7 +347,9 @@ def mark_fully_verified(root: Path, *, input_fingerprint: str) -> dict[str, Any]
     return {"state": "FULLY_VERIFIED", "flag": state["flag_candidate"]}
 
 
-def _optional_scheduler_update(run: Path, branch_id: str, confidence: str, receipt_id: str) -> None:
+def _optional_scheduler_update(
+    run: Path, branch_id: str, confidence: str, receipt_id: str, *, strict: bool = False,
+) -> None:
     try:
         from .resources.scheduler import ResourceLedger, detect_capacity
         ledger = ResourceLedger(run)
@@ -244,6 +367,8 @@ def _optional_scheduler_update(run: Path, branch_id: str, confidence: str, recei
             "event": "FLAG_RECEIPT_SCHEDULER_UPDATE_FAILED", "receipt_id": receipt_id,
             "error": str(exc), "created_at": utc_now(),
         }, label="scheduler error ledger")
+        if strict:
+            raise
 
 
 def _response(
@@ -335,6 +460,12 @@ def _bounded_excerpt(output: str, candidate: str) -> str:
 
 def _without_time(value: Mapping[str, Any]) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "created_at"}
+
+
+def _verification_failpoint(
+    boundary: str, phase: str, receipt: Mapping[str, Any],
+) -> None:
+    """Private no-op seam used only by fault-injection tests."""
 
 
 def _sha256(path: Path) -> str:
