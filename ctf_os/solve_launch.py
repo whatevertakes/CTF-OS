@@ -15,11 +15,8 @@ SOLVE_LAUNCH_SCHEMA_VERSION = 1
 MAX_SOLVE_LAUNCH_BYTES = 64 * 1024
 MAX_PRIORITY_FILES = 20
 MAX_OBSERVATION_HINTS = 8
-MAX_TRIAGE_REASONS = 3
-MAX_RECOMMENDED_TOOLS = 8
-MAX_SETUP_REQUIREMENTS = 5
 OBSERVATION_HINT_SEMANTICS = (
-    "Triage and Intake attack surfaces are observation-ordering hints only. "
+    "Preflight observation hints only order direct inspection of this selected challenge. "
     "They are not confirmed vulnerabilities or exploit primitives. "
     "Discard a hint immediately when the first decisive experiment refutes it."
 )
@@ -29,16 +26,15 @@ def build_solve_launch_context(
     challenge: ChallengeSpec,
     record: dict[str, object],
 ) -> dict[str, object]:
-    """Project current Intake and optional selected Triage into bounded context."""
+    """Project current selected-challenge evidence into bounded solve context."""
 
     files = _priority_files(record)
     metadata = _mapping(record.get("important_metadata"))
     all_files = _dict_list(record.get("files"))
     targets = [target.to_dict() for target in parse_remotes(challenge.remotes)]
     target_count = len(targets)
-    triage = _triage_context(record.get("contest_triage"))
     hints = _strings(
-        record.get("initial_attack_surface") or record.get("attack_surface"),
+        record.get("observation_hints") or record.get("initial_attack_surface") or record.get("attack_surface"),
         maximum=MAX_OBSERVATION_HINTS,
         length=240,
     )
@@ -48,6 +44,13 @@ def build_solve_launch_context(
         "challenge_key": _text(challenge.key, 320),
         "category": _text(challenge.category, 80),
         "name": _text(challenge.name, 240),
+        "problem_information": {
+            "description": _optional_text(challenge.description, 4_000),
+            "hint": _optional_text(challenge.hint, 2_000),
+            "flag_format": _optional_text(challenge.flag_format, 320),
+            "flag_pattern": _optional_text(challenge.flag_pattern, 1_000),
+            "input_profile": _text(challenge.input_profile, 80),
+        },
         "input_fingerprint": str(record.get("source_fingerprint") or ""),
         "objective": "FIRST_VALID_FLAG",
         "authorized_targets": [_target(item) for item in targets],
@@ -68,12 +71,11 @@ def build_solve_launch_context(
             "resource_profile": _text(record.get("recommended_resource_profile") or "standard", 80),
             "service_plan": _service_plan(record.get("service_plan")),
         },
-        "contest_triage": triage,
         "execution_policy": {
             "same_session_required": True,
             "observation_budget_seconds": 90,
             "maximum_active_hypotheses": 3,
-            "triage_hints_are_not_confirmed_vulnerabilities": True,
+            "preflight_hints_are_not_confirmed_vulnerabilities": True,
             "discard_refuted_hints_immediately": True,
             "python_must_not_choose_tier_or_spawn_children": True,
             "observation_hint_semantics": OBSERVATION_HINT_SEMANTICS,
@@ -145,59 +147,6 @@ def _target(item: dict[str, Any]) -> dict[str, object]:
         "transport": _text(item.get("transport"), 20),
         "organizer_declared": bool(item.get("organizer_declared")),
         "callback": bool(item.get("callback")),
-    }
-
-
-def _triage_context(value: object) -> dict[str, object]:
-    triage = _mapping(value)
-    if not triage:
-        return {
-            "available": False,
-            "recommendation": {},
-            "reasons": [],
-            "baseline": {},
-            "setup": {},
-            "attack_surface_clarity": None,
-            "recommended_tools": [],
-            "recommended_playbook": {},
-        }
-    recommendation = _mapping(triage.get("recommendation"))
-    reasons: list[dict[str, str]] = []
-    for reason in _dict_list(triage.get("reasons"))[:MAX_TRIAGE_REASONS]:
-        reasons.append({
-            "fact_id": _text(reason.get("fact_id"), 80),
-            "text": _text(reason.get("text"), 360),
-        })
-    baseline = _mapping(triage.get("baseline"))
-    setup = _mapping(triage.get("setup"))
-    playbook = _mapping(triage.get("recommended_playbook"))
-    return {
-        "available": True,
-        "recommendation": _selected_mapping(
-            recommendation,
-            (("bucket", 40), ("rank", None), ("label", 120)),
-        ),
-        "reasons": reasons,
-        "baseline": _selected_mapping(
-            baseline,
-            (("difficulty", 80), ("estimated_solve_time", 80), ("success_probability", 80)),
-        ),
-        "setup": {
-            **_selected_mapping(setup, (("cost", 80),)),
-            "requirements": _strings(
-                setup.get("requirements"), maximum=MAX_SETUP_REQUIREMENTS, length=240,
-            ),
-        },
-        "attack_surface_clarity": (
-            _text(triage.get("attack_surface_clarity"), 80)
-            if triage.get("attack_surface_clarity") is not None else None
-        ),
-        "recommended_tools": _strings(
-            triage.get("recommended_tools"), maximum=MAX_RECOMMENDED_TOOLS, length=120,
-        ),
-        "recommended_playbook": _selected_mapping(
-            playbook, (("category", 80), ("path", 320)),
-        ),
     }
 
 
@@ -274,6 +223,10 @@ def _text(value: object, limit: int) -> str:
     marker = "…"
     prefix = encoded[: max(0, limit - len(marker.encode("utf-8")))].decode("utf-8", errors="ignore")
     return prefix + marker
+
+
+def _optional_text(value: object, limit: int) -> str | None:
+    return None if value is None else _text(value, limit)
 
 
 def _mapping(value: object) -> dict[str, Any]:

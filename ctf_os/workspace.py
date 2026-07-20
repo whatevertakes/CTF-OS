@@ -120,10 +120,25 @@ def bind_input_fingerprint(root: Path, challenge: ChallengeSpec, fingerprint: st
 
 @contextmanager
 def state_lock(root: Path) -> Iterator[None]:
-    lock_path = root / ".STATE.lock"
     state_path = root / "STATE.json"
-    if lock_path.is_symlink() or state_path.is_symlink():
-        raise ValueError("challenge state and lock files must not be symlinks")
+    if state_path.is_symlink():
+        raise ValueError("challenge state file must not be a symlink")
+    with _workspace_lock(root / ".STATE.lock", "challenge state"):
+        yield
+
+
+@contextmanager
+def preflight_lock(root: Path) -> Iterator[None]:
+    """Serialize preparation only for this exact challenge workspace."""
+
+    with _workspace_lock(root / ".PREFLIGHT.lock", "challenge preflight"):
+        yield
+
+
+@contextmanager
+def _workspace_lock(lock_path: Path, label: str) -> Iterator[None]:
+    if lock_path.is_symlink():
+        raise ValueError(f"{label} lock file must not be a symlink")
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)

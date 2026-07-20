@@ -31,14 +31,23 @@ uv run python -m ctf_os.agent_tools doctor
 uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
 ```
 
-문제 파일을 `incoming/<contest>/<category>/`에 넣고 `incoming/<contest>/problems.txt`에 문제와 organizer-declared target을 기록합니다. 별도 세션에서 “intake 해”, “triage 해”, “1번 문제 풀어” 순으로 요청합니다. Intake는 내부 context를 만들고, Triage는 원본을 exploit하지 않은 채 추천 Board만 만듭니다.
+표준 사용 흐름은 다음과 같습니다.
+
+1. 현재 문제 파일 또는 디렉터리를 `incoming/<contest>/<category>/`의 해당 challenge 위치에 둡니다.
+2. 문제 설명·힌트·플래그 형식과 optional organizer-declared remote를 `incoming/<contest>/problems.txt`에 기록하거나 현재 Sol 세션에 제공합니다.
+3. 사용자가 연 그 Sol 세션에서 “이 문제 풀어라”, 문제 이름, 번호, 또는 `category/name`을 요청합니다.
+4. CTF-OS가 현재 문제만 challenge-local preflight로 안전하게 준비하고 즉시 exploit-first solve를 시작합니다.
+5. exact flag가 출력되면 사람이 제출합니다.
+
+Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ranking을 명시적으로 요청할 때만 쓰는 optional legacy/admin 도구입니다. Solve의 선행 단계나 readiness source가 아니며, 현재 운영은 전체 Board·난이도·성공확률로 개별 challenge를 유도하지 않습니다.
 
 ## 실제 solve 흐름
 
 “1번 문제 풀어”는 다음 동작을 목표로 합니다.
 
 ```text
-prepare
+selected challenge resolution
+→ challenge-local preflight
 → category command budget 안의 minimal recon
 → concrete exploit hypotheses 선택
 → decisive experiments 즉시 실행

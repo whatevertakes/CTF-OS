@@ -1,11 +1,11 @@
 ---
 name: ctf-intake
-description: Prepare deep-ready context packs for all challenges in an authorized CTF contest. Use when the user says "intake 해라", "대회 문제 읽어라", "문제 목록 준비해라", names a contest for intake, or otherwise asks the current Sol session to inspect incoming challenge files before separate solve sessions.
+description: Run an optional legacy/admin whole-contest inventory. Use only when the user explicitly says "intake 해라", "대회 문제 읽어라", "문제 목록 준비해라", or explicitly requests a named whole-contest inventory.
 ---
 
-# CTF intake
+# Optional whole-contest Intake administration
 
-Act as the intake lead in the currently open dedicated session. Do not begin a full exploit race and never launch another Codex process.
+This tool is not a Solve prerequisite or readiness source. Run it only for an explicit whole-contest administration request. Do not begin a full exploit race and never launch another Codex process.
 
 1. Read root `AGENTS.md` and identify the requested contest. Treat only remotes declared in its `contest.md` as authorized.
 2. Run `uv run python -m ctf_os.agent_tools inspect-contest --contest '<name>'` when a contest is named. Omit `--contest` only when exactly one contest exists. If selection is ambiguous, show the returned candidates; do not guess.
@@ -15,4 +15,4 @@ Act as the intake lead in the currently open dedicated session. Do not begin a f
 
 For unusually broad inputs, use native delegation for at most 1–3 bounded, read-only triage tasks. Give each branch distinct files or categories and ask it to return evidence only. Model pinning is optional: use Sol/Terra/Luna roles when the runtime supports exact selection; otherwise use available native agents and state that the model was not pinned. Never use subprocesses, sockets, stdout protocols, or Python code to create model workers.
 
-Finish with the numbered list from `INTAKE.md`, including status, category/name, inputs, remote, estimate, initial direction, and selector. State the two saved index paths. Stop the intake session there; tell the user to open a new Challenge Triage session before selecting a challenge to solve.
+Finish with the numbered list from `INTAKE.md`, including status, category/name, inputs, remote, estimate, initial direction, and selector. State the two saved index paths and stop. Do not direct the user through Triage or a replacement Solve session.

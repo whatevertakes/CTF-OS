@@ -19,6 +19,8 @@ Time-to-first-valid-flag outranks analysis breadth, documentation quality, reusa
 
 Unless needed by the leading exploit path, do not enumerate the complete attack surface, classify every possible vulnerability, audit unrelated source, conduct generalized vulnerability research, build reusable frameworks/libraries, refactor for code quality, polish reports, fully verify before a plausible remote attempt, search for other bugs while a viable path is alive, study the whole problem structure, or document architecture. Preserve only the minimal command receipt, exploit artifact, flag provenance, and information needed for later replay.
 
+The current user-opened Sol session owns the solve continuously from selection through flag acquisition. Preparation is an internal challenge-local preflight over only the selected identity, problem information, declared scope, source, prepared input, and service configuration. Whole-contest inventory, ranking, difficulty, and success estimates are not prerequisites or solve inputs. A sibling challenge change must not stale, rewrite, or block the selected challenge workspace.
+
 ## Required execution loop
 
 ```text

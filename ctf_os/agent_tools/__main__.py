@@ -12,7 +12,6 @@ from ..challenge import SelectionError, resolve_selector
 from ..challenge_scope import remove_challenge_secrets
 from ..contest import ContestError, discover_contests, select_contest
 from ..evidence import append_finding
-from ..intake import current_source_fingerprint, prepared_tree_fingerprint, run_intake
 from ..doctor import run_doctor
 from ..delegation import (
     BranchCandidate, add_branch, branch_utility, init_plan, load_plan,
@@ -31,6 +30,9 @@ from ..resources.scheduler import (
 from ..oast import create_oast, oast_events, poll_oast
 from ..replay import run_replay
 from ..problems import sync_contest_manifest
+from ..preflight import (
+    load_challenge_preflight, prepare_selected_challenge, prepared_tree_fingerprint,
+)
 from ..scaffold import initialize_contest
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import gpu_available, sandbox_gc, sandbox_status
@@ -43,7 +45,7 @@ from ..service import (
     service_reset, service_status, service_stop,
 )
 from ..solve_launch import build_solve_launch_context, save_solve_launch_context
-from ..triage import finalize_triage, load_optional_final_triage, prepare_triage
+from ..triage import finalize_triage, prepare_triage
 from ..timeouts import timeout_seconds
 from ..transitions import control_loop_tick
 from ..tui import resource_panel
@@ -408,6 +410,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         contest = select_contest(discover_contests(root / "incoming"), args.contest)
         return contest.to_dict()
     if args.command == "intake":
+        from ..intake import run_intake
+
         payload = run_intake(root, args.contest)
         contest = payload["contest"]
         return {
@@ -1243,12 +1247,9 @@ def _compact_prepare(
         "challenge": challenge.to_dict(),
         "priority_files": priority,
         "important_metadata": important_metadata,
-        "initial_attack_surface": list(launch_context["observation_hints"]),
-        "recommended_image": record.get("recommended_image", "ctf-os-sandbox:base"),
-        "recommended_resource_profile": record.get("recommended_resource_profile", "standard"),
-        "triage_available": bool(record.get("triage_available")),
-        "triage_recommendation": record.get("triage_recommendation", {}),
-        "contest_triage": record.get("contest_triage"),
+        "problem_information": dict(launch_context["problem_information"]),
+        "observation_hints": list(launch_context["observation_hints"]),
+        "recommended_environment": dict(launch_context["recommended_environment"]),
         "service_plan": record.get("service_plan", {}),
         "state_summary": _state_summary(solve_root),
         "read_on_demand": [
@@ -1257,6 +1258,7 @@ def _compact_prepare(
         ],
         "solve_launch_path": str(launch_path),
         "solve_launch_context": launch_context,
+        "preflight_record_path": str(solve_root / "CHALLENGE-PREFLIGHT.json"),
         "solve_root": str(solve_root),
     }
 
@@ -1272,203 +1274,29 @@ def _state_summary(solve_root: Path) -> dict[str, object]:
 
 
 def _prepare_challenge_same_session(root: Path, contest_selector: str | None, selector: str):
-    """Repair missing/stale Intake state for one selected challenge in this call."""
+    """Prepare only the selected challenge in the current Sol session."""
 
     sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     challenge = resolve_selector(manifest.challenges, selector)
-    index_path = _intake_index_path(root, manifest)
-    refresh = False
-    force_materialize = False
-
-    if index_path.is_symlink():
-        raise ValueError(f"Challenge input cannot be safely prepared because the Intake index is a symlink: {index_path}")
-    if not index_path.exists():
-        refresh = True
-    else:
-        index = _read_intake_index(index_path)
-        record = _matching_intake_record(index, challenge)
-        if record is not None and record.get("prepared_input") is not None:
-            _prepared_input_path(root, manifest, challenge, record, allow_missing_field=True)
-        if _intake_manifest_fingerprint(index) != manifest.fingerprint or record is None:
-            refresh = True
-        else:
-            current_fingerprint = current_source_fingerprint(manifest, challenge)
-            if record.get("source_fingerprint") != current_fingerprint:
-                refresh = True
-            elif record.get("status") == "READY":
-                prepared, declared = _prepared_input_path(
-                    root, manifest, challenge, record, allow_missing_field=True,
-                )
-                if not declared or prepared.is_symlink() or not prepared.is_dir():
-                    refresh = True
-                    force_materialize = True
-                else:
-                    try:
-                        prepared_fingerprint = prepared_tree_fingerprint(prepared)
-                    except Exception as exc:
-                        raise ValueError(
-                            f"Challenge input cannot be safely prepared because prepared input validation failed: {exc}"
-                        ) from exc
-                    if record.get("prepared_fingerprint") != prepared_fingerprint:
-                        refresh = True
-                        force_materialize = True
-
-    if refresh:
-        try:
-            run_intake(
-                root,
-                contest_selector,
-                force_challenge_ids={challenge.id} if force_materialize else None,
-            )
-        except Exception as exc:
-            raise ValueError(f"Same-session preparation failed because {exc}") from exc
-        # Reload from disk and resolve again so the repair result receives all
-        # of the same path, schema, selector, and fingerprint checks.
-        sync_contest_manifest(root, contest_selector)
-        manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-        challenge = resolve_selector(manifest.challenges, selector)
-        index_path = _intake_index_path(root, manifest)
-
-    index = _read_intake_index(index_path)
-    if _intake_manifest_fingerprint(index) != manifest.fingerprint:
-        raise ValueError("Same-session preparation failed because the regenerated Intake manifest is stale")
-    record = _matching_intake_record(index, challenge)
-    if record is None:
-        raise ValueError("Same-session preparation failed because Intake has no record for the selected challenge")
+    try:
+        record = prepare_selected_challenge(root, manifest, challenge)
+    except Exception as exc:
+        raise ValueError(f"Same-session challenge-local preflight failed because {exc}") from exc
     if record.get("status") != "READY":
         blockers = [str(value) for value in record.get("blockers", []) if str(value).strip()]
         detail = "; ".join(blockers) or "no blocker detail was recorded"
         raise ValueError(f"The selected challenge remains BLOCKED: {detail}")
-    record = _validate_ready_intake_record(
-        root, manifest, challenge, record,
-        stale_prefix="Same-session preparation failed because",
-    )
-    return manifest, challenge, _with_optional_triage(root, manifest, challenge, record)
+    return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
 
 
 def _load_challenge_strict(root: Path, contest_selector: str | None, selector: str):
-    """Load already-prepared current state without performing Intake repair."""
+    """Load already-prepared selected state without whole-contest repair."""
 
     sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     challenge = resolve_selector(manifest.challenges, selector)
-    index_path = _intake_index_path(root, manifest)
-    if not index_path.exists() and not index_path.is_symlink():
-        raise ValueError("Challenge runtime state is not prepared: Intake index is missing")
-    index = _read_intake_index(index_path)
-    if _intake_manifest_fingerprint(index) != manifest.fingerprint:
-        raise ValueError("Challenge runtime state is stale because contest.md changed after preparation")
-    record = _matching_intake_record(index, challenge)
-    if record is None:
-        raise ValueError("Challenge runtime state is stale because Intake has no selected challenge record")
-    if record.get("status") != "READY":
-        blockers = [str(value) for value in record.get("blockers", []) if str(value).strip()]
-        raise ValueError(f"The selected challenge remains BLOCKED: {'; '.join(blockers) or 'unknown blocker'}")
-    record = _validate_ready_intake_record(
-        root, manifest, challenge, record,
-        stale_prefix="Challenge runtime state is stale because",
-    )
-    return manifest, challenge, _with_optional_triage(root, manifest, challenge, record)
-
-
-def _intake_index_path(root: Path, manifest) -> Path:
-    try:
-        return safe_under(root / "output", Path(manifest.slug) / "intake.json")
-    except ValueError as exc:
-        raise ValueError(f"Challenge input cannot be safely prepared because the Intake index path is unsafe: {exc}") from exc
-
-
-def _read_intake_index(path: Path) -> dict[str, object]:
-    if path.is_symlink():
-        raise ValueError(f"Challenge input cannot be safely prepared because the Intake index is a symlink: {path}")
-    if not path.is_file():
-        raise ValueError(f"Challenge runtime state is not prepared: Intake index is missing or unsafe: {path}")
-    try:
-        index = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Challenge input cannot be safely prepared because the Intake index is unreadable: {path}") from exc
-    if not isinstance(index, dict) or index.get("schema_version") != 1:
-        raise ValueError("Challenge input cannot be safely prepared because the Intake index schema is invalid")
-    if not isinstance(index.get("contest"), dict):
-        raise ValueError("Challenge input cannot be safely prepared because the Intake contest record is invalid")
-    records = index.get("challenges")
-    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
-        raise ValueError("Challenge input cannot be safely prepared because Intake challenges are not JSON objects")
-    return index
-
-
-def _intake_manifest_fingerprint(index: dict[str, object]) -> object:
-    contest = index.get("contest")
-    return contest.get("manifest_sha256") if isinstance(contest, dict) else None
-
-
-def _matching_intake_record(index: dict[str, object], challenge) -> dict[str, object] | None:
-    records = [record for record in index["challenges"] if record.get("id") == challenge.id]
-    if len(records) > 1:
-        raise ValueError("Challenge input cannot be safely prepared because Intake contains duplicate selected challenge records")
-    return dict(records[0]) if records else None
-
-
-def _prepared_input_path(
-    root: Path,
-    manifest,
-    challenge,
-    record: dict[str, object],
-    *,
-    allow_missing_field: bool = False,
-) -> tuple[Path, bool]:
-    prepared = challenge_root(root, manifest, challenge) / "input"
-    declared = record.get("prepared_input")
-    if (declared is None or declared == "") and allow_missing_field:
-        return prepared, False
-    if not isinstance(declared, str) or not declared:
-        raise ValueError("Challenge input cannot be safely prepared because Intake prepared_input is missing or invalid")
-    try:
-        declared_path = Path(declared).resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("Challenge input cannot be safely prepared because Intake prepared_input cannot be resolved") from exc
-    if declared_path != prepared.resolve(strict=False):
-        raise ValueError("Challenge input cannot be safely prepared because Intake prepared_input escapes the selected challenge workspace")
-    return prepared, True
-
-
-def _validate_ready_intake_record(
-    root: Path,
-    manifest,
-    challenge,
-    record: dict[str, object],
-    *,
-    stale_prefix: str,
-) -> dict[str, object]:
-    try:
-        parse_remotes(challenge.remotes)
-    except Exception as exc:
-        raise ValueError(f"Challenge input cannot be safely prepared because selected challenge scope is invalid: {exc}") from exc
-    current_fingerprint = current_source_fingerprint(manifest, challenge)
-    if record.get("source_fingerprint") != current_fingerprint:
-        raise ValueError(f"{stale_prefix} the selected challenge source fingerprint changed")
-    prepared, _ = _prepared_input_path(root, manifest, challenge, record)
-    if prepared.is_symlink() or not prepared.is_dir():
-        raise ValueError(f"{stale_prefix} prepared challenge input is missing or unsafe")
-    try:
-        prepared_fingerprint = prepared_tree_fingerprint(prepared)
-    except Exception as exc:
-        raise ValueError(f"Challenge input cannot be safely prepared because prepared input validation failed: {exc}") from exc
-    if record.get("prepared_fingerprint") != prepared_fingerprint:
-        raise ValueError(f"{stale_prefix} the prepared challenge input fingerprint changed")
-    return dict(record)
-
-
-def _with_optional_triage(root: Path, manifest, challenge, record: dict[str, object]) -> dict[str, object]:
-    triage = load_optional_final_triage(root, manifest, challenge)
-    enriched = dict(record)
-    enriched["triage_available"] = triage is not None
-    enriched["triage_recommendation"] = (
-        dict(triage.get("recommendation") or {}) if triage is not None else {}
-    )
-    enriched["contest_triage"] = dict(triage) if triage is not None else None
-    return enriched
+    return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
 
 
 def _load_metadata(root: Path, value: str) -> dict[str, object]:

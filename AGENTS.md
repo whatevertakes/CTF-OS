@@ -6,7 +6,7 @@ The current user-opened Sol session is lead attacker and owns native delegation,
 
 ## Scope and minimum boundaries
 
-- `incoming/<contest>/problems.txt` is the only user-maintained contest input; Intake generates internal `contest.md`.
+- `incoming/<contest>/problems.txt` is the only user-maintained contest input; commands synchronize the internal `contest.md` deterministically.
 - Attack exactly one selected challenge and only organizer-declared targets. Declared public/private/VPN/IPv6 and supported custom protocols are valid. Cloud metadata, Docker gateways, undeclared private LANs, unrelated hosts, and other challenges are not.
 - Challenge input/context are read-only. Workers receive private writable `/work`, `/evidence`, and `/artifacts` only. Never access or mount the host Docker socket/root, SSH keys, browser profiles, personal cloud credentials/kubeconfig, or personal files.
 - Challenge-provided temporary credentials and required cloud mutations are allowed only inside declared challenge scope, worker-private, logged, and redacted. Personal or ambient accounts are forbidden.
@@ -14,11 +14,11 @@ The current user-opened Sol session is lead attacker and owns native delegation,
 
 ## Request routing
 
-For “intake 해라”, “대회 문제 읽어라”, “문제 목록 준비해라”, or a named contest intake request, load `.codex/skills/ctf-intake/SKILL.md`. Intake is a dedicated no-solve session: inspect all challenges, generate `output/<contest>/intake.json` and `INTAKE.md`, print the numbered status list, and stop.
+For “N번 문제 풀어라”, `category/name`, a challenge name, “이 문제 풀어라”, deep solve, or swarm request, keep the current user-opened Sol session and load `.codex/skills/ctf-solve/SKILL.md`. Resolve exactly one challenge, run its internal challenge-local preflight, and immediately begin direct file/runtime observation and exploit-first solving. Do not require whole-contest Intake, Triage, a Board, a new session, or repeated problem/remote input. Stop only for genuinely ambiguous selection; selected input or metadata that cannot be prepared safely; missing scope; an undeclared required target; required host credentials; or an out-of-scope action.
 
-For “triage 해라”, “추천 풀이 순서 정해라”, “문제 우선순위 정해라”, or a named triage request after Intake, load `.codex/skills/ctf-triage/SKILL.md`. Triage is a dedicated no-solve session using only Intake metadata. Run `triage-prepare`, decide the order, run `triage-finalize`, show the READY/BLOCKED Board, and stop.
+Whole-contest Intake and Triage are optional legacy/admin tools only. Invoke them only when the user explicitly requests whole-contest inventory or ranking. They are not Solve prerequisites, are not Solve readiness sources, and their artifacts must not be read, generated, changed, or invalidated by the Solve path. Current operations do not use a whole-contest priority Board or difficulty classification to guide a challenge solve.
 
-For “N번 문제 풀어라”, `category/name`, a challenge name, deep solve, or swarm request, keep the current user-opened Sol session and load `.codex/skills/ctf-solve/SKILL.md`. Solve exactly one challenge; `prepare-challenge` repairs missing or stale Intake in the same session and uses current finalized Triage only when available. Stop only for ambiguous selection/contest, input or metadata that cannot be prepared safely, missing scope, an undeclared external target, required host credentials, or an out-of-scope action.
+For an explicit “intake 해라” or whole-contest inspection request, load `.codex/skills/ctf-intake/SKILL.md`. For an explicit “triage 해라” or whole-contest ranking request, load `.codex/skills/ctf-triage/SKILL.md`. Complete only that requested administrative action and do not present it as the normal route into Solve.
 
 ## Solve invariants
 

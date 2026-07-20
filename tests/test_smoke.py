@@ -5,19 +5,18 @@ import subprocess
 from ctf_os.challenge import resolve_selector
 from ctf_os.contest import discover_contests
 from ctf_os.flags import verify_and_record
-from ctf_os.intake import run_intake
+from ctf_os.preflight import prepare_selected_challenge
 from conftest import write_contest
 
 
-def test_offline_intake_to_solver_verification_smoke(repo: Path) -> None:
+def test_offline_preflight_to_solver_verification_smoke(repo: Path) -> None:
     write_contest(repo, "# Smoke CTF\n- Flag Format: SMOKE{...}\n### crypto/Toy\n- Description: output the constant\n", "Smoke CTF")
     source = repo / "incoming" / "Smoke CTF" / "crypto" / "Toy"
     source.mkdir(parents=True)
     (source / "challenge.py").write_text("print('SMOKE{offline-proof}')\n")
-    intake = run_intake(repo, "Smoke CTF")
     manifest = discover_contests(repo / "incoming")[0]
     challenge = resolve_selector(manifest.challenges, "1번")
-    record = intake["challenges"][0]
+    record = prepare_selected_challenge(repo, manifest, challenge)
     solve_root = Path(record["workspace_path"])
     exploit = solve_root / "exploit"
     exploit.mkdir()

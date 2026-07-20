@@ -84,7 +84,7 @@ def test_triage_builds_static_context_and_evidence_backed_board(repo: Path) -> N
         require_final_triage(repo, manifest, resolve_selector(manifest.challenges, "1"))
 
 
-def test_missing_triage_is_optional_and_current_triage_is_included(repo: Path) -> None:
+def test_solve_never_consumes_current_or_missing_legacy_triage(repo: Path) -> None:
     write_contest(repo, """# Demo Triage
 ### misc/one
 - Description: warmup encoding
@@ -99,20 +99,9 @@ def test_missing_triage_is_optional_and_current_triage_is_included(repo: Path) -
         capture_output=True, text=True, check=True,
     )
     prepared_without_triage = json.loads(without_triage.stdout)["result"]
-    assert prepared_without_triage["triage_available"] is False
-    assert prepared_without_triage["triage_recommendation"] == {}
-    assert prepared_without_triage["contest_triage"] is None
-    launch_without_triage = prepared_without_triage["solve_launch_context"]["contest_triage"]
-    assert launch_without_triage == {
-        "available": False,
-        "recommendation": {},
-        "reasons": [],
-        "baseline": {},
-        "setup": {},
-        "attack_surface_clarity": None,
-        "recommended_tools": [],
-        "recommended_playbook": {},
-    }
+    without_text = json.dumps(prepared_without_triage, sort_keys=True)
+    for forbidden in ("contest_triage", "triage_available", "triage_recommendation"):
+        assert forbidden not in without_text
 
     strict_runtime = subprocess.run(
         ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "resource-history", "1", "--contest", "Demo Triage"],
@@ -132,24 +121,21 @@ def test_missing_triage_is_optional_and_current_triage_is_included(repo: Path) -
         capture_output=True, text=True, check=True,
     )
     assert json.loads(finalized.stdout)["result"]["summary"]["priority"] == 1
+    triage_path = Path(json.loads(finalized.stdout)["result"]["index_path"])
+    triage_bytes = triage_path.read_bytes()
 
     ready = subprocess.run(
         ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage"],
         capture_output=True, text=True, check=True,
     )
     prepared_with_triage = json.loads(ready.stdout)["result"]
-    assert prepared_with_triage["triage_available"] is True
-    assert prepared_with_triage["triage_recommendation"]["label"] == "Priority #1"
-    assert prepared_with_triage["contest_triage"]["recommendation"]["rank"] == 1
-    launch_triage = prepared_with_triage["solve_launch_context"]["contest_triage"]
-    assert launch_triage["available"] is True
-    assert launch_triage["recommendation"]["label"] == "Priority #1"
-    assert launch_triage["baseline"]["difficulty"] == "easy"
-    assert launch_triage["setup"]["cost"] in {"low", "medium", "high"}
-    assert launch_triage["attack_surface_clarity"] in {"clear", "partial", "limited"}
-    assert launch_triage["reasons"]
-    assert launch_triage["recommended_tools"]
-    assert launch_triage["recommended_playbook"]["path"].endswith("misc.md")
+    prepared_text = json.dumps(prepared_with_triage, sort_keys=True)
+    for forbidden in (
+        "contest_triage", "triage_available", "triage_recommendation",
+        "difficulty", "estimated_solve_time", "success_probability",
+    ):
+        assert forbidden not in prepared_text
+    assert triage_path.read_bytes() == triage_bytes
 
 
 def test_stale_final_triage_is_ignored_without_rewriting_it(repo: Path) -> None:
@@ -178,11 +164,10 @@ def test_stale_final_triage_is_ignored_without_rewriting_it(repo: Path) -> None:
     )
     payload = json.loads(command.stdout)["result"]
 
-    assert payload["triage_available"] is False
-    assert payload["triage_recommendation"] == {}
-    assert payload["contest_triage"] is None
-    assert payload["solve_launch_context"]["contest_triage"]["available"] is False
-    assert payload["solve_launch_context"]["contest_triage"]["recommendation"] == {}
+    rendered = json.dumps(payload, sort_keys=True)
+    assert "contest_triage" not in rendered
+    assert "triage_available" not in rendered
+    assert "triage_recommendation" not in rendered
     assert triage_path.read_bytes() == stale_bytes
 
     manifest = discover_contests(repo / "incoming")[0]
@@ -190,7 +175,7 @@ def test_stale_final_triage_is_ignored_without_rewriting_it(repo: Path) -> None:
     assert load_optional_final_triage(repo, manifest, challenge) is None
 
 
-def test_malformed_current_triage_is_rejected(repo: Path) -> None:
+def test_malformed_current_triage_is_ignored_by_solve(repo: Path) -> None:
     write_contest(repo, """# Demo Triage
 ### misc/one
 - Description: warmup encoding
@@ -207,5 +192,7 @@ def test_malformed_current_triage_is_rejected(repo: Path) -> None:
         capture_output=True, text=True,
     )
 
-    assert command.returncode == 2
-    assert "Challenge Triage index is unreadable" in json.loads(command.stdout)["error"]
+    assert command.returncode == 0
+    assert triage_path.read_text() == "{not-json"
+    rendered = json.dumps(json.loads(command.stdout)["result"], sort_keys=True)
+    assert "contest_triage" not in rendered

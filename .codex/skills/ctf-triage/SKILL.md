@@ -1,11 +1,11 @@
 ---
 name: ctf-triage
-description: "Create an evidence-backed recommended solve order for every challenge in an authorized CTF contest after Intake. Use when the user says 'triage 해라', '추천 풀이 순서 정해라', '문제 우선순위 정해라', or asks to rank/select CTF challenges before solving. This is a no-solve stage: use only Intake artifacts and never open challenge input, start a sandbox/service, contact a remote, exploit, brute force, fuzz, symbolically execute, or run a solver."
+description: "Run an optional legacy/admin whole-contest ranking from explicit Intake artifacts. Use only when the user explicitly says 'triage 해라', '추천 풀이 순서 정해라', '문제 우선순위 정해라', or explicitly requests a whole-contest ranking. This is a no-solve admin tool."
 ---
 
-# CTF Challenge Triage
+# Optional whole-contest Triage administration
 
-Act in a new dedicated Sol session after Intake. Produce a quick recommendation Board, not a solution or a reconnaissance pass.
+This tool is not a Solve prerequisite, readiness source, or standard operating flow. Use it only for an explicit whole-contest administration request and only from explicit legacy Intake artifacts. Produce a bounded recommendation Board, not a solution or reconnaissance pass.
 
 1. Read root `AGENTS.md`. Resolve the contest with `uv run python -m ctf_os.agent_tools inspect-contest --contest '<name>'` when the user named one. Omit `--contest` only when exactly one contest exists.
 2. Run `uv run python -m ctf_os.agent_tools triage-prepare --contest '<name>'`.
@@ -22,6 +22,6 @@ uv run python -m ctf_os.agent_tools triage-finalize --contest '<name>' --assessm
 
 Do not supply a rank for `hold` or `later`. The finalizer rejects unsupported prose and fact IDs, then writes `output/<contest>/triage.json` and `TRIAGE.md`.
 
-6. Read `TRIAGE.md` and show its READY/BLOCKED Board and recommended solve order. Mention both saved paths. Stop there; let the human start a new Sol session and choose a selector such as `1번 문제 풀어`.
+6. Read `TRIAGE.md` and show its READY/BLOCKED Board and recommended solve order. Mention both saved paths and stop. Do not direct the user into a replacement Solve session.
 
 Keep this stage bounded to 1–2 minutes for a typical 8–20 challenge contest. Never use native delegation unless the supplied Board itself is too large to inspect in one pass; any helper may only rank a disjoint subset from the compact Board and must not access original files or perform solve actions.

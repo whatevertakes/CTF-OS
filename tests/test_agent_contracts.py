@@ -13,13 +13,31 @@ def test_skills_and_agents_define_sol_native_contract() -> None:
     assert "Full clean replay: not required" in solve
     assert "Never run Codex" in solve
     assert "solve_launch_context" in solve
-    assert "observation-ordering hints only" in solve
+    assert "Preflight observation hints only" in solve
     assert "They are not confirmed vulnerabilities or exploit primitives" in solve
-    assert "A Triage recommendation, difficulty, or success estimate never substitutes" in solve
-    assert "dedicated session" in intake
+    assert "challenge-local preflight" in solve
+    assert "Whole-contest Intake and Triage are not prerequisites" in solve
+    assert "optional legacy/admin" in intake
     assert "keep the current user-opened Sol session" in agents
-    assert "repairs missing or stale Intake in the same session" in agents
-    assert "no-solve stage" in triage and "triage-finalize" in triage
+    assert "run its internal challenge-local preflight" in agents
+    assert "not Solve prerequisites" in agents
+    assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
+
+
+def test_solve_docs_do_not_require_contest_wide_handoffs() -> None:
+    text = "\n".join(
+        Path(path).read_text().casefold()
+        for path in (
+            "AGENTS.md", "README.md", ".codex/skills/ctf-solve/SKILL.md",
+            "ctf_os/resources/agent-policy.md",
+        )
+    )
+    for forbidden in (
+        "run intake first", "run triage first", "open a new solve session",
+        "choose by difficulty",
+    ):
+        assert forbidden not in text
+    assert "intake\n→ triage\n→ board" not in text
 
 
 def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:

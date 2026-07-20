@@ -1,4 +1,4 @@
-"""Fast, evidence-bounded challenge triage between Intake and Solve.
+"""Optional legacy/admin whole-contest ranking from explicit Intake artifacts.
 
 This module deliberately consumes Intake artifacts only. It never opens a
 prepared challenge file, starts a service, or launches an analysis sandbox.

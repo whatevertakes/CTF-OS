@@ -6,7 +6,7 @@ import pytest
 
 from ctf_os.challenge import resolve_selector
 from ctf_os.contest import discover_contests
-from ctf_os.intake import run_intake
+from ctf_os.preflight import prepare_selected_challenge
 from ctf_os.replay import run_replay
 from conftest import write_contest
 
@@ -19,8 +19,9 @@ def test_live_offline_replay_is_clean_independent_and_ready(repo: Path) -> None:
     source = repo / "incoming" / "Replay CTF" / "misc" / "Toy"
     source.mkdir(parents=True)
     (source / "input.txt").write_text("fixture")
-    intake = run_intake(repo, "Replay CTF")
-    record = intake["challenges"][0]
+    manifest = discover_contests(repo / "incoming")[0]
+    challenge = resolve_selector(manifest.challenges, "1")
+    record = prepare_selected_challenge(repo, manifest, challenge)
     root = Path(record["workspace_path"])
     (root / "exploit").mkdir()
     (root / "exploit" / "solve.py").write_text("print('LIVE{sandbox-replay}')\n")
@@ -29,9 +30,6 @@ def test_live_offline_replay_is_clean_independent_and_ready(repo: Path) -> None:
         "service_required": False, "argv": ["python3", "/artifacts/exploit/solve.py"],
         "expected_flag_pattern": record["flag_pattern"], "input_fingerprint": record["source_fingerprint"],
     }))
-    manifest = discover_contests(repo / "incoming")[0]
-    challenge = resolve_selector(manifest.challenges, "1")
-
     result = run_replay(repo, manifest, challenge, record)
 
     assert result["flag_candidate"] == "LIVE{sandbox-replay}"

@@ -23,8 +23,7 @@ from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
 from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, _lifecycle
 import ctf_os.service as service_module
 from ctf_os.solve_launch import (
-    MAX_OBSERVATION_HINTS, MAX_PRIORITY_FILES, MAX_RECOMMENDED_TOOLS,
-    MAX_SETUP_REQUIREMENTS, MAX_SOLVE_LAUNCH_BYTES, MAX_TRIAGE_REASONS,
+    MAX_OBSERVATION_HINTS, MAX_PRIORITY_FILES, MAX_SOLVE_LAUNCH_BYTES,
     OBSERVATION_HINT_SEMANTICS, build_solve_launch_context, solve_launch_size,
 )
 from ctf_os.verification import FastFlagError, mark_fully_verified, record_remote_flag
@@ -53,6 +52,8 @@ def test_solve_launch_context_is_bounded_and_hints_are_not_progress() -> None:
     ]
     challenge = SimpleNamespace(
         id="stable-id", key="web/large", category="web", name="large", remotes=(),
+        description=long_text, hint=None, flag_format="DEMO{...}",
+        flag_pattern=r"\ADEMO\{[^}]+\}\Z", input_profile="standard",
     )
     record = {
         "source_fingerprint": "f" * 64,
@@ -94,13 +95,16 @@ def test_solve_launch_context_is_bounded_and_hints_are_not_progress() -> None:
 
     assert len(context["priority_files"]) == MAX_PRIORITY_FILES
     assert len(context["observation_hints"]) == MAX_OBSERVATION_HINTS
-    assert len(context["contest_triage"]["reasons"]) == MAX_TRIAGE_REASONS
-    assert len(context["contest_triage"]["recommended_tools"]) == MAX_RECOMMENDED_TOOLS
-    assert len(context["contest_triage"]["setup"]["requirements"]) == MAX_SETUP_REQUIREMENTS
     assert solve_launch_size(context) <= MAX_SOLVE_LAUNCH_BYTES
     policy = context["execution_policy"]
     assert policy["observation_hint_semantics"] == OBSERVATION_HINT_SEMANTICS
-    assert policy["triage_hints_are_not_confirmed_vulnerabilities"] is True
+    assert policy["preflight_hints_are_not_confirmed_vulnerabilities"] is True
+    rendered = json.dumps(context, sort_keys=True)
+    for forbidden in (
+        "contest_triage", "triage_available", "triage_recommendation", "difficulty",
+        "estimated_solve_time", "success_probability",
+    ):
+        assert forbidden not in rendered
     assert "primitive" not in context and "finding" not in context
 
 
