@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Claude Rescue"
+  short_description: "Prepare an exact-run manual Claude rescue"
+  default_prompt: "Use $ctf-claude-rescue-prepare to prepare this current CTF run for a manual Claude rescue."

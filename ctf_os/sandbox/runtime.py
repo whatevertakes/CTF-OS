@@ -57,6 +57,13 @@ class SandboxSpec:
     workload_class: str | None = None
     resource_priority: str | None = None
     resource_request_override: Mapping[str, object] | None = None
+    workspace_mode: str = "tmpfs"
+    run_id: str | None = None
+    rescue_attempt_id: str | None = None
+    external_solver: bool = False
+    solver_family: str | None = None
+    session_kind: str = "native-worker"
+    requested_lead_model: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -87,14 +94,19 @@ class SandboxSpec:
 
     @property
     def labels(self) -> dict[str, str]:
-        return {
+        labels = {
             "ctf-os": "true", "ctf-os.contest": self.contest_slug,
             "ctf-os.challenge_id": self.challenge_id, "ctf-os.branch": self.branch,
         }
+        if self.run_id:
+            labels["ctf-os.run_id"] = self.run_id
+        if self.rescue_attempt_id:
+            labels["ctf-os.rescue_attempt_id"] = self.rescue_attempt_id
+        return labels
 
     @property
     def runtime_labels(self) -> dict[str, str]:
-        return {
+        labels = {
             **self.labels,
             "ctf-os.kind": "sandbox",
             "ctf-os.resource_profile": self.resource_profile,
@@ -106,6 +118,13 @@ class SandboxSpec:
             "ctf-os.workload_class": str(self.workload_class),
             "ctf-os.resource_priority": str(self.resource_priority),
         }
+        if self.external_solver or self.workspace_mode != "tmpfs" or self.session_kind != "native-worker":
+            labels["ctf-os.session_kind"] = self.session_kind
+            labels["ctf-os.external_solver"] = str(self.external_solver).lower()
+            labels["ctf-os.workspace_mode"] = self.workspace_mode
+        if self.solver_family:
+            labels["ctf-os.solver_family"] = str(self.solver_family)
+        return labels
 
     @property
     def resource_request(self) -> ResourceRequest:
@@ -135,6 +154,19 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
     local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
     allocation = {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}
     resource_env = allocation_environment(allocation, spec.resource_request)
+    mutable_mounts = (
+        [
+            "--mount", f"type=bind,src={(spec.branch_root / 'work').resolve()},dst=/work",
+            "--mount", f"type=bind,src={(spec.branch_root / 'evidence').resolve()},dst=/evidence",
+            "--mount", f"type=bind,src={(spec.branch_root / 'artifacts').resolve()},dst=/artifacts",
+        ]
+        if spec.workspace_mode == "bind" else
+        [
+            "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+            "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+            "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        ]
+    )
     argv = [
         docker, "run", "--detach", "--name", spec.name, "--read-only",
         "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -142,10 +174,8 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         "--memory", spec.memory, "--cpus", str(spec.cpus), "--pids-limit", str(spec.pids),
         "--ulimit", "nofile=1024:1024", "--ulimit", "nproc=256:256",
         "--mount", f"type=bind,src={spec.source},dst=/challenge,readonly",
-        "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-        "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        *mutable_mounts,
         "--mount", f"type=bind,src={context},dst=/context,readonly",
-        "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
         "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
         "--env", f"CTF_OS_ALLOWED_ENDPOINTS_JSON={policy}",
         "--env", f"CTF_OS_LOCAL_ENDPOINTS_JSON={local_policy}",
@@ -227,6 +257,16 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "target_revision": spec.target_revision,
         "authorized_targets": [target.to_dict() for target in spec.targets],
     }
+    if spec.external_solver or spec.workspace_mode != "tmpfs" or spec.session_kind != "native-worker":
+        metadata.update({
+            "session_kind": spec.session_kind,
+            "run_id": spec.run_id,
+            "rescue_attempt_id": spec.rescue_attempt_id,
+            "external_solver": spec.external_solver,
+            "solver_family": spec.solver_family,
+            "requested_lead_model": spec.requested_lead_model,
+            "workspace_mode": spec.workspace_mode,
+        })
     try:
         with admission_lock():
             admit(
@@ -498,7 +538,7 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
         if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
             raise SandboxError("refusing cleanup: container labels do not match sandbox metadata")
         branch_root = Path(str(metadata["branch_root"])).resolve()
-        exports = (
+        exports = () if metadata.get("workspace_mode", "tmpfs") == "bind" else (
             ("artifacts", branch_root / "artifacts", "/artifacts", "artifact"),
             ("work", branch_root / "work", "/work", "work"),
             ("evidence", branch_root / "evidence", "/evidence", "evidence"),
@@ -534,7 +574,17 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
     append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_cleanup", {"branch": metadata["branch"], **record})
     ledger = ResourceLedger(branch_root.parents[1])
     if ledger.state_path.exists():
-        ledger.release(str(metadata.get("session_id") or metadata.get("branch")), "sandbox cleanup")
+        session_id = str(metadata.get("session_id") or metadata.get("branch"))
+        resource_state = ledger.load()
+        observation = resource_state.get("observations", {}).get(session_id, {})
+        if (
+            session_id in resource_state.get("requests", {})
+            and (
+                not isinstance(observation, Mapping)
+                or observation.get("state") != "RELEASED"
+            )
+        ):
+            ledger.release(session_id, "sandbox cleanup")
     return record
 
 
@@ -635,10 +685,19 @@ def _validate_spec(spec: SandboxSpec) -> None:
     for label, value in (("session id", spec.session_id), ("parent session id", spec.parent_session_id)):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
             raise SandboxError(f"{label} is invalid")
-    if spec.session_role not in {"sol", "child"}:
-        raise SandboxError("session role must be sol or child")
+    if spec.session_role not in {"sol", "child", "external"}:
+        raise SandboxError("session role must be sol, child, or external")
     if spec.session_role == "child" and spec.session_id == spec.parent_session_id:
         raise SandboxError("child session id must differ from its parent session id")
+    if spec.session_role == "external" and not (
+        spec.external_solver and spec.session_kind == "external-rescue"
+        and spec.rescue_attempt_id == spec.session_id
+    ):
+        raise SandboxError("external sandbox role requires an exact external-rescue identity")
+    if spec.workspace_mode not in {"tmpfs", "bind"}:
+        raise SandboxError("workspace mode must be tmpfs or bind")
+    if spec.workspace_mode == "bind" and not spec.external_solver:
+        raise SandboxError("bind workspace mode is reserved for an external solver")
     if spec.cpus is None or spec.pids is None or spec.cpus <= 0 or spec.pids < 1:
         raise SandboxError("sandbox CPU and PID limits must be positive")
     try:
@@ -676,14 +735,14 @@ def _prepare_branch_root(spec: SandboxSpec) -> None:
         "evidence": {"path": "/evidence", "private": True},
         "managed_service": dict(spec.service_context or {}),
     }
-    for name in ("work", "evidence", "logs", "context"):
+    for name in ("work", "evidence", "artifacts", "logs", "context"):
         path = spec.branch_root / name
         if path.is_symlink():
             raise SandboxError(f"worker {name} path must not be a symlink")
         path.mkdir(exist_ok=True)
         # These paths are mounted only into this worker container. World write is
         # needed because the unprivileged container uid need not match the host uid.
-        path.chmod(0o777 if name in {"work", "evidence"} else (0o755 if name == "context" else 0o700))
+        path.chmod(0o777 if name in {"work", "evidence", "artifacts"} else (0o755 if name == "context" else 0o700))
     context_file = spec.branch_root / "context" / "session.json"
     _write_json(context_file, context_payload)
     context_file.chmod(0o444)
@@ -702,7 +761,7 @@ def _authorize_sandbox(
     """Enforce worker ownership when a model-facing caller identity is supplied."""
     if session_id is None and session_role is None:
         return  # Backwards-compatible trusted in-process controller path.
-    if session_role not in {"sol", "child"} or not session_id:
+    if session_role not in {"sol", "child", "external"} or not session_id:
         raise SandboxError("sandbox caller must provide a valid session id and role")
     owner = str(metadata.get("session_id", ""))
     parent = str(metadata.get("parent_session_id", ""))
@@ -710,6 +769,16 @@ def _authorize_sandbox(
         if session_id != parent:
             raise SandboxError(
                 f"DENIED_SANDBOX_ACCESS: Sol session {session_id} does not own worker parent scope {parent}"
+            )
+        return
+    if session_role == "external":
+        if (
+            metadata.get("external_solver") is not True
+            or metadata.get("session_kind") != "external-rescue"
+            or session_id != owner
+        ):
+            raise SandboxError(
+                f"DENIED_SANDBOX_ACCESS: external session {session_id} does not own this rescue sandbox"
             )
         return
     if session_id != owner:

@@ -51,10 +51,11 @@ from ..preflight import (
     prepared_tree_fingerprint,
 )
 from ..scaffold import initialize_contest
-from ..sandbox.network import parse_remotes, resolve_targets
-from ..sandbox.resources import gpu_available, sandbox_gc, sandbox_status
+from ..sandbox.network import parse_remotes
+from ..sandbox.resources import sandbox_gc, sandbox_status
+from ..sandbox.preparation import prepare_sandbox_spec
 from ..sandbox.runtime import (
-    SandboxSpec, cleanup, create, execute, export_artifacts, probe_service_connectivity, resize,
+    cleanup, create, execute, export_artifacts, probe_service_connectivity, resize,
 )
 from ..service import (
     ServiceActor, ServiceSpec, service_build, service_cleanup, service_inspect,
@@ -82,6 +83,11 @@ from ..modes import SolveMode, resolve_solve_mode
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
+from ..rescue import (
+    MODES as RESCUE_MODES, PROFILES as RESCUE_PROFILES,
+    close_rescue, prepare_rescue, show_rescue,
+    validate_exact_live_mutable_run, validate_rescue_return,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -255,6 +261,43 @@ def build_parser() -> argparse.ArgumentParser:
         repair_projection_parser = commands.add_parser("repair-projections")
         repair_projection_parser.add_argument("selector"); repair_projection_parser.add_argument("--contest")
         repair_projection_parser.add_argument("--run-id"); _add_session_args(repair_projection_parser)
+        rescue_prepare = commands.add_parser(
+            "rescue-prepare",
+            description=(
+                "Prepare an exact LIVE run for a manually started Claude rescue. "
+                "This command never launches Claude or another model process."
+            ),
+        )
+        rescue_prepare.add_argument("selector"); rescue_prepare.add_argument("--contest")
+        rescue_prepare.add_argument("--run-id", required=True)
+        rescue_prepare.add_argument("--mode", required=True, choices=tuple(sorted(RESCUE_MODES)))
+        rescue_prepare.add_argument("--profile", choices=tuple(sorted(RESCUE_PROFILES)), default="standard")
+        rescue_prepare.add_argument("--objective", required=True)
+        rescue_prepare.add_argument("--current-blocker", required=True)
+        rescue_prepare.add_argument("--leading-exploit-path")
+        rescue_prepare.add_argument("--path-not-to-repeat", action="append", default=[])
+        rescue_prepare.add_argument("--operation-id", required=True)
+        rescue_prepare.add_argument("--lead-model")
+        _add_session_args(rescue_prepare)
+        rescue_show = commands.add_parser("rescue-show")
+        rescue_show.add_argument("selector"); rescue_show.add_argument("--contest")
+        rescue_show.add_argument("--run-id", required=True)
+        rescue_show.add_argument("--rescue-id", required=True)
+        _add_session_args(rescue_show)
+        rescue_validate = commands.add_parser("rescue-return-validate")
+        rescue_validate.add_argument("selector"); rescue_validate.add_argument("--contest")
+        rescue_validate.add_argument("--run-id", required=True)
+        rescue_validate.add_argument("--rescue-id", required=True)
+        _add_session_args(rescue_validate)
+        rescue_close = commands.add_parser("rescue-close")
+        rescue_close.add_argument("selector"); rescue_close.add_argument("--contest")
+        rescue_close.add_argument("--run-id", required=True)
+        rescue_close.add_argument("--rescue-id", required=True)
+        rescue_close.add_argument(
+            "--reason", required=True,
+            choices=("integrated", "refuted", "no-new-path", "manual"),
+        )
+        _add_session_args(rescue_close)
     resource_status = commands.add_parser("resource-status")
     resource_status.add_argument("--contest")
     if not child_surface:
@@ -940,6 +983,38 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         )
         return receipt
 
+    if args.command in {
+        "rescue-prepare", "rescue-show", "rescue-return-validate", "rescue-close",
+    }:
+        _require_sol(args, "Only the current parent Sol session may operate a manual Claude rescue.")
+        manifest, challenge, record = _load_challenge_strict(
+            root, args.contest, args.selector,
+        )
+        workspace = challenge_root(root, manifest, challenge)
+        run = resolve_run_raw(workspace, run_id=args.run_id)
+        if run.name != args.run_id:
+            raise ValueError(f"wrong exact run ID: requested {args.run_id}, resolved {run.name}")
+        if args.command == "rescue-prepare":
+            return prepare_rescue(
+                root, manifest, challenge, record, run,
+                mode=args.mode, profile=args.profile,
+                objective=args.objective, current_blocker=args.current_blocker,
+                operation_id=args.operation_id,
+                leading_exploit_path=args.leading_exploit_path,
+                paths_not_to_repeat=args.path_not_to_repeat,
+                lead_model=args.lead_model,
+                sandbox_factory=create,
+                connectivity_probe=probe_service_connectivity,
+                service_inspector=service_inspect,
+                attachment_factory=service_attachment,
+            )
+        if args.command == "rescue-show":
+            return show_rescue(run, args.rescue_id)
+        if args.command == "rescue-return-validate":
+            validate_exact_live_mutable_run(run, challenge, record)
+            return validate_rescue_return(run, challenge, args.rescue_id)
+        return close_rescue(run, args.rescue_id, reason=args.reason, sandbox_cleanup=cleanup)
+
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
     if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
         if (
@@ -1433,124 +1508,22 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
         return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
     if args.command == "sandbox-create":
-        if record["status"] != "READY":
-            raise ValueError(f"challenge is not READY: {record.get('blockers')}")
         branch_root = solve_root / "workers" / args.branch
-        input_path = workspace / "input"
-        if input_path.is_symlink() or not input_path.is_dir():
-            raise ValueError("prepared challenge input is missing or unsafe; run same-session preparation again")
-        expected_source = input_path.resolve()
-        try:
-            expected_source.relative_to(workspace.resolve())
-        except ValueError as exc:
-            raise ValueError("prepared challenge input escapes its challenge workspace") from exc
-        if Path(str(record.get("prepared_input", ""))).resolve() != expected_source:
-            raise ValueError("preflight record prepared_input is outside the selected challenge workspace")
-        if record.get("prepared_fingerprint") != prepared_tree_fingerprint(input_path):
-            raise ValueError("prepared challenge input changed after preparation; run same-session preparation again")
-        supported_profiles = {'pwn', 'web', 'rev', 'crypto', 'forensic', 'misc', 'osint', 'ai', 'cloud'}
-        image = args.image or str(record.get("recommended_image") or f"ctf-os-sandbox:{challenge.category if challenge.category in supported_profiles else 'base'}")
-        profile = args.resource_profile or str(record.get("recommended_resource_profile") or "standard")
-        targets = resolve_targets(parse_remotes(challenge.remotes))
-        service_network = None
-        attachment_service: ServiceSpec | None = None
-        endpoints: tuple[str, ...] = ()
-        service_context: dict[str, object] = {
-            "exists": False, "state": "UNAVAILABLE", "attach_only": True,
-            "lifecycle_owner": args.parent_session_id,
-        }
-        plan = record.get("service_plan")
-        if isinstance(plan, dict) and plan.get("kind") in {"dockerfile", "compose"}:
-            service = _service_spec(manifest, challenge, record, solve_root)
-            inspection = service_inspect(service, actor=_service_actor(args, child_default=True))
-            owner = inspection.get("ownership") if isinstance(inspection.get("ownership"), dict) else {}
-            containers = inspection.get("containers") if isinstance(inspection.get("containers"), list) else []
-            network = inspection.get("network") if isinstance(inspection.get("network"), dict) else {}
-            active = (
-                owner.get("state") == "RUNNING" and bool(containers)
-                and all(item.get("state") == "running" for item in containers if isinstance(item, dict))
-                and network.get("owned") is True and network.get("internal") is True
-            )
-            service_context = {
-                "exists": bool(owner), "state": owner.get("state", "UNOWNED"),
-                "alias": service.stable_alias, "network": service.network,
-                "lifecycle_owner": owner.get("owner_session_id"), "attach_only": True,
-            }
-            if active:
-                if owner.get("owner_session_id") != args.parent_session_id:
-                    raise ValueError(
-                        f"managed service owner mismatch: expected {args.parent_session_id}, "
-                        f"found {owner.get('owner_session_id')}"
-                    )
-                metadata = inspection.get("metadata") if isinstance(inspection.get("metadata"), dict) else {}
-                endpoint_rows = metadata.get("service_endpoints") if isinstance(metadata.get("service_endpoints"), list) else []
-                endpoints = tuple(
-                    str(item["target"]) for item in endpoint_rows
-                    if isinstance(item, dict) and item.get("target")
-                )
-                if not endpoints:
-                    raise ValueError("active managed service has no stable endpoint metadata")
-                targets = ()
-                service_network = service.network
-                attachment_service = service
-                service_context["endpoints"] = endpoint_rows
-                service_context["service_url"] = endpoints[0]
-                service_context["instructions"] = (
-                    "Managed service is already running. You may inspect, connect, send requests, "
-                    "and run PoCs. Service lifecycle is owned by the parent Sol session; this worker is attach-only."
-                )
-            elif args.service or owner.get("state") == "RUNNING" or bool(containers):
-                reasons = []
-                if not owner: reasons.append("owner missing")
-                if owner and owner.get("state") != "RUNNING": reasons.append("service not running")
-                if owner.get("state") == "RUNNING" and not containers: reasons.append("service container missing")
-                if containers and not all(
-                    item.get("state") == "running" for item in containers if isinstance(item, dict)
-                ):
-                    reasons.append("service container not running")
-                if network.get("exists") is not True: reasons.append("network missing")
-                elif network.get("owned") is not True: reasons.append("network is not owned")
-                elif network.get("internal") is not True: reasons.append("network is not internal")
-                raise ValueError("managed service attachment failed: " + ", ".join(reasons or ["service unavailable"]))
-        elif args.service:
-            raise ValueError("managed service attachment failed: challenge preparation has no service plan")
         session_id, session_role = _caller(args, branch=args.branch)
-        resource_state = ledger.load()
-        request_raw = resource_state.get("requests", {}).get(session_id)
-        allocation = resource_state.get("allocations", {}).get(session_id)
-        if isinstance(request_raw, dict) and not isinstance(allocation, dict):
-            scheduler_plan = ledger.rebalance(detect_capacity(workspace=root))
-            allocation = scheduler_plan.get("allocations", {}).get(session_id)
-            if not isinstance(allocation, dict):
-                waiting = next((row for row in scheduler_plan.get("waiting", []) if row.get("session_id") == session_id), {})
-                raise ValueError(f"resource scheduler cannot admit sandbox minimum: {waiting.get('reason', 'insufficient budget')}")
-        inferred = infer_workload(
-            files=[str(item.get("path", "")) for item in record.get("files", []) if isinstance(item, dict)],
-            role=args.branch, category=challenge.category,
-            override=str(request_raw.get("workload_class")) if isinstance(request_raw, dict) else None,
+        prepared = prepare_sandbox_spec(
+            repo_root=root, manifest=manifest, challenge=challenge, record=record,
+            workspace=workspace, solve_root=solve_root, branch=args.branch,
+            branch_root=branch_root, session_id=session_id,
+            parent_session_id=args.parent_session_id, session_role=session_role,
+            image_override=args.image, resource_profile_override=args.resource_profile,
+            require_service=bool(args.service),
+            prepared_fingerprint_reader=prepared_tree_fingerprint,
+            service_inspector=service_inspect,
+            service_actor=_service_actor(args, child_default=True),
         )
-        spec = SandboxSpec(
-            contest_slug=manifest.slug, challenge_id=challenge.id, branch=args.branch,
-            source=expected_source, branch_root=branch_root,
-            input_fingerprint=str(record["source_fingerprint"]),
-            target_revision=int(json.loads((solve_root / "STATE.json").read_text(encoding="utf-8")).get("target_revision") or 1),
-            input_bytes=prepared_input_bytes(record),
-            targets=targets, image=image, resource_profile=profile,
-            service_network=service_network, local_endpoints=endpoints,
-            session_id=session_id, parent_session_id=args.parent_session_id,
-            session_role=session_role, service_context=service_context,
-            category=challenge.category,
-            memory=str(allocation["memory_bytes"]) if isinstance(allocation, dict) else None,
-            cpus=float(allocation["cpus"]) if isinstance(allocation, dict) else None,
-            storage=str(allocation["storage_bytes"]) if isinstance(allocation, dict) else None,
-            workload_class=str(inferred["workload_class"]),
-            resource_priority=str(request_raw.get("priority", "NORMAL")) if isinstance(request_raw, dict) else "NORMAL",
-            resource_request_override=request_raw if isinstance(request_raw, dict) else None,
-            gpu_enabled=(
-                isinstance(allocation, dict) and allocation.get("gpu_device") is not None
-            ) or (not isinstance(request_raw, dict) and challenge.category == "ai" and gpu_available()),
-            gpu_device=int(allocation["gpu_device"]) if isinstance(allocation, dict) and allocation.get("gpu_device") is not None else None,
-        )
+        spec = prepared.spec
+        attachment_service = prepared.attachment_service
+        service_network = spec.service_network
         guard = (
             service_attachment(
                 attachment_service,

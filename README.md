@@ -153,6 +153,46 @@ workers = max(1, int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")))
 
 Scheduler는 자원을 배분할 뿐 solve progress나 native lifecycle을 소유하지 않습니다. 관리가 solver reasoning, minimal PoC, remote attempt, flag 출력보다 앞설 수 없습니다.
 
+## Manual Claude Rescue
+
+Manual Claude Rescue는 진행 중인 LIVE Codex Solve의 exact run에 수동 외부 solver workspace를 하나 준비하는 기능입니다. CTF-OS와 Codex는 Claude CLI를 실행하거나 감독하지 않습니다. Intake/Triage, 새 benchmark arm, race child, 공유 writable workdir도 만들지 않습니다.
+
+실제 흐름은 다음과 같습니다.
+
+1. Codex Solve 중 Codex에게 `Claude 구조대 준비해라`라고 요청합니다.
+2. 출력된 exact run, rescue ID, rescue path를 확인합니다.
+3. Codex CLI를 중지하거나 일시 중지합니다.
+4. 새 터미널을 엽니다.
+5. 출력된 rescue directory로 `cd`합니다.
+6. standard profile은 `claude --model sonnet`, 명시적으로 요청한 deep profile은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
+7. Claude가 sandbox의 `./ctf-tool`만 사용해 challenge/remote 명령을 실행하고 `CLAUDE_RETURN.json`을 작성하도록 합니다.
+8. Claude를 종료합니다.
+9. 기존 Codex 세션을 재개합니다.
+10. Codex에게 `Claude 구조대 결과 이어서 원격 플래그까지 풀어라`라고 요청합니다.
+11. Codex가 return identity, packet digest, artifact/evidence hash, command receipt와 network observation을 검증한 뒤 최대 1~3개의 결정적 실험으로 기존 Solve를 계속합니다.
+12. 기존 protected flag receipt가 만들어지면 exact flag를 사람이 제출합니다.
+
+저수준 CLI도 exact `--run-id`를 반드시 요구합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools rescue-prepare 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --mode PRIMITIVE_TO_POC --profile standard \
+  --objective 'confirmed primitive을 executable remote PoC로 연결' \
+  --current-blocker 'remote protocol framing이 아직 검증되지 않음' \
+  --operation-id 'manual-rescue-poc-v1'
+
+uv run python -m ctf_os.agent_tools rescue-show 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
+
+uv run python -m ctf_os.agent_tools rescue-return-validate 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
+
+uv run python -m ctf_os.agent_tools rescue-close 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --reason integrated
+```
+
+`RESCUE_PACKET.json`은 `packet_digest` 필드만 제외한 객체를 UTF-8 canonical JSON(`sort_keys=true`, compact separators)으로 직렬화한 SHA-256을 digest로 사용하며 생성 후 read-only입니다. 새 상태는 같은 packet을 수정하지 않고 새 operation ID와 rescue attempt로 캡처합니다. `requested_lead_model`은 운영 의도일 뿐이고 `observed_lead_model`은 실제 CLI evidence가 있을 때만 기록합니다. Deep Fable이 거부하거나 진행할 수 없을 때 START 문서가 보여 주는 Opus 명령은 사람이 승인해 새 세션에서 실행하는 대안이며 자동 fallback이 아닙니다.
+
 ## Scope와 flag fast path
 
 Organizer-declared public/private/VPN/IPv6 target과 tcp, udp, http(s), tls, websocket/wss, dns, ssh, grpc, custom protocol을 지원합니다. Cloud metadata, Docker gateway, undeclared LAN, unrelated host, 다른 challenge는 차단됩니다. Challenge temporary credential은 declared account/domain 안에서만 worker-private으로 사용하고 mutation을 기록합니다.

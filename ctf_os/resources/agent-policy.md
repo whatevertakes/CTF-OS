@@ -79,6 +79,14 @@ Elastic scheduling is opt-in for proven long-compute workloads. `LONG_COMPUTE` r
 
 The dynamic scheduler allocates compute; it does not define solve progress. Short probes and quick PoCs run immediately without repeated `resource-status`, `resource-request`, `resource-plan`, or rebalance calls. Use scheduler planning before long symbolic execution, fuzzing, forensic scans, crypto/cracking, or AI computation, then inspect progress only at bounded slices. Scheduler management must never delay solver reasoning, a minimal PoC, remote execution, or flag display. New parallel harnesses use `CTF_OS_RECOMMENDED_WORKERS`.
 
+### Manual external rescue profile
+
+A manual Claude rescue is an exact-run external solver session, not a race child, benchmark treatment, or transfer of Solve ownership. It is available only on mutable LIVE competition runs. Python may validate the current run, create an immutable bounded packet, prepare a rescue-only sandbox/workspace, validate a returned JSON document, and clean that exact rescue container. Python, Codex, and shell automation never launch, supervise, restart, route, or infer the model process. The human explicitly starts and stops Claude in another terminal, while the current user-opened Sol session retains the solve.
+
+Rescue state is append-only and run-local under `runs/<run-id>/rescue/`. Its ledger and immutable packet are authoritative; `RESCUE_STATE.json` and `CODEX-RESUME.md` are projections or handoff views. A rescue is absent from race lineage, delegation plans, branch projections, and native child widths. Its bind workspace exposes only rescue-local `work`, `evidence`, and `artifacts` as writable, selected generated context and prepared challenge input as read-only, and only organizer-declared targets through the existing sandbox network policy. A managed service is attach-only and remains owned by `sol-main`.
+
+Claude output remains candidate insight. Return validation never modifies Solve state, candidates, milestone receipts, race events, verified flag receipts, or submission recommendations. A claimed remote flag may reach `SUBMISSION_RECOMMENDED` only after Sol independently satisfies the existing protected remote receipt contract. Submission remains human-only.
+
 ## Scope, isolation, and flag fast path
 
 - Attack exactly one selected challenge and only organizer-declared targets. Declared public/private/VPN/IPv6 and tcp, udp, http(s), tls, websocket/wss, dns, ssh, grpc, and custom endpoints are valid. Cloud metadata, Docker gateways, undeclared private LANs, other challenges, and unrelated hosts remain blocked.

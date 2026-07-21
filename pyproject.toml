@@ -13,7 +13,18 @@ build-backend = "setuptools.build_meta"
 include = ["ctf_os*"]
 
 [tool.setuptools.package-data]
-ctf_os = ["resources/agent-policy.md", "resources/run-workspace-migration.md", "resources/delegation-templates.yaml", "resources/timeout-profiles.yaml", "resources/solve-policy.yaml", "resources/knowledge/playbooks/*.md"]
+ctf_os = [
+  "resources/agent-policy.md",
+  "resources/run-workspace-migration.md",
+  "resources/delegation-templates.yaml",
+  "resources/timeout-profiles.yaml",
+  "resources/solve-policy.yaml",
+  "resources/knowledge/playbooks/*.md",
+  "resources/claude-rescue/*.md",
+  "resources/claude-rescue/*.json",
+  "resources/claude-rescue/modes/*.md",
+  "resources/claude-rescue/playbooks/*.md",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
