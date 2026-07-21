@@ -290,7 +290,62 @@ def test_native_packet_selects_exact_supported_custom_agent() -> None:
     assert packet["requested_agent_type"] == "ctf_terra_high"
     assert packet["requested_model"] == "gpt-5.6-terra"
     assert packet["requested_reasoning"] == "high"
+    assert packet["fork_turns"] == "none"
+    assert packet["fork_turns"] != "all"
     assert packet["start_asynchronously"] is True
+
+
+@pytest.mark.parametrize(
+    ("profile", "context", "agent_profile", "model", "reasoning"),
+    [
+        ("MECHANICAL", {"mechanical_only": True}, "ctf_mechanical", "gpt-5.6-luna", "medium"),
+        ("BOUNDED_EXPERIMENT", {"bounded_experiment": True}, "ctf_terra_high", "gpt-5.6-terra", "high"),
+        (
+            "IMPLEMENTATION",
+            {"primitive_confirmed": True, "implementation_only": True},
+            "ctf_terra_high", "gpt-5.6-terra", "high",
+        ),
+        (
+            "DEEP_SOLVER", {"purpose": "independent-full-solve"},
+            "ctf_deep_solver", "gpt-5.6-sol", "xhigh",
+        ),
+        (
+            "CONFIRMED_BOTTLENECK",
+            {
+                "primitive_confirmed": True, "specific_blocker_present": True,
+                "blocker_type": "MATH_CONSTRAINT", "xhigh_decisive_experiments": 1,
+                "working_poc_present": False, "flag_path_present": False,
+            },
+            "ctf_max_endgame", "gpt-5.6-sol", "max",
+        ),
+    ],
+)
+def test_all_custom_agent_packets_disable_full_history_forks(
+    profile: str,
+    context: dict[str, object],
+    agent_profile: str,
+    model: str,
+    reasoning: str,
+) -> None:
+    contract = _contract(profile, **context)
+    packet = build_native_delegation_packet(
+        contract, task_name="routing-lane", child_prompt={"hypothesis": "test one concrete sink"},
+    )
+
+    assert packet["fork_turns"] == "none"
+    assert packet["fork_turns"] != "all"
+    assert packet["custom_agent_profile"] == agent_profile
+    assert packet["requested_agent_type"] == agent_profile
+    assert packet["requested_model"] == model
+    assert packet["requested_reasoning"] == reasoning
+    assert packet["message"]["hypothesis"] == "test one concrete sink"
+    assert set(packet) == {
+        "schema_version", "native_delegation_surface", "selection_transport",
+        "custom_agent_profile", "requested_agent_type", "requested_model_class",
+        "requested_model", "requested_reasoning", "task_name", "fork_turns",
+        "message", "start_asynchronously", "requires_native_start_receipt",
+        "unsupported_action",
+    }
 
 
 @pytest.mark.parametrize(

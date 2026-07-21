@@ -300,7 +300,7 @@ def build_native_delegation_packet(
         "requested_model": contract["requested_model"],
         "requested_reasoning": contract["requested_reasoning"],
         "task_name": task_name,
-        "fork_turns": "all",
+        "fork_turns": "none",
         "message": prompt,
         "start_asynchronously": True,
         "requires_native_start_receipt": True,

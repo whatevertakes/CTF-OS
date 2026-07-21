@@ -32,6 +32,12 @@ sandbox/build-images.sh
 uv run python -m ctf_os.agent_tools doctor
 ```
 
+새 대회 입력 폴더가 필요하면 아래 명령으로 `incoming/<대회명>/`와 기본 category 폴더, `problems.txt` 템플릿을 만듭니다.
+
+```bash
+uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
+```
+
 표준 사용 흐름은 다음과 같습니다.
 
 1. 최소 `contest.md`가 있는 대회 workspace를 선택합니다.
