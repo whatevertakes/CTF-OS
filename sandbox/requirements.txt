@@ -7,7 +7,7 @@ PyYAML==6.0.2
 rich==14.1.0
 numpy==2.2.6
 scipy==1.15.3
-Pillow==11.3.0
+Pillow==12.3.0
 networkx==3.5
 sympy==1.14.0
 z3-solver==4.15.3.0
