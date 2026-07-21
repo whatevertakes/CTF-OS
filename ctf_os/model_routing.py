@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
+import json
 import re
 from typing import Any
 
@@ -290,18 +291,29 @@ def build_native_delegation_packet(
         "native_lifecycle_owner": "sol",
         "stop_at_max_lease": profile == "CONFIRMED_BOTTLENECK",
     }
+    try:
+        serialized_message = json.dumps(
+            prompt, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RoutingError("child prompt is not JSON serializable") from exc
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "native_delegation_surface": "spawn_agent",
         "selection_transport": "PROJECT_CUSTOM_AGENT",
-        "custom_agent_profile": agent_profile,
-        "requested_agent_type": agent_profile,
-        "requested_model_class": contract["requested_model_class"],
-        "requested_model": contract["requested_model"],
-        "requested_reasoning": contract["requested_reasoning"],
-        "task_name": task_name,
-        "fork_turns": "none",
-        "message": prompt,
+        "routing_metadata": {
+            "routing_profile": profile,
+            "custom_agent_profile": agent_profile,
+            "requested_model_class": contract["requested_model_class"],
+            "requested_model": contract["requested_model"],
+            "requested_reasoning": contract["requested_reasoning"],
+        },
+        "spawn_agent_args": {
+            "task_name": task_name,
+            "agent_type": agent_profile,
+            "fork_turns": "none",
+            "message": serialized_message,
+        },
         "start_asynchronously": True,
         "requires_native_start_receipt": True,
         "unsupported_action": "record ROUTING_UNSUPPORTED; do not claim the requested runtime was applied",

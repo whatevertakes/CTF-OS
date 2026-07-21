@@ -222,7 +222,7 @@ def test_policy_recommendations_use_mechanism_and_artifact_evidence() -> None:
     )
     assert build_native_delegation_packet(
         mechanical_high, task_name="batch", child_prompt={"hypothesis": "normalize"},
-    )["custom_agent_profile"] == "ctf_mechanical_high"
+    )["spawn_agent_args"]["agent_type"] == "ctf_mechanical_high"
     assert implementation["routing_profile"] == "IMPLEMENTATION"
     implementation_contract = _contract(
         "IMPLEMENTATION", primitive_confirmed=True,
@@ -286,12 +286,12 @@ def test_native_packet_selects_exact_supported_custom_agent() -> None:
     packet = build_native_delegation_packet(
         contract, task_name="payload-lane", child_prompt={"hypothesis": "write payload"},
     )
-    assert packet["custom_agent_profile"] == "ctf_terra_high"
-    assert packet["requested_agent_type"] == "ctf_terra_high"
-    assert packet["requested_model"] == "gpt-5.6-terra"
-    assert packet["requested_reasoning"] == "high"
-    assert packet["fork_turns"] == "none"
-    assert packet["fork_turns"] != "all"
+    assert packet["schema_version"] == 2
+    assert packet["spawn_agent_args"]["agent_type"] == "ctf_terra_high"
+    assert packet["routing_metadata"]["custom_agent_profile"] == "ctf_terra_high"
+    assert packet["routing_metadata"]["requested_model"] == "gpt-5.6-terra"
+    assert packet["routing_metadata"]["requested_reasoning"] == "high"
+    assert packet["spawn_agent_args"]["fork_turns"] == "none"
     assert packet["start_asynchronously"] is True
 
 
@@ -328,24 +328,82 @@ def test_all_custom_agent_packets_disable_full_history_forks(
     reasoning: str,
 ) -> None:
     contract = _contract(profile, **context)
+    child_prompt = {
+        "session_id": "routing-lane",
+        "hypothesis": "test one concrete sink",
+        "expected_artifacts": ["artifacts/probe.json"],
+    }
     packet = build_native_delegation_packet(
-        contract, task_name="routing-lane", child_prompt={"hypothesis": "test one concrete sink"},
+        contract, task_name="routing-lane", child_prompt=child_prompt,
     )
 
-    assert packet["fork_turns"] == "none"
-    assert packet["fork_turns"] != "all"
-    assert packet["custom_agent_profile"] == agent_profile
-    assert packet["requested_agent_type"] == agent_profile
-    assert packet["requested_model"] == model
-    assert packet["requested_reasoning"] == reasoning
-    assert packet["message"]["hypothesis"] == "test one concrete sink"
+    args = packet["spawn_agent_args"]
+    metadata = packet["routing_metadata"]
+    decoded = json.loads(args["message"])
+    assert set(args) == {"task_name", "agent_type", "fork_turns", "message"}
+    assert args["task_name"] == "routing-lane"
+    assert args["agent_type"] == agent_profile
+    assert args["fork_turns"] == "none"
+    assert isinstance(args["message"], str)
+    assert decoded["routing_contract"] == contract
+    assert decoded["routing_limits"]["do_not_change_profile"] is True
+    assert decoded["routing_limits"]["native_lifecycle_owner"] == "sol"
+    assert decoded["session_id"] == child_prompt["session_id"]
+    assert decoded["hypothesis"] == child_prompt["hypothesis"]
+    assert decoded["expected_artifacts"] == child_prompt["expected_artifacts"]
+    assert child_prompt == {
+        "session_id": "routing-lane",
+        "hypothesis": "test one concrete sink",
+        "expected_artifacts": ["artifacts/probe.json"],
+    }
+    assert metadata["routing_profile"] == profile
+    assert metadata["custom_agent_profile"] == agent_profile
+    assert metadata["requested_model"] == model
+    assert metadata["requested_reasoning"] == reasoning
+    for key in ("requested_model", "requested_reasoning", "custom_agent_profile"):
+        assert key not in args
+    for key in ("requested_agent_type", "task_name", "fork_turns", "message"):
+        assert key not in packet
     assert set(packet) == {
         "schema_version", "native_delegation_surface", "selection_transport",
-        "custom_agent_profile", "requested_agent_type", "requested_model_class",
-        "requested_model", "requested_reasoning", "task_name", "fork_turns",
-        "message", "start_asynchronously", "requires_native_start_receipt",
-        "unsupported_action",
+        "routing_metadata", "spawn_agent_args", "start_asynchronously",
+        "requires_native_start_receipt", "unsupported_action",
     }
+
+
+def test_native_packet_message_is_deterministic() -> None:
+    contract = _contract(
+        "IMPLEMENTATION", primitive_confirmed=True, implementation_only=True,
+    )
+    child_prompt = {
+        "identity": {"session_id": "impl-lane"},
+        "hypothesis": "페이로드 작성",
+        "artifact": "artifacts/exploit.py",
+    }
+
+    packet1 = build_native_delegation_packet(
+        contract, task_name="impl-lane", child_prompt=child_prompt,
+    )
+    packet2 = build_native_delegation_packet(
+        contract, task_name="impl-lane", child_prompt=child_prompt,
+    )
+
+    message1 = packet1["spawn_agent_args"]["message"]
+    assert message1 == packet2["spawn_agent_args"]["message"]
+    assert "페이로드 작성" in message1
+    decoded = json.loads(message1)
+    assert decoded["identity"] == child_prompt["identity"]
+    assert decoded["hypothesis"] == child_prompt["hypothesis"]
+    assert decoded["artifact"] == child_prompt["artifact"]
+
+
+def test_native_packet_rejects_non_serializable_child_prompt() -> None:
+    contract = _contract("BOUNDED_EXPERIMENT", bounded_experiment=True)
+
+    with pytest.raises(RoutingError, match="child prompt is not JSON serializable"):
+        build_native_delegation_packet(
+            contract, task_name="probe-lane", child_prompt={"bad": object()},
+        )
 
 
 @pytest.mark.parametrize(
@@ -393,7 +451,10 @@ def test_routing_fields_survive_planned_to_native_start_and_observation_is_not_c
     assert planned["routing_profile"] == "IMPLEMENTATION"
     assert planned["requested_model"] == "gpt-5.6-terra"
     assert planned["observed_runtime_model"] is None
-    assert planned["prompt_packet"]["native_delegation_packet"]["custom_agent_profile"] == "ctf_terra_high"
+    assert (
+        planned["prompt_packet"]["native_delegation_packet"]
+        ["spawn_agent_args"]["agent_type"]
+    ) == "ctf_terra_high"
     _ready(root, "impl")
     receipt = confirm_branch_start(
         root, input_fingerprint="fp", replacement_request_id="initial-race",
