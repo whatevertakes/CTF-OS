@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -12,22 +14,29 @@ import pytest
 
 from ctf_os.agent_tools.__main__ import build_parser
 from ctf_os.contest import ChallengeSpec, ContestManifest
+from ctf_os.preflight import prepared_tree_fingerprint
 from ctf_os.rescue import (
     RescueError,
+    _load_packet,
     calculate_packet_digest,
     canonical_json,
     close_rescue,
     load_rescue_ledger,
     prepare_rescue,
+    promote_rescue_flag,
     record_rescue_runtime,
     rescue_attempt_id,
     show_rescue,
     validate_exact_live_mutable_run,
     validate_rescue_return,
 )
+from ctf_os.rescue_backend import RescueBackend
+from ctf_os.rescue_hooks import handle_hook
+from ctf_os.rescue_mcp import StdioMCPServer
+from ctf_os.rescue_sessions import RescueSessionManager
 from ctf_os.rescue_tool import (
     _artifact_snapshot, _import_input, _input_files, _record_command_receipt,
-    _reject_model_command, _safe_relative,
+    _reject_model_command, _safe_relative, _sandbox_control,
 )
 from ctf_os.sandbox.network import ResolvedTarget, Target
 from ctf_os.sandbox.preparation import (
@@ -35,7 +44,10 @@ from ctf_os.sandbox.preparation import (
     RESCUE_SERVICE_ERROR,
     prepare_sandbox_spec,
 )
-from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
+from ctf_os.sandbox.runtime import (
+    SandboxSpec, build_run_argv, cleanup as cleanup_sandbox,
+    create as create_sandbox, execute as execute_sandbox,
+)
 from ctf_os.workspace import atomic_json
 
 
@@ -54,8 +66,11 @@ def _write(path: Path, value: object) -> None:
 
 
 @pytest.fixture
-def rescue_case(tmp_path: Path) -> SimpleNamespace:
+def rescue_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     repo = tmp_path / "repo"
+    claude_home = tmp_path / "CTF-OS-claude"
+    claude_home.mkdir()
+    monkeypatch.setenv("CTF_OS_CLAUDE_HOME", str(claude_home))
     contest_path = repo / "incoming" / "demo" / "contest.md"
     _write(contest_path, "# Demo\n")
     challenge = ChallengeSpec(
@@ -154,7 +169,8 @@ def rescue_case(tmp_path: Path) -> SimpleNamespace:
         "prepared_fingerprint": "prepared-digest",
     })
     return SimpleNamespace(
-        repo=repo, manifest=manifest, challenge=challenge, workspace=workspace,
+        repo=repo, claude_home=claude_home, manifest=manifest,
+        challenge=challenge, workspace=workspace,
         input_root=input_root, run=run, state=state,
         run_manifest=run_manifest, record=record,
     )
@@ -246,14 +262,19 @@ def _prepare(case: SimpleNamespace, **changes: object) -> dict[str, object]:
 
 
 def _rescue_root(case: SimpleNamespace, result: dict[str, object]) -> Path:
-    return case.run / "rescue" / str(result["rescue_attempt_id"])
+    return Path(str(result["path"]))
 
 
 def test_prepare_without_intake_triage_and_session_input_adapter(rescue_case: SimpleNamespace) -> None:
     rescue_case.record["input_source"] = "session-input"
     result = _prepare(rescue_case)
     root = _rescue_root(rescue_case, result)
-    assert root.parent.parent == rescue_case.run
+    assert root.is_relative_to(rescue_case.claude_home / "runs")
+    pointer = (
+        rescue_case.run / "rescue" / "RESCUE_POINTERS" /
+        f"{result['rescue_attempt_id']}.json"
+    )
+    assert pointer.is_file()
     assert not (rescue_case.workspace / "INTAKE.md").exists()
     assert not (rescue_case.workspace / "TRIAGE.md").exists()
     assert (root / "RESCUE_PACKET.json").is_file()
@@ -380,18 +401,29 @@ def test_packet_identity_digest_tree_and_standard_model(rescue_case: SimpleNames
     assert resources["allocations"] == {}
 
 
-def test_deep_requested_model_and_manual_fallback(rescue_case: SimpleNamespace) -> None:
+def test_deep_requested_model_is_opus(rescue_case: SimpleNamespace) -> None:
     result = _prepare(
         rescue_case, profile="deep", mode="FRESH_REINTERPRETATION",
         operation_id="deep-op-1",
     )
     root = _rescue_root(rescue_case, result)
-    assert "claude --model claude-fable-5" in result["start_command"]
-    assert "claude --model opus" in result["fallback_command"]
+    assert "claude --model opus" in result["start_command"]
+    assert result["fallback_command"] is None
     assert result["observed_lead_model"] is None
     start = (root / "START.md").read_text()
     assert "--dangerously-skip-permissions" not in start
-    assert "manual alternative" in start
+    assert "Observed model" in start
+
+
+def test_fable_strategy_is_separate_from_deep(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(
+        rescue_case, profile="fable-strategy", mode="FRESH_REINTERPRETATION",
+        operation_id="fable-strategy-op",
+    )
+    root = _rescue_root(rescue_case, result)
+    assert "claude --model claude-fable-5" in result["start_command"]
+    assert "claude --model opus" in result["fallback_command"]
+    assert (root / ".claude" / "agents" / "clean-room-recon-haiku.md").is_file()
 
 
 def test_assisted_requested_model_is_sonnet_and_not_observed(
@@ -424,7 +456,7 @@ def test_runtime_model_requires_evidence_and_projects_observed_model(
         observed_model="opus", evidence="evidence/runtime-model.txt",
         fallback_observed=True,
     )
-    assert recorded["requested_lead_model"] == "claude-fable-5"
+    assert recorded["requested_lead_model"] == "opus"
     assert recorded["observed_lead_model"] == "opus"
     assert recorded["fallback_observed"] is True
     shown = show_rescue(rescue_case.run, str(result["rescue_attempt_id"]))
@@ -463,8 +495,8 @@ def test_subagent_frontmatter_and_model_limits(rescue_case: SimpleNamespace) -> 
         rescue_case, profile="deep", operation_id="deep-agent-op-1",
     )
     deep_root = _rescue_root(rescue_case, deep)
-    assert (deep_root / ".claude" / "agents" / "clean-room-recon-haiku.md").is_file()
-    assert not (deep_root / ".claude" / "agents" / "ctf-recon-haiku.md").exists()
+    assert (deep_root / ".claude" / "agents" / "ctf-recon-haiku.md").is_file()
+    assert not (deep_root / ".claude" / "agents" / "clean-room-recon-haiku.md").exists()
 
 
 def test_packet_does_not_select_sibling_or_other_attempt(rescue_case: SimpleNamespace) -> None:
@@ -551,7 +583,9 @@ def test_truth_levels_come_from_typed_receipts_not_generic_narrative(rescue_case
 def test_rescue_ledger_is_strict_and_projection_based(rescue_case: SimpleNamespace) -> None:
     result = _prepare(rescue_case)
     rows = load_rescue_ledger(rescue_case.run)
-    assert [row["event"] for row in rows] == ["RESCUE_PREPARED", "RESCUE_SANDBOX_READY"]
+    assert [row["event"] for row in rows] == [
+        "RESCUE_PREPARED", "RESCUE_SANDBOX_CREATING", "RESCUE_SANDBOX_READY",
+    ]
     shown = show_rescue(rescue_case.run, str(result["rescue_attempt_id"]))
     assert shown["status"] == "READY"
     assert shown["process_state_inferred"] is False
@@ -805,7 +839,7 @@ def _remote_flag_result(
 @pytest.mark.parametrize(
     ("receipt", "network", "candidate_in_output", "message"),
     [
-        (False, True, True, "command receipt"),
+        (False, True, True, "command or session observation receipt"),
         (True, False, True, "authorized network observation"),
         (True, True, False, "candidate is absent"),
     ],
@@ -845,7 +879,7 @@ def test_remote_flag_validation_creates_resume_only(rescue_case: SimpleNamespace
     assert not (rescue_case.run / "flag-receipts").exists()
     resume = (root / "CODEX-RESUME.md").read_text()
     assert "candidate insight" in resume
-    assert "flag-receipt-save" in resume
+    assert "rescue-flag-promote" in resume
     assert "--contest demo" in resume
 
 
@@ -888,6 +922,7 @@ def test_remote_ready_handoff_requires_executable_and_one_to_three(rescue_case: 
         remote_ready={
             "value": True,
             "exploit_artifact": "artifacts/solve.py",
+            "exploit_artifact_sha256": digest,
             "exact_next_argv": ["python3", "/artifacts/solve.py", "example.com", "31337"],
             "target_index": 0,
             "success_condition": "flag appears in output",
@@ -900,6 +935,31 @@ def test_remote_ready_handoff_requires_executable_and_one_to_three(rescue_case: 
     assert "Maximum decisive experiments: 3" in resume
     assert "Success condition" in resume and "Kill condition" in resume
     assert not (rescue_case.run / "flag-receipts").exists()
+
+
+def test_remote_ready_rejects_unrelated_artifact_argv(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="remote-ready-unlinked")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    artifact = root / "artifacts" / "solve.py"
+    _write(artifact, "#!/usr/bin/env python3\n")
+    artifact.chmod(0o755)
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _write_return(
+        root, packet, verdict="REMOTE_READY_HANDOFF",
+        artifacts=[{"path": "artifacts/solve.py", "sha256": digest, "executable": True}],
+        remote_ready={
+            "value": True, "exploit_artifact": "artifacts/solve.py",
+            "exploit_artifact_sha256": digest,
+            "exact_next_argv": ["python3", "/work/unrelated.py"],
+            "target_index": 0, "success_condition": "flag", "kill_condition": "reject",
+            "maximum_remaining_experiments": 1,
+        },
+    )
+    with pytest.raises(RescueError, match="not linked"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
 
 
 @pytest.mark.parametrize("maximum", [0, 4])
@@ -923,6 +983,7 @@ def test_remote_ready_rejects_out_of_range_experiment_bound(
         }],
         remote_ready={
             "value": True, "exploit_artifact": "artifacts/solve.py",
+            "exploit_artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
             "exact_next_argv": ["python3", "/artifacts/solve.py"],
             "target_index": 0, "success_condition": "flag",
             "kill_condition": "rejected",
@@ -996,6 +1057,49 @@ def test_close_rejects_unknown_evidence_receipt(rescue_case: SimpleNamespace) ->
             evidence_receipt_id="missing-receipt",
             sandbox_cleanup=lambda *_args, **_kwargs: {},
         )
+
+
+def test_close_integrated_accepts_exact_command_observation(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="close-command-evidence")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    receipt = _record_command_receipt(
+        rescue_case.run, root, packet, ["python3", "probe.py"],
+        {
+            "exit_code": 0, "timed_out": False, "stdout": "decisive output\n",
+            "stderr": "", "authorized_network_observed": False,
+            "authorized_network_target_indices": [], "authorized_targets": [],
+        }, before_artifacts=_artifact_snapshot(root),
+    )
+    closed = close_rescue(
+        rescue_case.run, str(result["rescue_attempt_id"]), outcome="integrated",
+        evidence_receipt_id=str(receipt["command_receipt_id"]),
+        sandbox_cleanup=lambda *_args, **_kwargs: {"removed": True},
+    )
+    assert closed["closed"] is True and closed["outcome"] == "integrated"
+    events = [row["event"] for row in load_rescue_ledger(rescue_case.run)]
+    assert "RESCUE_CONFIRMED" in events
+
+
+def test_close_rescue_without_created_sandbox_preserves_workspace(
+    rescue_case: SimpleNamespace,
+) -> None:
+    operation = "pre-sandbox-failure"
+
+    def fail_create(_spec: SandboxSpec) -> dict[str, object]:
+        raise RuntimeError("synthetic create failure")
+
+    with pytest.raises(RuntimeError, match="synthetic"):
+        _prepare(rescue_case, operation_id=operation, sandbox_factory=fail_create)
+    rescue_id = rescue_attempt_id(RUN_ID, operation)
+    root = (
+        rescue_case.claude_home / "runs" / "demo" / "pwn" /
+        "challenge-001" / RUN_ID / rescue_id
+    )
+    assert root.is_dir() and not (root / "sandbox.json").exists()
+    closed = close_rescue(rescue_case.run, rescue_id, outcome="manual")
+    assert closed["cleanup_receipt"]["sandbox_cleanup"] == "NOT_PRESENT"
+    assert closed["workspace_preserved"] is True
 
 
 def test_ctf_tool_command_receipt_and_repetition_advisory(
@@ -1076,7 +1180,8 @@ def test_ctf_tool_identity_is_fixed_and_paths_are_safe(rescue_case: SimpleNamesp
     assert f"CTF_OS_RESCUE_RUN_ID={RUN_ID}" in wrapper
     assert f"CTF_OS_RESCUE_ID={result['rescue_attempt_id']}" in wrapper
     assert f"CTF_OS_RESCUE_PACKET_DIGEST={result['packet_digest']}" in wrapper
-    assert "rescue-tool-status" in wrapper and "rescue-exec" in wrapper
+    assert "python -m ctf_os.rescue_tool" in wrapper
+    assert "session|progress|task|knowledge|sandbox|hook|mcp-serve" in wrapper
     assert '"$@"' in wrapper
     for unsafe in ("/absolute", "../parent", "dir/../parent", "."):
         with pytest.raises(RescueError):
@@ -1166,3 +1271,557 @@ def test_benchmark_contract_has_no_rescue_arm() -> None:
     assert "| C | CTF-OS `fixed-race` |" in text
     assert "| D | CTF-OS `adaptive-race` |" in text
     assert not re.search(r"(?:arm|treatment).*Claude rescue", text, re.I)
+
+
+def _v3_backend(
+    case: SimpleNamespace, result: dict[str, object],
+) -> tuple[Path, dict[str, object], dict[str, object], RescueBackend]:
+    root = _rescue_root(case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    metadata = json.loads((root / "sandbox.json").read_text())
+    return root, packet, metadata, RescueBackend(case.run, root, metadata, packet)
+
+
+def test_v2_packet_research_policy_and_v1_read_compatibility(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(
+        rescue_case, operation_id="v2-research", research_policy="public-web",
+    )
+    root, packet, _metadata, _backend = _v3_backend(rescue_case, result)
+    assert packet["schema_version"] == 2
+    assert packet["research_policy"] == "public-web"
+    assert packet["external_research_allowed"] is True
+    settings = json.loads((root / ".claude" / "settings.json").read_text())
+    assert settings["permissions"]["defaultMode"] == "default"
+    assert "WebSearch" in settings["permissions"]["allow"]
+    assert set((
+        "SessionStart", "PreCompact", "PostCompact", "SessionEnd",
+        "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    )).issubset(settings["hooks"])
+    legacy = dict(packet)
+    legacy["schema_version"] = 1
+    legacy["packet_digest"] = calculate_packet_digest(legacy)
+    (root / "RESCUE_PACKET.json").chmod(0o600)
+    _write(root / "RESCUE_PACKET.json", legacy)
+    assert _load_packet(root)["schema_version"] == 1
+
+
+def test_progress_task_and_knowledge_typed_ledgers(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="typed-ledgers")
+    root, packet, _metadata, backend = _v3_backend(rescue_case, result)
+    for number in (1, 2):
+        backend.progress_record({
+            "event": "HYPOTHESIS_OPENED", "hypothesis_id": f"hyp-{number}",
+            "summary": f"candidate {number}",
+        })
+    with pytest.raises(RescueError, match="limit is 2"):
+        backend.progress_record({
+            "event": "HYPOTHESIS_OPENED", "hypothesis_id": "hyp-3",
+            "summary": "too many",
+        })
+    with pytest.raises(RescueError, match="success and kill"):
+        backend.progress_record({"event": "EXPERIMENT_PLANNED", "experiment_id": "exp-1"})
+    artifact = root / "artifacts" / "typed.py"
+    _write(artifact, "print('typed')\n")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    task = {
+        "task_id": "task-1", "role": "exploit-builder", "objective": "build PoC",
+        "success_condition": "artifact runs", "kill_condition": "primitive fails",
+        "maximum_turns": 10, "expected_artifacts": ["artifacts/typed.py"],
+        "allowed_hypothesis_family": "overflow", "forbidden_repeated_paths": [],
+    }
+    backend.task_create(task)
+    backend.task_result({
+        "task_id": "task-1", "status": "SUPPORTED", "summary": "artifact ready",
+        "command_receipt_ids": [], "session_observation_receipt_ids": [],
+        "artifacts": [{"path": "artifacts/typed.py", "sha256": digest}],
+        "evidence": [], "recommended_next_action": "run remote",
+    })
+    source = backend.knowledge_source_record({
+        "query": "version exploit", "tool": "WebSearch", "source_title": "source",
+        "source_url_or_resource_id": "https://example.test/source",
+        "bounded_excerpt": "candidate technique", "content_digest": "0" * 64,
+        "session_id": "claude-session", "subagent_id": "",
+    })
+    hint = backend.knowledge_hint_record({
+        "query": "version exploit", "source_receipt_ids": [source["receipt_id"]],
+        "atomic_attack_facts": ["fact"], "applicability_conditions": ["version matches"],
+        "current_challenge_matches": ["banner matches"], "proposed_attack_path": "try primitive",
+        "decisive_experiment": {
+            "argv_or_session_plan": {"argv": ["python3", "probe.py"]},
+            "success_condition": "control differs", "kill_condition": "control matches",
+        },
+        "status": "CANDIDATE",
+    })
+    assert hint["payload"]["status"] == "CANDIDATE"
+    assert backend.progress_show()["active_hypotheses"][0]["hypothesis_id"] == "hyp-1"
+
+
+def test_session_cursor_binary_send_and_observation_receipt(
+    rescue_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _prepare(rescue_case, operation_id="session-unit")
+    root, packet, metadata, _backend = _v3_backend(rescue_case, result)
+    manager = RescueSessionManager(rescue_case.run, root, metadata, packet)
+    monkeypatch.setattr(manager, "_network_counters", lambda: None)
+
+    def fake_open(
+        session_id: str, _kind: str, argv: list[str], directory: Path,
+    ) -> dict[str, object]:
+        _write(directory / "control" / "cursor_base", "0\n")
+        return {"backend": "tmux", "backend_id": "fake", "argv": argv}
+
+    sent: list[bytes] = []
+    monkeypatch.setattr(manager.backend, "open_pty", fake_open)
+    monkeypatch.setattr(manager.backend, "status", lambda *_args: {"status": "RUNNING"})
+    monkeypatch.setattr(manager.backend, "send_pty", lambda _sid, data: sent.append(data))
+    monkeypatch.setattr(manager.backend, "close", lambda *_args: {"termination_exit_code": 0, "remaining_processes": []})
+    opened = manager.open(kind="shell", name="main-shell", argv=["/bin/bash"])
+    session_id = str(opened["session_id"])
+    manager.send(session_id, b"\x00\x01\xff", encoding="hex")
+    assert sent == [b"\x00\x01\xff"]
+    directory = root / "sessions" / session_id
+    (directory / "stdout.bin").write_bytes(b"hello\x00\xff")
+    observed = manager.read(session_id, cursor=0, max_bytes=32)
+    assert observed["stdout"] is None
+    assert base64.b64decode(observed["stdout_base64"]) == b"hello\x00\xff"
+    rows = [json.loads(line) for line in (root / "RESCUE_SESSIONS.jsonl").read_text().splitlines()]
+    output = [row for row in rows if row["event"] == "SESSION_OUTPUT_OBSERVED"][-1]
+    assert output["observation_receipt_id"] == observed["observation_receipt_id"]
+    assert output["cursor_before"] == 0 and output["cursor_after"] == 7
+    assert manager.close(session_id)["status"] == "CLOSED"
+
+
+def test_hook_model_resume_compaction_and_offline_research(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="hook-events", research_policy="offline")
+    root, _packet, _metadata, backend = _v3_backend(rescue_case, result)
+    started = handle_hook(backend, "SessionStart", {
+        "hook_event_name": "SessionStart", "session_id": "claude-session-1",
+        "model": "claude-opus-4-8", "source": "startup",
+        "transcript_path": "/tmp/transcript.jsonl", "cwd": str(root),
+    })
+    assert "bounded resume context" in started["hookSpecificOutput"]["additionalContext"]
+    shown = show_rescue(rescue_case.run, str(result["rescue_attempt_id"]))
+    assert shown["claude_session_id"] == "claude-session-1"
+    assert shown["claude_resume_command"] == "claude --resume 'claude-session-1'"
+    compact = handle_hook(backend, "PreCompact", {
+        "hook_event_name": "PreCompact", "session_id": "claude-session-1", "trigger": "auto",
+    })
+    assert compact["checkpoint_present"] is False
+    blocked = handle_hook(backend, "PreToolUse", {
+        "hook_event_name": "PreToolUse", "session_id": "claude-session-1",
+        "tool_name": "WebSearch", "tool_input": {"query": "exact challenge"},
+    })
+    assert blocked["hookSpecificOutput"]["permissionDecision"] == "deny"
+    handle_hook(backend, "PostCompact", {
+        "hook_event_name": "PostCompact", "session_id": "claude-session-1",
+        "trigger": "auto", "compact_summary": "bounded summary",
+    })
+    handle_hook(backend, "SessionEnd", {
+        "hook_event_name": "SessionEnd", "session_id": "claude-session-1",
+        "reason": "prompt_input_exit",
+    })
+    rows = [json.loads(line) for line in (root / "CLAUDE_SESSION_EVENTS.jsonl").read_text().splitlines()]
+    assert rows[-1]["duration_seconds"] is not None
+
+
+def test_hook_resume_subagent_task_and_web_source_capture(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(
+        rescue_case, operation_id="hook-extended", research_policy="public-web",
+    )
+    root, _packet, _metadata, backend = _v3_backend(rescue_case, result)
+    backend.task_create({
+        "task_id": "task-hook", "role": "recon", "objective": "check banner",
+        "success_condition": "version identified", "kill_condition": "no banner",
+        "maximum_turns": 3, "expected_artifacts": [],
+        "allowed_hypothesis_family": "version", "forbidden_repeated_paths": [],
+    })
+    handle_hook(backend, "SessionStart", {
+        "hook_event_name": "SessionStart", "session_id": "claude-session-resume",
+        "model": "claude-sonnet-4-6", "source": "resume",
+        "transcript_path": "/tmp/resume.jsonl", "cwd": str(root),
+    })
+    handle_hook(backend, "SubagentStart", {
+        "hook_event_name": "SubagentStart", "session_id": "claude-session-resume",
+        "agent_id": "agent-1", "agent_type": "ctf-recon-haiku",
+    })
+    handle_hook(backend, "TaskCreated", {
+        "hook_event_name": "TaskCreated", "session_id": "claude-session-resume",
+        "task_id": "task-hook",
+    })
+    captured = handle_hook(backend, "PostToolUse", {
+        "hook_event_name": "PostToolUse", "session_id": "claude-session-resume",
+        "agent_id": "agent-1", "tool_name": "WebSearch",
+        "tool_input": {"query": "library version behavior"},
+        "tool_response": {"title": "bounded source", "url": "https://example.test"},
+    })
+    handle_hook(backend, "TaskCompleted", {
+        "hook_event_name": "TaskCompleted", "session_id": "claude-session-resume",
+        "task_id": "task-hook",
+    })
+    handle_hook(backend, "SubagentStop", {
+        "hook_event_name": "SubagentStop", "session_id": "claude-session-resume",
+        "agent_id": "agent-1", "agent_type": "ctf-recon-haiku",
+    })
+    assert captured["recorded"] is True
+    hooks = [json.loads(line) for line in (root / "CLAUDE_SESSION_EVENTS.jsonl").read_text().splitlines()]
+    assert hooks[0]["source"] == "resume"
+    assert {row["event"] for row in hooks}.issuperset({
+        "SessionStart", "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    })
+    tasks = [json.loads(line) for line in (root / "RESCUE_TASKS.jsonl").read_text().splitlines()]
+    assert {row["event"] for row in tasks}.issuperset({"TASK_STARTED", "TASK_CLOSED"})
+    sources = [json.loads(line) for line in (root / "KNOWLEDGE_SOURCES.jsonl").read_text().splitlines()]
+    assert sources[-1]["payload"]["tool"] == "WebSearch"
+
+
+def test_mcp_initialize_tools_list_and_fixed_backend(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="mcp-tools")
+    _root, _packet, _metadata, backend = _v3_backend(rescue_case, result)
+    server = StdioMCPServer(backend, lambda *_args: {"unused": True})
+    initialized = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+    })
+    assert initialized["result"]["serverInfo"]["name"] == "ctf-rescue"
+    listed = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = {row["name"] for row in listed["result"]["tools"]}
+    assert {
+        "ctf_inventory", "ctf_exec", "ctf_session_open", "ctf_session_read",
+        "ctf_progress_record", "ctf_task_result", "ctf_knowledge_hint_record",
+    }.issubset(names)
+
+
+def test_generated_mcp_server_uses_real_stdio_protocol(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="mcp-stdio")
+    root = _rescue_root(rescue_case, result)
+    preflight_path = rescue_case.workspace / "CHALLENGE-PREFLIGHT.json"
+    preflight = json.loads(preflight_path.read_text())
+    preflight["prepared_fingerprint"] = prepared_tree_fingerprint(rescue_case.input_root)
+    _write(preflight_path, preflight)
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ctf_progress_show", "arguments": {}},
+        },
+    ]
+    completed = subprocess.run(
+        [str(root / "ctf-tool"), "mcp-serve"],
+        input="".join(json.dumps(row) + "\n" for row in requests),
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    responses = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert [row["id"] for row in responses] == [1, 2, 3]
+    assert responses[0]["result"]["serverInfo"]["name"] == "ctf-rescue"
+    content = json.loads(responses[-1]["result"]["content"][0]["text"])
+    assert content["ok"] is True
+    assert content["result"]["run_id"] == RUN_ID
+
+
+def test_exact_rescue_flag_promotion_uses_preserved_receipt(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="exact-flag-promotion")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _remote_flag_result(rescue_case, root, packet)
+    promoted = promote_rescue_flag(
+        rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        execution_receipt_id="command-remote", candidate="CTF{remote-rescue}",
+        exploit_artifact="artifacts/solve.py",
+    )
+    receipt = json.loads(Path(promoted["receipt"]).read_text())
+    assert receipt["source_type"] == "CLAUDE_RESCUE"
+    assert receipt["rescue_attempt_id"] == result["rescue_attempt_id"]
+    assert receipt["execution_receipt_id"] == "command-remote"
+
+
+@pytest.mark.skipif(
+    os.environ.get("CTF_OS_DOCKER_SMOKE") != "1",
+    reason="explicit local/CI gate: set CTF_OS_DOCKER_SMOKE=1 after building ctf-os-sandbox:pwn",
+)
+def test_real_docker_rescue_runtime_and_session_flag_promotion(
+    rescue_case: SimpleNamespace,
+) -> None:
+    docker_info = subprocess.run(
+        ["docker", "info", "--format", "{{.ServerVersion}}"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert docker_info.returncode == 0, "real Docker daemon is required: " + docker_info.stderr
+    image = subprocess.run(
+        ["docker", "image", "inspect", "ctf-os-sandbox:pwn"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert image.returncode == 0, "build ctf-os-sandbox:pwn before the Docker smoke gate"
+
+    suffix = hashlib.sha256(str(rescue_case.run).encode()).hexdigest()[:10]
+    target_name = f"ctf-os-rescue-target-{suffix}"
+    target_started = subprocess.run([
+        "docker", "run", "--detach", "--name", target_name, "--network", "bridge",
+        "--entrypoint", "/bin/sh", "ctf-os-sandbox:pwn", "-c",
+        "socat TCP4-LISTEN:31337,reuseaddr,fork EXEC:/bin/cat & "
+        "socat UDP4-RECVFROM:31338,reuseaddr,fork EXEC:/bin/cat & wait",
+    ], capture_output=True, text=True, timeout=30, check=False)
+    assert target_started.returncode == 0, target_started.stderr
+    metadata: dict[str, object] | None = None
+    result: dict[str, object] | None = None
+    mcp: subprocess.Popen[str] | None = None
+    try:
+        inspected = subprocess.run([
+            "docker", "inspect", target_name, "--format",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        ], capture_output=True, text=True, timeout=20, check=False)
+        assert inspected.returncode == 0 and inspected.stdout.strip(), inspected.stderr
+        target_ip = inspected.stdout.strip()
+        result = _prepare(rescue_case, operation_id="real-docker-runtime")
+        root = _rescue_root(rescue_case, result)
+        packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+        rescue_id = str(result["rescue_attempt_id"])
+        tcp_target = ResolvedTarget(Target(
+            "tcp://example.com:31337", "example.com", 31337, "tcp",
+            organizer_declared=True,
+        ), target_ip)
+        udp_target = ResolvedTarget(Target(
+            "udp://udp-smoke.test:31338", "udp-smoke.test", 31338, "udp",
+            organizer_declared=True,
+        ), target_ip)
+        spec = SandboxSpec(
+            contest_slug="demo", challenge_id=rescue_case.challenge.id,
+            branch=rescue_id, source=rescue_case.input_root, branch_root=root,
+            input_fingerprint=FINGERPRINT, target_revision=1,
+            targets=(tcp_target, udp_target), image="ctf-os-sandbox:pwn",
+            resource_profile="light", category="pwn", workspace_mode="bind",
+            run_id=RUN_ID, rescue_attempt_id=rescue_id, external_solver=True,
+            solver_family="claude", session_id=rescue_id,
+            parent_session_id="sol-main", session_role="external-rescue",
+            session_kind="external-rescue", requested_lead_model="sonnet",
+        )
+        metadata = create_sandbox(spec)
+        adopted = create_sandbox(spec)
+        assert adopted["name"] == metadata["name"]
+        metadata["packet_digest"] = packet["packet_digest"]
+        _write(root / "sandbox.json", metadata)
+        preflight_path = rescue_case.workspace / "CHALLENGE-PREFLIGHT.json"
+        preflight = json.loads(preflight_path.read_text())
+        preflight["prepared_fingerprint"] = prepared_tree_fingerprint(rescue_case.input_root)
+        _write(preflight_path, preflight)
+        backend = RescueBackend(rescue_case.run, root, metadata, packet)
+        inventory = backend.inventory(refresh=True)
+        required = {
+            row["name"] for row in inventory["installed_tools"]
+            if row["classification"] == "REQUIRED" and row["available"]
+        }
+        assert {"gdb", "python3", "tmux"}.issubset(required)
+        assert inventory["actual_image_id"]
+
+        mcp = subprocess.Popen(
+            [str(root / "ctf-tool"), "mcp-serve"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert mcp.stdin is not None and mcp.stdout is not None
+        mcp_id = 0
+
+        def mcp_request(method: str, params: dict[str, object]) -> dict[str, object]:
+            nonlocal mcp_id
+            mcp_id += 1
+            mcp.stdin.write(json.dumps({
+                "jsonrpc": "2.0", "id": mcp_id, "method": method, "params": params,
+            }) + "\n")
+            mcp.stdin.flush()
+            response = json.loads(mcp.stdout.readline())
+            assert response.get("id") == mcp_id and "error" not in response, response
+            return response["result"]
+
+        initialized = mcp_request("initialize", {})
+        assert initialized["serverInfo"]["name"] == "ctf-rescue"
+        listed = mcp_request("tools/list", {})
+        assert any(row["name"] == "ctf_inventory" for row in listed["tools"])
+
+        def mcp_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+            result_value = mcp_request(
+                "tools/call", {"name": name, "arguments": arguments},
+            )
+            assert result_value.get("isError") is not True, result_value
+            payload = json.loads(result_value["content"][0]["text"])
+            assert payload["ok"] is True, payload
+            return payload["result"]
+
+        assert mcp_call("ctf_inventory", {})["actual_image_id"]
+        mcp_shell = mcp_call("ctf_session_open", {
+            "kind": "shell", "name": "mcp-shell",
+            "argv": ["/bin/bash", "--noprofile", "--norc"],
+        })
+        mcp_session_id = str(mcp_shell["session_id"])
+        mcp_call("ctf_session_send", {
+            "session_id": mcp_session_id, "text": "printf 'MCP_SESSION_OK\\n'",
+        })
+        mcp_output = mcp_call("ctf_session_read", {
+            "session_id": mcp_session_id, "cursor": 0,
+            "max_bytes": 32768, "wait_seconds": 2,
+        })
+        assert "MCP_SESSION_OK" in str(mcp_output["stdout"])
+        mcp_call("ctf_session_close", {"session_id": mcp_session_id})
+        mcp_call("ctf_progress_record", {"payload": {
+            "event": "NEXT_ACTION_SET", "next_action": "continue deterministic smoke",
+        }})
+        mcp_call("ctf_task_create", {"payload": {
+            "task_id": "mcp-task", "role": "evidence", "objective": "verify MCP result",
+            "success_condition": "typed result stored", "kill_condition": "ledger rejects result",
+            "maximum_turns": 2, "expected_artifacts": [],
+            "allowed_hypothesis_family": "mcp-smoke", "forbidden_repeated_paths": [],
+        }})
+        mcp_call("ctf_task_result", {"payload": {
+            "task_id": "mcp-task", "status": "INCONCLUSIVE", "summary": "transport works",
+            "command_receipt_ids": [], "session_observation_receipt_ids": [],
+            "artifacts": [], "evidence": [], "recommended_next_action": "continue smoke",
+        }})
+        source = backend.knowledge_source_record({
+            "query": "MCP smoke", "tool": "WebSearch", "source_title": "fixture",
+            "source_url_or_resource_id": "https://example.test/mcp",
+            "bounded_excerpt": "candidate fact", "content_digest": "1" * 64,
+            "session_id": "fixture-session", "subagent_id": "",
+        })
+        mcp_call("ctf_knowledge_hint_record", {"payload": {
+            "query": "MCP smoke", "source_receipt_ids": [source["receipt_id"]],
+            "atomic_attack_facts": ["candidate fact"],
+            "applicability_conditions": ["fixture"],
+            "current_challenge_matches": ["fixture"],
+            "proposed_attack_path": "run the smoke probe",
+            "decisive_experiment": {
+                "argv_or_session_plan": {"argv": ["python3", "probe.py"]},
+                "success_condition": "probe succeeds", "kill_condition": "probe fails",
+            },
+            "status": "CANDIDATE",
+        }})
+        mcp.stdin.close()
+        assert mcp.wait(timeout=20) == 0, mcp.stderr.read() if mcp.stderr else ""
+
+        manager = RescueSessionManager(rescue_case.run, root, metadata, packet)
+        shell = manager.open(
+            kind="shell", name="main-shell", argv=["/bin/bash", "--noprofile", "--norc"],
+        )
+        manager.send(str(shell["session_id"]), b"printf 'SHELL_OK\\n'\n", encoding="text")
+        shell_output = manager.read(str(shell["session_id"]), cursor=0, wait_seconds=2)
+        assert "SHELL_OK" in str(shell_output["stdout"])
+        manager.close(str(shell["session_id"]))
+
+        gdb = manager.open(kind="gdb", name="smoke-gdb", argv=["gdb", "-q", "/bin/true"])
+        manager.send(str(gdb["session_id"]), b"info files\n", encoding="text")
+        gdb_output = manager.read(str(gdb["session_id"]), cursor=0, wait_seconds=2)
+        assert "Symbols from" in str(gdb_output["stdout"])
+        manager.close(str(gdb["session_id"]))
+
+        repl = manager.open(kind="repl", name="python-repl", argv=["python3", "-q"])
+        manager.send(str(repl["session_id"]), b"print(6*7)\n", encoding="text")
+        repl_output = manager.read(str(repl["session_id"]), cursor=0, wait_seconds=2)
+        assert "42" in str(repl_output["stdout"])
+        manager.close(str(repl["session_id"]))
+
+        artifact = root / "artifacts" / "solve.py"
+        _write(artifact, "#!/usr/bin/env python3\nprint('deterministic smoke exploit')\n")
+        artifact.chmod(0o755)
+        tcp = manager.open(kind="tcp", name="remote", target_index=0)
+        tcp_id = str(tcp["session_id"])
+        manager.send(tcp_id, b"CTF{remote-rescue}\n", encoding="text")
+        flag_output = manager.read(tcp_id, cursor=0, wait_seconds=3)
+        assert "CTF{remote-rescue}" in str(flag_output["stdout"])
+        assert flag_output["network_observation"][0]["observed"] is True
+        cursor = int(flag_output["cursor_after"])
+        manager.send(tcp_id, b"A\x00B\xff", encoding="hex")
+        binary_output = manager.read(tcp_id, cursor=cursor, wait_seconds=3)
+        binary_bytes = (
+            base64.b64decode(binary_output["stdout_base64"])
+            if binary_output["stdout_base64"] else str(binary_output["stdout"]).encode()
+        )
+        assert binary_bytes == b"A\x00B\xff"
+        manager.close(tcp_id)
+
+        udp = execute_sandbox(
+            metadata,
+            [
+                "python3", "-c",
+                "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+                "s.settimeout(3);s.sendto(b'UDP_OK',(\"udp-smoke.test\",31338));"
+                "print(s.recvfrom(64)[0].decode())",
+            ],
+            10, session_id=rescue_id, session_role="external-rescue",
+            timeout_profile="quick_probe", retain_on_timeout=True,
+        )
+        assert udp["exit_code"] == 0 and "UDP_OK" in str(udp["stdout"])
+        assert udp["network_observation"][1]["observed"] is True
+        assert udp["network_observation"][1]["established_after"] is None
+
+        timed = execute_sandbox(
+            metadata, ["python3", "-c", "import time; time.sleep(3)"], 1,
+            session_id=rescue_id, session_role="external-rescue",
+            timeout_profile="quick_probe", retain_on_timeout=True,
+        )
+        assert timed["timed_out"] is True and timed["container_retained"] is True
+        assert subprocess.run(
+            ["docker", "inspect", str(metadata["name"])],
+            capture_output=True, timeout=20, check=False,
+        ).returncode == 0
+
+        marker = root / "work" / "recovery-marker.txt"
+        _write(marker, "bind persistence\n")
+        stale_shell = manager.open(kind="shell", name="stale-shell", argv=["/bin/bash"])
+        subprocess.run(
+            ["docker", "rm", "--force", str(metadata["name"])],
+            capture_output=True, timeout=30, check=False,
+        )
+        status = _sandbox_control(backend, "status")
+        assert status["runtime_state"] == "MISSING" and status["status"] == "RECOVERABLE"
+        recovered = _sandbox_control(backend, "recover")
+        assert recovered["status"] == "RUNNING" and recovered["stale_persistent_sessions"] >= 1
+        assert marker.read_text() == "bind persistence\n"
+        stale_state = json.loads((root / "sessions" / str(stale_shell["session_id"]) / "SESSION_STATE.json").read_text())
+        assert stale_state["status"] == "STALE"
+
+        promoted = promote_rescue_flag(
+            rescue_case.run, rescue_case.challenge, rescue_id,
+            execution_receipt_id=str(flag_output["observation_receipt_id"]),
+            candidate="CTF{remote-rescue}", exploit_artifact="artifacts/solve.py",
+        )
+        protected = json.loads(Path(promoted["receipt"]).read_text())
+        assert protected["source_type"] == "CLAUDE_RESCUE"
+        assert protected["execution_receipt_id"] == flag_output["observation_receipt_id"]
+    finally:
+        if mcp is not None and mcp.poll() is None:
+            if mcp.stdin is not None and not mcp.stdin.closed:
+                mcp.stdin.close()
+            try:
+                mcp.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mcp.terminate()
+                try:
+                    mcp.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    mcp.kill(); mcp.wait(timeout=5)
+        if result is not None:
+            root = _rescue_root(rescue_case, result)
+            current_metadata = root / "sandbox.json"
+            if current_metadata.is_file():
+                try:
+                    cleanup_sandbox(
+                        json.loads(current_metadata.read_text()),
+                        session_id=str(result["rescue_attempt_id"]),
+                        session_role="external-rescue",
+                    )
+                except Exception:
+                    if metadata is not None:
+                        subprocess.run(
+                            ["docker", "rm", "--force", str(metadata.get("name") or "")],
+                            capture_output=True, timeout=30, check=False,
+                        )
+        subprocess.run(
+            ["docker", "rm", "--force", target_name],
+            capture_output=True, timeout=30, check=False,
+        )

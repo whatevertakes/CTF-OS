@@ -3,6 +3,8 @@ CTF-OS SANDBOX CAPABILITIES
 All profiles inherit the pinned common Python/scientific/crypto layer and the
 shell, network, archive, binary inspection, tracing, compiler, Java, and Ruby
 toolchain declared in sandbox/install/common.sh.
+The common layer also includes tmux, socat, and expect for exact-rescue
+persistent PTY/TCP sessions; ordinary workers do not gain host access from them.
 
 Images: base, pwn, web, rev, crypto, forensic, misc, osint, ai, cloud.
 The exact profile additions are the executable install scripts in

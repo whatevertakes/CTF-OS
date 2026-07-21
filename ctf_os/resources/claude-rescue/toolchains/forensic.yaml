@@ -1,0 +1,9 @@
+tools:
+  file: REQUIRED
+  7z: REQUIRED
+  exiftool: REQUIRED
+  binwalk: REQUIRED
+  python3: REQUIRED
+  tmux: REQUIRED
+  strings: RECOMMENDED
+  xxd: OPTIONAL

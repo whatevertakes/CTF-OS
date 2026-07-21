@@ -43,6 +43,7 @@ def record_remote_flag(
     observed_protocol: str, network_observed: bool, output: str,
     candidate: str, flag_pattern: str | None, command_argv: Sequence[str],
     exploit_artifact: str, target_revision: int | None = None,
+    receipt_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     compatibility_root = root.resolve(strict=False)
     run = resolve_active_run(root, input_fingerprint=input_fingerprint, target_revision=target_revision)
@@ -104,13 +105,15 @@ def record_remote_flag(
             "exploit_artifact_digest": artifact_digest,
             "confidence": confidence,
             "validation_method": "REMOTE_SERVICE_ACCEPTANCE",
+            **dict(receipt_metadata or {}),
         }
         receipt_id = hashlib.sha256(
             json.dumps(receipt_material, sort_keys=True, separators=(",", ":")).encode(),
         ).hexdigest()[:24]
         candidate_record = build_candidate(
             run_id=run_id, session_id=branch_id, candidate=candidate,
-            source_type="REMOTE_OUTPUT", receipt_id=receipt_id, confidence=confidence,
+            source_type=str((receipt_metadata or {}).get("source_type") or "REMOTE_OUTPUT"),
+            receipt_id=receipt_id, confidence=confidence,
             validation_method="REMOTE_SERVICE_ACCEPTANCE",
             status="SUBMISSION_RECOMMENDED" if confidence == "HIGH" else "OBSERVED_REMOTE",
         )

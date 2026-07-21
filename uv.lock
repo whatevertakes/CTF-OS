@@ -166,7 +166,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ctf-os"
+name = "ctf-os-claude"
 version = "3.0.0"
 source = { editable = "." }
 dependencies = [

@@ -1,0 +1,7 @@
+tools:
+  python3: REQUIRED
+  curl: REQUIRED
+  jq: REQUIRED
+  tmux: REQUIRED
+  podman: RECOMMENDED
+  openssl: OPTIONAL

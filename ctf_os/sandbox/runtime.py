@@ -177,6 +177,10 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
             "--mount", f"type=bind,src={(spec.branch_root / 'work').resolve()},dst=/work",
             "--mount", f"type=bind,src={(spec.branch_root / 'evidence').resolve()},dst=/evidence",
             "--mount", f"type=bind,src={(spec.branch_root / 'artifacts').resolve()},dst=/artifacts",
+            *(
+                ["--mount", f"type=bind,src={(spec.branch_root / 'sessions').resolve()},dst=/sessions"]
+                if spec.session_kind == "external-rescue" else []
+            ),
         ]
         if spec.workspace_mode == "bind" else
         [
@@ -305,10 +309,33 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
     except ResourceError as exc:
         raise SandboxError(str(exc)) from exc
     if result.returncode:
-        if "already in use" not in result.stderr.casefold() and "conflict" not in result.stderr.casefold():
-            _rollback_failed_create(spec, docker=docker)
-        raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
+        conflict = "already in use" in result.stderr.casefold() or "conflict" in result.stderr.casefold()
+        if conflict and _existing_exact_sandbox(spec, docker=docker):
+            result = subprocess.CompletedProcess(result.args, 0, result.stdout, result.stderr)
+        else:
+            if not conflict:
+                _rollback_failed_create(spec, docker=docker)
+            raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
     try:
+        image_id = _run(
+            [docker, "image", "inspect", spec.image, "--format", "{{.Id}}"],
+            timeout=30,
+        )
+        if image_id.returncode or not image_id.stdout.strip():
+            raise SandboxError("cannot resolve actual sandbox image identity")
+        metadata["actual_image_id"] = image_id.stdout.strip()
+        image = _run(
+            [docker, "image", "inspect", spec.image, "--format", "{{json .RepoDigests}}"],
+            timeout=30,
+        )
+        if image.returncode == 0:
+            try:
+                digests = json.loads(image.stdout)
+            except json.JSONDecodeError:
+                digests = []
+            metadata["image_repo_digests"] = digests if isinstance(digests, list) else []
+        else:
+            metadata["image_repo_digests"] = []
         _write_json(spec.branch_root / "sandbox.json", metadata)
         append_evidence(spec.branch_root.parents[1] / "evidence.log", "sandbox_create", {
             "branch": spec.branch, "container": spec.name,
@@ -324,6 +351,57 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
             raise SandboxError(f"sandbox started but rollback cleanup failed: {removed.stderr.strip()}")
         raise
     return metadata
+
+
+def _existing_exact_sandbox(spec: SandboxSpec, *, docker: str) -> bool:
+    """Adopt only the exact running container left between create and READY."""
+
+    inspected = _run([docker, "inspect", spec.name], timeout=30)
+    if inspected.returncode:
+        return False
+    try:
+        runtime = json.loads(inspected.stdout)[0]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return False
+    labels = runtime.get("Config", {}).get("Labels", {}) or {}
+    if (
+        runtime.get("State", {}).get("Running") is not True
+        or runtime.get("Config", {}).get("Image") != spec.image
+        or any(labels.get(key) != value for key, value in spec.runtime_labels.items())
+    ):
+        return False
+    expected = {
+        "/challenge": spec.source.resolve(),
+        "/context": (spec.branch_root / "context").resolve(),
+    }
+    if spec.workspace_mode == "bind":
+        expected.update({
+            "/work": (spec.branch_root / "work").resolve(),
+            "/evidence": (spec.branch_root / "evidence").resolve(),
+            "/artifacts": (spec.branch_root / "artifacts").resolve(),
+        })
+        if spec.session_kind == "external-rescue":
+            expected["/sessions"] = (spec.branch_root / "sessions").resolve()
+    observed_binds: dict[str, Path] = {}
+    for mount in runtime.get("Mounts", []):
+        if not isinstance(mount, Mapping) or mount.get("Type") != "bind":
+            continue
+        destination = str(mount.get("Destination") or "")
+        source = str(mount.get("Source") or "")
+        if destination and source:
+            observed_binds[destination] = Path(source).resolve()
+    if any(observed_binds.get(destination) != source for destination, source in expected.items()):
+        return False
+    if set(observed_binds).difference(expected):
+        return False
+    env = set(runtime.get("Config", {}).get("Env", []) or [])
+    target_policy = json.dumps([target.to_dict() for target in spec.targets], separators=(",", ":"))
+    local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
+    return {
+        f"CTF_OS_ALLOWED_ENDPOINTS_JSON={target_policy}",
+        f"CTF_OS_LOCAL_ENDPOINTS_JSON={local_policy}",
+        f"CTF_OS_SESSION_ID={spec.session_id}",
+    }.issubset(env)
 
 
 def execute(
@@ -412,9 +490,12 @@ def _execute_locked(
         "umask 077; echo $$ >\"$1\"; shift; exec \"$@\"",
         "ctf-os-exec", pid_file, *command,
     ])
-    before = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
+    before = firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
     result = _run(argv, timeout=timeout)
-    after = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") and result.returncode != 124 else None
+    after = firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") and result.returncode != 124 else None
+    network_observation = protocol_network_observation(
+        before, after, list(metadata.get("authorized_targets", [])),
+    )
     from ..timeouts import retain_sandbox_on_timeout
     retained = result.returncode == 124 and retain_sandbox_on_timeout(timeout_profile, retain_on_timeout)
     orphan_check = None
@@ -438,20 +519,12 @@ def _execute_locked(
         "input_fingerprint": metadata.get("input_fingerprint"),
         "authorized_targets": metadata.get("authorized_targets", []),
         "authorized_network_observed": (
-            before is not None and after is not None
-            and after["target_packets"] > before["target_packets"]
-            and after["established_packets"] > before["established_packets"]
+            any(row.get("observed") is True for row in network_observation)
         ),
         "authorized_network_target_indices": (
-            [
-                index for index, packets in enumerate(after.get("target_packets_by_index", []))
-                if index < len(before.get("target_packets_by_index", []))
-                and packets > before["target_packets_by_index"][index]
-            ]
-            if before is not None and after is not None
-            and after["established_packets"] > before["established_packets"]
-            else []
+            [row["target_index"] for row in network_observation if row.get("observed") is True]
         ),
+        "network_observation": network_observation,
         "artifacts_exported": bool(cleanup_record and cleanup_record.get("artifact_export")),
         "timeout_profile": timeout_profile, "timeout_status": timeout_status,
         "container_retained": retained,
@@ -582,6 +655,15 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
         if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
             raise SandboxError("refusing cleanup: container labels do not match sandbox metadata")
         branch_root = Path(str(metadata["branch_root"])).resolve()
+        if metadata.get("workspace_mode", "tmpfs") == "bind":
+            normalized = _run([
+                docker, "exec", "--user", "0:0", name, "chmod", "-R", "a+rwX",
+                "/work", "/evidence", "/artifacts", "/sessions",
+            ], timeout=30)
+            if normalized.returncode:
+                export_errors["bind_permissions"] = normalized.stderr.strip()[:1000]
+            else:
+                retained_exports["bind_permissions"] = {"normalized": True}
         exports = () if metadata.get("workspace_mode", "tmpfs") == "bind" else (
             ("artifacts", branch_root / "artifacts", "/artifacts", "artifact"),
             ("work", branch_root / "work", "/work", "work"),
@@ -785,15 +867,22 @@ def _prepare_branch_root(spec: SandboxSpec) -> None:
         "evidence": {"path": "/evidence", "private": True},
         "managed_service": dict(spec.service_context or {}),
     }
-    for name in ("work", "evidence", "artifacts", "logs", "context"):
+    names = ["work", "evidence", "artifacts", "logs", "context"]
+    if spec.session_kind == "external-rescue":
+        names.append("sessions")
+    for name in names:
         path = spec.branch_root / name
         if path.is_symlink():
             raise SandboxError(f"worker {name} path must not be a symlink")
         path.mkdir(exist_ok=True)
         # These paths are mounted only into this worker container. World write is
         # needed because the unprivileged container uid need not match the host uid.
-        path.chmod(0o777 if name in {"work", "evidence", "artifacts"} else (0o755 if name == "context" else 0o700))
+        path.chmod(0o777 if name in {"work", "evidence", "artifacts", "sessions"} else (0o755 if name == "context" else 0o700))
     context_file = spec.branch_root / "context" / "session.json"
+    if context_file.is_symlink():
+        raise SandboxError("worker session context must not be a symlink")
+    if context_file.exists():
+        context_file.chmod(0o644)
     _write_json(context_file, context_payload)
     context_file.chmod(0o444)
 
@@ -905,7 +994,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, object]:
+def firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, object]:
     ipv4 = _run([docker, "exec", "--user", "0:0", container, "iptables-save", "-c"], timeout=10)
     ipv6 = _run([docker, "exec", "--user", "0:0", container, "ip6tables-save", "-c"], timeout=10)
     if ipv4.returncode or ipv6.returncode:
@@ -935,6 +1024,53 @@ def _firewall_counters(container: str, docker: str, targets: list[object]) -> di
         "target_packets_by_index": target_packets_by_index,
         "established_packets": established_packets,
     }
+
+
+def protocol_network_observation(
+    before: object, after: object, targets: list[object],
+) -> list[dict[str, object]]:
+    """Evaluate target-specific proof without imposing TCP state on UDP/DNS."""
+
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+        return []
+    before_packets = before.get("target_packets_by_index")
+    after_packets = after.get("target_packets_by_index")
+    if not isinstance(before_packets, list) or not isinstance(after_packets, list):
+        return []
+    established_before = int(before.get("established_packets") or 0)
+    established_after = int(after.get("established_packets") or 0)
+    rows: list[dict[str, object]] = []
+    for index, target in enumerate(targets):
+        if not isinstance(target, Mapping):
+            continue
+        packets_before = int(before_packets[index]) if index < len(before_packets) else 0
+        packets_after = int(after_packets[index]) if index < len(after_packets) else packets_before
+        protocol = str(target.get("protocol") or target.get("transport") or "tcp").casefold()
+        transport = str(
+            target.get("transport")
+            or ("udp" if protocol in {"udp", "dns"} else "tcp")
+        ).casefold()
+        packet_delta = packets_after > packets_before
+        connection_state = established_after > established_before
+        observed = packet_delta and (connection_state if transport == "tcp" else True)
+        rows.append({
+            "target_index": index,
+            "host": str(target.get("host") or ""),
+            "resolved_ip": str(target.get("ip") or ""),
+            "port": int(target.get("port") or 0),
+            "protocol": protocol,
+            "transport": transport,
+            "packets_before": packets_before,
+            "packets_after": packets_after,
+            "established_before": established_before if transport == "tcp" else None,
+            "established_after": established_after if transport == "tcp" else None,
+            "observed": observed,
+        })
+    return rows
+
+
+# Compatibility for callers/tests that imported the former private helper.
+_firewall_counters = firewall_counters
 
 
 def _export_artifacts(

@@ -1,3 +1,3 @@
 ## Profile: deep
 
-The requested main model is Fable; requested routing is not proof of the observed model. Main reinterprets the problem, resolves conflicting evidence, selects the path, integrates all agent results, and owns remote judgment. Use only the generated clean-room/evidence Haiku and alternate/builder Sonnet agents within the three-invocation initial limit. Do not assume subagent nesting. Opus is a human-started fallback only after an explicit refusal or routing failure.
+The requested main model is Opus. Main owns complex exploit-chain reasoning, conflicting evidence resolution, attack-family selection, integration, and remote judgment. Use only the generated recon/evidence Haiku and alternate/builder Sonnet agents within the three-task initial limit. Requested routing is not proof of the observed model; only the SessionStart hook records that. Do not assume subagent nesting.

@@ -5,7 +5,7 @@ source /opt/ctf-os/install/lib.sh
 apt_install \
   bash ca-certificates curl wget git jq ripgrep file binutils xxd hexedit \
   unzip zip p7zip-full tar gzip bzip2 xz-utils zstd netcat-openbsd socat \
-  nmap dnsutils iproute2 iputils-ping openssl strace ltrace procps psmisc \
+  nmap dnsutils iproute2 iputils-ping openssl strace ltrace procps psmisc tmux expect \
   util-linux findutils gawk gcc g++ make cmake ninja-build pkg-config clang lld \
   python3 python3-dev python3-pip python3-venv ruby ruby-dev default-jre-headless \
   iptables tini locales gnupg libmagic1 libxml2 libxslt1.1

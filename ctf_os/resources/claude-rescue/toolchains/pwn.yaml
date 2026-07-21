@@ -1,0 +1,11 @@
+tools:
+  gdb: REQUIRED
+  file: REQUIRED
+  readelf: REQUIRED
+  objdump: REQUIRED
+  python3: REQUIRED
+  tmux: REQUIRED
+  socat: RECOMMENDED
+  checksec: RECOMMENDED
+  strace: OPTIONAL
+  expect: OPTIONAL

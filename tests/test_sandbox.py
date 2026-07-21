@@ -90,6 +90,11 @@ def test_child_cannot_operate_a_sibling_sandbox(tmp_path: Path) -> None:
 def test_authorized_url_and_nc_parse_and_private_targets_fail() -> None:
     targets = parse_remotes(("https://example.com/path", "nc 8.8.8.8 31337"))
     assert [(target.scheme, target.port) for target in targets] == [("https", 443), ("nc", 31337)]
+    dns = parse_remotes((
+        {"host": "dns.example", "port": 53, "protocol": "dns", "transport": "udp", "organizer_declared": True},
+        {"host": "dns.example", "port": 53, "protocol": "dns", "transport": "tcp", "organizer_declared": True},
+    ))
+    assert [target.transport for target in dns] == ["udp", "tcp"]
     with pytest.raises(NetworkPolicyError):
         parse_remotes(("http://127.0.0.1",))
     with pytest.raises(NetworkPolicyError):
@@ -144,6 +149,25 @@ def test_remote_counters_only_count_exact_authorized_accept_rule(monkeypatch) ->
         "target_packets": 3, "target_packets_by_index": [3],
         "established_packets": 7,
     }
+
+
+def test_protocol_network_observation_udp_dns_do_not_require_established() -> None:
+    targets = [
+        {"host": "udp.example", "ip": "8.8.8.8", "port": 31337, "protocol": "udp", "transport": "udp"},
+        {"host": "dns.example", "ip": "1.1.1.1", "port": 53, "protocol": "dns", "transport": "udp"},
+        {"host": "tcp.example", "ip": "9.9.9.9", "port": 443, "protocol": "tcp", "transport": "tcp"},
+        {"host": "dns-tcp.example", "ip": "1.0.0.1", "port": 53, "protocol": "dns", "transport": "tcp"},
+    ]
+    before = {"target_packets_by_index": [0, 4, 0, 0], "established_packets": 10}
+    after = {"target_packets_by_index": [2, 5, 2, 2], "established_packets": 10}
+    rows = runtime.protocol_network_observation(before, after, targets)
+    assert rows[0]["observed"] is True
+    assert rows[1]["observed"] is True
+    assert rows[2]["observed"] is False
+    assert rows[3]["observed"] is False
+    after["established_packets"] = 11
+    rows = runtime.protocol_network_observation(before, after, targets)
+    assert rows[2]["observed"] is True and rows[3]["observed"] is True
 
 
 def test_dns_multi_address_and_change_are_resolved_per_sandbox(monkeypatch) -> None:

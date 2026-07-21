@@ -1,0 +1,7 @@
+tools:
+  python3: REQUIRED
+  tmux: REQUIRED
+  curl: RECOMMENDED
+  jq: RECOMMENDED
+  nvidia-smi: OPTIONAL
+  socat: OPTIONAL

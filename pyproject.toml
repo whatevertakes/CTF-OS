@@ -1,7 +1,7 @@
 [project]
-name = "ctf-os"
+name = "ctf-os-claude"
 version = "3.0.0"
-description = "Competition-first Sol-native race tools for authorized CTF solving"
+description = "Separated manual Claude rescue runtime for authorized CTF-OS solves"
 requires-python = ">=3.11"
 dependencies = ["cryptography>=45.0.0", "PyYAML>=6.0.2"]
 
@@ -26,6 +26,7 @@ ctf_os = [
   "resources/claude-rescue/profiles/*.md",
   "resources/claude-rescue/agents/*.md",
   "resources/claude-rescue/playbooks/*.md",
+  "resources/claude-rescue/toolchains/*.yaml",
 ]
 
 [dependency-groups]

@@ -40,6 +40,7 @@ class Target:
     scheme: str
     organizer_declared: bool = False
     callback: bool = False
+    transport_override: str | None = None
 
     @property
     def protocol(self) -> str:
@@ -47,7 +48,7 @@ class Target:
 
     @property
     def transport(self) -> str:
-        return "udp" if self.protocol in UDP_PROTOCOLS else "tcp"
+        return self.transport_override or ("udp" if self.protocol in UDP_PROTOCOLS else "tcp")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -69,11 +70,14 @@ class ResolvedTarget:
 
 def parse_remotes(values: Sequence[str | Mapping[str, Any]]) -> tuple[Target, ...]:
     targets: list[Target] = []
-    seen: set[tuple[str, int, str]] = set()
+    seen: set[tuple[str, int, str, str]] = set()
     for value in values:
         target = _parse_target(value)
         _validate_target(target)
-        key = (target.host.casefold().rstrip("."), target.port, target.protocol)
+        key = (
+            target.host.casefold().rstrip("."), target.port,
+            target.protocol, target.transport,
+        )
         if key in seen:
             raise NetworkPolicyError(f"duplicate authorized remote: {target.declared!r}")
         seen.add(key)
@@ -138,10 +142,18 @@ def _parse_target(value: str | Mapping[str, Any]) -> Target:
             port = int(port_raw)
         except (TypeError, ValueError) as exc:
             raise NetworkPolicyError("structured target port must be an integer") from exc
+        transport = str(raw.get("transport") or "").casefold() or None
+        if transport is not None and transport not in {"tcp", "udp"}:
+            raise NetworkPolicyError("structured target transport must be tcp or udp")
+        if transport is not None and protocol not in {"dns", "custom"}:
+            expected = "udp" if protocol == "udp" else "tcp"
+            if transport != expected:
+                raise NetworkPolicyError("structured target protocol and transport conflict")
         return Target(
             declared, host, port, protocol,
             organizer_declared=raw.get("organizer_declared") is True,
             callback=raw.get("callback") is True,
+            transport_override=transport,
         )
     if (
         not isinstance(value, str) or value != value.strip() or not value

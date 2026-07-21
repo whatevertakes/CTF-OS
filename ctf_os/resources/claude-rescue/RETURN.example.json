@@ -25,6 +25,7 @@
   "remote_ready": {
     "value": true,
     "exploit_artifact": "artifacts/solve.py",
+    "exploit_artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "exact_next_argv": ["python3", "/artifacts/solve.py"],
     "target_index": 0,
     "success_condition": "flag appears in output",

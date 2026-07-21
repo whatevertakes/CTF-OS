@@ -1,4 +1,8 @@
-# CTF-OS — Sol-native routing contract
+# CTF-OS Claude Runtime — exact handoff contract
+
+This repository owns the separated Claude rescue runtime and generated workspaces. The source Codex solve remains in `CTF-OS-main`; never copy its whole `output/` tree here or treat this repository as owner of Sol state. A prepared workspace under `runs/` is the only directory from which the operator starts Claude. Runtime code reads the exact source run through a validated pointer and writes only the rescue workspace plus the source run's append-only rescue lifecycle/protected integration receipts.
+
+Do not start Claude, Codex, or any model process from Python or shell automation. The human starts Claude manually in the generated workspace and later resumes the source Codex session.
 
 CTF-OS exists to obtain the first valid flag quickly in an authorized CTF. For every solve, `ctf_os/resources/agent-policy.md` is the authoritative competition and safety policy: this is a timed CTF solve, not vulnerability research; prefer the shortest executable exploit path and exploit first. `.codex/skills/ctf-solve/SKILL.md` defines the procedure, and `ctf_os/resources/knowledge/playbooks/<category>.md` defines the bounded category tactics. Do not duplicate or weaken those contracts here.
 

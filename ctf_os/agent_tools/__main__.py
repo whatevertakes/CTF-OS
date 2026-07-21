@@ -88,7 +88,7 @@ from ..terminal import converge_terminal, record_native_stop, record_submission_
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
 from ..rescue import (
     MODES as RESCUE_MODES, PROFILES as RESCUE_PROFILES,
-    close_rescue, prepare_rescue, record_rescue_runtime, show_rescue,
+    close_rescue, prepare_rescue, promote_rescue_flag, record_rescue_runtime, show_rescue,
     validate_exact_live_mutable_run, validate_rescue_return,
 )
 from ..rescue_tool import dispatch as dispatch_rescue_tool
@@ -285,6 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         rescue_prepare.add_argument("--operation-id", required=True)
         rescue_prepare.add_argument("--lead-model")
+        rescue_prepare.add_argument(
+            "--research-policy",
+            choices=("offline", "public-web", "public-web-and-mcp"),
+        )
         _add_session_args(rescue_prepare)
         rescue_show = commands.add_parser("rescue-show")
         rescue_show.add_argument("selector"); rescue_show.add_argument("--contest")
@@ -317,6 +321,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         rescue_close.add_argument("--evidence-receipt-id")
         _add_session_args(rescue_close)
+        rescue_promote = commands.add_parser("rescue-flag-promote")
+        rescue_promote.add_argument("selector"); rescue_promote.add_argument("--contest")
+        rescue_promote.add_argument("--run-id", required=True)
+        rescue_promote.add_argument("--rescue-id", required=True)
+        rescue_promote.add_argument("--execution-receipt-id", required=True)
+        rescue_promote.add_argument("--candidate", required=True)
+        rescue_promote.add_argument("--exploit-artifact", required=True)
+        _add_session_args(rescue_promote)
     rescue_tool_status = commands.add_parser("rescue-tool-status", help=argparse.SUPPRESS)
     rescue_exec = commands.add_parser("rescue-exec", help=argparse.SUPPRESS)
     rescue_exec.add_argument("--timeout", type=int)
@@ -1054,7 +1066,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
 
     if args.command in {
         "rescue-prepare", "rescue-show", "rescue-runtime-record",
-        "rescue-return-validate", "rescue-close",
+        "rescue-return-validate", "rescue-close", "rescue-flag-promote",
     }:
         _require_sol(args, "Only the current parent Sol session may operate a manual Claude rescue.")
         manifest, challenge, record = _load_challenge_strict(
@@ -1073,6 +1085,7 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 leading_exploit_path=args.leading_exploit_path,
                 paths_not_to_repeat=args.path_not_to_repeat,
                 lead_model=args.lead_model,
+                research_policy=args.research_policy,
                 sandbox_factory=create,
                 connectivity_probe=probe_service_connectivity,
                 service_inspector=service_inspect,
@@ -1090,6 +1103,13 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         if args.command == "rescue-return-validate":
             validate_exact_live_mutable_run(run, challenge, record)
             return validate_rescue_return(run, challenge, args.rescue_id)
+        if args.command == "rescue-flag-promote":
+            validate_exact_live_mutable_run(run, challenge, record)
+            return promote_rescue_flag(
+                run, challenge, args.rescue_id,
+                execution_receipt_id=args.execution_receipt_id,
+                candidate=args.candidate, exploit_artifact=args.exploit_artifact,
+            )
         return close_rescue(
             run, args.rescue_id, outcome=args.outcome,
             evidence_receipt_id=args.evidence_receipt_id,

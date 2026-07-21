@@ -57,10 +57,11 @@
     "remote_ready": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["value", "exploit_artifact", "exact_next_argv", "target_index", "success_condition", "kill_condition", "maximum_remaining_experiments"],
+      "required": ["value", "exploit_artifact", "exploit_artifact_sha256", "exact_next_argv", "target_index", "success_condition", "kill_condition", "maximum_remaining_experiments"],
       "properties": {
         "value": {"const": true},
         "exploit_artifact": {"type": "string", "minLength": 1},
+        "exploit_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "exact_next_argv": {"$ref": "#/$defs/argv"},
         "target_index": {"type": "integer", "minimum": 0},
         "success_condition": {"type": "string", "minLength": 1, "maxLength": 2000},
@@ -71,12 +72,17 @@
     "flag_claim": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["candidate", "command_receipt_id", "exploit_artifact"],
+      "required": ["candidate", "exploit_artifact"],
       "properties": {
         "candidate": {"type": "string", "minLength": 1},
         "command_receipt_id": {"type": "string", "minLength": 1},
+        "execution_receipt_id": {"type": "string", "minLength": 1},
         "exploit_artifact": {"type": "string", "minLength": 1}
-      }
+      },
+      "oneOf": [
+        {"required": ["execution_receipt_id"]},
+        {"required": ["command_receipt_id"]}
+      ]
     }
   },
   "allOf": [

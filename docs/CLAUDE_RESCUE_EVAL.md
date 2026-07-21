@@ -1,34 +1,36 @@
 # Claude Rescue Evaluation Contract
 
-This document defines a future controlled SCA replay. It is separate from the frozen CTF-OS solver benchmark A/B/C/D and does not add a Claude arm to `BENCHMARK_LOCK`, its signed schedule, matched blocks, or evaluator.
+This document defines a future controlled SCA replay. It is separate from the frozen CTF-OS solver benchmark A/B/C/D and does not add or modify a benchmark arm, `BENCHMARK_LOCK`, signed schedule, matched block, or evaluator.
 
-No model run is part of the implementation patch. Unit and integration tests establish policy and software behavior only. Solve-performance impact remains **INCONCLUSIVE** until controlled replay data exists.
+No model run is part of this implementation patch. Unit, MCP, hook, integration, and Docker tests establish software behavior only. Solve-performance impact remains **INCONCLUSIVE** until controlled replay data exists.
 
-## Proposed replay treatments
+## Replay treatments
 
 | Arm | Rescue treatment |
 |---|---|
-| A | `standard`: Sonnet single solver |
-| B | assisted evidence: Sonnet main plus bounded Haiku evidence/recon |
-| C | assisted full: Sonnet main plus Haiku and one Sonnet builder/alternate lane |
-| D | `deep`: Fable requested main plus bounded Haiku/Sonnet agents |
+| A | Sonnet `standard`, one-shot tools |
+| B | Sonnet `standard`, persistent tools |
+| C | Sonnet `assisted`, persistent tools |
+| D | Opus `deep`, persistent tools |
+| E | Fable strategy plus separately operator-started Sonnet/Opus execution |
+| F | appropriate execution profile with knowledge lane enabled |
 
-Each matched replay must use the same exact challenge snapshot, starting typed receipts, target revision, authorized network, tool image, host envelope, time limit, objective, blocker, and packet material. Attempts require fresh rescue IDs, isolated sandboxes, and no artifact or model-context reuse. Requested and observed model identity are distinct fields; missing observed identity is missing data, not requested identity.
+Each matched replay uses the same exact challenge snapshot, typed starting receipts, target revision, authorized network, tool image, host envelope, time limit, objective, blocker, and packet material. Attempts require fresh rescue IDs, isolated sandboxes, and no artifact or model-context reuse. Requested and observed model identity are distinct fields; a missing observation is missing data.
 
 ## Measurements
 
 - organizer-oracle remote flag rate
 - structurally valid remote-ready handoff rate
-- Claude runtime to return
-- Codex time from validated handoff to protected remote flag receipt
-- command-family repetition and repetitions without new evidence
-- `NO_NEW_PATH` rate
-- false breakthrough rate
-- requested versus observed lead model and fallback observations
-- profile-level command, runtime, and resource use
+- Claude runtime and Codex post-handoff time
+- experiments to working PoC and time to first remote interaction
+- persistent-session usage and invalid observation rate
+- false breakthrough and command repetition rate
+- context compaction count
+- requested/observed model and profile/subagent/tool counts
+- token/tool cost only when runtime evidence actually provides it
 
-Secondary diagnostics may include experiments to PoC, first remote interaction, invalid return rate, target mismatch, and Codex refutation rate. A return verdict alone is not success; remote flags require the existing verified receipt and human oracle, while remote-ready success requires bounded Codex completion criteria preregistered before replay.
+A return verdict alone is not success. Remote flags require the protected exact-run receipt and the human submission oracle; remote-ready success requires preregistered, bounded Codex completion criteria.
 
-## Reporting
+## Interpretation
 
-Report matched outcomes, uncertainty, environment/model-routing failures, missing observations, and per-profile usage. Do not claim improvement from test passage, a small anecdotal sample, requested Fable routing, or unverified breakthrough verdicts. Before a controlled replay is complete, the only permitted performance conclusion is `INCONCLUSIVE`.
+SCA replay is for regression and operational comparison. Generalization requires separate held-out or live challenges. Report matched outcomes, uncertainty, routing failures, missing observations, and resource use. Do not infer solve improvement from passing unit tests, Docker smoke, requested model identity, or unverified breakthrough verdicts. Before controlled replay, the only permitted performance conclusion is `INCONCLUSIVE`.

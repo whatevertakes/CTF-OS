@@ -1,0 +1,8 @@
+tools:
+  python3: REQUIRED
+  curl: REQUIRED
+  jq: REQUIRED
+  tmux: REQUIRED
+  socat: RECOMMENDED
+  nmap: OPTIONAL
+  expect: OPTIONAL

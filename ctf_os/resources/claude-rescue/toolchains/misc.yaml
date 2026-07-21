@@ -1,0 +1,7 @@
+tools:
+  python3: REQUIRED
+  file: REQUIRED
+  tmux: REQUIRED
+  socat: RECOMMENDED
+  jq: OPTIONAL
+  expect: OPTIONAL

@@ -1,4 +1,8 @@
-# CTF-OS
+# CTF-OS Claude Runtime
+
+이 저장소는 `CTF-OS-main`에서 분리된 Claude 구조대 실행 전용 저장소입니다. main이 exact Codex Solve와 protected flag state를 소유하고, 이 저장소는 immutable rescue packet, Claude workspace, MCP/hooks, session tooling, sandbox receipts를 소유합니다. 실제 Claude 작업 디렉터리는 `runs/<contest>/<category>/<challenge>/<run-id>/<rescue-id>/` 아래에 생성됩니다.
+
+평상시에는 이 저장소 루트에서 Claude를 시작하지 않습니다. `CTF-OS-main`에서 `Claude 구조대 준비해라`를 요청한 뒤 출력된 `Path`로 이동해 출력된 start command를 사용자가 실행합니다. 이 저장소는 Claude나 다른 모델 프로세스를 자동으로 시작하거나 감독하지 않습니다.
 
 CTF-OS는 사용자가 직접 연 Sol 세션을 lead attacker로 유지하면서, 제한 시간 안에 첫 valid flag를 얻도록 서로 다른 exploit 경로를 짧게 경쟁시키는 로컬 CTF 도구입니다. Python은 model/API를 실행하지 않고 manifest, race/resource ledger, sandbox, target policy, event, artifact, receipt와 replay만 담당합니다.
 
@@ -163,8 +167,8 @@ Manual Claude Rescue는 진행 중인 LIVE Codex Solve의 exact run에 수동 �
 3. Codex CLI를 중지하거나 일시 중지합니다.
 4. 새 터미널을 엽니다.
 5. 출력된 rescue directory로 `cd`합니다.
-6. standard profile은 `claude --model sonnet`, 명시적 assisted profile은 동일 Sonnet main과 제한된 agent, 명시적 deep profile은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
-7. Claude가 sandbox의 `./ctf-tool`만 사용해 challenge/remote 명령을 실행하고 `CLAUDE_RETURN.json`을 작성하도록 합니다.
+6. standard/assisted는 `claude --model sonnet`, deep은 `claude --model opus`, 독립 전략 재해석은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
+7. Claude가 project-local MCP를 우선 사용하고 `./ctf-tool`을 fallback으로 사용해 persistent shell/GDB/REPL/TCP session, progress/task/knowledge ledger, challenge/remote 명령을 실행한 뒤 `CLAUDE_RETURN.json`을 작성하도록 합니다.
 8. Claude를 종료합니다.
 9. 기존 Codex 세션을 재개합니다.
 10. Codex에게 `Claude 구조대 결과 이어서 원격 플래그까지 풀어라`라고 요청합니다.
@@ -176,6 +180,7 @@ Manual Claude Rescue는 진행 중인 LIVE Codex Solve의 exact run에 수동 �
 ```bash
 uv run python -m ctf_os.agent_tools rescue-prepare 1 --contest my-ctf \
   --run-id '<exact-run-id>' --mode PRIMITIVE_TO_POC --profile standard \
+  --research-policy offline \
   --objective 'confirmed primitive을 executable remote PoC로 연결' \
   --current-blocker 'remote protocol framing이 아직 검증되지 않음' \
   --operation-id 'manual-rescue-poc-v1'
@@ -186,11 +191,16 @@ uv run python -m ctf_os.agent_tools rescue-show 1 --contest my-ctf \
 uv run python -m ctf_os.agent_tools rescue-return-validate 1 --contest my-ctf \
   --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
 
+uv run python -m ctf_os.agent_tools rescue-flag-promote 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' \
+  --execution-receipt-id '<command-or-session-observation-id>' \
+  --candidate 'CTF{...}' --exploit-artifact 'artifacts/solve.py'
+
 uv run python -m ctf_os.agent_tools rescue-close 1 --contest my-ctf \
   --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --outcome integrated
 ```
 
-실제 runtime model evidence가 있을 때만 requested/observed를 분리 기록합니다.
+생성된 `.claude/settings.json`의 lifecycle hook은 실제 Claude runtime이 시작될 때 session ID, observed model, resume/compact/end와 subagent/task event를 `CLAUDE_SESSION_EVENTS.jsonl`에 기록합니다. `rescue-show`는 최신 exact session ID가 있으면 `claude --resume '<session-id>'`를 우선 출력하고 `claude --continue`를 보조 명령으로 출력합니다. Claude Code가 설치되지 않았거나 hook evidence가 없는 환경에서는 아래 legacy fallback만 사용할 수 있습니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools rescue-runtime-record 1 --contest my-ctf \
@@ -198,9 +208,9 @@ uv run python -m ctf_os.agent_tools rescue-runtime-record 1 --contest my-ctf \
   --observed-model '<observed model>' --evidence 'evidence/runtime-model.txt'
 ```
 
-설계와 격리 계약은 [`docs/CLAUDE_RESCUE_SOLVER.md`](docs/CLAUDE_RESCUE_SOLVER.md), 후속 controlled replay 계약은 [`docs/CLAUDE_RESCUE_EVAL.md`](docs/CLAUDE_RESCUE_EVAL.md)에 있습니다. 실제 replay 전 성능 결론은 `INCONCLUSIVE`입니다.
+설계와 격리 계약은 [`docs/CLAUDE_RESCUE_SOLVER.md`](docs/CLAUDE_RESCUE_SOLVER.md), interactive 도구는 [`docs/CLAUDE_RESCUE_INTERACTIVE_TOOLS.md`](docs/CLAUDE_RESCUE_INTERACTIVE_TOOLS.md), research lane은 [`docs/CLAUDE_RESCUE_KNOWLEDGE.md`](docs/CLAUDE_RESCUE_KNOWLEDGE.md), 실제 검증 절차는 [`docs/CLAUDE_RESCUE_LIVE_TEST.md`](docs/CLAUDE_RESCUE_LIVE_TEST.md), 후속 controlled replay 계약은 [`docs/CLAUDE_RESCUE_EVAL.md`](docs/CLAUDE_RESCUE_EVAL.md)에 있습니다. 실제 replay 전 성능 결론은 `INCONCLUSIVE`입니다.
 
-`RESCUE_PACKET.json`은 `packet_digest` 필드만 제외한 객체를 UTF-8 canonical JSON(`sort_keys=true`, compact separators)으로 직렬화한 SHA-256을 digest로 사용하며 생성 후 read-only입니다. 새 상태는 같은 packet을 수정하지 않고 새 operation ID와 rescue attempt로 캡처합니다. `requested_lead_model`은 운영 의도일 뿐이고 `observed_lead_model`은 실제 CLI evidence가 있을 때만 기록합니다. Deep Fable이 거부하거나 진행할 수 없을 때 START 문서가 보여 주는 Opus 명령은 사람이 승인해 새 세션에서 실행하는 대안이며 자동 fallback이 아닙니다.
+`RESCUE_PACKET.json` schema v2는 `packet_digest` 필드만 제외한 객체를 UTF-8 canonical JSON(`sort_keys=true`, compact separators)으로 직렬화한 SHA-256을 digest로 사용하며 생성 후 read-only입니다. schema v1 packet은 계속 읽고 검증할 수 있습니다. 새 상태는 packet을 수정하지 않고 append-only progress/session/task/knowledge/telemetry ledger에 기록합니다. `requested_lead_model`은 운영 의도일 뿐이고 `observed_lead_model`은 실제 `SessionStart` hook evidence가 있을 때만 authoritative합니다. Fable strategy와 Opus deep은 별도 profile이며 자동 모델 fallback/restart는 없습니다.
 
 ## Scope와 flag fast path
 

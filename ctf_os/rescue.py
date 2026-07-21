@@ -1,7 +1,8 @@
 """Exact-run, manually launched Claude rescue workspaces.
 
 This module prepares data, sandboxes, and receipts.  It never launches or
-supervises a model process and never promotes Claude output into Solve state.
+supervises a model process.  Preparation/return validation never promote state;
+only the explicit Sol-only exact-receipt promotion enters the protected flag path.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 from typing import Any, Iterator
 
 from .contest import ChallengeSpec, ContestManifest
@@ -34,7 +36,8 @@ from .workspace import (
 )
 
 
-RESCUE_SCHEMA_VERSION = 1
+RESCUE_SCHEMA_VERSION = 2
+SUPPORTED_RESCUE_SCHEMA_VERSIONS = frozenset({1, 2})
 RESCUE_LEDGER_SCHEMA_VERSION = 1
 MAX_PACKET_BYTES = 128 * 1024
 MAX_RETURN_BYTES = 128 * 1024
@@ -47,7 +50,8 @@ MODES = frozenset({
     "BLOCKER_BREAK", "PRIMITIVE_TO_POC", "REMOTE_ENDGAME",
     "FRESH_REINTERPRETATION", "FLAG_VERIFICATION",
 })
-PROFILES = frozenset({"standard", "assisted", "deep"})
+PROFILES = frozenset({"standard", "assisted", "deep", "fable-strategy"})
+RESEARCH_POLICIES = frozenset({"offline", "public-web", "public-web-and-mcp"})
 VERDICTS = frozenset({
     "REMOTE_FLAG_OBTAINED", "REMOTE_READY_HANDOFF", "CONFIRMED_BREAKTHROUGH",
     "NO_NEW_PATH", "ERROR",
@@ -57,6 +61,8 @@ LEDGER_EVENTS = frozenset({
     "RESCUE_RUNTIME_RECORDED", "RESCUE_COMMAND_RECORDED",
     "RESCUE_HANDED_BACK", "RESCUE_CONFIRMED", "RESCUE_REFUTED",
     "RESCUE_CLOSED", "RESCUE_ERROR",
+    "RESCUE_SANDBOX_CREATING", "RESCUE_SANDBOX_MISSING",
+    "RESCUE_SANDBOX_RECOVERED", "RESCUE_SANDBOX_RECOVERY_FAILED",
 })
 IMMUTABLE_STATUSES = frozenset({
     "ACCEPTED", "SEALED", "SEALED_CLEAN", "SOLVED", "SUBMISSION_RECOMMENDED",
@@ -64,6 +70,7 @@ IMMUTABLE_STATUSES = frozenset({
 })
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+CLAUDE_HOME_ENV = "CTF_OS_CLAUDE_HOME"
 
 
 class RescueError(ValueError):
@@ -106,6 +113,7 @@ def prepare_rescue(
     leading_exploit_path: str | None = None,
     paths_not_to_repeat: Sequence[str] = (),
     lead_model: str | None = None,
+    research_policy: str | None = None,
     sandbox_factory: Callable[..., dict[str, object]] = create,
     sandbox_cleanup: Callable[..., dict[str, object]] = cleanup,
     connectivity_probe: Callable[..., dict[str, object]] = probe_service_connectivity,
@@ -118,6 +126,14 @@ def prepare_rescue(
 
     normalized_mode = _enum(mode, MODES, "mode")
     normalized_profile = _enum(profile, PROFILES, "profile", preserve_case=True)
+    normalized_research = _enum(
+        research_policy or "offline", RESEARCH_POLICIES, "research_policy",
+        preserve_case=True,
+    )
+    research_policy_source = (
+        "operator-declared" if research_policy is not None
+        else "default-offline-contest-policy-unavailable"
+    )
     normalized_operation = _text(operation_id, "operation_id", 256)
     normalized_objective = _text(objective, "objective", 2000)
     normalized_blocker = _text(current_blocker, "current_blocker", 2000)
@@ -125,8 +141,12 @@ def prepare_rescue(
         leading_exploit_path or normalized_objective,
         "leading_exploit_path", 2000,
     )
+    default_models = {
+        "standard": "sonnet", "assisted": "sonnet", "deep": "opus",
+        "fable-strategy": "claude-fable-5",
+    }
     requested_model = _text(
-        lead_model or ("claude-fable-5" if normalized_profile == "deep" else "sonnet"),
+        lead_model or default_models[normalized_profile],
         "lead_model", 160,
     )
     identity = validate_exact_live_mutable_run(run, challenge, record)
@@ -136,9 +156,7 @@ def prepare_rescue(
         fingerprint_reader=prepared_fingerprint_reader,
     )
     rid = rescue_attempt_id(run.name, normalized_operation)
-    rescue_root = run / "rescue" / rid
-    if rescue_root.parent.parent != run:
-        raise RescueError("rescue directory is not exact-run local")
+    rescue_root = _external_rescue_root(manifest, challenge, run, rid)
 
     truth, experiments, state_summary, references = _truth_from_run(
         run, leading_exploit_path=leading, current_blocker=normalized_blocker,
@@ -155,6 +173,8 @@ def prepare_rescue(
             for item in list(paths_not_to_repeat)[:20]
         ],
         "requested_lead_model": requested_model,
+        "research_policy": normalized_research,
+        "research_policy_source": research_policy_source,
     }
     packet = {
         "schema_version": RESCUE_SCHEMA_VERSION,
@@ -172,7 +192,13 @@ def prepare_rescue(
         "artifacts": [row for row in selected if row["kind"] == "artifact"],
         "evidence": [row for row in selected if row["kind"] == "evidence"],
         "authorized_targets": _bounded_targets(record.get("authorized_targets")),
+        "research_policy": normalized_research,
+        "research_policy_source": research_policy_source,
+        "external_research_allowed": normalized_research != "offline",
+        "exact_challenge_lookup_policy": "operator-declared",
         "model_policy": _model_policy(normalized_profile),
+        "claude_code_capabilities": _claude_code_capabilities(),
+        "model_requirements": _model_requirements(requested_model),
         "source_inventory": _source_inventory(run),
         "context_limits": {
             "packet_bytes": MAX_PACKET_BYTES,
@@ -219,11 +245,13 @@ def prepare_rescue(
             _create_workspace(
                 repo_root, run, rescue_root, challenge, packet, selected,
             )
+            _write_rescue_pointer(run, rescue_root, packet)
             _append_event_unlocked(
                 run, packet, "RESCUE_PREPARED",
                 details={
                     "mode": normalized_mode, "profile": normalized_profile,
                     "requested_lead_model": requested_model,
+                    "research_policy": normalized_research,
                     "path": str(rescue_root),
                 },
             )
@@ -288,12 +316,25 @@ def prepare_rescue(
             if prepared.attachment_service is not None else nullcontext()
         )
         with guard:
+            with rescue_lock(run):
+                _append_event_unlocked(
+                    run, packet, "RESCUE_SANDBOX_CREATING",
+                    details={"container": prepared.spec.name, "phase": "initial-create"},
+                )
             metadata = sandbox_factory(prepared.spec)
+            metadata["packet_digest"] = packet["packet_digest"]
+            metadata["source_repo_path"] = str(repo_root.resolve(strict=False))
+            metadata["source_run_path"] = str(run.resolve(strict=False))
+            metadata_path = Path(str(metadata.get("metadata_path") or rescue_root / "sandbox.json"))
+            atomic_json(metadata_path, metadata)
             _lock_read_only_workspace(rescue_root)
             _validate_rescue_metadata(metadata, packet, rescue_root)
             if prepared.spec.service_network:
                 metadata["connectivity_probe"] = connectivity_probe(metadata)
                 atomic_json(Path(str(metadata["metadata_path"])), metadata)
+            if metadata.get("actual_image_id") and metadata.get("image"):
+                from .rescue_backend import RescueBackend
+                RescueBackend(run, rescue_root, metadata, packet).inventory(refresh=True)
     except Exception as exc:
         cleanup_error = None
         if metadata is not None:
@@ -330,6 +371,11 @@ def prepare_rescue(
                 "managed_service_attached": bool(metadata.get("service_network")),
             },
         )
+    from .rescue_backend import record_telemetry
+    record_telemetry(rescue_root, "sandbox_ready", details={
+        "container": metadata.get("name"),
+        "sandbox_image_id": metadata.get("actual_image_id"),
+    })
     return _prepare_response(run, rescue_root, packet, metadata, idempotent=False)
 
 
@@ -444,7 +490,49 @@ def show_rescue(run: Path, rescue_id: str) -> dict[str, Any]:
     )
     if metadata is not None:
         _validate_rescue_metadata(metadata, packet, rescue_root)
+    runtime_state = "MISSING"
+    recovery_state = "RECOVERY_REQUIRED"
+    if metadata is not None:
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", str(metadata.get("name") or "")],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if inspected.returncode == 0:
+                try:
+                    runtime = json.loads(inspected.stdout)[0]
+                    runtime_state = "RUNNING" if runtime.get("State", {}).get("Running") is True else "STOPPED"
+                except (json.JSONDecodeError, IndexError, TypeError):
+                    runtime_state = "ERROR"
+            image = subprocess.run(
+                ["docker", "image", "inspect", str(metadata.get("image") or ""), "--format", "{{.Id}}"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            image_matches = image.returncode == 0 and (
+                not metadata.get("actual_image_id")
+                or image.stdout.strip() == metadata.get("actual_image_id")
+            )
+            service_matches = True
+            if metadata.get("service_network"):
+                service_matches = subprocess.run(
+                    ["docker", "network", "inspect", str(metadata["service_network"])],
+                    capture_output=True, text=True, timeout=30, check=False,
+                ).returncode == 0
+            recovery_state = "RECOVERABLE" if image_matches and service_matches else "RECOVERY_REQUIRED"
+        except (OSError, subprocess.TimeoutExpired):
+            runtime_state, recovery_state = "MISSING", "RECOVERY_REQUIRED"
+    projected_sandbox_state = (
+        runtime_state if runtime_state == "RUNNING"
+        else recovery_state if runtime_state in {"MISSING", "STOPPED"}
+        else runtime_state
+    )
+    latest = None
+    if metadata is not None:
+        from .rescue_backend import RescueBackend
+        from .rescue_hooks import latest_session
+        latest = latest_session(RescueBackend(run, rescue_root, metadata, packet))
     request = packet["request"]
+    claude_session_id = latest.get("session_id") if latest else None
     return {
         "rescue_attempt_id": rescue_id,
         "operation_id": packet["identity"]["operation_id"],
@@ -454,16 +542,25 @@ def show_rescue(run: Path, rescue_id: str) -> dict[str, Any]:
         "mode": request["mode"], "profile": request["profile"],
         "status": state["status"],
         "requested_lead_model": request["requested_lead_model"],
-        "observed_lead_model": state.get("observed_lead_model"),
+        "research_policy": packet.get("research_policy", "offline"),
+        "observed_lead_model": latest.get("model") if latest else state.get("observed_lead_model"),
+        "claude_session_id": claude_session_id,
         "runtime_observation_evidence": state.get("runtime_observation_evidence"),
         "fallback_observed": state.get("fallback_observed"),
         "packet_digest": packet["packet_digest"],
         "ctf_tool_digest": state.get("ctf_tool_digest"),
-        "sandbox_state": state["sandbox_state"],
+        "sandbox_state": projected_sandbox_state,
+        "sandbox_runtime_state": runtime_state,
+        "sandbox_recovery_state": recovery_state,
         "return_file_state": _return_file_state(rescue_root),
         "start_command": _start_command(rescue_root, str(request["requested_lead_model"])),
         "fallback_command": _fallback_command(rescue_root, str(request["profile"])),
-        "resume_command": _resume_command(packet),
+        "resume_command": _resume_command(packet, run),
+        "claude_resume_command": (
+            f"claude --resume '{str(claude_session_id)}'"
+            if claude_session_id else None
+        ),
+        "claude_continue_command": "claude --continue",
         "validation_state": state["validation_state"],
         "path": str(rescue_root),
         "process_state_inferred": False,
@@ -564,6 +661,8 @@ def validate_rescue_return(
     """Validate candidate insight and write only rescue-local handback files."""
 
     rescue_root = _rescue_root(run, rescue_id)
+    from .rescue_backend import record_telemetry
+    record_telemetry(rescue_root, "codex_resumed", details={"operation": "rescue-return-validate"})
     packet = _load_packet(rescue_root)
     digest = calculate_packet_digest(packet)
     if packet.get("packet_digest") != digest:
@@ -585,7 +684,7 @@ def validate_rescue_return(
         raise RescueError("rescue return packet digest mismatch")
     if result.get("requested_lead_model") != packet["request"]["requested_lead_model"]:
         raise RescueError("Claude return requested model does not match the packet")
-    _validate_model_observation(rescue_root, result)
+    _validate_model_observation(run, rescue_root, result)
 
     artifact_rows = _validate_return_artifacts(rescue_root, result.get("artifacts"))
     _validate_return_evidence(rescue_root, result)
@@ -647,6 +746,9 @@ def validate_rescue_return(
                     "return_digest": return_digest,
                 },
             )
+    record_telemetry(rescue_root, "return_validated", details={
+        "verdict": verdict, "return_digest": return_digest,
+    })
     return {
         "run_id": run.name, "rescue_attempt_id": rescue_id,
         "packet_digest": digest, "verdict": verdict,
@@ -657,6 +759,106 @@ def validate_rescue_return(
         "milestone_or_flag_receipt_created": False,
         "automatic_submission_attempted": False,
     }
+
+
+def promote_rescue_flag(
+    run: Path, challenge: ChallengeSpec, rescue_id: str, *,
+    execution_receipt_id: str, candidate: str, exploit_artifact: str,
+) -> dict[str, Any]:
+    """Promote only preserved exact-rescue execution evidence into the protected path."""
+
+    from .sandbox.network import parse_remotes
+    from .verification import record_remote_flag
+    rescue_root = _rescue_root(run, rescue_id)
+    packet = _load_packet(rescue_root)
+    _validate_packet_against_current_run(run, packet, challenge)
+    if not matches_flag(candidate, challenge.flag_pattern):
+        raise RescueError("rescue flag promotion candidate does not match the current flag pattern")
+    receipt = _execution_receipt_by_id(rescue_root, execution_receipt_id)
+    identity = packet["identity"]
+    if (
+        receipt.get("run_id") != run.name
+        or receipt.get("rescue_attempt_id") != rescue_id
+        or receipt.get("packet_digest") != packet.get("packet_digest")
+        or receipt.get("authorized_network_observed") is not True
+    ):
+        raise RescueError("execution receipt identity or network proof is invalid")
+    evidence = _safe_rescue_path(
+        rescue_root, str(receipt.get("evidence_path") or ""),
+        "execution output evidence", allowed={"evidence"},
+    )
+    evidence_digest = _sha256(evidence)
+    if evidence_digest != receipt.get("evidence_digest"):
+        raise RescueError("execution output evidence digest mismatch")
+    output_bytes = evidence.read_bytes()
+    if candidate.encode() not in output_bytes:
+        raise RescueError("candidate is absent from preserved execution output")
+    source_artifact = _safe_rescue_path(
+        rescue_root, exploit_artifact, "rescue exploit artifact",
+        allowed={"work", "artifacts"},
+    )
+    artifact_digest = _sha256(source_artifact)
+    snapshots = receipt.get("artifact_snapshot")
+    if isinstance(snapshots, Mapping):
+        after = snapshots.get("after") if isinstance(snapshots.get("after"), Mapping) else snapshots
+        files = after.get("files") if isinstance(after, Mapping) else None
+        if isinstance(files, list) and not any(
+            isinstance(row, Mapping)
+            and row.get("path") == exploit_artifact
+            and row.get("sha256") == artifact_digest
+            for row in files
+        ):
+            raise RescueError("execution receipt artifact snapshot does not bind the exploit artifact")
+    observed_rows = [
+        row for row in list(receipt.get("network_observation") or [])
+        if isinstance(row, Mapping) and row.get("observed") is True
+    ]
+    if len(observed_rows) != 1:
+        # Schema-v1 command receipt compatibility.
+        indices = list(receipt.get("authorized_network_target_indices") or [])
+        targets = list(receipt.get("authorized_targets") or [])
+        if len(indices) != 1 or not isinstance(indices[0], int) or not 0 <= indices[0] < len(targets):
+            raise RescueError("execution receipt lacks one exact observed target")
+        observed = targets[indices[0]]
+    else:
+        observed = observed_rows[0]
+    if not isinstance(observed, Mapping):
+        raise RescueError("execution receipt observed target is malformed")
+    destination = run / "artifacts" / "claude-rescue" / rescue_id / source_artifact.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.is_symlink() or not destination.is_file() or _sha256(destination) != artifact_digest:
+            raise RescueError("promoted exploit artifact path conflicts with existing content")
+    else:
+        _copy_file(source_artifact, destination)
+        destination.chmod(source_artifact.stat().st_mode & 0o777)
+    argv = _direct_argv(receipt.get("argv"))
+    result = record_remote_flag(
+        run, challenge_id=challenge.id,
+        input_fingerprint=str(identity["input_fingerprint"]), branch_id=rescue_id,
+        declared_targets=parse_remotes(challenge.remotes),
+        observed_host=str(observed.get("host") or observed.get("resolved_ip") or observed.get("ip") or ""),
+        observed_port=int(observed.get("port") or 0),
+        observed_protocol=str(observed.get("transport") or observed.get("protocol") or ""),
+        network_observed=True,
+        output=output_bytes.decode("utf-8", errors="replace"), candidate=candidate,
+        flag_pattern=challenge.flag_pattern, command_argv=argv,
+        exploit_artifact=destination.relative_to(run).as_posix(),
+        target_revision=int(identity["target_revision"]),
+        receipt_metadata={
+            "source_type": "CLAUDE_RESCUE", "rescue_attempt_id": rescue_id,
+            "packet_digest": packet["packet_digest"],
+            "execution_receipt_id": execution_receipt_id,
+            "sandbox_image_id": receipt.get("sandbox_image_id"),
+            "output_evidence_digest": evidence_digest,
+        },
+    )
+    from .rescue_backend import record_telemetry
+    record_telemetry(rescue_root, "flag_receipt_created", details={
+        "execution_receipt_id": execution_receipt_id,
+        "receipt_path": result.get("receipt"),
+    })
+    return result
 
 
 def close_rescue(
@@ -680,6 +882,8 @@ def close_rescue(
         _text(evidence_receipt_id, "evidence_receipt_id", 256)
         if evidence_receipt_id is not None else None
     )
+    if normalized in {"integrated", "flag-obtained"} and evidence_id is None:
+        raise RescueError(f"{normalized} rescue close requires an evidence receipt ID")
     rescue_root = _rescue_root(run, rescue_id)
     packet = _load_packet(rescue_root)
     if evidence_id is not None and not _existing_receipt_id(
@@ -693,11 +897,35 @@ def close_rescue(
             "closed": True, "outcome": state.get("close_outcome"), "idempotent": True,
             "workspace_preserved": True,
         }
-    metadata = _load_json(rescue_root / "sandbox.json", "rescue sandbox metadata")
-    _validate_rescue_metadata(metadata, packet, rescue_root)
-    cleanup_receipt = sandbox_cleanup(
-        metadata, session_id=rescue_id, session_role="external-rescue",
-    )
+    metadata_path = rescue_root / "sandbox.json"
+    closed_sessions: list[dict[str, Any]] = []
+    if metadata_path.is_file() and not metadata_path.is_symlink():
+        metadata = _load_json(metadata_path, "rescue sandbox metadata")
+        _validate_rescue_metadata(metadata, packet, rescue_root)
+        from .rescue_sessions import RescueSessionManager
+        closed_sessions = RescueSessionManager(
+            run, rescue_root, metadata, packet,
+        ).close_all()
+        runtime = subprocess.run(
+            ["docker", "inspect", str(metadata.get("name") or "")],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        cleanup_receipt = (
+            {"sandbox_cleanup": "NOT_PRESENT", "container": metadata.get("name")}
+            if runtime.returncode and sandbox_cleanup is cleanup else
+            sandbox_cleanup(
+                metadata, session_id=rescue_id, session_role="external-rescue",
+            )
+        )
+    else:
+        cleanup_receipt = {"sandbox_cleanup": "NOT_PRESENT"}
+    try:
+        ResourceLedger(run).release(
+            rescue_id, "manual Claude rescue closed",
+            actor_session_id="sol-main", actor_role="sol",
+        )
+    except Exception as exc:
+        cleanup_receipt = {**cleanup_receipt, "resource_release_warning": str(exc)[:1000]}
     with rescue_lock(run):
         if normalized in {"integrated", "flag-obtained"}:
             _append_event_unlocked(
@@ -714,12 +942,18 @@ def close_rescue(
             details={
                 "outcome": normalized, "evidence_receipt_id": evidence_id,
                 "cleanup_receipt": cleanup_receipt,
+                "closed_persistent_sessions": len(closed_sessions),
             },
         )
+    from .rescue_backend import record_telemetry
+    record_telemetry(rescue_root, "rescue_closed", details={
+        "outcome": normalized, "evidence_receipt_id": evidence_id,
+    })
     return {
         "run_id": run.name, "rescue_attempt_id": rescue_id,
         "closed": True, "outcome": normalized,
         "cleanup_receipt": cleanup_receipt, "idempotent": False,
+        "closed_persistent_sessions": len(closed_sessions),
         "workspace_preserved": True,
     }
 
@@ -769,6 +1003,14 @@ def project_rescue_state(run: Path, rescue_id: str) -> dict[str, Any]:
         details = row["details"]
         if event == "RESCUE_SANDBOX_READY":
             status, sandbox_state = "READY", "READY"
+        elif event == "RESCUE_SANDBOX_CREATING":
+            sandbox_state = "RECOVERY_REQUIRED"
+        elif event == "RESCUE_SANDBOX_MISSING":
+            sandbox_state = "MISSING"
+        elif event == "RESCUE_SANDBOX_RECOVERED":
+            status, sandbox_state = "READY", "READY"
+        elif event == "RESCUE_SANDBOX_RECOVERY_FAILED":
+            sandbox_state = "RECOVERY_REQUIRED"
         elif event == "RESCUE_RUNTIME_RECORDED":
             observed_model = details.get("observed_lead_model")
             runtime_evidence = details.get("runtime_observation_evidence")
@@ -865,7 +1107,11 @@ def _append_event_unlocked(
     existing = next((row for row in rows if row.get("event_id") == event_id), None)
     if existing is not None:
         return existing
-    repeatable = {"RESCUE_ERROR", "RESCUE_COMMAND_RECORDED", "RESCUE_RUNTIME_RECORDED"}
+    repeatable = {
+        "RESCUE_ERROR", "RESCUE_COMMAND_RECORDED", "RESCUE_RUNTIME_RECORDED",
+        "RESCUE_SANDBOX_CREATING", "RESCUE_SANDBOX_MISSING",
+        "RESCUE_SANDBOX_RECOVERED", "RESCUE_SANDBOX_RECOVERY_FAILED",
+    }
     same_event = next((
         row for row in rows
         if row.get("rescue_attempt_id") == identity["rescue_attempt_id"]
@@ -1114,7 +1360,7 @@ def _create_workspace(
         raise RescueError("rescue workspace must not be a symlink")
     for name in (
         "work", "evidence", "artifacts", "logs", "context", ".claude",
-        ".claude/agents", "context/selected",
+        ".claude/agents", "context/selected", "sessions",
     ):
         path = rescue_root / name
         if path.is_symlink():
@@ -1206,16 +1452,43 @@ def _create_workspace(
         rescue_root / "CODEX-RESUME.md",
         "# Codex resume\n\nPending `rescue-return-validate`. Claude output is not confirmed Solve truth.\n",
     )
-    atomic_json(rescue_root / ".claude" / "settings.json", _claude_settings())
+    atomic_json(rescue_root / ".claude" / "settings.json", _claude_settings(packet))
     for name in _agent_file_names(str(packet["request"]["profile"])):
         source = resources / "agents" / name
         destination = rescue_root / ".claude" / "agents" / name
         shutil.copyfile(source, destination)
         destination.chmod(0o444)
-    atomic_text(rescue_root / "RESCUE_COMMANDS.jsonl", "")
+    for ledger in (
+        "RESCUE_COMMANDS.jsonl", "RESCUE_SESSIONS.jsonl", "RESCUE_PROGRESS.jsonl",
+        "RESCUE_TASKS.jsonl", "KNOWLEDGE_SOURCES.jsonl", "KNOWLEDGE_HINTS.jsonl",
+        "CLAUDE_SESSION_EVENTS.jsonl", "RESCUE_TELEMETRY.jsonl",
+    ):
+        atomic_text(rescue_root / ledger, "")
+        (rescue_root / ledger).chmod(0o600)
+    atomic_json(rescue_root / "RESCUE_LIVE_STATE.json", {
+        "schema_version": 1, "run_id": run.name,
+        "rescue_attempt_id": packet["identity"]["rescue_attempt_id"],
+        "packet_digest": packet["packet_digest"], "active_hypotheses": [],
+        "current_blocker": packet["request"]["current_blocker"],
+        "last_decisive_experiment": None, "latest_working_artifact": None,
+        "next_action": None, "event_count": 0,
+    })
+    atomic_json(rescue_root / "TOOLCHAIN_RECEIPT.json", {
+        "schema_version": 1, "status": "PENDING_SANDBOX_INVENTORY",
+        "run_id": run.name, "rescue_attempt_id": packet["identity"]["rescue_attempt_id"],
+        "packet_digest": packet["packet_digest"],
+    })
     wrapper = _ctf_tool_wrapper(repo_root, rescue_root, packet)
     atomic_text(rescue_root / "ctf-tool", wrapper)
     (rescue_root / "ctf-tool").chmod(0o555)
+    atomic_json(rescue_root / ".mcp.json", {
+        "mcpServers": {
+            "ctf-rescue": {
+                "type": "stdio", "command": str(rescue_root / "ctf-tool"),
+                "args": ["mcp-serve"], "env": {},
+            }
+        }
+    })
     for name in (
         "CLAUDE.md", "REQUEST.md", "MODEL_POLICY.md", "START.md",
         "RESCUE_PACKET.json", "RETURN.schema.json", "RETURN.example.json",
@@ -1224,7 +1497,12 @@ def _create_workspace(
     (rescue_root / ".claude" / "settings.json").chmod(0o444)
     (rescue_root / "CLAUDE_RETURN.json").chmod(0o600)
     (rescue_root / "CODEX-RESUME.md").chmod(0o600)
-    (rescue_root / "RESCUE_COMMANDS.jsonl").chmod(0o600)
+    (rescue_root / ".mcp.json").chmod(0o444)
+    from .rescue_backend import record_telemetry
+    record_telemetry(rescue_root, "rescue_prepared", details={
+        "requested_model": packet["request"]["requested_lead_model"],
+        "profile": packet["request"]["profile"],
+    })
 
 
 def _lock_read_only_workspace(rescue_root: Path) -> None:
@@ -1292,7 +1570,7 @@ def _render_model_policy(packet: Mapping[str, Any]) -> str:
         f"- Lead role: {policy['lead_role']}",
         "- Available profile subagents: " + ", ".join(policy["subagents"]),
         "- Requested model is intent only; do not copy it into observed model fields.",
-        "- Record observed model only with a real CLI evidence file.",
+        "- Record authoritative observed model only from the Claude Code SessionStart hook; legacy runtime evidence is fallback-only.",
         "- Do not treat Claude Code `--fallback-model` as evidence of Fable cyber routing.",
         f"- Maximum active hypotheses: {policy['maximum_active_hypotheses']}",
         f"- Maximum initial decisive experiments: {policy['maximum_initial_decisive_experiments']}",
@@ -1306,42 +1584,99 @@ def _render_model_policy(packet: Mapping[str, Any]) -> str:
 
 def _render_start(rescue_root: Path, packet: Mapping[str, Any]) -> str:
     start = _start_command(rescue_root, str(packet["request"]["requested_lead_model"]))
+    requirements = packet.get("model_requirements", {})
+    capabilities = packet.get("claude_code_capabilities", {})
     lines = [
         "# Manual start", "",
         "CTF-OS did not start Claude. Pause or exit Codex, open a new terminal, and run:",
         "", "```bash", start, "```", "",
+        f"- Requested model: `{packet['request']['requested_lead_model']}`",
+        "- Observed model: `PENDING SessionStart hook`",
+        f"- Cyber routing/fallback: {requirements.get('cyber_routing_or_fallback', 'not configured')}",
+        f"- Retention requirement: {requirements.get('retention_requirement', 'account policy applies')}",
+        f"- Account requirement: {requirements.get('account_requirement', 'model access required')}",
+        f"- Research policy: `{packet.get('research_policy', 'offline')}`",
+        f"- Research policy source: `{packet.get('research_policy_source', 'schema-v1/default-offline')}`",
+        f"- Claude Code installed during preparation: `{capabilities.get('installed', False)}`",
+        f"- Claude Code version observed during preparation: `{capabilities.get('version') or 'UNAVAILABLE'}`",
+        "- Runtime hook evidence, not the requested alias, is authoritative for the observed model.",
+        "", "## Installed Claude Code capability probe", "",
     ]
-    if packet["request"]["profile"] == "deep":
+    for feature, observation in dict(capabilities.get("features") or {}).items():
+        installed = observation.get("installed_observed") if isinstance(observation, Mapping) else None
+        state = "SUPPORTED" if installed is True else (
+            "UNAVAILABLE (CLI not installed or option absent)" if installed is False
+            else "OFFICIALLY DOCUMENTED; installed CLI help cannot prove this project/runtime feature"
+        )
+        lines.append(f"- `{feature}`: {state}")
+    if packet["request"]["profile"] == "fable-strategy":
         lines.extend([
-            "", "If the Fable session explicitly refuses or cannot continue the authorized CTF task, "
-            "exit it and start a new manually approved session with:", "", "```bash",
-            f"cd {shlex.quote(str(rescue_root))}\nclaude --model opus", "```",
-            "", "This is a manual alternative, not an automatic fallback or evidence of observed routing.",
+            "", "Fable is a strategy profile. It may produce a cyber classifier refusal. "
+            "CTF-OS does not automatically restart or route the model; end the session and let the operator "
+            "choose a separate Sonnet/Opus execution session.",
         ])
+    lines.extend([
+        "", "Once SessionStart has recorded a session ID, `rescue-show` prints `claude --resume '<session-id>'`. ",
+        "`claude --continue` remains a directory-local fallback; prefer the explicit session ID.",
+    ])
     return "\n".join(lines) + "\n"
 
 
-def _claude_settings() -> dict[str, Any]:
+def _claude_settings(packet: Mapping[str, Any]) -> dict[str, Any]:
+    research = str(packet.get("research_policy") or "offline")
+    allow = [
+        "Read(./**)", "Write(./work/**)", "Edit(./work/**)",
+        "Write(./evidence/**)", "Edit(./evidence/**)",
+        "Write(./artifacts/**)", "Edit(./artifacts/**)",
+        "Write(./CLAUDE_RETURN.json)", "Edit(./CLAUDE_RETURN.json)",
+        "Bash(./ctf-tool *)", "mcp__ctf-rescue__*",
+    ]
+    if research in {"public-web", "public-web-and-mcp"}:
+        allow.extend(["WebSearch", "WebFetch"])
+    if research == "public-web-and-mcp":
+        allow.append("mcp__*")
+    hook_events = (
+        "SessionStart", "PreCompact", "PostCompact", "SessionEnd",
+        "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    )
+    hooks = {
+        event: [{
+            "hooks": [{
+                "type": "command", "command": f"./ctf-tool hook {event}",
+                "timeout": 10,
+            }],
+        }]
+        for event in hook_events
+    }
+    hooks["PreToolUse"] = [{
+        "hooks": [{
+            "type": "command", "command": "./ctf-tool hook PreToolUse", "timeout": 10,
+        }],
+    }]
+    hooks["PostToolUse"] = [{
+        "matcher": "WebSearch|WebFetch|mcp__.*", "hooks": [{
+            "type": "command", "command": "./ctf-tool hook PostToolUse", "timeout": 10,
+        }],
+    }]
+    deny = [
+        "Read(../**)", "Write(./context/**)", "Edit(./context/**)",
+        "Write(./RESCUE_PACKET.json)", "Edit(./RESCUE_PACKET.json)",
+        "Write(./sandbox.json)", "Edit(./sandbox.json)",
+        "Write(./ctf-tool)", "Edit(./ctf-tool)",
+        "Bash(git *)", "Bash(docker *)", "Bash(sudo *)", "Bash(ssh *)",
+        "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(ncat *)", "Bash(codex *)",
+        "Bash(claude *)", "Bash(python *codex*)", "Bash(python *claude*)",
+    ]
+    if research == "offline":
+        deny.extend(["WebSearch", "WebFetch"])
+    features = packet.get("claude_code_capabilities", {}).get("features", {})
+    dont_ask = isinstance(features, Mapping) and isinstance(features.get("dontAsk"), Mapping) and features["dontAsk"].get("installed_observed") is True
     return {
         "permissions": {
-            "allow": [
-                "Read(./**)", "Write(./work/**)", "Edit(./work/**)",
-                "Write(./evidence/**)", "Edit(./evidence/**)",
-                "Write(./artifacts/**)", "Edit(./artifacts/**)",
-                "Write(./CLAUDE_RETURN.json)", "Edit(./CLAUDE_RETURN.json)",
-                "Bash(./ctf-tool status)", "Bash(./ctf-tool exec *)",
-                "Bash(./ctf-tool import-input *)",
-            ],
-            "deny": [
-                "Read(../**)", "Write(./context/**)", "Edit(./context/**)",
-                "Write(./RESCUE_PACKET.json)", "Edit(./RESCUE_PACKET.json)",
-                "Write(./sandbox.json)", "Edit(./sandbox.json)",
-                "Write(./ctf-tool)", "Edit(./ctf-tool)",
-                "Bash(git *)", "Bash(docker *)", "Bash(sudo *)", "Bash(ssh *)",
-                "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(ncat *)", "Bash(codex *)",
-                "Bash(claude *)", "Bash(python *codex*)", "Bash(python *claude*)",
-            ],
-        }
+            "defaultMode": "dontAsk" if dont_ask else "default",
+            "allow": allow, "deny": deny,
+        },
+        "hooks": hooks,
     }
 
 
@@ -1353,9 +1688,14 @@ def _agent_file_names(profile: str) -> tuple[str, ...]:
             "ctf-recon-haiku.md", "evidence-triage-haiku.md",
             "exploit-builder-sonnet.md", "alternate-solver-sonnet.md",
         )
+    if profile == "deep":
+        return (
+            "ctf-recon-haiku.md", "evidence-triage-haiku.md",
+            "alternate-solver-sonnet.md", "exploit-builder-sonnet.md",
+        )
     return (
-        "clean-room-recon-haiku.md", "evidence-triage-haiku.md",
-        "alternate-solver-sonnet.md", "exploit-builder-sonnet.md",
+        "clean-room-recon-haiku.md", "alternate-solver-sonnet.md",
+        "exploit-builder-sonnet.md",
     )
 
 
@@ -1364,6 +1704,7 @@ def _ctf_tool_wrapper(
     rescue_root: Path,
     packet: Mapping[str, Any],
 ) -> str:
+    runtime_root = _claude_runtime_root()
     return (
         "#!/bin/sh\n"
         "set -eu\n"
@@ -1374,23 +1715,15 @@ def _ctf_tool_wrapper(
         f"export CTF_OS_RESCUE_PACKET_DIGEST={shlex.quote(str(packet['packet_digest']))}\n"
         "command=${1:-}\n"
         "case \"$command\" in\n"
-        "  status)\n"
-        "    [ \"$#\" -eq 1 ] || { echo 'status accepts no arguments' >&2; exit 2; }\n"
-        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
-        f"--repo {shlex.quote(str(repo_root))} rescue-tool-status\n"
-        "    ;;\n"
-        "  exec)\n"
-        "    shift\n"
-        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
-        f"--repo {shlex.quote(str(repo_root))} rescue-exec \"$@\"\n"
-        "    ;;\n"
-        "  import-input)\n"
-        "    shift\n"
-        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
-        f"--repo {shlex.quote(str(repo_root))} rescue-import-input \"$@\"\n"
-        "    ;;\n"
-        "  *) echo 'usage: ./ctf-tool status | exec [options] -- <direct argv> | import-input <path|--all-bounded>' >&2; exit 2 ;;\n"
+        "  status|exec|import-input|inventory|session|progress|task|knowledge|sandbox|hook|mcp-serve) ;;\n"
+        "  *) echo 'unsupported exact-rescue ctf-tool command' >&2; exit 2 ;;\n"
         "esac\n"
+        f"exec uv run --project {shlex.quote(str(runtime_root))} python -m ctf_os.rescue_tool "
+        f"--repo {shlex.quote(str(repo_root))} "
+        f"--metadata {shlex.quote(str(rescue_root / 'sandbox.json'))} "
+        f"--run-id {shlex.quote(str(packet['identity']['run_id']))} "
+        f"--rescue-id {shlex.quote(str(packet['identity']['rescue_attempt_id']))} "
+        f"--packet-digest {shlex.quote(str(packet['packet_digest']))} \"$@\"\n"
     )
 
 
@@ -1421,17 +1754,30 @@ def _validate_return_shape(result: Mapping[str, Any]) -> None:
             raise RescueError(f"CLAUDE_RETURN.json {field} must be an array")
 
 
-def _validate_model_observation(rescue_root: Path, result: Mapping[str, Any]) -> None:
+def _validate_model_observation(
+    run: Path, rescue_root: Path, result: Mapping[str, Any],
+) -> None:
     observed = result.get("observed_lead_model")
     evidence = result.get("runtime_observation_evidence")
     fallback = result.get("fallback_observed")
-    run = rescue_root.parents[1]
     rescue_id = rescue_root.name
     recorded = [
         row for row in load_rescue_ledger(run)
         if row.get("rescue_attempt_id") == rescue_id
         and row.get("event") == "RESCUE_RUNTIME_RECORDED"
     ]
+    hook_path = rescue_root / "CLAUDE_SESSION_EVENTS.jsonl"
+    hook_rows = read_jsonl_strict(hook_path, "Claude session event ledger") if hook_path.is_file() else []
+    hook_starts = [row for row in hook_rows if row.get("event") == "SessionStart" and row.get("model")]
+    if hook_starts:
+        authoritative = hook_starts[-1]
+        if observed != authoritative.get("model"):
+            raise RescueError("observed model does not match authoritative SessionStart hook evidence")
+        if evidence != "CLAUDE_SESSION_EVENTS.jsonl":
+            raise RescueError("hook-observed model must reference CLAUDE_SESSION_EVENTS.jsonl")
+        if fallback not in {None, True, False}:
+            raise RescueError("fallback_observed must be boolean or null")
+        return
     if observed is None:
         if evidence is not None or fallback is not None:
             raise RescueError("unobserved model must not carry runtime or fallback observation")
@@ -1442,7 +1788,7 @@ def _validate_model_observation(rescue_root: Path, result: Mapping[str, Any]) ->
         raise RescueError("observed model requires an actual runtime evidence path")
     path = _safe_rescue_path(
         rescue_root, evidence, "runtime observation evidence",
-        allowed={"evidence", "logs"},
+        allowed={"evidence", "logs", "CLAUDE_SESSION_EVENTS.jsonl"},
     )
     content = _read_bounded_text(path, 256 * 1024)
     if observed.casefold() not in content.casefold():
@@ -1506,6 +1852,10 @@ def _validate_return_evidence(rescue_root: Path, result: Mapping[str, Any]) -> N
             _direct_argv(row.get("argv"))
         if isinstance(row.get("command_receipt_id"), str):
             _command_receipt_by_id(rescue_root, str(row["command_receipt_id"]))
+        if isinstance(row.get("session_observation_receipt_id"), str):
+            _session_receipt_by_id(
+                rescue_root, str(row["session_observation_receipt_id"]),
+            )
         for key in ("evidence", "command_evidence", "output_evidence"):
             if isinstance(row.get(key), str):
                 references.append(str(row[key]))
@@ -1526,10 +1876,14 @@ def _validate_remote_flag_claim(
     claim = result.get("flag_claim")
     if not isinstance(claim, Mapping):
         raise RescueError("REMOTE_FLAG_OBTAINED requires flag_claim")
-    required = {"candidate", "command_receipt_id", "exploit_artifact"}
-    if not required.issubset(claim):
+    required = {"candidate", "exploit_artifact"}
+    receipt_fields = [
+        key for key in ("execution_receipt_id", "command_receipt_id")
+        if claim.get(key)
+    ]
+    if not required.issubset(claim) or len(receipt_fields) != 1:
         raise RescueError("REMOTE_FLAG_OBTAINED flag_claim is incomplete")
-    unsupported = set(claim).difference(required)
+    unsupported = set(claim).difference(required | {"execution_receipt_id", "command_receipt_id"})
     if unsupported:
         raise RescueError(
             "REMOTE_FLAG_OBTAINED flag_claim has unsupported fields: "
@@ -1538,9 +1892,8 @@ def _validate_remote_flag_claim(
     candidate = str(claim.get("candidate") or "")
     if not candidate or not matches_flag(candidate, challenge.flag_pattern):
         raise RescueError("remote flag candidate does not match the current flag pattern")
-    command_row = _command_receipt_by_id(
-        rescue_root, str(claim.get("command_receipt_id") or ""),
-    )
+    execution_id = str(claim.get(receipt_fields[0]) or "")
+    command_row = _execution_receipt_by_id(rescue_root, execution_id)
     if command_row.get("authorized_network_observed") is not True:
         raise RescueError("REMOTE_FLAG_OBTAINED lacks an authorized network observation")
     if command_row.get("packet_digest") != packet.get("packet_digest"):
@@ -1583,7 +1936,7 @@ def _validate_remote_flag_claim(
         rescue_root, str(command_row.get("evidence_path") or ""), "output evidence",
         allowed={"evidence"},
     )
-    if candidate not in _read_bounded_text(output_path, 512 * 1024):
+    if candidate.encode() not in output_path.read_bytes()[: 512 * 1024]:
         raise RescueError("REMOTE_FLAG_OBTAINED candidate is absent from preserved output evidence")
     artifact_value = str(claim["exploit_artifact"])
     artifact_path = _safe_rescue_path(
@@ -1596,8 +1949,13 @@ def _validate_remote_flag_claim(
         "port": int(target.get("port") or 0),
         "protocol": str(target.get("protocol") or target.get("transport") or ""),
         "target_index": target_index,
-        "exact_argv": argv, "command_receipt_id": command_row["command_receipt_id"],
-        "command_evidence": "RESCUE_COMMANDS.jsonl",
+        "exact_argv": argv, "execution_receipt_id": execution_id,
+        "command_receipt_id": command_row.get("command_receipt_id"),
+        "session_observation_receipt_id": command_row.get("observation_receipt_id"),
+        "command_evidence": (
+            "RESCUE_SESSIONS.jsonl" if command_row.get("observation_receipt_id")
+            else "RESCUE_COMMANDS.jsonl"
+        ),
         "output_evidence": str(command_row["evidence_path"]),
         "exploit_artifact": artifact_value,
         "authorized_network_observed": True,
@@ -1614,11 +1972,18 @@ def _same_declared_target(
         str(observed.get("protocol") or "").casefold(),
         str(observed.get("transport") or "").casefold(),
     }
+    declared_transport = str(
+        declared.get("transport") or declared_protocol
+    ).casefold()
+    observed_transport = str(
+        observed.get("transport") or declared_transport
+    ).casefold()
     return (
         str(declared.get("host") or "").casefold().rstrip(".")
         == str(observed.get("host") or "").casefold().rstrip(".")
         and declared.get("port") == observed.get("port")
         and declared_protocol in observed_protocols
+        and declared_transport == observed_transport
     )
 
 
@@ -1633,6 +1998,7 @@ def _validate_remote_ready(
     allowed = {
         "value", "exact_next_argv", "target_index", "success_condition",
         "kill_condition", "maximum_remaining_experiments", "exploit_artifact",
+        "exploit_artifact_sha256",
     }
     unsupported = set(ready).difference(allowed)
     if unsupported:
@@ -1653,12 +2019,21 @@ def _validate_remote_ready(
     if not isinstance(targets, list) or not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(targets):
         raise RescueError("REMOTE_READY_HANDOFF target index is not a current declared target")
     artifact_value = str(ready.get("exploit_artifact") or "")
-    executable = [
+    matching_artifacts = [
         row for row in artifacts
-        if row.get("actual_executable") and row.get("path") == artifact_value
+        if row.get("path") == artifact_value
     ]
-    if not artifact_value or not executable:
-        raise RescueError("REMOTE_READY_HANDOFF requires an existing executable artifact")
+    artifact_digest = str(ready.get("exploit_artifact_sha256") or "")
+    if (
+        not artifact_value or len(matching_artifacts) != 1
+        or matching_artifacts[0].get("sha256") != artifact_digest
+    ):
+        raise RescueError("REMOTE_READY_HANDOFF requires a matching hashed exploit artifact")
+    container_artifact = "/" + artifact_value
+    interpreter_link = len(argv) > 1 and argv[1] == container_artifact
+    executable_link = argv[0] == container_artifact and matching_artifacts[0].get("actual_executable")
+    if not (interpreter_link or executable_link):
+        raise RescueError("REMOTE_READY_HANDOFF argv is not linked to the exploit artifact")
     if not str(result.get("message_for_codex") or "").strip():
         raise RescueError("REMOTE_READY_HANDOFF requires a message for Codex")
     return {
@@ -1666,6 +2041,7 @@ def _validate_remote_ready(
         "success_condition": success, "kill_condition": kill,
         "maximum_remaining_experiments": maximum,
         "executable_artifact": artifact_value,
+        "exploit_artifact_sha256": artifact_digest,
     }
 
 
@@ -1708,7 +2084,7 @@ def _render_resume(
             or "none"
         ),
         "- Validated command receipts: " + (
-            f"`{remote['command_receipt_id']}`" if remote else
+            f"`{remote['execution_receipt_id']}`" if remote else
             ", ".join(
                 f"`{row.get('command_receipt_id')}`"
                 for row in result.get("decisive_experiments", [])
@@ -1729,27 +2105,23 @@ def _render_resume(
         "Never add the rescue to race lineage or branch projections.",
     ]
     if remote:
-        relative_artifact = (rescue_root / str(remote["exploit_artifact"])).relative_to(run).as_posix()
-        preserved_output = _read_bounded_text(
-            rescue_root / str(remote["output_evidence"]), 64 * 1024,
-        )
         flag_command = [
-            "uv", "run", "python", "-m", "ctf_os.agent_tools", "flag-receipt-save",
+            "uv", "run", "python", "-m", "ctf_os.agent_tools", "rescue-flag-promote",
             str(packet["identity"]["challenge_key"]), "--contest", str(packet["identity"]["contest"]),
-            "--branch", str(packet["identity"]["rescue_attempt_id"]),
-            "--host", str(remote["host"]), "--port", str(remote["port"]),
-            "--protocol", str(remote["protocol"]), "--network-observed",
-            "--output", preserved_output, "--candidate", str(remote["candidate"]),
-            "--exploit-artifact", relative_artifact, "--", *list(remote["exact_argv"]),
+            "--run-id", str(packet["identity"]["run_id"]),
+            "--rescue-id", str(packet["identity"]["rescue_attempt_id"]),
+            "--execution-receipt-id", str(remote["execution_receipt_id"]),
+            "--candidate", str(remote["candidate"]),
+            "--exploit-artifact", str(remote["exploit_artifact"]),
         ]
         lines.extend([
-            "", "## Existing protected flag receipt promotion", "",
-            f"Validated command receipt: `{remote['command_receipt_id']}`  ",
+            "", "## Exact-run protected flag receipt promotion", "",
+            f"Validated execution receipt: `{remote['execution_receipt_id']}`  ",
             f"Preserved output: `{remote['output_evidence']}`  ",
             f"Observed target: `{remote['host']}:{remote['port']}/{remote['protocol']}`  ",
-            f"Network observation proof: `RESCUE_COMMANDS.jsonl#{remote['command_receipt_id']}`",
+            f"Network observation proof: `{remote['command_evidence']}#{remote['execution_receipt_id']}`",
             "",
-            "Only after reproducing all existing `flag-receipt-save` requirements, run:",
+            "Only from the resumed Sol/Codex path, run:",
             "", "```bash", " ".join(shlex.quote(item) for item in flag_command), "```",
             "", "This validation did not create a candidate, milestone, flag receipt, or submission recommendation.",
         ])
@@ -1784,15 +2156,57 @@ def _command_receipt_by_id(rescue_root: Path, receipt_id: str) -> dict[str, Any]
     return row
 
 
+def _session_receipt_by_id(rescue_root: Path, receipt_id: str) -> dict[str, Any]:
+    if not receipt_id or not _ID.fullmatch(receipt_id):
+        raise RescueError("session observation receipt ID is missing or malformed")
+    path = rescue_root / "RESCUE_SESSIONS.jsonl"
+    rows = read_jsonl_strict(path, "rescue session receipt ledger") if path.is_file() else []
+    matching = [
+        row for row in rows
+        if row.get("event") == "SESSION_OUTPUT_OBSERVED"
+        and receipt_id in {row.get("observation_receipt_id"), row.get("receipt_id")}
+    ]
+    if len(matching) != 1:
+        raise RescueError("REMOTE_FLAG_OBTAINED has no unique session observation receipt")
+    row = matching[0]
+    required = {
+        "run_id", "rescue_attempt_id", "packet_digest", "session_id",
+        "session_kind", "cursor_before", "cursor_after", "output_digest",
+        "evidence_path", "evidence_digest", "authorized_network_observed",
+    }
+    if not required.issubset(row):
+        raise RescueError("rescue session observation receipt is malformed")
+    evidence = _safe_rescue_path(
+        rescue_root, str(row["evidence_path"]), "session output evidence",
+        allowed={"evidence"},
+    )
+    if _sha256(evidence) != row.get("evidence_digest"):
+        raise RescueError("rescue session output evidence digest mismatch")
+    return row
+
+
+def _execution_receipt_by_id(rescue_root: Path, receipt_id: str) -> dict[str, Any]:
+    command_error = None
+    try:
+        return _command_receipt_by_id(rescue_root, receipt_id)
+    except RescueError as exc:
+        command_error = exc
+    try:
+        return _session_receipt_by_id(rescue_root, receipt_id)
+    except RescueError as session_error:
+        raise RescueError("no unique command or session observation receipt") from session_error
+
+
 def _existing_receipt_id(run: Path, rescue_root: Path, receipt_id: str) -> bool:
-    for ledger_name in ("milestone-receipts.jsonl", "RESCUE_COMMANDS.jsonl"):
+    for ledger_name in ("milestone-receipts.jsonl", "RESCUE_COMMANDS.jsonl", "RESCUE_SESSIONS.jsonl"):
         path = (
             rescue_root / ledger_name
-            if ledger_name == "RESCUE_COMMANDS.jsonl" else run / ledger_name
+            if ledger_name in {"RESCUE_COMMANDS.jsonl", "RESCUE_SESSIONS.jsonl"} else run / ledger_name
         )
         for row in read_jsonl_strict(path, ledger_name):
             if receipt_id in {
                 row.get("receipt_id"), row.get("command_receipt_id"), row.get("event_id"),
+                row.get("observation_receipt_id"),
             }:
                 return True
     for directory in (
@@ -1814,16 +2228,16 @@ def _existing_receipt_id(run: Path, rescue_root: Path, receipt_id: str) -> bool:
 def _experiment_has_evidence(rescue_root: Path, row: object) -> bool:
     if not isinstance(row, Mapping):
         return False
-    receipt_id = row.get("command_receipt_id")
+    receipt_id = row.get("command_receipt_id") or row.get("session_observation_receipt_id")
     if isinstance(receipt_id, str):
         try:
-            receipt = _command_receipt_by_id(rescue_root, receipt_id)
+            receipt = _execution_receipt_by_id(rescue_root, receipt_id)
         except RescueError:
             return False
         decision = str(row.get("decision") or "").upper()
         observed = str(row.get("observed_result") or "").strip()
         return (
-            receipt.get("exit_code") == 0
+            (receipt.get("exit_code") == 0 or receipt.get("event") == "SESSION_OUTPUT_OBSERVED")
             and bool(observed)
             and decision in {"PROMOTE", "CONFIRMED", "CONTINUE", "SUCCESS"}
         )
@@ -1943,7 +2357,7 @@ def _prepare_response(
         "start_command": _start_command(rescue_root, str(request["requested_lead_model"])),
         "fallback_command": _fallback_command(rescue_root, str(request["profile"])),
         "codex_resume_instruction": "Claude 구조대 결과를 검증하고 이어서 원격 플래그까지 풀어라.",
-        "resume_command": _resume_command(packet),
+        "resume_command": _resume_command(packet, run),
         "sandbox_metadata": str(metadata.get("metadata_path")),
         "sandbox_state": "READY", "idempotent": idempotent,
         "claude_process_started": False, "automatic_model_fallback": False,
@@ -1957,14 +2371,17 @@ def _start_command(rescue_root: Path, requested_model: str) -> str:
 def _fallback_command(rescue_root: Path, profile: str) -> str | None:
     return (
         f"cd {shlex.quote(str(rescue_root))}\nclaude --model opus"
-        if profile == "deep" else None
+        if profile == "fable-strategy" else None
     )
 
 
-def _resume_command(packet: Mapping[str, Any]) -> str:
+def _resume_command(packet: Mapping[str, Any], run: Path) -> str:
     identity = packet["identity"]
+    source_repo = _source_repo_root(run)
     return (
-        "uv run python -m ctf_os.agent_tools rescue-return-validate "
+        f"uv run --project {shlex.quote(str(source_repo))} "
+        "python -m ctf_os.agent_tools "
+        f"--repo {shlex.quote(str(source_repo))} rescue-return-validate "
         f"{shlex.quote(str(identity['challenge_key']))} --contest {shlex.quote(str(identity['contest']))} "
         f"--run-id {shlex.quote(str(identity['run_id']))} "
         f"--rescue-id {shlex.quote(str(identity['rescue_attempt_id']))}"
@@ -1986,21 +2403,90 @@ def _rescue_root(run: Path, rescue_id: str, *, require_packet: bool = True) -> P
     if not _ID.fullmatch(rescue_id) or not rescue_id.startswith("rescue-"):
         raise RescueError("rescue ID is invalid")
     run = run.resolve(strict=False)
-    root = safe_under(run / "rescue", Path(rescue_id))
+    pointer_path = safe_under(
+        run / "rescue" / "RESCUE_POINTERS", Path(f"{rescue_id}.json"),
+    )
+    if pointer_path.is_file() and not pointer_path.is_symlink():
+        pointer = _load_json(pointer_path, "rescue pointer", maximum=16 * 1024)
+        if pointer.get("run_id") != run.name or pointer.get("rescue_attempt_id") != rescue_id:
+            raise RescueError("rescue pointer identity mismatch")
+        root = Path(str(pointer.get("path") or "")).resolve(strict=False)
+        try:
+            root.relative_to((_claude_runtime_root() / "runs").resolve(strict=False))
+        except ValueError as exc:
+            raise RescueError("rescue pointer escapes the Claude runtime root") from exc
+    else:
+        # Workspaces made before the repository split remain readable.
+        root = safe_under(run / "rescue", Path(rescue_id))
     if root.is_symlink() or not root.is_dir():
         raise RescueError(f"rescue attempt does not exist in run {run.name}: {rescue_id}")
-    if root.parent.parent != run:
-        raise RescueError("rescue attempt is not exact-run local")
     if require_packet and not (root / "RESCUE_PACKET.json").is_file():
         raise RescueError("rescue packet is missing")
     return root
+
+
+def _claude_runtime_root() -> Path:
+    configured = os.environ.get(CLAUDE_HOME_ENV)
+    raw_root = (
+        Path(configured).expanduser() if configured
+        else Path(__file__).resolve().parents[1]
+    )
+    if raw_root.is_symlink():
+        raise RescueError(f"Claude runtime root must not be a symlink: {raw_root}")
+    root = raw_root.resolve(strict=False)
+    if not root.is_dir():
+        raise RescueError(f"Claude runtime root is missing or unsafe: {root}")
+    return root
+
+
+def _source_repo_root(run: Path) -> Path:
+    for candidate in (run, *run.parents):
+        if candidate.name == "output":
+            return candidate.parent.resolve(strict=False)
+    raise RescueError("exact run is not below a source repository output directory")
+
+
+def _external_rescue_root(
+    manifest: ContestManifest, challenge: ChallengeSpec, run: Path, rescue_id: str,
+) -> Path:
+    parts = (
+        str(manifest.slug), str(challenge.category), str(challenge.id),
+        str(run.name), rescue_id,
+    )
+    if any(not _ID.fullmatch(part) for part in parts):
+        raise RescueError("Claude workspace identity contains an unsafe path component")
+    return safe_under(_claude_runtime_root() / "runs", Path(*parts))
+
+
+def _write_rescue_pointer(
+    run: Path, rescue_root: Path, packet: Mapping[str, Any],
+) -> None:
+    pointer_dir = run / "rescue" / "RESCUE_POINTERS"
+    if pointer_dir.is_symlink():
+        raise RescueError("run-local rescue pointer directory is unsafe")
+    pointer_dir.mkdir(parents=True, exist_ok=True)
+    pointer = pointer_dir / f"{packet['identity']['rescue_attempt_id']}.json"
+    payload = {
+        "schema_version": 1,
+        "run_id": run.name,
+        "rescue_attempt_id": packet["identity"]["rescue_attempt_id"],
+        "packet_digest": packet["packet_digest"],
+        "path": str(rescue_root.resolve(strict=False)),
+        "runtime_root": str(_claude_runtime_root()),
+    }
+    if pointer.is_file():
+        if _load_json(pointer, "rescue pointer", maximum=16 * 1024) != payload:
+            raise RescueError("existing rescue pointer conflicts with immutable packet")
+        return
+    atomic_json(pointer, payload)
+    pointer.chmod(0o444)
 
 
 def _load_packet(rescue_root: Path) -> dict[str, Any]:
     packet = _load_json(
         rescue_root / "RESCUE_PACKET.json", "rescue packet", maximum=MAX_PACKET_BYTES,
     )
-    if packet.get("schema_version") != RESCUE_SCHEMA_VERSION:
+    if packet.get("schema_version") not in SUPPORTED_RESCUE_SCHEMA_VERSIONS:
         raise RescueError("rescue packet schema is unsupported")
     if not isinstance(packet.get("identity"), dict) or not isinstance(packet.get("request"), dict):
         raise RescueError("rescue packet identity or request is malformed")
@@ -2189,13 +2675,17 @@ def _model_policy(profile: str) -> dict[str, Any]:
             "exploit-builder-sonnet", "alternate-solver-sonnet",
         ],
         "deep": [
-            "clean-room-recon-haiku", "evidence-triage-haiku",
+            "ctf-recon-haiku", "evidence-triage-haiku",
             "alternate-solver-sonnet", "exploit-builder-sonnet",
+        ],
+        "fable-strategy": [
+            "clean-room-recon-haiku", "alternate-solver-sonnet",
+            "exploit-builder-sonnet",
         ],
     }[profile]
     return {
         "profile": profile,
-        "lead_role": "strategy/reinterpretation" if profile == "deep" else "main solver",
+        "lead_role": "strategy/reinterpretation" if profile == "fable-strategy" else "main solver",
         "maximum_concurrent_haiku": 0 if profile == "standard" else 2,
         "maximum_sonnet_implementation": 0 if profile == "standard" else 1,
         "maximum_initial_subagent_invocations": 0 if profile == "standard" else 3,
@@ -2205,6 +2695,70 @@ def _model_policy(profile: str) -> dict[str, Any]:
         "requested_model_is_observed_model": False,
         "automatic_opus_fallback": False,
         "subagents": subagents,
+    }
+
+
+def _claude_code_capabilities() -> dict[str, Any]:
+    """Inspect the CLI without starting a model session."""
+
+    executable = shutil.which("claude")
+    names = (
+        "--resume", "--continue", "--permission-mode", "dontAsk", "project_agents",
+        "project_mcp", "SessionStart", "PreCompact", "PostCompact", "SessionEnd",
+        "SubagentStart", "SubagentStop", "TaskCreated", "TaskCompleted",
+    )
+    result: dict[str, Any] = {
+        "executable": executable, "installed": executable is not None,
+        "version": None, "features": {},
+        "official_contract_checked_at": "2026-07-21",
+    }
+    help_text = ""
+    if executable:
+        try:
+            version = subprocess.run(
+                [executable, "--version"], capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            help_result = subprocess.run(
+                [executable, "--help"], capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            result["version"] = (version.stdout or version.stderr).strip()[:500] or None
+            help_text = help_result.stdout + help_result.stderr
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result["inspection_error"] = str(exc)[:1000]
+    for name in names:
+        if name.startswith("--") or name == "dontAsk":
+            observed = name in help_text if executable else False
+            basis = "installed --help" if executable else "CLI_NOT_INSTALLED"
+        else:
+            observed = None
+            basis = "official Claude Code documentation; runtime hook evidence required"
+        result["features"][name] = {
+            "officially_supported": True, "installed_observed": observed,
+            "basis": basis,
+        }
+    return result
+
+
+def _model_requirements(requested_model: str) -> dict[str, Any]:
+    fable = requested_model == "claude-fable-5"
+    mythos = "mythos" in requested_model.casefold()
+    return {
+        "requested_model": requested_model,
+        "observed_model_source": "Claude Code SessionStart hook only",
+        "cyber_routing_or_fallback": (
+            "Fable cyber classifier may refuse; any fallback must be observed at runtime and is not automatic in CTF-OS"
+            if fable else "none configured by CTF-OS"
+        ),
+        "retention_requirement": (
+            "30-day retention required; unavailable to zero-data-retention workspaces"
+            if fable or mythos else "account/provider policy applies"
+        ),
+        "account_requirement": (
+            "Covered Model access and an eligible retained-data account/workspace"
+            if fable or mythos else "Claude Code account with requested model access"
+        ),
     }
 
 

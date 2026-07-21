@@ -1,0 +1,7 @@
+tools:
+  python3: REQUIRED
+  sage: REQUIRED
+  tmux: REQUIRED
+  z3: RECOMMENDED
+  openssl: OPTIONAL
+  socat: OPTIONAL
