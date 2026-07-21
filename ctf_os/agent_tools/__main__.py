@@ -86,12 +86,9 @@ from ..model_routing import (
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
-from ..rescue import (
-    MODES as RESCUE_MODES, PROFILES as RESCUE_PROFILES,
-    close_rescue, prepare_rescue, record_rescue_runtime, show_rescue,
-    validate_exact_live_mutable_run, validate_rescue_return,
+from ..claude_bridge import (
+    MODES as RESCUE_MODES, PROFILES as RESCUE_PROFILES, dispatch_claude_rescue,
 )
-from ..rescue_tool import dispatch as dispatch_rescue_tool
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -285,6 +282,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
         rescue_prepare.add_argument("--operation-id", required=True)
         rescue_prepare.add_argument("--lead-model")
+        rescue_prepare.add_argument(
+            "--research-policy",
+            choices=("offline", "public-web", "public-web-and-mcp"),
+        )
         _add_session_args(rescue_prepare)
         rescue_show = commands.add_parser("rescue-show")
         rescue_show.add_argument("selector"); rescue_show.add_argument("--contest")
@@ -317,14 +318,14 @@ def build_parser() -> argparse.ArgumentParser:
         )
         rescue_close.add_argument("--evidence-receipt-id")
         _add_session_args(rescue_close)
-    rescue_tool_status = commands.add_parser("rescue-tool-status", help=argparse.SUPPRESS)
-    rescue_exec = commands.add_parser("rescue-exec", help=argparse.SUPPRESS)
-    rescue_exec.add_argument("--timeout", type=int)
-    rescue_exec.add_argument("--timeout-profile", default="quick_probe")
-    rescue_exec.add_argument("argv", nargs=argparse.REMAINDER)
-    rescue_import = commands.add_parser("rescue-import-input", help=argparse.SUPPRESS)
-    rescue_import.add_argument("path", nargs="?")
-    rescue_import.add_argument("--all-bounded", action="store_true")
+        rescue_promote = commands.add_parser("rescue-flag-promote")
+        rescue_promote.add_argument("selector"); rescue_promote.add_argument("--contest")
+        rescue_promote.add_argument("--run-id", required=True)
+        rescue_promote.add_argument("--rescue-id", required=True)
+        rescue_promote.add_argument("--execution-receipt-id", required=True)
+        rescue_promote.add_argument("--candidate", required=True)
+        rescue_promote.add_argument("--exploit-artifact", required=True)
+        _add_session_args(rescue_promote)
     resource_status = commands.add_parser("resource-status")
     resource_status.add_argument("--contest")
     if not child_surface:
@@ -676,7 +677,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     direct_argv_commands = {
         "milestone-save", "progress-command", "flag-receipt-save", "working-poc-commit",
-        "rescue-exec",
     }
     separator = raw_argv.index("--") if "--" in raw_argv else -1
     controls = raw_argv[:separator] if separator >= 0 else raw_argv
@@ -704,30 +704,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def dispatch(root: Path, args: argparse.Namespace) -> object:
-    if args.command in {"rescue-tool-status", "rescue-exec", "rescue-import-input"}:
-        fixed = {
-            "repo": os.environ.get("CTF_OS_RESCUE_REPO"),
-            "metadata": os.environ.get("CTF_OS_RESCUE_METADATA"),
-            "run_id": os.environ.get("CTF_OS_RESCUE_RUN_ID"),
-            "rescue_id": os.environ.get("CTF_OS_RESCUE_ID"),
-            "packet_digest": os.environ.get("CTF_OS_RESCUE_PACKET_DIGEST"),
-        }
-        if not all(fixed.values()) or Path(str(fixed["repo"])).resolve() != root:
-            raise ValueError("internal rescue tool command requires fixed wrapper identity")
-        command = {
-            "rescue-tool-status": "status",
-            "rescue-exec": "exec",
-            "rescue-import-input": "import-input",
-        }[args.command]
-        return dispatch_rescue_tool(argparse.Namespace(
-            **fixed,
-            command=command,
-            timeout=getattr(args, "timeout", None),
-            timeout_profile=getattr(args, "timeout_profile", "quick_probe"),
-            argv=getattr(args, "argv", []),
-            path=getattr(args, "path", None),
-            all_bounded=getattr(args, "all_bounded", False),
-        ))
     if args.command == "init-contest":
         return initialize_contest(root, args.name)
     if args.command == "doctor":
@@ -1054,47 +1030,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
 
     if args.command in {
         "rescue-prepare", "rescue-show", "rescue-runtime-record",
-        "rescue-return-validate", "rescue-close",
+        "rescue-return-validate", "rescue-close", "rescue-flag-promote",
     }:
         _require_sol(args, "Only the current parent Sol session may operate a manual Claude rescue.")
-        manifest, challenge, record = _load_challenge_strict(
-            root, args.contest, args.selector,
-        )
-        workspace = challenge_root(root, manifest, challenge)
-        run = resolve_run_raw(workspace, run_id=args.run_id)
-        if run.name != args.run_id:
-            raise ValueError(f"wrong exact run ID: requested {args.run_id}, resolved {run.name}")
-        if args.command == "rescue-prepare":
-            return prepare_rescue(
-                root, manifest, challenge, record, run,
-                mode=args.mode, profile=args.profile,
-                objective=args.objective, current_blocker=args.current_blocker,
-                operation_id=args.operation_id,
-                leading_exploit_path=args.leading_exploit_path,
-                paths_not_to_repeat=args.path_not_to_repeat,
-                lead_model=args.lead_model,
-                sandbox_factory=create,
-                connectivity_probe=probe_service_connectivity,
-                service_inspector=service_inspect,
-                attachment_factory=service_attachment,
-            )
-        if args.command == "rescue-show":
-            return show_rescue(run, args.rescue_id)
-        if args.command == "rescue-runtime-record":
-            validate_exact_live_mutable_run(run, challenge, record)
-            return record_rescue_runtime(
-                run, args.rescue_id,
-                observed_model=args.observed_model, evidence=args.evidence,
-                fallback_observed=args.fallback_observed,
-            )
-        if args.command == "rescue-return-validate":
-            validate_exact_live_mutable_run(run, challenge, record)
-            return validate_rescue_return(run, challenge, args.rescue_id)
-        return close_rescue(
-            run, args.rescue_id, outcome=args.outcome,
-            evidence_receipt_id=args.evidence_receipt_id,
-            sandbox_cleanup=cleanup,
-        )
+        return dispatch_claude_rescue(root, args)
 
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
     if os.environ.get("CTF_OS_SESSION_ROLE") == "child":

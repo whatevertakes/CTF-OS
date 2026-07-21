@@ -20,7 +20,7 @@ Whole-contest Intake and Triage are optional legacy/admin tools only. Invoke the
 
 For an explicit “intake 해라” or whole-contest inspection request, load `.codex/skills/ctf-intake/SKILL.md`. For an explicit “triage 해라” or whole-contest ranking request, load `.codex/skills/ctf-triage/SKILL.md`. Complete only that requested administrative action and do not present it as the normal route into Solve.
 
-For “Claude 구조대 준비해라”, “클로드 구조대 준비해라”, “Claude에게 넘길 준비해라”, “구조대 폴더 만들어라”, or an explicit deep Claude rescue preparation request, keep the current exact Sol run and load `.codex/skills/ctf-claude-rescue-prepare/SKILL.md`. For “Claude 구조대 결과 이어서 풀어라”, “클로드 결과 검증해라”, “구조대 결과로 계속 풀어라”, or “Claude가 끝났으니 원격 플래그까지 해라”, load `.codex/skills/ctf-claude-resume/SKILL.md`. Preparation never launches Claude; continuation validates the return as candidate insight before the existing Solve and protected flag-receipt paths resume.
+For “Claude 구조대 준비해라”, “클로드 구조대 준비해라”, “코덱스 구조대 준비해라”, “Claude에게 넘길 준비해라”, “구조대 폴더 만들어라”, or an explicit deep Claude rescue preparation request, keep the current exact Sol run and load `.codex/skills/ctf-claude-rescue-prepare/SKILL.md`. In this repository, “코덱스 구조대 준비해라” is an alias for preparing the manual Claude handoff from the current Codex-owned run. The main CLI delegates workspace creation to `~/CTF-OS-claude` (or `CTF_OS_CLAUDE_HOME`) and the returned path must be below that runtime's `runs/` directory. For “Claude 구조대 결과 이어서 풀어라”, “클로드 결과 검증해라”, “구조대 결과로 계속 풀어라”, or “Claude가 끝났으니 원격 플래그까지 해라”, load `.codex/skills/ctf-claude-resume/SKILL.md`. Preparation never launches Claude; continuation validates the return as candidate insight before the existing Solve and protected flag-receipt paths resume.
 
 ## Solve invariants
 

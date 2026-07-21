@@ -1,11 +1,11 @@
 ---
 name: ctf-claude-rescue-prepare
-description: Prepare an exact-run, operator-started Claude rescue workspace without launching Claude. Use for “Claude 구조대 준비해라”, “클로드 구조대 준비해라”, “Claude에게 넘길 준비해라”, “구조대 폴더 만들어라”, “Haiku를 포함한 Claude 구조대 준비해라”, “deep Claude 구조대 준비해라”, or “Fable 구조대 준비해라”.
+description: Prepare an exact-run, operator-started Claude rescue workspace without launching Claude. Use for “Claude 구조대 준비해라”, “코덱스 구조대 준비해라”, “Claude assisted 구조대 준비해라”, “Claude Opus 구조대 준비해라”, “Fable 전략 구조대 준비해라”, “외부 검색 허용하고 구조대 준비해라”, or equivalent manual rescue preparation requests.
 ---
 
 # Manual Claude Rescue Preparation
 
-Prepare one immutable rescue packet for the current exact LIVE solve run. The current Sol session remains the owner of the solve. Never launch, supervise, or restart Claude, Codex, or another model process.
+Prepare one immutable rescue packet for the current exact LIVE solve run through the `CTF-OS-main` bridge. The implementation and generated workspace live in `~/CTF-OS-claude` (or `CTF_OS_CLAUDE_HOME`); the current Sol session remains the owner of the solve. Never launch, supervise, or restart Claude, Codex, or another model process.
 
 ## Workflow
 
@@ -15,10 +15,14 @@ Prepare one immutable rescue packet for the current exact LIVE solve run. The cu
 4. Read recent typed milestone receipts and their referenced evidence. Treat narrative events only as supplemental context.
 5. If the last decisive experiment was actually performed but not recorded, record only that real experiment through the existing milestone command. Never invent an experiment, evidence, or narrative milestone.
 6. Choose one mode: `BLOCKER_BREAK`, `PRIMITIVE_TO_POC`, `REMOTE_ENDGAME`, `FRESH_REINTERPRETATION`, or `FLAG_VERIFICATION`.
-7. Use `standard` unless the operator explicitly requested helpers or deep/Fable. An explicit Haiku-assisted request uses `assisted`; an explicit deep/Fable request uses `deep`. Do not infer either from elapsed time or difficulty.
-8. Run `rescue-prepare` with the selector, contest, exact `--run-id`, mode, profile, one exact objective, one exact blocker, the one-sentence leading path, and a stable `--operation-id`.
-9. If preparation says the Sol-owned managed service is not running, start that service from the current Sol session through the existing service path, then rerun the same preparation. Rescue preparation never takes service ownership.
-10. Do not run the printed `claude` command. The human chooses whether and when to start Claude in a separate terminal.
+7. Select profiles literally: ordinary rescue is `standard`/Sonnet; assisted is `assisted`/Sonnet; explicit Opus/deep is `deep`/Opus; explicit Fable strategy is `fable-strategy`/`claude-fable-5`. Never merge Opus deep and Fable strategy. A restricted model such as Mythos is allowed only when the operator supplies the full `--lead-model` ID.
+8. Select research policy from explicit operator/contest policy. “외부 검색 허용” means `public-web`; an explicit already-connected research MCP request means `public-web-and-mcp`. If policy cannot be established, use `offline` and state that in the handoff.
+9. Run `rescue-prepare` with selector, contest, exact `--run-id`, mode, profile, research policy, one exact objective, one exact blocker, the leading path, and a stable `--operation-id`.
+   Run it from `CTF-OS-main`; do not invoke or copy the migrated runtime modules back into main.
+10. Check the returned `toolchain_receipt`; missing `REQUIRED` category tools are an actionable preparation failure. Report installed Claude CLI capability status exactly as recorded; never invent support when the CLI is absent.
+11. If preparation says the Sol-owned managed service is not running, start that service from the current Sol session through the existing service path, then rerun the same preparation. Rescue preparation never takes service ownership.
+12. Do not run the printed `claude`, resume, or continue command. The human chooses whether and when to start Claude in a separate terminal.
+13. Confirm that the returned `Path` is below `~/CTF-OS-claude/runs/` (or the configured `CTF_OS_CLAUDE_HOME/runs/`). A path inside `CTF-OS-main/output/.../rescue/` is a migration failure.
 
 ## Required handoff
 
@@ -31,10 +35,12 @@ Rescue ID:
 Mode:
 Profile:
 Requested model:
+Research policy:
+Toolchain receipt:
 Path:
 Start command:
-Fallback command if manually needed:
+Resume command if a runtime session already exists:
 Codex resume instruction:
 ```
 
-The fallback is a manually approved command only. Never treat requested Fable as observed Fable or automatically restart it as Opus.
+Only a Claude Code `SessionStart` hook may establish the authoritative observed model. Never treat requested Fable as observed Fable or automatically restart it as Opus/Sonnet.

@@ -152,30 +152,18 @@ workers = max(1, int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")))
 
 Scheduler는 자원을 배분할 뿐 solve progress나 native lifecycle을 소유하지 않습니다. 관리가 solver reasoning, minimal PoC, remote attempt, flag 출력보다 앞설 수 없습니다.
 
-## Manual Claude Rescue
+## Claude 구조대 브리지
 
-Manual Claude Rescue는 진행 중인 LIVE Codex Solve의 exact run에 수동 외부 solver workspace를 하나 준비하는 기능입니다. CTF-OS와 Codex는 Claude CLI를 실행하거나 감독하지 않습니다. Intake/Triage, 새 benchmark arm, race child, 공유 writable workdir도 만들지 않습니다.
+`CTF-OS-main`은 Codex Solve와 exact-run 보호 상태를 소유하고, Claude 실행 구현과 workspace는 별도 `~/CTF-OS-claude`가 소유합니다. Codex에게 `Claude 구조대 준비해라`라고 요청하면 main의 얇은 브리지가 새 저장소의 런타임을 호출합니다. 생성되는 packet, MCP, hook, toolchain, writable `work/evidence/artifacts`는 모두 `~/CTF-OS-claude/runs/` 아래에 놓이고, main run에는 lifecycle ledger와 검증된 경로 포인터만 남습니다.
 
-실제 흐름은 다음과 같습니다.
+Claude는 자동 실행되지 않습니다. 출력된 `Path`로 이동한 뒤 출력된 `Start command`를 사용자가 별도 터미널에서 실행합니다. 완료 후 기존 Codex 세션에서 `Claude 구조대 결과 이어서 원격 플래그까지 풀어라`를 요청하면 같은 브리지를 통해 return을 검증하고 기존 protected flag 경로로 복귀합니다.
 
-1. Codex Solve 중 Codex에게 `Claude 구조대 준비해라`라고 요청합니다.
-2. 출력된 exact run, rescue ID, rescue path를 확인합니다.
-3. Codex CLI를 중지하거나 일시 중지합니다.
-4. 새 터미널을 엽니다.
-5. 출력된 rescue directory로 `cd`합니다.
-6. standard profile은 `claude --model sonnet`, 명시적 assisted profile은 동일 Sonnet main과 제한된 agent, 명시적 deep profile은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
-7. Claude가 sandbox의 `./ctf-tool`만 사용해 challenge/remote 명령을 실행하고 `CLAUDE_RETURN.json`을 작성하도록 합니다.
-8. Claude를 종료합니다.
-9. 기존 Codex 세션을 재개합니다.
-10. Codex에게 `Claude 구조대 결과 이어서 원격 플래그까지 풀어라`라고 요청합니다.
-11. Codex가 return identity, packet digest, artifact/evidence hash, command receipt와 network observation을 검증한 뒤 최대 1~3개의 결정적 실험으로 기존 Solve를 계속합니다.
-12. 기존 protected flag receipt가 만들어지면 exact flag를 사람이 제출합니다.
-
-저수준 CLI도 exact `--run-id`를 반드시 요구합니다.
+기본 설치 위치는 `~/CTF-OS-claude`이며 다른 위치를 쓸 때는 `CTF_OS_CLAUDE_HOME`을 설정합니다. 저수준 CLI 표면은 기존과 동일하고 exact `--run-id`를 반드시 요구합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools rescue-prepare 1 --contest my-ctf \
   --run-id '<exact-run-id>' --mode PRIMITIVE_TO_POC --profile standard \
+  --research-policy offline \
   --objective 'confirmed primitive을 executable remote PoC로 연결' \
   --current-blocker 'remote protocol framing이 아직 검증되지 않음' \
   --operation-id 'manual-rescue-poc-v1'
@@ -186,21 +174,16 @@ uv run python -m ctf_os.agent_tools rescue-show 1 --contest my-ctf \
 uv run python -m ctf_os.agent_tools rescue-return-validate 1 --contest my-ctf \
   --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
 
+uv run python -m ctf_os.agent_tools rescue-flag-promote 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' \
+  --execution-receipt-id '<command-or-session-observation-id>' \
+  --candidate 'CTF{...}' --exploit-artifact 'artifacts/solve.py'
+
 uv run python -m ctf_os.agent_tools rescue-close 1 --contest my-ctf \
   --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --outcome integrated
 ```
 
-실제 runtime model evidence가 있을 때만 requested/observed를 분리 기록합니다.
-
-```bash
-uv run python -m ctf_os.agent_tools rescue-runtime-record 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' \
-  --observed-model '<observed model>' --evidence 'evidence/runtime-model.txt'
-```
-
-설계와 격리 계약은 [`docs/CLAUDE_RESCUE_SOLVER.md`](docs/CLAUDE_RESCUE_SOLVER.md), 후속 controlled replay 계약은 [`docs/CLAUDE_RESCUE_EVAL.md`](docs/CLAUDE_RESCUE_EVAL.md)에 있습니다. 실제 replay 전 성능 결론은 `INCONCLUSIVE`입니다.
-
-`RESCUE_PACKET.json`은 `packet_digest` 필드만 제외한 객체를 UTF-8 canonical JSON(`sort_keys=true`, compact separators)으로 직렬화한 SHA-256을 digest로 사용하며 생성 후 read-only입니다. 새 상태는 같은 packet을 수정하지 않고 새 operation ID와 rescue attempt로 캡처합니다. `requested_lead_model`은 운영 의도일 뿐이고 `observed_lead_model`은 실제 CLI evidence가 있을 때만 기록합니다. Deep Fable이 거부하거나 진행할 수 없을 때 START 문서가 보여 주는 Opus 명령은 사람이 승인해 새 세션에서 실행하는 대안이며 자동 fallback이 아닙니다.
+런타임 설계, 격리, interactive tool, research lane, live test 문서는 [`../CTF-OS-claude/docs/`](../CTF-OS-claude/docs/)에 있습니다. main은 Claude CLI나 모델 API를 실행·감독하지 않으며 flag 제출도 자동화하지 않습니다.
 
 ## Scope와 flag fast path
 

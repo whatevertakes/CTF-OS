@@ -20,12 +20,6 @@ ctf_os = [
   "resources/timeout-profiles.yaml",
   "resources/solve-policy.yaml",
   "resources/knowledge/playbooks/*.md",
-  "resources/claude-rescue/*.md",
-  "resources/claude-rescue/*.json",
-  "resources/claude-rescue/modes/*.md",
-  "resources/claude-rescue/profiles/*.md",
-  "resources/claude-rescue/agents/*.md",
-  "resources/claude-rescue/playbooks/*.md",
 ]
 
 [dependency-groups]

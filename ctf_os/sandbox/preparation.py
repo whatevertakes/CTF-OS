@@ -18,7 +18,7 @@ SUPPORTED_IMAGES = frozenset({
     "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud",
 })
 RESCUE_SERVICE_ERROR = (
-    "Claude rescue requires the Sol-owned challenge service to be running. "
+    "External rescue requires the Sol-owned challenge service to be running. "
     "Return to the current Sol session, start the managed service, then rerun rescue-prepare."
 )
 
