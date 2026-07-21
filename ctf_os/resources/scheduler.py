@@ -35,7 +35,6 @@ WORKLOAD_CLASSES = (
     "web-probing", "service-runtime", "symbolic-execution", "fuzzing", "crypto-light",
     "crypto-heavy", "password-cracking", "forensic-scan", "forensic-extraction",
     "ai-inference", "ai-training", "independent-full-solve", "clean-room-verification",
-    "external-rescue",
     "custom-cpu-bound", "custom-memory-bound", "custom-io-bound", "custom-network-bound",
 )
 TERMINAL_STATES = frozenset({
@@ -101,10 +100,6 @@ WORKLOAD_DEFAULTS: dict[str, WorkloadDefaults] = {
     "ai-training": _d((4, 6, 8), (8, 16, 20), 16, priority="HIGH", parallelizable=True, gpu_preferred=True, memory_per_worker_bytes=2 * GIB),
     "independent-full-solve": _d((2, 4, 6), (4, 8, 12), 6, parallelizable=True),
     "clean-room-verification": _d((1, 2, 4), (2, 4, 8), 4, priority="LOW"),
-    "external-rescue": _d(
-        (2, 2, 2), (4, 4, 4), 6, priority="HIGH",
-        parallelizable=False, elastic=False,
-    ),
     "custom-cpu-bound": _d((1, 4, 16), (2, 6, 16), 6, parallelizable=True),
     "custom-memory-bound": _d((1, 3, 8), (4, 12, 32), 8, memory_per_worker_bytes=2 * GIB),
     "custom-io-bound": _d((1, 3, 8), (2, 8, 16), 16, parallelizable=True),

@@ -97,13 +97,11 @@ Elastic scheduling is opt-in for proven long-compute workloads. `LONG_COMPUTE` r
 
 The dynamic scheduler allocates compute; it does not define solve progress. Short probes and quick PoCs run immediately without repeated `resource-status`, `resource-request`, `resource-plan`, or rebalance calls. Use scheduler planning before long symbolic execution, fuzzing, forensic scans, crypto/cracking, or AI computation, then inspect progress only at bounded slices. Scheduler management must never delay solver reasoning, a minimal PoC, remote execution, or flag display. New parallel harnesses use `CTF_OS_RECOMMENDED_WORKERS`.
 
-### Manual external rescue profile
+### Manual Claude handoff termination
 
-A manual Claude rescue is an exact-run external solver session, not a race child, benchmark treatment, or transfer of Solve ownership. It is available only on mutable LIVE competition runs. Main delegates packet/workspace operations to the separately installed `CTF-OS-claude` runtime while retaining the exact Sol run and protected flag state. Python, Codex, and shell automation never launch, supervise, restart, route, or infer the model process. The human explicitly starts and stops Claude in another terminal, while the current user-opened Sol session retains the solve.
+“클로드 구조대 준비해라” is an immediate termination command for the current exact Solve. New recon, exploit, remote, service, and challenge-file commands stop before handoff collection. Sol compacts only evidence-backed facts and commands that actually ran into one repository-local `rescue/<contest>/<challenge>/HANDOFF.md`, verifies that file, and then ends the challenge solve.
 
-The authoritative lifecycle ledger and a bounded workspace pointer remain run-local under `runs/<run-id>/rescue/`; the immutable packet and writable rescue workspace live under `CTF-OS-claude/runs/`. `RESCUE_STATE.json` and `CODEX-RESUME.md` are projections or handoff views. A rescue is absent from race lineage, delegation plans, branch projections, and native child widths. Its bind workspace exposes only rescue-local `work`, `evidence`, and `artifacts` as writable, selected generated context and prepared challenge input as read-only, and only organizer-declared targets through the existing sandbox network policy. A managed service is attach-only and remains owned by `sol-main`.
-
-Claude output remains candidate insight. Return validation never modifies Solve state, candidates, milestone receipts, race events, verified flag receipts, or submission recommendations. A claimed remote flag may reach `SUBMISSION_RECOMMENDED` only after Sol independently satisfies the existing protected remote receipt contract. Submission remains human-only.
+The handoff process never searches for or touches the original ZIP, invokes or inspects a Claude runtime, creates an external sandbox or workspace, copies an artifact, validates a returned result, or resumes the Solve from Claude output. The human alone moves the original ZIP and `HANDOFF.md` to another system.
 
 ## Scope, isolation, and flag fast path
 

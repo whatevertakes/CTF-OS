@@ -60,13 +60,7 @@ class SandboxSpec:
     workload_class: str | None = None
     resource_priority: str | None = None
     resource_request_override: Mapping[str, object] | None = None
-    workspace_mode: str = "tmpfs"
     run_id: str | None = None
-    rescue_attempt_id: str | None = None
-    external_solver: bool = False
-    solver_family: str | None = None
-    session_kind: str = "native-worker"
-    requested_lead_model: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -111,8 +105,6 @@ class SandboxSpec:
         }
         if self.run_id:
             labels["ctf-os.run_id"] = self.run_id
-        if self.rescue_attempt_id:
-            labels["ctf-os.rescue_attempt_id"] = self.rescue_attempt_id
         return labels
 
     @property
@@ -135,12 +127,6 @@ class SandboxSpec:
             labels["ctf-os.gpu_backend"] = self.gpu_backend
         if self.gpu_fallback:
             labels["ctf-os.gpu_fallback"] = self.gpu_fallback
-        if self.external_solver or self.workspace_mode != "tmpfs" or self.session_kind != "native-worker":
-            labels["ctf-os.session_kind"] = self.session_kind
-            labels["ctf-os.external_solver"] = str(self.external_solver).lower()
-            labels["ctf-os.workspace_mode"] = self.workspace_mode
-        if self.solver_family:
-            labels["ctf-os.solver_family"] = str(self.solver_family)
         return labels
 
     @property
@@ -172,19 +158,11 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
     local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
     allocation = {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}
     resource_env = allocation_environment(allocation, spec.resource_request)
-    mutable_mounts = (
-        [
-            "--mount", f"type=bind,src={(spec.branch_root / 'work').resolve()},dst=/work",
-            "--mount", f"type=bind,src={(spec.branch_root / 'evidence').resolve()},dst=/evidence",
-            "--mount", f"type=bind,src={(spec.branch_root / 'artifacts').resolve()},dst=/artifacts",
-        ]
-        if spec.workspace_mode == "bind" else
-        [
-            "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-            "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-            "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-        ]
-    )
+    mutable_mounts = [
+        "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+        "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
+    ]
     argv = [
         docker, "run", "--detach", "--name", spec.name, "--read-only",
         "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -284,16 +262,6 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "target_revision": spec.target_revision,
         "authorized_targets": [target.to_dict() for target in spec.targets],
     }
-    if spec.external_solver or spec.workspace_mode != "tmpfs" or spec.session_kind != "native-worker":
-        metadata.update({
-            "session_kind": spec.session_kind,
-            "run_id": spec.run_id,
-            "rescue_attempt_id": spec.rescue_attempt_id,
-            "external_solver": spec.external_solver,
-            "solver_family": spec.solver_family,
-            "requested_lead_model": spec.requested_lead_model,
-            "workspace_mode": spec.workspace_mode,
-        })
     try:
         with admission_lock():
             admit(
@@ -582,7 +550,7 @@ def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, ob
         if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
             raise SandboxError("refusing cleanup: container labels do not match sandbox metadata")
         branch_root = Path(str(metadata["branch_root"])).resolve()
-        exports = () if metadata.get("workspace_mode", "tmpfs") == "bind" else (
+        exports = (
             ("artifacts", branch_root / "artifacts", "/artifacts", "artifact"),
             ("work", branch_root / "work", "/work", "work"),
             ("evidence", branch_root / "evidence", "/evidence", "evidence"),
@@ -729,19 +697,10 @@ def _validate_spec(spec: SandboxSpec) -> None:
     for label, value in (("session id", spec.session_id), ("parent session id", spec.parent_session_id)):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
             raise SandboxError(f"{label} is invalid")
-    if spec.session_role not in {"sol", "child", "external", "external-rescue"}:
-        raise SandboxError("session role must be sol, child, or external-rescue")
+    if spec.session_role not in {"sol", "child"}:
+        raise SandboxError("session role must be sol or child")
     if spec.session_role == "child" and spec.session_id == spec.parent_session_id:
         raise SandboxError("child session id must differ from its parent session id")
-    if spec.session_role in {"external", "external-rescue"} and not (
-        spec.external_solver and spec.session_kind == "external-rescue"
-        and spec.rescue_attempt_id == spec.session_id
-    ):
-        raise SandboxError("external sandbox role requires an exact external-rescue identity")
-    if spec.workspace_mode not in {"tmpfs", "bind"}:
-        raise SandboxError("workspace mode must be tmpfs or bind")
-    if spec.workspace_mode == "bind" and not spec.external_solver:
-        raise SandboxError("bind workspace mode is reserved for an external solver")
     if spec.gpu_device is not None and not spec.gpu_enabled:
         raise SandboxError("GPU device selection requires GPU passthrough to be enabled")
     if spec.gpu_backend not in {None, "nvidia"}:
@@ -811,7 +770,7 @@ def _authorize_sandbox(
     """Enforce worker ownership when a model-facing caller identity is supplied."""
     if session_id is None and session_role is None:
         return  # Backwards-compatible trusted in-process controller path.
-    if session_role not in {"sol", "child", "external", "external-rescue"} or not session_id:
+    if session_role not in {"sol", "child"} or not session_id:
         raise SandboxError("sandbox caller must provide a valid session id and role")
     owner = str(metadata.get("session_id", ""))
     parent = str(metadata.get("parent_session_id", ""))
@@ -819,16 +778,6 @@ def _authorize_sandbox(
         if session_id != parent:
             raise SandboxError(
                 f"DENIED_SANDBOX_ACCESS: Sol session {session_id} does not own worker parent scope {parent}"
-            )
-        return
-    if session_role in {"external", "external-rescue"}:
-        if (
-            metadata.get("external_solver") is not True
-            or metadata.get("session_kind") != "external-rescue"
-            or session_id != owner
-        ):
-            raise SandboxError(
-                f"DENIED_SANDBOX_ACCESS: external session {session_id} does not own this rescue sandbox"
             )
         return
     if session_id != owner:

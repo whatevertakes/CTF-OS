@@ -7,6 +7,8 @@ description: Competition-first solve of exactly one authorized CTF challenge wit
 
 `ctf_os/resources/agent-policy.md` is authoritative and governs every step below. This is a timed CTF solve, not a research task: obtain the first valid flag, prefer the shortest executable exploit path, and explain later. The current user-opened Sol session is lead attacker. Never run Codex or Claude from Python/a shell, call a model API, or submit a flag automatically.
 
+“클로드 구조대 준비해라” and the equivalent manual Claude handoff triggers are immediate Solve termination commands. Stop before any new recon, exploit, remote, service, or challenge-file command; load `.codex/skills/ctf-claude-handoff/SKILL.md`; write and verify the single evidence-backed `rescue/<contest>/<challenge>/HANDOFF.md`; then perform no more reasoning or tool execution for that challenge. Never call a Claude system or move the original ZIP or any challenge artifact.
+
 ## Start with bounded observation
 
 1. The current user-opened session remains lead Sol from preparation through human submission feedback and cleanup. You are the main attacker, not a coordinator-only process. Read root `AGENTS.md`, the authoritative agent policy, and only the selected category playbook.

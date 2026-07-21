@@ -69,7 +69,7 @@ from ..transitions import control_loop_tick
 from ..tui import resource_panel
 from ..workspace import (
     atomic_json, challenge_root, challenge_workspace, initialize_solve_files,
-    list_attempts, recover_run_state, resolve_run_raw, resume_attempt, safe_under,
+    list_attempts, recover_run_state, resolve_active_run, resolve_run_raw, resume_attempt, safe_under,
     resolve_exact_run, show_attempt, start_fresh_attempt, state_lock, target_revisions,
 )
 from ..worker import (
@@ -86,9 +86,7 @@ from ..model_routing import (
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
-from ..claude_bridge import (
-    MODES as RESCUE_MODES, PROFILES as RESCUE_PROFILES, dispatch_claude_rescue,
-)
+from ..claude_handoff import save_handoff
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -262,70 +260,15 @@ def build_parser() -> argparse.ArgumentParser:
         repair_projection_parser = commands.add_parser("repair-projections")
         repair_projection_parser.add_argument("selector"); repair_projection_parser.add_argument("--contest")
         repair_projection_parser.add_argument("--run-id"); _add_session_args(repair_projection_parser)
-        rescue_prepare = commands.add_parser(
-            "rescue-prepare",
-            description=(
-                "Prepare an exact LIVE run for a manually started Claude rescue. "
-                "This command never launches Claude or another model process."
-            ),
+        handoff_save = commands.add_parser(
+            "claude-handoff-save",
+            help=argparse.SUPPRESS,
+            description="Store the current exact run's manually composed HANDOFF.md.",
         )
-        rescue_prepare.add_argument("selector"); rescue_prepare.add_argument("--contest")
-        rescue_prepare.add_argument("--run-id", required=True)
-        rescue_prepare.add_argument("--mode", required=True, choices=tuple(sorted(RESCUE_MODES)))
-        rescue_prepare.add_argument("--profile", choices=tuple(sorted(RESCUE_PROFILES)), default="standard")
-        rescue_prepare.add_argument("--objective", required=True)
-        rescue_prepare.add_argument("--current-blocker", required=True)
-        rescue_prepare.add_argument("--leading-exploit-path")
-        rescue_prepare.add_argument(
-            "--avoid", "--path-not-to-repeat", dest="path_not_to_repeat",
-            action="append", default=[],
-        )
-        rescue_prepare.add_argument("--operation-id", required=True)
-        rescue_prepare.add_argument("--lead-model")
-        rescue_prepare.add_argument(
-            "--research-policy",
-            choices=("offline", "public-web", "public-web-and-mcp"),
-        )
-        _add_session_args(rescue_prepare)
-        rescue_show = commands.add_parser("rescue-show")
-        rescue_show.add_argument("selector"); rescue_show.add_argument("--contest")
-        rescue_show.add_argument("--run-id", required=True)
-        rescue_show.add_argument("--rescue-id", required=True)
-        _add_session_args(rescue_show)
-        rescue_runtime = commands.add_parser("rescue-runtime-record")
-        rescue_runtime.add_argument("selector"); rescue_runtime.add_argument("--contest")
-        rescue_runtime.add_argument("--run-id", required=True)
-        rescue_runtime.add_argument("--rescue-id", required=True)
-        rescue_runtime.add_argument("--observed-model", required=True)
-        rescue_runtime.add_argument("--evidence", required=True)
-        rescue_runtime.add_argument(
-            "--fallback-observed", action=argparse.BooleanOptionalAction,
-            default=None,
-        )
-        _add_session_args(rescue_runtime)
-        rescue_validate = commands.add_parser("rescue-return-validate")
-        rescue_validate.add_argument("selector"); rescue_validate.add_argument("--contest")
-        rescue_validate.add_argument("--run-id", required=True)
-        rescue_validate.add_argument("--rescue-id", required=True)
-        _add_session_args(rescue_validate)
-        rescue_close = commands.add_parser("rescue-close")
-        rescue_close.add_argument("selector"); rescue_close.add_argument("--contest")
-        rescue_close.add_argument("--run-id", required=True)
-        rescue_close.add_argument("--rescue-id", required=True)
-        rescue_close.add_argument(
-            "--outcome", required=True,
-            choices=("integrated", "refuted", "no-new-path", "flag-obtained", "manual"),
-        )
-        rescue_close.add_argument("--evidence-receipt-id")
-        _add_session_args(rescue_close)
-        rescue_promote = commands.add_parser("rescue-flag-promote")
-        rescue_promote.add_argument("selector"); rescue_promote.add_argument("--contest")
-        rescue_promote.add_argument("--run-id", required=True)
-        rescue_promote.add_argument("--rescue-id", required=True)
-        rescue_promote.add_argument("--execution-receipt-id", required=True)
-        rescue_promote.add_argument("--candidate", required=True)
-        rescue_promote.add_argument("--exploit-artifact", required=True)
-        _add_session_args(rescue_promote)
+        handoff_save.add_argument("selector"); handoff_save.add_argument("--contest", required=True)
+        handoff_save.add_argument("--run-id", required=True)
+        handoff_save.add_argument("--markdown-file", required=True)
+        _add_session_args(handoff_save)
     resource_status = commands.add_parser("resource-status")
     resource_status.add_argument("--contest")
     if not child_surface:
@@ -1028,12 +971,35 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         )
         return receipt
 
-    if args.command in {
-        "rescue-prepare", "rescue-show", "rescue-runtime-record",
-        "rescue-return-validate", "rescue-close", "rescue-flag-promote",
-    }:
-        _require_sol(args, "Only the current parent Sol session may operate a manual Claude rescue.")
-        return dispatch_claude_rescue(root, args)
+    if args.command == "claude-handoff-save":
+        _require_sol(args, "Only the current parent Sol session may save a Claude handoff.")
+        manifest = select_contest(discover_contests(root / "incoming"), args.contest)
+        challenge = resolve_session_challenge(root, manifest, args.selector)
+        workspace = challenge_root(root, manifest, challenge)
+        current = resolve_active_run(workspace, migrate=False)
+        run = resolve_exact_run(workspace, args.run_id)
+        if current != run:
+            raise ValueError("requested run_id is not the current exact run")
+        run_manifest_path = run / "RUN_MANIFEST.json"
+        if run_manifest_path.is_symlink() or not run_manifest_path.is_file():
+            raise ValueError("current run manifest is missing or unsafe")
+        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+        run_challenge = run_manifest.get("challenge")
+        if (
+            not isinstance(run_challenge, dict)
+            or run_manifest.get("run_id") != args.run_id
+            or run_challenge.get("challenge_id") != challenge.id
+        ):
+            raise ValueError("current run manifest does not match the selected challenge/run")
+        path = save_handoff(
+            root, contest=manifest.slug, challenge=challenge.id,
+            markdown_file=Path(args.markdown_file),
+        )
+        return {
+            "contest": manifest.slug, "challenge": challenge.id,
+            "run_id": run.name, "path": str(path),
+            "relative_path": str(path.relative_to(root)),
+        }
 
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
     if os.environ.get("CTF_OS_SESSION_ROLE") == "child":

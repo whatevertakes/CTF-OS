@@ -1,4 +1,4 @@
-"""Shared, side-effect-light preparation for worker and manual-rescue sandboxes."""
+"""Shared, side-effect-light preparation for worker sandboxes."""
 
 from __future__ import annotations
 
@@ -17,12 +17,6 @@ from .runtime import SandboxSpec
 SUPPORTED_IMAGES = frozenset({
     "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud",
 })
-RESCUE_SERVICE_ERROR = (
-    "External rescue requires the Sol-owned challenge service to be running. "
-    "Return to the current Sol session, start the managed service, then rerun rescue-prepare."
-)
-
-
 @dataclass(frozen=True, slots=True)
 class PreparedSandbox:
     spec: SandboxSpec
@@ -92,14 +86,7 @@ def prepare_sandbox_spec(
     image_override: str | None = None,
     resource_profile_override: str | None = None,
     require_service: bool = False,
-    require_running_managed_service: bool = False,
-    workspace_mode: str = "tmpfs",
     run_id: str | None = None,
-    rescue_attempt_id: str | None = None,
-    external_solver: bool = False,
-    solver_family: str | None = None,
-    session_kind: str = "native-worker",
-    requested_lead_model: str | None = None,
     allow_scheduler_rebalance: bool = True,
     prepared_fingerprint_reader: Callable[[Path], str] = prepared_tree_fingerprint,
     service_inspector: Callable[..., dict[str, object]] = service_inspect,
@@ -185,8 +172,6 @@ def prepare_sandbox_spec(
                     "the parent Sol session owns its lifecycle."
                 ),
             })
-        elif require_running_managed_service:
-            raise ValueError(RESCUE_SERVICE_ERROR)
         elif require_service or owner.get("state") == "RUNNING" or bool(containers):
             reasons: list[str] = []
             if not owner:
@@ -210,9 +195,8 @@ def prepare_sandbox_spec(
                 "managed service attachment failed: "
                 + ", ".join(reasons or ["service unavailable"])
             )
-    elif require_service or require_running_managed_service:
+    elif require_service:
         raise ValueError(
-            RESCUE_SERVICE_ERROR if require_running_managed_service else
             "managed service attachment failed: challenge preparation has no service plan"
         )
 
@@ -241,7 +225,6 @@ def prepare_sandbox_spec(
         ],
         role=branch, category=category,
         override=(
-            "external-rescue" if session_kind == "external-rescue" else
             str(request_raw.get("workload_class"))
             if isinstance(request_raw, dict) else None
         ),
@@ -309,10 +292,7 @@ def prepare_sandbox_spec(
         gpu_enabled=gpu_enabled, gpu_device=gpu_device,
         gpu_requested=gpu_requested, gpu_backend=gpu_backend,
         gpu_fallback=gpu_fallback,
-        workspace_mode=workspace_mode, run_id=run_id,
-        rescue_attempt_id=rescue_attempt_id, external_solver=external_solver,
-        solver_family=solver_family, session_kind=session_kind,
-        requested_lead_model=requested_lead_model,
+        run_id=run_id,
     )
     return PreparedSandbox(spec, attachment_service, service_context)
 

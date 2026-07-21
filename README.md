@@ -152,38 +152,15 @@ workers = max(1, int(os.environ.get("CTF_OS_RECOMMENDED_WORKERS", "1")))
 
 Scheduler는 자원을 배분할 뿐 solve progress나 native lifecycle을 소유하지 않습니다. 관리가 solver reasoning, minimal PoC, remote attempt, flag 출력보다 앞설 수 없습니다.
 
-## Claude 구조대 브리지
+## Manual Claude handoff
 
-`CTF-OS-main`은 Codex Solve와 exact-run 보호 상태를 소유하고, Claude 실행 구현과 workspace는 별도 `~/CTF-OS-claude`가 소유합니다. Codex에게 `Claude 구조대 준비해라`라고 요청하면 main의 얇은 브리지가 새 저장소의 런타임을 호출합니다. 생성되는 packet, MCP, hook, toolchain, writable `work/evidence/artifacts`는 모두 `~/CTF-OS-claude/runs/` 아래에 놓이고, main run에는 lifecycle ledger와 검증된 경로 포인터만 남습니다.
+Codex Solve 중 “클로드 구조대 준비해라”라고 요청하면 CTF-OS는 현재까지 확인한 사실과 실제 풀이 과정을 다음 파일 하나에 정리합니다.
 
-Claude는 자동 실행되지 않습니다. 출력된 `Path`로 이동한 뒤 출력된 `Start command`를 사용자가 별도 터미널에서 실행합니다. 완료 후 기존 Codex 세션에서 `Claude 구조대 결과 이어서 원격 플래그까지 풀어라`를 요청하면 같은 브리지를 통해 return을 검증하고 기존 protected flag 경로로 복귀합니다.
-
-기본 설치 위치는 `~/CTF-OS-claude`이며 다른 위치를 쓸 때는 `CTF_OS_CLAUDE_HOME`을 설정합니다. 저수준 CLI 표면은 기존과 동일하고 exact `--run-id`를 반드시 요구합니다.
-
-```bash
-uv run python -m ctf_os.agent_tools rescue-prepare 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --mode PRIMITIVE_TO_POC --profile standard \
-  --research-policy offline \
-  --objective 'confirmed primitive을 executable remote PoC로 연결' \
-  --current-blocker 'remote protocol framing이 아직 검증되지 않음' \
-  --operation-id 'manual-rescue-poc-v1'
-
-uv run python -m ctf_os.agent_tools rescue-show 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
-
-uv run python -m ctf_os.agent_tools rescue-return-validate 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
-
-uv run python -m ctf_os.agent_tools rescue-flag-promote 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' \
-  --execution-receipt-id '<command-or-session-observation-id>' \
-  --candidate 'CTF{...}' --exploit-artifact 'artifacts/solve.py'
-
-uv run python -m ctf_os.agent_tools rescue-close 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --outcome integrated
+```text
+~/CTF-OS/rescue/<contest>/<challenge>/HANDOFF.md
 ```
 
-런타임 설계, 격리, interactive tool, research lane, live test 문서는 [`../CTF-OS-claude/docs/`](../CTF-OS-claude/docs/)에 있습니다. main은 Claude CLI나 모델 API를 실행·감독하지 않으며 flag 제출도 자동화하지 않습니다.
+CTF-OS는 문제 ZIP을 찾거나 복사하지 않고 Claude 시스템을 실행하거나 검사하지 않습니다. 사용자가 원본 문제 ZIP과 `HANDOFF.md`를 직접 Claude 환경으로 옮깁니다. HANDOFF 생성 후 Codex는 해당 문제풀이를 종료합니다.
 
 ## Scope와 flag fast path
 

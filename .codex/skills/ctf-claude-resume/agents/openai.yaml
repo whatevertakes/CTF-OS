@@ -1,4 +1,0 @@
-interface:
-  display_name: "Resume Claude Rescue"
-  short_description: "Validate a rescue result and continue solving"
-  default_prompt: "Use $ctf-claude-resume to validate the Claude rescue result and continue to the remote flag."
