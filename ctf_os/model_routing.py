@@ -98,13 +98,10 @@ _NON_MAX_BLOCKERS = frozenset({
 _HIGH_COMPLEXITY_PATTERNS = (
     r"\bheap\b", r"\brop\b", r"\bexploit[- ]chain\b", r"\bdeobfuscat\w*\b",
     r"\bobfuscat\w*\b", r"\bnew crypto\b", r"\blattice attack\b",
-    r"\balgebraic attack\b", r"\binversion\b", r"\bagent exploit\b",
+    r"\balgebraic attack\b", r"\bcrypto derivation\b", r"\binversion\b",
+    r"\bagent exploit\b",
     r"\balternate attack\b", r"\bdistinct attack\b", r"\bnew mechanism\b",
     r"\bindependent-full-solve\b",
-)
-_MECHANICAL_TERMS = (
-    "list files", "inventory", "extract strings", "metadata", "filter logs", "batch run",
-    "normalize", "deduplicate", "repeat command", "candidate inputs",
 )
 _IMPLEMENTATION_TERMS = (
     "implement", "payload", "exploit script", "solver", "minimal poc", "adapt remote",
@@ -137,13 +134,13 @@ def recommend_routing_profile(evidence: Mapping[str, Any]) -> dict[str, str]:
             "routing_profile": "DEEP_SOLVER",
             "routing_reason": "branch owns an independent or high-complexity exploit mechanism",
         }
-    mechanical = evidence.get("mechanical_only") is True or any(
-        term in text for term in _MECHANICAL_TERMS
-    )
-    if mechanical and not _contains_high_complexity(text):
+    if evidence.get("mechanical_only") is True:
         return {
             "routing_profile": "MECHANICAL",
-            "routing_reason": "branch performs bounded extraction, batching, or normalization without mechanism discovery",
+            "routing_reason": (
+                "branch is explicitly limited to deterministic extraction, "
+                "batching, normalization, or exact repetition"
+            ),
         }
     implementation = evidence.get("mechanism_confirmed") is True or evidence.get("primitive_confirmed") is True
     implementation = implementation and (
@@ -235,6 +232,11 @@ def validate_routing_contract(
         branch_evidence.get("high_complexity_mechanism") is True
         or _contains_high_complexity(text)
     )
+    if profile == "MECHANICAL":
+        if branch_evidence.get("mechanical_only") is not True:
+            raise RoutingError("MECHANICAL requires explicit mechanical_only=true")
+        if high_complexity:
+            raise RoutingError("MECHANICAL cannot run high-complexity mechanism discovery")
     if high_complexity and policy["model_class"] == "terra-equivalent":
         raise RoutingError("Terra-equivalent cannot be assigned new high-complexity mechanism discovery")
     if profile == "CONFIRMED_BOTTLENECK":

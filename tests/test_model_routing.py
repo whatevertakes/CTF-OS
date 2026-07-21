@@ -28,8 +28,10 @@ def _contract(profile: str, **context: object) -> dict[str, object]:
     base = {
         "role": "worker", "purpose": "parallel-race",
         "hypothesis": "test one concrete sink", "decisive_experiment": "run target and control",
-        **context,
     }
+    if profile == "MECHANICAL":
+        base["mechanical_only"] = True
+    base.update(context)
     return build_routing_contract(
         profile, routing_reason=f"test {profile}",
         routing_evidence=["receipt:test:1"], branch_evidence=base,
@@ -236,6 +238,129 @@ def test_policy_recommendations_use_mechanism_and_artifact_evidence() -> None:
         "DEEP_SOLVER", purpose="independent-full-solve",
     )["requested_reasoning"] == "xhigh"
     assert alternate["routing_profile"] == "DEEP_SOLVER"
+
+
+def test_osint_metadata_reasoning_is_a_bounded_experiment() -> None:
+    result = recommend_routing_profile({
+        "purpose": "parallel-race",
+        "hypothesis": (
+            "correlate document metadata with archive snapshots "
+            "to verify public attribution"
+        ),
+        "tool_strategy": ["public-search", "archive", "metadata"],
+        "decisive_experiment": "compare one dated archive snapshot",
+    })
+
+    assert result["routing_profile"] != "MECHANICAL"
+    assert result["routing_profile"] == "BOUNDED_EXPERIMENT"
+
+
+@pytest.mark.parametrize(
+    "hypothesis",
+    [
+        "metadata",
+        "inventory",
+        "extract strings",
+        "normalize candidate inputs",
+        "archive metadata",
+    ],
+)
+def test_mechanical_terms_do_not_imply_mechanical_contract(hypothesis: str) -> None:
+    result = recommend_routing_profile({"hypothesis": hypothesis})
+
+    assert result["routing_profile"] != "MECHANICAL"
+
+
+def test_explicit_mechanical_contract_recommends_mechanical() -> None:
+    result = recommend_routing_profile({
+        "mechanical_only": True,
+        "hypothesis": "extract fixed strings and normalize exact candidate hashes",
+        "tool_strategy": ["strings", "sha256sum"],
+    })
+
+    assert result["routing_profile"] == "MECHANICAL"
+
+
+@pytest.mark.parametrize(
+    "branch_evidence",
+    [
+        {"hypothesis": "inspect metadata"},
+        {"hypothesis": "inspect metadata", "mechanical_only": False},
+        {"hypothesis": "inspect metadata", "mechanical_only": "true"},
+        {"hypothesis": "inspect metadata", "mechanical_only": 1},
+    ],
+)
+def test_explicit_mechanical_profile_requires_boolean_true(
+    branch_evidence: dict[str, object],
+) -> None:
+    with pytest.raises(RoutingError, match="mechanical_only=true"):
+        build_routing_contract(
+            "MECHANICAL", routing_reason="metadata helper",
+            routing_evidence=["branch:metadata"], branch_evidence=branch_evidence,
+        )
+
+
+def test_explicit_mechanical_profile_rejects_independent_solve() -> None:
+    with pytest.raises(RoutingError, match="independent-full-solve"):
+        build_routing_contract(
+            "MECHANICAL", routing_reason="bad independent lane",
+            routing_evidence=["branch:independent"],
+            branch_evidence={
+                "mechanical_only": True,
+                "purpose": "independent-full-solve",
+            },
+        )
+
+
+def test_explicit_mechanical_profile_rejects_high_complexity_mechanism() -> None:
+    with pytest.raises(RoutingError, match="high-complexity"):
+        build_routing_contract(
+            "MECHANICAL", routing_reason="bad heap lane",
+            routing_evidence=["branch:heap"],
+            branch_evidence={
+                "mechanical_only": True,
+                "high_complexity_mechanism": True,
+                "hypothesis": "derive a new heap exploit chain",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "hypothesis",
+    [
+        "derive a new mechanism",
+        "derive a heap exploit",
+        "construct a ROP chain",
+        "perform crypto derivation",
+        "design an inversion attack",
+    ],
+)
+def test_explicit_mechanical_profile_rejects_high_complexity_text(
+    hypothesis: str,
+) -> None:
+    with pytest.raises(RoutingError, match="high-complexity"):
+        build_routing_contract(
+            "MECHANICAL", routing_reason="bad reasoning lane",
+            routing_evidence=["branch:reasoning"],
+            branch_evidence={
+                "mechanical_only": True,
+                "hypothesis": hypothesis,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"mechanical_only": True, "purpose": "independent-full-solve"},
+        {"mechanical_only": True, "high_complexity_mechanism": True},
+        {"mechanical_only": True, "hypothesis": "perform crypto derivation"},
+    ],
+)
+def test_deep_solver_precedes_explicit_mechanical_contract(
+    evidence: dict[str, object],
+) -> None:
+    assert recommend_routing_profile(evidence)["routing_profile"] == "DEEP_SOLVER"
 
 
 def test_max_requires_exact_reasoning_bottleneck_and_never_tool_or_compute() -> None:
@@ -725,6 +850,10 @@ def test_valid_config_and_catalog_are_not_runtime_support(
     assert capabilities["native_delegation"] == "SUPPORTED"
     assert capabilities["model_catalog_status"] == "VALID"
     assert capabilities["packet_contract"] == "VALID"
+    assert not any(
+        error.startswith("MECHANICAL:")
+        for error in capabilities["packet_contract_errors"]
+    )
     assert capabilities["custom_agent_configuration"] == "VALID"
     assert capabilities["custom_agent_profile_selection"] == "UNKNOWN"
     assert capabilities["model_override"] == "UNKNOWN"

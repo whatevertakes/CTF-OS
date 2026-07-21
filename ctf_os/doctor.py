@@ -403,7 +403,12 @@ def inspect_codex_routing_capabilities(
     for routing_profile in sorted(ROUTING_PROFILES):
         policy = PROFILE_POLICIES[routing_profile]
         branch_evidence: dict[str, object] = {}
-        if routing_profile == "CONFIRMED_BOTTLENECK":
+        if routing_profile == "MECHANICAL":
+            branch_evidence = {
+                "mechanical_only": True,
+                "hypothesis": "deterministically extract and normalize fixed values",
+            }
+        elif routing_profile == "CONFIRMED_BOTTLENECK":
             branch_evidence = {
                 "primitive_confirmed": True,
                 "specific_blocker_present": True,
