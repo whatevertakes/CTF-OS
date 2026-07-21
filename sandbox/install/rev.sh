@@ -9,7 +9,8 @@ WASMTIME_VERSION=24.0.0
 
 apt_install \
   gdb gdb-multiarch qemu-user qemu-user-static apktool wabt mono-runtime \
-  build-essential meson ninja-build pkg-config libzip-dev liblz4-dev libssl-dev
+  build-essential meson ninja-build pkg-config libzip-dev liblz4-dev libssl-dev \
+  ocl-icd-libopencl1
 pip_install -r /opt/ctf-os/requirements/rev.txt
 
 download "https://github.com/radareorg/radare2/archive/refs/tags/${RADARE2_VERSION}.tar.gz" /tmp/radare2.tar.gz
@@ -34,4 +35,4 @@ install -m 0755 "/tmp/wasmtime-v${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/
 rm -rf /tmp/radare2* /tmp/jadx.zip /tmp/upx* /tmp/wasmtime*
 
 for command in r2 gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-mips qemu-riscv64; do require_command "$command"; done
-for module in angr unicorn capstone keystone lief pefile elftools; do require_import "$module"; done
+for module in angr unicorn capstone keystone lief pefile elftools pyopencl; do require_import "$module"; done

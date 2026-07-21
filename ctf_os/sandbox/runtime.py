@@ -54,6 +54,9 @@ class SandboxSpec:
     category: str | None = None
     gpu_enabled: bool = False
     gpu_device: int | None = None
+    gpu_requested: bool | None = None
+    gpu_backend: str | None = None
+    gpu_fallback: str | None = None
     workload_class: str | None = None
     resource_priority: str | None = None
     resource_request_override: Mapping[str, object] | None = None
@@ -85,6 +88,14 @@ class SandboxSpec:
             }.get(self.resource_profile, "independent-full-solve"))
         if self.resource_priority is None:
             object.__setattr__(self, "resource_priority", "NORMAL")
+        if self.gpu_requested is None:
+            object.__setattr__(self, "gpu_requested", self.gpu_enabled)
+        if self.gpu_enabled:
+            object.__setattr__(self, "gpu_backend", self.gpu_backend or "nvidia")
+            object.__setattr__(self, "gpu_fallback", None)
+        else:
+            object.__setattr__(self, "gpu_backend", None)
+            object.__setattr__(self, "gpu_fallback", self.gpu_fallback or "CPU")
 
     @property
     def name(self) -> str:
@@ -117,7 +128,13 @@ class SandboxSpec:
             "ctf-os.session_role": self.session_role,
             "ctf-os.workload_class": str(self.workload_class),
             "ctf-os.resource_priority": str(self.resource_priority),
+            "ctf-os.gpu_requested": str(bool(self.gpu_requested)).lower(),
+            "ctf-os.gpu_assigned": str(self.gpu_enabled).lower(),
         }
+        if self.gpu_backend:
+            labels["ctf-os.gpu_backend"] = self.gpu_backend
+        if self.gpu_fallback:
+            labels["ctf-os.gpu_fallback"] = self.gpu_fallback
         if self.external_solver or self.workspace_mode != "tmpfs" or self.session_kind != "native-worker":
             labels["ctf-os.session_kind"] = self.session_kind
             labels["ctf-os.external_solver"] = str(self.external_solver).lower()
@@ -142,7 +159,8 @@ class SandboxSpec:
                 "preferred_memory_bytes": parse_size_bytes(str(self.memory)),
                 "max_memory_bytes": parse_size_bytes(str(self.memory)),
                 "storage_bytes": parse_size_bytes(str(self.storage)),
-                "gpu_preferred": self.gpu_enabled, "gpu_memory_bytes": 4 * 1024**3 if self.gpu_enabled else 0,
+                "gpu_preferred": bool(self.gpu_requested),
+                "gpu_memory_bytes": 4 * 1024**3 if self.gpu_requested else 0,
             },
         )
 
@@ -198,9 +216,14 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
         for device in ("/dev/loop-control", "/dev/loop0", "/dev/loop1", "/dev/loop2", "/dev/loop3"):
             if Path(device).exists():
                 argv.extend(["--device", f"{device}:{device}:rwm"])
-    if category == "ai" and spec.gpu_enabled:
+    if spec.gpu_enabled:
         selector = f"device={spec.gpu_device}" if spec.gpu_device is not None else "all"
-        argv.extend(["--gpus", selector, "--env", "CTF_OS_GPU_ENABLED=1"])
+        argv.extend([
+            "--gpus", selector,
+            "--env", "CTF_OS_GPU_AVAILABLE=1",
+            "--env", "CTF_OS_GPU_ENABLED=1",
+            "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        ])
     # Rootless Podman needs only namespace-management syscalls for local OCI
     # inspection. Keep Docker's default deny list otherwise; mount and other
     # CAP_SYS_ADMIN-gated syscalls remain blocked and every capability is still dropped.
@@ -244,6 +267,10 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         "category": spec.category,
         "gpu_enabled": spec.gpu_enabled,
         "gpu_device": spec.gpu_device,
+        "gpu_backend": spec.gpu_backend,
+        "gpu_requested": bool(spec.gpu_requested),
+        "gpu_assigned": spec.gpu_enabled,
+        "gpu_fallback": spec.gpu_fallback,
         "resource_request": spec.resource_request.to_dict(),
         "allocation_env": allocation_environment(
             {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}, spec.resource_request,
@@ -283,7 +310,14 @@ def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
         raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
     try:
         _write_json(spec.branch_root / "sandbox.json", metadata)
-        append_evidence(spec.branch_root.parents[1] / "evidence.log", "sandbox_create", {"branch": spec.branch, "container": spec.name})
+        append_evidence(spec.branch_root.parents[1] / "evidence.log", "sandbox_create", {
+            "branch": spec.branch, "container": spec.name,
+            "gpu_requested": bool(spec.gpu_requested),
+            "gpu_assigned": spec.gpu_enabled,
+            "gpu_device": spec.gpu_device,
+            "gpu_backend": spec.gpu_backend,
+            "gpu_fallback": spec.gpu_fallback,
+        })
     except Exception:
         removed = _run([docker, "rm", "--force", spec.name], timeout=30)
         if removed.returncode:
@@ -708,6 +742,12 @@ def _validate_spec(spec: SandboxSpec) -> None:
         raise SandboxError("workspace mode must be tmpfs or bind")
     if spec.workspace_mode == "bind" and not spec.external_solver:
         raise SandboxError("bind workspace mode is reserved for an external solver")
+    if spec.gpu_device is not None and not spec.gpu_enabled:
+        raise SandboxError("GPU device selection requires GPU passthrough to be enabled")
+    if spec.gpu_backend not in {None, "nvidia"}:
+        raise SandboxError("only the NVIDIA GPU backend is supported")
+    if spec.gpu_fallback not in {None, "CPU"}:
+        raise SandboxError("GPU fallback must be CPU when present")
     if spec.cpus is None or spec.pids is None or spec.cpus <= 0 or spec.pids < 1:
         raise SandboxError("sandbox CPU and PID limits must be positive")
     try:

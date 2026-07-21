@@ -328,11 +328,11 @@ def _container_cpus(raw: dict[str, object]) -> float:
 
 
 def gpu_available(*, docker: str = "docker") -> bool:
-    try:
-        result = _run([docker, "info", "--format", "{{json .Runtimes}}"], timeout=20)
-    except ResourceError:
-        return False
-    return (result.returncode == 0 and "nvidia" in result.stdout.casefold()) or Path("/dev/nvidia0").exists()
+    # Import locally because the scheduler's capacity detector imports this
+    # module for managed-container accounting.
+    from ..resources.scheduler import detect_gpus
+
+    return bool(detect_gpus(docker=docker).get("available"))
 
 
 def _positive_int(value: object) -> int:

@@ -13,8 +13,10 @@ Runtime policy: /challenge is read-only; /work and /artifacts are worker-private
 tmpfs. Containers are read-only, non-root, capability-dropped, resource-limited,
 and have either no network or exact declared endpoint rules. Docker sockets,
 host filesystems, personal browser profiles, cloud credential directories,
-KVM/GPU/devices, host network/PID, and privileged mode are never mounted by the
-sandbox runtime. KVM, GPU, or physical device needs are reported NEEDS_REVIEW.
+KVM or arbitrary physical devices, host network/PID, and privileged mode are
+never mounted by the sandbox runtime. A locally verified NVIDIA GPU may be
+passed through with Docker's scoped GPU device request; all other device needs
+are reported NEEDS_REVIEW.
 Misc/cloud permit only the additional namespace, mount, and chroot syscalls
 needed by single-ID rootless Podman; capabilities, no-new-privileges, read-only
 root, private tmpfs storage, and network policy still apply.

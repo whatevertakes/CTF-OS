@@ -27,11 +27,12 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
     assert set(PROFILE_PROBES) == {image.rsplit(":", 1)[1] for image in IMAGES}
     expectations = {
         "pwn": ("qemu-aarch64", "qemu-system-x86_64", "angr"),
-        "crypto": ("sage -c", "RsaCtfTool", "cado-nfs"),
+        "rev": ("pyopencl", "r2 -v"),
+        "crypto": ("sage -c", "RsaCtfTool", "cado-nfs", "hashcat --version"),
         "forensic": ("vol", "mmls", "tshark", "stegseek"),
         "misc": ("podman", "torch", "cv2"),
         "osint": ("chromium --headless", "whois", "tesseract"),
-        "ai": ("InferenceSession", "torch.tensor", "tokenizers"),
+        "ai": ("InferenceSession", "torch.tensor", "torch.version.cuda", "tokenizers"),
         "cloud": ("aws --version", "gcloud --version", "conftest", "checkov"),
     }
     for profile, required in expectations.items():

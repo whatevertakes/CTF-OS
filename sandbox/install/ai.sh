@@ -3,7 +3,7 @@ set -Eeuo pipefail
 source /opt/ctf-os/install/lib.sh
 
 apt_install protobuf-compiler libprotobuf-dev hdf5-tools netcdf-bin graphviz libgl1 libglib2.0-0
-pip_install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1 torchvision==0.22.1
+pip_install --index-url https://download.pytorch.org/whl/cu126 torch==2.7.1 torchvision==0.22.1
 pip_install -r /opt/ctf-os/requirements/ai.txt
 
 for command in protoc h5dump ncdump dot jupyter; do require_command "$command"; done
@@ -14,6 +14,7 @@ import onnx
 import onnxruntime as ort
 import torch
 from onnx import TensorProto, helper
+assert torch.version.cuda is not None
 assert torch.tensor([2, 3]).sum().item() == 5
 node = helper.make_node("Identity", ["x"], ["y"])
 graph = helper.make_graph([node], "smoke", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])], [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])])

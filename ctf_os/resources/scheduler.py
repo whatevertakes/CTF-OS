@@ -26,6 +26,7 @@ from ..workspace import atomic_json, state_lock
 
 GIB = 1024**3
 MIB = 1024**2
+GPU_PROBE_IMAGE = "ctf-os-sandbox:base"
 RESOURCE_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 2
 PRIORITIES = ("CRITICAL", "HIGH", "NORMAL", "LOW")
@@ -410,10 +411,17 @@ def detect_capacity(
 
 
 def detect_gpus(*, docker: str = "docker", run: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> dict[str, Any]:
+    """Detect an NVIDIA GPU only after a real Docker device request succeeds.
+
+    Host driver discovery and Docker passthrough are deliberately separate so a
+    workstation with a working GPU but a missing/broken container runtime is
+    reported as DEGRADED instead of being advertised to the scheduler.
+    """
+
     runner = run or _run
     degraded: list[str] = []
     runtime_text = _docker_text(runner, [docker, "info", "--format", "{{json .Runtimes}}"])
-    runtime = bool(runtime_text and "nvidia" in runtime_text.casefold())
+    registered_runtime = bool(runtime_text and "nvidia" in runtime_text.casefold())
     query = runner([
         "nvidia-smi", "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
         "--format=csv,noheader,nounits",
@@ -427,19 +435,86 @@ def detect_gpus(*, docker: str = "docker", run: Callable[..., subprocess.Complet
                 continue
             try:
                 devices.append({
-                    "index": int(parts[0]), "model": parts[1],
+                    "index": int(parts[0]), "name": parts[1], "model": parts[1],
                     "vram_total_bytes": int(float(parts[2]) * MIB),
                     "vram_free_bytes": int(float(parts[3]) * MIB),
                     "utilization_percent": float(parts[4]), "assigned_vram_bytes": 0,
                 })
             except ValueError:
                 degraded.append("gpu_metrics")
-    elif Path("/dev/nvidia0").exists():
-        degraded.append("gpu_metrics")
+    host_detail = query.stdout.strip() or query.stderr.strip()
+    no_device = "no devices were found" in host_detail.casefold()
+    host_driver = query.returncode == 0 and bool(devices)
+
+    run_help = runner(
+        [docker, "run", "--help"], capture_output=True, text=True, timeout=20, check=False,
+    )
+    docker_gpus = run_help.returncode == 0 and "--gpus" in run_help.stdout
+    image = runner(
+        [docker, "image", "inspect", GPU_PROBE_IMAGE],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    passthrough: subprocess.CompletedProcess[str] | None = None
+    if host_driver and docker_gpus and image.returncode == 0:
+        passthrough = runner([
+            docker, "run", "--rm", "--pull", "never", "--gpus", "all",
+            "--network", "none", "--read-only",
+            "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+            "--user", "1001:1001",
+            "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+            "--entrypoint", "nvidia-smi", GPU_PROBE_IMAGE,
+            "--query-gpu=index,name", "--format=csv,noheader,nounits",
+        ], capture_output=True, text=True, timeout=30, check=False)
+    passthrough_ok = bool(
+        passthrough is not None and passthrough.returncode == 0 and passthrough.stdout.strip()
+    )
+
+    if not host_driver:
+        if query.returncode not in {0, 127} and not no_device:
+            status = "DEGRADED"
+            degraded.append("gpu_host_driver")
+            reason = host_detail or "nvidia-smi failed"
+        else:
+            status = "UNAVAILABLE"
+            reason = (
+                "nvidia-smi reported no NVIDIA devices" if no_device else
+                "nvidia-smi is unavailable" if query.returncode == 127 else
+                "nvidia-smi reported no usable NVIDIA devices"
+            )
+    elif not docker_gpus:
+        status = "DEGRADED"
+        degraded.append("gpu_docker_cli")
+        reason = "Docker does not support the --gpus device request"
+    elif image.returncode != 0:
+        status = "DEGRADED"
+        degraded.append("gpu_docker_passthrough")
+        reason = f"GPU probe image {GPU_PROBE_IMAGE} is unavailable"
+    elif not passthrough_ok:
+        status = "DEGRADED"
+        degraded.append("gpu_docker_passthrough")
+        reason = (
+            (passthrough.stderr.strip() or passthrough.stdout.strip())
+            if passthrough is not None else "Docker GPU passthrough probe was not run"
+        )
+    else:
+        status = "AVAILABLE"
+        reason = None
+
     return {
-        "observation_mode": "DEGRADED" if degraded else "FULL",
-        "degraded_metrics": sorted(set(degraded)), "docker_runtime": runtime,
-        "available": bool(devices and runtime), "device_count": len(devices), "devices": devices,
+        "status": status,
+        "observation_mode": "DEGRADED" if status == "DEGRADED" else "FULL",
+        "degraded_metrics": sorted(set(degraded)),
+        "available": status == "AVAILABLE",
+        "backend": "nvidia" if devices else None,
+        "device_count": len(devices), "devices": devices,
+        "host_driver": host_driver,
+        "docker_gpus": docker_gpus,
+        "docker_runtime": registered_runtime or passthrough_ok,
+        "docker_passthrough": passthrough_ok,
+        "passthrough_detail": (
+            passthrough.stdout.strip() if passthrough_ok and passthrough is not None else None
+        ),
+        "reason": reason,
     }
 
 

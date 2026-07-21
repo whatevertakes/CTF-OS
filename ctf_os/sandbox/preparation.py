@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ..preflight import prepared_input_bytes, prepared_tree_fingerprint
-from ..resources.scheduler import ResourceLedger, detect_capacity, infer_workload
+from ..resources.scheduler import ResourceLedger, detect_capacity, detect_gpus, infer_workload
 from ..service import ServiceActor, ServiceSpec, service_inspect
 from ..workspace import challenge_workspace
 from .network import parse_remotes, resolve_targets
-from .resources import gpu_available
 from .runtime import SandboxSpec
 
 
@@ -105,6 +104,7 @@ def prepare_sandbox_spec(
     prepared_fingerprint_reader: Callable[[Path], str] = prepared_tree_fingerprint,
     service_inspector: Callable[..., dict[str, object]] = service_inspect,
     service_actor: ServiceActor | None = None,
+    gpu_detector: Callable[[], Mapping[str, object]] = detect_gpus,
 ) -> PreparedSandbox:
     """Build one SandboxSpec without starting a container or service lifecycle."""
 
@@ -247,6 +247,45 @@ def prepare_sandbox_spec(
         ),
     )
     state = _load_state(solve_root)
+    gpu_device = (
+        int(allocation["gpu_device"])
+        if isinstance(allocation, dict) and allocation.get("gpu_device") is not None else None
+    )
+    request_gpu = bool(
+        isinstance(request_raw, dict)
+        and (request_raw.get("gpu_required") or request_raw.get("gpu_preferred"))
+    )
+    if isinstance(allocation, dict):
+        # A committed scheduler allocation is authoritative, including an
+        # explicit preferred-GPU CPU fallback.
+        gpu_enabled = gpu_device is not None
+        if (
+            isinstance(request_raw, dict) and request_raw.get("gpu_required")
+            and not gpu_enabled
+        ):
+            raise ValueError(
+                "resource scheduler cannot admit sandbox minimum: required GPU "
+                "was not assigned"
+            )
+        gpu_requested = request_gpu or gpu_enabled
+        gpu_backend = "nvidia" if gpu_enabled else None
+        gpu_fallback = (
+            None if gpu_enabled else str(allocation.get("gpu_fallback") or "CPU")
+        )
+    else:
+        gpu = gpu_detector()
+        gpu_enabled = bool(gpu.get("available"))
+        if (
+            isinstance(request_raw, dict) and request_raw.get("gpu_required")
+            and not gpu_enabled
+        ):
+            raise ValueError(
+                "resource scheduler cannot admit sandbox minimum: required GPU "
+                + str(gpu.get("reason") or "runtime/device unavailable")
+            )
+        gpu_requested = request_gpu or gpu_enabled
+        gpu_backend = str(gpu.get("backend") or "nvidia") if gpu_enabled else None
+        gpu_fallback = None if gpu_enabled else "CPU"
     spec = SandboxSpec(
         contest_slug=str(manifest.slug), challenge_id=str(challenge.id), branch=branch,
         source=source, branch_root=branch_root,
@@ -267,15 +306,9 @@ def prepare_sandbox_spec(
             if isinstance(request_raw, dict) else "NORMAL"
         ),
         resource_request_override=request_raw if isinstance(request_raw, dict) else None,
-        gpu_enabled=(
-            isinstance(allocation, dict) and allocation.get("gpu_device") is not None
-        ) or (
-            not isinstance(request_raw, dict) and category == "ai" and gpu_available()
-        ),
-        gpu_device=(
-            int(allocation["gpu_device"])
-            if isinstance(allocation, dict) and allocation.get("gpu_device") is not None else None
-        ),
+        gpu_enabled=gpu_enabled, gpu_device=gpu_device,
+        gpu_requested=gpu_requested, gpu_backend=gpu_backend,
+        gpu_fallback=gpu_fallback,
         workspace_mode=workspace_mode, run_id=run_id,
         rescue_attempt_id=rescue_attempt_id, external_solver=external_solver,
         solver_family=solver_family, session_kind=session_kind,

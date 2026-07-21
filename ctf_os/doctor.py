@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 import importlib.util
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 
 from .delegation import DelegationError, load_templates
+from .resources.scheduler import detect_gpus
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute
 from .timeouts import TimeoutProfileError, load_timeout_profiles
 
@@ -49,14 +51,14 @@ node --version; npm --version; php --version; sqlite3 --version
     "rev": """
 (command -v r2 || command -v rizin)
 for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-mips qemu-riscv64; do command -v "$c"; done
-python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools'
+python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools,pyopencl'
 r2 -v; jadx --version; apktool --version; wasm-objdump --version; upx --version; wasmtime --version
 """,
     "crypto": """
-for c in sage RsaCtfTool cado-nfs gp gap maxima; do command -v "$c"; done
+for c in sage RsaCtfTool cado-nfs gp gap maxima hashcat; do command -v "$c"; done
 python3 -c 'import z3,gmpy2,Crypto,fpylll,cysignals,sympy,cryptography,ecdsa'
 sage -c 'assert 2^10 == 1024; assert GF(7)(3)^2 == 2'
-RsaCtfTool --help >/dev/null; cado-nfs --help >/dev/null; gp --version; gap --version; maxima --version
+RsaCtfTool --help >/dev/null; cado-nfs --help >/dev/null; gp --version; gap --version; maxima --version; hashcat --version
 """,
     "forensic": """
 for c in vol mmls fls icat foremost exiftool binwalk tshark tcpdump testdisk photorec dcfldd steghide stegseek zsteg convert tesseract pngcheck ffmpeg sox; do command -v "$c"; done
@@ -83,6 +85,7 @@ python3 - <<'PY'
 import numpy as np, onnx, onnxruntime as ort, torch, torchvision
 import sklearn, transformers, tokenizers, sentencepiece, safetensors, datasets, joblib, cv2, pandas
 from onnx import TensorProto, helper
+assert torch.version.cuda is not None
 assert torch.tensor([2,3]).sum().item() == 5
 node=helper.make_node('Identity',['x'],['y'])
 graph=helper.make_graph([node],'smoke',[helper.make_tensor_value_info('x',TensorProto.FLOAT,[1])],[helper.make_tensor_value_info('y',TensorProto.FLOAT,[1])])
@@ -100,6 +103,69 @@ test "${AWS_SHARED_CREDENTIALS_FILE:-/work/credentials/aws}" = /work/credentials
 test ! -e "$HOME/.aws/credentials"; test ! -e "$HOME/.azure"; test ! -e "$HOME/.config/gcloud"; test ! -e "$HOME/.kube/config"
 """,
 }
+
+GPU_AI_TORCH_PROBE = """
+import torch
+assert torch.version.cuda is not None
+assert torch.cuda.is_available()
+x = torch.ones(1024, device="cuda")
+y = x.sum()
+torch.cuda.synchronize()
+assert y.item() == 1024
+print(torch.version.cuda, torch.cuda.get_device_name(0))
+"""
+
+GPU_AI_ONNX_PROBE = """
+import numpy as np
+import torch
+import onnxruntime as ort
+from onnx import TensorProto, helper
+assert "CUDAExecutionProvider" in ort.get_available_providers()
+node = helper.make_node("Add", ["x", "x"], ["y"])
+graph = helper.make_graph(
+    [node], "gpu-smoke",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [4])],
+)
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9)
+session = ort.InferenceSession(
+    model.SerializeToString(), providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+assert session.get_providers()[0] == "CUDAExecutionProvider"
+result = session.run(None, {"x": np.ones(4, dtype=np.float32)})[0]
+assert result.tolist() == [2.0, 2.0, 2.0, 2.0]
+print(session.get_providers())
+"""
+
+GPU_REV_PROBE = '''
+import numpy as np
+import pyopencl as cl
+devices = [
+    device
+    for platform in cl.get_platforms()
+    for device in platform.get_devices(device_type=cl.device_type.GPU)
+    if "NVIDIA" in (device.vendor + " " + device.name).upper()
+]
+assert devices, "no NVIDIA OpenCL GPU"
+context = cl.Context([devices[0]])
+queue = cl.CommandQueue(context)
+values = np.arange(64, dtype=np.uint32)
+output = np.empty_like(values)
+source = """
+__kernel void candidate_check(__global const uint *input, __global uint *output) {
+    size_t i = get_global_id(0);
+    output[i] = input[i] * input[i] + 7;
+}
+"""
+program = cl.Program(context, source).build()
+flags = cl.mem_flags
+input_buffer = cl.Buffer(context, flags.READ_ONLY | flags.COPY_HOST_PTR, hostbuf=values)
+output_buffer = cl.Buffer(context, flags.WRITE_ONLY, output.nbytes)
+program.candidate_check(queue, values.shape, None, input_buffer, output_buffer)
+cl.enqueue_copy(queue, output, output_buffer).wait()
+assert np.array_equal(output, values * values + 7)
+print(devices[0].name)
+'''
 
 
 def _run(
@@ -128,12 +194,115 @@ def _image_probe(profile: str) -> subprocess.CompletedProcess[str]:
     return _run(argv, timeout=180)
 
 
+def _gpu_image_probe(
+    profile: str,
+    command: Sequence[str],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run,
+) -> subprocess.CompletedProcess[str]:
+    argv = [
+        "docker", "run", "--rm", "--pull", "never", "--gpus", "all",
+        "--network", "none", "--read-only",
+        "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+        "--user", "1001:1001",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+        "--tmpfs", "/work:rw,nosuid,nodev,size=256m,mode=1777",
+        "--env", "HOME=/work", "--env", "XDG_DATA_HOME=/work/.local/share",
+        "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        "--entrypoint", command[0], f"ctf-os-sandbox:{profile}", *command[1:],
+    ]
+    return run(argv, timeout=60)
+
+
+def _gpu_doctor_checks(
+    gpu: Mapping[str, object],
+    image_present: Mapping[str, bool],
+    *,
+    probe: Callable[[str, Sequence[str]], subprocess.CompletedProcess[str]] = _gpu_image_probe,
+) -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+
+    def add(
+        name: str, ok: bool, detail: str, *, skipped: bool = False,
+        fix: str | None = None,
+    ) -> None:
+        item: dict[str, object] = {
+            "name": name, "ok": ok,
+            "status": "SKIPPED" if skipped else "PASS" if ok else "FAIL",
+            "detail": detail,
+        }
+        if not ok and fix:
+            item["fix"] = fix
+        checks.append(item)
+
+    host_driver = bool(gpu.get("host_driver"))
+    detection_status = str(gpu.get("status") or "UNAVAILABLE")
+    if not host_driver:
+        if detection_status == "DEGRADED":
+            add(
+                "gpu-host-driver", False, str(gpu.get("reason") or "nvidia-smi failed"),
+                fix="repair the host NVIDIA driver and nvidia-smi",
+            )
+        else:
+            add(
+                "gpu-host-driver", True,
+                str(gpu.get("reason") or "no NVIDIA GPU detected; CPU fallback active"),
+                skipped=True,
+            )
+        for name in (
+            "gpu-docker-passthrough", "gpu-ai-torch", "gpu-ai-onnx",
+            "gpu-crypto-hashcat", "gpu-rev-runtime",
+        ):
+            add(name, True, "no usable host NVIDIA GPU; CPU fallback active", skipped=True)
+        return checks
+
+    device_count = int(gpu.get("device_count") or 0)
+    add("gpu-host-driver", True, f"nvidia-smi detected {device_count} NVIDIA GPU(s)")
+    passthrough = bool(gpu.get("available") and gpu.get("docker_passthrough"))
+    add(
+        "gpu-docker-passthrough", passthrough,
+        str(
+            gpu.get("passthrough_detail") or gpu.get("reason")
+            or "container nvidia-smi passed"
+        ),
+        fix="install/configure NVIDIA Container Toolkit for Docker --gpus device requests",
+    )
+    probes: tuple[tuple[str, str, Sequence[str]], ...] = (
+        ("gpu-ai-torch", "ai", ("python3", "-c", GPU_AI_TORCH_PROBE)),
+        ("gpu-ai-onnx", "ai", ("python3", "-c", GPU_AI_ONNX_PROBE)),
+        (
+            "gpu-crypto-hashcat", "crypto",
+            ("sh", "-ec", "output=$(hashcat -I 2>&1); printf '%s\\n' \"$output\"; printf '%s\\n' \"$output\" | grep -qiE 'NVIDIA|CUDA'"),
+        ),
+        ("gpu-rev-runtime", "rev", ("python3", "-c", GPU_REV_PROBE)),
+    )
+    for name, profile, command in probes:
+        if not passthrough:
+            add(name, True, "Docker GPU passthrough unavailable; framework probe not run", skipped=True)
+            continue
+        if not image_present.get(profile, False):
+            add(name, True, f"ctf-os-sandbox:{profile} is not present", skipped=True)
+            continue
+        result = probe(profile, command)
+        streams = "\n".join(
+            part.strip() for part in (result.stdout, result.stderr) if part.strip()
+        )
+        add(
+            name, result.returncode == 0,
+            (streams or "real GPU operation passed")[-8_000:],
+            fix=f"rebuild ctf-os-sandbox:{profile} and verify its GPU runtime dependencies",
+        )
+    return checks
+
+
 def run_doctor(repo: Path) -> dict[str, object]:
     checks: list[dict[str, object]] = []
     warnings: list[str] = []
 
     def add(name: str, ok: bool, detail: str, fix: str | None = None) -> None:
-        item: dict[str, object] = {"name": name, "ok": ok, "detail": detail}
+        item: dict[str, object] = {
+            "name": name, "ok": ok, "status": "PASS" if ok else "FAIL", "detail": detail,
+        }
         if not ok and fix:
             item["fix"] = fix
         checks.append(item)
@@ -228,9 +397,11 @@ def run_doctor(repo: Path) -> dict[str, object]:
     add("docker-build-command", build_command.returncode == 0, "available" if build_command.returncode == 0 else build_command.stderr.strip(), "install a Docker CLI with docker build")
     add("docker-run-command", run_command.returncode == 0, "available" if run_command.returncode == 0 else run_command.stderr.strip(), "install a Docker CLI with docker run")
 
+    image_present: dict[str, bool] = {}
     if docker.returncode == 0:
         for profile, image in zip(PROFILES, IMAGES, strict=True):
             present = _run(["docker", "image", "inspect", image])
+            image_present[profile] = present.returncode == 0
             add(f"image-{profile}", present.returncode == 0, "tag present" if present.returncode == 0 else present.stderr.strip(), f"run sandbox/build-images.sh {profile}")
             if present.returncode == 0:
                 smoke = _image_probe(profile)
@@ -244,6 +415,7 @@ def run_doctor(repo: Path) -> dict[str, object]:
             add("sandbox-lifecycle", False, "one or more category images are missing", "run sandbox/build-images.sh")
     else:
         for profile in PROFILES:
+            image_present[profile] = False
             add(f"image-{profile}", False, "Docker daemon unavailable", f"run sandbox/build-images.sh {profile}")
         add("sandbox-lifecycle", False, "Docker daemon unavailable", "start Docker and run sandbox/build-images.sh")
 
@@ -331,12 +503,7 @@ def run_doctor(repo: Path) -> dict[str, object]:
     ]) if docker.returncode == 0 else subprocess.CompletedProcess([], 1, "", "")
     stale_count = len(stale_sandboxes.stdout.split())
     add("stale-resources", stale_count == 0, f"{stale_count} stopped sandbox resources", "run sandbox-gc for stopped sandboxes")
-    nvidia = shutil.which("nvidia-smi")
-    add(
-        "gpu-optional", True,
-        "NVIDIA tooling detected; GPU-required requests perform runtime validation"
-        if nvidia else "not installed; CPU profiles including AI remain supported",
-    )
+    checks.extend(_gpu_doctor_checks(detect_gpus(), image_present))
     return {
         "ok": all(bool(item["ok"]) for item in checks),
         "host_system": platform.system(),
