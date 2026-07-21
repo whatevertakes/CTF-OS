@@ -15,6 +15,10 @@ from typing import Any
 
 from .delegation import branch_utility, load_plan, utc_now
 from .primitives import PRIMITIVE_CONFIRMED, PRIMITIVE_REFUTED
+from .model_routing import (
+    build_routing_contract, max_endgame_eligibility, max_lease_status,
+    recommend_routing_profile,
+)
 from .worker import collect_worker_checkpoints, load_worker_result
 from .workspace import (
     atomic_json, challenge_workspace, ensure_run_mutable, is_run_root,
@@ -93,8 +97,15 @@ def evaluate_race_transition(
     checkpoints = collect_worker_checkpoints(root / "workers", input_fingerprint=fingerprint)
     # Race events participate in utility without duplicating worker checkpoints.
     checkpoints.extend(_read_jsonl(root / "race-events.jsonl"))
+    # Max escalation is authorized only by authoritative typed milestone
+    # receipts. Keep them separate from utility checkpoints so projections do
+    # not double-count a decisive experiment.
+    routing_evidence_rows = [
+        *checkpoints, *_read_jsonl(root / "milestone-receipts.jsonl"),
+    ]
     utility: dict[str, Any] = {}
     evaluated: list[str] = []
+    branch_by_session: dict[str, Mapping[str, Any]] = {}
     for branch in plan.get("branches", []):
         session_id = str(branch.get("session_id", ""))
         if not session_id:
@@ -103,6 +114,7 @@ def evaluate_race_transition(
         result = load_worker_result(result_path) if result_path.is_file() else None
         utility[session_id] = branch_utility(plan, session_id=session_id, checkpoints=checkpoints, result=result)
         evaluated.append(session_id)
+        branch_by_session[session_id] = branch
     confirmed = trigger == PRIMITIVE_CONFIRMED
     refuted = trigger == PRIMITIVE_REFUTED
     claimed = _primitive_claim(event)
@@ -113,6 +125,11 @@ def evaluate_race_transition(
     finalize: list[str] = []
     reclaim: list[str] = []
     takeover = None
+    active_max_lanes = sum(
+        branch.get("routing_profile") == "CONFIRMED_BOTTLENECK"
+        and branch.get("status") in {"NATIVE_STARTED", "RUNNING", "CHECKPOINTED", "STOP_REQUESTED"}
+        for branch in plan.get("branches", []) if isinstance(branch, Mapping)
+    )
     if confirmed:
         takeover = {
             "session_id": affected_session_id, "claimed_capability": claimed,
@@ -165,6 +182,84 @@ def evaluate_race_transition(
             })
     if trigger != "REMOTE_FLAG_OBTAINED":
         for sid, advice in utility.items():
+            branch = branch_by_session.get(sid, {})
+            routing = advice.get("routing_interpretation") or {}
+            routing_classification = routing.get("routing_classification")
+            if (
+                routing_classification == "LEGACY_UNROUTED"
+                and branch.get("status") in {
+                    "PLANNED", "CAPACITY_ADMITTED", "SANDBOX_READY", "AWAITING_NATIVE_START",
+                }
+            ):
+                recommendation = recommend_routing_profile({
+                    **dict(branch), "decisive_experiment": branch.get("decisive_experiment"),
+                })
+                actions.append({
+                    "action": "ROUTING_PROFILE_RECOMMENDED", "session_id": sid,
+                    **recommendation, "native_action_owner": "sol",
+                })
+            elif routing_classification == "FALLBACK_MATCHED":
+                actions.append({
+                    "action": "ROUTING_FALLBACK_RECORDED", "session_id": sid,
+                    "native_start_receipt_id": (
+                        (branch.get("start_receipt") or branch.get("native_start_receipt") or {}).get("receipt_id")
+                    ),
+                    "observed_model": routing.get("attributed_model"),
+                    "observed_reasoning": routing.get("attributed_reasoning"),
+                    "native_action_owner": "sol",
+                })
+            elif routing_classification == "ROUTING_MISMATCH":
+                actions.append({
+                    "action": "ROUTING_MISMATCH_REVIEW", "session_id": sid,
+                    "native_start_receipt_id": (
+                        (branch.get("start_receipt") or branch.get("native_start_receipt") or {}).get("receipt_id")
+                    ),
+                    "observed_model": routing.get("attributed_model"),
+                    "observed_reasoning": routing.get("attributed_reasoning"),
+                    "native_action_owner": "sol",
+                })
+            max_evidence, max_refs = _max_routing_evidence(
+                branch, routing_evidence_rows, advice,
+            )
+            max_status = max_endgame_eligibility(
+                max_evidence, active_max_lanes=active_max_lanes,
+            )
+            if max_status["eligible"] and branch.get("routing_profile") != "CONFIRMED_BOTTLENECK":
+                max_contract = build_routing_contract(
+                    "CONFIRMED_BOTTLENECK",
+                    routing_reason=(
+                        "confirmed primitive and exact typed blocker remain after bounded xhigh experiment"
+                    ),
+                    routing_evidence=max_refs,
+                    branch_evidence=max_evidence,
+                    active_max_lanes=active_max_lanes,
+                )
+                actions.extend([
+                    {
+                        "action": "REASONING_ESCALATION_RECOMMENDED", "session_id": sid,
+                        "from_reasoning": branch.get("observed_reasoning") or "xhigh",
+                        "to_reasoning": "max", "routing_contract": max_contract,
+                        "native_action_owner": "sol",
+                    },
+                    {
+                        "action": "MAX_ENDGAME_RECOMMENDED", "session_id": sid,
+                        "routing_contract": max_contract,
+                        "maximum_active_max_lanes": 1, "native_action_owner": "sol",
+                    },
+                ])
+            lease = max_lease_status(
+                branch,
+                decisive_experiments=int(advice.get("metrics", {}).get("decisive_experiment_count", 0) or 0),
+            )
+            if lease.get("expired") and not advice.get("metrics", {}).get("working_poc_present"):
+                actions.append({
+                    "action": "MAX_LEASE_EXPIRED", "session_id": sid,
+                    "lease": lease,
+                    "native_start_receipt_id": (
+                        (branch.get("start_receipt") or branch.get("native_start_receipt") or {}).get("receipt_id")
+                    ),
+                    "stop_and_reclaim": True, "native_action_owner": "sol",
+                })
             classification = advice.get("classification")
             if classification == "FLAG_PATH":
                 actions.append({
@@ -182,6 +277,23 @@ def evaluate_race_transition(
             elif classification == "DEAD_BRANCH":
                 finalize.append(sid); reclaim.append(sid)
                 actions.append({"action": "FINALIZE_AND_RECLAIM", "session_id": sid, "native_action_owner": "sol"})
+    affected_branch = branch_by_session.get(str(affected_session_id or ""), {})
+    max_handoff = (
+        trigger in {"WORKING_POC", "REMOTE_ATTEMPT", "FLAG_CANDIDATE"}
+        and affected_branch.get("routing_profile") == "CONFIRMED_BOTTLENECK"
+    )
+    if max_handoff:
+        actions.append({
+            "action": "SOL_TAKEOVER", "session_id": affected_session_id,
+            "next_objective": "take the Max artifact and execute the declared remote endgame",
+            "native_action_owner": "sol", "required": True,
+        })
+        if trigger == "WORKING_POC":
+            actions.append({
+                "action": "STOP_LOW_VALUE_BRANCH", "session_id": affected_session_id,
+                "reason": "Max lane produced WORKING_POC and may not continue broad work",
+                "native_action_owner": "sol",
+            })
     result = {
         "schema_version": 1, "transition_id": transition_id, "trigger": trigger,
         "run_id": plan.get("run_id") or root.name,
@@ -196,6 +308,7 @@ def evaluate_race_transition(
         "branches_to_finalize": sorted(set(finalize)),
         "branches_to_reclaim": sorted(set(reclaim)),
         "dependent_invalidations": dependent, "created_at": utc_now(), "idempotent": False,
+        "max_continuation_allowed": not max_handoff,
         "required_projections": list(TRANSITION_PROJECTIONS),
     }
     with state_lock(root):
@@ -333,6 +446,12 @@ def _expected_control_pairs(result: Mapping[str, Any]) -> set[tuple[str, str]]:
         "STOP_LOW_VALUE_BRANCH": "STOP_LOW_VALUE_BRANCH",
         "FINALIZE_AND_RECLAIM": "STOP_REQUIRED",
         "REVIEW_REQUIRED": "REVIEW_CANDIDATE_DEPENDENCY",
+        "ROUTING_PROFILE_RECOMMENDED": "ROUTING_PROFILE_RECOMMENDED",
+        "REASONING_ESCALATION_RECOMMENDED": "REASONING_ESCALATION_RECOMMENDED",
+        "MAX_ENDGAME_RECOMMENDED": "MAX_ENDGAME_RECOMMENDED",
+        "MAX_LEASE_EXPIRED": "MAX_LEASE_EXPIRED",
+        "ROUTING_FALLBACK_RECORDED": "ROUTING_FALLBACK_RECORDED",
+        "ROUTING_MISMATCH_REVIEW": "ROUTING_MISMATCH_REVIEW",
     }
     pairs = {
         (
@@ -603,6 +722,12 @@ def _materialize_control_actions(
         "SOL_TAKEOVER": "SOL_TAKEOVER", "CONTINUE_WITH_EVIDENCE": "CONTINUE_WITH_EVIDENCE",
         "STOP_LOW_VALUE_BRANCH": "STOP_LOW_VALUE_BRANCH", "FINALIZE_AND_RECLAIM": "STOP_REQUIRED",
         "REVIEW_REQUIRED": "REVIEW_CANDIDATE_DEPENDENCY",
+        "ROUTING_PROFILE_RECOMMENDED": "ROUTING_PROFILE_RECOMMENDED",
+        "REASONING_ESCALATION_RECOMMENDED": "REASONING_ESCALATION_RECOMMENDED",
+        "MAX_ENDGAME_RECOMMENDED": "MAX_ENDGAME_RECOMMENDED",
+        "MAX_LEASE_EXPIRED": "MAX_LEASE_EXPIRED",
+        "ROUTING_FALLBACK_RECORDED": "ROUTING_FALLBACK_RECORDED",
+        "ROUTING_MISMATCH_REVIEW": "ROUTING_MISMATCH_REVIEW",
     }
     for action in result.get("recommended_actions", []):
         kind = mapping.get(str(action.get("action")))
@@ -622,3 +747,58 @@ def _materialize_control_actions(
             metadata=metadata,
         ))
     return records
+
+
+def _max_routing_evidence(
+    branch: Mapping[str, Any], checkpoints: list[Mapping[str, Any]], advice: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    sid = str(branch.get("session_id") or "")
+    rows = [row for row in checkpoints if row.get("session_id") == sid]
+    primitive = next((
+        row for row in reversed(rows)
+        if str(row.get("type") or row.get("event_type") or "").upper()
+        in {"EXPLOIT_PRIMITIVE_CONFIRMED", "PRIMITIVE_CONFIRMED"}
+    ), None)
+    blocker = next((
+        row for row in reversed(rows)
+        if str(row.get("type") or row.get("event_type") or "").upper()
+        in {"TYPED_BLOCKER", "BLOCKER"}
+    ), None)
+    blocker_details = blocker.get("details") if isinstance(blocker, Mapping) and isinstance(blocker.get("details"), Mapping) else {}
+    blocker_type = (
+        blocker.get("blocker_type") if isinstance(blocker, Mapping) else None
+    ) or blocker_details.get("blocker_type")
+    metrics = advice.get("metrics") if isinstance(advice.get("metrics"), Mapping) else {}
+    decisive_rows = [
+        row for row in reversed(rows)
+        if str(row.get("type") or row.get("event_type") or "").upper()
+        == "DECISIVE_EXPERIMENT"
+    ]
+    decisive = decisive_rows[0] if decisive_rows else None
+    working_poc_receipt = any(
+        str(row.get("type") or row.get("event_type") or "").upper() == "WORKING_POC"
+        for row in rows
+    )
+    observed_xhigh = (
+        branch.get("observed_reasoning") == "xhigh"
+        and branch.get("runtime_observation_status") == "OBSERVED"
+    )
+    refs = [
+        str(row.get("receipt_id") or row.get("event_id") or row.get("checkpoint_id"))
+        for row in (primitive, blocker, decisive) if isinstance(row, Mapping)
+        and (row.get("receipt_id") or row.get("event_id") or row.get("checkpoint_id"))
+    ]
+    return {
+        "primitive_confirmed": primitive is not None,
+        "specific_blocker_present": blocker is not None and bool(blocker_type),
+        "blocker_type": blocker_type,
+        "environment_or_tool_blocker": str(blocker_type or "").upper() in {
+            "DOCKER_ERROR", "DEPENDENCY_ERROR", "TOOL_INSTALLATION", "TOOL_FAILURE",
+            "TARGET_DOWN", "RATE_LIMITED", "ENVIRONMENT_FAILURE", "LONG_COMPUTE",
+        },
+        "working_poc_present": bool(metrics.get("working_poc_present")) or working_poc_receipt,
+        "flag_path_present": advice.get("classification") == "FLAG_PATH",
+        "xhigh_decisive_experiments": (
+            len(decisive_rows) if observed_xhigh else 0
+        ),
+    }, refs or [f"branch:{sid}:typed-endgame-state"]

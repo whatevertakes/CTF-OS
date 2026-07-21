@@ -19,6 +19,9 @@ ACTION_TYPES = frozenset({
     "CONTINUE_WITH_EVIDENCE", "SOL_TAKEOVER", "REPLACE_ATTACK_FAMILY", "STOP_REQUIRED",
     "LONG_COMPUTE_REVIEW", "REMOTE_ATTEMPT_REQUIRED", "OPERATOR_REVIEW",
     "RETARGET_TO_POC", "STOP_LOW_VALUE_BRANCH", "REVIEW_CANDIDATE_DEPENDENCY",
+    "ROUTING_PROFILE_RECOMMENDED", "REASONING_ESCALATION_RECOMMENDED",
+    "MAX_ENDGAME_RECOMMENDED", "MAX_LEASE_EXPIRED",
+    "ROUTING_FALLBACK_RECORDED", "ROUTING_MISMATCH_REVIEW",
 })
 
 
@@ -331,6 +334,35 @@ def _validate_action_proof(
             )
         except ProgressGateError as exc:
             raise ControlActionError(str(exc)) from exc
+
+    if action_type in {"ROUTING_FALLBACK_RECORDED", "ROUTING_MISMATCH_REVIEW"}:
+        if branch is None:
+            raise ControlActionError("routing review target branch does not exist")
+        start = branch.get("start_receipt") or branch.get("native_start_receipt")
+        if (
+            not isinstance(start, Mapping)
+            or start.get("receipt_id") != proof.get("native_start_receipt_id")
+        ):
+            raise ControlActionError("routing review requires the exact native start receipt")
+        expected = (
+            "FALLBACK_MATCHED" if action_type == "ROUTING_FALLBACK_RECORDED"
+            else "ROUTING_MISMATCH"
+        )
+        if start.get("routing_classification") != expected:
+            raise ControlActionError("native start receipt does not prove the routing action")
+        return dict(start)
+
+    if action_type == "MAX_LEASE_EXPIRED":
+        if branch is None or branch.get("routing_profile") != "CONFIRMED_BOTTLENECK":
+            raise ControlActionError("Max lease action target is not a Max lane")
+        start = branch.get("start_receipt") or branch.get("native_start_receipt")
+        if not isinstance(start, Mapping) or start.get("receipt_id") != proof.get("native_start_receipt_id"):
+            raise ControlActionError("Max lease expiry requires the exact native start receipt")
+        if proof.get("lease_reason") not in {
+            "lease_expired", "two_decisive_experiments_completed",
+        }:
+            raise ControlActionError("Max lease expiry reason is invalid")
+        return dict(start)
 
     _require_milestone_reference(
         milestones, proof.get("evidence_receipt_id"),

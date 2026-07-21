@@ -103,6 +103,8 @@ def create_benchmark_manifest(
         "observed_reasoning_missing_reason": None if observed_reasoning else "runtime surface did not expose reasoning identity",
         "runtime_observation_policy": runtime_policy,
         "runtime_observation_evidence": source_environment.get("runtime_observation_evidence"),
+        "branch_routing_observations": [],
+        "model_routing_diagnostic_layer": "SEPARATE_FROM_ABCD_TREATMENT",
     }
     manifest = {
         "schema_version": BENCHMARK_MANIFEST_SCHEMA_VERSION,

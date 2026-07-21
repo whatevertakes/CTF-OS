@@ -162,6 +162,7 @@ def evaluate_benchmark(
             for stratum in STRATA
         },
         "target_environment_failures": failures,
+        "model_routing_diagnostics": _model_routing_diagnostics(manifests),
         "final_decision": final,
         "primary_conclusion_stratum": "PRIVATE_HELDOUT",
         "stratum_policy": {
@@ -183,6 +184,57 @@ def evaluate_benchmark(
         "censor_time_seconds": DEFAULT_CENSOR_SECONDS,
     }
     return result
+
+
+def _model_routing_diagnostics(
+    manifests: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Separate diagnostic layer; never changes A/B/C/D treatment validity or decisions."""
+
+    observations: list[dict[str, Any]] = []
+    for manifest in manifests:
+        runtime = manifest.get("runtime") if isinstance(manifest.get("runtime"), Mapping) else {}
+        for raw in runtime.get("branch_routing_observations", []) or []:
+            if isinstance(raw, Mapping):
+                observations.append(dict(raw))
+    by_observed: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"observations": 0, "solver_successes": 0, "solver_failures": 0}
+    )
+    invalid: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    solver_failures: list[dict[str, Any]] = []
+    valid_statuses = {"ROUTING_MATCHED", "FALLBACK_MATCHED"}
+    for row in observations:
+        classification = str(row.get("routing_classification") or "RUNTIME_NOT_OBSERVABLE")
+        observed_model = row.get("observed_model")
+        observed_reasoning = row.get("observed_reasoning")
+        if classification in {"RUNTIME_NOT_OBSERVABLE", "ROUTING_UNSUPPORTED", "LEGACY_UNROUTED"}:
+            missing.append(row)
+            continue
+        if classification == "ROUTING_MISMATCH":
+            invalid.append(row)
+            continue
+        if not observed_model or not observed_reasoning:
+            missing.append(row)
+            continue
+        key = f"{observed_model}:{observed_reasoning}"
+        by_observed[key]["observations"] += 1
+        if row.get("solver_success") is True:
+            by_observed[key]["solver_successes"] += 1
+        else:
+            by_observed[key]["solver_failures"] += 1
+            if classification in valid_statuses:
+                solver_failures.append(row)
+    return {
+        "layer": "SEPARATE_FROM_ABCD_TREATMENT",
+        "affects_abcd_decision": False,
+        "observation_count": len(observations),
+        "performance_by_observed_runtime": dict(sorted(by_observed.items())),
+        "invalid_model_routing_treatments": invalid,
+        "missing_runtime_observations": missing,
+        "solver_failures_after_valid_routing": solver_failures,
+        "requested_identity_used_for_attribution": False,
+    }
 
 
 def validate_inputs(manifests: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

@@ -1,0 +1,7 @@
+name = "ctf_max_endgame"
+description = "Single leased CTF Sol max endgame worker for an already confirmed primitive and exact blocker."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "max"
+developer_instructions = """
+Work only on the confirmed primitive and typed blocker in the packet. Maximum lease is 600 seconds or two decisive experiments. Stop immediately on a working PoC, remote attempt, flag candidate, primitive refutation, or lease expiry. Do not perform broad recon, generic research, tool installation, or long computation. Publish the decisive artifact so the parent Sol can take over.
+"""

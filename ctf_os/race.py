@@ -17,6 +17,10 @@ from .delegation import (
     BranchCandidate, DelegationError, admit_branch, load_templates, plan_path, utc_now,
 )
 from .modes import SolveMode, resolve_solve_mode, validate_branch_intents
+from .model_routing import (
+    RoutingError, build_native_delegation_packet, build_routing_contract,
+    recommend_routing_profile,
+)
 from .race_lineage import plan_race_generation
 from .workspace import (
     append_jsonl_fsync, atomic_json, atomic_text, ensure_run_mutable,
@@ -48,6 +52,7 @@ class RaceBranchSpec:
     budget_seconds: int = 1800
     requested_model_role: str = "solver"
     requested_reasoning: str = "high"
+    routing_contract: Mapping[str, Any] | None = None
     purpose: str = "parallel-race"
     race_override_reason: str | None = None
 
@@ -71,6 +76,61 @@ class RaceBranchSpec:
         budget = int(raw.get("budget_seconds", 1800))
         if not 1 <= steps <= 10000 or not 1 <= budget <= 86400:
             raise DelegationError("race branch steps or budget are outside supported bounds")
+        purpose = str(raw.get("purpose") or "parallel-race")
+        decisive_experiment = str(
+            raw.get("decisive_experiment")
+            or "Run the cheapest experiment that can prove or kill the expected primitive"
+        )
+        routing_evidence_context = {
+            "role": candidate.role, "purpose": purpose,
+            "hypothesis": candidate.hypothesis,
+            "hypothesis_family": candidate.hypothesis_family,
+            "mechanism": raw.get("mechanism"),
+            "decisive_experiment": decisive_experiment,
+            "expected_artifacts": list(candidate.expected_artifacts),
+            "tool_strategy": list(candidate.tool_strategy),
+            "mechanical_only": raw.get("mechanical_only") is True,
+            "bounded_experiment": raw.get("bounded_experiment") is True,
+            "implementation_only": raw.get("implementation_only") is True,
+            "mechanism_confirmed": raw.get("mechanism_confirmed") is True,
+            "high_complexity_mechanism": raw.get("high_complexity_mechanism") is True,
+            "primitive_confirmed": raw.get("primitive_confirmed") is True,
+            "specific_blocker_present": raw.get("specific_blocker_present") is True,
+            "blocker_type": raw.get("blocker_type"),
+            "environment_or_tool_blocker": raw.get("environment_or_tool_blocker") is True,
+            "working_poc_present": raw.get("working_poc_present") is True,
+            "flag_path_present": raw.get("flag_path_present") is True,
+            "xhigh_decisive_experiments": int(raw.get("xhigh_decisive_experiments") or 0),
+        }
+        recommendation = recommend_routing_profile(routing_evidence_context)
+        routing_profile = str(raw.get("routing_profile") or recommendation["routing_profile"])
+        routing_reason = str(raw.get("routing_reason") or recommendation["routing_reason"])
+        routing_references = raw.get("routing_evidence") or [
+            f"branch-contract:{candidate.session_id}:hypothesis",
+            f"branch-contract:{candidate.session_id}:decisive-experiment",
+        ]
+        try:
+            routing_contract = build_routing_contract(
+                routing_profile, routing_reason=routing_reason,
+                routing_evidence=_strings(routing_references),
+                branch_evidence=routing_evidence_context,
+                requested_model=(
+                    str(raw["requested_model"]) if raw.get("requested_model") is not None else None
+                ),
+                requested_reasoning=(
+                    str(raw["requested_reasoning"])
+                    if raw.get("routing_profile") and raw.get("requested_reasoning") is not None
+                    else None
+                ),
+                fallback_profile=(
+                    raw.get("fallback_profile") if "fallback_profile" in raw else ...
+                ),
+                fallback_reason=(
+                    raw.get("fallback_reason") if "fallback_reason" in raw else ...
+                ),
+            )
+        except RoutingError as exc:
+            raise DelegationError(str(exc)) from exc
         return cls(
             session_id=candidate.session_id, role=candidate.role,
             hypothesis_family=candidate.hypothesis_family, hypothesis=candidate.hypothesis,
@@ -78,13 +138,13 @@ class RaceBranchSpec:
             expected_artifacts=candidate.expected_artifacts, evidence_contract=evidence,
             success_condition=str(raw.get("success_condition") or "The decisive experiment proves the primitive, produces a working PoC, or obtains the flag"),
             kill_condition=str(raw.get("kill_condition") or "The decisive experiment refutes the primitive or a changed experiment still does not improve exploit proximity"),
-            decisive_experiment=str(raw.get("decisive_experiment") or "Run the cheapest experiment that can prove or kill the expected primitive"),
+            decisive_experiment=decisive_experiment,
             minimal_poc_requirement=str(raw.get("minimal_poc_requirement") or "Build the smallest executable input, request, or script that proves the primitive"),
             remote_transition_requirement=str(raw.get("remote_transition_requirement") or "Attempt the declared remote as soon as the PoC is plausible"),
             maximum_steps=steps, budget_seconds=budget,
-            requested_model_role=str(raw.get("requested_model_role") or raw.get("model_role") or "solver"),
-            requested_reasoning=str(raw.get("requested_reasoning") or raw.get("reasoning") or "high"),
-            purpose=str(raw.get("purpose") or "parallel-race"),
+            requested_model_role=str(raw.get("requested_model_role") or raw.get("model_role") or routing_contract["requested_model_class"]),
+            requested_reasoning=str(routing_contract["requested_reasoning"]),
+            routing_contract=routing_contract, purpose=purpose,
             race_override_reason=(str(raw["race_override_reason"]) if raw.get("race_override_reason") else None),
         )
 
@@ -186,6 +246,7 @@ def start_race_plan(
         "race_id": request_id, "challenge_id": challenge_id,
         "input_fingerprint": input_fingerprint,
         "run_id": current_state.get("run_id"),
+        "attempt_id": current_state.get("attempt_id"),
         "target_revision": int(current_state.get("target_revision") or 1),
         "parent_session_id": parent_session_id,
         "tier": tier, "tier_reason": tier_reason, "mode": selected_mode.value,
@@ -199,7 +260,18 @@ def start_race_plan(
         "admission_decisions": [], "ledger_recoverable": True,
     }
     rejected: list[dict[str, Any]] = []
+    if sum(
+        spec.routing_contract is not None
+        and spec.routing_contract.get("routing_profile") == "CONFIRMED_BOTTLENECK"
+        for spec in branch_specs
+    ) > 1:
+        raise DelegationError("maximum active Max lanes is one")
     for spec in branch_specs:
+        if (
+            spec.routing_contract is not None
+            and spec.routing_contract.get("routing_profile") == "CONFIRMED_BOTTLENECK"
+        ):
+            _validate_max_receipt_references(solve_root, spec.routing_contract)
         decision = admit_branch(
             plan, spec.candidate, threshold=threshold, purpose=spec.purpose,
             race_override_reason=spec.race_override_reason,
@@ -216,6 +288,7 @@ def start_race_plan(
             spec, decision, challenge_id, input_fingerprint, parent_session_id,
             tier=tier or 0, tier_reason=tier_reason,
             run_id=current_state.get("run_id"),
+            attempt_id=current_state.get("attempt_id"),
             target_revision=int(current_state.get("target_revision") or 1),
         ))
     compatibility_archive: tuple[Path, dict[str, Any]] | None = None
@@ -308,9 +381,15 @@ def race_board(
             "result_state": "TERMINAL_RECORDED" if branch.get("finished_at") else "PENDING",
             "role": branch.get("role"), "hypothesis_family": branch.get("hypothesis_family"),
             "requested_model_role": branch.get("requested_model_role"),
+            "routing_profile": branch.get("routing_profile", "LEGACY_UNROUTED"),
+            "requested_model_class": branch.get("requested_model_class"),
+            "requested_model": branch.get("requested_model"),
             "requested_reasoning": branch.get("requested_reasoning"),
             "observed_runtime_model": branch.get("observed_runtime_model"),
             "observed_reasoning": branch.get("observed_reasoning"),
+            "runtime_observation_status": branch.get("runtime_observation_status"),
+            "routing_classification": branch.get("routing_classification"),
+            "routing_matched": branch.get("routing_matched", False),
             "current_utility_classification": branch.get("utility_classification", "INSUFFICIENT_DATA"),
             "last_checkpoint": latest,
             "last_new_evidence_time": latest.get("created_at") if latest else None,
@@ -393,13 +472,14 @@ def _default_tools(category: str, role: str) -> list[str]:
 def _branch_payload(
     spec: RaceBranchSpec, admission: Mapping[str, Any], challenge_id: str,
     fingerprint: str, parent_session_id: str, *, tier: int, tier_reason: str,
-    run_id: str | None, target_revision: int,
+    run_id: str | None, attempt_id: str | None, target_revision: int,
 ) -> dict[str, Any]:
     now = utc_now()
+    routing = dict(spec.routing_contract or {})
     packet = {
         "schema_version": 1, "session_id": spec.session_id,
         "parent_session_id": parent_session_id, "challenge_id": challenge_id,
-        "run_id": run_id, "input_fingerprint": fingerprint,
+        "run_id": run_id, "attempt_id": attempt_id, "input_fingerprint": fingerprint,
         "target_revision": target_revision, "role": spec.role,
         "hypothesis_family": spec.hypothesis_family,
         "primary_objective": "Obtain the first valid flag as quickly as possible",
@@ -419,6 +499,7 @@ def _branch_payload(
             "expected primitive", "cheapest decisive experiment", "success condition", "kill condition",
         ],
         "budget_seconds": spec.budget_seconds, "maximum_steps": spec.maximum_steps,
+        **routing,
         "replacement_context": tier_reason if tier == 4 else None,
         "replacement_requirement": (
             "Use a genuinely different exploit mechanism and state why the prior family did not increase exploit proximity"
@@ -431,19 +512,41 @@ def _branch_payload(
             "before any summary; create REMOTE_FLAG_OBTAINED only through a verified flag receipt. Use only this challenge and declared targets."
         ),
     }
+    if routing:
+        packet["native_delegation_packet"] = build_native_delegation_packet(
+            routing, task_name=spec.session_id,
+            child_prompt={
+                "session_id": spec.session_id,
+                "challenge_id": challenge_id,
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "leading_exploit_hypothesis": spec.hypothesis,
+                "decisive_experiment": spec.decisive_experiment,
+                "success_condition": spec.success_condition,
+                "kill_condition": spec.kill_condition,
+                "expected_artifacts": list(spec.expected_artifacts),
+                "instruction": packet["instruction"],
+            },
+        )
     if len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > PROMPT_PACKET_MAX_BYTES:
         raise DelegationError(f"prompt packet exceeds {PROMPT_PACKET_MAX_BYTES} bytes")
     return {
         **_candidate_payload(spec.candidate), "evidence_contract": list(spec.evidence_contract),
+        "run_id": run_id, "attempt_id": attempt_id,
+        "parent_session_id": parent_session_id,
         "success_condition": spec.success_condition, "kill_condition": spec.kill_condition,
         "decisive_experiment": spec.decisive_experiment,
         "minimal_poc_requirement": spec.minimal_poc_requirement,
         "remote_transition_requirement": spec.remote_transition_requirement,
         "maximum_steps": spec.maximum_steps, "budget_seconds": spec.budget_seconds,
         "requested_model_role": spec.requested_model_role,
-        "requested_reasoning": spec.requested_reasoning,
+        "requested_reasoning": spec.requested_reasoning, **routing,
         "observed_runtime_model": None, "observed_reasoning": None,
-        "runtime_observation_evidence": None, "pinning_verified": False,
+        "runtime_observation_status": None, "runtime_observation_evidence": None,
+        "routing_classification": None,
+        "model_routing_matched": False, "reasoning_routing_matched": False,
+        "routing_matched": False, "fallback_used": False, "fallback_reason_observed": None,
+        "pinning_verified": False,
         "independent_verification": spec.purpose in {"independent-verification", "clean-room-verification"},
         "purpose": spec.purpose, "admission": dict(admission), "status": "PLANNED",
         "native_delegation_required": True, "start_receipt": None,
@@ -492,6 +595,29 @@ def _append_ledger(root: Path, payload: Mapping[str, Any]) -> None:
             append_jsonl_fsync(path, payload, label="race plan ledger")
         except ValueError as exc:
             raise DelegationError(str(exc)) from exc
+
+
+def _validate_max_receipt_references(
+    solve_root: Path, contract: Mapping[str, Any],
+) -> None:
+    rows = read_jsonl_strict(
+        solve_root / "milestone-receipts.jsonl", "milestone receipt ledger",
+    )
+    references = set(str(value) for value in contract.get("routing_evidence", []))
+    selected = [
+        row for row in rows
+        if str(row.get("receipt_id") or "") in references
+        or str(row.get("operation_id") or "") in references
+    ]
+    kinds = {str(row.get("event_type") or "").upper() for row in selected}
+    if "PRIMITIVE_CONFIRMED" not in kinds or "TYPED_BLOCKER" not in kinds:
+        raise DelegationError(
+            "CONFIRMED_BOTTLENECK routing requires referenced PRIMITIVE_CONFIRMED and TYPED_BLOCKER receipts"
+        )
+    if "DECISIVE_EXPERIMENT" not in kinds:
+        raise DelegationError(
+            "CONFIRMED_BOTTLENECK routing requires a referenced xhigh decisive experiment receipt"
+        )
 
 
 def _strings(value: Any) -> list[str]:

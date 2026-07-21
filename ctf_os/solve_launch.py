@@ -8,6 +8,7 @@ from typing import Any
 
 from .contest import ChallengeSpec
 from .modes import SolveMode, resolve_solve_mode
+from .model_routing import VERIFIED_RUNTIME_MODELS, validate_ultra_guard
 from .preflight import prepared_input_bytes
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json
@@ -60,6 +61,20 @@ def build_solve_launch_context(
         "solve_mode": selected_mode.value,
         "legacy_tier": legacy_tier,
         "sol_lane": {"status": "RUNNING", "session_id": "sol-main"},
+        "lead_runtime_contract": {
+            "requested_model_class": "sol-equivalent",
+            "requested_model": VERIFIED_RUNTIME_MODELS["sol-equivalent"],
+            "requested_reasoning": "xhigh",
+            "observed_model": None, "observed_reasoning": None,
+            "runtime_observation_status": "NOT_YET_OBSERVED",
+            "lead_attacker": True,
+        },
+        "ultra_guard": {
+            **validate_ultra_guard(selected_mode.value, observed_reasoning=None),
+            "adaptive_race_with_ultra_allowed": False,
+            "fixed_race_with_ultra_allowed": False,
+            "sol_only_with_ultra_requires_separate_experiment": True,
+        },
         "planned_child_width": 0,
         "active_child_width": 0,
         "bounded_observation": {
@@ -93,6 +108,11 @@ def build_solve_launch_context(
             "tier_is_legacy_resource_hint_only": True,
             "fixed_race_requires_exactly_three_frozen_intents": True,
             "adaptive_replacement_limit": 1,
+            "maximum_model_concurrency": (
+                1 if selected_mode is SolveMode.SOL_ONLY else 4
+            ),
+            "maximum_active_max_lanes": 1,
+            "ultra_must_not_nest_with_ctf_os_race": True,
             "observation_hint_semantics": OBSERVATION_HINT_SEMANTICS,
         },
     }

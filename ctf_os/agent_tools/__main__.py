@@ -80,6 +80,9 @@ from ..verification import record_remote_flag
 from ..control import apply_control_action, acknowledge_control_action, load_control_actions
 from ..milestones import repair_run_projections, save_milestone
 from ..modes import SolveMode, resolve_solve_mode
+from ..model_routing import (
+    ROUTING_PROFILES, build_routing_contract, recommend_routing_profile,
+)
 from ..progress import heartbeat_long_compute, record_command
 from ..terminal import converge_terminal, record_native_stop, record_submission_result, terminal_status
 from ..working_poc import commit_working_poc, resolve_unknown_working_poc
@@ -394,6 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
         branch_add.add_argument("--success-condition", required=True); branch_add.add_argument("--kill-condition", required=True)
         branch_add.add_argument("--maximum-steps", type=int, required=True); branch_add.add_argument("--budget-seconds", type=int, required=True)
         branch_add.add_argument("--requested-model-role", required=True); branch_add.add_argument("--requested-reasoning", required=True)
+        _add_routing_args(branch_add)
         branch_add.add_argument("--purpose"); _add_delegation_controller_args(branch_add)
         branch_update = commands.add_parser("delegation-branch-update")
         branch_update.add_argument("selector"); branch_update.add_argument("--contest"); branch_update.add_argument("--session-id", required=True)
@@ -413,11 +417,18 @@ def build_parser() -> argparse.ArgumentParser:
         replacement.add_argument("--success-condition", required=True); replacement.add_argument("--kill-condition", required=True)
         replacement.add_argument("--maximum-steps", type=int, required=True); replacement.add_argument("--budget-seconds", type=int, required=True)
         replacement.add_argument("--requested-model-role", required=True); replacement.add_argument("--requested-reasoning", required=True)
+        _add_routing_args(replacement)
         _add_delegation_controller_args(replacement)
         start_confirm = commands.add_parser("branch-start-confirm")
         start_confirm.add_argument("selector"); start_confirm.add_argument("--contest")
         start_confirm.add_argument("--replacement-request-id", default="initial-race"); start_confirm.add_argument("--session-id", required=True)
         start_confirm.add_argument("--native-session-observed", required=True); start_confirm.add_argument("--runtime-observation-evidence", required=True)
+        start_confirm.add_argument("--native-start-operation-id", required=True)
+        start_confirm.add_argument("--observed-model"); start_confirm.add_argument("--observed-reasoning")
+        start_confirm.add_argument(
+            "--runtime-observation-status", required=True,
+            choices=("OBSERVED", "NOT_OBSERVABLE", "UNSUPPORTED", "CONFLICT"),
+        )
         start_confirm.add_argument("--sandbox-metadata-path", required=True)
         start_confirm.add_argument("--session-role", choices=("sol",), default="sol"); start_confirm.add_argument("--parent-session-id", default="sol-main"); start_confirm.add_argument("--recover-stale", action="store_true")
     if not child_surface:
@@ -633,6 +644,15 @@ def _add_branch_candidate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("selector"); parser.add_argument("--contest"); parser.add_argument("--session-id", required=True)
     parser.add_argument("--role", required=True); parser.add_argument("--hypothesis-family", required=True); parser.add_argument("--hypothesis", required=True)
     parser.add_argument("--scope", required=True); parser.add_argument("--tool-strategy", required=True); parser.add_argument("--expected-artifact", action="append", required=True)
+
+
+def _add_routing_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--routing-profile", choices=tuple(sorted(ROUTING_PROFILES)))
+    parser.add_argument("--routing-reason")
+    parser.add_argument("--routing-evidence", action="append", default=[])
+    parser.add_argument("--fallback-profile", choices=tuple(sorted(ROUTING_PROFILES)))
+    parser.add_argument("--fallback-reason")
+    parser.add_argument("--routing-context-json")
 
 
 def _add_delegation_controller_args(parser: argparse.ArgumentParser) -> None:
@@ -1261,7 +1281,19 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             )
         if args.command == "delegation-branch-add":
             candidate = _candidate_from_args(args)
-            return add_branch(solve_root, input_fingerprint=current_fingerprint, candidate=candidate, evidence_contract=args.evidence_contract, success_condition=args.success_condition, kill_condition=args.kill_condition, maximum_steps=args.maximum_steps, budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role, requested_reasoning=args.requested_reasoning, purpose=args.purpose)
+            routing_contract, routing_context = _routing_from_args(
+                args, candidate, purpose=args.purpose,
+            )
+            return add_branch(
+                solve_root, input_fingerprint=current_fingerprint, candidate=candidate,
+                evidence_contract=args.evidence_contract,
+                success_condition=args.success_condition, kill_condition=args.kill_condition,
+                maximum_steps=args.maximum_steps, budget_seconds=args.budget_seconds,
+                requested_model_role=args.requested_model_role,
+                requested_reasoning=args.requested_reasoning, purpose=args.purpose,
+                routing_contract=routing_contract,
+                routing_evidence_context=routing_context,
+            )
         if args.command == "delegation-branch-update":
             result = update_branch(solve_root, input_fingerprint=current_fingerprint, session_id=args.session_id, status=args.status, observed_runtime_model=args.observed_runtime_model, observed_reasoning=args.observed_reasoning, pinning_verified=args.pinning_verified, runtime_observation_evidence=args.runtime_observation_evidence)
             terminal = args.status.upper() in {"SUPPORTED", "REFUTED", "PARTIAL", "INCONCLUSIVE", "TERMINATED", "ERROR", "STALE"}
@@ -1312,15 +1344,21 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                     )
             return advice
         if args.command == "branch-replacement-prepare":
+            candidate = _candidate_from_args(args)
+            routing_contract, routing_context = _routing_from_args(
+                args, candidate, purpose="alternate-attack-family",
+            )
             return prepare_branch_replacement(
                 solve_root, input_fingerprint=current_fingerprint,
-                superseded_branch_id=args.superseded_branch_id, candidate=_candidate_from_args(args),
+                superseded_branch_id=args.superseded_branch_id, candidate=candidate,
                 kill_reason=args.kill_reason, distinct_mechanism_proof=args.distinct_mechanism_proof,
                 evidence_contract=args.evidence_contract, success_condition=args.success_condition,
                 kill_condition=args.kill_condition, maximum_steps=args.maximum_steps,
                 budget_seconds=args.budget_seconds, requested_model_role=args.requested_model_role,
                 requested_reasoning=args.requested_reasoning,
                 triggering_receipt_id=args.triggering_receipt_id,
+                routing_contract=routing_contract,
+                routing_evidence_context=routing_context,
             )
         if args.command == "branch-start-confirm":
             return confirm_branch_start(
@@ -1329,6 +1367,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 native_session_observed=args.native_session_observed,
                 runtime_observation_evidence=args.runtime_observation_evidence,
                 sandbox_metadata_path=args.sandbox_metadata_path,
+                native_start_operation_id=args.native_start_operation_id,
+                observed_model=args.observed_model,
+                observed_reasoning=args.observed_reasoning,
+                runtime_observation_status=args.runtime_observation_status,
             )
     if args.command.startswith("service-"):
         spec = _service_spec(manifest, challenge, record, solve_root)
@@ -2099,6 +2141,53 @@ def _csv(value: str) -> list[str]:
 
 def _candidate_from_args(args: argparse.Namespace) -> BranchCandidate:
     return BranchCandidate.create(session_id=args.session_id, role=args.role, hypothesis_family=args.hypothesis_family, hypothesis=args.hypothesis, scope=_csv(args.scope), tool_strategy=_csv(args.tool_strategy), expected_artifacts=args.expected_artifact)
+
+
+def _routing_from_args(
+    args: argparse.Namespace, candidate: BranchCandidate, *, purpose: str | None,
+) -> tuple[dict[str, object] | None, dict[str, object]]:
+    context: dict[str, object] = {
+        "role": candidate.role, "purpose": purpose,
+        "hypothesis": candidate.hypothesis,
+        "hypothesis_family": candidate.hypothesis_family,
+        "tool_strategy": list(candidate.tool_strategy),
+        "expected_artifacts": list(candidate.expected_artifacts),
+    }
+    raw_context = getattr(args, "routing_context_json", None)
+    if raw_context:
+        supplied = json.loads(raw_context)
+        if not isinstance(supplied, dict):
+            raise ValueError("--routing-context-json must be a JSON object")
+        context.update(supplied)
+    profile = getattr(args, "routing_profile", None)
+    if not profile:
+        if any((
+            getattr(args, "routing_reason", None),
+            getattr(args, "routing_evidence", []),
+            getattr(args, "fallback_profile", None),
+            getattr(args, "fallback_reason", None),
+            raw_context,
+        )):
+            raise ValueError("routing metadata requires --routing-profile")
+        return None, context
+    reason = getattr(args, "routing_reason", None)
+    references = getattr(args, "routing_evidence", [])
+    if not reason or not references:
+        recommendation = recommend_routing_profile(context)
+        raise ValueError(
+            "routed branch requires --routing-reason and --routing-evidence; "
+            f"evidence recommendation was {recommendation['routing_profile']}"
+        )
+    kwargs: dict[str, object] = {}
+    if getattr(args, "fallback_profile", None):
+        kwargs["fallback_profile"] = args.fallback_profile
+        kwargs["fallback_reason"] = args.fallback_reason
+    contract = build_routing_contract(
+        profile, routing_reason=reason, routing_evidence=references,
+        branch_evidence=context, requested_reasoning=args.requested_reasoning,
+        **kwargs,
+    )
+    return contract, context
 
 
 def _legacy_projection_enabled(workspace: Path) -> bool:

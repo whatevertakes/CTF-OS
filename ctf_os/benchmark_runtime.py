@@ -199,6 +199,13 @@ def validate_benchmark_completion(run: Path) -> dict[str, Any]:
         replacements = [row for row in lineage["branches"] if row.get("supersedes_branch_id")]
         if len(replacements) > 1:
             raise BenchmarkRuntimeError("adaptive-race exceeded one replacement")
+    manifest.setdefault("runtime", {})["branch_routing_observations"] = [
+        _branch_routing_observation(branch) for branch in lineage["branches"]
+    ]
+    manifest["runtime"]["model_routing_diagnostic_layer"] = (
+        "SEPARATE_FROM_ABCD_TREATMENT"
+    )
+    atomic_json(run / "RUN_MANIFEST.json", manifest)
     validate_manifest(manifest, require_complete=True)
     return {"valid": True, "run_id": run.name, "arm": arm}
 
@@ -238,7 +245,9 @@ def _context(
                 "tool_strategy": list(spec.tool_strategy),
                 "expected_artifacts": list(spec.expected_artifacts),
                 "requested_model_role": spec.requested_model_role,
-                "requested_reasoning": spec.requested_reasoning,
+                # Preserve the preregistered A/B/C/D fixed-race treatment.
+                # Branch-model routing is a separate diagnostic layer.
+                "requested_reasoning": "high",
             }
             for spec in specs
         ]
@@ -375,3 +384,28 @@ def _active_width_timeline(branches: list[Mapping[str, Any]]) -> list[int]:
             active.discard(key)
         widths.append(len(active))
     return widths
+
+
+def _branch_routing_observation(branch: Mapping[str, Any]) -> dict[str, Any]:
+    start = branch.get("start_receipt") or branch.get("native_start_receipt")
+    receipt = start if isinstance(start, Mapping) else {}
+    classification = str(
+        receipt.get("routing_classification")
+        or ("LEGACY_UNROUTED" if not branch.get("routing_profile") else "RUNTIME_NOT_OBSERVABLE")
+    )
+    return {
+        "run_id": branch.get("run_id"),
+        "session_id": branch.get("session_id"),
+        "routing_profile": branch.get("routing_profile", "LEGACY_UNROUTED"),
+        "requested_model": receipt.get("requested_model", branch.get("requested_model")),
+        "requested_reasoning": receipt.get(
+            "requested_reasoning", branch.get("requested_reasoning"),
+        ),
+        "observed_model": receipt.get("observed_model"),
+        "observed_reasoning": receipt.get("observed_reasoning"),
+        "routing_classification": classification,
+        "routing_matched": receipt.get("routing_matched", False),
+        "solver_success": branch.get("status") in {
+            "SUPPORTED", "COMPLETED", "FLAG_CANDIDATE",
+        },
+    }

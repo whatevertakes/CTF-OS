@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import importlib.util
+import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
 import tempfile
+import tomllib
+from typing import Any
 
 from .delegation import DelegationError, load_templates
+from .model_routing import PROFILE_POLICIES, ROUTING_PROFILES
 from .resources.scheduler import detect_gpus
 from .sandbox.runtime import SandboxSpec, cleanup, create, execute
 from .timeouts import TimeoutProfileError, load_timeout_profiles
@@ -192,6 +196,168 @@ def _image_probe(profile: str) -> subprocess.CompletedProcess[str]:
         argv.extend(["--security-opt", f"seccomp={seccomp}"])
     argv.extend(["--entrypoint", "sh", f"ctf-os-sandbox:{profile}", "-ec", command])
     return _run(argv, timeout=180)
+
+
+def inspect_codex_routing_capabilities(
+    repo: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = _run,
+) -> dict[str, object]:
+    """Inspect official Codex custom-agent routing without launching a model."""
+
+    codex = shutil.which("codex")
+    if not codex:
+        return {
+            "native_delegation": "UNKNOWN", "model_override": "UNKNOWN",
+            "reasoning_override": "UNKNOWN",
+            "direct_native_override": "UNKNOWN",
+            "custom_agent_profile_selection": "UNKNOWN",
+            "override_transport": "PROJECT_CUSTOM_AGENT",
+            "runtime_identity_observation": "NOT_OBSERVABLE",
+            "max_reasoning": "UNKNOWN", "ultra_mode_observation": "NOT_OBSERVABLE",
+            "supported_routing_profiles": [], "supported_model_identifiers": [],
+            "custom_agent_profiles": {}, "warnings": ["Codex CLI binary not found"],
+            "model_session_launched": False,
+        }
+    warnings: list[str] = []
+    version = run([codex, "--version"], timeout=15)
+    features = run([codex, "features", "list"], timeout=20)
+    native_delegation = (
+        "SUPPORTED" if features.returncode == 0 and any(
+            line.split()[:1] == ["multi_agent"] and line.split()[-1:] == ["true"]
+            for line in features.stdout.splitlines()
+        ) else "UNKNOWN"
+    )
+    catalog_result = run([codex, "debug", "models"], timeout=30)
+    catalog: dict[str, set[str]] = {}
+    if catalog_result.returncode == 0:
+        try:
+            raw_catalog = json.loads(catalog_result.stdout)
+            for item in raw_catalog.get("models", []):
+                if not isinstance(item, Mapping) or not item.get("slug"):
+                    continue
+                catalog[str(item["slug"])] = {
+                    str(level.get("effort")) for level in item.get("supported_reasoning_levels", [])
+                    if isinstance(level, Mapping) and level.get("effort")
+                }
+        except (json.JSONDecodeError, AttributeError):
+            warnings.append("Codex model catalog was malformed")
+    else:
+        warnings.append("Codex model catalog was unavailable")
+    profile_results: dict[str, dict[str, object]] = {}
+    supported_profiles: list[str] = []
+    for routing_profile in sorted(ROUTING_PROFILES):
+        policy = PROFILE_POLICIES[routing_profile]
+        variants = policy.get("agent_profiles") or {
+            str(policy["reasoning"]): str(policy["agent_profile"]),
+        }
+        variant_results: dict[str, dict[str, object]] = {}
+        for reasoning, raw_name in variants.items():
+            name = str(raw_name)
+            path = repo / ".codex" / "agents" / f"{name}.toml"
+            errors: list[str] = []
+            payload: Mapping[str, Any] = {}
+            try:
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("profile file missing or unsafe")
+                parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("profile is not a TOML object")
+                payload = parsed
+            except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+                errors.append(str(exc))
+            for field in ("name", "description", "developer_instructions"):
+                if not str(payload.get(field) or "").strip():
+                    errors.append(f"missing {field}")
+            if payload.get("name") != name:
+                errors.append("profile name mismatch")
+            if payload.get("model") != policy["model"]:
+                errors.append("model mapping mismatch")
+            if payload.get("model_reasoning_effort") != reasoning:
+                errors.append("reasoning mapping mismatch")
+            efforts = catalog.get(str(policy["model"]), set())
+            if not efforts:
+                errors.append("model identifier absent from current catalog")
+            elif reasoning not in efforts:
+                errors.append("reasoning effort absent from current model catalog")
+            variant_results[str(reasoning)] = {
+                "custom_agent_profile": name, "path": str(path),
+                "model": policy["model"], "reasoning": reasoning,
+                "valid": not errors, "errors": errors,
+            }
+        default = variant_results[str(policy["reasoning"])]
+        valid = all(bool(row["valid"]) for row in variant_results.values())
+        profile_results[routing_profile] = {
+            "custom_agent_profile": default["custom_agent_profile"],
+            "path": default["path"],
+            "model": policy["model"], "reasoning": policy["reasoning"],
+            "valid": valid,
+            "errors": [
+                error for row in variant_results.values() for error in row["errors"]
+            ],
+            "variants": variant_results,
+        }
+        if valid:
+            supported_profiles.append(routing_profile)
+    runtime_observation = "NOT_OBSERVABLE"
+    try:
+        with tempfile.TemporaryDirectory(prefix="ctf-os-codex-schema-") as directory:
+            schema = run([
+                codex, "app-server", "generate-json-schema", "--experimental",
+                "--out", directory,
+            ], timeout=30)
+            if schema.returncode == 0:
+                root = Path(directory)
+                combined_path = root / "codex_app_server_protocol.schemas.json"
+                thread_path = root / "v2" / "ThreadStartResponse.json"
+                combined = combined_path.read_text(encoding="utf-8") if combined_path.is_file() else ""
+                thread = thread_path.read_text(encoding="utf-8") if thread_path.is_file() else ""
+                if (
+                    '"CollabAgentToolCallThreadItem"' in combined
+                    and '"model"' in combined and '"reasoningEffort"' in combined
+                    and '"model"' in thread and '"reasoningEffort"' in thread
+                ):
+                    runtime_observation = "SUPPORTED"
+            else:
+                warnings.append("Codex native runtime schema generation failed")
+    except (OSError, ValueError):
+        warnings.append("Codex native runtime identity schema was unavailable")
+    profiles_valid = set(supported_profiles) == set(ROUTING_PROFILES)
+    model_override = "SUPPORTED" if profiles_valid else "UNSUPPORTED"
+    reasoning_override = "SUPPORTED" if profiles_valid else "UNSUPPORTED"
+    if not profiles_valid:
+        warnings.append("one or more CTF custom agent routing profiles are unavailable")
+    if runtime_observation != "SUPPORTED":
+        warnings.append("native child runtime identity is not observable through the detected schema")
+    return {
+        "codex_version": version.stdout.strip() if version.returncode == 0 else None,
+        "native_delegation": native_delegation,
+        "model_override": model_override,
+        "reasoning_override": reasoning_override,
+        # The installed/public native spawn call does not expose stable model or
+        # reasoning arguments.  Official project-scoped custom agents are the
+        # supported override transport; do not imply a direct call override.
+        "direct_native_override": "UNSUPPORTED",
+        "direct_native_override_evidence": (
+            "installed Codex native spawn surface has no documented stable model/reasoning arguments"
+        ),
+        "custom_agent_profile_selection": (
+            "SUPPORTED" if profiles_valid and native_delegation == "SUPPORTED" else "UNSUPPORTED"
+        ),
+        "override_transport": "PROJECT_CUSTOM_AGENT",
+        "runtime_identity_observation": runtime_observation,
+        "max_reasoning": (
+            "SUPPORTED" if "max" in catalog.get("gpt-5.6-sol", set()) else "UNSUPPORTED"
+        ),
+        "ultra_mode_observation": "NOT_OBSERVABLE",
+        "supported_routing_profiles": supported_profiles,
+        "supported_model_identifiers": sorted({
+            str(PROFILE_POLICIES[profile]["model"]) for profile in supported_profiles
+        }),
+        "custom_agent_profiles": profile_results,
+        "warnings": warnings,
+        "model_session_launched": False,
+    }
 
 
 def _gpu_image_probe(
@@ -504,6 +670,25 @@ def run_doctor(repo: Path) -> dict[str, object]:
     stale_count = len(stale_sandboxes.stdout.split())
     add("stale-resources", stale_count == 0, f"{stale_count} stopped sandbox resources", "run sandbox-gc for stopped sandboxes")
     checks.extend(_gpu_doctor_checks(detect_gpus(), image_present))
+    model_routing = inspect_codex_routing_capabilities(repo)
+    routing_supported = (
+        model_routing.get("native_delegation") == "SUPPORTED"
+        and model_routing.get("model_override") == "SUPPORTED"
+        and model_routing.get("reasoning_override") == "SUPPORTED"
+        and model_routing.get("custom_agent_profile_selection") == "SUPPORTED"
+        and model_routing.get("runtime_identity_observation") == "SUPPORTED"
+    )
+    routing_warnings = [str(item) for item in model_routing.get("warnings", [])]
+    warnings.extend(routing_warnings)
+    checks.append({
+        "name": "codex-model-routing", "ok": True,
+        "status": "PASS" if routing_supported else "WARN",
+        "detail": (
+            "project custom agents and native delegation are supported"
+            if routing_supported else
+            "model routing unavailable or incomplete; live solve may continue with inherited child or Sol-only"
+        ),
+    })
     return {
         "ok": all(bool(item["ok"]) for item in checks),
         "host_system": platform.system(),
@@ -516,6 +701,7 @@ def run_doctor(repo: Path) -> dict[str, object]:
         "docker_server_architecture": docker_server_architecture,
         "compose_version": compose.stdout.strip() if compose.returncode == 0 else None,
         "warnings": warnings,
+        "model_routing": model_routing,
         "checks": checks,
     }
 

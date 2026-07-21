@@ -476,6 +476,32 @@ def _validate_semantics(
             raise LineageError("replacement hypothesis family must be genuinely distinct")
     if event in {"NATIVE_STARTED", "NATIVE_STOP_RECORDED"} and not row.get("referenced_receipt_digest"):
         raise LineageError(f"{event} requires an exact referenced receipt digest")
+    if event == "NATIVE_STARTED":
+        first_details = history[0].get("details") if history else {}
+        contract = (
+            first_details.get("branch_contract")
+            if isinstance(first_details, Mapping) else {}
+        )
+        routed = isinstance(contract, Mapping) and contract.get("routing_profile") in {
+            "MECHANICAL", "BOUNDED_EXPERIMENT", "IMPLEMENTATION", "DEEP_SOLVER",
+            "CONFIRMED_BOTTLENECK",
+        }
+        observation_status = (
+            (row.get("details") or {}).get("runtime_observation_status")
+            if isinstance(row.get("details"), Mapping) else None
+        )
+        if routed and observation_status == "OBSERVED" and not row.get("operation_id"):
+            raise LineageError("observed routed NATIVE_STARTED requires a native start operation ID")
+        if row.get("operation_id") and any(
+            item.get("event") == "NATIVE_STARTED"
+            and item.get("operation_id") == row.get("operation_id")
+            and (
+                item.get("lineage_branch_id") != row.get("lineage_branch_id")
+                or item.get("referenced_receipt_digest") != row.get("referenced_receipt_digest")
+            )
+            for item in all_rows
+        ):
+            raise LineageError("native start operation ID has conflicting runtime identity")
     if event == "NATIVE_STARTED" and any(
         item.get("event") == "NATIVE_STARTED"
         and item.get("session_id") == row.get("session_id")
@@ -627,6 +653,21 @@ def _project_branch(row: Mapping[str, Any]) -> dict[str, Any]:
         "sandbox_cleaned", "resource_released", "terminal", "lineage_branch_id",
     }
     projected = {key: value for key, value in row.items() if key not in excluded}
+    projected.setdefault("evidence_contract", ["authoritative lineage receipt"])
+    projected.setdefault("success_condition", "decisive experiment proves the branch primitive")
+    projected.setdefault("kill_condition", "decisive experiment refutes the branch primitive")
+    projected.setdefault("maximum_steps", 80)
+    projected.setdefault("budget_seconds", 1800)
+    projected.setdefault("requested_model_role", "solver")
+    projected.setdefault("requested_reasoning", "high")
+    projected.setdefault("observed_runtime_model", None)
+    projected.setdefault("observed_reasoning", None)
+    projected.setdefault("runtime_observation_status", None)
+    projected.setdefault("runtime_observation_evidence", None)
+    projected.setdefault("pinning_verified", False)
+    projected.setdefault("admission", {"admitted": True, "reason": "authoritative lineage plan"})
+    projected.setdefault("started_at", None)
+    projected.setdefault("finished_at", None)
     if row.get("status") == "CHILD_TERMINAL_RESULT_RECORDED":
         projected["lifecycle_status"] = row["status"]
         terminal = row.get("terminal_result_receipt")
@@ -634,6 +675,22 @@ def _project_branch(row: Mapping[str, Any]) -> dict[str, Any]:
             str(terminal.get("result_status") or "TERMINAL")
             if isinstance(terminal, Mapping) else "TERMINAL"
         )
+    start = row.get("start_receipt")
+    if isinstance(start, Mapping):
+        projected.update({
+            "native_start_receipt": dict(start),
+            "observed_runtime_model": start.get("observed_model"),
+            "observed_reasoning": start.get("observed_reasoning"),
+            "runtime_observation_status": start.get("runtime_observation_status"),
+            "runtime_observation_evidence": start.get("runtime_observation_evidence"),
+            "routing_classification": start.get("routing_classification"),
+            "model_routing_matched": start.get("model_routing_matched", False),
+            "reasoning_routing_matched": start.get("reasoning_routing_matched", False),
+            "routing_matched": start.get("routing_matched", False),
+            "fallback_used": start.get("fallback_used", False),
+            "fallback_reason_observed": start.get("fallback_reason"),
+            "pinning_verified": start.get("routing_classification") == "ROUTING_MATCHED",
+        })
     projected["native_delegation_required"] = True
     projected["expected_start_receipt"] = True
     return projected

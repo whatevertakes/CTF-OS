@@ -20,6 +20,11 @@ import yaml
 
 from .categories import playbook_category
 from .modes import SolveMode
+from .model_routing import (
+    ROUTING_PROFILES, RoutingError, branch_routing_interpretation,
+    build_native_delegation_packet, compare_runtime_routing,
+    validate_routing_contract,
+)
 from .race_lineage import (
     append_lineage_event, lineage_state, recover_lineage_projections,
     record_start_failure,
@@ -224,6 +229,8 @@ def add_branch(
     evidence_contract: Sequence[str], success_condition: str, kill_condition: str,
     maximum_steps: int, budget_seconds: int, requested_model_role: str,
     requested_reasoning: str, purpose: str | None = None,
+    routing_contract: Mapping[str, Any] | None = None,
+    routing_evidence_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     solve_root = ensure_run_mutable(solve_root)
     if not isinstance(maximum_steps, int) or not 1 <= maximum_steps <= 10000:
@@ -252,6 +259,11 @@ def add_branch(
         )
         if not admission["admitted"]:
             raise DelegationError(f"branch admission denied: {admission['reason']}")
+        routing = _validated_routing(
+            plan, routing_contract, branch_evidence=(routing_evidence_context or {
+                **_candidate_dict(candidate), "purpose": purpose,
+            }),
+        )
         now = utc_now()
         branch = {
             **_candidate_dict(candidate),
@@ -260,9 +272,12 @@ def add_branch(
             "kill_condition": _bounded(kill_condition, "kill_condition", 2000),
             "maximum_steps": maximum_steps, "budget_seconds": budget_seconds,
             "requested_model_role": _short(requested_model_role, "requested_model_role"),
-            "requested_reasoning": _short(requested_reasoning, "requested_reasoning"),
+            "requested_reasoning": _short(
+                routing.get("requested_reasoning", requested_reasoning), "requested_reasoning",
+            ),
+            **_routing_branch_defaults(routing),
             "observed_runtime_model": None, "observed_reasoning": None,
-            "runtime_observation_evidence": None,
+            "runtime_observation_status": None, "runtime_observation_evidence": None,
             "pinning_verified": False, "independent_verification": bool(
                 purpose in {"independent-verification", "clean-room-verifier", "clean-room-verification"}
             ),
@@ -283,6 +298,10 @@ def update_branch(
     solve_root = ensure_run_mutable(solve_root)
     if status not in BRANCH_STATUSES:
         raise DelegationError(f"status must be one of {sorted(BRANCH_STATUSES)}")
+    if observed_runtime_model is not None or observed_reasoning is not None:
+        raise DelegationError(
+            "observed runtime identity may be recorded only by branch-start-confirm with exact native evidence"
+        )
     lineage_file = solve_root / "RACE_LINEAGE.jsonl"
     if lineage_file.is_file():
         result_path = solve_root / "workers" / session_id / "result.json"
@@ -386,6 +405,8 @@ def prepare_branch_replacement(
     evidence_contract: Sequence[str], success_condition: str, kill_condition: str,
     maximum_steps: int, budget_seconds: int, requested_model_role: str,
     requested_reasoning: str, triggering_receipt_id: str | None = None,
+    routing_contract: Mapping[str, Any] | None = None,
+    routing_evidence_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically admit/register a replacement and persist its prompt intent."""
     if not isinstance(maximum_steps, int) or not 1 <= maximum_steps <= 10000:
@@ -414,6 +435,12 @@ def prepare_branch_replacement(
             triggering_receipt_id=triggering_receipt_id,
         )
         now = utc_now()
+        routing = _validated_routing(
+            {"branches": current["branches"]}, routing_contract,
+            branch_evidence=(routing_evidence_context or {
+                **_candidate_dict(candidate), "purpose": "alternate-attack-family",
+            }),
+        )
         request_id = hashlib.sha256(
             f"{superseded_branch_id}:{candidate.session_id}:{now}".encode()
         ).hexdigest()[:24]
@@ -425,7 +452,10 @@ def prepare_branch_replacement(
             "kill_condition": _bounded(kill_condition, "kill_condition", 2000),
             "maximum_steps": maximum_steps, "budget_seconds": budget_seconds,
             "requested_model_role": _short(requested_model_role, "requested_model_role"),
-            "requested_reasoning": _short(requested_reasoning, "requested_reasoning"),
+            "requested_reasoning": _short(
+                routing.get("requested_reasoning", requested_reasoning), "requested_reasoning",
+            ),
+            **_routing_branch_defaults(routing),
             "purpose": "alternate-attack-family", "replacement_request_id": request_id,
             "supersedes_branch_id": superseded_branch_id,
             "kill_reason": _bounded(kill_reason, "kill_reason", 2000),
@@ -434,6 +464,22 @@ def prepare_branch_replacement(
             ),
             "expected_sandbox_identity": f"workers/{candidate.session_id}/sandbox.json",
         }
+        prompt = {
+            "session_id": candidate.session_id,
+            "challenge_id": old.get("challenge_id"),
+            "run_id": old.get("run_id"),
+            "hypothesis_family": candidate.hypothesis_family,
+            "hypothesis": candidate.hypothesis,
+            "objective": "Run a distinct decisive exploit experiment; then minimal PoC and declared remote",
+            "kill_reason": kill_reason,
+            "distinct_mechanism_proof": distinct_mechanism_proof,
+            **routing,
+        }
+        if routing:
+            prompt["native_delegation_packet"] = build_native_delegation_packet(
+                routing, task_name=candidate.session_id, child_prompt=prompt,
+            )
+        contract["prompt_packet"] = prompt
         event = append_lineage_event(
             solve_root, event="PLANNED", branch_id=candidate.session_id,
             session_id=candidate.session_id, race_id=str(old["race_id"]),
@@ -461,6 +507,7 @@ def prepare_branch_replacement(
             "replacement_trigger_kind": trigger_kind,
             "lineage_event_id": event["lineage_event_id"],
             "status": "PLANNED", "native_delegation_required": True,
+            **routing, "prompt_packet": prompt,
             "created_at": event["created_at"],
         }
     with state_lock(solve_root):
@@ -474,6 +521,11 @@ def prepare_branch_replacement(
         if not admission["admitted"]:
             raise DelegationError(f"replacement admission denied: {admission['reason']}")
         now = utc_now()
+        routing = _validated_routing(
+            plan, routing_contract, branch_evidence=(routing_evidence_context or {
+                **_candidate_dict(candidate), "purpose": "alternate-attack-family",
+            }),
+        )
         request_id = hashlib.sha256(f"{superseded_branch_id}:{candidate.session_id}:{now}".encode()).hexdigest()[:24]
         prompt = {
             "session_id": candidate.session_id, "parent_session_id": plan["parent_session_id"],
@@ -482,15 +534,23 @@ def prepare_branch_replacement(
             "objective": "Run a distinct decisive exploit experiment; then minimal PoC and declared remote",
             "kill_reason": kill_reason, "distinct_mechanism_proof": distinct_mechanism_proof,
         }
+        if routing:
+            prompt["native_delegation_packet"] = build_native_delegation_packet(
+                routing, task_name=candidate.session_id, child_prompt=prompt,
+            )
         branch = {
             **_candidate_dict(candidate), "evidence_contract": _string_list(evidence_contract, "evidence_contract", maximum=32),
             "success_condition": _bounded(success_condition, "success_condition", 2000),
             "kill_condition": _bounded(kill_condition, "kill_condition", 2000),
             "maximum_steps": maximum_steps, "budget_seconds": budget_seconds,
             "requested_model_role": _short(requested_model_role, "requested_model_role"),
-            "requested_reasoning": _short(requested_reasoning, "requested_reasoning"),
+            "requested_reasoning": _short(
+                routing.get("requested_reasoning", requested_reasoning), "requested_reasoning",
+            ),
+            **_routing_branch_defaults(routing),
             "observed_runtime_model": None, "observed_reasoning": None,
-            "runtime_observation_evidence": None, "pinning_verified": False,
+            "runtime_observation_status": None, "runtime_observation_evidence": None,
+            "pinning_verified": False,
             "independent_verification": False, "purpose": "alternate-attack-family",
             "admission": admission, "status": "AWAITING_NATIVE_START",
             "created_at": now, "started_at": None, "finished_at": None,
@@ -572,7 +632,9 @@ def _validate_replacement_trigger(
 def confirm_branch_start(
     solve_root: Path, *, input_fingerprint: str, replacement_request_id: str,
     session_id: str, native_session_observed: str, runtime_observation_evidence: str,
-    sandbox_metadata_path: str,
+    sandbox_metadata_path: str, native_start_operation_id: str | None = None,
+    observed_model: str | None = None, observed_reasoning: str | None = None,
+    runtime_observation_status: str | None = None,
 ) -> dict[str, Any]:
     solve_root = ensure_run_mutable(solve_root)
     if not all(str(value).strip() for value in (native_session_observed, runtime_observation_evidence, sandbox_metadata_path)):
@@ -590,11 +652,40 @@ def confirm_branch_start(
         ), None)
         if branch is None:
             raise DelegationError("replacement request and session do not match")
+        routed = branch.get("routing_profile") in ROUTING_PROFILES
+        operation_id = str(native_start_operation_id or "").strip() or None
+        inferred_status = runtime_observation_status or (
+            "OBSERVED" if observed_model is not None or observed_reasoning is not None
+            else "NOT_OBSERVABLE"
+        )
+        if routed and operation_id is None and inferred_status == "OBSERVED":
+            raise DelegationError("observed routed native start requires native_start_operation_id")
+        contract = (
+            {key: branch.get(key) for key in (
+                "routing_profile", "requested_model_class", "requested_model",
+                "requested_reasoning", "routing_reason", "routing_evidence",
+                "fallback_profile", "fallback_reason", "max_lease",
+            ) if key in branch}
+            if routed else None
+        )
+        try:
+            routing_result = compare_runtime_routing(
+                contract, observed_model=observed_model,
+                observed_reasoning=observed_reasoning,
+                runtime_observation_status=inferred_status,
+                runtime_observation_evidence=runtime_observation_evidence,
+            )
+        except RoutingError as exc:
+            raise DelegationError(str(exc)) from exc
         if branch.get("start_receipt"):
             saved = branch["start_receipt"]
             if (
                 saved.get("native_session_observed") == native_session_observed
                 and saved.get("runtime_observation_evidence") == runtime_observation_evidence
+                and saved.get("native_start_operation_id") == operation_id
+                and saved.get("observed_model") == observed_model
+                and saved.get("observed_reasoning") == observed_reasoning
+                and saved.get("runtime_observation_status") == inferred_status
             ):
                 return {**saved, "idempotent": True}
             raise DelegationError("branch already has a conflicting native start receipt")
@@ -609,15 +700,42 @@ def confirm_branch_start(
             raise DelegationError("sandbox metadata path does not match expected sandbox identity")
         if supplied.is_symlink() or not supplied.is_file():
             raise DelegationError("sandbox metadata path is missing or unsafe")
+        for other in plan.get("branches", []):
+            saved = other.get("start_receipt") or other.get("native_start_receipt")
+            if not isinstance(saved, Mapping):
+                continue
+            if operation_id and saved.get("native_start_operation_id") == operation_id:
+                raise DelegationError(
+                    "native start operation ID conflicts with another run/session runtime identity"
+                )
+            if (
+                other.get("session_id") != session_id
+                and saved.get("native_session_observed") == native_session_observed
+            ):
+                raise DelegationError("one observed native session cannot start multiple branches")
         receipt = {
+            "schema_version": 2,
             "replacement_request_id": replacement_request_id, "session_id": session_id,
             "run_id": plan.get("run_id"), "challenge_id": plan.get("challenge_id"),
+            "attempt_id": plan.get("attempt_id"),
+            "parent_session_id": plan.get("parent_session_id"),
             "input_fingerprint": plan.get("input_fingerprint"),
             "target_revision": plan.get("target_revision"),
+            "native_start_operation_id": operation_id,
             "native_session_observed": native_session_observed,
-            "runtime_observation_evidence": runtime_observation_evidence,
+            **routing_result,
             "sandbox_metadata_path": str(supplied), "started_at": utc_now(),
         }
+        receipt["receipt_id"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:24]
+        validate_native_start_receipt_binding(
+            receipt, run_id=plan.get("run_id"), challenge_id=plan.get("challenge_id"),
+            attempt_id=plan.get("attempt_id"),
+            parent_session_id=plan.get("parent_session_id"),
+            input_fingerprint=plan.get("input_fingerprint"),
+            target_revision=plan.get("target_revision"), session_id=session_id,
+        )
         if lineage_enabled:
             pass
         else:
@@ -628,12 +746,24 @@ def confirm_branch_start(
                 {"status": "RUNNING", "created_at": receipt["started_at"]},
             ])
             branch["status"] = "RUNNING"; branch["started_at"] = receipt["started_at"]
+            branch["observed_runtime_model"] = receipt.get("observed_model")
+            branch["observed_reasoning"] = receipt.get("observed_reasoning")
+            branch["runtime_observation_status"] = receipt.get("runtime_observation_status")
+            branch["runtime_observation_evidence"] = receipt.get("runtime_observation_evidence")
+            branch["routing_classification"] = receipt.get("routing_classification")
+            branch["model_routing_matched"] = receipt.get("model_routing_matched", False)
+            branch["reasoning_routing_matched"] = receipt.get("reasoning_routing_matched", False)
+            branch["routing_matched"] = receipt.get("routing_matched", False)
+            branch["fallback_used"] = receipt.get("fallback_used", False)
+            branch["fallback_reason_observed"] = receipt.get("fallback_reason")
+            branch["pinning_verified"] = receipt.get("routing_classification") == "ROUTING_MATCHED"
             plan.setdefault("branch_start_receipts", []).append(receipt)
             plan["updated_at"] = utc_now(); atomic_json(plan_path(solve_root), plan)
     if lineage_enabled:
         append_lineage_event(
             solve_root, event="NATIVE_STARTED", branch_id=session_id,
-            referenced_receipt=receipt, details=receipt, project=False,
+            referenced_receipt=receipt, details=receipt, operation_id=operation_id,
+            project=False,
         )
         append_lineage_event(
             solve_root, event="RUNNING", branch_id=session_id,
@@ -643,6 +773,30 @@ def confirm_branch_start(
             details={"native_start_receipt": receipt},
         )
     return receipt
+
+
+def validate_native_start_receipt_binding(
+    receipt: Mapping[str, Any], *, run_id: str | None, challenge_id: str | None,
+    input_fingerprint: str | None, target_revision: int | None, session_id: str,
+    attempt_id: str | None = None, parent_session_id: str | None = None,
+) -> None:
+    """Reject reuse of a native start receipt across run, attempt, or branch identity."""
+
+    expected = {
+        "run_id": run_id, "challenge_id": challenge_id,
+        "input_fingerprint": input_fingerprint,
+        "target_revision": target_revision, "session_id": session_id,
+    }
+    for field, value in expected.items():
+        if receipt.get(field) != value:
+            raise DelegationError(f"native start receipt {field} belongs to another run/session")
+    for field, value in {
+        "attempt_id": attempt_id, "parent_session_id": parent_session_id,
+    }.items():
+        if value is not None and receipt.get(field) != value:
+            raise DelegationError(f"native start receipt {field} belongs to another run/session")
+    if receipt.get("schema_version") not in {None, 1, 2}:
+        raise DelegationError("native start receipt schema version is unsupported")
 
 
 def record_capacity_admission(
@@ -798,9 +952,15 @@ def branch_utility(
     if len(branches) != 1:
         raise DelegationError(f"unknown branch session_id: {session_id}")
     branch = branches[0]
+    routing_interpretation = branch_routing_interpretation(branch)
     relevant = [item for item in checkpoints if item.get("session_id") == session_id]
     if not relevant and result is None:
-        return {"session_id": session_id, "utility_score": None, "classification": "INSUFFICIENT_DATA", "recommendation": "Collect a bounded checkpoint or worker result before judging utility", "metrics": {}}
+        return {
+            "session_id": session_id, "utility_score": None,
+            "classification": "INSUFFICIENT_DATA",
+            "recommendation": "Collect a bounded checkpoint or worker result before judging utility",
+            "metrics": {}, "routing_interpretation": routing_interpretation,
+        }
     counts = {name: 0 for name in (
         "supported_facts", "exploit_relevant_facts", "useful_artifacts",
         "documentation_artifacts", "primitive_candidates", "exploit_primitives", "refuted_primitives", "flag_candidates",
@@ -948,7 +1108,11 @@ def branch_utility(
         "recent_supported_facts": sum(item.get("type") == "SUPPORTED_FACT" for item in recent),
         "same_error_repeat_count": same_error_repeats,
     }
-    return {"session_id": session_id, "utility_score": score, "classification": classification, "recommendation": recommendation, "metrics": metrics}
+    return {
+        "session_id": session_id, "utility_score": score,
+        "classification": classification, "recommendation": recommendation,
+        "metrics": metrics, "routing_interpretation": routing_interpretation,
+    }
 
 
 def _checkpoint_proximity(item: Mapping[str, Any]) -> float:
@@ -1070,7 +1234,8 @@ def _load_plan_unlocked(path: Path) -> dict[str, Any]:
     required = {"challenge_id", "input_fingerprint", "parent_session_id", "tier", "tier_reason", "created_at", "updated_at", "branches"}
     if not required.issubset(raw) or not isinstance(raw["branches"], list):
         raise DelegationError("delegation plan schema is incomplete")
-    if raw["tier"] not in range(0, 5): raise DelegationError("delegation plan contains invalid tier")
+    if raw["tier"] is not None and raw["tier"] not in range(0, 5):
+        raise DelegationError("delegation plan contains invalid tier")
     seen: set[str] = set()
     for branch in raw["branches"]:
         if not isinstance(branch, dict) or branch.get("status") not in BRANCH_STATUSES: raise DelegationError("delegation plan contains an invalid branch")
@@ -1099,8 +1264,80 @@ def _load_plan_unlocked(path: Path) -> dict[str, Any]:
         seen.add(session_id)
         if branch.get("pinning_verified") and not (branch.get("observed_runtime_model") and branch.get("observed_reasoning")):
             raise DelegationError("pinning_verified lacks observed runtime evidence")
+        _upgrade_legacy_routing_fields(branch)
     raw.setdefault("admission_decisions", [])
     return raw
+
+
+def _validated_routing(
+    plan: Mapping[str, Any], contract: Mapping[str, Any] | None,
+    *, branch_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    if contract is None:
+        return {}
+    active_max = sum(
+        row.get("routing_profile") == "CONFIRMED_BOTTLENECK"
+        and row.get("status") not in {
+            "TERMINAL", "TERMINATED", "COMPLETED", "ERROR", "START_FAILED",
+            "TIMED_OUT", "STALE", "REFUTED",
+        }
+        for row in plan.get("branches", []) if isinstance(row, Mapping)
+    )
+    try:
+        validate_routing_contract(
+            contract, branch_evidence=branch_evidence, active_max_lanes=active_max,
+        )
+    except RoutingError as exc:
+        raise DelegationError(str(exc)) from exc
+    return dict(contract)
+
+
+def _routing_branch_defaults(routing: Mapping[str, Any]) -> dict[str, Any]:
+    if not routing:
+        return {
+            "routing_profile": "LEGACY_UNROUTED",
+            "requested_model_class": None, "requested_model": None,
+            "routing_reason": None, "routing_evidence": [],
+            "fallback_profile": None, "fallback_reason": None,
+            "routing_classification": "LEGACY_UNROUTED",
+            "model_routing_matched": False, "reasoning_routing_matched": False,
+            "routing_matched": False, "fallback_used": False,
+            "fallback_reason_observed": None,
+        }
+    return {
+        **dict(routing), "routing_classification": None,
+        "model_routing_matched": False, "reasoning_routing_matched": False,
+        "routing_matched": False, "fallback_used": False,
+        "fallback_reason_observed": None,
+    }
+
+
+def _upgrade_legacy_routing_fields(branch: dict[str, Any]) -> None:
+    if branch.get("routing_profile") in ROUTING_PROFILES:
+        branch.setdefault("requested_model", None)
+        branch.setdefault("requested_model_class", None)
+        branch.setdefault("runtime_observation_status", None)
+        branch.setdefault("routing_classification", None)
+        branch.setdefault("model_routing_matched", False)
+        branch.setdefault("reasoning_routing_matched", False)
+        branch.setdefault("routing_matched", False)
+        branch.setdefault("fallback_used", False)
+        branch.setdefault("fallback_reason_observed", None)
+        return
+    branch.setdefault("routing_profile", "LEGACY_UNROUTED")
+    branch.setdefault("requested_model_class", None)
+    branch.setdefault("requested_model", None)
+    branch.setdefault("routing_reason", None)
+    branch.setdefault("routing_evidence", [])
+    branch.setdefault("fallback_profile", None)
+    branch.setdefault("fallback_reason", None)
+    branch.setdefault("runtime_observation_status", None)
+    branch.setdefault("routing_classification", "LEGACY_UNROUTED")
+    branch.setdefault("model_routing_matched", False)
+    branch.setdefault("reasoning_routing_matched", False)
+    branch.setdefault("routing_matched", False)
+    branch.setdefault("fallback_used", False)
+    branch.setdefault("fallback_reason_observed", None)
 
 
 def _mark_stale(plan: dict[str, Any]) -> None:

@@ -249,3 +249,64 @@ def test_noninferior_but_uncertain_time_returns_suggestive_only() -> None:
 def test_solve_regression_over_five_points_returns_regression_indicated() -> None:
     evaluate = _module(); private = _private(solve_rate_difference=-.06)
     assert evaluate._decision(private, validation={"sample_complete": True}, base="A", treatment="D") == "REGRESSION_INDICATED"
+
+
+def test_routing_success_is_attributed_to_observed_sol_not_requested_terra() -> None:
+    rows = _rows()
+    rows[3]["runtime"]["branch_routing_observations"] = [{
+        "session_id": "implementation-lane",
+        "requested_model": "gpt-5.6-terra", "requested_reasoning": "high",
+        "observed_model": "gpt-5.6-sol", "observed_reasoning": "xhigh",
+        "routing_classification": "FALLBACK_MATCHED", "solver_success": True,
+    }]
+    diagnostic = _evaluate(rows)["model_routing_diagnostics"]
+    assert diagnostic["performance_by_observed_runtime"] == {
+        "gpt-5.6-sol:xhigh": {
+            "observations": 1, "solver_successes": 1, "solver_failures": 0,
+        },
+    }
+    assert "gpt-5.6-terra:high" not in diagnostic["performance_by_observed_runtime"]
+    assert diagnostic["requested_identity_used_for_attribution"] is False
+
+
+def test_unknown_observed_sol_request_gets_no_sol_routing_credit() -> None:
+    rows = _rows()
+    observation = {
+        "session_id": "deep-lane",
+        "requested_model": "gpt-5.6-sol", "requested_reasoning": "xhigh",
+        "observed_model": None, "observed_reasoning": None,
+        "routing_classification": "RUNTIME_NOT_OBSERVABLE", "solver_success": True,
+    }
+    rows[3]["runtime"]["branch_routing_observations"] = [observation]
+    diagnostic = _evaluate(rows)["model_routing_diagnostics"]
+    assert diagnostic["performance_by_observed_runtime"] == {}
+    assert diagnostic["missing_runtime_observations"] == [observation]
+
+
+def test_routing_mismatch_is_separate_from_validly_routed_solver_failure() -> None:
+    rows = _rows()
+    mismatch = {
+        "session_id": "bounded-lane",
+        "requested_model": "gpt-5.6-terra", "requested_reasoning": "high",
+        "observed_model": "gpt-5.6-luna", "observed_reasoning": "medium",
+        "routing_classification": "ROUTING_MISMATCH", "solver_success": False,
+    }
+    rows[3]["runtime"]["branch_routing_observations"] = [mismatch]
+    diagnostic = _evaluate(rows)["model_routing_diagnostics"]
+    assert diagnostic["invalid_model_routing_treatments"] == [mismatch]
+    assert diagnostic["performance_by_observed_runtime"] == {}
+    assert diagnostic["solver_failures_after_valid_routing"] == []
+
+
+def test_routing_diagnostic_layer_does_not_change_abcd_treatment_result() -> None:
+    rows = _rows()
+    baseline = _evaluate(deepcopy(rows))
+    rows[3]["runtime"]["branch_routing_observations"] = [{
+        "requested_model": "gpt-5.6-terra", "requested_reasoning": "high",
+        "observed_model": None, "observed_reasoning": None,
+        "routing_classification": "ROUTING_UNSUPPORTED", "solver_success": True,
+    }]
+    routed = _evaluate(rows)
+    assert routed["final_decision"] == baseline["final_decision"]
+    assert routed["paired_comparisons"] == baseline["paired_comparisons"]
+    assert routed["valid_matched_blocks"] == baseline["valid_matched_blocks"]
