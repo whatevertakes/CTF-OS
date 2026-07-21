@@ -20,7 +20,7 @@ minimal observation
 
 ## 준비
 
-Official competition runtime: **WSL2 Ubuntu x86_64 + Docker Engine + Docker Compose v2**. 팀 운영 기준의 host는 Windows 11입니다. 저장소는 Docker build context, forensic extraction, receipt ledger와 다수 파일의 원자적 동작 성능을 위해 `/home/<user>/CTF-OS` 같은 WSL2 Linux filesystem에 두는 것을 권장합니다. `/mnt/c`, `/mnt/d` 또는 다른 drvfs 위치는 경고만 발생하며 실행을 차단하지 않습니다. Native Ubuntu Linux x86_64는 compatible environment입니다.
+Official competition runtime: **WSL2 Ubuntu 또는 Kali Linux x86_64 + Docker Engine + Docker Compose v2**. 팀 운영 기준의 host는 Windows 11입니다. 저장소는 Docker build context, forensic extraction, receipt ledger와 다수 파일의 원자적 동작 성능을 위해 `/home/<user>/CTF-OS` 같은 WSL2 Linux filesystem에 두는 것을 권장합니다. `/mnt/c`, `/mnt/d` 또는 다른 drvfs 위치는 경고만 발생하며 실행을 차단하지 않습니다. Native Ubuntu 또는 Kali Linux x86_64는 compatible environment입니다.
 
 Docker Desktop 전용 기능은 요구하지 않습니다. WSL2 Ubuntu 안에서 `docker info`, `docker compose version`, `docker build`, `docker run`이 정상 동작하는 Docker Engine이면 됩니다. Python 3.11+와 `uv`도 필요합니다. GPU는 GPU-required workload가 있는 머신에서만 NVIDIA WSL2 GPU passthrough와 NVIDIA Container Toolkit을 선택 설치합니다. 일반 `docker build`가 기준이며 Buildx는 필수가 아닙니다. macOS, ARM64, multi-architecture image, host Podman runtime은 지원 범위가 아닙니다.
 

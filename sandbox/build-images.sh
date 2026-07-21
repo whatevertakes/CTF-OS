@@ -7,21 +7,27 @@ PROFILES=("$@")
 if (( ${#PROFILES[@]} == 0 )); then PROFILES=("${ALL_PROFILES[@]}"); fi
 
 [[ "$(uname -s)" == "Linux" ]] || {
-  echo "Unsupported host OS: sandbox images are supported on Ubuntu Linux x86_64 only." >&2
+  echo "Unsupported host OS: sandbox images require Ubuntu or Kali Linux x86_64." >&2
   exit 65
 }
-if [[ ! -r /etc/os-release ]] || ! ( . /etc/os-release; [[ "${ID:-}" == "ubuntu" ]] ); then
-  echo "Unsupported Linux distribution: sandbox images are supported on Ubuntu Linux x86_64 only." >&2
+if [[ ! -r /etc/os-release ]]; then
+  echo "Unsupported Linux distribution: cannot read /etc/os-release (Ubuntu or Kali Linux x86_64 required)." >&2
   exit 65
 fi
+source /etc/os-release
+case "${ID:-}" in
+  ubuntu|kali) ;;
+  *) echo "Unsupported Linux distribution: sandbox images require Ubuntu or Kali Linux x86_64." >&2; exit 65 ;;
+esac
 case "$(uname -m)" in
   x86_64|amd64) ;;
-  *) echo "Unsupported host architecture: sandbox images require Ubuntu Linux x86_64." >&2; exit 65 ;;
+  *) echo "Unsupported host architecture: sandbox images require Ubuntu or Kali Linux x86_64." >&2; exit 65 ;;
 esac
+HOST_DISTRIBUTION="${ID^^}"
 if [[ "$(uname -r)" == *[Mm]icrosoft* || -n "${WSL_INTEROP:-}" ]]; then
-  HOST_RUNTIME="WSL2_UBUNTU_X86_64"
+  HOST_RUNTIME="WSL2_${HOST_DISTRIBUTION}_X86_64"
 else
-  HOST_RUNTIME="NATIVE_UBUNTU_X86_64"
+  HOST_RUNTIME="NATIVE_${HOST_DISTRIBUTION}_X86_64"
 fi
 
 repository_fstype="$(findmnt -T "$ROOT" -n -o FSTYPE 2>/dev/null || true)"

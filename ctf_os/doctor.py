@@ -474,22 +474,24 @@ def run_doctor(repo: Path) -> dict[str, object]:
         checks.append(item)
 
     os_release = _os_release()
-    ubuntu = os_release.get("ID", "").casefold() == "ubuntu"
+    distribution = os_release.get("ID", "").casefold()
     machine = platform.machine().casefold()
     kernel_release = platform.release().casefold()
     wsl = "microsoft" in kernel_release or bool(os.environ.get("WSL_INTEROP"))
     wsl_generation = _wsl_generation(kernel_release, wsl)
-    runtime_kind = "WSL2_UBUNTU" if wsl else "NATIVE_UBUNTU"
+    distribution_kind = distribution.upper() if distribution else "UNKNOWN"
+    runtime_kind = f"{'WSL2' if wsl else 'NATIVE'}_{distribution_kind}"
     supported_host = _supported_host(
-        host_system=platform.system(), ubuntu=ubuntu, architecture=machine,
+        host_system=platform.system(), distribution=distribution, architecture=machine,
         wsl_generation=wsl_generation,
     )
     add(
         "host-platform", bool(supported_host),
-        f"host_system={platform.system()} ubuntu_version={os_release.get('VERSION_ID') or 'unknown'} "
+        f"host_system={platform.system()} distribution={distribution or 'unknown'} "
+        f"distribution_version={os_release.get('VERSION_ID') or 'unknown'} "
         f"architecture={platform.machine()} runtime_kind={runtime_kind} "
         f"kernel_release={platform.release()}",
-        "use WSL2 Ubuntu x86_64 (official) or native Ubuntu x86_64 (compatible)",
+        "use WSL2 Ubuntu/Kali x86_64 (official) or native Ubuntu/Kali x86_64 (compatible)",
     )
     if wsl:
         add(
@@ -499,7 +501,7 @@ def run_doctor(repo: Path) -> dict[str, object]:
                 "WSL1 kernel detected" if wsl_generation == 1
                 else "WSL marker present; version could not be distinguished, Docker daemon checks remain authoritative"
             ),
-            "upgrade this Ubuntu distribution to WSL2",
+            "upgrade this Linux distribution to WSL2",
         )
         systemd_available = _systemd_available()
         detail = (
@@ -692,7 +694,8 @@ def run_doctor(repo: Path) -> dict[str, object]:
     return {
         "ok": all(bool(item["ok"]) for item in checks),
         "host_system": platform.system(),
-        "ubuntu_version": os_release.get("VERSION_ID"),
+        "linux_distribution": distribution or None,
+        "linux_version": os_release.get("VERSION_ID"),
         "architecture": platform.machine(),
         "runtime_kind": runtime_kind,
         "kernel_release": platform.release(),
@@ -718,10 +721,6 @@ def _os_release() -> dict[str, str]:
         return {}
 
 
-def _ubuntu_release() -> bool:
-    return _os_release().get("ID", "").casefold() == "ubuntu"
-
-
 def _wsl_generation(kernel_release: str, detected: bool) -> int | None:
     if not detected:
         return None
@@ -734,11 +733,11 @@ def _wsl_generation(kernel_release: str, detected: bool) -> int | None:
 
 
 def _supported_host(
-    *, host_system: str, ubuntu: bool, architecture: str,
+    *, host_system: str, distribution: str, architecture: str,
     wsl_generation: int | None,
 ) -> bool:
     return (
-        host_system == "Linux" and ubuntu
+        host_system == "Linux" and distribution.casefold() in {"ubuntu", "kali"}
         and architecture.casefold() in {"x86_64", "amd64"}
         and wsl_generation != 1
     )

@@ -44,26 +44,26 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
     }
 
 
-def test_wsl2_and_native_ubuntu_x86_64_are_supported() -> None:
+def test_wsl2_and_native_ubuntu_or_kali_x86_64_are_supported() -> None:
     wsl2 = _wsl_generation("5.15.167.4-microsoft-standard-WSL2", True)
     assert wsl2 == 2
     assert _supported_host(
-        host_system="Linux", ubuntu=True, architecture="x86_64",
+        host_system="Linux", distribution="ubuntu", architecture="x86_64",
         wsl_generation=wsl2,
     )
     assert _supported_host(
-        host_system="Linux", ubuntu=True, architecture="amd64",
+        host_system="Linux", distribution="kali", architecture="amd64",
         wsl_generation=None,
     )
 
 
-def test_non_ubuntu_or_arm64_host_is_unsupported() -> None:
+def test_unsupported_distribution_or_arm64_host_is_unsupported() -> None:
     assert not _supported_host(
-        host_system="Linux", ubuntu=False, architecture="x86_64",
+        host_system="Linux", distribution="debian", architecture="x86_64",
         wsl_generation=None,
     )
     assert not _supported_host(
-        host_system="Linux", ubuntu=True, architecture="aarch64",
+        host_system="Linux", distribution="ubuntu", architecture="aarch64",
         wsl_generation=None,
     )
 

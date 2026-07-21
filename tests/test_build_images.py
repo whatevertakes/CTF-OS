@@ -125,7 +125,7 @@ def test_build_images_propagates_one_profile_failure_and_continues(tmp_path: Pat
     assert len(builds) == 3
 
 
-def test_build_images_accepts_wsl2_and_reports_runtime(tmp_path: Path) -> None:
+def test_build_images_accepts_supported_wsl2_host_and_reports_runtime(tmp_path: Path) -> None:
     bin_dir, _log = _fake_docker(tmp_path)
     env = os.environ.copy()
     env.update({
@@ -141,7 +141,17 @@ def test_build_images_accepts_wsl2_and_reports_runtime(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0
-    assert "Host runtime: WSL2_UBUNTU_X86_64" in result.stdout
+    distribution = next(
+        line.split("=", 1)[1].strip().strip('"')
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines()
+        if line.startswith("ID=")
+    )
+    assert f"Host runtime: WSL2_{distribution.upper()}_X86_64" in result.stdout
+
+
+def test_build_images_explicitly_supports_kali_hosts() -> None:
+    script = BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert "ubuntu|kali" in script
 
 
 def test_build_images_rejects_non_amd64_docker_server(tmp_path: Path) -> None:
