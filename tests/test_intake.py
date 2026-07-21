@@ -152,26 +152,6 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert launch_path.read_bytes() == first_launch
 
 
-def test_prepare_bootstraps_directly_from_user_problems_file(repo: Path) -> None:
-    contest = repo / "incoming" / "Demo CTF"
-    contest.mkdir()
-    (contest / "problems.txt").write_text(
-        "대회명: Demo CTF\n\nmisc/X\n설명: user supplied problem\n",
-        encoding="utf-8",
-    )
-    source = contest / "misc" / "X"
-    source.mkdir(parents=True)
-    (source / "value.txt").write_text("one")
-
-    result = _prepare(repo)
-
-    assert result.returncode == 0
-    assert (contest / "contest.md").is_file()
-    assert not list((repo / "output").glob("*/intake.json"))
-    payload = json.loads(result.stdout)["result"]
-    assert Path(payload["preflight_record_path"]).is_file()
-
-
 def test_solve_launch_includes_declared_target_and_priority_file(repo: Path) -> None:
     write_contest(repo, """# Demo CTF
 ### web/X
@@ -287,25 +267,6 @@ def test_selected_description_change_refreshes_local_preflight(repo: Path) -> No
     refreshed = json.loads(preflight_path.read_text())
     assert refreshed["challenge"]["description"] == "after"
     assert refreshed["source_fingerprint"] != old["source_fingerprint"]
-
-
-def test_prepare_syncs_changed_problem_description_before_local_preflight(repo: Path) -> None:
-    contest = repo / "incoming" / "Demo CTF"
-    contest.mkdir()
-    problems = contest / "problems.txt"
-    problems.write_text("대회명: Demo CTF\n\nmisc/X\n설명: before\n", encoding="utf-8")
-    source = contest / "misc" / "X"
-    source.mkdir(parents=True)
-    (source / "value.txt").write_text("trusted")
-    assert _prepare(repo).returncode == 0
-    problems.write_text("대회명: Demo CTF\n\nmisc/X\n설명: after\n", encoding="utf-8")
-
-    result = _prepare(repo)
-
-    assert result.returncode == 0
-    payload = json.loads(result.stdout)["result"]
-    preflight = json.loads(Path(payload["preflight_record_path"]).read_text())
-    assert preflight["challenge"]["description"] == "after"
 
 
 def test_prepare_repairs_corrupt_selected_preflight_record(repo: Path) -> None:

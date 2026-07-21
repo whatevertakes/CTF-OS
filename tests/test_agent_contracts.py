@@ -17,10 +17,14 @@ def test_skills_and_agents_define_sol_native_contract() -> None:
     assert "They are not confirmed vulnerabilities or exploit primitives" in solve
     assert "challenge-local preflight" in solve
     assert "Whole-contest Intake and Triage are not prerequisites" in solve
+    assert "pass that explicit information to the internal prepare call using the existing session input format" in solve
+    assert "This is not a separate user step" in solve
+    assert "--session-input-json" not in solve
     assert "optional legacy/admin" in intake
     assert "keep the current user-opened Sol session" in agents
     assert "run its internal challenge-local preflight" in agents
     assert "not Solve prerequisites" in agents
+    assert "only user-maintained contest input" not in agents
     assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
 
 
@@ -38,6 +42,11 @@ def test_solve_docs_do_not_require_contest_wide_handoffs() -> None:
     ):
         assert forbidden not in text
     assert "intake\n→ triage\n→ board" not in text
+    readme = Path("README.md").read_text()
+    standard_flow = readme.split("표준 사용 흐름은 다음과 같습니다.", 1)[1].split(
+        "## Low-level CLI debugging", 1,
+    )[0]
+    assert "problems.txt" not in standard_flow
 
 
 def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:

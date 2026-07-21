@@ -295,6 +295,11 @@ def test_prepare_repairs_missing_or_tampered_preflight_companions(repo: Path) ->
 
 def test_session_input_prepares_unlisted_challenge_without_rewriting_manifest(repo: Path) -> None:
     manifest_path = write_contest(repo, "# Session CTF\n", "Session CTF")
+    problems = manifest_path.with_name("problems.txt")
+    problems.write_text(
+        "대회명: Session CTF\n\nmisc/Sibling\n설명: unrelated sibling\n",
+        encoding="utf-8",
+    )
     upload = manifest_path.parent / "uploads" / "prompt.bin"
     upload.parent.mkdir()
     upload.write_bytes(b"prompt supplied challenge")
@@ -312,6 +317,10 @@ def test_session_input_prepares_unlisted_challenge_without_rewriting_manifest(re
     payload = _result(prepared)
     workspace = Path(payload["solve_root"])
     record = json.loads((workspace / "CHALLENGE-PREFLIGHT.json").read_text())
+    problems.write_text(
+        "대회명: Session CTF\n\nmisc/Sibling\n설명: changed sibling\n",
+        encoding="utf-8",
+    )
     runtime = subprocess.run([
         "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
         "resource-history", "misc/PromptOnly", "--contest", "Session CTF",
@@ -322,3 +331,6 @@ def test_session_input_prepares_unlisted_challenge_without_rewriting_manifest(re
     assert (workspace / "input" / "prompt.bin").read_bytes() == b"prompt supplied challenge"
     assert record["authorized_targets"][0]["host"] == "8.8.8.8"
     assert runtime.returncode == 0, runtime.stdout + runtime.stderr
+    contest_output = workspace.parents[1]
+    for artifact in ("intake.json", "triage.json", "INTAKE.md", "TRIAGE.md"):
+        assert not (contest_output / artifact).exists()

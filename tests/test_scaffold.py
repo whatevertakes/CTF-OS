@@ -15,7 +15,6 @@ def test_initialize_contest_creates_template_and_category_directories(repo: Path
     assert result["contest"] == "My CTF 2026"
     assert result["categories"] == list(DEFAULT_CATEGORIES)
     assert all((contest_root / category).is_dir() for category in DEFAULT_CATEGORIES)
-    assert not (contest_root / "contest.md").exists()
     problems = contest_root / "problems.txt"
     document = parse_problems(problems)
     assert document.name == "My CTF 2026"

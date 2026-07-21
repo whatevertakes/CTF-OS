@@ -6,7 +6,7 @@ The current user-opened Sol session is lead attacker and owns native delegation,
 
 ## Scope and minimum boundaries
 
-- `incoming/<contest>/problems.txt` is the only user-maintained contest input; commands synchronize the internal `contest.md` deterministically.
+- An individual Solve uses the current user request and the selected challenge's challenge-local input. `problems.txt` may be used for explicit whole-contest administration, but it is not a prerequisite for an individual Solve.
 - Attack exactly one selected challenge and only organizer-declared targets. Declared public/private/VPN/IPv6 and supported custom protocols are valid. Cloud metadata, Docker gateways, undeclared private LANs, unrelated hosts, and other challenges are not.
 - Challenge input/context are read-only. Workers receive private writable `/work`, `/evidence`, and `/artifacts` only. Never access or mount the host Docker socket/root, SSH keys, browser profiles, personal cloud credentials/kubeconfig, or personal files.
 - Challenge-provided temporary credentials and required cloud mutations are allowed only inside declared challenge scope, worker-private, logged, and redacted. Personal or ambient accounts are forbidden.
@@ -14,7 +14,7 @@ The current user-opened Sol session is lead attacker and owns native delegation,
 
 ## Request routing
 
-For “N번 문제 풀어라”, `category/name`, a challenge name, “이 문제 풀어라”, deep solve, or swarm request, keep the current user-opened Sol session and load `.codex/skills/ctf-solve/SKILL.md`. Resolve exactly one challenge, run its internal challenge-local preflight, and immediately begin direct file/runtime observation and exploit-first solving. Do not require whole-contest Intake, Triage, a Board, a new session, or repeated problem/remote input. Stop only for genuinely ambiguous selection; selected input or metadata that cannot be prepared safely; missing scope; an undeclared required target; required host credentials; or an out-of-scope action.
+For “N번 문제 풀어라”, `category/name`, a challenge name, “이 문제 풀어라”, deep solve, or swarm request, keep the current user-opened Sol session and load `.codex/skills/ctf-solve/SKILL.md`. When the request includes the problem description, files, or organizer-declared remote information, include that information in the internal preparation call and continue the Solve in the same session. Resolve exactly one challenge, run its internal challenge-local preflight, and immediately begin direct file/runtime observation and exploit-first solving. Do not require whole-contest Intake, Triage, a Board, a new session, or repeated problem/remote input. Stop only for genuinely ambiguous selection; selected input or metadata that cannot be prepared safely; missing scope; an undeclared required target; required host credentials; or an out-of-scope action.
 
 Whole-contest Intake and Triage are optional legacy/admin tools only. Invoke them only when the user explicitly requests whole-contest inventory or ranking. They are not Solve prerequisites, are not Solve readiness sources, and their artifacts must not be read, generated, changed, or invalidated by the Solve path. Current operations do not use a whole-contest priority Board or difficulty classification to guide a challenge solve.
 

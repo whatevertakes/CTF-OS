@@ -30,18 +30,21 @@ cd CTF-OS
 uv sync --frozen
 sandbox/build-images.sh
 uv run python -m ctf_os.agent_tools doctor
-uv run python -m ctf_os.agent_tools init-contest "My CTF 2026"
 ```
 
 표준 사용 흐름은 다음과 같습니다.
 
-1. 현재 문제 파일 또는 디렉터리를 `incoming/<contest>/<category>/`의 해당 challenge 위치에 둡니다.
-2. 문제 설명·힌트·플래그 형식과 optional organizer-declared remote를 `incoming/<contest>/problems.txt`에 기록하거나 현재 Sol 세션에 제공합니다.
-3. 사용자가 연 그 Sol 세션에서 “이 문제 풀어라”, 문제 이름, 번호, 또는 `category/name`을 요청합니다.
-4. CTF-OS가 현재 문제만 challenge-local preflight로 안전하게 준비하고 즉시 exploit-first solve를 시작합니다.
-5. exact flag가 출력되면 사람이 제출합니다.
+1. 최소 `contest.md`가 있는 대회 workspace를 선택합니다.
+2. 문제 파일을 해당 contest 내부에 둡니다.
+3. 현재 Sol 세션에 문제·설명·원격 정보와 함께 풀이라고 요청합니다.
+4. CTF-OS가 해당 문제만 challenge-local하게 준비합니다.
+5. 같은 Sol 세션이 즉시 문제 풀이를 진행합니다.
 
-문제가 아직 `problems.txt`에 없고 현재 Sol 세션에서만 전달된 경우에는 전체 manifest를 수정하지 않고 문제별 packet으로 준비할 수 있습니다.
+Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ranking을 명시적으로 요청할 때만 쓰는 optional legacy/admin 도구입니다. Solve의 선행 단계나 readiness source가 아니며, 현재 운영은 전체 Board·난이도·성공확률로 개별 challenge를 유도하지 않습니다.
+
+## Low-level CLI debugging
+
+다음 수동 호출은 session input 저장과 runtime loader를 진단하기 위한 저수준 예시이며, 정상 대회 운영에서 사용자가 수행할 단계가 아닙니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools prepare-challenge misc/PromptOnly \
@@ -50,10 +53,6 @@ uv run python -m ctf_os.agent_tools prepare-challenge misc/PromptOnly \
 ```
 
 `source_paths`는 선택한 대회의 `incoming/<contest>/` 아래 경로만 허용됩니다. 정규화된 packet은 해당 문제 workspace의 `SESSION-INPUT.json`에 저장되고, 이후 runtime command는 같은 challenge-local 정의와 authorized target을 다시 사용합니다.
-
-Session packet merge는 JSON 필드의 존재 여부를 보존합니다. 생략한 필드는 기존 challenge, contest default, `standard` 순으로 상속하고, optional text의 명시적 `null`은 삭제, 빈 문자열은 오류입니다. 배열 생략은 상속, `[]`는 삭제입니다. `input_profile: "standard"`는 명시적 override입니다. `flag_format`을 바꾸고 `flag_pattern`을 생략하면 새 format에서 pattern을 결정적으로 재생성하고, 명시적 `flag_pattern: null`은 pattern을 삭제합니다. 입력과 remote가 모두 없어지는 packet은 preflight에서 `BLOCKED`입니다.
-
-Whole-contest Intake와 Triage는 사용자가 전체 대회 inventory 또는 ranking을 명시적으로 요청할 때만 쓰는 optional legacy/admin 도구입니다. Solve의 선행 단계나 readiness source가 아니며, 현재 운영은 전체 Board·난이도·성공확률로 개별 challenge를 유도하지 않습니다.
 
 ## 실제 solve 흐름
 

@@ -1960,7 +1960,6 @@ def _prepare_challenge_same_session(
 ):
     """Prepare only the selected challenge in the current Sol session."""
 
-    sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     packet = parse_session_input(session_input_json) if session_input_json else None
     challenge = resolve_session_challenge(root, manifest, selector, packet)
@@ -1978,7 +1977,6 @@ def _prepare_challenge_same_session(
 def _load_challenge_strict(root: Path, contest_selector: str | None, selector: str):
     """Load already-prepared selected state without whole-contest repair."""
 
-    sync_contest_manifest(root, contest_selector)
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     challenge = resolve_session_challenge(root, manifest, selector)
     return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
