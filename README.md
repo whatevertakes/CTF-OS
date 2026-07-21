@@ -164,7 +164,7 @@ Manual Claude Rescue는 진행 중인 LIVE Codex Solve의 exact run에 수동 �
 3. Codex CLI를 중지하거나 일시 중지합니다.
 4. 새 터미널을 엽니다.
 5. 출력된 rescue directory로 `cd`합니다.
-6. standard profile은 `claude --model sonnet`, 명시적으로 요청한 deep profile은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
+6. standard profile은 `claude --model sonnet`, 명시적 assisted profile은 동일 Sonnet main과 제한된 agent, 명시적 deep profile은 `claude --model claude-fable-5`를 사용자가 직접 실행합니다.
 7. Claude가 sandbox의 `./ctf-tool`만 사용해 challenge/remote 명령을 실행하고 `CLAUDE_RETURN.json`을 작성하도록 합니다.
 8. Claude를 종료합니다.
 9. 기존 Codex 세션을 재개합니다.
@@ -188,8 +188,18 @@ uv run python -m ctf_os.agent_tools rescue-return-validate 1 --contest my-ctf \
   --run-id '<exact-run-id>' --rescue-id '<rescue-id>'
 
 uv run python -m ctf_os.agent_tools rescue-close 1 --contest my-ctf \
-  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --reason integrated
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' --outcome integrated
 ```
+
+실제 runtime model evidence가 있을 때만 requested/observed를 분리 기록합니다.
+
+```bash
+uv run python -m ctf_os.agent_tools rescue-runtime-record 1 --contest my-ctf \
+  --run-id '<exact-run-id>' --rescue-id '<rescue-id>' \
+  --observed-model '<observed model>' --evidence 'evidence/runtime-model.txt'
+```
+
+설계와 격리 계약은 [`docs/CLAUDE_RESCUE_SOLVER.md`](docs/CLAUDE_RESCUE_SOLVER.md), 후속 controlled replay 계약은 [`docs/CLAUDE_RESCUE_EVAL.md`](docs/CLAUDE_RESCUE_EVAL.md)에 있습니다. 실제 replay 전 성능 결론은 `INCONCLUSIVE`입니다.
 
 `RESCUE_PACKET.json`은 `packet_digest` 필드만 제외한 객체를 UTF-8 canonical JSON(`sort_keys=true`, compact separators)으로 직렬화한 SHA-256을 digest로 사용하며 생성 후 read-only입니다. 새 상태는 같은 packet을 수정하지 않고 새 operation ID와 rescue attempt로 캡처합니다. `requested_lead_model`은 운영 의도일 뿐이고 `observed_lead_model`은 실제 CLI evidence가 있을 때만 기록합니다. Deep Fable이 거부하거나 진행할 수 없을 때 START 문서가 보여 주는 Opus 명령은 사람이 승인해 새 세션에서 실행하는 대안이며 자동 fallback이 아닙니다.
 

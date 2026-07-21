@@ -23,6 +23,8 @@ ctf_os = [
   "resources/claude-rescue/*.md",
   "resources/claude-rescue/*.json",
   "resources/claude-rescue/modes/*.md",
+  "resources/claude-rescue/profiles/*.md",
+  "resources/claude-rescue/agents/*.md",
   "resources/claude-rescue/playbooks/*.md",
 ]
 

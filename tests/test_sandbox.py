@@ -140,7 +140,10 @@ def test_remote_counters_only_count_exact_authorized_accept_rule(monkeypatch) ->
     outputs = iter((output, ""))
     monkeypatch.setattr(runtime, "_run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, next(outputs), ""))
     counters = runtime._firewall_counters("container", "docker", [{"ip": "8.8.8.8", "port": 443}])
-    assert counters == {"target_packets": 3, "established_packets": 7}
+    assert counters == {
+        "target_packets": 3, "target_packets_by_index": [3],
+        "established_packets": 7,
+    }
 
 
 def test_dns_multi_address_and_change_are_resolved_per_sandbox(monkeypatch) -> None:

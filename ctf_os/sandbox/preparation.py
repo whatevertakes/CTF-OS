@@ -101,6 +101,7 @@ def prepare_sandbox_spec(
     solver_family: str | None = None,
     session_kind: str = "native-worker",
     requested_lead_model: str | None = None,
+    allow_scheduler_rebalance: bool = True,
     prepared_fingerprint_reader: Callable[[Path], str] = prepared_tree_fingerprint,
     service_inspector: Callable[..., dict[str, object]] = service_inspect,
     service_actor: ServiceActor | None = None,
@@ -218,7 +219,10 @@ def prepare_sandbox_spec(
     resource_state = ResourceLedger(solve_root).load()
     request_raw = resource_state.get("requests", {}).get(session_id)
     allocation = resource_state.get("allocations", {}).get(session_id)
-    if isinstance(request_raw, dict) and not isinstance(allocation, dict):
+    if (
+        allow_scheduler_rebalance
+        and isinstance(request_raw, dict) and not isinstance(allocation, dict)
+    ):
         scheduler_plan = ResourceLedger(solve_root).rebalance(detect_capacity(workspace=repo_root))
         allocation = scheduler_plan.get("allocations", {}).get(session_id)
         if not isinstance(allocation, dict):
@@ -237,6 +241,7 @@ def prepare_sandbox_spec(
         ],
         role=branch, category=category,
         override=(
+            "external-rescue" if session_kind == "external-rescue" else
             str(request_raw.get("workload_class"))
             if isinstance(request_raw, dict) else None
         ),

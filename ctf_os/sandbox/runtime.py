@@ -408,6 +408,16 @@ def _execute_locked(
             and after["target_packets"] > before["target_packets"]
             and after["established_packets"] > before["established_packets"]
         ),
+        "authorized_network_target_indices": (
+            [
+                index for index, packets in enumerate(after.get("target_packets_by_index", []))
+                if index < len(before.get("target_packets_by_index", []))
+                and packets > before["target_packets_by_index"][index]
+            ]
+            if before is not None and after is not None
+            and after["established_packets"] > before["established_packets"]
+            else []
+        ),
         "artifacts_exported": bool(cleanup_record and cleanup_record.get("artifact_export")),
         "timeout_profile": timeout_profile, "timeout_status": timeout_status,
         "container_retained": retained,
@@ -685,11 +695,11 @@ def _validate_spec(spec: SandboxSpec) -> None:
     for label, value in (("session id", spec.session_id), ("parent session id", spec.parent_session_id)):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
             raise SandboxError(f"{label} is invalid")
-    if spec.session_role not in {"sol", "child", "external"}:
-        raise SandboxError("session role must be sol, child, or external")
+    if spec.session_role not in {"sol", "child", "external", "external-rescue"}:
+        raise SandboxError("session role must be sol, child, or external-rescue")
     if spec.session_role == "child" and spec.session_id == spec.parent_session_id:
         raise SandboxError("child session id must differ from its parent session id")
-    if spec.session_role == "external" and not (
+    if spec.session_role in {"external", "external-rescue"} and not (
         spec.external_solver and spec.session_kind == "external-rescue"
         and spec.rescue_attempt_id == spec.session_id
     ):
@@ -761,7 +771,7 @@ def _authorize_sandbox(
     """Enforce worker ownership when a model-facing caller identity is supplied."""
     if session_id is None and session_role is None:
         return  # Backwards-compatible trusted in-process controller path.
-    if session_role not in {"sol", "child", "external"} or not session_id:
+    if session_role not in {"sol", "child", "external", "external-rescue"} or not session_id:
         raise SandboxError("sandbox caller must provide a valid session id and role")
     owner = str(metadata.get("session_id", ""))
     parent = str(metadata.get("parent_session_id", ""))
@@ -771,7 +781,7 @@ def _authorize_sandbox(
                 f"DENIED_SANDBOX_ACCESS: Sol session {session_id} does not own worker parent scope {parent}"
             )
         return
-    if session_role == "external":
+    if session_role in {"external", "external-rescue"}:
         if (
             metadata.get("external_solver") is not True
             or metadata.get("session_kind") != "external-rescue"
@@ -855,12 +865,13 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, int]:
+def _firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, object]:
     ipv4 = _run([docker, "exec", "--user", "0:0", container, "iptables-save", "-c"], timeout=10)
     ipv6 = _run([docker, "exec", "--user", "0:0", container, "ip6tables-save", "-c"], timeout=10)
     if ipv4.returncode or ipv6.returncode:
         raise SandboxError("cannot read authorized firewall counters for remote verification")
     target_packets = 0
+    target_packets_by_index = [0 for _target in targets]
     established_packets = 0
     rules = ipv4.stdout.splitlines() + ipv6.stdout.splitlines()
     for line in rules:
@@ -870,15 +881,20 @@ def _firewall_counters(container: str, docker: str, targets: list[object]) -> di
         packets = int(counter.group(1))
         if "--ctstate RELATED,ESTABLISHED" in line or "--ctstate ESTABLISHED,RELATED" in line:
             established_packets += packets
-        for target in targets:
+        for index, target in enumerate(targets):
             if not isinstance(target, dict):
                 continue
             address = str(target.get("ip", ""))
             port = str(target.get("port", ""))
             if address and f"--dport {port}" in line and (f"-d {address}/32" in line or f"-d {address}/128" in line):
                 target_packets += packets
+                target_packets_by_index[index] += packets
                 break
-    return {"target_packets": target_packets, "established_packets": established_packets}
+    return {
+        "target_packets": target_packets,
+        "target_packets_by_index": target_packets_by_index,
+        "established_packets": established_packets,
+    }
 
 
 def _export_artifacts(

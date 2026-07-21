@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import stat
 import subprocess
 import sys
@@ -14,12 +13,14 @@ from typing import Any, Mapping, Sequence
 
 from .rescue import (
     RescueError, _direct_argv, _load_json, _load_packet, _validate_rescue_metadata,
-    canonical_json,
+    canonical_json, record_rescue_command,
 )
 from .sandbox.runtime import execute
 from .preflight import prepared_tree_fingerprint
 from .timeouts import timeout_seconds
-from .workspace import append_jsonl_fsync, challenge_workspace, read_jsonl_strict, utc_now
+from .workspace import (
+    append_jsonl_fsync, atomic_text, challenge_workspace, read_jsonl_strict, utc_now,
+)
 
 
 MAX_IMPORT_FILES = 200
@@ -32,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata", required=True, help=argparse.SUPPRESS)
     parser.add_argument("--run-id", required=True, help=argparse.SUPPRESS)
     parser.add_argument("--rescue-id", required=True, help=argparse.SUPPRESS)
+    parser.add_argument("--packet-digest", required=True, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
     execute_parser = commands.add_parser("exec")
@@ -70,6 +72,9 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         state = runtime.get("State") if isinstance(runtime.get("State"), Mapping) else {}
         if state.get("Running") is not True:
             raise RescueError("exact rescue sandbox container is not running")
+        commands = read_jsonl_strict(
+            rescue_root / "RESCUE_COMMANDS.jsonl", "rescue command receipt ledger",
+        )
         return {
             "run_id": run.name, "rescue_attempt_id": args.rescue_id,
             "container": metadata["name"], "container_state": "RUNNING",
@@ -79,6 +84,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             "authorized_targets": metadata.get("authorized_targets", []),
             "local_managed_endpoints": metadata.get("local_endpoints", []),
             "service_context": metadata.get("service_context", {}),
+            "packet_digest": packet["packet_digest"],
+            "recent_command_receipts": commands[-10:],
+            "repeated_command_warnings": sum(
+                bool(row.get("repeated_command_warning")) for row in commands
+            ),
         }
     if args.command == "exec":
         command = list(args.argv)
@@ -90,12 +100,20 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
         timeout = args.timeout if args.timeout is not None else profile_timeout
         if timeout < 1 or timeout > 1800:
             raise RescueError("ctf-tool exec timeout must be between 1 and 1800 seconds")
+        before_artifacts = _artifact_snapshot(rescue_root)
         result = execute(
             metadata, direct, timeout,
-            session_id=args.rescue_id, session_role="external",
+            session_id=args.rescue_id, session_role="external-rescue",
             timeout_profile=args.timeout_profile,
         )
-        result["command_count"] = _command_count(rescue_root / "logs" / "commands.jsonl")
+        receipt = _record_command_receipt(
+            run, rescue_root, packet, direct, result,
+            before_artifacts=before_artifacts,
+        )
+        result["command_receipt"] = receipt
+        result["command_count"] = _command_count(
+            rescue_root / "RESCUE_COMMANDS.jsonl"
+        )
         result["run_id"] = run.name
         result["rescue_attempt_id"] = args.rescue_id
         return result
@@ -112,9 +130,22 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _context(args: argparse.Namespace) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
-    metadata_path = Path(args.metadata).resolve(strict=False)
-    if metadata_path.is_symlink() or not metadata_path.is_file() or metadata_path.name != "sandbox.json":
+    raw_repo_root = Path(args.repo)
+    if raw_repo_root.is_symlink():
+        raise RescueError("fixed rescue repository root is missing or unsafe")
+    repo_root = raw_repo_root.resolve(strict=False)
+    if not repo_root.is_dir():
+        raise RescueError("fixed rescue repository root is missing or unsafe")
+    raw_metadata_path = Path(args.metadata)
+    if raw_metadata_path.is_symlink():
         raise RescueError("fixed rescue sandbox metadata is missing or unsafe")
+    metadata_path = raw_metadata_path.resolve(strict=False)
+    if not metadata_path.is_file() or metadata_path.name != "sandbox.json":
+        raise RescueError("fixed rescue sandbox metadata is missing or unsafe")
+    try:
+        metadata_path.relative_to((repo_root / "output").resolve())
+    except ValueError as exc:
+        raise RescueError("fixed rescue metadata is outside repository output") from exc
     rescue_root = metadata_path.parent
     if rescue_root.name != args.rescue_id or rescue_root.parent.name != "rescue":
         raise RescueError("fixed rescue ID does not match metadata path")
@@ -123,6 +154,8 @@ def _context(args: argparse.Namespace) -> tuple[Path, Path, dict[str, Any], dict
         raise RescueError("fixed run ID does not match rescue metadata path")
     metadata = _load_json(metadata_path, "rescue sandbox metadata")
     packet = _load_packet(rescue_root)
+    if packet.get("packet_digest") != args.packet_digest:
+        raise RescueError("fixed packet digest does not match rescue packet")
     _validate_rescue_metadata(metadata, packet, rescue_root)
     state = _load_json(run / "STATE.json", "run state")
     identity = packet["identity"]
@@ -227,7 +260,7 @@ print(json.dumps(copied, sort_keys=True, separators=(',', ':')))
 """
     receipt = execute(
         dict(metadata), ["python3", "-c", script, json.dumps(manifest, separators=(",", ":"))],
-        300, session_id=str(metadata["rescue_attempt_id"]), session_role="external",
+        300, session_id=str(metadata["rescue_attempt_id"]), session_role="external-rescue",
         timeout_profile="quick_probe",
     )
     if receipt.get("exit_code") != 0:
@@ -254,7 +287,7 @@ print(json.dumps(copied, sort_keys=True, separators=(',', ':')))
         "run_id": run.name, "rescue_attempt_id": metadata["rescue_attempt_id"],
         "files": len(files), "bytes": total, "manifest": manifest,
         "destination": "/work/input-view", "receipt_id": material["receipt_id"],
-        "command_count": _command_count(rescue_root / "logs" / "commands.jsonl"),
+        "command_count": _command_count(rescue_root / "RESCUE_COMMANDS.jsonl"),
     }
 
 
@@ -307,6 +340,10 @@ def _reject_model_command(argv: Sequence[str]) -> None:
     executable = Path(argv[0]).name.casefold()
     if executable in programs:
         raise RescueError("ctf-tool cannot launch a model process")
+    if executable in {"sh", "bash", "zsh", "dash"} and any(
+        item in {"-c", "-lc", "-ic"} for item in argv[1:]
+    ):
+        raise RescueError("ctf-tool exec requires direct argv and rejects shell strings")
     python_names = {"python", "python3", "python3.11", "python3.12", "uv"}
     if executable in python_names:
         lowered = [item.casefold() for item in argv[1:]]
@@ -315,11 +352,6 @@ def _reject_model_command(argv: Sequence[str]) -> None:
             module = lowered[index + 1] if index + 1 < len(lowered) else ""
             if module.split(".", 1)[0] in programs | {"anthropic", "openai"}:
                 raise RescueError("ctf-tool cannot launch a model process or model API client")
-    if executable in {"sh", "bash", "zsh", "dash"} and any(
-        re.search(r"(?:^|[/\s])(?:claude|codex|aider|gemini|copilot|ollama)(?:\s|$)", item, re.I)
-        for item in argv[1:]
-    ):
-        raise RescueError("ctf-tool cannot launch a model process through a shell")
 
 
 def _sha256(path: Path) -> str:
@@ -330,11 +362,148 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _command_count(path: Path) -> int:
-    return sum(
-        row.get("event") == "sandbox_exec"
-        for row in read_jsonl_strict(path, "rescue command receipt ledger")
+def _record_command_receipt(
+    run: Path,
+    rescue_root: Path,
+    packet: Mapping[str, Any],
+    argv: Sequence[str],
+    execution: Mapping[str, Any],
+    *,
+    before_artifacts: Mapping[str, Any],
+) -> dict[str, Any]:
+    created_at = utc_now()
+    stdout = str(execution.get("stdout") or "")
+    stderr = str(execution.get("stderr") or "")
+    command_digest = hashlib.sha256(canonical_json(list(argv))).hexdigest()
+    command_family = _command_family(argv)
+    command_family_digest = hashlib.sha256(
+        canonical_json(command_family)
+    ).hexdigest()
+    stdout_digest = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+    stderr_digest = hashlib.sha256(stderr.encode("utf-8")).hexdigest()
+    after_artifacts = _artifact_snapshot(rescue_root)
+    target_indices = list(execution.get("authorized_network_target_indices") or [])
+    material = {
+        "run_id": run.name,
+        "rescue_attempt_id": rescue_root.name,
+        "packet_digest": packet["packet_digest"],
+        "command_digest": command_digest,
+        "stdout_digest": stdout_digest,
+        "stderr_digest": stderr_digest,
+        "exit_code": execution.get("exit_code"),
+        "timed_out": execution.get("timed_out") is True,
+        "artifact_snapshot": {"before": before_artifacts, "after": after_artifacts},
+        "authorized_network_target_indices": target_indices,
+        "created_at": created_at,
+    }
+    receipt_id = hashlib.sha256(canonical_json(material)).hexdigest()[:24]
+    evidence_path = rescue_root / "evidence" / "commands" / f"{receipt_id}.txt"
+    if evidence_path.is_symlink():
+        raise RescueError("command output evidence path must not be a symlink")
+    evidence_text = (
+        "CTF-OS rescue command receipt\n"
+        f"receipt_id: {receipt_id}\n"
+        f"argv_json: {json.dumps(list(argv), ensure_ascii=False, separators=(',', ':'))}\n"
+        f"exit_code: {execution.get('exit_code')}\n"
+        f"timed_out: {execution.get('timed_out') is True}\n"
+        "\n[stdout]\n" + stdout + "\n[stderr]\n" + stderr
     )
+    atomic_text(evidence_path, evidence_text)
+    evidence_path.chmod(0o600)
+    prior = read_jsonl_strict(
+        rescue_root / "RESCUE_COMMANDS.jsonl", "rescue command receipt ledger",
+    )
+    repeated = any(
+        row.get("command_family_digest") == command_family_digest
+        and row.get("stdout_digest") == stdout_digest
+        and row.get("stderr_digest") == stderr_digest
+        and row.get("artifact_snapshot", {}).get("after") == after_artifacts
+        for row in prior
+        if isinstance(row.get("artifact_snapshot"), Mapping)
+    )
+    receipt = {
+        "schema_version": 1,
+        "command_receipt_id": receipt_id,
+        "run_id": run.name,
+        "rescue_attempt_id": rescue_root.name,
+        "packet_digest": packet["packet_digest"],
+        "argv": list(argv),
+        "command_digest": command_digest,
+        "command_family": command_family,
+        "command_family_digest": command_family_digest,
+        "exit_code": execution.get("exit_code"),
+        "timed_out": execution.get("timed_out") is True,
+        "stdout_digest": stdout_digest,
+        "stderr_digest": stderr_digest,
+        "output_excerpt": _bounded_excerpt(stdout, stderr),
+        "authorized_network_observed": execution.get("authorized_network_observed") is True,
+        "authorized_network_target_indices": target_indices,
+        "authorized_targets": list(execution.get("authorized_targets") or []),
+        "artifact_snapshot": {"before": before_artifacts, "after": after_artifacts},
+        "evidence_path": evidence_path.relative_to(rescue_root).as_posix(),
+        "evidence_digest": _sha256(evidence_path),
+        "repeated_command_warning": repeated,
+        "created_at": created_at,
+    }
+    append_jsonl_fsync(
+        rescue_root / "RESCUE_COMMANDS.jsonl", receipt,
+        label="rescue command receipt ledger",
+    )
+    record_rescue_command(run, rescue_root.name, receipt)
+    return receipt
+
+
+def _artifact_snapshot(rescue_root: Path) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    total = 0
+    unsafe = 0
+    for base_name in ("work", "artifacts"):
+        base = rescue_root / base_name
+        for path in sorted(base.rglob("*")):
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                unsafe += 1
+                continue
+            size = path.stat().st_size
+            total += size
+            if len(rows) < 200:
+                rows.append({
+                    "path": path.relative_to(rescue_root).as_posix(),
+                    "size": size, "sha256": _sha256(path),
+                })
+    digest = hashlib.sha256(canonical_json(rows)).hexdigest()
+    return {
+        "file_count": len(rows), "total_bytes": total,
+        "manifest_digest": digest, "unsafe_entry_count": unsafe,
+    }
+
+
+def _command_family(argv: Sequence[str]) -> list[str]:
+    executable = Path(argv[0]).name.casefold()
+    family = [executable]
+    if executable in {"python", "python3", "python3.11", "python3.12", "pypy3"}:
+        if len(argv) > 2 and argv[1] == "-m":
+            family.extend(["-m", argv[2]])
+        elif len(argv) > 1 and not argv[1].startswith("-"):
+            family.append(Path(argv[1]).as_posix())
+    elif executable in {"bash", "sh", "zsh", "dash", "node", "ruby", "perl"}:
+        if len(argv) > 1 and not argv[1].startswith("-"):
+            family.append(Path(argv[1]).as_posix())
+    return family
+
+
+def _bounded_excerpt(stdout: str, stderr: str, maximum: int = 8000) -> str:
+    combined = ("stdout:\n" + stdout + "\nstderr:\n" + stderr).replace("\x00", "\\0")
+    data = combined.encode("utf-8")
+    if len(data) <= maximum:
+        return combined
+    return data[: maximum - 3].decode("utf-8", errors="ignore") + "..."
+
+
+def _command_count(path: Path) -> int:
+    return len(read_jsonl_strict(path, "rescue command receipt ledger"))
 
 
 def _run(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:

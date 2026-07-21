@@ -22,11 +22,11 @@ from typing import Any, Iterator
 from .contest import ChallengeSpec, ContestManifest
 from .flags import matches_flag
 from .preflight import prepared_tree_fingerprint
-from .sandbox.network import parse_remotes, target_matches_observation
 from .sandbox.preparation import (
     PreparedSandbox, prepare_sandbox_spec, validate_prepared_input,
 )
 from .sandbox.runtime import cleanup, create, probe_service_connectivity
+from .resources.scheduler import ResourceLedger
 from .service import ServiceActor, service_attachment
 from .workspace import (
     CURRENT_FINGERPRINT_SCHEME, append_jsonl_fsync, atomic_json, atomic_text,
@@ -47,13 +47,14 @@ MODES = frozenset({
     "BLOCKER_BREAK", "PRIMITIVE_TO_POC", "REMOTE_ENDGAME",
     "FRESH_REINTERPRETATION", "FLAG_VERIFICATION",
 })
-PROFILES = frozenset({"standard", "deep"})
+PROFILES = frozenset({"standard", "assisted", "deep"})
 VERDICTS = frozenset({
     "REMOTE_FLAG_OBTAINED", "REMOTE_READY_HANDOFF", "CONFIRMED_BREAKTHROUGH",
     "NO_NEW_PATH", "ERROR",
 })
 LEDGER_EVENTS = frozenset({
     "RESCUE_PREPARED", "RESCUE_SANDBOX_READY", "RESCUE_RETURN_VALIDATED",
+    "RESCUE_RUNTIME_RECORDED", "RESCUE_COMMAND_RECORDED",
     "RESCUE_HANDED_BACK", "RESCUE_CONFIRMED", "RESCUE_REFUTED",
     "RESCUE_CLOSED", "RESCUE_ERROR",
 })
@@ -125,7 +126,7 @@ def prepare_rescue(
         "leading_exploit_path", 2000,
     )
     requested_model = _text(
-        lead_model or ("sonnet" if normalized_profile == "standard" else "claude-fable-5"),
+        lead_model or ("claude-fable-5" if normalized_profile == "deep" else "sonnet"),
         "lead_model", 160,
     )
     identity = validate_exact_live_mutable_run(run, challenge, record)
@@ -140,7 +141,7 @@ def prepare_rescue(
         raise RescueError("rescue directory is not exact-run local")
 
     truth, experiments, state_summary, references = _truth_from_run(
-        run, leading_exploit_path=leading,
+        run, leading_exploit_path=leading, current_blocker=normalized_blocker,
     )
     selected = _selected_manifest(run, references, rescue_root=rescue_root)
     request = {
@@ -249,7 +250,7 @@ def prepare_rescue(
         "branch_root": rescue_root,
         "session_id": rid,
         "parent_session_id": "sol-main",
-        "session_role": "external",
+        "session_role": "external-rescue",
         "require_running_managed_service": managed,
         "workspace_mode": "bind",
         "run_id": run.name,
@@ -258,13 +259,25 @@ def prepare_rescue(
         "solver_family": "claude",
         "session_kind": "external-rescue",
         "requested_lead_model": requested_model,
+        "allow_scheduler_rebalance": False,
         "prepared_fingerprint_reader": prepared_fingerprint_reader,
     }
     if service_inspector is not None:
         prepare_kwargs["service_inspector"] = service_inspector
     metadata: dict[str, object] | None = None
+    resource_requested = False
     try:
         prepared = sandbox_preparer(**prepare_kwargs)
+        ResourceLedger(run).request(
+            prepared.spec.resource_request,
+            actor_session_id="sol-main", actor_role="sol",
+            inference={
+                "source": "manual-claude-rescue",
+                "workload_class": "external-rescue",
+                "automatic_rebalance": False,
+            },
+        )
+        resource_requested = True
         guard = (
             attachment_factory(
                 prepared.attachment_service,
@@ -276,6 +289,7 @@ def prepare_rescue(
         )
         with guard:
             metadata = sandbox_factory(prepared.spec)
+            _lock_read_only_workspace(rescue_root)
             _validate_rescue_metadata(metadata, packet, rescue_root)
             if prepared.spec.service_network:
                 metadata["connectivity_probe"] = connectivity_probe(metadata)
@@ -285,10 +299,18 @@ def prepare_rescue(
         if metadata is not None:
             try:
                 sandbox_cleanup(
-                    metadata, session_id=rid, session_role="external",
+                    metadata, session_id=rid, session_role="external-rescue",
                 )
             except Exception as cleanup_exc:
                 cleanup_error = str(cleanup_exc)[:2000]
+        if resource_requested:
+            try:
+                ResourceLedger(run).release(
+                    rid, "rescue sandbox preparation failed",
+                    actor_session_id="sol-main", actor_role="sol",
+                )
+            except Exception as release_exc:
+                cleanup_error = cleanup_error or str(release_exc)[:2000]
         with rescue_lock(run):
             _append_event_unlocked(
                 run, packet, "RESCUE_ERROR",
@@ -436,6 +458,7 @@ def show_rescue(run: Path, rescue_id: str) -> dict[str, Any]:
         "runtime_observation_evidence": state.get("runtime_observation_evidence"),
         "fallback_observed": state.get("fallback_observed"),
         "packet_digest": packet["packet_digest"],
+        "ctf_tool_digest": state.get("ctf_tool_digest"),
         "sandbox_state": state["sandbox_state"],
         "return_file_state": _return_file_state(rescue_root),
         "start_command": _start_command(rescue_root, str(request["requested_lead_model"])),
@@ -445,6 +468,92 @@ def show_rescue(run: Path, rescue_id: str) -> dict[str, Any]:
         "path": str(rescue_root),
         "process_state_inferred": False,
     }
+
+
+def record_rescue_runtime(
+    run: Path,
+    rescue_id: str,
+    *,
+    observed_model: str,
+    evidence: str,
+    fallback_observed: bool | None = None,
+) -> dict[str, Any]:
+    """Record operator-observed model identity without inferring process state."""
+
+    rescue_root = _rescue_root(run, rescue_id)
+    packet = _load_packet(rescue_root)
+    _validate_packet_against_current_run(run, packet, None)
+    observed = _text(observed_model, "observed_model", 160)
+    evidence_path = _safe_rescue_path(
+        rescue_root, evidence, "runtime observation evidence",
+        allowed={"evidence", "logs"},
+    )
+    if evidence_path.stat().st_size > MAX_SELECTED_TEXT_BYTES:
+        raise RescueError("runtime observation evidence exceeds the bounded text limit")
+    evidence_text = _read_bounded_text(evidence_path, MAX_SELECTED_TEXT_BYTES)
+    if observed.casefold() not in evidence_text.casefold():
+        raise RescueError("runtime observation evidence does not contain the observed model")
+    requested = str(packet["request"]["requested_lead_model"])
+    if fallback_observed not in {None, True, False}:
+        raise RescueError("fallback_observed must be boolean or null")
+    if fallback_observed is not None and "fallback" not in evidence_text.casefold():
+        raise RescueError("fallback observation requires explicit fallback evidence")
+    details = {
+        "requested_lead_model": requested,
+        "observed_lead_model": observed,
+        "runtime_observation_evidence": evidence_path.relative_to(rescue_root).as_posix(),
+        "runtime_observation_evidence_sha256": _sha256(evidence_path),
+        "fallback_observed": fallback_observed,
+    }
+    with rescue_lock(run):
+        row = _append_event_unlocked(
+            run, packet, "RESCUE_RUNTIME_RECORDED", details=details,
+        )
+    return {
+        "run_id": run.name, "rescue_attempt_id": rescue_id,
+        "packet_digest": packet["packet_digest"], **details,
+        "event_id": row["event_id"],
+    }
+
+
+def record_rescue_command(
+    run: Path,
+    rescue_id: str,
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one ctf-tool receipt to the append-only rescue lifecycle ledger."""
+
+    rescue_root = _rescue_root(run, rescue_id)
+    packet = _load_packet(rescue_root)
+    required = {
+        "command_receipt_id", "run_id", "rescue_attempt_id", "packet_digest",
+        "command_digest", "stdout_digest", "stderr_digest", "evidence_path",
+    }
+    if not required.issubset(receipt):
+        raise RescueError("rescue command receipt is incomplete")
+    if (
+        receipt.get("run_id") != run.name
+        or receipt.get("rescue_attempt_id") != rescue_id
+        or receipt.get("packet_digest") != packet.get("packet_digest")
+    ):
+        raise RescueError("rescue command receipt identity mismatch")
+    evidence_path = _safe_rescue_path(
+        rescue_root, str(receipt["evidence_path"]), "command output evidence",
+        allowed={"evidence"},
+    )
+    if receipt.get("evidence_digest") != _sha256(evidence_path):
+        raise RescueError("rescue command output evidence digest mismatch")
+    details = {
+        "command_receipt_id": receipt["command_receipt_id"],
+        "command_digest": receipt["command_digest"],
+        "authorized_network_observed": receipt.get("authorized_network_observed") is True,
+        "evidence_path": receipt["evidence_path"],
+        "evidence_digest": receipt["evidence_digest"],
+    }
+    with rescue_lock(run):
+        return _append_event_unlocked(
+            run, packet, "RESCUE_COMMAND_RECORDED", details=details,
+        )
 
 
 def validate_rescue_return(
@@ -554,45 +663,62 @@ def close_rescue(
     run: Path,
     rescue_id: str,
     *,
-    reason: str,
+    outcome: str | None = None,
+    evidence_receipt_id: str | None = None,
+    reason: str | None = None,
     sandbox_cleanup: Callable[..., dict[str, object]] = cleanup,
 ) -> dict[str, Any]:
+    selected_outcome = outcome if outcome is not None else reason
+    if selected_outcome is None:
+        raise RescueError("rescue close requires an outcome")
     normalized = _enum(
-        reason, frozenset({"integrated", "refuted", "no-new-path", "manual"}),
-        "reason", preserve_case=True,
+        selected_outcome,
+        frozenset({"integrated", "refuted", "no-new-path", "flag-obtained", "manual"}),
+        "outcome", preserve_case=True,
+    )
+    evidence_id = (
+        _text(evidence_receipt_id, "evidence_receipt_id", 256)
+        if evidence_receipt_id is not None else None
     )
     rescue_root = _rescue_root(run, rescue_id)
     packet = _load_packet(rescue_root)
+    if evidence_id is not None and not _existing_receipt_id(
+        run, rescue_root, evidence_id,
+    ):
+        raise RescueError("rescue close evidence receipt does not exist in this exact run")
     state = project_rescue_state(run, rescue_id)
     if state.get("status") == "CLOSED":
         return {
             "run_id": run.name, "rescue_attempt_id": rescue_id,
-            "closed": True, "reason": state.get("close_reason"), "idempotent": True,
+            "closed": True, "outcome": state.get("close_outcome"), "idempotent": True,
             "workspace_preserved": True,
         }
     metadata = _load_json(rescue_root / "sandbox.json", "rescue sandbox metadata")
     _validate_rescue_metadata(metadata, packet, rescue_root)
     cleanup_receipt = sandbox_cleanup(
-        metadata, session_id=rescue_id, session_role="external",
+        metadata, session_id=rescue_id, session_role="external-rescue",
     )
     with rescue_lock(run):
-        if normalized == "integrated":
+        if normalized in {"integrated", "flag-obtained"}:
             _append_event_unlocked(
                 run, packet, "RESCUE_CONFIRMED",
-                details={"reason": normalized},
+                details={"outcome": normalized, "evidence_receipt_id": evidence_id},
             )
         elif normalized in {"refuted", "no-new-path"}:
             _append_event_unlocked(
                 run, packet, "RESCUE_REFUTED",
-                details={"reason": normalized},
+                details={"outcome": normalized, "evidence_receipt_id": evidence_id},
             )
         _append_event_unlocked(
             run, packet, "RESCUE_CLOSED",
-            details={"reason": normalized, "cleanup_receipt": cleanup_receipt},
+            details={
+                "outcome": normalized, "evidence_receipt_id": evidence_id,
+                "cleanup_receipt": cleanup_receipt,
+            },
         )
     return {
         "run_id": run.name, "rescue_attempt_id": rescue_id,
-        "closed": True, "reason": normalized,
+        "closed": True, "outcome": normalized,
         "cleanup_receipt": cleanup_receipt, "idempotent": False,
         "workspace_preserved": True,
     }
@@ -604,10 +730,20 @@ def load_rescue_ledger(run: Path) -> list[dict[str, Any]]:
         run / "rescue" / "RESCUE_LEDGER.jsonl", "rescue ledger",
     )
     for row in rows:
+        required = {
+            "schema_version", "event_id", "event", "rescue_attempt_id",
+            "operation_id", "run_id", "challenge_instance_id",
+            "input_fingerprint", "target_revision", "packet_digest",
+            "details", "created_at",
+        }
         if (
-            row.get("schema_version") != RESCUE_LEDGER_SCHEMA_VERSION
+            not required.issubset(row)
+            or row.get("schema_version") != RESCUE_LEDGER_SCHEMA_VERSION
             or row.get("event") not in LEDGER_EVENTS
             or not isinstance(row.get("details"), dict)
+            or row.get("run_id") != run.name
+            or not isinstance(row.get("target_revision"), int)
+            or not _SHA256.fullmatch(str(row.get("packet_digest") or ""))
         ):
             raise RescueError("rescue ledger contains an unsupported or malformed row")
     return rows
@@ -627,12 +763,16 @@ def project_rescue_state(run: Path, rescue_id: str) -> dict[str, Any]:
     observed_model = None
     runtime_evidence = None
     fallback_observed = None
-    close_reason = None
+    close_outcome = None
     for row in rows:
         event = row["event"]
         details = row["details"]
         if event == "RESCUE_SANDBOX_READY":
             status, sandbox_state = "READY", "READY"
+        elif event == "RESCUE_RUNTIME_RECORDED":
+            observed_model = details.get("observed_lead_model")
+            runtime_evidence = details.get("runtime_observation_evidence")
+            fallback_observed = details.get("fallback_observed")
         elif event == "RESCUE_RETURN_VALIDATED":
             status, validation_state = "RETURN_VALIDATED", "VALIDATED"
             observed_model = details.get("observed_lead_model")
@@ -646,7 +786,7 @@ def project_rescue_state(run: Path, rescue_id: str) -> dict[str, Any]:
             status = "REFUTED"
         elif event == "RESCUE_CLOSED":
             status, sandbox_state = "CLOSED", "CLOSED"
-            close_reason = details.get("reason")
+            close_outcome = details.get("outcome") or details.get("reason")
         elif event == "RESCUE_ERROR" and status not in {"CLOSED", "CONFIRMED", "REFUTED"}:
             status = "ERROR"
     packet = _load_packet(rescue_root) if (rescue_root / "RESCUE_PACKET.json").is_file() else None
@@ -659,11 +799,16 @@ def project_rescue_state(run: Path, rescue_id: str) -> dict[str, Any]:
         "observed_lead_model": observed_model,
         "runtime_observation_evidence": runtime_evidence,
         "fallback_observed": fallback_observed,
-        "close_reason": close_reason,
+        "close_outcome": close_outcome,
         "last_event_id": rows[-1].get("event_id"),
         "last_event": rows[-1].get("event"),
         "event_count": len(rows),
         "packet_digest": packet.get("packet_digest") if packet else None,
+        "ctf_tool_digest": (
+            _sha256(rescue_root / "ctf-tool")
+            if (rescue_root / "ctf-tool").is_file()
+            and not (rescue_root / "ctf-tool").is_symlink() else None
+        ),
         "updated_at": rows[-1].get("created_at"),
     }
     atomic_json(rescue_root / "RESCUE_STATE.json", state)
@@ -720,12 +865,13 @@ def _append_event_unlocked(
     existing = next((row for row in rows if row.get("event_id") == event_id), None)
     if existing is not None:
         return existing
+    repeatable = {"RESCUE_ERROR", "RESCUE_COMMAND_RECORDED", "RESCUE_RUNTIME_RECORDED"}
     same_event = next((
         row for row in rows
         if row.get("rescue_attempt_id") == identity["rescue_attempt_id"]
         and row.get("event") == event
     ), None)
-    if same_event is not None and event not in {"RESCUE_ERROR"}:
+    if same_event is not None and event not in repeatable:
         raise RescueError(f"rescue event {event} already exists with conflicting details")
     row = {**material, "event_id": event_id, "created_at": utc_now()}
     append_jsonl_fsync(
@@ -772,6 +918,7 @@ def _truth_from_run(
     run: Path,
     *,
     leading_exploit_path: str,
+    current_blocker: str,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, Any], list[tuple[str, str]]]:
     truth: dict[str, list[dict[str, Any]]] = {
         "confirmed": [], "candidates": [], "refuted": [], "untested": [],
@@ -781,6 +928,9 @@ def _truth_from_run(
     rows = read_jsonl_strict(
         run / "milestone-receipts.jsonl", "milestone receipt ledger",
     )
+    milestone_ids = {
+        str(row.get("receipt_id")) for row in rows if row.get("receipt_id")
+    }
     working_poc = False
     remote_attempted = False
     for row in rows:
@@ -804,15 +954,27 @@ def _truth_from_run(
             evidence or artifacts or row.get("command_digest")
             or row.get("output_excerpt")
         )
-        if event == "PRIMITIVE_CONFIRMED" and linked:
+        detail = row.get("details") if isinstance(row.get("details"), Mapping) else {}
+        control_reference = (
+            detail.get("negative_control_assertion_receipt")
+            or detail.get("control_receipt")
+        )
+        controlled = isinstance(control_reference, str) and (
+            control_reference in milestone_ids
+            or control_reference in evidence
+            or control_reference in artifacts
+        )
+        if event == "PRIMITIVE_CONFIRMED" and linked and controlled:
             claim["truth_level"] = "CONFIRMED"
+            claim["positive_assertion_receipt"] = row.get("receipt_id")
+            claim["control_receipt"] = control_reference
             truth["confirmed"].append(claim)
         elif event == "WORKING_POC" and (artifacts or row.get("command_digest")):
             claim["truth_level"] = "CONFIRMED"
             truth["confirmed"].append(claim)
             working_poc = True
         elif event in {"PRIMITIVE_CANDIDATE", "FLAG_CANDIDATE"} or (
-            event == "PRIMITIVE_CONFIRMED" and not linked
+            event == "PRIMITIVE_CONFIRMED" and not (linked and controlled)
         ):
             claim["truth_level"] = "CANDIDATE"
             truth["candidates"].append(claim)
@@ -820,7 +982,6 @@ def _truth_from_run(
             claim["truth_level"] = "REFUTED"
             truth["refuted"].append(claim)
         elif event == "DECISIVE_EXPERIMENT":
-            detail = row.get("details") if isinstance(row.get("details"), Mapping) else {}
             decision = str(detail.get("decision") or "").upper()
             experiment = {
                 "receipt_id": row.get("receipt_id"),
@@ -858,10 +1019,15 @@ def _truth_from_run(
             truth["refuted" if status == "REFUTED" else "candidates"].append(claim)
             if status != "REFUTED":
                 flag_candidate = candidate
-    truth["untested"].append({
-        "truth_level": "UNTESTED", "source": "operator_request",
+    truth["candidates"].append({
+        "truth_level": "CANDIDATE", "source": "operator_request",
         "summary": _bounded(leading_exploit_path, 2000),
-        "reopen_condition": None,
+        "operator_provided": True,
+    })
+    truth["candidates"].append({
+        "truth_level": "CANDIDATE", "source": "operator_request",
+        "summary": _bounded(current_blocker, 2000),
+        "claim_kind": "current_blocker", "operator_provided": True,
     })
     state = _load_json(run / "STATE.json", "run state")
     return (
@@ -981,6 +1147,26 @@ def _create_workspace(
         "artifact-manifest.json": {
             "artifacts": packet["artifacts"], "evidence": packet["evidence"],
         },
+        "rescue-memory.json": {
+            "objective": packet["request"]["objective"],
+            "current_blocker": packet["request"]["current_blocker"],
+            "leading_path": packet["request"]["leading_exploit_path"],
+            "confirmed": packet["truth"]["confirmed"],
+            "candidates": packet["truth"]["candidates"],
+            "refuted": packet["truth"]["refuted"],
+            "untested": packet["truth"]["untested"],
+            "active_hypotheses": [],
+            "last_decisive_experiment": (
+                packet["decisive_experiments"][-1]
+                if packet["decisive_experiments"] else None
+            ),
+            "working_poc": packet["state"]["working_poc"],
+            "remote_state": {
+                "remote_ready": packet["state"]["remote_ready"],
+                "remote_attempted": packet["state"]["remote_attempted"],
+                "flag_candidate": packet["state"]["flag_candidate"],
+            },
+        },
     }
     for name, payload in context_payloads.items():
         path = rescue_root / "context" / name
@@ -994,6 +1180,9 @@ def _create_workspace(
     if not playbook_path.is_file():
         playbook_path = resources / "playbooks" / "misc.md"
     base = _read_resource(resources / "CLAUDE.base.md")
+    profile_text = _read_resource(
+        resources / "profiles" / f"{packet['request']['profile']}.md"
+    )
     identity_note = (
         f"\n## Exact assignment\n\n- Run: `{run.name}`\n"
         f"- Rescue: `{packet['identity']['rescue_attempt_id']}`\n"
@@ -1002,24 +1191,58 @@ def _create_workspace(
     )
     atomic_text(
         rescue_root / "CLAUDE.md",
-        base + identity_note + "\n" + mode_text + "\n" + _read_resource(playbook_path),
+        base + identity_note + "\n" + profile_text + "\n" + mode_text + "\n"
+        + _read_resource(playbook_path),
     )
     atomic_text(rescue_root / "REQUEST.md", _render_request(packet))
     atomic_text(rescue_root / "MODEL_POLICY.md", _render_model_policy(packet))
     atomic_text(rescue_root / "START.md", _render_start(rescue_root, packet))
     shutil.copyfile(resources / "RETURN.schema.json", rescue_root / "RETURN.schema.json")
     (rescue_root / "RETURN.schema.json").chmod(0o444)
+    shutil.copyfile(resources / "RETURN.example.json", rescue_root / "RETURN.example.json")
+    (rescue_root / "RETURN.example.json").chmod(0o444)
     atomic_json(rescue_root / "CLAUDE_RETURN.json", {})
     atomic_text(
         rescue_root / "CODEX-RESUME.md",
         "# Codex resume\n\nPending `rescue-return-validate`. Claude output is not confirmed Solve truth.\n",
     )
     atomic_json(rescue_root / ".claude" / "settings.json", _claude_settings())
-    for name, content in _agent_files().items():
-        atomic_text(rescue_root / ".claude" / "agents" / name, content)
+    for name in _agent_file_names(str(packet["request"]["profile"])):
+        source = resources / "agents" / name
+        destination = rescue_root / ".claude" / "agents" / name
+        shutil.copyfile(source, destination)
+        destination.chmod(0o444)
+    atomic_text(rescue_root / "RESCUE_COMMANDS.jsonl", "")
     wrapper = _ctf_tool_wrapper(repo_root, rescue_root, packet)
     atomic_text(rescue_root / "ctf-tool", wrapper)
-    (rescue_root / "ctf-tool").chmod(0o755)
+    (rescue_root / "ctf-tool").chmod(0o555)
+    for name in (
+        "CLAUDE.md", "REQUEST.md", "MODEL_POLICY.md", "START.md",
+        "RESCUE_PACKET.json", "RETURN.schema.json", "RETURN.example.json",
+    ):
+        (rescue_root / name).chmod(0o444)
+    (rescue_root / ".claude" / "settings.json").chmod(0o444)
+    (rescue_root / "CLAUDE_RETURN.json").chmod(0o600)
+    (rescue_root / "CODEX-RESUME.md").chmod(0o600)
+    (rescue_root / "RESCUE_COMMANDS.jsonl").chmod(0o600)
+
+
+def _lock_read_only_workspace(rescue_root: Path) -> None:
+    for base_name in ("context", ".claude"):
+        base = rescue_root / base_name
+        if base.is_symlink() or not base.is_dir():
+            raise RescueError(f"rescue read-only tree is missing or unsafe: {base_name}")
+        paths = sorted(base.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+        for path in paths:
+            if path.is_symlink():
+                raise RescueError(f"rescue read-only tree contains a symlink: {path}")
+            if path.is_dir():
+                path.chmod(0o555)
+            elif path.is_file():
+                path.chmod(0o444)
+            else:
+                raise RescueError(f"rescue read-only tree contains a special file: {path}")
+        base.chmod(0o555)
 
 
 def _render_request(packet: Mapping[str, Any]) -> str:
@@ -1106,7 +1329,7 @@ def _claude_settings() -> dict[str, Any]:
                 "Write(./evidence/**)", "Edit(./evidence/**)",
                 "Write(./artifacts/**)", "Edit(./artifacts/**)",
                 "Write(./CLAUDE_RETURN.json)", "Edit(./CLAUDE_RETURN.json)",
-                "Bash(./ctf-tool status)", "Bash(./ctf-tool exec -- *)",
+                "Bash(./ctf-tool status)", "Bash(./ctf-tool exec *)",
                 "Bash(./ctf-tool import-input *)",
             ],
             "deny": [
@@ -1115,63 +1338,25 @@ def _claude_settings() -> dict[str, Any]:
                 "Write(./sandbox.json)", "Edit(./sandbox.json)",
                 "Write(./ctf-tool)", "Edit(./ctf-tool)",
                 "Bash(git *)", "Bash(docker *)", "Bash(sudo *)", "Bash(ssh *)",
-                "Bash(curl *)", "Bash(nc *)", "Bash(ncat *)", "Bash(codex *)",
+                "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(ncat *)", "Bash(codex *)",
                 "Bash(claude *)", "Bash(python *codex*)", "Bash(python *claude*)",
             ],
         }
     }
 
 
-def _agent_files() -> dict[str, str]:
-    def render(
-        name: str, description: str, model: str, tools: Sequence[str],
-        disallowed: Sequence[str], max_turns: int, body: str,
-    ) -> str:
-        tool_values = ", ".join(tools)
-        denied = ", ".join(disallowed)
+def _agent_file_names(profile: str) -> tuple[str, ...]:
+    if profile == "standard":
+        return ()
+    if profile == "assisted":
         return (
-            "---\n"
-            f"name: {name}\n"
-            f"description: {description}\n"
-            f"model: {model}\n"
-            f"tools: [{tool_values}]\n"
-            f"disallowedTools: [{denied}]\n"
-            f"maxTurns: {max_turns}\n"
-            "---\n\n" + body.strip() + "\n"
+            "ctf-recon-haiku.md", "evidence-triage-haiku.md",
+            "exploit-builder-sonnet.md", "alternate-solver-sonnet.md",
         )
-    common_denied = ["WebFetch", "WebSearch"]
-    return {
-        "ctf-recon-haiku.md": render(
-            "ctf-recon-haiku",
-            "Use for one bounded objective reconnaissance question when missing facts block a decisive experiment.",
-            "haiku", ["Read", "Grep", "Glob", "Bash"], common_denied + ["Write", "Edit"], 6,
-            "Inspect only generated context or imported input. Use ctf-tool for commands. Return the smallest fact that changes the exploit decision.",
-        ),
-        "clean-room-recon-haiku.md": render(
-            "clean-room-recon-haiku",
-            "Use in deep profile to independently reinterpret evidence without assuming the Codex leading hypothesis is correct.",
-            "haiku", ["Read", "Grep", "Glob", "Bash"], common_denied + ["Write", "Edit"], 7,
-            "Build at most two mechanism hypotheses from evidence, explicitly ignoring the leading path as an answer. Propose the cheapest separating test.",
-        ),
-        "evidence-triage-haiku.md": render(
-            "evidence-triage-haiku",
-            "Use when claims need compression and classification before the main solver chooses an experiment.",
-            "haiku", ["Read", "Grep", "Glob"], common_denied + ["Write", "Edit", "Bash"], 5,
-            "Classify every claim as CONFIRMED, CANDIDATE, REFUTED, or UNTESTED and cite its exact receipt or evidence path. Never upgrade narrative.",
-        ),
-        "exploit-builder-sonnet.md": render(
-            "exploit-builder-sonnet",
-            "Use after a plausible primitive exists and an executable PoC or solver artifact is the shortest route forward.",
-            "sonnet", ["Read", "Grep", "Glob", "Write", "Edit", "Bash"], common_denied, 12,
-            "Write only under work, evidence, or artifacts. Use ctf-tool for all execution and networking. Produce a runnable artifact and exact next argv.",
-        ),
-        "alternate-solver-sonnet.md": render(
-            "alternate-solver-sonnet",
-            "Use when the leading family is blocked or refuted and a materially different exploit mechanism needs a bounded implementation attempt.",
-            "sonnet", ["Read", "Grep", "Glob", "Write", "Edit", "Bash"], common_denied, 10,
-            "Avoid recorded refuted families. Choose a distinct mechanism, run one separating experiment, and implement only if it survives.",
-        ),
-    }
+    return (
+        "clean-room-recon-haiku.md", "evidence-triage-haiku.md",
+        "alternate-solver-sonnet.md", "exploit-builder-sonnet.md",
+    )
 
 
 def _ctf_tool_wrapper(
@@ -1182,11 +1367,30 @@ def _ctf_tool_wrapper(
     return (
         "#!/bin/sh\n"
         "set -eu\n"
-        f"exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.rescue_tool "
-        f"--repo {shlex.quote(str(repo_root))} "
-        f"--metadata {shlex.quote(str(rescue_root / 'sandbox.json'))} "
-        f"--run-id {shlex.quote(str(packet['identity']['run_id']))} "
-        f"--rescue-id {shlex.quote(str(packet['identity']['rescue_attempt_id']))} \"$@\"\n"
+        f"export CTF_OS_RESCUE_REPO={shlex.quote(str(repo_root))}\n"
+        f"export CTF_OS_RESCUE_METADATA={shlex.quote(str(rescue_root / 'sandbox.json'))}\n"
+        f"export CTF_OS_RESCUE_RUN_ID={shlex.quote(str(packet['identity']['run_id']))}\n"
+        f"export CTF_OS_RESCUE_ID={shlex.quote(str(packet['identity']['rescue_attempt_id']))}\n"
+        f"export CTF_OS_RESCUE_PACKET_DIGEST={shlex.quote(str(packet['packet_digest']))}\n"
+        "command=${1:-}\n"
+        "case \"$command\" in\n"
+        "  status)\n"
+        "    [ \"$#\" -eq 1 ] || { echo 'status accepts no arguments' >&2; exit 2; }\n"
+        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
+        f"--repo {shlex.quote(str(repo_root))} rescue-tool-status\n"
+        "    ;;\n"
+        "  exec)\n"
+        "    shift\n"
+        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
+        f"--repo {shlex.quote(str(repo_root))} rescue-exec \"$@\"\n"
+        "    ;;\n"
+        "  import-input)\n"
+        "    shift\n"
+        f"    exec uv run --project {shlex.quote(str(repo_root))} python -m ctf_os.agent_tools "
+        f"--repo {shlex.quote(str(repo_root))} rescue-import-input \"$@\"\n"
+        "    ;;\n"
+        "  *) echo 'usage: ./ctf-tool status | exec [options] -- <direct argv> | import-input <path|--all-bounded>' >&2; exit 2 ;;\n"
+        "esac\n"
     )
 
 
@@ -1221,9 +1425,18 @@ def _validate_model_observation(rescue_root: Path, result: Mapping[str, Any]) ->
     observed = result.get("observed_lead_model")
     evidence = result.get("runtime_observation_evidence")
     fallback = result.get("fallback_observed")
+    run = rescue_root.parents[1]
+    rescue_id = rescue_root.name
+    recorded = [
+        row for row in load_rescue_ledger(run)
+        if row.get("rescue_attempt_id") == rescue_id
+        and row.get("event") == "RESCUE_RUNTIME_RECORDED"
+    ]
     if observed is None:
         if evidence is not None or fallback is not None:
             raise RescueError("unobserved model must not carry runtime or fallback observation")
+        if recorded:
+            raise RescueError("Claude return omits the recorded runtime model observation")
         return
     if not isinstance(observed, str) or not observed.strip() or not isinstance(evidence, str):
         raise RescueError("observed model requires an actual runtime evidence path")
@@ -1236,6 +1449,16 @@ def _validate_model_observation(rescue_root: Path, result: Mapping[str, Any]) ->
         raise RescueError("runtime observation evidence does not contain the observed model")
     if fallback not in {None, True, False}:
         raise RescueError("fallback_observed must be boolean or null")
+    matches = [
+        row for row in recorded
+        if row.get("details", {}).get("observed_lead_model") == observed
+        and row.get("details", {}).get("runtime_observation_evidence") == evidence
+        and row.get("details", {}).get("fallback_observed") == fallback
+    ]
+    if not matches:
+        raise RescueError(
+            "observed model requires a matching rescue-runtime-record receipt"
+        )
 
 
 def _validate_return_artifacts(
@@ -1281,6 +1504,8 @@ def _validate_return_evidence(rescue_root: Path, result: Mapping[str, Any]) -> N
             raise RescueError("decisive experiment rows must be objects")
         if "argv" in row:
             _direct_argv(row.get("argv"))
+        if isinstance(row.get("command_receipt_id"), str):
+            _command_receipt_by_id(rescue_root, str(row["command_receipt_id"]))
         for key in ("evidence", "command_evidence", "output_evidence"):
             if isinstance(row.get(key), str):
                 references.append(str(row[key]))
@@ -1301,10 +1526,7 @@ def _validate_remote_flag_claim(
     claim = result.get("flag_claim")
     if not isinstance(claim, Mapping):
         raise RescueError("REMOTE_FLAG_OBTAINED requires flag_claim")
-    required = {
-        "candidate", "host", "port", "protocol", "exact_argv",
-        "command_evidence", "output_evidence", "exploit_artifact",
-    }
+    required = {"candidate", "command_receipt_id", "exploit_artifact"}
     if not required.issubset(claim):
         raise RescueError("REMOTE_FLAG_OBTAINED flag_claim is incomplete")
     unsupported = set(claim).difference(required)
@@ -1316,33 +1538,50 @@ def _validate_remote_flag_claim(
     candidate = str(claim.get("candidate") or "")
     if not candidate or not matches_flag(candidate, challenge.flag_pattern):
         raise RescueError("remote flag candidate does not match the current flag pattern")
-    port_raw = claim.get("port")
-    if not isinstance(port_raw, int) or isinstance(port_raw, bool):
-        raise RescueError("remote flag port must be an integer")
-    port = port_raw
-    host = str(claim.get("host") or "")
-    protocol = str(claim.get("protocol") or "")
-    declared = parse_remotes(packet.get("authorized_targets", []))
-    matching = [
-        target for target in declared
-        if target_matches_observation(target, host, port, protocol)
-    ]
-    if len(matching) != 1:
-        raise RescueError("remote flag claim does not match one organizer-declared target")
-    argv = _direct_argv(claim.get("exact_argv"))
-    command_path = _safe_rescue_path(
-        rescue_root, str(claim["command_evidence"]), "command evidence", allowed={"logs"},
+    command_row = _command_receipt_by_id(
+        rescue_root, str(claim.get("command_receipt_id") or ""),
     )
-    command_row = _matching_command_receipt(command_path, argv)
-    if command_row is None:
-        raise RescueError("REMOTE_FLAG_OBTAINED has no matching sandbox command receipt")
     if command_row.get("authorized_network_observed") is not True:
         raise RescueError("REMOTE_FLAG_OBTAINED lacks an authorized network observation")
-    if candidate not in str(command_row.get("stdout") or ""):
-        raise RescueError("REMOTE_FLAG_OBTAINED candidate is absent from command output")
+    if command_row.get("packet_digest") != packet.get("packet_digest"):
+        raise RescueError("REMOTE_FLAG_OBTAINED command receipt packet digest mismatch")
+    if (
+        command_row.get("run_id") != packet["identity"]["run_id"]
+        or command_row.get("rescue_attempt_id") != packet["identity"]["rescue_attempt_id"]
+    ):
+        raise RescueError("REMOTE_FLAG_OBTAINED command receipt belongs to another rescue")
+    indices = command_row.get("authorized_network_target_indices")
+    receipt_targets = command_row.get("authorized_targets")
+    if (
+        not isinstance(indices, list) or not indices
+        or any(not isinstance(index, int) for index in indices)
+        or not isinstance(receipt_targets, list)
+    ):
+        raise RescueError("REMOTE_FLAG_OBTAINED lacks an exact declared target observation")
+    targets = packet.get("authorized_targets")
+    if not isinstance(targets, list):
+        raise RescueError("REMOTE_FLAG_OBTAINED declared targets are malformed")
+    observed_targets: list[Mapping[str, Any]] = []
+    for index in indices:
+        if not 0 <= index < len(receipt_targets) or not isinstance(receipt_targets[index], Mapping):
+            raise RescueError("REMOTE_FLAG_OBTAINED declared target mismatch")
+        observed_targets.append(receipt_targets[index])
+    matching_indices = {
+        packet_index
+        for packet_index, declared_target in enumerate(targets)
+        if isinstance(declared_target, Mapping)
+        and all(_same_declared_target(declared_target, observed) for observed in observed_targets)
+    }
+    if len(matching_indices) != 1:
+        raise RescueError("REMOTE_FLAG_OBTAINED declared target mismatch")
+    target_index = matching_indices.pop()
+    target = targets[target_index]
+    if not isinstance(target, Mapping):
+        raise RescueError("REMOTE_FLAG_OBTAINED declared target is malformed")
+    argv = _direct_argv(command_row.get("argv"))
     output_path = _safe_rescue_path(
-        rescue_root, str(claim["output_evidence"]), "output evidence",
-        allowed={"evidence", "logs"},
+        rescue_root, str(command_row.get("evidence_path") or ""), "output evidence",
+        allowed={"evidence"},
     )
     if candidate not in _read_bounded_text(output_path, 512 * 1024):
         raise RescueError("REMOTE_FLAG_OBTAINED candidate is absent from preserved output evidence")
@@ -1353,12 +1592,34 @@ def _validate_remote_flag_claim(
     if not any(Path(str(row["absolute_path"])) == artifact_path for row in artifacts):
         raise RescueError("REMOTE_FLAG_OBTAINED exploit artifact is missing from hashed artifacts")
     return {
-        "candidate": candidate, "host": host, "port": port, "protocol": protocol,
-        "exact_argv": argv, "command_evidence": str(claim["command_evidence"]),
-        "output_evidence": str(claim["output_evidence"]),
+        "candidate": candidate, "host": str(target.get("host") or ""),
+        "port": int(target.get("port") or 0),
+        "protocol": str(target.get("protocol") or target.get("transport") or ""),
+        "target_index": target_index,
+        "exact_argv": argv, "command_receipt_id": command_row["command_receipt_id"],
+        "command_evidence": "RESCUE_COMMANDS.jsonl",
+        "output_evidence": str(command_row["evidence_path"]),
         "exploit_artifact": artifact_value,
         "authorized_network_observed": True,
     }
+
+
+def _same_declared_target(
+    declared: Mapping[str, Any], observed: Mapping[str, Any],
+) -> bool:
+    declared_protocol = str(
+        declared.get("protocol") or declared.get("transport") or ""
+    ).casefold()
+    observed_protocols = {
+        str(observed.get("protocol") or "").casefold(),
+        str(observed.get("transport") or "").casefold(),
+    }
+    return (
+        str(declared.get("host") or "").casefold().rstrip(".")
+        == str(observed.get("host") or "").casefold().rstrip(".")
+        and declared.get("port") == observed.get("port")
+        and declared_protocol in observed_protocols
+    )
 
 
 def _validate_remote_ready(
@@ -1371,7 +1632,7 @@ def _validate_remote_ready(
         raise RescueError("REMOTE_READY_HANDOFF requires remote_ready.value true")
     allowed = {
         "value", "exact_next_argv", "target_index", "success_condition",
-        "kill_condition", "maximum_remaining_experiments",
+        "kill_condition", "maximum_remaining_experiments", "exploit_artifact",
     }
     unsupported = set(ready).difference(allowed)
     if unsupported:
@@ -1391,8 +1652,12 @@ def _validate_remote_ready(
     index = ready.get("target_index")
     if not isinstance(targets, list) or not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(targets):
         raise RescueError("REMOTE_READY_HANDOFF target index is not a current declared target")
-    executable = [row for row in artifacts if row.get("actual_executable")]
-    if not executable:
+    artifact_value = str(ready.get("exploit_artifact") or "")
+    executable = [
+        row for row in artifacts
+        if row.get("actual_executable") and row.get("path") == artifact_value
+    ]
+    if not artifact_value or not executable:
         raise RescueError("REMOTE_READY_HANDOFF requires an existing executable artifact")
     if not str(result.get("message_for_codex") or "").strip():
         raise RescueError("REMOTE_READY_HANDOFF requires a message for Codex")
@@ -1400,7 +1665,7 @@ def _validate_remote_ready(
         "exact_next_argv": argv, "target_index": index,
         "success_condition": success, "kill_condition": kill,
         "maximum_remaining_experiments": maximum,
-        "executable_artifact": executable[0].get("path"),
+        "executable_artifact": artifact_value,
     }
 
 
@@ -1435,8 +1700,21 @@ def _render_resume(
         "> Claude output is candidate insight, not confirmed Solve truth. Validate it before adoption.",
         "", f"- Exact run ID: `{run.name}`",
         f"- Rescue ID: `{packet['identity']['rescue_attempt_id']}`",
+        f"- Packet digest: `{packet['packet_digest']}`",
         f"- Rescue sandbox metadata: `{rescue_root / 'sandbox.json'}`",
         f"- Validated verdict: `{verdict}`",
+        "- Validated artifacts: " + (
+            ", ".join(f"`{row.get('path')}`" for row in result.get("artifacts", []))
+            or "none"
+        ),
+        "- Validated command receipts: " + (
+            f"`{remote['command_receipt_id']}`" if remote else
+            ", ".join(
+                f"`{row.get('command_receipt_id')}`"
+                for row in result.get("decisive_experiments", [])
+                if isinstance(row, Mapping) and row.get("command_receipt_id")
+            ) or "none"
+        ),
         f"- Maximum decisive experiments: {maximum}", "",
         "## First validation command", "", "```bash", command, "```", "",
         f"- Success condition: {success}", f"- Kill condition: {kill}", "",
@@ -1452,17 +1730,25 @@ def _render_resume(
     ]
     if remote:
         relative_artifact = (rescue_root / str(remote["exploit_artifact"])).relative_to(run).as_posix()
+        preserved_output = _read_bounded_text(
+            rescue_root / str(remote["output_evidence"]), 64 * 1024,
+        )
         flag_command = [
             "uv", "run", "python", "-m", "ctf_os.agent_tools", "flag-receipt-save",
             str(packet["identity"]["challenge_key"]), "--contest", str(packet["identity"]["contest"]),
             "--branch", str(packet["identity"]["rescue_attempt_id"]),
             "--host", str(remote["host"]), "--port", str(remote["port"]),
             "--protocol", str(remote["protocol"]), "--network-observed",
-            "--output", str(remote["candidate"]), "--candidate", str(remote["candidate"]),
+            "--output", preserved_output, "--candidate", str(remote["candidate"]),
             "--exploit-artifact", relative_artifact, "--", *list(remote["exact_argv"]),
         ]
         lines.extend([
             "", "## Existing protected flag receipt promotion", "",
+            f"Validated command receipt: `{remote['command_receipt_id']}`  ",
+            f"Preserved output: `{remote['output_evidence']}`  ",
+            f"Observed target: `{remote['host']}:{remote['port']}/{remote['protocol']}`  ",
+            f"Network observation proof: `RESCUE_COMMANDS.jsonl#{remote['command_receipt_id']}`",
+            "",
             "Only after reproducing all existing `flag-receipt-save` requirements, run:",
             "", "```bash", " ".join(shlex.quote(item) for item in flag_command), "```",
             "", "This validation did not create a candidate, milestone, flag receipt, or submission recommendation.",
@@ -1471,31 +1757,76 @@ def _render_resume(
     return "\n".join(lines) + "\n"
 
 
-def _matching_command_receipt(path: Path, argv: Sequence[str]) -> dict[str, Any] | None:
-    if path.suffix != ".jsonl":
-        raise RescueError("command evidence must be the append-only JSONL command receipt")
-    rows = read_jsonl_strict(path, "rescue command receipt ledger")
-    matching = [
-        row for row in rows
-        if row.get("event") == "sandbox_exec" and row.get("command") == list(argv)
-    ]
-    return matching[-1] if matching else None
+def _command_receipt_by_id(rescue_root: Path, receipt_id: str) -> dict[str, Any]:
+    if not receipt_id or not _ID.fullmatch(receipt_id):
+        raise RescueError("command receipt ID is missing or malformed")
+    rows = read_jsonl_strict(
+        rescue_root / "RESCUE_COMMANDS.jsonl", "rescue command receipt ledger",
+    )
+    matching = [row for row in rows if row.get("command_receipt_id") == receipt_id]
+    if len(matching) != 1:
+        raise RescueError("REMOTE_FLAG_OBTAINED has no unique matching command receipt")
+    row = matching[0]
+    required = {
+        "schema_version", "command_receipt_id", "run_id", "rescue_attempt_id",
+        "packet_digest", "argv", "command_digest", "stdout_digest",
+        "stderr_digest", "authorized_network_observed", "evidence_path",
+        "evidence_digest",
+    }
+    if row.get("schema_version") != 1 or not required.issubset(row):
+        raise RescueError("rescue command receipt is malformed")
+    evidence_path = _safe_rescue_path(
+        rescue_root, str(row["evidence_path"]), "command output evidence",
+        allowed={"evidence"},
+    )
+    if _sha256(evidence_path) != row.get("evidence_digest"):
+        raise RescueError("rescue command output evidence digest mismatch")
+    return row
+
+
+def _existing_receipt_id(run: Path, rescue_root: Path, receipt_id: str) -> bool:
+    for ledger_name in ("milestone-receipts.jsonl", "RESCUE_COMMANDS.jsonl"):
+        path = (
+            rescue_root / ledger_name
+            if ledger_name == "RESCUE_COMMANDS.jsonl" else run / ledger_name
+        )
+        for row in read_jsonl_strict(path, ledger_name):
+            if receipt_id in {
+                row.get("receipt_id"), row.get("command_receipt_id"), row.get("event_id"),
+            }:
+                return True
+    for directory in (
+        run / "flag-receipts", run / "working-poc-operations",
+        run / "working-poc-resolution-receipts",
+    ):
+        if not directory.exists():
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise RescueError("exact-run receipt directory is unsafe")
+        for path in directory.glob("*.json"):
+            if path.is_symlink() or not path.is_file():
+                raise RescueError("exact-run receipt path is unsafe")
+            if _load_json(path, "exact-run receipt").get("receipt_id") == receipt_id:
+                return True
+    return False
 
 
 def _experiment_has_evidence(rescue_root: Path, row: object) -> bool:
     if not isinstance(row, Mapping):
         return False
-    for key in ("evidence", "command_evidence", "output_evidence"):
-        value = row.get(key)
-        if isinstance(value, str):
-            try:
-                _safe_rescue_path(
-                    rescue_root, value, "decisive experiment evidence",
-                    allowed={"evidence", "logs", "artifacts", "work"},
-                )
-                return True
-            except RescueError:
-                return False
+    receipt_id = row.get("command_receipt_id")
+    if isinstance(receipt_id, str):
+        try:
+            receipt = _command_receipt_by_id(rescue_root, receipt_id)
+        except RescueError:
+            return False
+        decision = str(row.get("decision") or "").upper()
+        observed = str(row.get("observed_result") or "").strip()
+        return (
+            receipt.get("exit_code") == 0
+            and bool(observed)
+            and decision in {"PROMOTE", "CONFIRMED", "CONTINUE", "SUCCESS"}
+        )
     return False
 
 
@@ -1538,23 +1869,53 @@ def _validate_rescue_metadata(
 def _validate_packet_against_current_run(
     run: Path,
     packet: Mapping[str, Any],
-    challenge: ChallengeSpec,
+    challenge: ChallengeSpec | None,
 ) -> None:
     identity = packet.get("identity")
     if not isinstance(identity, Mapping):
         raise RescueError("rescue packet identity is malformed")
     state = _load_json(run / "STATE.json", "run state")
+    manifest = _load_json(run / "RUN_MANIFEST.json", "run manifest")
+    manifest_identity = manifest.get("identity")
+    manifest_challenge = manifest.get("challenge")
+    repository = manifest.get("repository")
+    if not all(isinstance(value, Mapping) for value in (
+        manifest_identity, manifest_challenge, repository,
+    )):
+        raise RescueError("current exact run manifest identity is malformed")
     expected = {
         "run_id": run.name,
-        "challenge_id": challenge.id,
-        "challenge_instance_id": identity.get("challenge_instance_id"),
-        "input_fingerprint": identity.get("input_fingerprint"),
-        "target_revision": identity.get("target_revision"),
+        "challenge_id": challenge.id if challenge is not None else identity.get("challenge_id"),
+        "challenge_instance_id": state.get("challenge_instance_id"),
+        "attempt_id": state.get("attempt_id"),
+        "input_fingerprint": state.get("input_fingerprint"),
+        "fingerprint_scheme": state.get("fingerprint_scheme"),
+        "target_revision": state.get("target_revision"),
+        "challenge_snapshot_digest": (
+            state.get("challenge_snapshot_digest")
+            or manifest.get("challenge_snapshot_digest")
+        ),
+        "transformation_seed": str(state.get("transformation_seed", "NONE")),
+        "solve_mode": str(state.get("solve_mode") or manifest.get("mode") or ""),
+        "repository_commit": repository.get("commit_sha"),
     }
     for field, value in expected.items():
         current = run.name if field == "run_id" else state.get(field)
+        if field in {"challenge_snapshot_digest", "repository_commit"}:
+            current = value
+        elif field in {"transformation_seed", "solve_mode"}:
+            current = str(value)
         if current != value or identity.get(field) != value:
             raise RescueError(f"current exact run {field} no longer matches rescue packet")
+    if (
+        manifest_identity.get("run_id") != identity.get("run_id")
+        or manifest_identity.get("attempt_id") != identity.get("attempt_id")
+        or manifest_identity.get("challenge_instance_id") != identity.get("challenge_instance_id")
+        or manifest_challenge.get("challenge_id") != identity.get("challenge_id")
+        or manifest_challenge.get("input_fingerprint") != identity.get("input_fingerprint")
+        or manifest_challenge.get("target_revision") != identity.get("target_revision")
+    ):
+        raise RescueError("current exact run manifest no longer matches rescue packet")
     revisions = read_jsonl_strict(
         challenge_workspace(run) / "target-revisions.jsonl", "target revision ledger",
     )
@@ -1771,6 +2132,31 @@ def _source_inventory(run: Path) -> list[dict[str, Any]]:
             "present": True, "record_count": count, "size": size,
             "sha256": _sha256(path),
         })
+    working_rows: list[dict[str, Any]] = []
+    working_root = run / "working-poc-operations"
+    if working_root.exists():
+        if working_root.is_symlink() or not working_root.is_dir():
+            raise RescueError("working-PoC receipt directory is unsafe")
+        for path in sorted(working_root.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise RescueError("working-PoC receipt path is unsafe")
+            payload = _load_json(path, "working-PoC receipt")
+            if str(payload.get("status") or "").upper() not in {
+                "WORKING_POC_RECORDED", "EXECUTION_STARTED", "EXECUTION_COMPLETED",
+                "REMOTE_FLAG_OBTAINED", "REMOTE_ATTEMPTED", "NO_FLAG",
+            }:
+                continue
+            working_rows.append({
+                "path": path.relative_to(run).as_posix(),
+                "size": path.stat().st_size, "sha256": _sha256(path),
+                "status": payload.get("status"),
+            })
+    rows.insert(4, {
+        "priority": 5, "path": "working-poc-operations/*.json",
+        "role": "authoritative committed working-PoC receipts",
+        "present": bool(working_rows), "record_count": len(working_rows),
+        "receipts": working_rows,
+    })
     receipts = run / "flag-receipts"
     receipt_rows: list[dict[str, Any]] = []
     if receipts.exists():
@@ -1796,22 +2182,29 @@ def _source_inventory(run: Path) -> list[dict[str, Any]]:
 
 
 def _model_policy(profile: str) -> dict[str, Any]:
+    subagents = {
+        "standard": [],
+        "assisted": [
+            "ctf-recon-haiku", "evidence-triage-haiku",
+            "exploit-builder-sonnet", "alternate-solver-sonnet",
+        ],
+        "deep": [
+            "clean-room-recon-haiku", "evidence-triage-haiku",
+            "alternate-solver-sonnet", "exploit-builder-sonnet",
+        ],
+    }[profile]
     return {
         "profile": profile,
         "lead_role": "strategy/reinterpretation" if profile == "deep" else "main solver",
-        "maximum_concurrent_haiku": 2,
-        "maximum_sonnet_implementation": 1,
-        "maximum_initial_subagent_invocations": 3,
+        "maximum_concurrent_haiku": 0 if profile == "standard" else 2,
+        "maximum_sonnet_implementation": 0 if profile == "standard" else 1,
+        "maximum_initial_subagent_invocations": 0 if profile == "standard" else 3,
         "maximum_active_hypotheses": 2,
         "maximum_initial_decisive_experiments": 3,
         "subagent_nesting_assumed": False,
         "requested_model_is_observed_model": False,
         "automatic_opus_fallback": False,
-        "subagents": (
-            ["clean-room-recon-haiku", "evidence-triage-haiku", "alternate-solver-sonnet", "exploit-builder-sonnet"]
-            if profile == "deep" else
-            ["ctf-recon-haiku", "evidence-triage-haiku", "exploit-builder-sonnet", "alternate-solver-sonnet"]
-        ),
+        "subagents": subagents,
     }
 
 

@@ -19,13 +19,15 @@ from ctf_os.rescue import (
     close_rescue,
     load_rescue_ledger,
     prepare_rescue,
+    record_rescue_runtime,
     rescue_attempt_id,
     show_rescue,
     validate_exact_live_mutable_run,
     validate_rescue_return,
 )
 from ctf_os.rescue_tool import (
-    _import_input, _input_files, _reject_model_command, _safe_relative,
+    _artifact_snapshot, _import_input, _input_files, _record_command_receipt,
+    _reject_model_command, _safe_relative,
 )
 from ctf_os.sandbox.network import ResolvedTarget, Target
 from ctf_os.sandbox.preparation import (
@@ -177,8 +179,9 @@ def _fake_preparer(**kwargs: object) -> PreparedSandbox:
         resource_profile="standard",
         session_id=str(kwargs["session_id"]),
         parent_session_id="sol-main",
-        session_role="external",
+        session_role="external-rescue",
         category="pwn",
+        workload_class="external-rescue",
         workspace_mode="bind",
         run_id=str(kwargs["run_id"]),
         rescue_attempt_id=str(kwargs["rescue_attempt_id"]),
@@ -273,6 +276,20 @@ def test_wrong_exact_run_is_rejected(rescue_case: SimpleNamespace) -> None:
         validate_exact_live_mutable_run(other, rescue_case.challenge, rescue_case.record)
 
 
+def test_changed_snapshot_and_challenge_instance_are_rejected(
+    rescue_case: SimpleNamespace,
+) -> None:
+    rescue_case.state["challenge_snapshot_digest"] = "d" * 64
+    _write(rescue_case.run / "STATE.json", rescue_case.state)
+    with pytest.raises(RescueError, match="snapshot"):
+        _prepare(rescue_case)
+    rescue_case.state["challenge_snapshot_digest"] = SNAPSHOT
+    rescue_case.state["challenge_instance_id"] = "wrong-instance"
+    _write(rescue_case.run / "STATE.json", rescue_case.state)
+    with pytest.raises(RescueError, match="instance identity"):
+        _prepare(rescue_case)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -341,16 +358,26 @@ def test_packet_identity_digest_tree_and_standard_model(rescue_case: SimpleNames
     expected = {
         "CLAUDE.md", "REQUEST.md", "MODEL_POLICY.md", "START.md",
         "RESCUE_PACKET.json", "RESCUE_STATE.json", "RETURN.schema.json",
+        "RETURN.example.json", "RESCUE_COMMANDS.jsonl",
         "CLAUDE_RETURN.json", "CODEX-RESUME.md", "ctf-tool", "sandbox.json",
         ".claude", "context", "work", "evidence", "artifacts", "logs",
     }
     assert expected.issubset({path.name for path in root.iterdir()})
     assert "claude --model sonnet" in result["start_command"]
     assert result["observed_lead_model"] is None
+    assert not any((root / ".claude" / "agents").iterdir())
+    assert (root / "context" / "rescue-memory.json").is_file()
+    assert (root / "ctf-tool").stat().st_mode & 0o222 == 0
+    assert (root / "context").stat().st_mode & 0o222 == 0
+    assert (root / ".claude").stat().st_mode & 0o222 == 0
     assert (root / "RESCUE_PACKET.json").stat().st_mode & 0o222 == 0
     assert (rescue_case.run / "STATE.json").read_bytes() == before_state
     assert not (rescue_case.run / "RACE_LINEAGE.jsonl").exists()
     assert before_lineage == b""
+    resources = json.loads((rescue_case.run / "RESOURCE_STATE.json").read_text())
+    request = resources["requests"][str(result["rescue_attempt_id"])]
+    assert request["workload_class"] == "external-rescue"
+    assert resources["allocations"] == {}
 
 
 def test_deep_requested_model_and_manual_fallback(rescue_case: SimpleNamespace) -> None:
@@ -367,21 +394,77 @@ def test_deep_requested_model_and_manual_fallback(rescue_case: SimpleNamespace) 
     assert "manual alternative" in start
 
 
+def test_assisted_requested_model_is_sonnet_and_not_observed(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(
+        rescue_case, profile="assisted", operation_id="assisted-model-op",
+    )
+    assert result["requested_lead_model"] == "sonnet"
+    assert result["observed_lead_model"] is None
+    root = _rescue_root(rescue_case, result)
+    policy = json.loads((root / "RESCUE_PACKET.json").read_text())["model_policy"]
+    assert policy["maximum_initial_subagent_invocations"] == 3
+    assert policy["requested_model_is_observed_model"] is False
+
+
+def test_runtime_model_requires_evidence_and_projects_observed_model(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(
+        rescue_case, profile="deep", operation_id="runtime-record-op",
+    )
+    root = _rescue_root(rescue_case, result)
+    _write(
+        root / "evidence" / "runtime-model.txt",
+        "Observed runtime model: opus; manual fallback observed.\n",
+    )
+    recorded = record_rescue_runtime(
+        rescue_case.run, str(result["rescue_attempt_id"]),
+        observed_model="opus", evidence="evidence/runtime-model.txt",
+        fallback_observed=True,
+    )
+    assert recorded["requested_lead_model"] == "claude-fable-5"
+    assert recorded["observed_lead_model"] == "opus"
+    assert recorded["fallback_observed"] is True
+    shown = show_rescue(rescue_case.run, str(result["rescue_attempt_id"]))
+    assert shown["observed_lead_model"] == "opus"
+    assert shown["fallback_observed"] is True
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _write_return(
+        root, packet, observed_lead_model="opus",
+        runtime_observation_evidence="evidence/runtime-model.txt",
+        fallback_observed=True,
+    )
+    validate_rescue_return(
+        rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+    )
+
+
 def test_subagent_frontmatter_and_model_limits(rescue_case: SimpleNamespace) -> None:
-    root = _rescue_root(rescue_case, _prepare(rescue_case))
+    assisted = _prepare(
+        rescue_case, profile="assisted", operation_id="assisted-op-1",
+    )
+    root = _rescue_root(rescue_case, assisted)
     expected = {
         "ctf-recon-haiku.md": ("haiku", 6),
-        "clean-room-recon-haiku.md": ("haiku", 7),
         "evidence-triage-haiku.md": ("haiku", 5),
         "exploit-builder-sonnet.md": ("sonnet", 12),
         "alternate-solver-sonnet.md": ("sonnet", 10),
     }
     for name, (model, turns) in expected.items():
         text = (root / ".claude" / "agents" / name).read_text()
-        for field in ("name:", "description:", "model:", "tools:", "disallowedTools:", "maxTurns:"):
+        for field in ("name:", "description:", "model:", "tools:", "disallowedTools:", "permissionMode:", "maxTurns:"):
             assert field in text
         assert f"model: {model}" in text
         assert f"maxTurns: {turns}" in text
+    assert not (root / ".claude" / "agents" / "clean-room-recon-haiku.md").exists()
+    deep = _prepare(
+        rescue_case, profile="deep", operation_id="deep-agent-op-1",
+    )
+    deep_root = _rescue_root(rescue_case, deep)
+    assert (deep_root / ".claude" / "agents" / "clean-room-recon-haiku.md").is_file()
+    assert not (deep_root / ".claude" / "agents" / "ctf-recon-haiku.md").exists()
 
 
 def test_packet_does_not_select_sibling_or_other_attempt(rescue_case: SimpleNamespace) -> None:
@@ -442,7 +525,7 @@ def test_truth_levels_come_from_typed_receipts_not_generic_narrative(rescue_case
     evidence = rescue_case.run / "evidence" / "primitive.txt"
     _write(evidence, "positive control differs\n")
     receipts = [
-        {"receipt_id": "confirmed", "event_type": "PRIMITIVE_CONFIRMED", "summary": "write primitive", "evidence": ["evidence/primitive.txt"], "artifacts": []},
+        {"receipt_id": "confirmed", "event_type": "PRIMITIVE_CONFIRMED", "summary": "write primitive", "evidence": ["evidence/primitive.txt"], "artifacts": [], "details": {"control_receipt": "evidence/primitive.txt"}},
         {"receipt_id": "candidate", "event_type": "PRIMITIVE_CANDIDATE", "summary": "heap path", "evidence": [], "artifacts": []},
         {"receipt_id": "refuted", "event_type": "PRIMITIVE_REFUTED", "summary": "format string", "evidence": [], "artifacts": []},
         {"receipt_id": "kill", "event_type": "DECISIVE_EXPERIMENT", "summary": "parser family killed", "details": {"decision": "KILL"}, "evidence": [], "artifacts": []},
@@ -476,6 +559,16 @@ def test_rescue_ledger_is_strict_and_projection_based(rescue_case: SimpleNamespa
     with ledger.open("a", encoding="utf-8") as handle:
         handle.write("not-json\n")
     with pytest.raises(Exception, match="malformed"):
+        load_rescue_ledger(rescue_case.run)
+
+
+def test_rescue_ledger_rejects_symlink(rescue_case: SimpleNamespace) -> None:
+    _prepare(rescue_case, operation_id="ledger-symlink-op")
+    ledger = rescue_case.run / "rescue" / "RESCUE_LEDGER.jsonl"
+    backup = ledger.with_name("ledger-backup.jsonl")
+    ledger.replace(backup)
+    ledger.symlink_to(backup)
+    with pytest.raises(Exception, match="unsafe"):
         load_rescue_ledger(rescue_case.run)
 
 
@@ -524,7 +617,7 @@ def test_managed_service_rescue_is_attach_only_or_actionable(rescue_case: Simple
             challenge=rescue_case.challenge, record=rescue_case.record,
             workspace=rescue_case.workspace, solve_root=rescue_case.run,
             branch="rescue-service", branch_root=rescue_case.run / "rescue" / "rescue-service",
-            session_id="rescue-service", parent_session_id="sol-main", session_role="external",
+            session_id="rescue-service", parent_session_id="sol-main", session_role="external-rescue",
             require_running_managed_service=True, workspace_mode="bind",
             run_id=RUN_ID, rescue_attempt_id="rescue-service", external_solver=True,
             solver_family="claude", session_kind="external-rescue",
@@ -545,7 +638,7 @@ def test_active_managed_service_is_sol_owned_attach_only(rescue_case: SimpleName
         challenge=challenge, record=rescue_case.record,
         workspace=rescue_case.workspace, solve_root=rescue_case.run,
         branch="rescue-service", branch_root=rescue_case.run / "rescue" / "rescue-service",
-        session_id="rescue-service", parent_session_id="sol-main", session_role="external",
+        session_id="rescue-service", parent_session_id="sol-main", session_role="external-rescue",
         require_running_managed_service=True, workspace_mode="bind",
         run_id=RUN_ID, rescue_attempt_id="rescue-service", external_solver=True,
         solver_family="claude", session_kind="external-rescue",
@@ -604,6 +697,17 @@ def test_return_digest_and_identity_mismatch_rejected(rescue_case: SimpleNamespa
         validate_rescue_return(rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]))
 
 
+def test_return_rejects_ambiguous_or_unknown_verdict(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="unknown-verdict-op")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _write_return(root, packet, verdict="USEFUL_LEAD")
+    with pytest.raises(RescueError, match="verdict is unsupported"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+
+
 def test_return_rejects_current_target_revision_change(rescue_case: SimpleNamespace) -> None:
     result = _prepare(rescue_case)
     root = _rescue_root(rescue_case, result)
@@ -624,6 +728,31 @@ def test_return_unsafe_artifact_path_rejected(rescue_case: SimpleNamespace) -> N
         validate_rescue_return(rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]))
 
 
+def test_return_rejects_missing_and_wrong_artifact_digest(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="artifact-digest-op")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _write_return(
+        root, packet,
+        artifacts=[{"path": "artifacts/missing.py", "sha256": "0" * 64}],
+    )
+    with pytest.raises(RescueError, match="is missing"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+    _write(root / "artifacts" / "solve.py", "print('x')\n")
+    _write_return(
+        root, packet,
+        artifacts=[{"path": "artifacts/solve.py", "sha256": "0" * 64}],
+    )
+    with pytest.raises(RescueError, match="SHA-256 mismatch"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+
+
 def _remote_flag_result(
     case: SimpleNamespace, root: Path, packet: dict[str, object],
     *, network: bool = True, receipt: bool = True, candidate_in_output: bool = True,
@@ -632,16 +761,33 @@ def _remote_flag_result(
     artifact = root / "artifacts" / "solve.py"
     _write(artifact, "#!/usr/bin/env python3\n")
     artifact.chmod(0o755)
-    evidence = root / "evidence" / "remote.txt"
+    evidence = root / "evidence" / "commands" / "command-remote.txt"
     _write(evidence, candidate if candidate_in_output else "no flag\n")
-    command_path = root / "logs" / "commands.jsonl"
+    command_path = root / "RESCUE_COMMANDS.jsonl"
     if receipt:
-        _write(command_path, json.dumps({
-            "event": "sandbox_exec",
-            "command": ["python3", "/artifacts/solve.py", "example.com", "31337"],
-            "stdout": candidate if candidate_in_output else "no flag",
+        command_row = {
+            "schema_version": 1,
+            "command_receipt_id": "command-remote",
+            "run_id": packet["identity"]["run_id"],
+            "rescue_attempt_id": packet["identity"]["rescue_attempt_id"],
+            "packet_digest": packet["packet_digest"],
+            "argv": ["python3", "/artifacts/solve.py", "example.com", "31337"],
+            "command_digest": "1" * 64,
+            "exit_code": 0,
+            "timed_out": False,
+            "stdout_digest": "2" * 64,
+            "stderr_digest": "3" * 64,
             "authorized_network_observed": network,
-        }, separators=(",", ":")) + "\n")
+            "authorized_network_target_indices": [0],
+            "authorized_targets": [{
+                "host": "example.com", "port": 31337,
+                "protocol": "tcp", "transport": "tcp",
+                "ip": "93.184.216.34",
+            }],
+            "evidence_path": "evidence/commands/command-remote.txt",
+            "evidence_digest": hashlib.sha256(evidence.read_bytes()).hexdigest(),
+        }
+        _write(command_path, json.dumps(command_row, separators=(",", ":")) + "\n")
     _write_return(
         root, packet, verdict="REMOTE_FLAG_OBTAINED",
         artifacts=[{
@@ -650,11 +796,7 @@ def _remote_flag_result(
             "executable": True,
         }],
         flag_claim={
-            "candidate": candidate, "host": "example.com", "port": 31337,
-            "protocol": "tcp",
-            "exact_argv": ["python3", "/artifacts/solve.py", "example.com", "31337"],
-            "command_evidence": "logs/commands.jsonl",
-            "output_evidence": "evidence/remote.txt",
+            "candidate": candidate, "command_receipt_id": "command-remote",
             "exploit_artifact": "artifacts/solve.py",
         },
     )
@@ -663,7 +805,7 @@ def _remote_flag_result(
 @pytest.mark.parametrize(
     ("receipt", "network", "candidate_in_output", "message"),
     [
-        (False, True, True, "command evidence"),
+        (False, True, True, "command receipt"),
         (True, False, True, "authorized network observation"),
         (True, True, False, "candidate is absent"),
     ],
@@ -707,6 +849,31 @@ def test_remote_flag_validation_creates_resume_only(rescue_case: SimpleNamespace
     assert "--contest demo" in resume
 
 
+def test_remote_flag_rejects_declared_target_mismatch_and_bad_pattern(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="remote-mismatch-op")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _remote_flag_result(rescue_case, root, packet)
+    receipt = json.loads((root / "RESCUE_COMMANDS.jsonl").read_text())
+    receipt["authorized_network_target_indices"] = [1]
+    _write(root / "RESCUE_COMMANDS.jsonl", json.dumps(receipt) + "\n")
+    with pytest.raises(RescueError, match="target mismatch"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+    receipt["authorized_network_target_indices"] = [0]
+    _write(root / "RESCUE_COMMANDS.jsonl", json.dumps(receipt) + "\n")
+    returned = json.loads((root / "CLAUDE_RETURN.json").read_text())
+    returned["flag_claim"]["candidate"] = "not-a-flag"
+    _write(root / "CLAUDE_RETURN.json", returned)
+    with pytest.raises(RescueError, match="flag pattern"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+
+
 def test_remote_ready_handoff_requires_executable_and_one_to_three(rescue_case: SimpleNamespace) -> None:
     result = _prepare(rescue_case)
     root = _rescue_root(rescue_case, result)
@@ -720,6 +887,7 @@ def test_remote_ready_handoff_requires_executable_and_one_to_three(rescue_case: 
         artifacts=[{"path": "artifacts/solve.py", "sha256": digest, "executable": True}],
         remote_ready={
             "value": True,
+            "exploit_artifact": "artifacts/solve.py",
             "exact_next_argv": ["python3", "/artifacts/solve.py", "example.com", "31337"],
             "target_index": 0,
             "success_condition": "flag appears in output",
@@ -732,6 +900,39 @@ def test_remote_ready_handoff_requires_executable_and_one_to_three(rescue_case: 
     assert "Maximum decisive experiments: 3" in resume
     assert "Success condition" in resume and "Kill condition" in resume
     assert not (rescue_case.run / "flag-receipts").exists()
+
+
+@pytest.mark.parametrize("maximum", [0, 4])
+def test_remote_ready_rejects_out_of_range_experiment_bound(
+    rescue_case: SimpleNamespace, maximum: int,
+) -> None:
+    result = _prepare(
+        rescue_case, operation_id=f"remote-ready-bound-{maximum}",
+    )
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    artifact = root / "artifacts" / "solve.py"
+    _write(artifact, "#!/usr/bin/env python3\n")
+    artifact.chmod(0o755)
+    _write_return(
+        root, packet, verdict="REMOTE_READY_HANDOFF",
+        artifacts=[{
+            "path": "artifacts/solve.py",
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "executable": True,
+        }],
+        remote_ready={
+            "value": True, "exploit_artifact": "artifacts/solve.py",
+            "exact_next_argv": ["python3", "/artifacts/solve.py"],
+            "target_index": 0, "success_condition": "flag",
+            "kill_condition": "rejected",
+            "maximum_remaining_experiments": maximum,
+        },
+    )
+    with pytest.raises(RescueError, match="1 through 3"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
 
 
 def test_return_validation_is_idempotent_but_changed_return_conflicts(rescue_case: SimpleNamespace) -> None:
@@ -763,21 +964,119 @@ def test_close_cleans_exact_rescue_and_preserves_workspace(rescue_case: SimpleNa
         return {"container": metadata["name"], "removed": True}
 
     closed = close_rescue(
-        rescue_case.run, str(result["rescue_attempt_id"]), reason="manual",
+        rescue_case.run, str(result["rescue_attempt_id"]), outcome="manual",
         sandbox_cleanup=fake_cleanup,
     )
     assert closed["closed"] is True and closed["workspace_preserved"] is True
-    assert seen == [(str(result["rescue_attempt_id"]), str(result["rescue_attempt_id"]), "external")]
+    assert seen == [(str(result["rescue_attempt_id"]), str(result["rescue_attempt_id"]), "external-rescue")]
     assert root.is_dir() and (root / "RESCUE_PACKET.json").is_file()
     assert load_rescue_ledger(rescue_case.run)[-1]["event"] == "RESCUE_CLOSED"
+
+
+def test_close_is_cleanup_only_after_run_is_sealed(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="sealed-cleanup-op")
+    rescue_case.state["sealed"] = True
+    rescue_case.state["status"] = "SEALED"
+    _write(rescue_case.run / "STATE.json", rescue_case.state)
+    closed = close_rescue(
+        rescue_case.run, str(result["rescue_attempt_id"]), outcome="manual",
+        sandbox_cleanup=lambda metadata, **_kwargs: {
+            "container": metadata["name"], "removed": True,
+        },
+    )
+    assert closed["closed"] is True
+    assert rescue_case.state["status"] == "SEALED"
+
+
+def test_close_rejects_unknown_evidence_receipt(rescue_case: SimpleNamespace) -> None:
+    result = _prepare(rescue_case, operation_id="close-evidence-op")
+    with pytest.raises(RescueError, match="does not exist"):
+        close_rescue(
+            rescue_case.run, str(result["rescue_attempt_id"]), outcome="integrated",
+            evidence_receipt_id="missing-receipt",
+            sandbox_cleanup=lambda *_args, **_kwargs: {},
+        )
+
+
+def test_ctf_tool_command_receipt_and_repetition_advisory(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="command-receipt-op")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    before = _artifact_snapshot(root)
+    execution = {
+        "exit_code": 0, "timed_out": False,
+        "stdout": "proof\n", "stderr": "",
+        "authorized_network_observed": False,
+        "authorized_network_target_indices": [],
+        "authorized_targets": [],
+    }
+    first = _record_command_receipt(
+        rescue_case.run, root, packet, ["python3", "probe.py"], execution,
+        before_artifacts=before,
+    )
+    second = _record_command_receipt(
+        rescue_case.run, root, packet, ["python3", "probe.py"], execution,
+        before_artifacts=before,
+    )
+    assert first["repeated_command_warning"] is False
+    assert second["repeated_command_warning"] is True
+    assert (root / first["evidence_path"]).is_file()
+    receipts = [json.loads(line) for line in (root / "RESCUE_COMMANDS.jsonl").read_text().splitlines()]
+    assert len(receipts) == 2
+    events = [row["event"] for row in load_rescue_ledger(rescue_case.run)]
+    assert events.count("RESCUE_COMMAND_RECORDED") == 2
+
+
+def test_confirmed_breakthrough_requires_positive_command_receipt(
+    rescue_case: SimpleNamespace,
+) -> None:
+    result = _prepare(rescue_case, operation_id="breakthrough-receipt-op")
+    root = _rescue_root(rescue_case, result)
+    packet = json.loads((root / "RESCUE_PACKET.json").read_text())
+    _write_return(
+        root, packet, verdict="CONFIRMED_BREAKTHROUGH",
+        decisive_experiments=[{
+            "decision": "CONFIRMED", "observed_result": "control differs",
+        }],
+    )
+    with pytest.raises(RescueError, match="decisive evidence"):
+        validate_rescue_return(
+            rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+        )
+    receipt = _record_command_receipt(
+        rescue_case.run, root, packet, ["python3", "probe.py"],
+        {
+            "exit_code": 0, "timed_out": False, "stdout": "control differs\n",
+            "stderr": "", "authorized_network_observed": False,
+            "authorized_network_target_indices": [], "authorized_targets": [],
+        },
+        before_artifacts=_artifact_snapshot(root),
+    )
+    _write_return(
+        root, packet, verdict="CONFIRMED_BREAKTHROUGH",
+        decisive_experiments=[{
+            "command_receipt_id": receipt["command_receipt_id"],
+            "decision": "CONFIRMED", "observed_result": "control differs",
+            "success_condition": "target only changes",
+            "kill_condition": "control also changes",
+        }],
+    )
+    validated = validate_rescue_return(
+        rescue_case.run, rescue_case.challenge, str(result["rescue_attempt_id"]),
+    )
+    assert validated["verdict"] == "CONFIRMED_BREAKTHROUGH"
 
 
 def test_ctf_tool_identity_is_fixed_and_paths_are_safe(rescue_case: SimpleNamespace) -> None:
     result = _prepare(rescue_case)
     root = _rescue_root(rescue_case, result)
     wrapper = (root / "ctf-tool").read_text()
-    assert f"--run-id {RUN_ID}" in wrapper
-    assert f"--rescue-id {result['rescue_attempt_id']}" in wrapper
+    assert f"CTF_OS_RESCUE_RUN_ID={RUN_ID}" in wrapper
+    assert f"CTF_OS_RESCUE_ID={result['rescue_attempt_id']}" in wrapper
+    assert f"CTF_OS_RESCUE_PACKET_DIGEST={result['packet_digest']}" in wrapper
+    assert "rescue-tool-status" in wrapper and "rescue-exec" in wrapper
     assert '"$@"' in wrapper
     for unsafe in ("/absolute", "../parent", "dir/../parent", "."):
         with pytest.raises(RescueError):
@@ -831,8 +1130,13 @@ def test_ctf_tool_import_records_copy_result_hashes(
     ],
 )
 def test_ctf_tool_rejects_model_process_commands(argv: list[str]) -> None:
-    with pytest.raises(RescueError, match="model process"):
+    with pytest.raises(RescueError, match="model process|shell strings"):
         _reject_model_command(argv)
+
+
+def test_ctf_tool_rejects_generic_shell_string() -> None:
+    with pytest.raises(RescueError, match="shell strings"):
+        _reject_model_command(["bash", "-c", "id && uname -a"])
 
 
 def test_prepare_never_launches_model_process(
