@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "rescue_attempt_id": "rescue-example",
+  "run_id": "run-example",
+  "challenge_instance_id": "challenge-instance-example",
+  "input_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+  "target_revision": 1,
+  "packet_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "requested_lead_model": "sonnet",
+  "observed_lead_model": null,
+  "runtime_observation_evidence": null,
+  "fallback_observed": null,
+  "verdict": "REMOTE_READY_HANDOFF",
+  "summary": "The exploit is ready for one declared-target validation.",
+  "verified_observations": [],
+  "new_attack_path": "Use the executable artifact with the exact argv below.",
+  "decisive_experiments": [],
+  "artifacts": [
+    {
+      "path": "artifacts/solve.py",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "executable": true
+    }
+  ],
+  "remote_ready": {
+    "value": true,
+    "exploit_artifact": "artifacts/solve.py",
+    "exact_next_argv": ["python3", "/artifacts/solve.py"],
+    "target_index": 0,
+    "success_condition": "flag appears in output",
+    "kill_condition": "declared remote rejects the exploit",
+    "maximum_remaining_experiments": 1
+  },
+  "flag_claim": null,
+  "message_for_codex": "Run the exact argv once and preserve its command receipt."
+}

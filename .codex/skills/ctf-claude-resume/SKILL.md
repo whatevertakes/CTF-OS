@@ -19,7 +19,7 @@ Validate the result without trusting it automatically, perform the cheapest deci
 8. Once the protected verified receipt exists, print the exact flag immediately for human submission. Do not submit it.
 9. If an experiment hits its kill condition, record the actual `DECISIVE_EXPERIMENT` decision or `PRIMITIVE_REFUTED` milestone with evidence; do not preserve the claim as confirmed.
 10. Continue the existing exploit-first Solve path when the rescue does not finish the challenge.
-11. After adopting or refuting the rescue result, run `rescue-close` with `integrated`, `refuted`, `no-new-path`, or `manual` as appropriate.
+11. After adopting or refuting the rescue result, run `rescue-close --outcome` with `integrated`, `refuted`, `no-new-path`, `flag-obtained`, or `manual` as appropriate and link an existing evidence receipt when available.
 12. Closing may remove only that rescue container and resource request. Preserve the rescue workspace and result.
 
 Do not add rescue to race lineage, delegation plans, branch counts, candidates, milestones, or flag receipts merely because validation succeeded.

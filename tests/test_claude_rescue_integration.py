@@ -34,7 +34,7 @@ def _spec(tmp_path: Path) -> SandboxSpec:
         target_revision=1, input_bytes=1,
         targets=(ResolvedTarget(target, "93.184.216.34"),),
         session_id="rescue-1", parent_session_id="sol-main",
-        session_role="external", workspace_mode="bind", run_id="run-1",
+        session_role="external-rescue", workspace_mode="bind", run_id="run-1",
         rescue_attempt_id="rescue-1", external_solver=True,
         solver_family="claude", session_kind="external-rescue",
         requested_lead_model="sonnet",
