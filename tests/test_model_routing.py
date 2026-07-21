@@ -12,7 +12,8 @@ from ctf_os.delegation import (
     record_capacity_admission, record_start_failure,
     validate_native_start_receipt_binding,
 )
-from ctf_os.doctor import inspect_codex_routing_capabilities
+import ctf_os.doctor as doctor_module
+from ctf_os.doctor import _codex_model_routing_check, inspect_codex_routing_capabilities
 from ctf_os.model_routing import (
     RoutingError, branch_routing_interpretation, build_native_delegation_packet,
     build_routing_contract, compare_runtime_routing, max_endgame_eligibility,
@@ -659,51 +660,219 @@ def test_ultra_cannot_nest_with_adaptive_or_fixed_race() -> None:
     )["status"] == "NOT_OBSERVABLE"
 
 
-def test_doctor_validates_custom_agents_against_catalog_and_runtime_schema(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
+def _doctor_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     agents = repo / ".codex" / "agents"
     agents.mkdir(parents=True)
     source = Path(".codex/agents")
     for item in source.glob("*.toml"):
         (agents / item.name).write_text(item.read_text())
-    models = []
-    for slug, efforts in (
+    return repo
+
+
+def _doctor_models() -> list[dict[str, object]]:
+    return [{
+        "slug": slug,
+        "supported_reasoning_levels": [{"effort": effort} for effort in efforts],
+    } for slug, efforts in (
         ("gpt-5.6-luna", ["medium", "high"]),
         ("gpt-5.6-terra", ["high"]),
         ("gpt-5.6-sol", ["xhigh", "max"]),
-    ):
-        models.append({
-            "slug": slug,
-            "supported_reasoning_levels": [{"effort": effort} for effort in efforts],
-        })
+    )]
+
+
+def _doctor_runner(
+    calls: list[list[str]],
+    *,
+    multi_agent: str = "true",
+    models: list[dict[str, object]] | None = None,
+    generic_schema: bool = False,
+):
+    catalog = _doctor_models() if models is None else models
 
     def fake_run(argv: list[str], timeout: int = 30, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
         if argv[1:] == ["--version"]:
             return subprocess.CompletedProcess(argv, 0, "codex-cli test\n", "")
         if argv[1:] == ["features", "list"]:
-            return subprocess.CompletedProcess(argv, 0, "multi_agent stable true\n", "")
+            return subprocess.CompletedProcess(
+                argv, 0, f"multi_agent stable {multi_agent}\n", "",
+            )
         if argv[1:] == ["debug", "models"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"models": models}), "")
-        if "generate-json-schema" in argv:
-            out = Path(argv[-1]); (out / "v2").mkdir(parents=True)
-            (out / "codex_app_server_protocol.schemas.json").write_text(
-                '{"CollabAgentToolCallThreadItem":{"model":{},"reasoningEffort":{}}}'
-            )
-            (out / "v2" / "ThreadStartResponse.json").write_text(
-                '{"model":{},"reasoningEffort":{}}'
-            )
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"models": catalog}), "")
+        if generic_schema and "generate-json-schema" in argv:
+            out = Path(argv[-1])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "ThreadStartResponse.json").write_text(json.dumps({
+                "ThreadStartResponse": {"model": {}, "reasoningEffort": {}},
+            }))
             return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 1, "", "unsupported")
 
+    return fake_run
+
+
+def test_valid_config_and_catalog_are_not_runtime_support(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+
     monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
-    capabilities = inspect_codex_routing_capabilities(repo, run=fake_run)
+    capabilities = inspect_codex_routing_capabilities(
+        repo, run=_doctor_runner(calls, generic_schema=True),
+    )
     assert capabilities["native_delegation"] == "SUPPORTED"
-    assert capabilities["model_override"] == "SUPPORTED"
-    assert capabilities["reasoning_override"] == "SUPPORTED"
-    assert capabilities["direct_native_override"] == "UNSUPPORTED"
-    assert capabilities["custom_agent_profile_selection"] == "SUPPORTED"
-    assert capabilities["runtime_identity_observation"] == "SUPPORTED"
+    assert capabilities["model_catalog_status"] == "VALID"
+    assert capabilities["packet_contract"] == "VALID"
+    assert capabilities["custom_agent_configuration"] == "VALID"
+    assert capabilities["custom_agent_profile_selection"] == "UNKNOWN"
+    assert capabilities["model_override"] == "UNKNOWN"
+    assert capabilities["reasoning_override"] == "UNKNOWN"
+    assert capabilities["direct_native_override"] == "UNKNOWN"
+    assert capabilities["runtime_identity_observation"] == "NOT_OBSERVABLE"
+    assert capabilities["custom_agent_profile_selection"] != "SUPPORTED"
+    assert capabilities["runtime_identity_observation"] != "SUPPORTED"
     assert capabilities["max_reasoning"] == "SUPPORTED"
     assert capabilities["model_session_launched"] is False
+    check = _codex_model_routing_check(capabilities)
+    assert check["status"] == "WARN"
+    assert check["ok"] is True
+    assert "native custom-agent selection not verified" in str(check["detail"])
+    assert "child model/reasoning identity not observable" in str(check["detail"])
+
+
+def test_generic_thread_start_schema_never_proves_child_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    capabilities = inspect_codex_routing_capabilities(
+        repo, run=_doctor_runner(calls, generic_schema=True),
+    )
+    assert capabilities["runtime_identity_observation"] == "NOT_OBSERVABLE"
+    assert capabilities["runtime_identity_observation"] != "SUPPORTED"
+    assert not any("generate-json-schema" in argv for argv in calls)
+
+
+def test_invalid_packet_contract_fails_codex_model_routing_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+    original_builder = doctor_module.build_native_delegation_packet
+
+    def invalid_builder(*args: object, **kwargs: object) -> dict[str, object]:
+        packet = original_builder(*args, **kwargs)  # type: ignore[arg-type]
+        packet["spawn_agent_args"]["fork_turns"] = "all"
+        packet["spawn_agent_args"]["requested_model"] = "gpt-5.6-terra"
+        return packet
+
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(doctor_module, "build_native_delegation_packet", invalid_builder)
+    capabilities = inspect_codex_routing_capabilities(repo, run=_doctor_runner(calls))
+    assert capabilities["packet_contract"] == "INVALID"
+    assert any("fork_turns" in error for error in capabilities["packet_contract_errors"])
+    assert any("requested_model" in error for error in capabilities["packet_contract_errors"])
+    check = _codex_model_routing_check(capabilities)
+    assert check["status"] == "FAIL"
+    assert check["ok"] is False
+    assert "packet contract is invalid" in str(check["detail"])
+
+
+def test_invalid_custom_agent_config_disables_model_and_reasoning_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    profile = repo / ".codex" / "agents" / "ctf_terra_high.toml"
+    profile.write_text(
+        profile.read_text().replace('model = "gpt-5.6-terra"', 'model = "wrong-model"')
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    capabilities = inspect_codex_routing_capabilities(repo, run=_doctor_runner(calls))
+    assert capabilities["custom_agent_configuration"] == "INVALID"
+    assert capabilities["model_override"] == "UNSUPPORTED"
+    assert capabilities["reasoning_override"] == "UNSUPPORTED"
+    check = _codex_model_routing_check(capabilities)
+    assert check["status"] == "FAIL"
+    assert check["ok"] is False
+
+
+def test_missing_catalog_reasoning_is_invalid_and_fails_routing_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    models = _doctor_models()
+    for model in models:
+        if model["slug"] == "gpt-5.6-sol":
+            model["supported_reasoning_levels"] = [{"effort": "xhigh"}]
+    calls: list[list[str]] = []
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    capabilities = inspect_codex_routing_capabilities(
+        repo, run=_doctor_runner(calls, models=models),
+    )
+    assert capabilities["model_catalog_status"] == "INVALID"
+    assert capabilities["custom_agent_configuration"] == "INVALID"
+    assert capabilities["model_override"] == "UNSUPPORTED"
+    assert capabilities["reasoning_override"] == "UNSUPPORTED"
+    assert "gpt-5.6-sol/max" in capabilities["model_catalog_missing_combinations"]
+    check = _codex_model_routing_check(capabilities)
+    assert check["status"] == "FAIL"
+    assert check["ok"] is False
+
+
+def test_no_codex_binary_keeps_local_packet_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    def unexpected_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        raise AssertionError("runner must not be called without a Codex binary")
+
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: None)
+    capabilities = inspect_codex_routing_capabilities(repo, run=unexpected_run)
+    assert capabilities["native_delegation"] == "UNKNOWN"
+    assert capabilities["model_catalog_status"] == "UNKNOWN"
+    assert capabilities["packet_contract"] == "VALID"
+    assert capabilities["custom_agent_profile_selection"] == "UNKNOWN"
+    assert capabilities["model_override"] == "UNKNOWN"
+    assert capabilities["reasoning_override"] == "UNKNOWN"
+    assert capabilities["runtime_identity_observation"] == "NOT_OBSERVABLE"
+    assert capabilities["model_session_launched"] is False
+    assert calls == []
+
+
+def test_doctor_routing_inspection_never_launches_a_model_or_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    capabilities = inspect_codex_routing_capabilities(repo, run=_doctor_runner(calls))
+    assert capabilities["model_session_launched"] is False
+    assert [argv[1:] for argv in calls] == [
+        ["--version"], ["features", "list"], ["debug", "models"],
+    ]
+    forbidden = ("exec", "resume", "spawn_agent", "thread/start", "claude")
+    for argv in calls:
+        rendered = " ".join(argv).casefold()
+        assert not any(token in rendered for token in forbidden)
+
+
+def test_explicitly_disabled_multi_agent_fails_routing_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = _doctor_repo(tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("ctf_os.doctor.shutil.which", lambda _name: "/usr/bin/codex")
+    capabilities = inspect_codex_routing_capabilities(
+        repo, run=_doctor_runner(calls, multi_agent="false"),
+    )
+    assert capabilities["native_delegation"] == "UNSUPPORTED"
+    check = _codex_model_routing_check(capabilities)
+    assert check["status"] == "FAIL"
+    assert check["ok"] is False
