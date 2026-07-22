@@ -14,7 +14,7 @@ import sys
 from typing import Any, Mapping, Sequence
 
 from ..blackboard import append_verified_event
-from ..contest import discover_contests, resolve_selector, select_contest
+from ..contest import discover_contests, initialize_contest, resolve_selector, select_contest
 from ..doctor import run_doctor
 from ..flag import StreamingDetector, record_candidate
 from ..handoff import load_markdown, save_handoff
@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init-contest", help="create a fresh contest manifest and one challenge input folder")
+    init.add_argument("contest")
+    init.add_argument("--challenge", required=True, metavar="CATEGORY/NAME")
 
     prepare = commands.add_parser("race-prepare", help="select, materialize, and create the Root sandbox")
     _selection_args(prepare)
@@ -176,6 +180,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def dispatch(args: argparse.Namespace, repo: Path) -> Any:
+    if args.command == "init-contest":
+        return initialize_contest(repo, args.contest, args.challenge)
     if args.command == "race-prepare":
         return _race_prepare(repo, args)
     if args.command == "race-bootstrap":

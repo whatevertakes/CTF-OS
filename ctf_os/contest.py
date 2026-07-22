@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 import hashlib
 import json
+import os
 import re
+import tempfile
 import unicodedata
 from pathlib import Path
 
@@ -32,6 +34,82 @@ def safe_name(value: str, *, fallback: str = "item") -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", ascii_text).strip("-").casefold()
     digest = hashlib.sha256(normalized.casefold().encode()).hexdigest()[:8]
     return f"{slug or fallback}-{digest}"
+
+
+def initialize_contest(root: str | Path, contest: str, challenge_key: str) -> dict[str, object]:
+    """Create the minimal fresh-schema input location for one challenge."""
+    contest_name = unicodedata.normalize("NFKC", contest).strip()
+    if (
+        not contest_name
+        or contest_name in {".", ".."}
+        or any(character in contest_name for character in ("/", "\\", "\0", "\r", "\n"))
+    ):
+        raise ContestError("contest name must be one safe directory name")
+    category, challenge_name = _parse_heading(challenge_key)
+    incoming = Path(root).resolve() / "incoming"
+    _ensure_directory(incoming)
+    contest_root = incoming / contest_name
+    _ensure_directory(contest_root)
+    category_root = contest_root / category
+    _ensure_directory(category_root)
+    challenge_root = category_root / challenge_name
+    _ensure_directory(challenge_root)
+
+    manifest = contest_root / "contest.md"
+    heading = f"### {category}/{challenge_name}"
+    if manifest.exists() or manifest.is_symlink():
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ContestError(f"contest manifest path is unsafe: {manifest}")
+        content = manifest.read_text(encoding="utf-8")
+        if heading not in {line.strip() for line in content.splitlines()}:
+            suffix = "" if content.endswith("\n\n") else "\n" if content.endswith("\n") else "\n\n"
+            _atomic_text(manifest, content + suffix + f"{heading}\n- 설명: \n- 원격: \n")
+            challenge_added = True
+        else:
+            challenge_added = False
+        manifest_created = False
+    else:
+        _atomic_text(
+            manifest,
+            f"# 대회명: {contest_name}\n"
+            "<!-- 여기에 대회 플래그 패턴을 추가하세요. -->\n\n"
+            f"{heading}\n- 설명: \n- 원격: \n",
+        )
+        manifest_created = True
+        challenge_added = True
+    return {
+        "contest": contest_name,
+        "challenge": f"{category}/{challenge_name}",
+        "contest_path": str(contest_root),
+        "challenge_path": str(challenge_root),
+        "manifest_path": str(manifest),
+        "manifest_created": manifest_created,
+        "challenge_added": challenge_added,
+    }
+
+
+def _ensure_directory(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_dir():
+            raise ContestError(f"directory path is unsafe: {path}")
+        return
+    path.mkdir(mode=0o700)
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    if path.is_symlink():
+        raise ContestError(f"contest manifest path is unsafe: {path}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 @dataclass(frozen=True, slots=True)

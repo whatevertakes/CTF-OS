@@ -10,6 +10,7 @@ import time
 import pytest
 
 from ctf_os.agent_tools.__main__ import build_parser
+from ctf_os.contest import parse_contest, resolve_selector
 from ctf_os.handoff import save_handoff
 from ctf_os.preflight import input_fingerprint
 from ctf_os.race import terminate
@@ -83,6 +84,23 @@ def test_cli_help_and_package_data_smoke() -> None:
     assert "sandbox" + "-create" not in result.stdout
     policy = Path("ctf_os/resources/agent-policy.md")
     assert policy.is_file() and "verified" in policy.read_text(encoding="utf-8").casefold()
+
+
+def test_init_contest_creates_fresh_manifest_and_challenge_folder(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "python", "-m", "ctf_os.agent_tools", "--repo", str(tmp_path),
+            "init-contest", "Demo CTF", "--challenge", "web/Example",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)["result"]
+    manifest = Path(payload["manifest_path"])
+    assert Path(payload["challenge_path"]).is_dir()
+    assert payload["manifest_created"] is True and payload["challenge_added"] is True
+    selected = resolve_selector(parse_contest(manifest).challenges, "web/Example")
+    assert selected.key == "web/Example"
 
 
 def test_temp_contest_race_prepare_dry_smoke(tmp_path: Path) -> None:
