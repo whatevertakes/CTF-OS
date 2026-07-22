@@ -9,6 +9,7 @@ import pytest
 
 import ctf_os.agent_tools.__main__ as agent_tools
 from ctf_os.agent_tools.__main__ import build_parser
+from conftest import write_contest
 
 
 def test_service_manual_attachment_option_is_visible_and_defaults_to_auto_attach() -> None:
@@ -20,6 +21,127 @@ def test_service_manual_attachment_option_is_visible_and_defaults_to_auto_attach
     args = parser.parse_args(["sandbox-create", "1", "--branch", "worker-001"])
     assert args.service is False
     assert args.session_role == "child"
+
+
+def test_prepare_auto_sandbox_is_default_and_can_be_disabled() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["prepare-challenge", "1"]).auto_sandbox is True
+    assert parser.parse_args([
+        "prepare-challenge", "1", "--no-auto-sandbox",
+    ]).auto_sandbox is False
+
+
+def test_prepare_starts_root_sandbox_and_publishes_exec_context(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "incoming").mkdir()
+    (tmp_path / "output").mkdir()
+    write_contest(tmp_path, "# Demo CTF\n### web/X\n- Description: app\n")
+    source = tmp_path / "incoming" / "Demo CTF" / "web" / "X"
+    source.mkdir(parents=True)
+    (source / "app.py").write_text("print('ready')\n", encoding="utf-8")
+    monkeypatch.setattr(agent_tools, "select_local_sandbox_image", lambda image: {
+        "status": "AVAILABLE", "recommended_image": image,
+        "selected_image": image, "fallback_used": False, "checks": [],
+    })
+
+    def fake_create(**kwargs):
+        branch_root = kwargs["branch_root"]
+        branch_root.mkdir(parents=True)
+        return {
+            "name": "ctf-os-root", "image": kwargs["image_override"],
+            "branch_root": str(branch_root),
+            "metadata_path": str(branch_root / "sandbox.json"),
+            "work_path": str(branch_root / "work"),
+            "evidence_path": str(branch_root / "evidence"),
+        }
+
+    monkeypatch.setattr(agent_tools, "_create_sandbox_runtime", fake_create)
+    args = build_parser().parse_args([
+        "--repo", str(tmp_path), "prepare-challenge", "web/X", "--contest", "Demo CTF",
+    ])
+
+    result = agent_tools.dispatch(tmp_path, args)
+
+    sandbox = result["root_sandbox"]
+    assert sandbox["status"] == "READY" and sandbox["mode"] == "sandbox"
+    assert sandbox["selected_image"] == "ctf-os-sandbox:web"
+    assert sandbox["metadata_path"].endswith("/workers/root/sandbox.json")
+    assert sandbox["exec_command_prefix"][-2:] == [sandbox["metadata_path"], "--"]
+    launch = json.loads(Path(result["authoritative_solve_launch_path"]).read_text())
+    assert launch["execution_environment"] == sandbox
+    assert launch["root_lane"]["sandbox_status"] == "READY"
+
+
+def test_prepare_reports_build_fallback_when_no_local_image(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "incoming").mkdir()
+    (tmp_path / "output").mkdir()
+    write_contest(tmp_path, "# Demo CTF\n### web/X\n- Description: app\n")
+    source = tmp_path / "incoming" / "Demo CTF" / "web" / "X"
+    source.mkdir(parents=True)
+    (source / "app.py").write_text("print('ready')\n", encoding="utf-8")
+    monkeypatch.setattr(agent_tools, "select_local_sandbox_image", lambda image: {
+        "status": "UNAVAILABLE", "recommended_image": image,
+        "selected_image": None, "fallback_used": False,
+        "checks": [{"image": image, "available": False}],
+    })
+    monkeypatch.setattr(
+        agent_tools, "_create_sandbox_runtime",
+        lambda **kwargs: pytest.fail("sandbox creation must not run without a local image"),
+    )
+    args = build_parser().parse_args([
+        "--repo", str(tmp_path), "prepare-challenge", "web/X", "--contest", "Demo CTF",
+    ])
+
+    result = agent_tools.dispatch(tmp_path, args)
+
+    sandbox = result["root_sandbox"]
+    assert sandbox["status"] == "UNAVAILABLE"
+    assert sandbox["build_command"][-2:] == ["web", "base"]
+    assert Path(sandbox["receipt_path"]).is_file()
+
+
+def test_root_bootstrap_retries_resource_admission_once_with_light_profile(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    solve_root = tmp_path / "run"
+    solve_root.mkdir()
+    challenge = SimpleNamespace(key="web/X")
+    manifest = SimpleNamespace(slug="demo")
+    calls = []
+    monkeypatch.setattr(agent_tools, "select_local_sandbox_image", lambda image: {
+        "status": "AVAILABLE", "recommended_image": image,
+        "selected_image": image, "fallback_used": False, "checks": [],
+    })
+
+    def fake_create(**kwargs):
+        calls.append(kwargs["resource_profile_override"])
+        if len(calls) == 1:
+            raise ValueError("sandbox admission refused: insufficient memory")
+        branch_root = kwargs["branch_root"]
+        return {
+            "name": "ctf-os-root", "image": kwargs["image_override"],
+            "branch_root": str(branch_root),
+            "metadata_path": str(branch_root / "sandbox.json"),
+            "work_path": str(branch_root / "work"),
+            "evidence_path": str(branch_root / "evidence"),
+        }
+
+    monkeypatch.setattr(agent_tools, "_create_sandbox_runtime", fake_create)
+
+    result = agent_tools._prepare_root_sandbox(
+        root=tmp_path, manifest=manifest, challenge=challenge,
+        record={
+            "recommended_image": "ctf-os-sandbox:web",
+            "recommended_resource_profile": "standard",
+        },
+        workspace=tmp_path / "workspace", solve_root=solve_root,
+        parent_session_id="sol-main", enabled=True,
+    )
+
+    assert calls == [None, "light"]
+    assert result["status"] == "READY"
+    assert result["resource_profile"] == "light"
+    assert result["resource_fallback_used"] is True
 
 
 def test_service_read_apis_and_restart_are_exposed() -> None:
@@ -57,6 +179,14 @@ def test_child_environment_identity_cannot_be_overridden(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="DENIED_SESSION_IDENTITY"):
         agent_tools._caller(args)
+
+
+def test_child_cannot_bootstrap_root_sandbox(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CTF_OS_SESSION_ROLE", "child")
+    args = build_parser().parse_args(["prepare-challenge", "1"])
+
+    with pytest.raises(ValueError, match="only Root may prepare"):
+        agent_tools.dispatch(tmp_path, args)
 
 
 def test_worker_result_controller_commands_are_exposed() -> None:

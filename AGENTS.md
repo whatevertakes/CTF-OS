@@ -11,12 +11,15 @@ flag, the 90-minute cutoff, or an explicit Claude handoff. Whole-contest Intake
 and Triage are optional admin commands and never Solve prerequisites.
 
 Root is Sol xhigh and the lead attacker, never coordinator-only. Preparation
-returns challenge context and no mandatory child lineup. Before any challenge
-inspection or attack command, Root creates or proves a live `root` sandbox using
-the selected category image. Every analyzer, debugger, compiler, script,
-payload, solver, and remote request runs through `sandbox-exec`; host execution
-is limited to CTF-OS controller commands. A missing or broken sandbox is an exact
-blocker, never permission to fall back to host challenge tools.
+returns challenge context and no mandatory child lineup. By default it also
+reuses or creates a live `root` sandbox from the locally available recommended
+image, falling back only to `ctf-os-sandbox:base`; it never pulls an image.
+Before any challenge inspection or attack command, Root requires
+`root_sandbox.status == READY` and uses the returned sandbox execution prefix.
+Every analyzer, debugger, compiler, script, payload, solver, and remote request
+runs through `sandbox-exec`. Only CTF-OS controller commands use host execution.
+A missing or broken sandbox is an exact blocker with an explicit
+recovery command, never permission to fall back to host challenge tools.
 
 Root may at any time prepare zero to three native workers by providing only
 `model_profile`, `role`, `task`, and `context_mode`. Use fresh Sol for a new

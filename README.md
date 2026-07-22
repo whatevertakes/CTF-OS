@@ -40,34 +40,39 @@ uv run python -m ctf_os.agent_tools init-contest 'My CTF 2026'
 uv run python -m ctf_os.agent_tools prepare-challenge 'web/Challenge' --contest 'My CTF 2026'
 ```
 
-Preparation returns `run_root`, the recommended category image, service context,
-and zero workers. Before any file inspection or attack command, Root creates its
-category sandbox:
+Preparation returns direct attack context and zero native workers. It
+inspects local images without pulling and automatically reuses or creates the
+Root sandbox. The recommended category image is preferred and
+`ctf-os-sandbox:base` is the fallback. A resource-admission failure gets one
+bounded retry with the `light` profile. `root_sandbox.exec_command_prefix` is
+the immediate execution entry point when `root_sandbox.status` is `READY`:
 
 ```bash
-uv run python -m ctf_os.agent_tools sandbox-create 'web/Challenge' \
-  --contest 'My CTF 2026' --branch root \
-  --session-id root --session-role child --parent-session-id sol-main
-```
-
-On a resumed attempt, the Solve probes and reuses an existing live Root sandbox;
-a stale one is cleaned and recreated. Every analyzer, debugger, compiler,
-script, exploit, and remote request runs through the returned metadata:
-
-```bash
+# Append the real command to the prefix returned by prepare-challenge, for example:
 uv run python -m ctf_os.agent_tools sandbox-exec \
   --metadata '<run_root>/workers/root/sandbox.json' \
   --session-id sol-main --session-role sol --parent-session-id sol-main \
-  -- <command> [args...]
+  -- file /challenge/app.py
 ```
 
-Inside the image, `/challenge` is read-only, `/work` is mutable, and durable
-output goes to `/artifacts`. Host execution is reserved for CTF-OS controller
-commands.
+The decision and recovery details are persisted in `<run>/ROOT-SANDBOX.json` and
+included as `execution_environment` in `SOLVE-LAUNCH.json`. If neither image is
+available, preparation does not run challenge artifacts on the host; it returns
+the exact `sandbox/build-images.sh <profile> base` command. If a managed local
+service is not running, start it with the controller commands and recover the
+Root sandbox with `sandbox-create --branch root --session-role sol --service`.
+Use `--no-auto-sandbox` only when intentionally managing the Root sandbox
+manually.
+
+Every analyzer, debugger, compiler, script, exploit, and remote request runs
+through the returned metadata. Inside the image, `/challenge` is read-only,
+`/work` is mutable, and durable output goes to `/artifacts`. Host execution is
+reserved for CTF-OS controller commands.
 
 ## Sandbox-backed native workers
 
-When useful, Root creates one optional packet:
+Root begins its own attack immediately through the ready sandbox. When useful,
+Root creates one optional packet:
 
 ```bash
 uv run python -m ctf_os.agent_tools worker-spawn-packet 'web/Challenge' \

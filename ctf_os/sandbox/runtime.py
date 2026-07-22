@@ -28,6 +28,91 @@ class SandboxError(RuntimeError):
     pass
 
 
+def inspect_local_image(image: str, *, docker: str = "docker") -> dict[str, object]:
+    """Inspect one local sandbox image without pulling or building it."""
+
+    if not image or any(character in image for character in "\r\n\0"):
+        raise SandboxError("sandbox image reference is invalid")
+    try:
+        result = _run(
+            [docker, "image", "inspect", image, "--format", "{{json .Id}}"],
+            timeout=20,
+        )
+    except SandboxError as exc:
+        return {
+            "image": image, "available": False, "runtime_available": False,
+            "reason": str(exc),
+        }
+    if result.returncode == 0:
+        try:
+            image_id = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            image_id = result.stdout.strip()
+        return {
+            "image": image, "available": True, "runtime_available": True,
+            "image_id": str(image_id or ""),
+        }
+    reason = (result.stderr or result.stdout or "Docker image inspect failed").strip()
+    missing = any(
+        marker in reason.casefold()
+        for marker in ("no such image", "no such object", "not found")
+    )
+    return {
+        "image": image, "available": False, "runtime_available": missing,
+        "reason": reason[:1000],
+    }
+
+
+def select_local_sandbox_image(
+    recommended_image: str, *, fallback_image: str = "ctf-os-sandbox:base",
+    docker: str = "docker",
+) -> dict[str, object]:
+    """Choose the first available local image, preferring the recommendation."""
+
+    candidates = list(dict.fromkeys((recommended_image, fallback_image)))
+    checks: list[dict[str, object]] = []
+    for candidate in candidates:
+        check = inspect_local_image(candidate, docker=docker)
+        checks.append(check)
+        if check["available"]:
+            return {
+                "status": "AVAILABLE", "recommended_image": recommended_image,
+                "selected_image": candidate,
+                "fallback_used": candidate != recommended_image,
+                "checks": checks,
+            }
+        if check.get("runtime_available") is False:
+            break
+    return {
+        "status": "UNAVAILABLE", "recommended_image": recommended_image,
+        "selected_image": None, "fallback_used": False, "checks": checks,
+    }
+
+
+def inspect_sandbox_runtime(
+    metadata: Mapping[str, object], *, docker: str = "docker",
+) -> dict[str, object]:
+    """Return whether persisted metadata still names a running owned sandbox."""
+
+    name = _metadata_name(dict(metadata))
+    try:
+        raw = _inspect_runtime(name, docker=docker)
+    except SandboxError as exc:
+        return {"exists": False, "running": False, "owned": False, "reason": str(exc)}
+    config = raw.get("Config") if isinstance(raw.get("Config"), Mapping) else {}
+    labels = config.get("Labels") if isinstance(config.get("Labels"), Mapping) else {}
+    expected = metadata.get("runtime_labels")
+    if not isinstance(expected, Mapping):
+        expected = metadata.get("labels") if isinstance(metadata.get("labels"), Mapping) else {}
+    owned = bool(expected) and all(labels.get(key) == value for key, value in expected.items())
+    state = raw.get("State") if isinstance(raw.get("State"), Mapping) else {}
+    return {
+        "exists": True, "running": state.get("Running") is True,
+        "owned": owned, "status": state.get("Status"),
+        "reason": None if owned else "container labels do not match sandbox metadata",
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxSpec:
     contest_slug: str
@@ -753,6 +838,10 @@ def _prepare_branch_root(spec: SandboxSpec) -> None:
         # needed because the unprivileged container uid need not match the host uid.
         path.chmod(0o777 if name in {"work", "evidence", "artifacts"} else (0o755 if name == "context" else 0o700))
     context_file = spec.branch_root / "context" / "session.json"
+    if context_file.is_symlink() or (context_file.exists() and not context_file.is_file()):
+        raise SandboxError("worker session context path is unsafe")
+    if context_file.exists():
+        context_file.chmod(0o600)
     _write_json(context_file, context_payload)
     context_file.chmod(0o444)
 

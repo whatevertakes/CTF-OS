@@ -37,7 +37,7 @@ def _prepare(repo: Path, selector: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
-            "prepare-challenge", selector, "--contest", "Isolation CTF",
+            "prepare-challenge", selector, "--contest", "Isolation CTF", "--no-auto-sandbox",
         ],
         capture_output=True,
         text=True,
@@ -110,7 +110,7 @@ def test_parallel_prepare_allows_only_one_machine_active_challenge(repo: Path) -
         commands.append(subprocess.Popen(
             [
                 "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
-                "prepare-challenge", selector, "--contest", "Isolation CTF",
+                "prepare-challenge", selector, "--contest", "Isolation CTF", "--no-auto-sandbox",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -364,7 +364,7 @@ def test_session_input_prepares_unlisted_challenge_without_rewriting_manifest(re
     })
     prepared = subprocess.run([
         "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
-        "prepare-challenge", "misc/PromptOnly", "--contest", "Session CTF",
+        "prepare-challenge", "misc/PromptOnly", "--contest", "Session CTF", "--no-auto-sandbox",
         "--session-input-json", packet,
     ], capture_output=True, text=True)
     payload = _result(prepared)

@@ -30,7 +30,8 @@ from ..sandbox.network import parse_remotes
 from ..sandbox.resources import sandbox_gc, sandbox_status
 from ..sandbox.preparation import prepare_sandbox_spec
 from ..sandbox.runtime import (
-    cleanup, create, execute, export_artifacts, probe_service_connectivity, resize,
+    cleanup, create, execute, export_artifacts, inspect_sandbox_runtime,
+    probe_service_connectivity, resize, select_local_sandbox_image,
 )
 from ..service import (
     ServiceActor, ServiceSpec, service_build, service_cleanup, service_inspect,
@@ -100,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--resume-run-id")
     prepare.add_argument("--attempt-id")
     prepare.add_argument("--transformation-seed")
+    prepare.add_argument(
+        "--auto-sandbox", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "automatically start a Root sandbox from the recommended local image, "
+            "falling back to ctf-os-sandbox:base (default: enabled)"
+        ),
+    )
     if not child_surface:
         attempt_start = commands.add_parser("attempt-start", help="start one isolated fresh attempt")
         attempt_start.add_argument("selector"); attempt_start.add_argument("--contest")
@@ -503,6 +511,10 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         return export_artifacts(metadata, session_id=session_id, session_role=role)
 
     if args.command == "prepare-challenge":
+        if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
+            raise ValueError(
+                "DENIED_CONTROLLER_ACTION: only Root may prepare a challenge and bootstrap its sandbox"
+            )
         if args.resume_run_id and (
             args.fresh_attempt or args.attempt_id or args.transformation_seed
         ):
@@ -520,12 +532,25 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                 transformation_seed=args.transformation_seed,
             )
         )
+        parent_session_id = os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main")
+        swarm = initialize_swarm(
+            solve_root, challenge=challenge, record=record,
+            root_session=parent_session_id,
+        )
+        root_sandbox = _prepare_root_sandbox(
+            root=root, manifest=manifest, challenge=challenge, record=record,
+            workspace=workspace, solve_root=solve_root,
+            parent_session_id=parent_session_id, enabled=bool(args.auto_sandbox),
+        )
         launch_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
         launch_context = build_solve_launch_context(challenge, record)
         launch_context["run_id"] = launch_state.get("run_id")
         launch_context["attempt_id"] = launch_state.get("attempt_id")
         launch_context["challenge_instance_id"] = launch_state.get("challenge_instance_id")
         launch_context["target_revision"] = launch_state.get("target_revision")
+        launch_context["execution_environment"] = root_sandbox
+        launch_context["root_lane"]["sandbox_status"] = root_sandbox["status"]
+        launch_context["root_lane"]["sandbox_metadata_path"] = root_sandbox.get("metadata_path")
         launch_path = save_solve_launch_context(solve_root, launch_context)
         compatibility_launch_path = save_solve_launch_context(workspace, launch_context)
         prepared = _compact_prepare(challenge, record, solve_root, launch_context, compatibility_launch_path)
@@ -533,11 +558,8 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
         prepared["attempt_id"] = launch_state.get("attempt_id")
         prepared["challenge_instance_id"] = launch_state.get("challenge_instance_id")
         prepared["solve_engine"] = "first-to-flag"
-        swarm = initialize_swarm(
-            solve_root, challenge=challenge, record=record,
-            root_session=getattr(args, "parent_session_id", "sol-main"),
-        )
         prepared["swarm"] = swarm
+        prepared["root_sandbox"] = root_sandbox
         return prepared
 
     if args.command == "attempt-start":
@@ -794,39 +816,16 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
     if args.command == "sandbox-create":
         branch_root = solve_root / "workers" / args.branch
         session_id, session_role = _caller(args, branch=args.branch)
-        prepared = prepare_sandbox_spec(
+        return _create_sandbox_runtime(
             repo_root=root, manifest=manifest, challenge=challenge, record=record,
             workspace=workspace, solve_root=solve_root, branch=args.branch,
             branch_root=branch_root, session_id=session_id,
             parent_session_id=args.parent_session_id, session_role=session_role,
             image_override=args.image, resource_profile_override=args.resource_profile,
             require_service=bool(args.service),
-            prepared_fingerprint_reader=prepared_tree_fingerprint,
-            service_inspector=service_inspect,
             service_actor=_service_actor(args, child_default=True),
+            run_id=solve_root.name,
         )
-        spec = prepared.spec
-        attachment_service = prepared.attachment_service
-        service_network = spec.service_network
-        guard = (
-            service_attachment(
-                attachment_service,
-                actor=ServiceActor(
-                    args.parent_session_id, role="sol", parent_session_id=args.parent_session_id,
-                ),
-            )
-            if attachment_service is not None else nullcontext()
-        )
-        with guard:
-            metadata = create(spec)
-            try:
-                if service_network:
-                    metadata["connectivity_probe"] = probe_service_connectivity(metadata)
-                    atomic_json(Path(str(metadata["metadata_path"])), metadata)
-            except Exception:
-                cleanup(metadata)
-                raise
-        return metadata
     if args.command == "record-finding":
         _require_sol(args, "Only Root may append shared findings.")
         return append_finding(solve_root, args.branch, args.summary, args.evidence, args.status)
@@ -958,6 +957,251 @@ def _require_sol(args: argparse.Namespace, message: str) -> None:
     session_id, role = _caller(args)
     if role != "sol" or session_id != str(args.parent_session_id):
         raise ValueError(f"DENIED_CONTROLLER_ACTION: {message}")
+
+
+def _create_sandbox_runtime(
+    *, repo_root: Path, manifest, challenge, record: dict[str, object],
+    workspace: Path, solve_root: Path, branch: str, branch_root: Path,
+    session_id: str, parent_session_id: str, session_role: str,
+    image_override: str | None, resource_profile_override: str | None,
+    require_service: bool, service_actor: ServiceActor, run_id: str | None,
+) -> dict[str, object]:
+    """Prepare and start a sandbox through the single shared lifecycle path."""
+
+    prepared = prepare_sandbox_spec(
+        repo_root=repo_root, manifest=manifest, challenge=challenge, record=record,
+        workspace=workspace, solve_root=solve_root, branch=branch,
+        branch_root=branch_root, session_id=session_id,
+        parent_session_id=parent_session_id, session_role=session_role,
+        image_override=image_override, resource_profile_override=resource_profile_override,
+        require_service=require_service, run_id=run_id,
+        prepared_fingerprint_reader=prepared_tree_fingerprint,
+        service_inspector=service_inspect, service_actor=service_actor,
+    )
+    spec = prepared.spec
+    guard = (
+        service_attachment(
+            prepared.attachment_service,
+            actor=ServiceActor(
+                parent_session_id, role="sol", parent_session_id=parent_session_id,
+            ),
+        )
+        if prepared.attachment_service is not None else nullcontext()
+    )
+    with guard:
+        metadata = create(spec)
+        try:
+            if spec.service_network:
+                metadata["connectivity_probe"] = probe_service_connectivity(metadata)
+                atomic_json(Path(str(metadata["metadata_path"])), metadata)
+        except Exception:
+            cleanup(metadata)
+            raise
+    return metadata
+
+
+def _prepare_root_sandbox(
+    *, root: Path, manifest, challenge, record: dict[str, object],
+    workspace: Path, solve_root: Path, parent_session_id: str, enabled: bool,
+) -> dict[str, object]:
+    """Create or reuse the Root lane sandbox, with an explicit local-image fallback."""
+
+    receipt_path = solve_root / "ROOT-SANDBOX.json"
+    branch = "root"
+    branch_root = solve_root / "workers" / branch
+    metadata_path = branch_root / "sandbox.json"
+    recommended = str(record.get("recommended_image") or "ctf-os-sandbox:base")
+    service_plan = record.get("service_plan")
+    managed_service = (
+        isinstance(service_plan, dict)
+        and service_plan.get("kind") in {"dockerfile", "compose"}
+    )
+    manual_command = [
+        sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root),
+        "sandbox-create", str(challenge.key), "--contest", str(manifest.slug),
+        "--branch", branch, "--session-role", "sol",
+        "--parent-session-id", parent_session_id,
+        *(["--service"] if managed_service else []),
+    ]
+
+    def persist(payload: dict[str, object]) -> dict[str, object]:
+        payload = {"schema_version": 1, "receipt_path": str(receipt_path), **payload}
+        atomic_json(receipt_path, payload)
+        return payload
+
+    if not enabled:
+        return persist({
+            "status": "DISABLED", "mode": "manual", "automatic": False,
+            "recommended_image": recommended, "selected_image": None,
+            "fallback_used": False, "manual_create_command": manual_command,
+        })
+
+    if metadata_path.is_file() and not metadata_path.is_symlink():
+        try:
+            existing = _load_metadata(root, str(metadata_path))
+            runtime = inspect_sandbox_runtime(existing)
+        except Exception as exc:
+            return persist({
+                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
+                "recommended_image": recommended, "selected_image": None,
+                "fallback_used": False,
+                "reason": f"existing Root sandbox metadata is unusable: {exc}"[:1000],
+                "manual_create_command": manual_command,
+            })
+        if runtime.get("exists") and runtime.get("running") and runtime.get("owned"):
+            prior = None
+            if receipt_path.is_file() and not receipt_path.is_symlink():
+                try:
+                    prior = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    prior = None
+            if isinstance(prior, dict) and prior.get("status") == "READY":
+                return prior
+            selected = str(existing.get("image") or recommended)
+            return persist(_ready_root_sandbox_receipt(
+                root=root, metadata=existing, recommended=recommended,
+                selected=selected, fallback_used=selected != recommended,
+                image_selection={"status": "RUNNING_SANDBOX_REUSED", "checks": []},
+                resource_profile=str(existing.get("resource_profile") or "standard"),
+                resource_fallback_used=False,
+            ))
+        if runtime.get("exists") and not runtime.get("owned"):
+            return persist({
+                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
+                "recommended_image": recommended, "selected_image": None,
+                "fallback_used": False,
+                "reason": str(runtime.get("reason") or "existing container is not CTF-OS-owned")[:1000],
+                "manual_create_command": manual_command,
+            })
+
+    selection = select_local_sandbox_image(recommended)
+    selected = selection.get("selected_image")
+    if not isinstance(selected, str) or not selected:
+        runtime_failure = next((
+            check for check in selection.get("checks", [])
+            if isinstance(check, dict) and check.get("runtime_available") is False
+        ), None)
+        profile = recommended.rsplit(":", 1)[-1]
+        profiles = [profile] if profile == "base" else [profile, "base"]
+        unavailable = {
+            "status": "UNAVAILABLE", "mode": "unavailable", "automatic": True,
+            "recommended_image": recommended, "selected_image": None,
+            "fallback_used": False, "image_selection": selection,
+            "manual_create_command": manual_command,
+        }
+        if runtime_failure is not None:
+            unavailable.update({
+                "reason": f"Docker runtime is unavailable: {runtime_failure.get('reason', 'inspect failed')}"[:1000],
+                "recovery_command": [
+                    sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root), "doctor",
+                ],
+            })
+        else:
+            unavailable.update({
+                "reason": "neither the recommended image nor ctf-os-sandbox:base is locally available",
+                "build_command": ["bash", str(root / "sandbox" / "build-images.sh"), *profiles],
+            })
+        return persist(unavailable)
+
+    selected_manual_command = [*manual_command, "--image", selected]
+
+    if metadata_path.is_file() and not metadata_path.is_symlink():
+        try:
+            stale = _load_metadata(root, str(metadata_path))
+            cleanup(stale, session_id=parent_session_id, session_role="sol")
+        except Exception as exc:
+            return persist({
+                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
+                "recommended_image": recommended, "selected_image": selected,
+                "fallback_used": bool(selection.get("fallback_used")),
+                "image_selection": selection,
+                "reason": f"stale Root sandbox cleanup failed: {exc}"[:1000],
+                "manual_create_command": selected_manual_command,
+            })
+
+    recommended_profile = str(record.get("recommended_resource_profile") or "standard")
+    selected_profile = recommended_profile
+    initial_failure: str | None = None
+    try:
+        metadata = _create_sandbox_runtime(
+            repo_root=root, manifest=manifest, challenge=challenge, record=record,
+            workspace=workspace, solve_root=solve_root, branch=branch,
+            branch_root=branch_root, session_id=parent_session_id,
+            parent_session_id=parent_session_id, session_role="sol",
+            image_override=selected, resource_profile_override=None,
+            require_service=managed_service,
+            service_actor=ServiceActor(
+                parent_session_id, role="sol", parent_session_id=parent_session_id,
+            ),
+            run_id=solve_root.name,
+        )
+    except Exception as exc:
+        initial_failure = str(exc)
+        resource_limited = any(marker in initial_failure.casefold() for marker in (
+            "sandbox admission refused", "resource scheduler cannot admit sandbox minimum",
+        ))
+        if not resource_limited or recommended_profile == "light":
+            return persist({
+                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
+                "recommended_image": recommended, "selected_image": selected,
+                "fallback_used": bool(selection.get("fallback_used")),
+                "image_selection": selection, "reason": initial_failure[:1000],
+                "manual_create_command": selected_manual_command,
+            })
+        selected_profile = "light"
+        try:
+            metadata = _create_sandbox_runtime(
+                repo_root=root, manifest=manifest, challenge=challenge, record=record,
+                workspace=workspace, solve_root=solve_root, branch=branch,
+                branch_root=branch_root, session_id=parent_session_id,
+                parent_session_id=parent_session_id, session_role="sol",
+                image_override=selected, resource_profile_override=selected_profile,
+                require_service=managed_service,
+                service_actor=ServiceActor(
+                    parent_session_id, role="sol", parent_session_id=parent_session_id,
+                ),
+                run_id=solve_root.name,
+            )
+        except Exception as retry_exc:
+            return persist({
+                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
+                "recommended_image": recommended, "selected_image": selected,
+                "fallback_used": bool(selection.get("fallback_used")),
+                "image_selection": selection,
+                "reason": str(retry_exc)[:1000],
+                "initial_failure": initial_failure[:1000],
+                "manual_create_command": selected_manual_command,
+            })
+    return persist(_ready_root_sandbox_receipt(
+        root=root, metadata=metadata, recommended=recommended,
+        selected=selected, fallback_used=bool(selection.get("fallback_used")),
+        image_selection=selection,
+        resource_profile=selected_profile,
+        resource_fallback_used=selected_profile != recommended_profile,
+    ))
+
+
+def _ready_root_sandbox_receipt(
+    *, root: Path, metadata: dict[str, object], recommended: str,
+    selected: str, fallback_used: bool, image_selection: dict[str, object],
+    resource_profile: str, resource_fallback_used: bool,
+) -> dict[str, object]:
+    metadata_path = str(metadata["metadata_path"])
+    return {
+        "status": "READY", "mode": "sandbox", "automatic": True,
+        "recommended_image": recommended, "selected_image": selected,
+        "fallback_used": fallback_used, "image_selection": image_selection,
+        "resource_profile": resource_profile,
+        "resource_fallback_used": resource_fallback_used,
+        "container": metadata.get("name"), "metadata_path": metadata_path,
+        "work_path": metadata.get("work_path"),
+        "evidence_path": metadata.get("evidence_path"),
+        "artifacts_path": str(Path(str(metadata["branch_root"])) / "artifacts"),
+        "exec_command_prefix": [
+            sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root),
+            "sandbox-exec", "--metadata", metadata_path, "--",
+        ],
+    }
 
 
 

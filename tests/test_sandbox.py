@@ -46,6 +46,70 @@ def test_workers_receive_distinct_durable_private_paths(tmp_path: Path, monkeypa
     assert not (roots[1] / "work" / "proof.txt").exists()
 
 
+def test_sandbox_context_can_be_prepared_again_after_failed_admission(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    spec = SandboxSpec("demo", "abc123", "root", source, tmp_path / "workers" / "root")
+
+    runtime._prepare_branch_root(spec)
+    runtime._prepare_branch_root(spec)
+
+    context = spec.branch_root / "context" / "session.json"
+    assert context.is_file()
+    assert context.stat().st_mode & 0o777 == 0o444
+
+
+def test_local_image_selection_prefers_recommended_without_pull(monkeypatch) -> None:
+    commands = []
+
+    def fake_run(argv, timeout):
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '"sha256:web"\n', "")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+
+    selected = runtime.select_local_sandbox_image("ctf-os-sandbox:web")
+
+    assert selected["selected_image"] == "ctf-os-sandbox:web"
+    assert selected["fallback_used"] is False
+    assert commands == [[
+        "docker", "image", "inspect", "ctf-os-sandbox:web", "--format", "{{json .Id}}",
+    ]]
+
+
+def test_local_image_selection_falls_back_to_base(monkeypatch) -> None:
+    def fake_run(argv, timeout):
+        if argv[3] == "ctf-os-sandbox:web":
+            return subprocess.CompletedProcess(argv, 1, "", "Error: No such image")
+        return subprocess.CompletedProcess(argv, 0, '"sha256:base"\n', "")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+
+    selected = runtime.select_local_sandbox_image("ctf-os-sandbox:web")
+
+    assert selected["selected_image"] == "ctf-os-sandbox:base"
+    assert selected["fallback_used"] is True
+    assert [row["image"] for row in selected["checks"]] == [
+        "ctf-os-sandbox:web", "ctf-os-sandbox:base",
+    ]
+
+
+def test_local_image_selection_stops_when_docker_is_unavailable(monkeypatch) -> None:
+    commands = []
+
+    def fake_run(argv, timeout):
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+
+    selected = runtime.select_local_sandbox_image("ctf-os-sandbox:web")
+
+    assert selected["status"] == "UNAVAILABLE"
+    assert selected["selected_image"] is None
+    assert len(commands) == 1
+
+
 def test_service_connectivity_probe_uses_declared_stable_alias(monkeypatch) -> None:
     commands = []
 

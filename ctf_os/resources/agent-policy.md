@@ -8,8 +8,7 @@ judge. The selected challenge owns the machine and session until a flag, the
 ## One live engine
 
 ```text
-challenge-local prepare
-→ create/prove the Root category sandbox
+challenge-local prepare + automatic Root category sandbox bootstrap
 → Root attacks immediately through sandbox-exec
 → Root may create 0–3 sandbox-backed native Sol/Terra/Luna workers
 → actual commands, artifacts, and attack mutation
@@ -58,6 +57,18 @@ execution has a distinct `attempt_id` and `run_id`. A fresh attempt inherits no
 artifact, cache, child identity, sandbox, service, or solver state. Input is
 read-only. Root and every worker have private writable `work`, `evidence`, and
 `artifacts` paths in the selected category sandbox.
+
+`prepare-challenge` inspects local images without pulling. It reuses a valid
+running Root sandbox when present; otherwise it selects the recommended category
+image, falls back to the local `ctf-os-sandbox:base`, and starts the Root sandbox
+through the same lifecycle used by `sandbox-create`. If the recommended resource
+profile cannot be admitted, the automatic Root bootstrap makes one bounded
+retry with the `light` profile. The result is persisted in
+`ROOT-SANDBOX.json` and projected into Solve Launch context. If Docker, both
+images, service attachment, or resource admission is unavailable, preparation
+reports `UNAVAILABLE` or `CREATE_FAILED` with a concrete recovery command. It
+does not silently execute challenge artifacts on the host. `--no-auto-sandbox`
+is an explicit operator escape hatch, not the Solve default.
 
 Root includes itself in model concurrency four, so at most three native children
 may run. Model lane state is separate from local process/resource state. Reuse

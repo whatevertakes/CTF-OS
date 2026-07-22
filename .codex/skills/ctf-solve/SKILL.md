@@ -25,34 +25,47 @@ uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<c
 
 When the request supplies description, hints, flag format, files, or declared
 remote data, pass the bounded challenge-local values with
-`--session-input-json`. Whole-contest Intake and Triage are optional
-administration and never Solve prerequisites.
+`--session-input-json`. Preparation returns challenge context, zero native
+workers, and `root_sandbox`. It automatically reuses or creates the Root
+sandbox from the recommended local image, with local `ctf-os-sandbox:base` as
+the only image fallback and no pull. When `root_sandbox.status` is `READY`, append
+the real attack command to its `exec_command_prefix` and execute immediately.
+When it is `UNAVAILABLE` or `CREATE_FAILED`, use the returned build or recovery
+command; do not silently execute challenge artifacts on the host.
+`--no-auto-sandbox` is only an explicit operator escape hatch. Root immediately
+attacks through the ready sandbox and does not wait for a child; no child is
+mandatory. Whole-contest Intake and Triage are
+optional administration and never Solve prerequisites.
 
-Read `run_root`, `recommended_environment.image`, and `service_plan` from the
-returned JSON. Before inspecting a challenge file, running recon, or executing
-an exploit, Root MUST have a live category sandbox at:
+Read `run_root`, `root_sandbox`, `recommended_environment.image`, and
+`service_plan` from the returned JSON. Before inspecting a challenge file,
+running recon, or executing an exploit, Root MUST have
+`root_sandbox.status == READY` and a live category sandbox at:
 
 ```text
 <run_root>/workers/root/sandbox.json
 ```
 
-If preparation reports a Dockerfile/Compose service plan, Root first inspects
-and reuses a healthy service or runs the existing `service-build` and
-`service-start` controller commands. Root owns that shared service lifecycle.
-Then create the Root sandbox; image selection is automatic from the selected
-category and preflight recommendation:
+No separate create command is needed when preparation returns `READY`; use its
+`metadata_path` and `exec_command_prefix`. On a resumed attempt, preparation
+proves and reuses an existing live owned Root sandbox. If it reports an image or
+Docker failure, run the returned build or recovery command and prepare again.
+
+If preparation reports a Dockerfile/Compose service plan that is not yet live,
+Root inspects it and runs the existing `service-build` and `service-start`
+controller commands. Root owns that shared service lifecycle. Then create the
+Root sandbox with mandatory service attachment:
 
 ```bash
 uv run python -m ctf_os.agent_tools sandbox-create '<selector>' \
   --contest '<contest>' --branch root \
-  --session-id root --session-role child --parent-session-id sol-main
+  --session-role sol --parent-session-id sol-main --service
 ```
 
-On a resumed attempt, if the metadata file already exists, first prove that the
-container is live with `sandbox-exec ... -- true` and reuse it. If that probe
-fails, run `sandbox-cleanup` for the exact metadata, run `sandbox-gc` if needed,
+Probe a manually recovered sandbox with `sandbox-exec ... -- true`. If an exact
+stale metadata path remains, run `sandbox-cleanup`, run `sandbox-gc` if needed,
 and recreate it. Never fall back to host challenge tools because sandbox
-bootstrap failed. Report the exact blocker instead.
+bootstrap failed; report the exact blocker instead.
 
 Root now attacks immediately. Every challenge inspection, analyzer, compiler,
 debugger, script, payload, solver, and remote request MUST run through:

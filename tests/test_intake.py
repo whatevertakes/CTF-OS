@@ -106,7 +106,10 @@ def _prepare(
     repo: Path, contest: str = "Demo CTF", selector: str = "1",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", selector, "--contest", contest],
+        [
+            "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
+            "prepare-challenge", selector, "--contest", contest, "--no-auto-sandbox",
+        ],
         capture_output=True, text=True,
     )
 

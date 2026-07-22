@@ -95,7 +95,7 @@ def test_solve_never_consumes_current_or_missing_legacy_triage(repo: Path) -> No
     run_intake(repo, "Demo Triage")
 
     without_triage = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage"],
+        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage", "--no-auto-sandbox"],
         capture_output=True, text=True, check=True,
     )
     prepared_without_triage = json.loads(without_triage.stdout)["result"]
@@ -125,7 +125,7 @@ def test_solve_never_consumes_current_or_missing_legacy_triage(repo: Path) -> No
     triage_bytes = triage_path.read_bytes()
 
     ready = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage"],
+        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage", "--no-auto-sandbox"],
         capture_output=True, text=True, check=True,
     )
     prepared_with_triage = json.loads(ready.stdout)["result"]
@@ -159,7 +159,7 @@ def test_stale_final_triage_is_ignored_without_rewriting_it(repo: Path) -> None:
     stale_bytes = triage_path.read_bytes()
 
     command = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage"],
+        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage", "--no-auto-sandbox"],
         capture_output=True, text=True, check=True,
     )
     payload = json.loads(command.stdout)["result"]
@@ -188,7 +188,7 @@ def test_malformed_current_triage_is_ignored_by_solve(repo: Path) -> None:
     triage_path.write_text("{not-json")
 
     command = subprocess.run(
-        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage"],
+        ["python", "-m", "ctf_os.agent_tools", "--repo", str(repo), "prepare-challenge", "1", "--contest", "Demo Triage", "--no-auto-sandbox"],
         capture_output=True, text=True,
     )
 

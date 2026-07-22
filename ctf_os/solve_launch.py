@@ -83,6 +83,8 @@ def build_solve_launch_context(
 
 
 def save_solve_launch_context(solve_root: Path, context: dict[str, object]) -> Path:
+    if solve_launch_size(context) > MAX_SOLVE_LAUNCH_BYTES:
+        raise ValueError("bounded Solve Launch Context exceeds 64 KiB")
     path = solve_root / "SOLVE-LAUNCH.json"
     if path.is_symlink():
         raise ValueError("Solve Launch Context path must not be a symlink")
