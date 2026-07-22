@@ -11,7 +11,8 @@ def test_skills_and_agents_define_dynamic_native_worker_contract() -> None:
         "worker-spawn-confirm", "sol-xhigh", "terra-high", "luna-high",
         "Root immediately", "completed command", "logging failure never",
         "worker-replace", "90 minutes", "flag-found", "interrupt_agent",
-        "A human submits", "Whole-contest",
+        "A human submits", "Whole-contest", "sandbox-create", "sandbox-exec",
+        "worker_paths.metadata_path", "Direct host execution",
     ):
         assert required in solve
     assert "--session-input-json" in solve
@@ -19,6 +20,8 @@ def test_skills_and_agents_define_dynamic_native_worker_contract() -> None:
     assert "current user-opened Root Sol session" in agents
     assert "prepare only that" in agents
     assert "never Solve prerequisites" in agents
+    assert "live `root` sandbox" in agents
+    assert "host execution is limited to CTF-OS controller commands" in agents
     assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
 
 
@@ -78,7 +81,29 @@ def test_required_model_profiles_are_short_and_present() -> None:
     for profile, model in expected.items():
         text = Path(f".codex/agents/{profile}.toml").read_text()
         assert f'name = "{profile}"' in text and f'model = "{model}"' in text
-        assert len(text.splitlines()) < 20
+        assert "sandbox-exec" in text
+        assert "worker_paths.metadata_path" in text
+        assert "directly on the host" in text
+        assert len(text.splitlines()) < 24
+
+
+def test_mandatory_sandbox_flow_is_consistent_across_authoritative_docs() -> None:
+    documents = [
+        Path(path).read_text()
+        for path in (
+            "AGENTS.md", "README.md", ".codex/skills/ctf-solve/SKILL.md",
+            "ctf_os/resources/agent-policy.md",
+        )
+    ]
+    for text in documents:
+        assert "sandbox-create" in text or "creates" in text
+        assert "sandbox-exec" in text
+        assert "category sandbox" in text
+        assert "host" in text
+    solve = documents[2]
+    assert solve.index("sandbox-create") < solve.index("Root now attacks immediately")
+    assert "A worker may be spawned only after that probe succeeds" in solve
+    assert "Keep the Root sandbox alive" in solve
 
 
 def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:
@@ -103,6 +128,6 @@ def test_competition_docs_preserve_minimum_boundaries() -> None:
     text = (Path("AGENTS.md").read_text() + Path("ctf_os/resources/agent-policy.md").read_text()).casefold()
     for required in (
         "host docker socket", "ssh", "browser", "personal cloud", "cloud metadata",
-        "undeclared private", "never submit", "native",
+        "undeclared private", "never submit", "native", "sandbox-exec",
     ):
         assert required in text
