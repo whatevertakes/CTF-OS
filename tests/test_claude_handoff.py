@@ -158,6 +158,7 @@ def test_cli_requires_current_exact_run_and_saves_by_manifest_identity(repo: Pat
     ]) == 0
     destination = repo / "rescue" / manifest.slug / challenge.id / "HANDOFF.md"
     assert destination.read_text(encoding="utf-8") == draft.read_text(encoding="utf-8")
+    assert json.loads((current / "STATE.json").read_text())["status"] == "HANDOFF"
 
 
 def test_skill_contract_covers_evidence_content_and_terminal_user_flow() -> None:
@@ -168,6 +169,7 @@ def test_skill_contract_covers_evidence_content_and_terminal_user_flow() -> None
         "## Useful technical material", "## Unresolved state", "## Clean start",
         "at most ten", "at most 100 lines", "32 KiB", "ATTACK_EVENTS.jsonl",
         "Do not ask", "Stop all new recon", "claude-handoff-save",
+        "HANDOFF` termination", "worker-stop-confirm",
         "원본 문제 ZIP과 이 파일을 사용자가 직접 Claude 시스템으로 옮기면 됩니다.",
         "이 문제에 대한 Codex 풀이를 여기서 종료합니다.",
     ):

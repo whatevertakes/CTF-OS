@@ -500,8 +500,13 @@ def run_doctor(repo: Path) -> dict[str, object]:
     stale_count = len(stale_sandboxes.stdout.split())
     add("stale-resources", stale_count == 0, f"{stale_count} stopped sandbox resources", "run sandbox-gc for stopped sandboxes")
     checks.extend(_gpu_doctor_checks(detect_gpus(), image_present))
-    sol_profile = repo / ".codex/agents/ctf_sol_xhigh.toml"
-    add("sol-xhigh-profile", sol_profile.is_file() and not sol_profile.is_symlink(), str(sol_profile), "restore the Sol xhigh child profile")
+    for name in ("ctf_sol_xhigh", "ctf_terra_high", "ctf_luna_high", "ctf_sol_max"):
+        profile = repo / f".codex/agents/{name}.toml"
+        add(
+            f"{name.removeprefix('ctf_')}-profile",
+            profile.is_file() and not profile.is_symlink(), str(profile),
+            f"restore the {name} worker profile",
+        )
     return {
         "ok": all(bool(item["ok"]) for item in checks),
         "host_system": platform.system(),

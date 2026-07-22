@@ -1,4 +1,4 @@
-# Forensic exploit-first playbook
+# Forensic attack playbook
 
 ## 1. Fast recon budget
 

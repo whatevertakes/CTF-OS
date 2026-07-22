@@ -56,7 +56,7 @@ uv run python -m ctf_os.agent_tools claude-handoff-save \
   --markdown-file '<temporary-markdown-file>'
 ```
 
-9. Verify that the command reports the current exact identity and `rescue/<contest>/<challenge>/HANDOFF.md`, that the file is at most 32 KiB, and that the challenge handoff directory contains only `HANDOFF.md`. Remove the temporary draft.
+9. Verify that the command reports the current exact identity, `HANDOFF` termination, and `rescue/<contest>/<challenge>/HANDOFF.md`, that the file is at most 32 KiB, and that the challenge handoff directory contains only `HANDOFF.md`. Native-interrupt every returned cancel target and record each with `worker-stop-confirm`. Remove the temporary draft.
 10. Do not call a Claude runtime, create a sandbox/job/start command, copy files, or continue solving. End the turn with exactly this shape, using `~` for the repository's home-relative installation path:
 
 ```text

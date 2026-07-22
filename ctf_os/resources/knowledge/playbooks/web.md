@@ -1,4 +1,4 @@
-# Web exploit-first playbook
+# Web attack playbook
 
 ## 1. Fast recon budget
 

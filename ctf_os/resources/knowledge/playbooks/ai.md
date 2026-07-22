@@ -1,4 +1,4 @@
-# AI exploit-first playbook
+# AI attack playbook
 
 ## 1. Fast recon budget
 

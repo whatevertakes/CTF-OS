@@ -1,4 +1,4 @@
-# Crypto exploit-first playbook
+# Crypto attack playbook
 
 ## 1. Fast recon budget
 

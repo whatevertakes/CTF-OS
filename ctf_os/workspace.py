@@ -27,7 +27,9 @@ RUN_MANIFEST_SCHEMA_VERSION = 2
 TARGET_REVISION_SCHEMA_VERSION = 1
 CURRENT_FINGERPRINT_SCHEME = "challenge-local-v2"
 LEGACY_FINGERPRINT_SCHEME = "challenge-v1"
-IMMUTABLE_RUN_STATUSES = frozenset({"ACCEPTED", "SEALED", "SOLVED", "SEALED_CLEAN"})
+IMMUTABLE_RUN_STATUSES = frozenset({
+    "ACCEPTED", "SEALED", "SOLVED", "SEALED_CLEAN", "HANDOFF", "SUPERSEDED",
+})
 LEGACY_RUN_FILES = (
     "STATE.json", "RESULT.md", "FINDINGS.md", "evidence.log", "findings.jsonl",
     "ATTACK_EVENTS.jsonl", "SWARM.json", "RESOURCE_STATE.json",
@@ -559,7 +561,7 @@ def _create_run_unlocked(
             "challenge_snapshot_digest": snapshot_digest,
             "transformation_seed": "NONE" if transformation_seed is None else str(transformation_seed),
             "solve_engine": "first-to-flag",
-            "active_child_width": 0, "planned_child_width": 0,
+            "active_child_width": 0,
             "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
             "created_at": now, "updated_at": now,
         })
@@ -918,15 +920,15 @@ def _recover_run_state_unlocked(
         events = read_jsonl_strict(run / "ATTACK_EVENTS.jsonl", "attack event ledger")
         _validate_recovery_identities(run_id, challenge_id, fingerprint, revision, events)
         lanes = _recovery_branches(run)
-        swarm_status = str(swarm.get("status") or "")
+        engine_status = str(swarm.get("status") or "")
         projected_status = {
-            "SPAWN_REQUIRED": "SWARM_READY",
             "ACTIVE": "SWARM_ACTIVE",
-            "ACTIVE_WITH_SPAWN_FAILURE": "SWARM_ACTIVE",
             "FLAG_FOUND": "SUBMISSION_RECOMMENDED",
             "ACCEPTED": "ACCEPTED",
             "TIMED_OUT": "TIMED_OUT",
-        }.get(swarm_status, "PREPARED")
+            "HANDOFF": "HANDOFF",
+            "SUPERSEDED": "SUPERSEDED",
+        }.get(engine_status, "PREPARED")
         winner = swarm.get("winner") if isinstance(swarm.get("winner"), Mapping) else {}
         submission_history = (
             [dict(row) for row in swarm.get("submission_history", []) if isinstance(row, Mapping)]
@@ -941,7 +943,7 @@ def _recover_run_state_unlocked(
             "sealed": projected_status == "ACCEPTED",
             "cleanup_state": "NOT_STARTED", "branches": lanes,
             "flag_candidate": winner.get("candidate"),
-            "competition_state": swarm_status or None,
+            "competition_state": engine_status or None,
             "submission_recommended": projected_status == "SUBMISSION_RECOMMENDED",
             "submission_history": submission_history,
             "input_fingerprint": fingerprint, "target_revision": revision,
@@ -949,7 +951,6 @@ def _recover_run_state_unlocked(
             "transformation_seed": manifest.get("transformation_seed", "NONE"),
             "solve_engine": "first-to-flag",
             "active_child_width": sum(row.get("status") == "RUNNING" for row in lanes),
-            "planned_child_width": sum(row.get("status") == "PENDING_SPAWN" for row in lanes),
             "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
             "created_at": started_at,
             "updated_at": str(swarm.get("updated_at") or started_at),
@@ -960,321 +961,7 @@ def _recover_run_state_unlocked(
             _preserve_corrupt_state(path)
         atomic_json(path, state)
         return state
-    milestones = read_jsonl_strict(run / "ATTACK_EVENTS.jsonl", "attack event ledger")
-    candidates = _recovery_candidates(run)
-    remote_receipts = _recovery_receipts(run, "remote-*.json", "remote flag receipt")
-    submissions = _recovery_receipts(run, "submission-*.json", "submission receipt")
-    terminal_rows = read_jsonl_strict(
-        run / "terminal-components.jsonl", "terminal component receipt ledger",
-    )
-    _validate_recovery_identities(
-        run_id, challenge_id, fingerprint, revision,
-        [*milestones, *remote_receipts, *submissions, *terminal_rows],
-    )
-
-    submission_by_candidate: dict[str, set[str]] = {}
-    for receipt in submissions:
-        candidate_id = str(receipt.get("candidate_id") or "")
-        result = str(receipt.get("result") or "").upper()
-        if not candidate_id or result not in {"WRONG", "ACCEPTED"}:
-            raise WorkspaceError("submission receipt is malformed")
-        submission_by_candidate.setdefault(candidate_id, set()).add(result)
-    conflicts = [cid for cid, results in submission_by_candidate.items() if len(results) > 1]
-    if conflicts:
-        raise WorkspaceError(
-            "corrupt authoritative submissions: ACCEPTED and WRONG exist for candidate "
-            + ", ".join(sorted(conflicts))
-        )
-
-    candidate_rows = candidates.get("candidates", [])
-    by_id = {
-        str(row.get("candidate_id")): dict(row) for row in candidate_rows
-        if isinstance(row, Mapping) and row.get("candidate_id")
-    }
-    candidates_changed = False
-    for receipt in milestones:
-        provenance = receipt.get("candidate_projection")
-        if not isinstance(provenance, Mapping):
-            continue
-        projected = _candidate_from_provenance(
-            run_id=run_id, session_id=str(receipt.get("session_id") or ""),
-            receipt_id=str(receipt.get("receipt_id") or ""), provenance=provenance,
-            created_at=str(receipt.get("created_at") or started_at), status="PROPOSED",
-        )
-        if projected["candidate_id"] not in by_id:
-            by_id[projected["candidate_id"]] = projected
-            candidates_changed = True
-    for receipt in remote_receipts:
-        candidate_id = str(receipt.get("candidate_id") or "")
-        if candidate_id in by_id:
-            continue
-        provenance = {
-            "candidate": receipt.get("candidate"), "source_type": "REMOTE_OUTPUT",
-            "confidence": receipt.get("confidence") or "LOW",
-            "validation_method": receipt.get("validation_method") or "REMOTE_SERVICE_ACCEPTANCE",
-        }
-        projected = _candidate_from_provenance(
-            run_id=run_id, session_id=str(receipt.get("branch_id") or ""),
-            receipt_id=str(receipt.get("receipt_id") or ""), provenance=provenance,
-            created_at=str(receipt.get("created_at") or started_at),
-            status=(
-                "SUBMISSION_RECOMMENDED"
-                if str(provenance["confidence"]).upper() == "HIGH" else "OBSERVED_REMOTE"
-            ),
-        )
-        if candidate_id and projected["candidate_id"] != candidate_id:
-            raise WorkspaceError("remote receipt candidate identity is corrupt")
-        by_id[projected["candidate_id"]] = projected
-        candidates_changed = True
-    for receipt in submissions:
-        candidate_id = str(receipt.get("candidate_id") or "")
-        if candidate_id in by_id:
-            continue
-        candidate_value = str(receipt.get("candidate") or "").strip()
-        session_id = str(receipt.get("session_id") or "sol-main").strip()
-        if not candidate_id or not candidate_value or not session_id:
-            raise WorkspaceError(
-                "submission receipt has no recoverable candidate provenance"
-            )
-        by_id[candidate_id] = {
-            "schema_version": 1, "candidate_id": candidate_id,
-            "run_id": run_id, "session_id": session_id,
-            "candidate": candidate_value, "source_type": "HUMAN_SUBMISSION",
-            "receipt_id": str(receipt.get("receipt_id") or ""),
-            "validation_method": "HUMAN_FEEDBACK", "confidence": "HIGH",
-            "status": "PROPOSED",
-            "created_at": str(receipt.get("created_at") or started_at),
-        }
-        candidates_changed = True
-    for candidate_id, results in submission_by_candidate.items():
-        if candidate_id in by_id:
-            by_id[candidate_id]["status"] = "ACCEPTED" if "ACCEPTED" in results else "REFUTED"
-            candidates_changed = True
-    if candidates_changed:
-        atomic_json(run / "candidates.json", {
-            "schema_version": 1,
-            "candidates": sorted(by_id.values(), key=lambda item: (
-                str(item.get("created_at", "")), str(item.get("candidate_id", "")),
-            )),
-        })
-
-    accepted = [row for row in submissions if str(row.get("result")).upper() == "ACCEPTED"]
-    accepted_ids = {str(row.get("candidate_id")) for row in accepted}
-    if len(accepted_ids) > 1:
-        raise WorkspaceError("multiple candidates have ACCEPTED submission receipts in one run")
-
-    active_remote: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for receipt in remote_receipts:
-        candidate_id = str(receipt.get("candidate_id") or "")
-        candidate = by_id.get(candidate_id)
-        confidence = str(receipt.get("confidence") or (candidate or {}).get("confidence") or "LOW").upper()
-        if confidence != "HIGH" or submission_by_candidate.get(candidate_id) == {"WRONG"}:
-            continue
-        if candidate is None:
-            raise WorkspaceError("verified remote receipt has no candidate provenance")
-        active_remote.append((receipt, candidate))
-    active_remote_ids = {str(candidate.get("candidate_id")) for _receipt, candidate in active_remote}
-    if not accepted_ids and len(active_remote_ids) > 1:
-        raise WorkspaceError("multiple HIGH remote receipts claim different active terminal candidates")
-    if accepted_ids:
-        active_remote = [
-            item for item in active_remote
-            if str(item[1].get("candidate_id")) in accepted_ids
-        ]
-
-    state: dict[str, Any] = {
-        "schema_version": RUN_SCHEMA_VERSION, "run_id": run_id,
-        "challenge_instance_id": manifest.get("challenge_instance_id"),
-        "attempt_id": manifest.get("attempt_id"),
-        "legacy_identity": not bool(manifest.get("challenge_instance_id") and manifest.get("attempt_id")),
-        "challenge_id": challenge_id, "status": "PREPARED", "sealed": False,
-        "cleanup_state": "NOT_STARTED", "branches": _recovery_branches(run),
-        "flag_candidate": None, "active_candidate_id": None,
-        "candidates": [
-            {
-                "candidate_id": row.get("candidate_id"), "status": row.get("status"),
-                "confidence": row.get("confidence"), "session_id": row.get("session_id"),
-            }
-            for row in sorted(by_id.values(), key=lambda item: (
-                str(item.get("created_at", "")), str(item.get("candidate_id", "")),
-            ))
-        ],
-        "verification": {}, "replay_verdict": None, "competition_state": None,
-        "remote_flag": None, "submission_recommended": False,
-        "remote_flag_receipt": None, "remote_candidate_receipt": None,
-        "flag_history": [], "submission_history": [],
-        "input_fingerprint": fingerprint, "target_revision": revision,
-        "challenge_snapshot_digest": manifest.get("challenge_snapshot_digest"),
-        "transformation_seed": manifest.get("transformation_seed", "NONE"),
-        "solve_engine": "first-to-flag",
-        "active_child_width": sum(
-            row.get("status") == "RUNNING" for row in _recovery_branches(run)
-        ),
-        "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
-        "created_at": started_at, "updated_at": started_at,
-    }
-    if recovery_warnings:
-        state["recovery_warnings"] = recovery_warnings
-
-    milestone_status = _recovery_milestone_status(milestones)
-    if milestone_status:
-        state["status"] = milestone_status
-    if state["branches"]:
-        state["status"] = _later_status(str(state["status"]), "RACE_RUNNING")
-
-    for receipt in remote_receipts:
-        candidate_id = str(receipt.get("candidate_id") or "")
-        candidate = by_id.get(candidate_id)
-        if candidate is None:
-            continue
-        confidence = str(receipt.get("confidence") or candidate.get("confidence") or "LOW").upper()
-        history_state = "REMOTE_FLAG_OBTAINED" if confidence == "HIGH" else "FLAG_CANDIDATE"
-        state["flag_history"].append({
-            "receipt_id": receipt.get("receipt_id"), "candidate_id": candidate_id,
-            "candidate": candidate.get("candidate"), "state": history_state,
-            "confidence": confidence, "created_at": receipt.get("created_at"),
-            "target_revision": receipt.get("target_revision"),
-        })
-    state["flag_history"].sort(key=lambda row: (str(row.get("created_at", "")), str(row.get("receipt_id", ""))))
-    state["submission_history"] = sorted([
-        {
-            "receipt_id": row.get("receipt_id"), "candidate_id": row.get("candidate_id"),
-            "result": str(row.get("result") or "").upper(), "created_at": row.get("created_at"),
-        }
-        for row in submissions
-    ], key=lambda row: (str(row.get("created_at", "")), str(row.get("receipt_id", ""))))
-
-    if active_remote:
-        receipt, candidate = active_remote[0]
-        state.update({
-            "status": "SUBMISSION_RECOMMENDED",
-            "competition_state": "SUBMISSION_RECOMMENDED",
-            "flag_candidate": candidate.get("candidate"),
-            "active_candidate_id": candidate.get("candidate_id"),
-            "remote_flag": candidate.get("candidate"), "submission_recommended": True,
-            "remote_flag_receipt": f"flag-receipts/remote-{receipt.get('receipt_id')}.json",
-        })
-    else:
-        active_candidates = [
-            row for row in by_id.values()
-            if str(row.get("status")) not in {"REFUTED"}
-        ]
-        if active_candidates:
-            latest = sorted(active_candidates, key=lambda row: (
-                str(row.get("created_at", "")), str(row.get("candidate_id", "")),
-            ))[-1]
-            state.update({
-                "status": _later_status(str(state["status"]), "FLAG_CANDIDATE"),
-                "flag_candidate": latest.get("candidate"),
-                "active_candidate_id": latest.get("candidate_id"),
-            })
-            matching_remote = next((
-                row for row in reversed(sorted(remote_receipts, key=lambda item: (
-                    str(item.get("created_at", "")), str(item.get("receipt_id", "")),
-                )))
-                if row.get("candidate_id") == latest.get("candidate_id")
-            ), None)
-            if matching_remote is not None:
-                state["remote_candidate_receipt"] = (
-                    f"flag-receipts/remote-{matching_remote.get('receipt_id')}.json"
-                )
-        elif any("WRONG" in results for results in submission_by_candidate.values()):
-            state["status"] = (
-                "RACE_RUNNING"
-                if any(row.get("status") == "RUNNING" for row in state["branches"])
-                else "SOLVING"
-            )
-
-    terminal_components = _recover_terminal_components(terminal_rows)
-    if accepted:
-        receipt = sorted(accepted, key=lambda row: (
-            str(row.get("created_at", "")), str(row.get("receipt_id", "")),
-        ))[-1]
-        candidate_id = str(receipt.get("candidate_id"))
-        candidate = by_id.get(candidate_id)
-        if candidate is None:
-            raise WorkspaceError("ACCEPTED submission receipt has no candidate provenance")
-        state.update({
-            "status": "SEALED", "solve_status": "SOLVED", "sealed": True,
-            "sealed_at": receipt.get("created_at"), "competition_state": "ACCEPTED",
-            "active_candidate_id": candidate_id,
-            "flag_candidate": candidate.get("candidate") or receipt.get("candidate"),
-            "submission_recommended": False,
-            "submission_receipt": f"flag-receipts/submission-{receipt.get('receipt_id')}.json",
-            "cleanup_state": "TERMINATION_PENDING",
-        })
-        if terminal_components:
-            state["terminal_components"] = terminal_components
-        if _terminal_components_clean(terminal_components, terminal_rows):
-            state["status"] = "SEALED_CLEAN"
-            state["cleanup_state"] = "SEALED_CLEAN"
-
-    timestamps = [started_at]
-    timestamps.extend(
-        str(row.get("created_at")) for row in [*milestones, *remote_receipts, *submissions, *terminal_rows]
-        if row.get("created_at")
-    )
-    state["updated_at"] = max(timestamps)
-    if preserve_corrupt:
-        _preserve_corrupt_state(path)
-    atomic_json(path, state)
-    return state
-
-
-def _recovery_candidates(run: Path) -> dict[str, Any]:
-    path = run / "candidates.json"
-    if not path.exists():
-        return {"schema_version": 1, "candidates": []}
-    payload = _load_json_object(path, "candidate store")
-    rows = payload.get("candidates")
-    if payload.get("schema_version") != 1 or not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise WorkspaceError("candidate store is malformed")
-    return payload
-
-
-def _candidate_from_provenance(
-    *, run_id: str, session_id: str, receipt_id: str,
-    provenance: Mapping[str, Any], created_at: str, status: str,
-) -> dict[str, Any]:
-    candidate = str(provenance.get("candidate") or "").strip()
-    source = str(provenance.get("source_type") or "").strip().upper()
-    validation = str(provenance.get("validation_method") or "").strip().upper()
-    confidence = str(provenance.get("confidence") or "LOW").strip().upper()
-    if not candidate or not session_id or not receipt_id or not source or not validation:
-        raise WorkspaceError("candidate provenance receipt is incomplete")
-    material = {
-        "run_id": run_id, "session_id": session_id, "candidate": candidate,
-        "source_type": source, "receipt_id": receipt_id,
-        "validation_method": validation,
-    }
-    candidate_id = hashlib.sha256(
-        json.dumps(material, sort_keys=True, separators=(",", ":")).encode(),
-    ).hexdigest()[:24]
-    return {
-        "schema_version": 1, "candidate_id": candidate_id, **material,
-        "confidence": confidence, "status": status, "created_at": created_at,
-    }
-
-
-def _recovery_receipts(run: Path, pattern: str, label: str) -> list[dict[str, Any]]:
-    root = run / "flag-receipts"
-    if not root.exists():
-        return []
-    rows = []
-    for path in sorted(root.glob(pattern)):
-        row = _load_json_object(path, label)
-        if (
-            label == "remote flag receipt"
-            and not row.get("receipt_id")
-            and row.get("schema_version") is None
-            and row.get("flag")
-        ):
-            # Legacy display-only files never contained enough evidence to be
-            # authoritative. Preserve them, but do not promote them during
-            # STATE reconstruction.
-            continue
-        rows.append(row)
-    return rows
+    raise WorkspaceError("run manifest does not use the one live first-to-flag engine")
 
 
 def _validate_recovery_target_revision(run: Path, revision: int) -> None:
@@ -1342,90 +1029,11 @@ def _recovery_branches(run: Path) -> list[dict[str, Any]]:
         {
             "id": row.get("id"), "session_id": row.get("native_session"),
             "status": row.get("status"), "role": row.get("role"),
-            **({"metadata_path": row.get("sandbox", {}).get("metadata_path")}
-               if isinstance(row.get("sandbox"), Mapping) else {}),
+            **({"metadata_path": row.get("worker_paths", {}).get("metadata_path")}
+               if isinstance(row.get("worker_paths"), Mapping) else {}),
         }
         for row in rows if row.get("id")
     ]
-
-
-def _recovery_milestone_status(rows: Sequence[Mapping[str, Any]]) -> str | None:
-    mapping = {
-        "COMMAND_EXECUTED": "SOLVING", "ATTACK_PATH_FOUND": "SOLVING",
-        "EXPLOIT_ATTEMPTED": "SOLVING", "PRIMITIVE": "SOLVING",
-        "POC": "POC_BUILDING", "WORKING_POC": "POC_BUILDING",
-        "REMOTE_ATTEMPT": "POC_BUILDING", "FLAG_FOUND": "SUBMISSION_RECOMMENDED",
-    }
-    status: str | None = None
-    for row in rows:
-        projected = mapping.get(str(row.get("type") or "").upper())
-        if projected:
-            status = projected if status is None else _later_status(status, projected)
-    return status
-
-
-def _later_status(current: str, proposed: str) -> str:
-    order = [
-        "PREPARED", "SWARM_READY", "SOLVING", "RACE_RUNNING", "POC_BUILDING",
-        "SUBMISSION_RECOMMENDED", "SEALED", "SEALED_CLEAN",
-    ]
-    if current not in order:
-        return proposed
-    return proposed if order.index(proposed) > order.index(current) else current
-
-
-def _recover_terminal_components(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    components: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        session_id = str(row.get("session_id") or "")
-        component_name = str(row.get("component") or "").lower()
-        status = str(row.get("status") or "").upper()
-        if not session_id or component_name not in {"native", "sandbox", "resource", "terminal"}:
-            raise WorkspaceError("terminal component receipt is malformed")
-        if component_name == "terminal":
-            continue
-        component = components.setdefault(session_id, {
-            "native": "NOT_REQUIRED", "sandbox": "NOT_PRESENT", "resource": "NOT_PRESENT",
-        })
-        mapping = {
-            "native": {
-                "STOP_REQUESTED": "TERMINATION_PENDING", "STOP_RECORDED": "TERMINAL_RECORDED",
-                "NOT_REQUIRED": "NOT_REQUIRED",
-            },
-            "sandbox": {
-                "CLEANUP_PENDING": "CLEANUP_PENDING", "CLEANUP_STARTED": "CLEANUP_IN_PROGRESS",
-                "CLEANED": "CLEANED", "CLEANUP_FAILED": "CLEANUP_FAILED", "NOT_PRESENT": "NOT_PRESENT",
-            },
-            "resource": {
-                "RELEASE_PENDING": "RELEASE_PENDING", "RELEASE_STARTED": "RELEASE_IN_PROGRESS",
-                "RELEASED": "RELEASED", "RELEASE_FAILED": "RELEASE_FAILED", "NOT_PRESENT": "NOT_PRESENT",
-            },
-        }
-        projected = mapping[component_name].get(status)
-        if projected is None:
-            raise WorkspaceError("terminal component receipt status is unsupported")
-        component[component_name] = projected
-        if row.get("related_receipt") is not None:
-            component[f"{component_name}_receipt"] = row.get("related_receipt")
-        if row.get("error"):
-            component[f"{component_name}_error"] = row.get("error")
-    return components
-
-
-def _terminal_components_clean(
-    components: Mapping[str, Mapping[str, Any]], rows: Sequence[Mapping[str, Any]],
-) -> bool:
-    complete = any(
-        str(row.get("component")).lower() == "terminal"
-        and str(row.get("status")).upper() == "CONVERGENCE_COMPLETE"
-        for row in rows
-    )
-    return complete or bool(components) and all(
-        row.get("native") in {"NOT_REQUIRED", "TERMINAL_RECORDED"}
-        and row.get("sandbox") in {"NOT_PRESENT", "CLEANED"}
-        and row.get("resource") in {"NOT_PRESENT", "RELEASED"}
-        for row in components.values()
-    )
 
 
 def _preserve_corrupt_state(path: Path) -> Path:
