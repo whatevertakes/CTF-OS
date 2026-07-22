@@ -19,7 +19,6 @@ from .attempts import (
     legacy_identity as derive_legacy_identity, run_id_for_attempt, safe_attempt_id,
 )
 from .contest import ChallengeSpec, ContestManifest
-from .modes import DEFAULT_LIVE_MODE, SolveMode, resolve_solve_mode
 
 
 RUN_SCHEMA_VERSION = 4
@@ -31,12 +30,9 @@ LEGACY_FINGERPRINT_SCHEME = "challenge-v1"
 IMMUTABLE_RUN_STATUSES = frozenset({"ACCEPTED", "SEALED", "SOLVED", "SEALED_CLEAN"})
 LEGACY_RUN_FILES = (
     "STATE.json", "RESULT.md", "FINDINGS.md", "evidence.log", "findings.jsonl",
-    "race-events.jsonl", "race-event-acks.json", "RACE_LEDGER.jsonl",
-    "RACE_TRANSITIONS.jsonl", "DELEGATION_PLAN.json", "RESOURCE_STATE.json",
+    "ATTACK_EVENTS.jsonl", "SWARM.json", "RESOURCE_STATE.json",
     "RESOURCE_HISTORY.jsonl", "REPRODUCE.json", "reproduce.sh",
-    "milestone-receipts.jsonl", "control-actions.jsonl", "terminal-components.jsonl",
-    "post-commit-errors.jsonl", "projection-errors.jsonl", "candidates.json",
-    "progress-state.json",
+    "post-commit-errors.jsonl",
 )
 LEGACY_RUN_DIRECTORIES = ("flag-receipts", "workers", "exploit", "artifacts", "evidence")
 
@@ -272,7 +268,6 @@ def start_fresh_attempt(
     root: Path, challenge: ChallengeSpec, fingerprint: str, *,
     target_revision: int | None = None, attempt_id: str | None = None,
     transformation_seed: str | int | None = None,
-    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
     requested_model: str = "", requested_reasoning: str = "",
     publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
@@ -280,8 +275,7 @@ def start_fresh_attempt(
         root, challenge, fingerprint, target_revision=target_revision,
         requested_model=requested_model, requested_reasoning=requested_reasoning,
         fresh_attempt=True, attempt_id=attempt_id,
-        transformation_seed=transformation_seed, mode=mode,
-        legacy_tier=legacy_tier, publish_active=publish_active,
+        transformation_seed=transformation_seed, publish_active=publish_active,
         local_target_image_digest=local_target_image_digest,
     )
 
@@ -303,7 +297,6 @@ def initialize_solve_files(
     *, target_revision: int | None = None, requested_model: str = "",
     requested_reasoning: str = "", fresh_attempt: bool = False,
     attempt_id: str | None = None, transformation_seed: str | int | None = None,
-    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
     publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
     """Create or resolve one immutable-generation solve run.
@@ -335,8 +328,7 @@ def initialize_solve_files(
             target_revision=revision, requested_model=requested_model,
             requested_reasoning=requested_reasoning, fresh_attempt=fresh_attempt,
             attempt_id=attempt_id, transformation_seed=transformation_seed,
-            solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
-            legacy_tier=legacy_tier, publish_active=publish_active,
+            publish_active=publish_active,
             local_target_image_digest=local_target_image_digest,
         )
 
@@ -347,7 +339,6 @@ def bind_input_fingerprint(
     requested_reasoning: str = "", legacy_fingerprints: Sequence[str] = (),
     fresh_attempt: bool = False, attempt_id: str | None = None,
     transformation_seed: str | int | None = None,
-    mode: SolveMode | str | None = None, legacy_tier: int | None = None,
     publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
     """Bind a run without mutating or erasing any previous run generation."""
@@ -375,8 +366,7 @@ def bind_input_fingerprint(
                     workspace, challenge=challenge, fingerprint=fingerprint,
                     target_revision=revision, requested_model=requested_model,
                     requested_reasoning=requested_reasoning,
-                    solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
-                    legacy_tier=legacy_tier, publish_active=publish_active,
+                    publish_active=publish_active,
                     local_target_image_digest=local_target_image_digest,
                 )
             try:
@@ -403,8 +393,7 @@ def bind_input_fingerprint(
             target_revision=revision, requested_model=requested_model,
             requested_reasoning=requested_reasoning, fresh_attempt=fresh_attempt,
             attempt_id=attempt_id, transformation_seed=transformation_seed,
-            solve_mode=resolve_solve_mode(mode, tier=legacy_tier),
-            legacy_tier=legacy_tier, publish_active=publish_active,
+            publish_active=publish_active,
             local_target_image_digest=local_target_image_digest,
         )
         # A legacy STATE.json is retained only as a non-authoritative
@@ -428,39 +417,6 @@ def record_target_revision(
 
 def target_revisions(root: Path) -> list[dict[str, Any]]:
     return read_jsonl_strict(challenge_workspace(root) / "target-revisions.jsonl", "target revision ledger")
-
-
-def update_run_manifest_timing(root: Path, field: str, timestamp: str | None = None) -> None:
-    allowed = {
-        "first_decisive_experiment_at", "primitive_confirmed_at", "working_poc_at",
-        "first_remote_attempt_at", "flag_observed_at", "submission_result_at",
-        "first_meaningful_observation_at", "first_viable_hypothesis_at",
-        "first_primitive_confirmed_at", "first_working_poc_at",
-        "first_flag_candidate_at", "first_oracle_accepted_flag_at", "attempt_finished_at",
-    }
-    if field not in allowed:
-        raise WorkspaceError(f"unsupported run timing field: {field}")
-    run = resolve_active_run(root)
-    with state_lock(run):
-        path = run / "RUN_MANIFEST.json"
-        manifest = _load_json_object(path, "run manifest")
-        timing = manifest.get("timing")
-        if not isinstance(timing, dict):
-            raise WorkspaceError("run manifest timing section is malformed")
-        if timing.get(field) is None:
-            timing[field] = timestamp or utc_now()
-            canonical = {
-                "primitive_confirmed_at": "first_primitive_confirmed_at",
-                "working_poc_at": "first_working_poc_at",
-                "flag_observed_at": "first_flag_candidate_at",
-            }.get(field, field)
-            timestamps = manifest.get("timestamps")
-            if isinstance(timestamps, dict) and canonical in timestamps:
-                timestamps[canonical] = timing[field]
-                reasons = manifest.get("timestamp_missing_reasons")
-                if isinstance(reasons, dict):
-                    reasons[canonical] = None
-            atomic_json(path, manifest)
 
 
 def append_jsonl_fsync(path: Path, payload: Mapping[str, Any], *, label: str = "ledger") -> None:
@@ -545,7 +501,6 @@ def _create_run_unlocked(
     target_revision: int, requested_model: str, requested_reasoning: str,
     fresh_attempt: bool = False, attempt_id: str | None = None,
     transformation_seed: str | int | None = None,
-    solve_mode: SolveMode = DEFAULT_LIVE_MODE, legacy_tier: int | None = None,
     publish_active: bool = True, local_target_image_digest: str | None = None,
 ) -> Path:
     snapshot_digest = derive_challenge_snapshot_digest(
@@ -603,8 +558,7 @@ def _create_run_unlocked(
             "input_fingerprint": fingerprint, "target_revision": target_revision,
             "challenge_snapshot_digest": snapshot_digest,
             "transformation_seed": "NONE" if transformation_seed is None else str(transformation_seed),
-            "solve_mode": solve_mode.value,
-            "legacy_tier": legacy_tier,
+            "solve_engine": "first-to-flag",
             "active_child_width": 0, "planned_child_width": 0,
             "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
             "created_at": now, "updated_at": now,
@@ -615,7 +569,7 @@ def _create_run_unlocked(
             requested_model=requested_model, requested_reasoning=requested_reasoning,
             challenge_instance_id=instance_id, attempt_id=selected_attempt_id,
             challenge_snapshot_digest=snapshot_digest,
-            transformation_seed=transformation_seed, solve_mode=solve_mode,
+            transformation_seed=transformation_seed,
         ))
     pointer = {
         "schema_version": ACTIVE_RUN_SCHEMA_VERSION, "run_id": run_id,
@@ -633,16 +587,12 @@ def _ensure_run_files(run: Path, challenge: ChallengeSpec) -> None:
     findings = run / "FINDINGS.md"
     if not findings.exists():
         atomic_text(findings, f"# Findings — {challenge.key}\n\nNo findings recorded yet.\n")
-    for name in (
-        "evidence.log", "race-events.jsonl", "control-actions.jsonl",
-        "milestone-receipts.jsonl", "terminal-components.jsonl",
-    ):
+    for name in ("evidence.log", "ATTACK_EVENTS.jsonl"):
         path = run / name
         if path.is_symlink():
             raise WorkspaceError(f"run ledger must not be a symlink: {path}")
         path.touch(exist_ok=True)
-    (run / "flag-receipts").mkdir(exist_ok=True)
-    (run / "receipt-projections").mkdir(exist_ok=True)
+    (run / "artifacts").mkdir(exist_ok=True)
 
 
 def _migrate_legacy_unlocked(workspace: Path, challenge: ChallengeSpec | None = None) -> bool:
@@ -701,13 +651,9 @@ def _migrate_legacy_unlocked(workspace: Path, challenge: ChallengeSpec | None = 
     if challenge is not None:
         _ensure_run_files(run, challenge)
     else:
-        for name in (
-            "evidence.log", "race-events.jsonl", "control-actions.jsonl",
-            "milestone-receipts.jsonl", "terminal-components.jsonl",
-        ):
+        for name in ("evidence.log", "ATTACK_EVENTS.jsonl"):
             (run / name).touch(exist_ok=True)
-        (run / "flag-receipts").mkdir(exist_ok=True)
-        (run / "receipt-projections").mkdir(exist_ok=True)
+        (run / "artifacts").mkdir(exist_ok=True)
     if not (run / "RUN_MANIFEST.json").exists():
         placeholder = challenge or _LegacyChallenge(challenge_id)
         atomic_json(run / "RUN_MANIFEST.json", _run_manifest(
@@ -765,38 +711,15 @@ def _run_manifest(
     challenge_instance_id: str | None = None, attempt_id: str | None = None,
     challenge_snapshot_digest: str | None = None,
     transformation_seed: str | int | None = None,
-    solve_mode: SolveMode = DEFAULT_LIVE_MODE,
 ) -> dict[str, Any]:
     commit, dirty = _repository_identity(workspace)
     started = utc_now()
-    timestamps = {
-        "attempt_started_at": started,
-        "first_meaningful_observation_at": None,
-        "first_viable_hypothesis_at": None,
-        "first_decisive_experiment_at": None,
-        "first_primitive_confirmed_at": None,
-        "first_working_poc_at": None,
-        "first_remote_attempt_at": None,
-        "first_flag_candidate_at": None,
-        "first_oracle_accepted_flag_at": None,
-        "attempt_finished_at": None,
-        "submission_result_at": None,
-    }
-    missing_reasons = {
-        key: (None if value is not None else "NOT_YET_OBSERVED")
-        for key, value in timestamps.items()
-    }
-    unavailable = lambda reason: {
-        "value": None, "observation_status": "NOT_OBSERVABLE", "reason": reason,
-    }
     return {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
         "challenge_instance_id": challenge_instance_id,
         "attempt_id": attempt_id,
         "run_id": run_id,
-        "arm": "LIVE", "mode": solve_mode.value, "repetition": None,
-        "matched_block_id": None, "stratum": "LIVE_CONTEST",
-        "lock_digest": None, "configuration_digest": None,
+        "solve_engine": "first-to-flag",
         "transformation_seed": "NONE" if transformation_seed is None else str(transformation_seed),
         "identity": {
             "challenge_instance_id": challenge_instance_id, "attempt_id": attempt_id,
@@ -804,63 +727,23 @@ def _run_manifest(
         },
         "repository": {"commit_sha": commit, "dirty_diff_digest": dirty},
         "runtime": {
-            "requested_model": requested_model, "observed_model": None,
-            "requested_reasoning": requested_reasoning, "observed_reasoning": None,
-            "observed_model_missing_reason": "NOT_YET_OBSERVED",
-            "observed_reasoning_missing_reason": "NOT_YET_OBSERVED",
-            "runtime_observation_evidence": None,
+            "root_model_request": requested_model or "gpt-5.6-sol",
+            "root_reasoning_request": requested_reasoning or "xhigh",
+            "model_observation_is_not_an_attack_gate": True,
         },
         "challenge": {
             "challenge_id": challenge.id, "run_id": run_id,
             "input_fingerprint": fingerprint, "target_revision": target_revision,
         },
         "environment": {
-            "container_digest": None, "target_image_digest": None, "tool_image_digest": None,
-            "cli_build_hash": None,
             "host_profile": {
                 "system": platform.system(), "kernel": platform.release(),
                 "machine": platform.machine(), "cpu_count": os.cpu_count(),
             },
             "tool_versions": {"python": platform.python_version()},
-            "docker_server": unavailable("not observed during general attempt preparation"),
-            "network_profile": None, "time_limit_seconds": None,
-            "maximum_model_concurrency": 1 if solve_mode is SolveMode.SOL_ONLY else 4,
-            "random_seed": None,
+            "maximum_model_concurrency": 4,
         },
-        "timing": {
-            "started_at": started, "first_decisive_experiment_at": None,
-            "primitive_confirmed_at": None, "working_poc_at": None,
-            "first_remote_attempt_at": None, "flag_observed_at": None,
-            "submission_result_at": None,
-        },
-        "timestamps": timestamps,
-        "timestamp_missing_reasons": missing_reasons,
-        "outcome": {
-            "oracle_result": None, "solved": None, "censored": None,
-            "censor_time_seconds": None, "environment_failure": False,
-            "invalidation_reason": None, "cleanup_success": None,
-            "terminal_correctness": None,
-        },
-        "resource_consumption": {
-            "model_queue_seconds": unavailable("external model queue telemetry is not observable"),
-            "model_tokens": unavailable("external model token telemetry is not observable"),
-            "subscription_units": unavailable("subscription telemetry is not observable"),
-            "model_session_minutes": unavailable("external model session telemetry is not observable"),
-            "cpu_seconds": unavailable("resource monitor has not completed"),
-            "ram_gib_seconds": unavailable("resource monitor has not completed"),
-            "ram_peak_bytes": unavailable("resource monitor has not completed"),
-            "network_rx_bytes": unavailable("resource monitor has not completed"),
-            "network_tx_bytes": unavailable("resource monitor has not completed"),
-            "container_lifetime_seconds": unavailable("resource monitor has not completed"),
-            "child_session_count": {"value": 0, "observation_status": "OBSERVED", "reason": None},
-            "maximum_active_width": {"value": 0, "observation_status": "OBSERVED", "reason": None},
-        },
-        "target_health_intervals": [],
-        "target_health_probe_contract": {
-            "deterministic_host_process": True, "cadence_seconds": 60,
-            "required_at": ["RUN_START", "EVERY_60_SECONDS", "RUN_END"],
-            "creates_model_sessions": False,
-        },
+        "timing": {"started_at": started, "budget_seconds": 90 * 60},
         "challenge_snapshot_digest": challenge_snapshot_digest,
     }
 
@@ -1020,7 +903,64 @@ def _recover_run_state_unlocked(
     started_at = str(timing.get("started_at") or "")
     if not started_at:
         raise WorkspaceError("run manifest has no deterministic start time")
-    milestones = read_jsonl_strict(run / "milestone-receipts.jsonl", "milestone receipt ledger")
+    if manifest.get("solve_engine") == "first-to-flag":
+        swarm_path = run / "SWARM.json"
+        swarm = (
+            _load_json_object(swarm_path, "swarm state")
+            if swarm_path.is_file() and not swarm_path.is_symlink() else {}
+        )
+        if swarm and (
+            swarm.get("run_id") != run_id
+            or swarm.get("challenge_id") != challenge_id
+            or swarm.get("input_fingerprint") != fingerprint
+        ):
+            raise WorkspaceError("swarm identity does not match its exact attempt")
+        events = read_jsonl_strict(run / "ATTACK_EVENTS.jsonl", "attack event ledger")
+        _validate_recovery_identities(run_id, challenge_id, fingerprint, revision, events)
+        lanes = _recovery_branches(run)
+        swarm_status = str(swarm.get("status") or "")
+        projected_status = {
+            "SPAWN_REQUIRED": "SWARM_READY",
+            "ACTIVE": "SWARM_ACTIVE",
+            "ACTIVE_WITH_SPAWN_FAILURE": "SWARM_ACTIVE",
+            "FLAG_FOUND": "SUBMISSION_RECOMMENDED",
+            "ACCEPTED": "ACCEPTED",
+            "TIMED_OUT": "TIMED_OUT",
+        }.get(swarm_status, "PREPARED")
+        winner = swarm.get("winner") if isinstance(swarm.get("winner"), Mapping) else {}
+        submission_history = (
+            [dict(row) for row in swarm.get("submission_history", []) if isinstance(row, Mapping)]
+            if isinstance(swarm.get("submission_history"), list) else []
+        )
+        state = {
+            "schema_version": RUN_SCHEMA_VERSION, "run_id": run_id,
+            "challenge_instance_id": manifest.get("challenge_instance_id"),
+            "attempt_id": manifest.get("attempt_id"),
+            "legacy_identity": not bool(manifest.get("challenge_instance_id") and manifest.get("attempt_id")),
+            "challenge_id": challenge_id, "status": projected_status,
+            "sealed": projected_status == "ACCEPTED",
+            "cleanup_state": "NOT_STARTED", "branches": lanes,
+            "flag_candidate": winner.get("candidate"),
+            "competition_state": swarm_status or None,
+            "submission_recommended": projected_status == "SUBMISSION_RECOMMENDED",
+            "submission_history": submission_history,
+            "input_fingerprint": fingerprint, "target_revision": revision,
+            "challenge_snapshot_digest": manifest.get("challenge_snapshot_digest"),
+            "transformation_seed": manifest.get("transformation_seed", "NONE"),
+            "solve_engine": "first-to-flag",
+            "active_child_width": sum(row.get("status") == "RUNNING" for row in lanes),
+            "planned_child_width": sum(row.get("status") == "PENDING_SPAWN" for row in lanes),
+            "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
+            "created_at": started_at,
+            "updated_at": str(swarm.get("updated_at") or started_at),
+        }
+        if recovery_warnings:
+            state["recovery_warnings"] = recovery_warnings
+        if preserve_corrupt:
+            _preserve_corrupt_state(path)
+        atomic_json(path, state)
+        return state
+    milestones = read_jsonl_strict(run / "ATTACK_EVENTS.jsonl", "attack event ledger")
     candidates = _recovery_candidates(run)
     remote_receipts = _recovery_receipts(run, "remote-*.json", "remote flag receipt")
     submissions = _recovery_receipts(run, "submission-*.json", "submission receipt")
@@ -1166,7 +1106,7 @@ def _recover_run_state_unlocked(
         "input_fingerprint": fingerprint, "target_revision": revision,
         "challenge_snapshot_digest": manifest.get("challenge_snapshot_digest"),
         "transformation_seed": manifest.get("transformation_seed", "NONE"),
-        "solve_mode": manifest.get("mode", "adaptive-race"),
+        "solve_engine": "first-to-flag",
         "active_child_width": sum(
             row.get("status") == "RUNNING" for row in _recovery_branches(run)
         ),
@@ -1391,44 +1331,34 @@ def _validate_recovery_identities(
 
 
 def _recovery_branches(run: Path) -> list[dict[str, Any]]:
-    lineage = run / "RACE_LINEAGE.jsonl"
-    if lineage.is_file() and not lineage.is_symlink():
-        from .race_lineage import lineage_state
-
-        return [
-            {
-                "id": row.get("branch_id"), "branch_id": row.get("branch_id"),
-                "session_id": row.get("session_id"), "generation": row.get("generation"),
-                "status": row.get("status"), "mode": row.get("mode"),
-            }
-            for row in lineage_state(run).get("branches", [])
-        ]
-    path = run / "DELEGATION_PLAN.json"
+    path = run / "SWARM.json"
     if not path.exists():
         return []
-    plan = _load_json_object(path, "delegation plan")
-    rows = plan.get("branches")
+    plan = _load_json_object(path, "swarm state")
+    rows = plan.get("lanes")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise WorkspaceError("delegation plan branches are malformed")
+        raise WorkspaceError("swarm lanes are malformed")
     return [
         {
-            "id": row.get("session_id"), "status": row.get("status"),
-            **({"metadata_path": row.get("sandbox_metadata_path")} if row.get("sandbox_metadata_path") else {}),
+            "id": row.get("id"), "session_id": row.get("native_session"),
+            "status": row.get("status"), "role": row.get("role"),
+            **({"metadata_path": row.get("sandbox", {}).get("metadata_path")}
+               if isinstance(row.get("sandbox"), Mapping) else {}),
         }
-        for row in rows if row.get("session_id")
+        for row in rows if row.get("id")
     ]
 
 
 def _recovery_milestone_status(rows: Sequence[Mapping[str, Any]]) -> str | None:
     mapping = {
-        "DECISIVE_EXPERIMENT": "SOLVING", "LONG_COMPUTE": "SOLVING",
-        "TYPED_BLOCKER": "SOLVING", "PRIMITIVE_CANDIDATE": "PRIMITIVE_CANDIDATE",
-        "PRIMITIVE_CONFIRMED": "PRIMITIVE_CONFIRMED", "WORKING_POC": "POC_BUILDING",
-        "REMOTE_ATTEMPT": "POC_BUILDING", "FLAG_CANDIDATE": "FLAG_CANDIDATE",
+        "COMMAND_EXECUTED": "SOLVING", "ATTACK_PATH_FOUND": "SOLVING",
+        "EXPLOIT_ATTEMPTED": "SOLVING", "PRIMITIVE": "SOLVING",
+        "POC": "POC_BUILDING", "WORKING_POC": "POC_BUILDING",
+        "REMOTE_ATTEMPT": "POC_BUILDING", "FLAG_FOUND": "SUBMISSION_RECOMMENDED",
     }
     status: str | None = None
     for row in rows:
-        projected = mapping.get(str(row.get("event_type") or "").upper())
+        projected = mapping.get(str(row.get("type") or "").upper())
         if projected:
             status = projected if status is None else _later_status(status, projected)
     return status
@@ -1436,8 +1366,7 @@ def _recovery_milestone_status(rows: Sequence[Mapping[str, Any]]) -> str | None:
 
 def _later_status(current: str, proposed: str) -> str:
     order = [
-        "PREPARED", "SOLVING", "RACE_RUNNING", "PRIMITIVE_CANDIDATE",
-        "PRIMITIVE_CONFIRMED", "POC_BUILDING", "FLAG_CANDIDATE",
+        "PREPARED", "SWARM_READY", "SOLVING", "RACE_RUNNING", "POC_BUILDING",
         "SUBMISSION_RECOMMENDED", "SEALED", "SEALED_CLEAN",
     ]
     if current not in order:

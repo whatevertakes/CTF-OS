@@ -166,7 +166,7 @@ def test_skill_contract_covers_evidence_content_and_terminal_user_flow() -> None
         "클로드 구조대 준비해라", "RUN_MANIFEST.json", "SESSION-INPUT.json",
         "## Confirmed facts", "## Verified solve history", "## Refuted paths",
         "## Useful technical material", "## Unresolved state", "## Clean start",
-        "at most ten", "at most 100 lines", "32 KiB", "PRIMITIVE_CONFIRMED",
+        "at most ten", "at most 100 lines", "32 KiB", "ATTACK_EVENTS.jsonl",
         "Do not ask", "Stop all new recon", "claude-handoff-save",
         "원본 문제 ZIP과 이 파일을 사용자가 직접 Claude 시스템으로 옮기면 됩니다.",
         "이 문제에 대한 Codex 풀이를 여기서 종료합니다.",

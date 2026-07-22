@@ -5,7 +5,7 @@ from typing import Any
 
 
 def resource_panel(capacity: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the resource section used by race-board and terminal renderers."""
+    """Build the resource section for live process and sandbox management."""
     requests = state.get("requests", {}) if isinstance(state.get("requests"), Mapping) else {}
     allocations = state.get("allocations", {}) if isinstance(state.get("allocations"), Mapping) else {}
     observations = state.get("observations", {}) if isinstance(state.get("observations"), Mapping) else {}
@@ -42,8 +42,6 @@ def resource_panel(capacity: Mapping[str, Any], state: Mapping[str, Any]) -> dic
             "degraded_metrics": capacity.get("degraded_metrics", []),
         },
         "branches": branches, "remaining": state.get("last_plan", {}).get("remaining", {}),
-        "capacity_based_race_width": state.get("last_plan", {}).get("capacity_based_race_width"),
-        "recommended_race_width": state.get("last_plan", {}).get("recommended_race_width"),
         "rebalance_required": state.get("rebalance_required", False),
         "rebalance_reason": state.get("rebalance_reason"),
     }

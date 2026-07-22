@@ -17,8 +17,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
-from .delegation import utc_now
-from .workspace import atomic_json, state_lock
+from .workspace import atomic_json, state_lock, utc_now
 
 
 class OastError(ValueError):

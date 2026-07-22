@@ -655,7 +655,6 @@ def plan_allocations(
     requests: Sequence[ResourceRequest | Mapping[str, Any]], capacity: HostCapacity | Mapping[str, Any],
     *, current: Mapping[str, Mapping[str, Any]] | None = None,
     observations: Mapping[str, Mapping[str, Any]] | None = None,
-    remote_flag_session: str | None = None, tier: int | None = None,
 ) -> dict[str, Any]:
     cap = capacity.to_dict() if isinstance(capacity, HostCapacity) else dict(capacity)
     current = current or {}
@@ -673,21 +672,14 @@ def plan_allocations(
     observations = observations or {}
     active = []
     released = []
-    verifier_kept = False
     for req in normalized:
         obs = observations.get(req.session_id, {})
         state = str(obs.get("state", "ACTIVE")).upper()
         if state in TERMINAL_STATES:
             released.append({"session_id": req.session_id, "reason": f"terminal state {state}"})
             continue
-        if remote_flag_session and req.session_id != remote_flag_session:
-            if req.workload_class == "clean-room-verification" and not verifier_kept:
-                verifier_kept = True
-            else:
-                released.append({"session_id": req.session_id, "reason": "remote flag fast path reclaims low-value branch"})
-                continue
         active.append(req)
-    active.sort(key=lambda req: _allocation_rank(req, observations.get(req.session_id, {}), remote_flag_session))
+    active.sort(key=lambda req: _allocation_rank(req, observations.get(req.session_id, {})))
     allocations: dict[str, dict[str, Any]] = {}
     cpu_left, memory_left, storage_left = cpu_budget, memory_budget, storage_budget
     waiting = []
@@ -787,31 +779,19 @@ def plan_allocations(
             })
     for item in released:
         actions.append({"action": "RELEASE", **item})
-    requested_width = {0: 0, 1: 2, 2: 3, 3: 4, 4: 4}.get(tier or 0, len(active))
-    child_allocations = [key for key in allocations if key != "sol-main"]
-    race_width = min(requested_width, len(child_allocations)) if tier is not None else len(child_allocations)
-    launch = None
-    additional_capacity = int(min(
-        cpu_left // 2, memory_left // (4 * GIB), storage_left // (4 * GIB),
-    )) if cpu_left >= 0 and memory_left >= 0 and storage_left >= 0 else 0
-    if additional_capacity > 0:
-        launch = "Add an alternate attack family or independent full solve; Sol owns native delegation."
     preemption = [item for item in actions if item["action"] == "RELEASE"]
     for req in active:
         obs = observations.get(req.session_id, {})
-        if str(obs.get("classification")) == "STALLED_COMPUTE" or str(obs.get("utility_classification")) in {"BUMP_AND_RETRY", "REPLACE_ATTACK_FAMILY", "SOL_TAKEOVER", "DEAD_BRANCH"}:
+        if str(obs.get("classification")) == "STALLED_COMPUTE":
             preemption.append({
                 "action": "PREEMPT_RECOMMENDATION", "session_id": req.session_id,
-                "sequence": ["shrink CPU", "stop new long commands", "request checkpoint", "export artifacts", "Sol decides native lifecycle"],
-                "recommendation": str(obs.get("utility_classification") or _stalled_recommendation(obs)),
+                "sequence": ["shrink CPU", "stop or restart the stalled process", "preserve current output"],
+                "recommendation": "STOP_OR_RESTART_STALLED_COMPUTE",
             })
     return {
         "schema_version": RESOURCE_SCHEMA_VERSION, "generated_at": utc_now(),
-        "capacity_based_race_width": race_width, "template_race_width": requested_width,
-        "additional_branch_capacity": max(0, additional_capacity),
-        "recommended_race_width": race_width + max(0, additional_capacity),
         "allocations": allocations, "waiting": waiting, "released": released,
-        "resize_actions": actions, "launch_recommendation": launch,
+        "resize_actions": actions,
         "preemption_recommendations": preemption,
         "remaining": {"cpus": round(cpu_left, 3), "memory_bytes": memory_left, "storage_bytes": storage_left},
         "reason": "workload evidence, priority, measured utilization, progress, and aggregate host reserve",
@@ -885,23 +865,6 @@ class ResourceLedger:
         self.append_history("REQUEST", request.session_id, {"request": request.to_dict(), "inference": dict(inference or {})})
         return state["requests"][request.session_id]
 
-    def begin_race(self, active_session_ids: Sequence[str]) -> None:
-        active = set(active_session_ids)
-        with state_lock(self.root):
-            state = self.load()
-            for session_id in set(state["requests"]) - active:
-                allocation = state["allocations"].pop(session_id, None)
-                state["released"][session_id] = {
-                    "session_id": session_id, "released_at": utc_now(),
-                    "reason": "superseded race plan", "last_allocation": allocation,
-                }
-                state["observations"].setdefault(session_id, {})["state"] = "RELEASED"
-            state.pop("remote_flag_session", None)
-            state["rebalance_required"] = True
-            state["updated_at"] = utc_now()
-            atomic_json(self.state_path, state)
-        self.append_history("RACE_RESOURCE_RESET", "sol-main", {"active_session_ids": sorted(active)})
-
     def update(
         self, session_id: str, *, actor_session_id: str, actor_role: str,
         changes: Mapping[str, Any], verified_long_compute: bool = False,
@@ -938,8 +901,6 @@ class ResourceLedger:
                 obs["progress"] = dict(progress)
             if changes.get("state"):
                 obs["state"] = str(changes["state"]).upper()
-            if changes.get("utility_classification"):
-                obs["utility_classification"] = str(changes["utility_classification"]).upper()
             if changes.get("scheduler_recommendation"):
                 obs["scheduler_recommendation"] = str(changes["scheduler_recommendation"])
             state["rebalance_required"] = True
@@ -1000,10 +961,10 @@ class ResourceLedger:
             atomic_json(self.state_path, state)
         self.append_history("RESIZE", session_id, dict(record))
 
-    def rebalance(self, capacity: HostCapacity | Mapping[str, Any], *, tier: int | None = None, remote_flag_session: str | None = None) -> dict[str, Any]:
+    def rebalance(self, capacity: HostCapacity | Mapping[str, Any]) -> dict[str, Any]:
         with state_lock(self.root):
             state = self.load()
-            plan = self._plan_from_state(state, capacity, tier=tier, remote_flag_session=remote_flag_session)
+            plan = self._plan_from_state(state, capacity)
             state["allocations"] = plan["allocations"]
             for item in plan["released"]:
                 state["released"][item["session_id"]] = {**item, "released_at": utc_now()}
@@ -1015,10 +976,10 @@ class ResourceLedger:
         self.append_history("REBALANCE", "sol-main", {"plan": plan})
         return plan
 
-    def plan(self, capacity: HostCapacity | Mapping[str, Any], *, tier: int | None = None, remote_flag_session: str | None = None) -> dict[str, Any]:
+    def plan(self, capacity: HostCapacity | Mapping[str, Any]) -> dict[str, Any]:
         """Return a dry plan without changing the current allocation baseline."""
         state = self.load()
-        plan = self._plan_from_state(state, capacity, tier=tier, remote_flag_session=remote_flag_session)
+        plan = self._plan_from_state(state, capacity)
         self.append_history("PLAN", "sol-main", {"plan": plan})
         return plan
 
@@ -1066,11 +1027,10 @@ class ResourceLedger:
                 self.append_history(event, session_id, dict(result) if event == "RESIZE_FAILURE" else {"failure_signature": circuit.get("signature"), "count": circuit.get("count")})
 
     @staticmethod
-    def _plan_from_state(state: Mapping[str, Any], capacity: HostCapacity | Mapping[str, Any], *, tier: int | None, remote_flag_session: str | None) -> dict[str, Any]:
+    def _plan_from_state(state: Mapping[str, Any], capacity: HostCapacity | Mapping[str, Any]) -> dict[str, Any]:
         requests = [ResourceRequest.from_mapping(raw) for raw in state["requests"].values()]
         plan = plan_allocations(
             requests, capacity, current=state["allocations"], observations=state["observations"],
-            remote_flag_session=remote_flag_session or state.get("remote_flag_session"), tier=tier,
         )
         open_sessions = {
             sid for sid, obs in state.get("observations", {}).items()
@@ -1081,52 +1041,6 @@ class ResourceLedger:
         for sid in sorted(open_sessions):
             plan["preemption_recommendations"].append({"action": "RESIZE_CIRCUIT_OPEN", "session_id": sid, "retry_requires": "config/permission change or Sol override"})
         return plan
-
-    def flag_event(self, event: Mapping[str, Any]) -> None:
-        event_type = str(event.get("type", ""))
-        session_id = str(event.get("session_id", ""))
-        management_events = {
-            "BLOCKER", "EXPLOIT_PRIMITIVE_CANDIDATE", "EXPLOIT_PRIMITIVE_CONFIRMED",
-            "EXPLOIT_PRIMITIVE_REFUTED", "WORKING_POC", "FLAG_CANDIDATE",
-            "REMOTE_FLAG_OBTAINED", "SERVICE_CRASHED",
-        }
-        if event_type not in management_events:
-            return
-        with state_lock(self.root):
-            state = self.load()
-            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE_CONFIRMED", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
-                state["requests"][session_id]["priority"] = "CRITICAL" if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"} else "HIGH"
-                state["requests"][session_id]["updated_at"] = utc_now()
-                obs = state["observations"].setdefault(session_id, {})
-                if event_type in {"WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
-                    obs["flag_path"] = True
-                if event_type == "REMOTE_FLAG_OBTAINED":
-                    state["remote_flag_session"] = session_id
-            if session_id in state["requests"] and event_type in {"EXPLOIT_PRIMITIVE_CONFIRMED", "WORKING_POC", "FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
-                obs = state["observations"].setdefault(session_id, {})
-                progress = dict(obs.get("progress") or {})
-                progress["progressing"] = True
-                progress["last_event_type"] = event_type
-                progress["last_event_at"] = utc_now()
-                if event_type == "EXPLOIT_PRIMITIVE_CONFIRMED":
-                    progress["exploit_primitives"] = int(progress.get("exploit_primitives", 0)) + 1
-                    progress["exploit_proximity"] = max(float(progress.get("exploit_proximity", 0) or 0), .5)
-                if event_type == "WORKING_POC":
-                    progress["working_poc_present"] = True
-                    progress["exploit_proximity"] = max(float(progress.get("exploit_proximity", 0) or 0), .82)
-                if event_type in {"FLAG_CANDIDATE", "REMOTE_FLAG_OBTAINED"}:
-                    progress["exploit_proximity"] = 1.0
-                    progress["flag_proximity"] = 1.0
-                obs["progress"] = progress
-            if session_id in state["requests"] and event_type == "EXPLOIT_PRIMITIVE_REFUTED":
-                state["requests"][session_id]["priority"] = "LOW"
-                obs = state["observations"].setdefault(session_id, {})
-                obs["progress"] = {"progressing": False, "exploit_proximity": 0.0, "primitive_refuted": True}
-            state["rebalance_required"] = True
-            state["rebalance_reason"] = f"race event {event_type}"
-            state["updated_at"] = utc_now()
-            atomic_json(self.state_path, state)
-        self.append_history("EVENT_REBALANCE_REQUIRED", session_id, {"event_type": event_type, "event_id": event.get("event_id")})
 
     def history(self, limit: int = 200) -> list[dict[str, Any]]:
         if not self.history_path.exists():
@@ -1151,19 +1065,12 @@ class ResourceLedger:
             handle.flush(); os.fsync(handle.fileno())
 
 
-def note_race_event(solve_root: Path, event: Mapping[str, Any]) -> None:
-    """Best-effort event integration; an absent resource ledger is valid early in solve."""
-    ledger = ResourceLedger(solve_root)
-    if ledger.state_path.exists():
-        ledger.flag_event(event)
 
-
-def _allocation_rank(req: ResourceRequest, obs: Mapping[str, Any], remote_flag_session: str | None) -> tuple[Any, ...]:
+def _allocation_rank(req: ResourceRequest, obs: Mapping[str, Any]) -> tuple[Any, ...]:
     priority = {"CRITICAL": 0, "HIGH": 1, "NORMAL": 2, "LOW": 3}[req.priority]
-    flag = 0 if req.session_id == remote_flag_session or obs.get("flag_path") or float(obs.get("progress", {}).get("flag_proximity", 0) if isinstance(obs.get("progress"), Mapping) else 0) > .7 else 1
     workload = req.workload_class
-    lane = 0 if workload == "exploit-development" else 1 if req.session_id == "sol-main" else 2 if workload == "dynamic-debugging" else 3 if workload in COMPUTE_WORKLOADS and progress_present(obs.get("progress") if isinstance(obs.get("progress"), Mapping) else obs) else 4 if workload == "independent-full-solve" else 5 if workload == "static-analysis" else 7 if workload == "clean-room-verification" else 6
-    return priority, flag, lane, req.created_at, req.session_id
+    lane = 0 if req.session_id == "sol-main" else 1 if workload in COMPUTE_WORKLOADS and progress_present(obs.get("progress") if isinstance(obs.get("progress"), Mapping) else obs) else 2
+    return priority, lane, req.created_at, req.session_id
 
 
 def _resize_reason(req: ResourceRequest, obs: Mapping[str, Any], old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
@@ -1174,12 +1081,6 @@ def _resize_reason(req: ResourceRequest, obs: Mapping[str, Any], old: Mapping[st
     return f"priority {req.priority} preferred allocation"
 
 
-def _stalled_recommendation(obs: Mapping[str, Any]) -> str:
-    if obs.get("repeated_error") or (isinstance(obs.get("progress"), Mapping) and obs["progress"].get("repeated_error")):
-        return "REPLACE_ATTACK_FAMILY"
-    if obs.get("flag_path"):
-        return "SOL_TAKEOVER"
-    return "BUMP_AND_RETRY"
 
 
 def _cpu_reserve(total: float) -> float:

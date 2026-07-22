@@ -92,7 +92,7 @@ def test_corrupt_sibling_blocks_only_when_it_is_selected(repo: Path) -> None:
     assert b_record["status"] == "BLOCKED"
     assert "damaged ZIP" in b_record["blockers"][0]
     assert (a_root / "CHALLENGE-PREFLIGHT.json").read_bytes() == a_before
-    assert json.loads((a_run / "STATE.json").read_text())["status"] == "PREPARED"
+    assert json.loads((a_run / "STATE.json").read_text())["status"] == "SWARM_READY"
 
 
 def test_parallel_prepare_uses_independent_challenge_locks_and_records(repo: Path) -> None:
@@ -186,9 +186,9 @@ def test_selected_source_change_invalidates_only_selected_workspace(repo: Path) 
     (a_run / "RESULT.md").write_text("old result", encoding="utf-8")
     protected = {}
     for relative, content in {
-        "race-events.jsonl": "event\n",
+        "ATTACK_EVENTS.jsonl": '{"type":"COMMAND_EXECUTED"}\n',
         "flag-receipts/remote-b.json": '{"flag":"ISO{b}"}\n',
-        "workers/race-b/result.json": '{"result":"b"}\n',
+        "workers/tool-driven/artifacts/probe.txt": "preserve\n",
     }.items():
         path = b_run / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +209,7 @@ def test_selected_source_change_invalidates_only_selected_workspace(repo: Path) 
 
     assert a_after["source_fingerprint"] != a_before["source_fingerprint"]
     assert (a_root / "input" / "a.txt").read_text() == "changed alpha"
-    assert state_after["status"] == "PREPARED" and state_after["flag_candidate"] is None
+    assert state_after["status"] == "SWARM_READY" and state_after["flag_candidate"] is None
     assert a_state_path.exists()
     assert json.loads(a_state_path.read_text())["flag_candidate"] == "ISO{old}"
     assert (a_run / "RESULT.md").read_text() == "old result"

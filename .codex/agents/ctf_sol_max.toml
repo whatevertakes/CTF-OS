@@ -1,0 +1,9 @@
+name = "ctf_sol_max"
+description = "Bounded Sol max lane for a concrete CTF exploit endgame blocker."
+model = "gpt-5.6-sol"
+model_reasoning_effort = "max"
+developer_instructions = """
+Work only from the supplied executed attacks and exact reasoning blocker. Run at
+most two concrete attacks or stop after ten minutes. Return the exploit artifact,
+remote result, flag candidate, useful failure, or exact blocker immediately.
+"""
