@@ -7,8 +7,12 @@ JADX_VERSION=1.5.1
 UPX_VERSION=4.2.4
 WASMTIME_VERSION=24.0.0
 
+/opt/ctf-os/install/binary-runtime.sh
+
 apt_install \
-  gdb gdb-multiarch qemu-user qemu-user-static apktool wabt mono-runtime \
+  gdb gdb-multiarch apktool wabt mono-runtime \
+  qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
+  ovmf qemu-efi-aarch64 qemu-efi-arm seabios u-boot-qemu \
   build-essential meson ninja-build pkg-config libzip-dev liblz4-dev libssl-dev \
   ocl-icd-libopencl1
 pip_install -r /opt/ctf-os/requirements/rev.txt
@@ -34,5 +38,7 @@ tar -xJf /tmp/wasmtime.tar.xz -C /tmp
 install -m 0755 "/tmp/wasmtime-v${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/local/bin/wasmtime
 rm -rf /tmp/radare2* /tmp/jadx.zip /tmp/upx* /tmp/wasmtime*
 
-for command in r2 gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-mips qemu-riscv64; do require_command "$command"; done
+for command in r2 gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 qemu-system-riscv64 qemu-img; do require_command "$command"; done
 for module in angr unicorn capstone keystone lief pefile elftools pyopencl; do require_import "$module"; done
+/usr/local/bin/ctf-os-binary-runtime-smoke
+/usr/local/bin/ctf-os-system-qemu-smoke

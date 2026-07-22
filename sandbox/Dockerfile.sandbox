@@ -24,18 +24,24 @@ FROM common AS profile-base
 
 FROM common AS profile-pwn
 COPY sandbox/requirements/pwn.txt /opt/ctf-os/requirements/pwn.txt
-COPY sandbox/install/pwn.sh /opt/ctf-os/install/pwn.sh
-RUN /opt/ctf-os/install/pwn.sh
+COPY sandbox/install/binary-runtime.sh sandbox/install/pwn.sh /opt/ctf-os/install/
+COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
+RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-binary-runtime-smoke \
+    && /opt/ctf-os/install/pwn.sh
 
 FROM common AS profile-web
 COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
 COPY sandbox/install/web.sh /opt/ctf-os/install/web.sh
-RUN /opt/ctf-os/install/web.sh
+COPY sandbox/smoke/web-runtime.py /usr/local/bin/ctf-os-web-runtime-smoke
+RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke && /opt/ctf-os/install/web.sh
 
 FROM common AS profile-rev
 COPY sandbox/requirements/rev.txt /opt/ctf-os/requirements/rev.txt
-COPY sandbox/install/rev.sh /opt/ctf-os/install/rev.sh
-RUN /opt/ctf-os/install/rev.sh
+COPY sandbox/install/binary-runtime.sh sandbox/install/rev.sh /opt/ctf-os/install/
+COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
+COPY sandbox/smoke/system-qemu.sh /usr/local/bin/ctf-os-system-qemu-smoke
+RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-*-smoke \
+    && /opt/ctf-os/install/rev.sh
 
 FROM common AS profile-crypto
 COPY sandbox/requirements/crypto.txt /opt/ctf-os/requirements/crypto.txt

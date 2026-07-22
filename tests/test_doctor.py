@@ -1,4 +1,7 @@
 from pathlib import Path
+import subprocess
+
+import ctf_os.doctor as doctor
 
 from ctf_os.doctor import (
     IMAGES, PROFILE_PROBES, _available_memory, _docker_failure_kind,
@@ -26,8 +29,22 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
     assert len(IMAGES) == 10
     assert set(PROFILE_PROBES) == {image.rsplit(":", 1)[1] for image in IMAGES}
     expectations = {
-        "pwn": ("qemu-aarch64", "qemu-system-x86_64", "angr"),
-        "rev": ("pyopencl", "r2 -v"),
+        "pwn": (
+            "qemu-aarch64", "qemu-mipsel", "pwninit --version",
+            "seccomp-tools --version", "musl-gcc --version",
+            "ctf-os-binary-runtime-smoke", "angr",
+        ),
+        "web": (
+            "chromium", "chromedriver", "playwright", "ffuf -V",
+            "ctf-os-web-runtime-smoke",
+        ),
+        "rev": (
+            "pyopencl", "r2 -v", "qemu-arm", "qemu-mipsel",
+            "qemu-system-x86_64", "qemu-system-aarch64",
+            "qemu-system-riscv64", "qemu-img",
+            "aarch64-linux-gnu-gcc", "ctf-os-binary-runtime-smoke",
+            "ctf-os-system-qemu-smoke",
+        ),
         "crypto": ("sage -c", "RsaCtfTool", "cado-nfs", "hashcat --version"),
         "forensic": ("vol", "mmls", "tshark", "stegseek"),
         "misc": ("podman", "torch", "cv2"),
@@ -42,6 +59,26 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
         "symbolic_slice": 1800, "fuzz_slice": 1800, "forensic_scan": 1800,
         "crypto_heavy": 1800, "cracking_slice": 1800, "ai_inference": 1800,
     }
+
+
+def test_pwn_and_rev_doctor_probes_match_existing_ptrace_runtime(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv, timeout=30, cwd=None):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    for profile in ("pwn", "rev"):
+        doctor._image_probe(profile)
+        joined = " ".join(calls[-1])
+        assert "/tmp:rw,exec,nosuid,nodev" in joined
+        assert "--cap-add SYS_PTRACE" in joined
+        assert "--security-opt seccomp=unconfined" in joined
+        assert "--ulimit core=-1:-1" in joined
+
+    doctor._image_probe("web")
+    assert "seccomp=unconfined" not in " ".join(calls[-1])
 
 
 def test_wsl2_and_native_ubuntu_or_kali_x86_64_are_supported() -> None:

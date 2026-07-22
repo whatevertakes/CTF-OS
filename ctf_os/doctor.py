@@ -47,22 +47,27 @@ python3 -c 'import requests,httpx,bs4,lxml,yaml,rich,numpy,scipy,PIL,networkx,sy
 python3 --version; jq --version; rg --version; objdump --version; nmap --version
 """,
     "pwn": """
-for c in gdb gdb-multiarch qemu-aarch64 qemu-mips qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 patchelf checksec ROPgadget ropper one_gadget; do command -v "$c"; done
+for c in gdb gdb-multiarch qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 patchelf checksec ROPgadget ropper one_gadget pwninit seccomp-tools musl-gcc aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc; do command -v "$c"; done
 python3 -c 'import pwn,angr,unicorn,capstone,keystone,z3'
-gdb --version; patchelf --version; checksec --help >/dev/null; ROPgadget --version; ropper --version; one_gadget --version
+gdb --version; patchelf --version; checksec --help >/dev/null; ROPgadget --version; ropper --version; one_gadget --version; pwninit --version; seccomp-tools --version; musl-gcc --version
 qemu-aarch64 --version; qemu-mips --version; qemu-system-x86_64 --version
+/usr/local/bin/ctf-os-binary-runtime-smoke
 """,
     "web": """
-for c in node npm npx corepack php sqlite3 redis-cli psql mysql; do command -v "$c"; done
+for c in node npm npx corepack php sqlite3 redis-cli psql mysql chromium chromedriver ffuf; do command -v "$c"; done
 node -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)'
-python3 -c 'import flask,fastapi,uvicorn,jwt,requests,httpx,websockets,dns'
+python3 -c 'import flask,fastapi,uvicorn,jwt,requests,httpx,websockets,dns,playwright'
 node --version; npm --version; php --version; sqlite3 --version
+ffuf -V
+/usr/local/bin/ctf-os-web-runtime-smoke
 """,
     "rev": """
 (command -v r2 || command -v rizin)
-for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-mips qemu-riscv64; do command -v "$c"; done
+for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 qemu-system-riscv64 qemu-img aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc; do command -v "$c"; done
 python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools,pyopencl'
 r2 -v; jadx --version; apktool --version; wasm-objdump --version; upx --version; wasmtime --version
+/usr/local/bin/ctf-os-binary-runtime-smoke
+/usr/local/bin/ctf-os-system-qemu-smoke
 """,
     "crypto": """
 for c in sage RsaCtfTool cado-nfs gp gap maxima hashcat; do command -v "$c"; done
@@ -194,9 +199,16 @@ def _image_probe(profile: str) -> subprocess.CompletedProcess[str]:
     argv = [
         "docker", "run", "--rm", "--network", "none", "--read-only",
         "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--user", "1001:1001",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777", "--tmpfs", "/work:rw,nosuid,nodev,size=1g,mode=1777",
+        "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777", "--tmpfs", "/work:rw,nosuid,nodev,size=1g,mode=1777",
         "--tmpfs", "/artifacts:rw,nosuid,nodev,size=64m,mode=1777",
     ]
+    if profile in {"pwn", "rev"}:
+        # Match the existing solve runtime contract. Docker's default seccomp
+        # filter rejects i386 syscalls before the 32-bit execution probe runs.
+        argv.extend([
+            "--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined",
+            "--ulimit", "core=-1:-1",
+        ])
     if profile in {"misc", "cloud"}:
         seccomp = Path(__file__).resolve().parents[1] / "sandbox" / "seccomp-rootless.json"
         argv.extend(["--security-opt", f"seccomp={seccomp}"])

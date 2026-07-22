@@ -110,6 +110,60 @@ def test_dockerfile_has_ten_profiles_and_no_nested_daemon_or_unpinned_clone() ->
         assert f"profile-{profile}" in text
 
 
+def test_binary_runtime_is_shared_and_executes_dynamic_foreign_fixtures() -> None:
+    dockerfile = Path("sandbox/Dockerfile.sandbox").read_text()
+    installer = Path("sandbox/install/binary-runtime.sh").read_text()
+    smoke = Path("sandbox/smoke/binary-runtime.sh").read_text()
+    pwn = Path("sandbox/install/pwn.sh").read_text()
+    rev = Path("sandbox/install/rev.sh").read_text()
+
+    assert dockerfile.count("sandbox/install/binary-runtime.sh") == 2
+    assert "/opt/ctf-os/install/binary-runtime.sh" in pwn
+    assert "/opt/ctf-os/install/binary-runtime.sh" in rev
+    for value in (
+        "gcc-12-multilib", "libc6-dev-i386", "gcc-aarch64-linux-gnu",
+        "gcc-arm-linux-gnueabihf", "gcc-mipsel-linux-gnu",
+        "gcc-riscv64-linux-gnu", "libc6-dev-arm64-cross",
+        "libc6-dev-armhf-cross", "libc6-dev-mipsel-cross",
+        "libc6-dev-riscv64-cross",
+    ):
+        assert value in installer
+    for value in (
+        "gcc -m32", "qemu-aarch64 -L /usr/aarch64-linux-gnu",
+        "qemu-arm -L /usr/arm-linux-gnueabihf",
+        "qemu-mipsel -L /usr/mipsel-linux-gnu",
+        "qemu-riscv64 -L /usr/riscv64-linux-gnu", "CTF_OS_QEMU_OK",
+        "dynamically linked",
+    ):
+        assert value in smoke
+
+
+def test_profile_installers_pin_requested_cli_capabilities_and_smokes() -> None:
+    lib = Path("sandbox/install/lib.sh").read_text()
+    pwn = Path("sandbox/install/pwn.sh").read_text()
+    rev = Path("sandbox/install/rev.sh").read_text()
+    web = Path("sandbox/install/web.sh").read_text()
+    lock = Path("sandbox/tool-versions.lock").read_text()
+    web_smoke = Path("sandbox/smoke/web-runtime.py").read_text()
+    qemu_smoke = Path("sandbox/smoke/system-qemu.sh").read_text()
+
+    assert "download_sha256()" in lib and "sha256sum --check --strict" in lib
+    assert "pwninit=3.3.1" in lock and "pwninit_sha256=" in lock
+    assert "seccomp_tools=1.6.2" in lock and "ffuf=2.1.0" in lock
+    assert "download_sha256" in pwn and "musl-tools" in pwn
+    assert "gem install seccomp-tools --version" in pwn
+    for package in (
+        "qemu-system-x86", "qemu-system-arm", "qemu-system-misc", "qemu-utils",
+        "ovmf", "qemu-efi-aarch64", "qemu-efi-arm", "seabios", "u-boot-qemu",
+    ):
+        assert package in rev
+    assert "github.com/ffuf/ffuf/v2@v${FFUF_VERSION}" in web
+    assert all(package in web for package in ("chromium", "chromium-driver", "golang-go"))
+    assert "executable_path=\"/usr/bin/chromium\"" in web_smoke
+    assert "os.geteuid() == 0" in web_smoke
+    assert "-machine none" in qemu_smoke and "status\" -ne 124" in qemu_smoke
+
+
 def test_runtime_isolates_mutable_credentials_in_work_tmpfs(tmp_path: Path) -> None:
     source = tmp_path / "input"
     source.mkdir()
