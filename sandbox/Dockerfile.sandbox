@@ -22,20 +22,61 @@ WORKDIR /challenge
 
 FROM common AS profile-base
 
-FROM common AS profile-pwn
+FROM common AS binary-analysis
+ENV JAVA_HOME=/opt/java \
+    GHIDRA_HOME=/opt/ghidra \
+    CAPA_RULES=/opt/capa-rules \
+    PATH=/opt/java/bin:/opt/ghidra/support:/opt/ghidra:${PATH}
+COPY sandbox/requirements/binary-analysis.txt /opt/ctf-os/requirements/binary-analysis.txt
+COPY sandbox/install/binary-analysis.sh /opt/ctf-os/install/binary-analysis.sh
+COPY sandbox/bin/ctf-ghidra-headless /usr/local/bin/ctf-ghidra-headless
+COPY sandbox/bin/capa /usr/local/bin/capa
+COPY sandbox/ghidra/ExportDecompilation.java /opt/ctf-os/ghidra-scripts/ExportDecompilation.java
+COPY sandbox/smoke/binary-analysis.sh /usr/local/bin/ctf-os-binary-analysis-smoke
+RUN chmod 0755 /opt/ctf-os/install/binary-analysis.sh \
+        /usr/local/bin/capa /usr/local/bin/ctf-ghidra-headless \
+        /usr/local/bin/ctf-os-binary-analysis-smoke \
+    && /opt/ctf-os/install/binary-analysis.sh
+
+FROM binary-analysis AS pwn-tools
 COPY sandbox/requirements/pwn.txt /opt/ctf-os/requirements/pwn.txt
 COPY sandbox/install/binary-runtime.sh sandbox/install/pwn.sh /opt/ctf-os/install/
 COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
 RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-binary-runtime-smoke \
     && /opt/ctf-os/install/pwn.sh
+COPY sandbox/install/pwn-fuzzing.sh /opt/ctf-os/install/pwn-fuzzing.sh
+RUN chmod 0755 /opt/ctf-os/install/pwn-fuzzing.sh \
+    && /opt/ctf-os/install/pwn-fuzzing.sh
 
-FROM common AS profile-web
+FROM pwn-tools AS profile-pwn
+COPY sandbox/smoke/pwn-fuzzing.sh /usr/local/bin/ctf-os-pwn-fuzzing-smoke
+RUN chmod 0755 /usr/local/bin/ctf-os-pwn-fuzzing-smoke \
+    && /usr/local/bin/ctf-os-pwn-fuzzing-smoke
+
+FROM common AS web-tools
+ENV NUCLEI_TEMPLATES=/opt/nuclei-templates \
+    DISABLE_NUCLEI_TEMPLATES_PUBLIC_DOWNLOAD=true \
+    DISABLE_NUCLEI_TEMPLATES_GITHUB_DOWNLOAD=true \
+    DISABLE_NUCLEI_TEMPLATES_GITLAB_DOWNLOAD=true \
+    DISABLE_NUCLEI_TEMPLATES_AWS_DOWNLOAD=true \
+    DISABLE_NUCLEI_TEMPLATES_AZURE_DOWNLOAD=true
 COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
-COPY sandbox/install/web.sh /opt/ctf-os/install/web.sh
+COPY sandbox/install/web.sh sandbox/install/web-verify.sh /opt/ctf-os/install/
 COPY sandbox/smoke/web-runtime.py /usr/local/bin/ctf-os-web-runtime-smoke
-RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke && /opt/ctf-os/install/web.sh
+COPY sandbox/bin/ctf-nuclei-scan /usr/local/bin/ctf-nuclei-scan
+COPY sandbox/rules/nuclei /opt/ctf-os/rules/nuclei
+COPY sandbox/rules/semgrep /opt/ctf-os/rules/semgrep
+RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke /usr/local/bin/ctf-nuclei-scan \
+    && /opt/ctf-os/install/web.sh
+RUN chmod 0755 /opt/ctf-os/install/web-verify.sh \
+    && /opt/ctf-os/install/web-verify.sh
 
-FROM common AS profile-rev
+FROM web-tools AS profile-web
+COPY sandbox/smoke/web-security.sh /usr/local/bin/ctf-os-web-security-smoke
+RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke \
+    && /usr/local/bin/ctf-os-web-security-smoke
+
+FROM binary-analysis AS profile-rev
 COPY sandbox/requirements/rev.txt /opt/ctf-os/requirements/rev.txt
 COPY sandbox/install/binary-runtime.sh sandbox/install/rev.sh /opt/ctf-os/install/
 COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
@@ -64,10 +105,21 @@ COPY sandbox/requirements/osint.txt /opt/ctf-os/requirements/osint.txt
 COPY sandbox/install/osint.sh /opt/ctf-os/install/osint.sh
 RUN /opt/ctf-os/install/osint.sh
 
-FROM common AS profile-ai
+FROM common AS ai-tools
 COPY sandbox/requirements/ai.txt /opt/ctf-os/requirements/ai.txt
 COPY sandbox/install/ai.sh /opt/ctf-os/install/ai.sh
 RUN /opt/ctf-os/install/ai.sh
+COPY sandbox/requirements/ai-security.txt /opt/ctf-os/requirements/ai-security.txt
+COPY sandbox/install/ai-security.sh /opt/ctf-os/install/ai-security.sh
+RUN chmod 0755 /opt/ctf-os/install/ai-security.sh \
+    && /opt/ctf-os/install/ai-security.sh
+
+FROM ai-tools AS profile-ai
+COPY sandbox/install/ai-security-verify.sh /opt/ctf-os/install/ai-security-verify.sh
+COPY sandbox/smoke/ai-serialization.py /usr/local/bin/ctf-os-ai-serialization-smoke
+RUN chmod 0755 /usr/local/bin/ctf-os-ai-serialization-smoke \
+        /opt/ctf-os/install/ai-security-verify.sh \
+    && /opt/ctf-os/install/ai-security-verify.sh
 
 FROM common AS profile-cloud
 COPY sandbox/requirements/cloud.txt /opt/ctf-os/requirements/cloud.txt

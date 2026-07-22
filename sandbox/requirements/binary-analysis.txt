@@ -1,0 +1,2 @@
+frida @ https://files.pythonhosted.org/packages/3c/fb/52c7a6e1efd50d55a4f6cb80dae0ba527fc1e6a45e08b23ee99692e3eabf/frida-17.16.4-cp37-abi3-manylinux1_x86_64.whl#sha256=cb64cdb036244ddbfd236c8baf6bd70917f74fd504852b08933eaf87daa6e284
+frida-tools @ https://files.pythonhosted.org/packages/80/5e/4592b8005bb5126642c80dfa7ea7a1ab81fd8c232fa03e20374216c04831/frida_tools-14.10.4.tar.gz#sha256=7a2c544b545d095040fffbd3768a287a426343dad89095b4a24f4b20382d926a

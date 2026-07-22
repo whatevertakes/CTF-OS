@@ -140,17 +140,35 @@ def test_binary_runtime_is_shared_and_executes_dynamic_foreign_fixtures() -> Non
 
 def test_profile_installers_pin_requested_cli_capabilities_and_smokes() -> None:
     lib = Path("sandbox/install/lib.sh").read_text()
+    binary = Path("sandbox/install/binary-analysis.sh").read_text()
     pwn = Path("sandbox/install/pwn.sh").read_text()
+    pwn_fuzzing = Path("sandbox/install/pwn-fuzzing.sh").read_text()
     rev = Path("sandbox/install/rev.sh").read_text()
     web = Path("sandbox/install/web.sh").read_text()
     lock = Path("sandbox/tool-versions.lock").read_text()
     web_smoke = Path("sandbox/smoke/web-runtime.py").read_text()
     qemu_smoke = Path("sandbox/smoke/system-qemu.sh").read_text()
+    dockerfile = Path("sandbox/Dockerfile.sandbox").read_text()
 
     assert "download_sha256()" in lib and "sha256sum --check --strict" in lib
     assert "pwninit=3.3.1" in lock and "pwninit_sha256=" in lock
     assert "seccomp_tools=1.6.2" in lock and "ffuf=2.1.0" in lock
     assert "download_sha256" in pwn and "musl-tools" in pwn
+    assert "FROM common AS binary-analysis" in dockerfile
+    assert "FROM binary-analysis AS pwn-tools" in dockerfile
+    assert "FROM pwn-tools AS profile-pwn" in dockerfile
+    assert "FROM binary-analysis AS profile-rev" in dockerfile
+    for value in (
+        "GHIDRA_VERSION=12.1.2", "TEMURIN_VERSION=21.0.11_10",
+        "CAPA_VERSION=9.4.0", "CAPA_RULES_COMMIT=", "download_sha256",
+    ):
+        assert value in binary
+    for value in (
+        "AFLPP_COMMIT=", "QEMUAFL_COMMIT=", "afl-clang-fast",
+        "afl-qemu-trace",
+    ):
+        assert value in pwn_fuzzing
+    assert "ctf-os-pwn-fuzzing-smoke" in dockerfile
     assert "gem install seccomp-tools --version" in pwn
     for package in (
         "qemu-system-x86", "qemu-system-arm", "qemu-system-misc", "qemu-utils",
@@ -158,10 +176,43 @@ def test_profile_installers_pin_requested_cli_capabilities_and_smokes() -> None:
     ):
         assert package in rev
     assert "github.com/ffuf/ffuf/v2@v${FFUF_VERSION}" in web
+    for value in (
+        "NUCLEI_VERSION=3.11.0", "NUCLEI_TEMPLATES_COMMIT=",
+        "DALFOX_VERSION=3.1.2",
+    ):
+        assert value in web
+    assert "ctf-os-web-security-smoke" in dockerfile
     assert all(package in web for package in ("chromium", "chromium-driver", "golang-go"))
     assert "executable_path=\"/usr/bin/chromium\"" in web_smoke
     assert "os.geteuid() == 0" in web_smoke
     assert "-machine none" in qemu_smoke and "status\" -ne 124" in qemu_smoke
+
+
+def test_security_tool_assets_are_offline_bounded_and_pinned() -> None:
+    lock = Path("sandbox/tool-versions.lock").read_text()
+    nuclei_wrapper = Path("sandbox/bin/ctf-nuclei-scan").read_text()
+    ghidra_wrapper = Path("sandbox/bin/ctf-ghidra-headless").read_text()
+    semgrep_rules = Path("sandbox/rules/semgrep/ctf-web-sinks.yml").read_text()
+    ai_smoke = Path("sandbox/smoke/ai-serialization.py").read_text()
+    afl_smoke = Path("sandbox/smoke/pwn-fuzzing.sh").read_text()
+
+    for key in (
+        "ghidra_sha256=", "capa_rules_sha256=", "aflplusplus_sha256=",
+        "qemuafl_sha256=", "nuclei_sha256=", "nuclei_templates_sha256=",
+        "dalfox_sha256=", "sqlmap_wheel_sha256=", "semgrep_wheel_sha256=",
+        "modelscan_wheel_sha256=", "fickling_wheel_sha256=",
+    ):
+        assert key in lock
+    assert "-disable-update-check" in nuclei_wrapper
+    assert "-no-interactsh" in nuclei_wrapper and "-pt http" in nuclei_wrapper
+    assert "/artifacts/" in nuclei_wrapper and "one explicit HTTP(S) URL" in nuclei_wrapper
+    assert "/work/ghidra-project" in ghidra_wrapper and "/artifacts/" in ghidra_wrapper
+    for language in ("python", "javascript", "typescript", "php", "java"):
+        assert language in semgrep_rules
+    assert "pickle.loads" not in ai_smoke and "torch.load" not in ai_smoke
+    assert "not marker.exists()" in ai_smoke
+    for value in ("afl-clang-fast", "afl-showmap", "AFL_USE_ASAN", "AFL_USE_UBSAN", "-Q"):
+        assert value in afl_smoke
 
 
 def test_runtime_isolates_mutable_credentials_in_work_tmpfs(tmp_path: Path) -> None:

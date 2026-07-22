@@ -17,10 +17,29 @@ seccomp-tools, and musl-gcc. Rev provides TCG-only system QEMU for x86, ARM,
 and miscellaneous targets, qemu-img, SeaBIOS, OVMF, ARM UEFI firmware, and
 Debian's QEMU U-Boot firmware images.
 
+Pwn and Rev also inherit one shared binary-analysis layer: Ghidra headless and
+PyGhidra on a verified Temurin JDK 21, Frida CLI/Python bindings, and capa with
+the fixed offline rules at `/opt/capa-rules`. `ctf-ghidra-headless INPUT
+[TIMEOUT_SECONDS]` keeps its temporary project below `/work` and writes the
+decompilation and log below `/artifacts`. Pwn adds AFL++ compiler instrumentation,
+ASan/UBSan builds, `afl-showmap`, bounded `afl-fuzz`, and a separately pinned
+`afl-qemu-trace`; this does not replace the system/cross-architecture QEMU layer.
+
 Web provides Debian Chromium and chromedriver, Playwright configured by probes
 to launch `/usr/bin/chromium` without a downloaded browser bundle, and pinned
-ffuf. Its offline smoke opens a local HTML document as the non-root `ctf` user
-with both Chromium headless and Playwright and reads its title and DOM.
+ffuf. It also provides Nuclei with the fixed snapshot at
+`/opt/nuclei-templates`, sqlmap, Dalfox, and Semgrep CE with the deliberately
+small local sink rules at `/opt/ctf-os/rules/semgrep`. `ctf-nuclei-scan` accepts
+one explicit HTTP(S) target and one pinned local template, disables update and
+Interactsh use, restricts execution to HTTP templates (never code/headless),
+and writes JSONL below `/artifacts`. Offline smokes use localhost only and keep
+Nuclei/Semgrep version checks disabled.
+
+AI provides ModelScan and Fickling before-load inspection for pickle/joblib and
+PyTorch serialization, plus ModelScan H5 and SavedModel support through pinned
+h5py/TensorFlow dependencies. The smoke creates benign and unsafe reduce
+pickles, confirms both scanners flag the unsafe file, and proves its payload was
+not executed. These scanners do not make a model safe to load by themselves.
 
 Runtime policy: /challenge is read-only; /work and /artifacts are worker-private
 tmpfs. Containers are read-only, non-root, capability-dropped, resource-limited,

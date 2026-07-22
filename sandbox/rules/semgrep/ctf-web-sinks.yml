@@ -1,0 +1,38 @@
+rules:
+  - id: ctf.python.dynamic-code
+    message: Python dynamic code execution sink candidate
+    severity: WARNING
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+          - pattern: os.system(...)
+
+  - id: ctf.javascript.dynamic-code
+    message: JavaScript/TypeScript dynamic code execution sink candidate
+    severity: WARNING
+    languages: [javascript, typescript]
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: $CP.exec(...)
+
+  - id: ctf.php.dangerous-call
+    message: PHP code, command, or serialization sink candidate
+    severity: WARNING
+    languages: [php]
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: system(...)
+          - pattern: unserialize(...)
+
+  - id: ctf.java.process-exec
+    message: Java process execution sink candidate
+    severity: WARNING
+    languages: [java]
+    patterns:
+      - pattern-either:
+          - pattern: Runtime.getRuntime().exec(...)
+          - pattern: new ProcessBuilder(...)

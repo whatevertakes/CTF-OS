@@ -12,6 +12,8 @@ Prefer directly evidenced ret2win, format disclosure/write, stack control, logic
 
 Use a cyclic pattern for offset/control, one format probe for disclosure/write, one debugger watchpoint for overwrite reachability, or one targeted input differential. Inspect only gadgets/symbols needed by the live chain.
 
+If source or a buildable parser has input-driven crash potential, consider a short bounded AFL++ campaign; do not return to fuzzing after a clear primitive exists. Preserve the crash input, exact command, and stack trace.
+
 ## 4. Immediate PoC criteria
 
 A minimal script/input that controls PC/RIP, leaks the required address, performs the required read/write, or deterministically reaches a privileged function is a working PoC. Convert it to pwntools or the smallest direct client immediately.

@@ -1,0 +1,17 @@
+id: ctf-os-local-smoke
+
+info:
+  name: CTF-OS local deterministic smoke marker
+  author: ctf-os
+  severity: info
+  tags: ctf-os,smoke
+
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/marker"
+    matchers:
+      - type: word
+        part: body
+        words:
+          - CTF_OS_NUCLEI_FINDING

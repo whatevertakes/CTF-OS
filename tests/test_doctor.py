@@ -32,24 +32,31 @@ def test_doctor_covers_ten_images_and_required_smokes() -> None:
         "pwn": (
             "qemu-aarch64", "qemu-mipsel", "pwninit --version",
             "seccomp-tools --version", "musl-gcc --version",
-            "ctf-os-binary-runtime-smoke", "angr",
+            "ctf-os-binary-runtime-smoke", "angr", "afl-clang-fast",
+            "afl-qemu-trace", "ctf-os-pwn-fuzzing-smoke",
+            "ctf-ghidra-headless", "frida", "pyghidra", "capa",
         ),
         "web": (
             "chromium", "chromedriver", "playwright", "ffuf -V",
-            "ctf-os-web-runtime-smoke",
+            "ctf-os-web-runtime-smoke", "nuclei -version", "sqlmap --version",
+            "dalfox --version", "semgrep --version", "ctf-os-web-security-smoke",
         ),
         "rev": (
             "pyopencl", "r2 -v", "qemu-arm", "qemu-mipsel",
             "qemu-system-x86_64", "qemu-system-aarch64",
             "qemu-system-riscv64", "qemu-img",
             "aarch64-linux-gnu-gcc", "ctf-os-binary-runtime-smoke",
-            "ctf-os-system-qemu-smoke",
+            "ctf-os-system-qemu-smoke", "ctf-os-binary-analysis-smoke",
+            "ctf-ghidra-headless", "frida", "pyghidra", "capa",
         ),
         "crypto": ("sage -c", "RsaCtfTool", "cado-nfs", "hashcat --version"),
         "forensic": ("vol", "mmls", "tshark", "stegseek"),
         "misc": ("podman", "torch", "cv2"),
         "osint": ("chromium --headless", "whois", "tesseract"),
-        "ai": ("InferenceSession", "torch.tensor", "torch.version.cuda", "tokenizers"),
+        "ai": (
+            "InferenceSession", "torch.tensor", "torch.version.cuda", "tokenizers",
+            "modelscan", "fickling", "tensorflow", "ctf-os-ai-serialization-smoke",
+        ),
         "cloud": ("aws --version", "gcloud --version", "conftest", "checkov"),
     }
     for profile, required in expectations.items():

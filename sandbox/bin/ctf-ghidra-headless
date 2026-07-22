@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if (( $# < 1 || $# > 2 )); then
+  echo "usage: ctf-ghidra-headless INPUT [TIMEOUT_SECONDS]" >&2
+  exit 64
+fi
+input="$(realpath -e -- "$1")"
+timeout_seconds="${2:-600}"
+[[ -f "$input" ]] || { echo "input is not a regular file: $input" >&2; exit 66; }
+[[ "$timeout_seconds" =~ ^[0-9]+$ ]] && (( timeout_seconds >= 1 && timeout_seconds <= 3600 )) || {
+  echo "timeout must be an integer from 1 through 3600 seconds" >&2
+  exit 64
+}
+mkdir -p /work /artifacts
+project_root="$(mktemp -d /work/ghidra-project.XXXXXX)"
+name="$(printf '%s' "$(basename -- "$input")" | tr -c 'A-Za-z0-9._-' '_')"
+decompilation="/artifacts/${name}.ghidra.c"
+log="/artifacts/${name}.ghidra.log"
+cleanup() { rm -rf -- "$project_root"; }
+trap cleanup EXIT
+
+set +e
+timeout --signal=TERM --kill-after=10 "${timeout_seconds}s" \
+  /opt/ghidra/support/analyzeHeadless "$project_root" ctf-project \
+  -import "$input" -analysisTimeoutPerFile "$timeout_seconds" \
+  -scriptPath /opt/ctf-os/ghidra-scripts \
+  -postScript ExportDecompilation.java "$decompilation" \
+  -deleteProject 2>&1 | tee "$log"
+status="${PIPESTATUS[0]}"
+set -e
+if (( status != 0 )); then
+  echo "Ghidra headless analysis failed with status $status; log: $log" >&2
+  exit "$status"
+fi
+test -s "$decompilation"
+printf 'decompilation=%s\nlog=%s\n' "$decompilation" "$log"

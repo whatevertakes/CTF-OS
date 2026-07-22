@@ -38,25 +38,33 @@ python3 -c 'import requests,httpx,bs4,lxml,yaml,rich,numpy,scipy,PIL,networkx,sy
 python3 --version; jq --version; rg --version; objdump --version; nmap --version
 """,
     "pwn": """
-for c in gdb gdb-multiarch qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 patchelf checksec ROPgadget ropper one_gadget pwninit seccomp-tools musl-gcc aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc; do command -v "$c"; done
-python3 -c 'import pwn,angr,unicorn,capstone,keystone,z3'
+for c in gdb gdb-multiarch qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 patchelf checksec ROPgadget ropper one_gadget pwninit seccomp-tools musl-gcc aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc analyzeHeadless ctf-ghidra-headless frida frida-ps capa afl-fuzz afl-showmap afl-clang-fast afl-clang-fast++ afl-qemu-trace; do command -v "$c"; done
+python3 -c 'import pwn,angr,unicorn,capstone,keystone,z3,frida,pyghidra'
 gdb --version; patchelf --version; checksec --help >/dev/null; ROPgadget --version; ropper --version; one_gadget --version; pwninit --version; seccomp-tools --version; musl-gcc --version
+java -version; frida --version; capa --version
+afl_help="$(afl-fuzz -h 2>&1 || true)"; printf '%s\n' "$afl_help" | grep -F 'afl-fuzz++5.02c' >/dev/null
+/usr/local/bin/ctf-os-binary-analysis-smoke
+/usr/local/bin/ctf-os-pwn-fuzzing-smoke
 qemu-aarch64 --version; qemu-mips --version; qemu-system-x86_64 --version
 /usr/local/bin/ctf-os-binary-runtime-smoke
 """,
     "web": """
-for c in node npm npx corepack php sqlite3 redis-cli psql mysql chromium chromedriver ffuf; do command -v "$c"; done
+for c in node npm npx corepack php sqlite3 redis-cli psql mysql chromium chromedriver ffuf nuclei ctf-nuclei-scan sqlmap dalfox semgrep; do command -v "$c"; done
 node -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)'
 python3 -c 'import flask,fastapi,uvicorn,jwt,requests,httpx,websockets,dns,playwright'
+/opt/semgrep-venv/bin/python -c 'import semgrep'
 node --version; npm --version; php --version; sqlite3 --version
-ffuf -V
+ffuf -V; nuclei -version; sqlmap --version; dalfox --version; semgrep --version
 /usr/local/bin/ctf-os-web-runtime-smoke
+/usr/local/bin/ctf-os-web-security-smoke
 """,
     "rev": """
 (command -v r2 || command -v rizin)
-for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 qemu-system-riscv64 qemu-img aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc; do command -v "$c"; done
-python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools,pyopencl'
+for c in gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 qemu-system-riscv64 qemu-img aarch64-linux-gnu-gcc arm-linux-gnueabihf-gcc mipsel-linux-gnu-gcc riscv64-linux-gnu-gcc analyzeHeadless ctf-ghidra-headless frida frida-ps capa; do command -v "$c"; done
+python3 -c 'import angr,unicorn,capstone,keystone,lief,pefile,elftools,pyopencl,frida,pyghidra'
 r2 -v; jadx --version; apktool --version; wasm-objdump --version; upx --version; wasmtime --version
+java -version; frida --version; capa --version
+/usr/local/bin/ctf-os-binary-analysis-smoke
 /usr/local/bin/ctf-os-binary-runtime-smoke
 /usr/local/bin/ctf-os-system-qemu-smoke
 """,
@@ -86,9 +94,9 @@ python3 -c 'import requests,httpx,bs4,lxml,playwright,PIL,cv2,pandas,whois,dns,g
 chromium --headless --no-sandbox --disable-gpu --dump-dom 'data:text/html,<title>ctf-os</title>' | grep -q ctf-os
 """,
     "ai": """
-for c in protoc h5dump ncdump dot jupyter; do command -v "$c"; done
+for c in protoc h5dump ncdump dot jupyter modelscan fickling; do command -v "$c"; done
 python3 - <<'PY'
-import numpy as np, onnx, onnxruntime as ort, torch, torchvision
+import numpy as np, onnx, onnxruntime as ort, torch, torchvision, h5py, tensorflow, modelscan, fickling
 import sklearn, transformers, tokenizers, sentencepiece, safetensors, datasets, joblib, cv2, pandas
 from onnx import TensorProto, helper
 assert torch.version.cuda is not None
@@ -99,6 +107,7 @@ model=helper.make_model(graph,opset_imports=[helper.make_opsetid('',17)],ir_vers
 session=ort.InferenceSession(model.SerializeToString(),providers=['CPUExecutionProvider'])
 assert session.run(None,{'x':np.array([7],dtype=np.float32)})[0][0] == 7
 PY
+/usr/local/bin/ctf-os-ai-serialization-smoke
 """,
     "cloud": """
 for c in aws az gcloud kubectl helm terraform tofu podman skopeo oras cosign trivy syft grype kustomize opa conftest checkov semgrep; do command -v "$c"; done

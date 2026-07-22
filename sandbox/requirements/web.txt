@@ -5,3 +5,4 @@ PyJWT==2.10.1
 websockets==15.0.1
 dnspython==2.7.0
 playwright==1.54.0
+sqlmap @ https://files.pythonhosted.org/packages/65/29/0938e45586f78c712c568160ba26a15d19b4dfeae2e9bafe2eefdd87ba74/sqlmap-1.10.7-py2.py3-none-any.whl#sha256=83ec02d4e373dd6656ae0b65f1362565dd8b09f998adac3a4bbf72fa7bc7f2ac

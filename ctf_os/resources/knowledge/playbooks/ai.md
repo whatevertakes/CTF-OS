@@ -4,6 +4,8 @@
 
 Keep untrusted models inside the sandbox. Budget three observations: (1) identify artifact format plus shapes/tokenizer/preprocessing; (2) inspect only the likely output/validation boundary; (3) run one input/output differential or small inversion test. Then implement the leading attack.
 
+Before any framework load, scan pickle/joblib/PyTorch serialization files with both ModelScan and Fickling. Treat scanner output as a candidate finding, not proof of exploitability or a flag.
+
 ## 2. Highest-value exploit hypotheses
 
 Prefer concrete model/input weaknesses: preprocessing mismatch, exposed logits/embedding relation, adversarial boundary, inversion/reconstruction, tokenizer/config confusion, unsafe agent/tool trust, or narrowly evidenced model-file behavior. Never use `trust_remote_code=True`.

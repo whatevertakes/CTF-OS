@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if (( $# < 2 || $# > 3 )); then
+  echo "usage: ctf-nuclei-scan TARGET TEMPLATE [OUTPUT_NAME.jsonl]" >&2
+  exit 64
+fi
+target="$1"
+selector="$2"
+output_name="${3:-nuclei.jsonl}"
+python3 - "$target" <<'PY'
+import sys
+from urllib.parse import urlsplit
+value = sys.argv[1]
+parsed = urlsplit(value)
+if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(c.isspace() for c in value):
+    raise SystemExit("target must be one explicit HTTP(S) URL")
+PY
+[[ "$output_name" =~ ^[A-Za-z0-9._-]+\.jsonl$ ]] || {
+  echo "output name must be a plain .jsonl filename" >&2
+  exit 64
+}
+
+if [[ "$selector" = /* ]]; then
+  template="$(realpath -e -- "$selector")"
+else
+  template="$(realpath -e -- "/opt/nuclei-templates/$selector" 2>/dev/null || \
+    realpath -e -- "/opt/ctf-os/rules/nuclei/$selector")"
+fi
+case "$template" in
+  /opt/nuclei-templates/*|/opt/ctf-os/rules/nuclei/*) ;;
+  *) echo "template must be inside a pinned image template directory" >&2; exit 64 ;;
+esac
+mkdir -p /artifacts
+exec nuclei -u "$target" -t "$template" -pt http \
+  -disable-update-check -no-interactsh -no-color -silent \
+  -jsonl -output "/artifacts/$output_name"

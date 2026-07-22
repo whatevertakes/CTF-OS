@@ -3,11 +3,24 @@ set -Eeuo pipefail
 source /opt/ctf-os/install/lib.sh
 
 FFUF_VERSION=2.1.0
+NUCLEI_VERSION=3.11.0
+NUCLEI_SHA256=dc238d6040813e14fc30514dac5a2eb1b430c694f3ca99eee2a5097e55076283
+NUCLEI_TEMPLATES_VERSION=10.4.6
+NUCLEI_TEMPLATES_COMMIT=7d66fa06cc0a5ad85f7bf35f18cf8ee9218fa9a5
+NUCLEI_TEMPLATES_SHA256=bb519f9fe89bfc37ae4bf5590c82507536aa1fc7fa00268d15589a0314643aa7
+DALFOX_VERSION=3.1.2
+DALFOX_SHA256=ef48d30c183cead88eb89da10bdc1a7fa58a484d175319096075b470f3652fd4
+SEMGREP_VERSION=1.127.1
+SEMGREP_SHA256=068fbd6e35b684356d14e7bb759b40d31d43cd9bfe88e4d209e18f91fda7ff8b
 
 apt_install \
   nodejs npm php-cli php-curl php-sqlite3 sqlite3 redis-tools \
   postgresql-client default-mysql-client chromium chromium-driver golang-go
 pip_install -r /opt/ctf-os/requirements/web.txt
+python3 -m venv /opt/semgrep-venv
+/opt/semgrep-venv/bin/pip install --no-cache-dir \
+  "https://files.pythonhosted.org/packages/3b/82/0f834b8315d0ae75fe53e45e7ce6e411f01d0119b0feb22f5a681f46760c/semgrep-${SEMGREP_VERSION}-cp39.cp310.cp311.py39.py310.py311-none-musllinux_1_0_x86_64.manylinux2014_x86_64.whl#sha256=${SEMGREP_SHA256}"
+ln -s /opt/semgrep-venv/bin/semgrep /usr/local/bin/semgrep
 npm install --global corepack@0.33.0
 corepack enable
 
@@ -16,12 +29,21 @@ GOBIN=/usr/local/bin GOPATH="$go_workspace/path" GOCACHE="$go_workspace/cache" \
   go install "github.com/ffuf/ffuf/v2@v${FFUF_VERSION}"
 rm -rf -- "$go_workspace"
 
-for command in node npm npx corepack php sqlite3 redis-cli psql mysql chromium chromedriver ffuf; do require_command "$command"; done
-for module in flask fastapi uvicorn jwt websockets dns requests httpx bs4 lxml cryptography playwright; do require_import "$module"; done
-node -e 'if (Number(process.versions.node.split(".")[0]) < 18) process.exit(1)'
-ffuf -V
-web_smoke_home="$(mktemp -d /tmp/ctf-os-web-home.XXXXXX)"
-chown ctf:ctf "$web_smoke_home"
-runuser -u ctf -- env HOME="$web_smoke_home" XDG_CACHE_HOME="$web_smoke_home/cache" \
-  /usr/local/bin/ctf-os-web-runtime-smoke
-rm -rf -- "$web_smoke_home"
+download_sha256 \
+  "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
+  /tmp/nuclei.zip "$NUCLEI_SHA256"
+unzip -q /tmp/nuclei.zip nuclei -d /tmp/nuclei
+install -m 0755 /tmp/nuclei/nuclei /usr/local/bin/nuclei
+download_sha256 \
+  "https://codeload.github.com/projectdiscovery/nuclei-templates/tar.gz/${NUCLEI_TEMPLATES_COMMIT}" \
+  /tmp/nuclei-templates.tar.gz "$NUCLEI_TEMPLATES_SHA256"
+mkdir -p /opt/nuclei-templates
+tar -xzf /tmp/nuclei-templates.tar.gz -C /opt/nuclei-templates --strip-components=1
+
+download_sha256 \
+  "https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VERSION}/dalfox-v${DALFOX_VERSION}-linux-x86_64.tar.gz" \
+  /tmp/dalfox.tar.gz "$DALFOX_SHA256"
+mkdir -p /tmp/dalfox-extract
+tar -xzf /tmp/dalfox.tar.gz -C /tmp/dalfox-extract --strip-components=1
+install -m 0755 /tmp/dalfox-extract/dalfox /usr/local/bin/dalfox
+rm -rf /tmp/nuclei /tmp/nuclei.zip /tmp/nuclei-templates.tar.gz /tmp/dalfox-extract /tmp/dalfox.tar.gz

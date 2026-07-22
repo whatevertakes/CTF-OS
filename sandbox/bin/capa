@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# The official one-file build extracts executable shared objects at startup.
+# Keep that private extraction on the runtime's executable /tmp mount while
+# preserving CTF-OS's noexec /work policy for all analysis outputs.
+CAPA_RUNTIME_TMPDIR="$(mktemp -d /tmp/capa-runtime.XXXXXX)"
+trap 'rm -rf -- "$CAPA_RUNTIME_TMPDIR"' EXIT HUP INT TERM
+export TMPDIR="$CAPA_RUNTIME_TMPDIR"
+status=0
+/opt/capa/capa "$@" || status="$?"
+exit "$status"

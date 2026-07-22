@@ -12,6 +12,8 @@ Choose at most three reachable chains involving auth/session bypass, injection, 
 
 Send one controlled comparison request that can prove or kill the sink/bypass: a quote/operator differential, template expression, traversal target, signed-token mutation, callback token, or role/ownership swap. Prefer a single reversible request over crawling.
 
+With source, use local Semgrep findings only as first attack candidates and verify them with a request. For remote-only work, run a specific Nuclei template chosen from a fingerprint or concrete suspicion, never a blind sweep. Use sqlmap only with SQLi evidence and Dalfox only with reflection plus an XSS sink.
+
 ## 4. Immediate PoC criteria
 
 A minimal `curl`, raw request, or short Python client that proves read, bypass, callback, execution, or flag-relevant state change is a working PoC. Save the exact request/response rather than a taxonomy report.

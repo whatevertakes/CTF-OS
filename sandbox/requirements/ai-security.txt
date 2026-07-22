@@ -1,0 +1,4 @@
+h5py @ https://files.pythonhosted.org/packages/21/d4/d461649cafd5137088fb7f8e78fdc6621bb0c4ff2c090a389f68e8edc136/h5py-3.14.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=723a40ee6505bd354bfd26385f2dae7bbfa87655f4e61bab175a49d72ebfc06b
+tensorflow-cpu @ https://files.pythonhosted.org/packages/59/03/9a99555a762de8cd4a405efbd39a732d926d8e58791441889560b7675b3e/tensorflow_cpu-2.21.0-cp311-cp311-manylinux_2_27_x86_64.whl#sha256=2b847d217b02ee7731ed91431daf3250daa0196c3c94614d23be27232e6e5b6c
+modelscan @ https://files.pythonhosted.org/packages/8b/1b/392fa2002cd60f22bc9328ce6eb015564930fef5ea7170947c93ef8384ee/modelscan-0.8.8-py3-none-any.whl#sha256=a1997df2368628daa1b3f394f5660a338b1debc623dec67b38f665ba04ad967e
+fickling @ https://files.pythonhosted.org/packages/ba/c0/c65003b71abc4ffddbae99ae86952a21ff859d81b0f1331f79239fe5a58e/fickling-0.1.12-py3-none-any.whl#sha256=6232b72857e6ee9d729922811b681132d49dc39abc896581390dad1c0eada814

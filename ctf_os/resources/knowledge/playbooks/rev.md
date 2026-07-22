@@ -12,6 +12,8 @@ Prefer direct comparison recovery, encoded/hashed constant recovery, branch patc
 
 Breakpoint at the comparison, trace one candidate byte, patch one conditional branch, execute a tiny constraint subset, or compare two input traces. The experiment must confirm how accepted input is constructed or kill that route.
 
+If strings/radare2 do not quickly expose function meaning, generate Ghidra headless output. Use Frida when runtime values, decryption, anti-debugging, or indirect calls are decisive; use capa only to narrow capability and function candidates.
+
 ## 4. Immediate PoC criteria
 
 A script producing an accepted input, a minimal patch demonstrating the validation condition, or a deterministic oracle extracting required bytes is a working PoC. Write the solver before cleaning decompiler output.
