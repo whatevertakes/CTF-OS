@@ -30,4 +30,4 @@ Do not collect every gadget, study the full heap without heap evidence, continue
 
 ## 8. Flag fast path
 
-Publish `EXPLOIT_PRIMITIVE_CANDIDATE` for the first observation, then `EXPLOIT_PRIMITIVE_CONFIRMED` only with target/control ownership, address, or offset receipts (or `EXPLOIT_PRIMITIVE_REFUTED` when the control kills it). Confirmation automatically converges the race and requires Sol takeover into the minimal PoC/endgame. Publish `WORKING_POC` immediately, run it on the declared remote, preserve the exact output and exploit artifact, and surface a matching flag without waiting for clean replay.
+Publish `PRIMITIVE` after the first useful executed observation and strike immediately. Publish `WORKING_POC`, run it on the declared remote, preserve the exact output and exploit artifact, and surface a matching flag without waiting for clean replay.

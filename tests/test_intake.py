@@ -127,7 +127,7 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     preflight = json.loads(preflight_path.read_text())
     launch = payload["solve_launch_context"]
     launch_path = Path(payload["solve_launch_path"])
-    assert launch["schema_version"] == 1
+    assert launch["schema_version"] == 2
     assert launch["challenge_id"] == payload["challenge"]["id"]
     assert launch["challenge_key"] == payload["challenge"]["key"]
     assert launch["input_fingerprint"] == preflight["source_fingerprint"]
@@ -136,7 +136,8 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert "contest_triage" not in launch
     assert not list((repo / "output").glob("*/intake.json"))
     assert launch["execution_policy"]["same_session_required"] is True
-    assert launch["execution_policy"]["maximum_active_hypotheses"] == 3
+    assert launch["initial_child_roles"] == ["independent", "exploit-first", "tool-driven"]
+    assert launch["execution_policy"]["native_spawn_required"] is True
     assert launch_path == solve_root / "SOLVE-LAUNCH.json"
     assert preflight_path == solve_root / "CHALLENGE-PREFLIGHT.json"
     assert json.loads(launch_path.read_text()) == launch
@@ -144,7 +145,7 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert (solve_root / "input" / "value.txt").read_text() == "one"
     assert (run_root / "evidence.log").read_text() == ""
     assert not (run_root / "findings.jsonl").exists()
-    assert (run_root / "race-events.jsonl").read_text() == ""
+    assert (run_root / "ATTACK_EVENTS.jsonl").read_text() == ""
     assert "dedicated Sol session" not in result.stdout
 
     repeated = _prepare(repo)
@@ -409,12 +410,12 @@ def test_solve_launch_refresh_preserves_terminal_state_and_flag_receipt(repo: Pa
     receipt.parent.mkdir(exist_ok=True)
     receipt.write_text('{"flag": "DEMO{preserve}"}')
     artifact = run_root / "artifacts" / "solve.py"
-    artifact.parent.mkdir()
+    artifact.parent.mkdir(exist_ok=True)
     artifact.write_text("print('preserve')")
     evidence = run_root / "evidence.log"
     evidence.write_text("preserve evidence\n")
-    worker = run_root / "workers" / "race-1" / "result.json"
-    worker.parent.mkdir(parents=True)
+    worker = run_root / "workers" / "tool-driven" / "artifacts" / "probe.txt"
+    worker.parent.mkdir(parents=True, exist_ok=True)
     worker.write_text('{"result": "preserve"}')
     state_bytes = state_path.read_bytes()
     receipt_bytes = receipt.read_bytes()

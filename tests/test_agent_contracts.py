@@ -6,24 +6,20 @@ def test_skills_and_agents_define_sol_native_contract() -> None:
     triage = Path(".codex/skills/ctf-triage/SKILL.md").read_text()
     solve = Path(".codex/skills/ctf-solve/SKILL.md").read_text()
     agents = Path("AGENTS.md").read_text()
-    assert "current user-opened Sol session" in solve
-    assert "native delegation" in solve
-    assert "Tier 2: three children" in solve
-    assert "SUBMISSION_RECOMMENDED" in solve
-    assert "Full clean replay: not required" in solve
-    assert "Never run Codex" in solve
-    assert "solve_launch_context" in solve
-    assert "Preflight observation hints only" in solve
-    assert "They are not confirmed vulnerabilities or exploit primitives" in solve
-    assert "challenge-local preflight" in solve
-    assert "Whole-contest Intake and Triage are not prerequisites" in solve
-    assert "pass that explicit information to the internal prepare call using the existing session input format" in solve
-    assert "This is not a separate user step" in solve
-    assert "--session-input-json" not in solve
+    for required in (
+        "current user-opened", "spawn_queue", "spawn_agent", 'fork_turns=\"none\"',
+        "actual returned native", "independent", "exploit-first", "tool-driven",
+        "Root does not wait", "ATTACK_PATH_FOUND", "next two meaningful tool actions",
+        "recording failure never blocks execution", "swarm-replace", "90 minutes",
+        "flag-found", "interrupt_agent", "automatic submission is forbidden",
+        "Whole-contest Intake, Triage",
+    ):
+        assert required in solve
+    assert "--session-input-json" in solve
     assert "optional legacy/admin" in intake
-    assert "keep the current user-opened Sol session" in agents
-    assert "run its internal challenge-local preflight" in agents
-    assert "not Solve prerequisites" in agents
+    assert "current user-opened Sol session" in agents
+    assert "prepare only that challenge" in agents
+    assert "never Solve prerequisites" in agents
     assert "only user-maintained contest input" not in agents
     assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
 
@@ -42,11 +38,17 @@ def test_solve_docs_do_not_require_contest_wide_handoffs() -> None:
     ):
         assert forbidden not in text
     assert "intake\n→ triage\n→ board" not in text
-    readme = Path("README.md").read_text()
-    standard_flow = readme.split("표준 사용 흐름은 다음과 같습니다.", 1)[1].split(
-        "## Low-level CLI debugging", 1,
-    )[0]
-    assert "problems.txt" not in standard_flow
+    assert "problems.txt" not in Path("README.md").read_text()
+
+
+def test_removed_engine_contracts_are_absent_from_live_surface() -> None:
+    source = Path("ctf_os/agent_tools/__main__.py").read_text()
+    for forbidden in (
+        "race-plan-start", "branch-admit", "PRIMITIVE_CANDIDATE",
+        "PRIMITIVE_CONFIRMED", "working-poc-commit", "control-action",
+        "benchmark-start", "fixed-race", "adaptive-race", "sol-only",
+    ):
+        assert forbidden not in source
 
 
 def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:

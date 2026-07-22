@@ -51,20 +51,20 @@ def test_no_artifact_or_ledger_reuse_across_attempts(tmp_path: Path) -> None:
     root, challenge = _workspace(tmp_path)
     first = start_fresh_attempt(root, challenge, "fp")
     (first / "exploit").mkdir(); (first / "exploit" / "solve.py").write_text("owned")
-    (first / "milestone-receipts.jsonl").write_text('{"old":true}\n')
+    (first / "ATTACK_EVENTS.jsonl").write_text('{"old":true}\n')
     second = start_fresh_attempt(root, challenge, "fp")
     assert not (second / "exploit").exists()
-    assert (second / "milestone-receipts.jsonl").read_text() == ""
+    assert (second / "ATTACK_EVENTS.jsonl").read_text() == ""
 
 
-def test_benchmark_never_resolves_attempt_via_active_run_pointer(tmp_path: Path) -> None:
+def test_explicit_run_never_resolves_via_active_run_pointer(tmp_path: Path) -> None:
     root, challenge = _workspace(tmp_path)
     current = bind_input_fingerprint(root, challenge, "fp")
-    benchmark = start_fresh_attempt(
-        root, challenge, "fp", attempt_id="bench-a-1", publish_active=False,
+    explicit = start_fresh_attempt(
+        root, challenge, "fp", attempt_id="manual-attempt-1", publish_active=False,
     )
     assert resolve_active_run(root) == current
-    assert resolve_exact_run(root, benchmark.name) == benchmark
+    assert resolve_exact_run(root, explicit.name) == explicit
 
 
 def test_sealed_prior_attempt_remains_queryable(tmp_path: Path) -> None:
@@ -103,9 +103,9 @@ def test_legacy_content_run_migrates_without_receipt_loss(tmp_path: Path) -> Non
         "schema_version": 1, "challenge_id": challenge.id, "status": "SEALED",
         "sealed": True, "input_fingerprint": "fp", "target_revision": 1,
     }))
-    (root / "milestone-receipts.jsonl").write_text('{"receipt_id":"keep"}\n')
+    (root / "ATTACK_EVENTS.jsonl").write_text('{"event_id":"keep"}\n')
     run = resolve_active_run(root)
-    assert "keep" in (run / "milestone-receipts.jsonl").read_text()
+    assert "keep" in (run / "ATTACK_EVENTS.jsonl").read_text()
     assert show_attempt(root, run_id=run.name)["legacy_identity"] is True
 
 

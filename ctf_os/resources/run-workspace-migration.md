@@ -7,7 +7,7 @@ target revision.
 
 On the first compatibility read of a legacy challenge-level `STATE.json`,
 CTF-OS takes the challenge-local run lock, copies legacy state, receipts,
-evidence, race ledgers, workers, and artifacts into a deterministic
+evidence, executed-attack ledgers, workers, and artifacts into a deterministic
 `runs/legacy-<digest>/` directory, writes a v3 state and manifest, and then
 atomically publishes `ACTIVE_RUN.json`. The original challenge-level files are
 kept as non-authoritative compatibility views. Repeating migration resolves the

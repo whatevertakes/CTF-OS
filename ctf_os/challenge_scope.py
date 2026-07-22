@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .delegation import utc_now
+from .workspace import utc_now
 
 
 class ChallengeScopeError(ValueError):

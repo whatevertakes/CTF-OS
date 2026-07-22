@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  unit-tests:
-    name: CTF-OS / unit-tests
+  test:
+    name: CTF-OS / first-to-flag engine
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -22,13 +22,12 @@ jobs:
       - run: uv sync --frozen
       - name: Full pytest suite
         run: uv run pytest -q
-      - name: Second Surgery and policy fault regressions
-        run: >-
-          uv run pytest -q
-          tests/test_second_surgery.py
-          tests/test_closed_loop.py
-          tests/test_agent_contracts.py
-          tests/test_exploit_first_policy.py
+      - name: First-to-flag integration contract
+        run: uv run pytest -q tests/test_first_to_flag.py tests/test_agent_contracts.py
+      - name: Compile Python sources and tests
+        run: python -m compileall -q ctf_os tests
+      - name: Patch whitespace validation
+        run: git diff --check
 
   package-build:
     name: CTF-OS / package-build
@@ -40,62 +39,4 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
-      - name: Build source and wheel packages
-        run: uv build
-
-  attempt-lineage:
-    name: CTF-OS / attempt-lineage
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - name: Attempt identity, lineage, schema and migration
-        run: >-
-          uv run pytest -q
-          tests/test_attempt_identity.py
-          tests/test_race_lineage.py
-          tests/test_workspace.py
-          tests/test_race_convergence.py
-
-  benchmark-evaluator:
-    name: CTF-OS / benchmark-evaluator
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - name: Signed lock, manifest, schedule and evaluator goldens
-        run: >-
-          uv run pytest -q
-          tests/test_benchmark_lock.py
-          tests/test_benchmark_runtime.py
-          tests/test_benchmark_evaluator.py
-          tests/test_eval.py
-
-  compile:
-    name: CTF-OS / compile
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - name: Compile Python sources and tests
-        run: python -m compileall -q ctf_os tests eval
-      - name: Repository policy validation
-        run: >-
-          uv run pytest -q
-          tests/test_agent_contracts.py
-          tests/test_competition_first.py
-          tests/test_exploit_first_policy.py
-      - name: Patch whitespace validation
-        run: git diff --check
+      - run: uv build

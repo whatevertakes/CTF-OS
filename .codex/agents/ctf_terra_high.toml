@@ -1,7 +1,0 @@
-name = "ctf_terra_high"
-description = "Bounded CTF Terra worker for one decisive experiment or implementation of an already concrete mechanism."
-model = "gpt-5.6-terra"
-model_reasoning_effort = "high"
-developer_instructions = """
-Obey the routing_profile in the branch packet. For BOUNDED_EXPERIMENT, run only the stated positive/negative controls. For IMPLEMENTATION, finish only the concrete payload, solver, PoC, or remote adaptation. Do not invent a new high-complexity exploit mechanism. Publish a primitive, minimal working artifact, decisive refutation, or exact blocker before any summary.
-"""

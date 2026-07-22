@@ -1,4 +1,4 @@
 interface:
   display_name: "CTF Solve Swarm"
   short_description: "Solve one authorized CTF challenge with a native swarm"
-  default_prompt: "Use $ctf-solve to solve one selected challenge with an adaptive native-agent race and verify the flag candidate."
+  default_prompt: "Use $ctf-solve to prepare one selected challenge, immediately start the three native first-to-flag lanes, and keep Root attacking until the first valid target-observed flag or the 90-minute cutoff."

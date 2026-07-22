@@ -7,7 +7,6 @@ import subprocess
 import pytest
 
 from ctf_os.agent_tools.__main__ import build_parser
-from ctf_os.events import publish_event
 from ctf_os.resources.scheduler import (
     GIB, HostCapacity, ResourceLedger, ResourceRequest, allocation_environment,
     classify_utilization, default_request, detect_capacity, infer_workload,
@@ -184,7 +183,7 @@ def test_single_sample_is_unknown_and_busy_loop_never_scales() -> None:
         "broken": {"classification": "STALLED_COMPUTE", "progress": {"busy_loop": True}},
     })
     assert plan["allocations"]["broken"]["cpus"] == 1
-    assert plan["preemption_recommendations"][0]["recommendation"] == "BUMP_AND_RETRY"
+    assert plan["preemption_recommendations"][0]["recommendation"] == "STOP_OR_RESTART_STALLED_COMPUTE"
 
 
 def test_network_progress_is_not_shrunk_as_underutilized() -> None:
@@ -193,18 +192,6 @@ def test_network_progress_is_not_shrunk_as_underutilized() -> None:
         "web-1": {"classification": "NETWORK_BOUND", "progress": {"remote_interactions": 3}},
     })
     assert plan["allocations"]["web-1"]["cpus"] == request.min_cpus
-
-
-def test_remote_flag_keeps_flag_path_and_at_most_one_verifier() -> None:
-    requests = [
-        _request("flagger", "exploit-development"),
-        _request("verify-1", "clean-room-verification"),
-        _request("verify-2", "clean-room-verification"),
-        _request("recon", "quick-recon"),
-    ]
-    plan = plan_allocations(requests, _capacity(), remote_flag_session="flagger")
-    assert set(plan["allocations"]) == {"flagger", "verify-1"}
-    assert {row["session_id"] for row in plan["released"]} == {"verify-2", "recon"}
 
 
 def test_gpu_assignment_vram_shortage_fallback_and_required_wait() -> None:
@@ -216,12 +203,6 @@ def test_gpu_assignment_vram_shortage_fallback_and_required_wait() -> None:
     assert plan["allocations"]["crack"]["gpu_fallback"] == "CPU"
     required = _request("train", "ai-training", gpu_required=True, gpu_preferred=True, gpu_memory_bytes=12 * GIB)
     assert plan_allocations([required], _capacity(devices=[device]))["waiting"][0]["reason"].startswith("required GPU")
-
-
-def test_capacity_based_tier_width_full_and_reduced() -> None:
-    requests = [_request(f"child-{index}", "independent-full-solve") for index in range(3)]
-    assert plan_allocations(requests, _capacity(cpus=8, memory=20 * GIB), tier=2)["capacity_based_race_width"] == 3
-    assert plan_allocations(requests, _capacity(cpus=4, memory=8 * GIB), tier=2)["capacity_based_race_width"] == 2
 
 
 def test_recommended_workers_and_sandbox_environment(tmp_path: Path) -> None:
@@ -241,38 +222,18 @@ def test_recommended_workers_and_sandbox_environment(tmp_path: Path) -> None:
     assert "CTF_OS_WORKLOAD_CLASS=symbolic-execution" in joined
 
 
-def test_ledger_child_ownership_event_priority_sampling_and_release(tmp_path: Path) -> None:
+def test_ledger_child_ownership_sampling_and_release(tmp_path: Path) -> None:
     ledger = ResourceLedger(tmp_path)
     request = _request("worker-1", "symbolic-execution")
     with pytest.raises(Exception, match="only for its own"):
         ledger.request(request, actor_session_id="worker-2", actor_role="child")
     ledger.request(request, actor_session_id="worker-1", actor_role="child")
-    publish_event(
-        tmp_path, challenge_id="challenge", input_fingerprint="fp", session_id="worker-1",
-        event_type="FLAG_CANDIDATE", summary="candidate path",
-    )
-    state = ledger.load()
-    assert state["requests"]["worker-1"]["priority"] == "CRITICAL"
     for sample in _samples(cpu=5.8, allocated=6, progress=True):
         observation = ledger.sample("worker-1", sample)
     assert observation["classification"] == "CPU_STARVED"
     release = ledger.release("worker-1", "complete")
     assert release["last_allocation"] is None
-    assert {row["event"] for row in ledger.history()} >= {"REQUEST", "SAMPLE", "RELEASE", "EVENT_REBALANCE_REQUIRED"}
-
-
-def test_information_only_event_does_not_claim_progress_or_request_rebalance(tmp_path: Path) -> None:
-    ledger = ResourceLedger(tmp_path)
-    request = _request("worker-1", "static-analysis")
-    ledger.request(request, actor_session_id="sol-main", actor_role="sol")
-    ledger.rebalance(_capacity())
-    publish_event(
-        tmp_path, challenge_id="challenge", input_fingerprint="fp", session_id="worker-1",
-        event_type="SUPPORTED_FACT", summary="new architecture note without exploit relevance",
-    )
-    state = ledger.load()
-    assert state["rebalance_required"] is False
-    assert state["observations"].get("worker-1", {}).get("progress", {}).get("progressing") is not True
+    assert {row["event"] for row in ledger.history()} >= {"REQUEST", "SAMPLE", "RELEASE"}
 
 
 def test_dry_plan_preserves_baseline_and_failed_apply_restores_it(tmp_path: Path) -> None:
@@ -366,7 +327,7 @@ def test_resize_refuses_memory_below_usage_and_preserves_on_update_failure(monke
     assert metadata["resources"]["cpus"] == 2
 
 
-def test_new_resource_cli_surface_and_sol_only_resize_hidden_from_child(monkeypatch) -> None:
+def test_new_resource_cli_surface_and_root_only_resize_hidden_from_child(monkeypatch) -> None:
     choices = build_parser()._subparsers._group_actions[0].choices
     required = {
         "resource-status", "resource-plan", "resource-request", "resource-update",

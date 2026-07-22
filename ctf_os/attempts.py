@@ -36,20 +36,6 @@ def safe_attempt_id(value: str | None = None) -> str:
     return attempt_id
 
 
-def benchmark_attempt_id(
-    matched_block_id: str, arm: str, repetition: int, preregistered_seed: str | int,
-) -> str:
-    if arm not in {"A", "B", "C", "D"} or not isinstance(repetition, int) or repetition < 1:
-        raise AttemptError("benchmark attempt identity requires arm A/B/C/D and repetition >= 1")
-    digest = sha256_json({
-        "matched_block_id": matched_block_id,
-        "arm": arm,
-        "repetition": repetition,
-        "preregistered_seed": str(preregistered_seed),
-    })[:32]
-    return f"bench-{arm.lower()}-{repetition}-{digest}"
-
-
 def tree_digest(root: Path) -> str:
     """Digest a prepared input tree without following links or using mtimes."""
 
