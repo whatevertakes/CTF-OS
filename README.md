@@ -1,43 +1,45 @@
 # CTF-OS
 
-CTF-OS is a one-challenge, Sol-native first-to-flag environment for authorized
-CTFs. It preserves challenge/attempt isolation, read-only inputs, category
-sandboxes, declared-target scope, process/GPU resources, manual submission, and
-manual Claude handoff.
+CTF-OS는 허가된 CTF를 위한 단일 문제 중심의 Sol 네이티브 선착순 플래그
+환경입니다. 문제와 시도 간 격리, 읽기 전용 입력, 카테고리별 샌드박스,
+명시된 대상 범위, 프로세스/GPU 자원, 수동 제출, 수동 Claude 인계를
+보장합니다.
 
 ```text
-prepare selected challenge
-→ Root Sol xhigh attacks immediately
-→ optional 0–3 Sol/Terra/Luna native workers
-→ actual commands, artifacts, and attack mutation
-→ declared remote
-→ first valid target-observed flag
-→ sibling cancellation and human submission
+선택한 문제 준비
+→ Root Sol xhigh가 즉시 공격
+→ 선택적으로 Sol/Terra/Luna 네이티브 워커 0–3개 사용
+→ 실제 명령, 산출물, 공격 변형 수행
+→ 명시된 원격 대상 공격
+→ 대상 출력에서 첫 유효 플래그 확인
+→ 동료 워커 취소 후 사람이 제출
 ```
 
-There is one live Solve engine. The selected challenge owns the machine and
-session until a flag, the 90-minute cutoff, or a Claude handoff.
+활성 Solve 엔진은 하나뿐입니다. 선택한 문제는 플래그를 찾거나,
+90분 제한에 도달하거나, Claude에게 인계할 때까지 머신과 세션을
+독점합니다.
 
-## Setup
+## 설치
 
 ```bash
 uv sync --frozen
 uv run python -m ctf_os.agent_tools doctor
 ```
 
-Category images are built with `bash sandbox/build-images.sh`.
+카테고리별 이미지는 `bash sandbox/build-images.sh`로 빌드합니다.
 
-## Solve flow
+## Solve 흐름
 
-Initialize a contest workspace if needed, then prepare only the selected problem:
+필요하면 대회 작업 공간을 초기화한 다음, 선택한 문제만 준비합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools init-contest 'My CTF 2026'
 uv run python -m ctf_os.agent_tools prepare-challenge 'web/Challenge' --contest 'My CTF 2026'
 ```
 
-Preparation returns direct attack context and zero workers. Root begins its own
-attack immediately. When useful, Root creates one optional packet:
+준비 결과로 직접 공격에 사용할 컨텍스트가 반환되며, 워커는 생성되지
+않습니다. Root는 즉시 직접 공격을 시작합니다. 필요하면 Root가 선택적
+패킷 하나를 생성합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools worker-spawn-packet 'web/Challenge' \
@@ -45,52 +47,59 @@ uv run python -m ctf_os.agent_tools worker-spawn-packet 'web/Challenge' \
   --context-mode directed --task 'Turn the current request path into remote exploit.py'
 ```
 
-Profiles are `sol-xhigh` for a new attack mechanism, `terra-high` for an
-executable artifact, and `luna-high` for bounded mechanical work. A packet does
-not start a model. Root passes its `spawn_agent_args` to native `spawn_agent`
-with `fork_turns="none"`, then records the returned identity:
+프로파일은 새 공격 기법에 `sol-xhigh`, 실행 가능한 산출물에
+`terra-high`, 범위가 제한된 기계적 작업에 `luna-high`를 사용합니다.
+패킷 자체는 모델을 시작하지 않습니다. Root는 `spawn_agent_args`를
+`fork_turns="none"`과 함께 네이티브 `spawn_agent`에 전달한 다음,
+반환된 식별자를 기록합니다.
 
 ```bash
 uv run python -m ctf_os.agent_tools worker-spawn-confirm 'web/Challenge' \
   --contest 'My CTF 2026' --lane terra-1 --native-session '<thread-id>'
 ```
 
-Only an actual native identity is `RUNNING`; Root plus at most three native
-children keeps model concurrency at four. Workers share existing resource and
-service foundations while retaining private writable paths.
+실제 네이티브 식별자가 있어야만 `RUNNING`입니다. Root와 최대 3개의
+네이티브 자식을 합쳐 동시 실행 모델을 4개로 유지합니다. 워커는 기존
+자원과 서비스 기반을 공유하면서도 각자의 전용 쓰기 경로를 유지합니다.
 
-## Events and replacement
+## 이벤트와 워커 교체
 
-`SWARM.json` holds compact attempt/worker state and `ATTACK_EVENTS.jsonl` holds
-post-execution facts. `attack-event` records actual commands, artifacts,
-primitives, PoCs, remote results, useful failures, blockers, and candidates.
-Execution comes first, so event-write failure cannot block a completed command.
+`SWARM.json`은 시도와 워커 상태를 간결하게 보관하고, `ATTACK_EVENTS.jsonl`은
+실행 후의 사실을 보관합니다. `attack-event`는 실제 명령, 산출물, 프리미티브,
+PoC, 원격 결과, 유용한 실패, 방해 요인, 후보를 기록합니다. 실행이 기록보다
+먼저이므로, 이벤트 기록 실패가 이미 완료된 명령을 무효로 만들지 않습니다.
 
-`worker-status` exposes compact real-output history. Root decides whether to keep
-or stop a worker and may call `worker-replace` with another profile, role, task,
-and fresh or directed context. Python does not score role quality.
+`worker-status`는 실제 출력 이력을 간결하게 보여줍니다. Root는 워커를 유지할지
+중지할지 판단하며, 다른 프로파일·역할·작업과 새 컨텍스트 또는 지정된
+컨텍스트로 `worker-replace`를 호출할 수 있습니다. Python은 역할의 품질을
+평가하지 않습니다.
 
-After minute 60, `worker-endgame` may replace one qualified worker with
-`ctf_sol_max`. Qualification requires an executable partial path, two actual
-attack outputs, an exact non-environment reasoning blocker, and a concrete next
-attack. The lease is ten minutes or two attacks. The 90-minute cutoff writes
-`artifacts/TIMEOUT_HANDOFF.md`, returns cancel targets, and never extends.
+60분이 지난 뒤에는 `worker-endgame`이 자격을 갖춘 워커 하나를
+`ctf_sol_max`로 교체할 수 있습니다. 자격을 갖추려면 실행 가능한 부분 경로,
+실제 공격 출력 2건, 환경과 무관한 명확한 추론 장애물, 구체적인 다음 공격이
+필요합니다. 할당 시간은 10분 또는 공격 2회입니다. 90분 제한에 도달하면
+`artifacts/TIMEOUT_HANDOFF.md`를 작성하고 취소 대상을 반환하며, 시간을
+연장하지 않습니다.
 
-## Flag and isolation
+## 플래그와 격리
 
-A usable payload or meaningful local response is enough to attack the declared
-remote. `flag-found` accepts only a format-valid non-placeholder candidate that
-appears in actual target output with an exact executed command. It chooses the
-first winner and returns native sibling cancel targets. CTF-OS never submits;
-`submission-result` records human `wrong` or `accepted` feedback.
+사용 가능한 페이로드나 의미 있는 로컬 응답을 확보하면 명시된 원격 대상을
+공격할 수 있습니다. `flag-found`는 정확히 실행한 명령과 함께 실제 대상
+출력에 나타난 후보 중, 형식이 유효하고 플레이스홀더가 아닌 것만
+받아들입니다. 가장 먼저 발견된 플래그를 승자로 선택하고 취소할 네이티브
+동료 워커 목록을 반환합니다. CTF-OS는 절대 자동 제출하지 않으며,
+`submission-result`는 사람이 남긴 `wrong` 또는 `accepted` 피드백을
+기록합니다.
 
-- A fresh attempt inherits no artifact, cache, native identity, sandbox, service,
-  or solver state.
-- Input is read-only; each worker writes only in private `work`, `evidence`, and
-  `artifacts` paths.
-- Sandboxes enforce organizer-declared target scope and block host/private data.
-- Shared service and global resource changes remain Root-only.
+- 새 시도는 이전의 산출물, 캐시, 네이티브 식별자, 샌드박스, 서비스,
+  솔버 상태를 상속하지 않습니다.
+- 입력은 읽기 전용이며, 각 워커는 자신의 전용 `work`, `evidence`,
+  `artifacts` 경로에만 쓸 수 있습니다.
+- 샌드박스는 주최 측이 명시한 대상 범위를 강제하고 호스트와 비공개 데이터에
+  대한 접근을 차단합니다.
+- 공유 서비스와 전역 자원은 Root만 변경할 수 있습니다.
 
-Whole-contest Intake and Triage run only when explicitly requested and do not
-affect a Solve. On “클로드 구조대 준비해라”, stop the attack and use the handoff
-skill to write one evidence-backed `rescue/<contest>/<challenge>/HANDOFF.md`.
+전체 대회 Intake와 Triage는 명시적으로 요청받을 때만 실행하며 Solve에
+영향을 주지 않습니다. “클로드 구조대 준비해라”라는 명령을 받으면 공격을 멈추고
+인계 스킬을 사용해 근거가 포함된
+`rescue/<contest>/<challenge>/HANDOFF.md` 하나를 작성합니다.
