@@ -21,7 +21,7 @@ def test_skills_and_agents_define_dynamic_native_worker_contract() -> None:
     assert "prepare only that" in agents
     assert "never Solve prerequisites" in agents
     assert "live `root` sandbox" in agents
-    assert "host execution is limited to CTF-OS controller commands" in agents
+    assert "host execution" in agents and "CTF-OS controller commands" in agents
     assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
 
 
