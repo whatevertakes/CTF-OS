@@ -1,4 +1,4 @@
-# Reverse engineering exploit-first playbook
+# Reverse engineering attack playbook
 
 ## 1. Fast recon budget
 

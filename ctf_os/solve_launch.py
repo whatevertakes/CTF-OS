@@ -12,7 +12,7 @@ from .sandbox.network import parse_remotes
 from .workspace import atomic_json
 
 
-SOLVE_LAUNCH_SCHEMA_VERSION = 2
+SOLVE_LAUNCH_SCHEMA_VERSION = 3
 MAX_SOLVE_LAUNCH_BYTES = 64 * 1024
 MAX_PRIORITY_FILES = 20
 MAX_OBSERVATION_HINTS = 8
@@ -47,8 +47,6 @@ def build_solve_launch_context(
             "lead_attacker": True, "coordinator_only": False,
             "model_request": "gpt-5.6-sol", "reasoning_effort": "xhigh",
         },
-        "initial_child_roles": ["independent", "exploit-first", "tool-driven"],
-        "initial_child_width": 3,
         "maximum_model_concurrency": 4,
         "budget_seconds": 90 * 60,
         "authorized_targets": [_target(item) for item in targets],
@@ -70,16 +68,10 @@ def build_solve_launch_context(
         },
         "execution_policy": {
             "same_session_required": True,
-            "prepare_then_spawn_before_recon": True,
-            "native_spawn_required": True,
+            "root_attacks_immediately": True,
+            "optional_native_children": True,
             "native_thread_id_required_for_running": True,
-            "fork_turns": "none",
             "root_continues_attacking_without_waiting": True,
-            "attack_path_strikes_within_meaningful_actions": 2,
-            "primitive_confirmation_required": False,
-            "negative_control_required": False,
-            "working_poc_authorization_required": False,
-            "remote_authorization_required": False,
             "event_write_blocks_execution": False,
             "automatic_flag_submission": False,
             "automatic_extension": False,

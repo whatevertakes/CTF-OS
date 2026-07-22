@@ -42,7 +42,8 @@ def test_child_tool_surface_omits_shared_lifecycle_and_final_judgment(monkeypatc
     assert not {
         "service-build", "service-start", "service-restart", "service-stop", "service-cleanup",
         "sandbox-create", "sandbox-gc", "record-finding", "replay",
-        "swarm-spawn-confirm", "swarm-replace", "flag-found", "submission-result",
+        "worker-status", "worker-spawn-packet", "worker-spawn-confirm", "worker-spawn-failed", "worker-replace",
+        "worker-endgame", "worker-stop-confirm", "flag-found", "submission-result",
     }.intersection(commands)
 
 
@@ -70,8 +71,8 @@ def test_first_to_flag_cli_surface_is_exposed_without_native_launcher() -> None:
     parser = build_parser()
     commands = parser._subparsers._group_actions[0].choices
     assert {
-        "swarm-status", "swarm-spawn-confirm", "swarm-spawn-failed",
-        "swarm-replace", "swarm-endgame", "swarm-stop-confirm", "attack-event", "attack-events-show",
+        "worker-status", "worker-spawn-packet", "worker-spawn-confirm", "worker-spawn-failed",
+        "worker-replace", "worker-endgame", "worker-stop-confirm", "attack-event", "attack-events-show",
         "flag-found", "submission-result", "oast-create", "oast-poll", "oast-events",
         "branch-service-restart", "branch-service-reset",
     }.issubset(commands)
@@ -79,6 +80,11 @@ def test_first_to_flag_cli_surface_is_exposed_without_native_launcher() -> None:
         "race-plan-start", "branch-admit", "milestone-save", "working-poc-commit",
         "control-action-apply", "benchmark-start",
     }.intersection(commands)
+    packet = parser.parse_args([
+        "worker-spawn-packet", "1", "--model-profile", "terra-high",
+        "--role", "builder", "--context-mode", "directed", "--task", "build exploit",
+    ])
+    assert packet.model_profile == "terra-high" and packet.role == "builder"
     exec_args = parser.parse_args(["sandbox-exec", "--timeout-profile", "fuzz_slice", "sandbox.json", "--", "true"])
     assert exec_args.timeout == 300 and exec_args.timeout_profile == "fuzz_slice"
 

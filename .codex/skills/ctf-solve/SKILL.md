@@ -1,218 +1,124 @@
 ---
 name: ctf-solve
-description: Solve exactly one authorized CTF challenge with the current user-opened Sol session and an immediate native first-to-flag swarm.
+description: Solve exactly one authorized CTF challenge with Root Sol and optional native Sol, Terra, or Luna workers.
 ---
 
 # CTF Solve — first to flag
 
 Read `ctf_os/resources/agent-policy.md`, root `AGENTS.md`, and only the selected
-category playbook. This is a 90-minute timed CTF attack. The current user-opened
-session is `/root`, Sol xhigh, lead attacker, remote operator, and flag judge.
-Python prepares isolated inputs, sandboxes, packets, events, and artifacts. It
-never starts a model, stops a native child, submits a flag, or authorizes an
-attack.
+category playbook. The current user-opened `/root` session is Sol xhigh and lead
+attacker. Python prepares context, private paths, packets, events, and artifacts;
+it never starts/stops a native child, authorizes an attack, or submits a flag.
 
-If the user requests a Claude handoff, stop before any new attack command, load
-the handoff skill, save its single evidence-backed `HANDOFF.md`, and end the
-Solve.
+If the user requests a Claude handoff, stop before any new attack, load the
+handoff skill, write its single evidence-backed `HANDOFF.md`, and end the Solve.
 
-## Prepare and immediately spawn
+## Prepare, then attack
 
-Run the selected challenge's challenge-local preparation in this same session:
+Prepare only the selected challenge in this session:
 
 ```bash
 uv run python -m ctf_os.agent_tools prepare-challenge '<selector>' --contest '<contest>'
 ```
 
-Pass description, hints, flag format, supplied files, and organizer-declared
-remote information from the current request through the existing session-input
-mechanism, adding `--session-input-json '<bounded challenge-local JSON>'` to that
-same prepare command when the request supplies or overrides those fields. Whole-contest Intake, Triage, a Board, tier, evidence grade, and recon
-approval are never prerequisites.
+When the request supplies description, hints, flag format, files, or declared
+remote data, pass the bounded challenge-local values with
+`--session-input-json`. Preparation returns the challenge context and an empty
+worker list. Root immediately runs its best real command or exploit; it does not
+wait for a child and no child is mandatory. Whole-contest Intake and Triage are
+optional administration and never Solve prerequisites.
 
-Successful preparation returns `spawn_queue` with exactly these initial lanes:
+## Optional native workers
+
+Root may create zero to three workers at any time. Choose directly:
 
 ```text
-/root/independent
-/root/exploit-first
-/root/tool-driven
+new attack mechanism or hard alternate reasoning → sol-xhigh
+concrete direction needs executable code          → terra-high
+bounded repetitive/mechanical work                → luna-high
 ```
 
-Before any additional analysis or recon command, Root must call native
-`spawn_agent` once for every initial packet. Pass each packet's
-`spawn_agent_args` exactly, including `fork_turns="none"`. Do not translate the
-packet into a shell command, Python subprocess, model API call, or JSON plan-only
-workflow. The initial three native calls are mandatory even when an extra
-capability check would be useful; capability discovery must not delay them.
-
-After all three native calls have been issued, record each returned native
-thread/session ID:
+Create one packet with only profile, role, task, and context mode:
 
 ```bash
-uv run python -m ctf_os.agent_tools swarm-spawn-confirm '<selector>' \
-  --contest '<contest>' --lane '<lane>' --native-session '<actual-thread-id>'
+uv run python -m ctf_os.agent_tools worker-spawn-packet '<selector>' \
+  --contest '<contest>' --model-profile terra-high --role builder \
+  --context-mode directed --task-file /tmp/task.txt \
+  --facts-json '["format string controls printf","offset candidate 8"]'
 ```
 
-Only a child with an actual returned native identity is `RUNNING`. If start
-fails, call `swarm-spawn-failed`, retry that lane once when the returned packet
-allows it, and keep Root attacking regardless. `PENDING_SPAWN` or a packet alone
-is not a live swarm.
+Use `fresh` for a Sol perspective that receives only the problem, prepared input,
+and declared remote. Use `directed` for a builder, mechanical task, or failure
+analysis; it may include `--facts-json`, `--failure-command-json`,
+`--failure-output`, `--artifact`, and `--exact-blocker`. These are optional and
+never block creation when omitted.
 
-Immediately after issuing the native starts, create/attach each lane's
-category sandbox using its packet metadata. Challenge input is read-only; each
-lane writes only under its private `work`, `evidence`, and `artifacts` paths.
-Root does not wait for child completion or poll low-value progress. Root begins
-its own most promising attack as soon as the native starts are issued.
+Call native `spawn_agent` with the returned `spawn_agent_args` exactly, including
+`fork_turns="none"`. Use the returned `agent_profile` when the native surface
+supports project profiles. Record the actual returned thread ID:
 
-The native surface in this installation accepts `task_name`, `message`, and
-`fork_turns`. If it cannot directly select model/reasoning, use the minimal
-`ctf_sol_xhigh` project profile where supported; lack of model attribution never
-blocks the live solve. Use `ctf_sol_max` only for the bounded 60-minute endgame
-contract below.
-
-## Lane contracts
-
-Every packet contains only challenge-local facts: name, category, description,
-hint, flag format, prepared input path, declared remotes, sandbox paths, deadline,
-and lane role. It must not contain Root's private reasoning.
-
-`independent` receives no Root hypotheses and independently races for the
-shortest flag path.
-
-`exploit-first` obeys:
-
-```text
-Do not produce a report.
-Do not seek complete understanding.
-Find, build, and run the smallest plausible exploit.
+```bash
+uv run python -m ctf_os.agent_tools worker-spawn-confirm '<selector>' \
+  --contest '<contest>' --lane '<lane-id>' --native-session '<thread-id>'
 ```
 
-`tool-driven` obeys:
+Without a native identity the worker is not `RUNNING`. Record a failed native
+start with `worker-spawn-failed`; one retry packet is allowed. Root keeps
+attacking throughout.
 
-```text
-Your progress must be commands, scripts, payloads,
-runtime observations, or exact blockers from actual execution.
+## Execute, inspect, and replace
+
+Each participant uses real tools and pursues the smallest executable attack.
+Workers obey the profile contract in their packet. Useful output is an actual
+command, executable artifact, primitive, working PoC, remote result, useful
+failure, exact blocker, or flag candidate.
+
+Use `attack-event` only after execution. `sandbox-exec` also attempts a
+best-effort command event after the process returns. A logging failure never
+blocks or invalidates the completed command. `worker-status` returns compact
+per-worker command/output counts and the last event so Root can keep, stop, or
+replace a worker without a score or semantic Python gate.
+
+Root calls native `interrupt_agent`, confirms it with `worker-stop-confirm`, then
+may use `worker-replace` with any general profile, role, task, and context mode.
+A running worker may also be replaced by passing its exact stopped native ID.
+Keep Root attacking; never wait only to coordinate.
+
+## Sol max and cutoff
+
+Sol max cannot be requested by `worker-spawn-packet`. From minute 60,
+`worker-status` lists a candidate only when one running worker has an executable
+partial path, two actual exploit or remote outputs, an exact non-environment
+reasoning blocker, and a concrete next attack. Stop that worker and call:
+
+```bash
+uv run python -m ctf_os.agent_tools worker-endgame '<selector>' \
+  --contest '<contest>' --lane '<lane-id>' --native-stop-session '<thread-id>'
 ```
 
-All lanes immediately use tools and follow one loop:
-
-```text
-MINIMAL OBSERVATION
-→ ONE ATTACK PATH
-→ SMALLEST EXECUTABLE ATTACK
-→ RUN
-→ READ REAL OUTPUT
-→ MUTATE OR REPLACE
-→ REMOTE
-→ FLAG
-```
-
-Do not wait for complete understanding, enumerate the whole attack surface,
-write a report first, build a reusable framework, or refactor a PoC before a
-remote attempt.
-
-## Attack and remote fast path
-
-Runtime attack state is only:
-
-```text
-ATTACK_PATH_FOUND
-EXPLOIT_ATTEMPTED
-USEFUL_FAILURE
-FLAG_FOUND
-```
-
-These are post-execution records, never permissions. A crash, leak, oracle,
-bypass, read/write path, controlled code path, solver-linked reduction,
-decrypt/extract candidate, or constructible remote request is an attack path.
-Within the next two meaningful tool actions, execute a payload, PoC, solver, or
-remote attack. Do not require a separate control experiment.
-
-If a remote is declared, check reachability early. After one meaningful local
-response or a payload that can be sent, go remote immediately. Do not delay for
-a clean replay, edge cases, PoC approval, or any authorization receipt. Preserve
-only the exact command, bounded output, and exploit artifact after execution.
-If event append fails, retain the command output locally and continue attacking;
-recording failure never blocks execution.
-
-Record compact events with `attack-event`. Share with siblings only:
-
-```text
-PRIMITIVE
-WORKING_POC
-REMOTE_RESULT
-FLAG_FOUND
-BLOCKER
-USEFUL_FAILURE
-```
-
-Root checks sibling state only at those events or child termination. Do not
-share general source summaries, long decompilation, unexecuted hypothesis lists,
-file listings, or “still analyzing” updates.
-
-## Failure, replacement, and time
-
-After a failed attack, change one variable and rerun, apply a sibling result and
-rerun, or switch to a fresh attack family. Never repeat an identical failing
-command without a changed input or reason.
-
-At 30 minutes, call `swarm-status`. Replace at most two low-yield running lanes
-that have no primitive/PoC and are repeating one family or analysis. Native-stop
-the chosen child first, then call `swarm-replace` with the exact failed command,
-stdout/stderr or remote response, disproved path, exact blocker, and untried
-family. There is no lifetime one-replacement limit; only the 90-minute deadline,
-native concurrency four including Root, and non-repetition apply.
-
-At 60 minutes, `swarm-status` may identify one Max endgame candidate only when a
-partial executable path exists, at least two actual attacks ran, and a concrete
-reasoning blocker remains. Its `ctf_sol_max` lease is ten minutes or two actual
-attacks, whichever comes first. Environment, dependency, Docker, target-down,
-rate-limit, and ordinary tool failures never justify Max.
-Stop that candidate's current native lane and call `swarm-endgame` with its exact
-native session; then issue the returned native max packet and confirm its actual
-thread ID like any other spawn.
-
-At 90 minutes, call `swarm-status`, interrupt every returned cancel target, and
-stop. Do not extend automatically. Preserve only the leading attack path, actual
-exploit/script, exact commands and output, observed primitive, exact blocker,
-and one next attack in `artifacts/TIMEOUT_HANDOFF.md`. A user request to continue
-starts a fresh 90-minute attempt generation.
+Spawn and confirm the returned `ctf_sol_max` packet. Its lease is ten minutes or
+two actual attacks. At 90 minutes, call `worker-status`, interrupt every cancel
+target, and stop without extension. Preserve the generated compact timeout
+handoff. A human continuation starts a fresh attempt.
 
 ## First flag wins
 
-Any lane sends a flag candidate to Root immediately with its exact command and
-actual target output. Root checks only that the challenge format matches, the
-candidate appears in actual output, and it is not a placeholder. Then call:
+Any worker sends a candidate, exact command, and actual target output to Root.
+Root validates and records it:
 
 ```bash
 uv run python -m ctf_os.agent_tools flag-found '<selector>' \
-  --contest '<contest>' --lane '<lane>' --candidate '<flag>' \
+  --contest '<contest>' --lane '<lane-id-or-root>' --candidate '<flag>' \
   --observed-output '<actual-output>' --artifact '<run-relative-artifact>' \
-  --source '<target/source>' -- '<exact-command>'
+  --source '<challenge-or-declared-target>' -- '<exact-command>'
 ```
 
-Display the returned block immediately:
+Display the returned flag block immediately. Interrupt every returned sibling,
+confirm stops, and do no replay that delays display. A human submits. Record
+`WRONG` or `ACCEPTED` with `submission-result`; after `WRONG`, Root resumes and
+may create any fresh worker.
 
-```text
-REMOTE FLAG OBTAINED
-Challenge: <challenge>
-Flag: <flag>
-Source: <lane / command>
-Recommendation: submit immediately
-```
-
-Immediately call native `interrupt_agent` for every returned cancel target,
-record each with `swarm-stop-confirm`, and do no additional analysis or replay.
-The human submits; automatic submission is forbidden.
-
-If the human reports `WRONG`, record that exact candidate with
-`submission-result`; discard only it and immediately spawn the returned fresh
-striker packet. If the human reports `ACCEPTED`, record it, stop remaining native
-children, and clean only CTF-OS-owned sandboxes/resources.
-
-Attack exactly one selected challenge and only organizer-declared targets.
-Never access cloud metadata, Docker gateways, unrelated LANs/challenges, host
-Docker socket/root, SSH keys, browser profiles, personal credentials, or personal
-files. A child mutates only its own private service; Root alone owns shared
-service, global resources, native lifecycle, remote judgment, and submission
-feedback.
+Attack only this challenge and declared targets. Keep input read-only and every
+worker under its private paths. Never access cloud metadata, Docker gateways,
+undeclared networks/challenges, the host Docker socket/root, SSH keys, browser
+profiles, personal credentials, or personal files.

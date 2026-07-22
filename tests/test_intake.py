@@ -127,7 +127,7 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     preflight = json.loads(preflight_path.read_text())
     launch = payload["solve_launch_context"]
     launch_path = Path(payload["solve_launch_path"])
-    assert launch["schema_version"] == 2
+    assert launch["schema_version"] == 3
     assert launch["challenge_id"] == payload["challenge"]["id"]
     assert launch["challenge_key"] == payload["challenge"]["key"]
     assert launch["input_fingerprint"] == preflight["source_fingerprint"]
@@ -136,8 +136,9 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     assert "contest_triage" not in launch
     assert not list((repo / "output").glob("*/intake.json"))
     assert launch["execution_policy"]["same_session_required"] is True
-    assert launch["initial_child_roles"] == ["independent", "exploit-first", "tool-driven"]
-    assert launch["execution_policy"]["native_spawn_required"] is True
+    assert "initial_child_roles" not in launch and "initial_child_width" not in launch
+    assert launch["execution_policy"]["root_attacks_immediately"] is True
+    assert launch["execution_policy"]["optional_native_children"] is True
     assert launch_path == solve_root / "SOLVE-LAUNCH.json"
     assert preflight_path == solve_root / "CHALLENGE-PREFLIGHT.json"
     assert json.loads(launch_path.read_text()) == launch
@@ -151,6 +152,34 @@ def test_prepare_bootstraps_challenge_local_preflight_in_the_same_call(repo: Pat
     repeated = _prepare(repo)
     assert repeated.returncode == 0
     assert launch_path.read_bytes() == first_launch
+
+
+def test_worker_spawn_packet_cli_builds_one_directed_terra_packet(repo: Path) -> None:
+    write_contest(repo, "# Demo CTF\n### pwn/X\n- Description: format string\n")
+    source = repo / "incoming" / "Demo CTF" / "pwn" / "X"
+    source.mkdir(parents=True)
+    (source / "chall").write_bytes(b"ELF")
+    assert _prepare(repo).returncode == 0
+    task = repo / "task.txt"
+    task.write_text("build and run the remote exploit", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "python", "-m", "ctf_os.agent_tools", "--repo", str(repo),
+            "worker-spawn-packet", "1", "--contest", "Demo CTF",
+            "--model-profile", "terra-high", "--role", "builder",
+            "--context-mode", "directed", "--task-file", str(task),
+            "--facts-json", '["printf(input) observed"]',
+        ],
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    packet = json.loads(result.stdout)["result"]
+    assert packet["model_profile"] == "terra-high" and packet["role"] == "builder"
+    assert packet["task"] == "build and run the remote exploit"
+    assert packet["challenge_context"]["directed"]["facts"] == ["printf(input) observed"]
+    assert packet["spawn_agent_args"]["fork_turns"] == "none"
 
 
 def test_solve_launch_includes_declared_target_and_priority_file(repo: Path) -> None:
@@ -414,7 +443,7 @@ def test_solve_launch_refresh_preserves_terminal_state_and_flag_receipt(repo: Pa
     artifact.write_text("print('preserve')")
     evidence = run_root / "evidence.log"
     evidence.write_text("preserve evidence\n")
-    worker = run_root / "workers" / "tool-driven" / "artifacts" / "probe.txt"
+    worker = run_root / "workers" / "preserved-worker" / "artifacts" / "probe.txt"
     worker.parent.mkdir(parents=True, exist_ok=True)
     worker.write_text('{"result": "preserve"}')
     state_bytes = state_path.read_bytes()

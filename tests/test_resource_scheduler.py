@@ -335,6 +335,8 @@ def test_new_resource_cli_surface_and_root_only_resize_hidden_from_child(monkeyp
         "sandbox-resize",
     }
     assert required <= set(choices)
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["scheduler-rebalance"])
     monkeypatch.setenv("CTF_OS_SESSION_ROLE", "child")
     child_choices = build_parser()._subparsers._group_actions[0].choices
     assert {"resource-request", "resource-update", "resource-release", "resource-sample"} <= set(child_choices)

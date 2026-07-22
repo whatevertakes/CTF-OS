@@ -1,4 +1,4 @@
-# Misc exploit-first playbook
+# Misc attack playbook
 
 ## 1. Fast recon budget
 

@@ -39,11 +39,12 @@ from ..service import (
 )
 from ..solve_launch import build_solve_launch_context, save_solve_launch_context
 from ..swarm import (
-    confirm_native_spawn, flag_found, high_value_events, initialize_swarm,
+    GENERAL_MODEL_PROFILES, confirm_native_spawn, create_worker_packet, ensure_prepare_scope,
+    flag_found, high_value_events, initialize_swarm,
     record_attack_event, record_command_after_execution, record_spawn_failure,
-    replace_lane, start_max_endgame, stop_confirmed,
+    replace_worker, start_max_endgame, stop_confirmed,
     submission_result as record_swarm_submission_result,
-    swarm_status,
+    terminate_for_handoff, worker_status,
 )
 from ..triage import finalize_triage, prepare_triage
 from ..timeouts import timeout_seconds
@@ -130,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         resource_plan = commands.add_parser("resource-plan")
         resource_plan.add_argument("selector"); resource_plan.add_argument("--contest"); _add_session_args(resource_plan)
         rebalance = commands.add_parser("scheduler-rebalance")
-        rebalance.add_argument("selector", nargs="?"); rebalance.add_argument("--contest")
+        rebalance.add_argument("selector"); rebalance.add_argument("--contest")
         rebalance.add_argument("--apply", dest="apply", action="store_true")
         rebalance.add_argument("--dry-run", dest="apply", action="store_false")
         rebalance.set_defaults(apply=True)
@@ -225,8 +226,6 @@ def build_parser() -> argparse.ArgumentParser:
         service.add_argument("--branch", required=True)
         _add_session_args(service, default_role="child")
 
-    swarm_show = commands.add_parser("swarm-status")
-    swarm_show.add_argument("selector"); swarm_show.add_argument("--contest"); _add_session_args(swarm_show)
     attack_event = commands.add_parser("attack-event")
     attack_event.add_argument("selector"); attack_event.add_argument("--contest")
     attack_event.add_argument("--lane", required=True); attack_event.add_argument("--type", required=True)
@@ -247,26 +246,30 @@ def build_parser() -> argparse.ArgumentParser:
     oast_show.add_argument("selector"); oast_show.add_argument("--contest"); oast_show.add_argument("--oast-id", required=True)
     _add_session_args(oast_show)
     if not child_surface:
-        spawn_confirm = commands.add_parser("swarm-spawn-confirm")
+        worker_show = commands.add_parser("worker-status")
+        worker_show.add_argument("selector"); worker_show.add_argument("--contest"); _add_session_args(worker_show)
+        spawn_packet = commands.add_parser("worker-spawn-packet")
+        spawn_packet.add_argument("selector"); spawn_packet.add_argument("--contest")
+        _add_worker_packet_args(spawn_packet); _add_session_args(spawn_packet)
+        spawn_confirm = commands.add_parser("worker-spawn-confirm")
         spawn_confirm.add_argument("selector"); spawn_confirm.add_argument("--contest")
         spawn_confirm.add_argument("--lane", required=True); spawn_confirm.add_argument("--native-session", required=True)
         spawn_confirm.add_argument("--operation-id"); _add_session_args(spawn_confirm)
-        spawn_failed = commands.add_parser("swarm-spawn-failed")
+        spawn_failed = commands.add_parser("worker-spawn-failed")
         spawn_failed.add_argument("selector"); spawn_failed.add_argument("--contest")
         spawn_failed.add_argument("--lane", required=True); spawn_failed.add_argument("--error", required=True)
         _add_session_args(spawn_failed)
-        replacement = commands.add_parser("swarm-replace")
+        replacement = commands.add_parser("worker-replace")
         replacement.add_argument("selector"); replacement.add_argument("--contest")
         replacement.add_argument("--lane", required=True)
-        replacement.add_argument("--role", required=True, choices=("alternate-family", "failure-analysis", "striker"))
         replacement.add_argument("--reason", required=True); replacement.add_argument("--native-stop-session")
-        replacement.add_argument("--actual-failure", required=True); replacement.add_argument("--untried-family", required=True)
+        _add_worker_packet_args(replacement)
         _add_session_args(replacement)
-        endgame = commands.add_parser("swarm-endgame")
+        endgame = commands.add_parser("worker-endgame")
         endgame.add_argument("selector"); endgame.add_argument("--contest")
         endgame.add_argument("--lane", required=True); endgame.add_argument("--native-stop-session", required=True)
         _add_session_args(endgame)
-        stop = commands.add_parser("swarm-stop-confirm")
+        stop = commands.add_parser("worker-stop-confirm")
         stop.add_argument("selector"); stop.add_argument("--contest")
         stop.add_argument("--lane", required=True); stop.add_argument("--native-session", required=True)
         _add_session_args(stop)
@@ -304,6 +307,54 @@ def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "s
     )
     parser.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main"))
     parser.add_argument("--recover-stale", action="store_true")
+
+
+def _add_worker_packet_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model-profile", required=True, choices=GENERAL_MODEL_PROFILES)
+    parser.add_argument("--role", required=True)
+    task = parser.add_mutually_exclusive_group(required=True)
+    task.add_argument("--task")
+    task.add_argument("--task-file")
+    parser.add_argument("--context-mode", required=True, choices=("fresh", "directed"))
+    parser.add_argument("--facts-json")
+    parser.add_argument("--failure-command-json")
+    parser.add_argument("--failure-output")
+    parser.add_argument("--artifact")
+    parser.add_argument("--exact-blocker")
+
+
+def _worker_request(args: argparse.Namespace, *, root: Path) -> dict[str, object]:
+    task = getattr(args, "task", None)
+    task_file = getattr(args, "task_file", None)
+    if task_file:
+        path = Path(task_file)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("--task-file must be a regular non-symlink file")
+        resolved = path.resolve()
+        if not any(resolved.is_relative_to(base) for base in (root.resolve(), Path("/tmp").resolve())):
+            raise ValueError("--task-file must stay under the repository or /tmp")
+        if path.stat().st_size > 16 * 1024:
+            raise ValueError("--task-file exceeds 16 KiB")
+        task = path.read_text(encoding="utf-8")
+    facts = _json_string_list(getattr(args, "facts_json", None), "--facts-json")
+    failure_command = _json_string_list(
+        getattr(args, "failure_command_json", None), "--failure-command-json",
+    )
+    return {
+        "model_profile": args.model_profile, "role": args.role, "task": task,
+        "context_mode": args.context_mode, "facts": facts,
+        "failure_command": failure_command, "failure_output": args.failure_output,
+        "artifact": args.artifact, "exact_blocker": args.exact_blocker,
+    }
+
+
+def _json_string_list(value: str | None, label: str) -> list[str]:
+    if not value:
+        return []
+    parsed = json.loads(value)
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise ValueError(f"{label} must contain a JSON array of strings")
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -373,9 +424,6 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
                     {"requested_cpus": args.cpus, "requested_memory": args.memory, "reason": str(exc)},
                 )
             raise
-    if args.command == "scheduler-rebalance" and args.selector is None:
-        _require_sol(args, "Only the parent Sol session may apply a global scheduler rebalance.")
-        return _rebalance_contest(root, args.contest, apply=args.apply)
     if args.command == "sandbox-gc":
         _require_sol(args, "Only the parent Sol session may garbage-collect managed sandboxes.")
         expired = _cleanup_expired_timeout_retention(root, args.parent_session_id)
@@ -490,7 +538,6 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             root_session=getattr(args, "parent_session_id", "sol-main"),
         )
         prepared["swarm"] = swarm
-        prepared["spawn_queue"] = swarm["spawn_queue"]
         return prepared
 
     if args.command == "attempt-start":
@@ -540,10 +587,12 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             root, contest=manifest.slug, challenge=challenge.id,
             markdown_file=Path(args.markdown_file),
         )
+        termination = terminate_for_handoff(run)
         return {
             "contest": manifest.slug, "challenge": challenge.id,
             "run_id": run.name, "path": str(path),
             "relative_path": str(path.relative_to(root)),
+            "termination": termination,
         }
 
     manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
@@ -663,8 +712,9 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             "branch-service-cleanup": service_cleanup,
         }[args.command]
         return operation(spec) if args.command == "branch-service-plan" else operation(spec, actor=actor)
-    if args.command == "swarm-status":
-        return swarm_status(solve_root)
+    if args.command == "worker-status":
+        _require_sol(args, "Only Root may inspect all native worker status.")
+        return worker_status(solve_root)
     if args.command == "attack-events-show":
         return {"events": high_value_events(solve_root, since=args.since)}
     if args.command == "attack-event":
@@ -679,28 +729,30 @@ def dispatch(root: Path, args: argparse.Namespace) -> object:
             command=argv, artifact=args.artifact, observed_output=args.observed_output,
             next_attack=args.next_attack,
         )
-    if args.command == "swarm-spawn-confirm":
+    if args.command == "worker-spawn-packet":
+        _require_sol(args, "Only Root may prepare a native child packet.")
+        return create_worker_packet(solve_root, **_worker_request(args, root=root))
+    if args.command == "worker-spawn-confirm":
         _require_sol(args, "Only Root may confirm native child start.")
         return confirm_native_spawn(
             solve_root, lane_id=args.lane, native_session=args.native_session,
             operation_id=args.operation_id,
         )
-    if args.command == "swarm-spawn-failed":
+    if args.command == "worker-spawn-failed":
         _require_sol(args, "Only Root may record native child start failure.")
         return record_spawn_failure(solve_root, lane_id=args.lane, error=args.error)
-    if args.command == "swarm-replace":
-        _require_sol(args, "Only Root may replace a native lane.")
-        return replace_lane(
-            solve_root, lane_id=args.lane, replacement_role=args.role,
-            reason=args.reason, native_stop_session=args.native_stop_session,
-            actual_failure=args.actual_failure, untried_family=args.untried_family,
+    if args.command == "worker-replace":
+        _require_sol(args, "Only Root may replace a native worker.")
+        return replace_worker(
+            solve_root, lane_id=args.lane, reason=args.reason,
+            native_stop_session=args.native_stop_session, **_worker_request(args, root=root),
         )
-    if args.command == "swarm-endgame":
-        _require_sol(args, "Only Root may promote a bounded Sol max endgame lane.")
+    if args.command == "worker-endgame":
+        _require_sol(args, "Only Root may promote a bounded Sol max endgame worker.")
         return start_max_endgame(
             solve_root, lane_id=args.lane, native_stop_session=args.native_stop_session,
         )
-    if args.command == "swarm-stop-confirm":
+    if args.command == "worker-stop-confirm":
         _require_sol(args, "Only Root may confirm native child stop.")
         return stop_confirmed(
             solve_root, lane_id=args.lane, native_session=args.native_session,
@@ -868,42 +920,6 @@ def _cleanup_released_sandboxes(root: Path, solve_root: Path, plan: dict[str, ob
     return results
 
 
-def _rebalance_contest(root: Path, contest: str | None, *, apply: bool) -> dict[str, object]:
-    output = root / "output"
-    search_root = output / contest if contest else output
-    if search_root.is_symlink() or not search_root.exists():
-        raise ValueError("contest resource workspace is missing or unsafe")
-    state_paths = sorted(search_root.glob("**/RESOURCE_STATE.json"))
-    if not state_paths:
-        return {"contest": contest, "plans": [], "reason": "no active resource ledgers"}
-    capacity = detect_capacity(workspace=root).to_dict()
-    plans = []
-    for path in state_paths:
-        solve_root = path.parent
-        if (solve_root / "ACTIVE_RUN.json").is_file() and solve_root.parent.name != "runs":
-            # Legacy compatibility projections are non-authoritative; their
-            # resource ledger was migrated under the active run.
-            continue
-        ledger = ResourceLedger(solve_root)
-        plan = ledger.rebalance(capacity)
-        entry: dict[str, object] = {"solve_root": str(solve_root), "plan": plan}
-        if apply:
-            dummy = argparse.Namespace(parent_session_id="sol-main")
-            entry["applied_resizes"] = _apply_resize_plan(root, solve_root, plan, dummy)
-            ledger.reconcile_apply(plan, entry["applied_resizes"])
-        plans.append(entry)
-        # Multiple simultaneous solves share the same host.  Consume the first
-        # plan's assigned totals before planning the next ledger.
-        used_cpu = sum(float(row.get("cpus", 0)) for row in plan["allocations"].values())
-        used_memory = sum(int(row.get("memory_bytes", 0)) for row in plan["allocations"].values())
-        used_storage = sum(int(row.get("storage_bytes", 0)) for row in plan["allocations"].values())
-        capacity["cpu"]["usable"] = max(0.0, float(capacity["cpu"]["usable"]) - used_cpu)
-        capacity["memory"]["usable_bytes"] = max(0, int(capacity["memory"]["usable_bytes"]) - used_memory)
-        capacity["storage"]["usable_bytes"] = max(0, int(capacity["storage"]["usable_bytes"]) - used_storage)
-    return {"contest": contest, "plans": plans, "applied": apply, "capacity": detect_capacity(workspace=root).to_dict()}
-
-
-
 def _caller(
     args: argparse.Namespace, *, metadata: dict[str, object] | None = None, branch: str | None = None,
 ) -> tuple[str, str]:
@@ -996,6 +1012,7 @@ def _prepare_challenge_same_session(
     manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
     packet = parse_session_input(session_input_json) if session_input_json else None
     challenge = resolve_session_challenge(root, manifest, selector, packet)
+    ensure_prepare_scope(root / "output", challenge_id=challenge.id)
     try:
         record = prepare_selected_challenge(root, manifest, challenge)
     except Exception as exc:

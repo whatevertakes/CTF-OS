@@ -1,39 +1,43 @@
-# CTF-OS — Sol-native routing contract
+# CTF-OS — one-challenge native worker contract
 
 `ctf_os/resources/agent-policy.md` is authoritative. `.codex/skills/ctf-solve/SKILL.md`
-defines the one Solve procedure and the selected category playbook provides only
-bounded tactics.
+defines the one Solve procedure; a selected category playbook supplies bounded
+tactics only.
 
-For a challenge name, category/name, “N번 문제 풀어라”, deep solve, or swarm
-request, keep the current user-opened Sol session, prepare only that challenge,
-and immediately run the first-to-flag swarm. Whole-contest Intake and Triage are
-optional admin commands only when explicitly requested.
-They are never Solve prerequisites.
+For a challenge name, category/name, numbered problem, deep solve, or swarm
+request, keep the current user-opened Root Sol session and prepare only that
+challenge. The selected challenge owns the machine and Solve session until a
+flag, the 90-minute cutoff, or an explicit Claude handoff. Whole-contest Intake
+and Triage are optional admin commands and never Solve prerequisites.
 
-Root is lead attacker, not coordinator-only. Successful preparation returns
-three native spawn packets: independent, exploit-first, and tool-driven. Root
-must call native `spawn_agent` for all three with `fork_turns=none` before any
-additional recon, confirm only returned thread IDs as running, then continue its
-own attack without waiting. Python never starts/stops models or submits flags.
+Root is Sol xhigh and the lead attacker, never coordinator-only. Preparation
+returns challenge context and no mandatory child lineup. Root immediately runs
+real commands and may at any time prepare and natively spawn zero to three
+workers by providing only `model_profile`, `role`, `task`, and `context_mode`.
+Use fresh Sol for a new attack mechanism, Terra high to build a concrete attack,
+and Luna high for bounded mechanical work. Call native `spawn_agent` with
+`fork_turns=none`, confirm only the returned thread ID as running, and keep Root
+attacking without waiting. Python never starts or stops models or submits flags.
 
-Use only organizer-declared targets. Keep challenge input read-only and worker
-work/evidence/artifacts private. Preserve challenge/attempt isolation, category
-sandboxes, GPU/process resources, target scope, minimal executed commands and
-artifacts, manual submission, and manual Claude handoff.
-Never access the host Docker socket, SSH keys, browser profiles, personal cloud
-credentials, cloud metadata, or undeclared private networks. Never submit a flag
-automatically. Native delegation remains owned by Root.
+Keep a worker only while its output contains an actual command, executable
+artifact, primitive, working PoC, remote result, useful failure, exact blocker,
+or flag candidate. Root owns native stop and may replace an unproductive worker
+with any general profile or role. Sol max is not a general child: after minute
+60 it may replace one worker only when an executable partial path, two actual
+attack outputs, an exact non-environment reasoning blocker, and a concrete next
+attack all exist. Its lease is ten minutes or two actual attacks.
 
-The attack loop is minimal observation, one path, smallest executable attack,
-real output, mutation or family replacement, remote, flag. Attack state and event
-records are post-execution facts, not permissions. A sendable remote payload is
-sent without replay or approval gates. The first valid target-observed flag is
-shown immediately; Root cancels siblings and the human submits.
+Use only organizer-declared targets. Preserve challenge/attempt isolation,
+read-only input, worker-private work/evidence/artifacts, category sandboxes, and
+real process/GPU resource management. Never access the host Docker socket, SSH
+keys, browser profiles, personal cloud credentials, cloud metadata, or
+undeclared private networks. Do not auto-submit a flag.
 
-At 30 minutes replace up to two low-yield lanes after native stop. At 60 minutes
-one bounded Sol max endgame lane is allowed only for an executed partial exploit
-with a concrete reasoning blocker. At 90 minutes stop without automatic
-extension and preserve a compact timeout handoff.
+Execution precedes event recording; a log failure never invalidates a completed
+attack. Send a usable payload to the declared remote without approval gates.
+The first format-valid candidate observed in actual target output is displayed
+immediately; Root cancels every sibling and a human submits. At 90 minutes stop
+without extension and preserve the compact timeout handoff.
 
-“클로드 구조대 준비해라” has priority over every new attack action. Load the
-handoff skill, write the one evidence-backed `HANDOFF.md`, and end that Solve.
+“클로드 구조대 준비해라” has priority over every new attack. Load the handoff
+skill, write the single evidence-backed `HANDOFF.md`, and end that Solve.

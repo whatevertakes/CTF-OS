@@ -1,23 +1,22 @@
 # CTF-OS
 
-CTF-OS is a Sol-native first-to-flag execution environment for authorized CTF
-challenges. It preserves challenge/attempt isolation, read-only inputs, category
-sandboxes, declared-target network scope, GPU and process resources, minimal
-evidence, manual flag submission, and manual Claude handoff.
-
-The live Solve engine is intentionally singular:
+CTF-OS is a one-challenge, Sol-native first-to-flag environment for authorized
+CTFs. It preserves challenge/attempt isolation, read-only inputs, category
+sandboxes, declared-target scope, process/GPU resources, manual submission, and
+manual Claude handoff.
 
 ```text
-challenge-local prepare
-→ Root + independent + exploit-first + tool-driven
-→ actual attack commands and payload mutation
+prepare selected challenge
+→ Root Sol xhigh attacks immediately
+→ optional 0–3 Sol/Terra/Luna native workers
+→ actual commands, artifacts, and attack mutation
 → declared remote
-→ first valid flag displayed immediately
-→ sibling cancellation
+→ first valid target-observed flag
+→ sibling cancellation and human submission
 ```
 
-There are no solve modes, tiers, evidence admissions, primitive confirmation
-steps, PoC/remote approvals, or alternate evaluation engines.
+There is one live Solve engine. The selected challenge owns the machine and
+session until a flag, the 90-minute cutoff, or a Claude handoff.
 
 ## Setup
 
@@ -26,113 +25,72 @@ uv sync --frozen
 uv run python -m ctf_os.agent_tools doctor
 ```
 
-Category images are built with:
+Category images are built with `bash sandbox/build-images.sh`.
 
-```bash
-bash sandbox/build-images.sh
-```
+## Solve flow
 
-## Standard flow
-
-Initialize a contest workspace if needed:
+Initialize a contest workspace if needed, then prepare only the selected problem:
 
 ```bash
 uv run python -m ctf_os.agent_tools init-contest 'My CTF 2026'
-```
-
-Then ask the current Sol session to solve one challenge. Solve uses the challenge
-description, hint, supplied files, and organizer-declared remote from that same
-request. Whole-contest Intake and Triage are not prerequisites.
-
-Internally, the skill runs:
-
-```bash
 uv run python -m ctf_os.agent_tools prepare-challenge 'web/Challenge' --contest 'My CTF 2026'
 ```
 
-The result includes `spawn_queue` with exactly three native packets. The skill
-calls `spawn_agent` for every packet with `fork_turns=none` before further recon,
-then records returned thread IDs:
+Preparation returns direct attack context and zero workers. Root begins its own
+attack immediately. When useful, Root creates one optional packet:
 
 ```bash
-uv run python -m ctf_os.agent_tools swarm-spawn-confirm 'web/Challenge' \
-  --contest 'My CTF 2026' --lane independent --native-session '<thread-id>'
+uv run python -m ctf_os.agent_tools worker-spawn-packet 'web/Challenge' \
+  --contest 'My CTF 2026' --model-profile terra-high --role builder \
+  --context-mode directed --task 'Turn the current request path into remote exploit.py'
 ```
 
-Only a returned native identity becomes `RUNNING`. A failure is recorded with
-`swarm-spawn-failed` and may be retried once; Root keeps attacking.
-
-## Attack events
-
-`SWARM.json` is the compact attempt state and `ATTACK_EVENTS.jsonl` stores
-post-execution facts. Useful event types are `COMMAND_EXECUTED`,
-`ATTACK_PATH_FOUND`, `EXPLOIT_ATTEMPTED`, `PRIMITIVE`, `POC`, `WORKING_POC`,
-`REMOTE_ATTEMPT`, `REMOTE_RESULT`, `USEFUL_FAILURE`, and `BLOCKER`.
+Profiles are `sol-xhigh` for a new attack mechanism, `terra-high` for an
+executable artifact, and `luna-high` for bounded mechanical work. A packet does
+not start a model. Root passes its `spawn_agent_args` to native `spawn_agent`
+with `fork_turns="none"`, then records the returned identity:
 
 ```bash
-uv run python -m ctf_os.agent_tools attack-event 'web/Challenge' \
-  --contest 'My CTF 2026' --lane exploit-first --type PRIMITIVE \
-  --summary 'request controls template path' --observed-output 'HTTP 200 ...' \
-  --next-attack 'send traversal payload' -- python3 probe.py
+uv run python -m ctf_os.agent_tools worker-spawn-confirm 'web/Challenge' \
+  --contest 'My CTF 2026' --lane terra-1 --native-session '<thread-id>'
 ```
 
-Events never authorize attacks. `sandbox-exec` runs first and only then attempts
-a best-effort command event, so a logging failure cannot prevent execution.
+Only an actual native identity is `RUNNING`; Root plus at most three native
+children keeps model concurrency at four. Workers share existing resource and
+service foundations while retaining private writable paths.
 
-## Remote and flag fast path
+## Events and replacement
 
-A sendable payload or one meaningful local response is enough to attack a
-declared remote. No clean replay or approval is required.
+`SWARM.json` holds compact attempt/worker state and `ATTACK_EVENTS.jsonl` holds
+post-execution facts. `attack-event` records actual commands, artifacts,
+primitives, PoCs, remote results, useful failures, blockers, and candidates.
+Execution comes first, so event-write failure cannot block a completed command.
 
-When Root sees a candidate in actual challenge output:
+`worker-status` exposes compact real-output history. Root decides whether to keep
+or stop a worker and may call `worker-replace` with another profile, role, task,
+and fresh or directed context. Python does not score role quality.
 
-```bash
-uv run python -m ctf_os.agent_tools flag-found 'web/Challenge' \
-  --contest 'My CTF 2026' --lane exploit-first --candidate 'CTF{...}' \
-  --observed-output '...CTF{...}...' --artifact 'workers/exploit-first/artifacts/solve.py' \
-  --source 'declared remote' -- python3 solve.py
-```
+After minute 60, `worker-endgame` may replace one qualified worker with
+`ctf_sol_max`. Qualification requires an executable partial path, two actual
+attack outputs, an exact non-environment reasoning blocker, and a concrete next
+attack. The lease is ten minutes or two attacks. The 90-minute cutoff writes
+`artifacts/TIMEOUT_HANDOFF.md`, returns cancel targets, and never extends.
 
-The command validates format/placeholder/output presence, chooses the first
-winner, returns all native cancel targets, and prints a ready-to-display flag
-block. CTF-OS never submits the flag. Human feedback is recorded with:
+## Flag and isolation
 
-```bash
-uv run python -m ctf_os.agent_tools submission-result 'web/Challenge' \
-  --contest 'My CTF 2026' --run-id '<run-id>' --candidate 'CTF{...}' --result accepted
-```
+A usable payload or meaningful local response is enough to attack the declared
+remote. `flag-found` accepts only a format-valid non-placeholder candidate that
+appears in actual target output with an exact executed command. It chooses the
+first winner and returns native sibling cancel targets. CTF-OS never submits;
+`submission-result` records human `wrong` or `accepted` feedback.
 
-`wrong` discards only that candidate and returns a fresh striker packet.
+- A fresh attempt inherits no artifact, cache, native identity, sandbox, service,
+  or solver state.
+- Input is read-only; each worker writes only in private `work`, `evidence`, and
+  `artifacts` paths.
+- Sandboxes enforce organizer-declared target scope and block host/private data.
+- Shared service and global resource changes remain Root-only.
 
-## Replacement and deadline
-
-`swarm-status` identifies up to two low-yield 30-minute lanes and one eligible
-60-minute reasoning endgame. Stop a running native child before `swarm-replace`;
-replacement count is bounded only by the 90-minute deadline and native
-concurrency. At 90 minutes status writes `artifacts/TIMEOUT_HANDOFF.md`, returns
-cancel targets, and never extends automatically.
-
-## Isolation and execution
-
-- Input is mounted read-only from the selected challenge workspace.
-- Each worker writes only to private `work`, `evidence`, and `artifacts` paths.
-- Sandboxes enforce organizer-declared remote scope and block host/private data.
-- Shared service and global scheduler operations are Root-only.
-- Long symbolic/fuzz/forensic/crypto/AI workloads use real resource/process
-  management; short probes and PoCs run immediately.
-- A new attempt never inherits artifacts, cache, child/session, sandbox, or
-  solver state from another attempt.
-
-Useful low-level commands include `sandbox-create`, `sandbox-exec`,
-`sandbox-cleanup`, service lifecycle commands, resource commands, `oast-*`,
-`repair-run`, and optional `replay`. Replay is post-result tooling and never part
-of the live remote/flag path.
-
-## Optional administration and handoff
-
-Run `intake` or `triage-*` only for an explicitly requested whole-contest admin
-task. They do not influence individual Solve readiness.
-
-On “클로드 구조대 준비해라”, the Solve stops immediately and the handoff skill
-writes one evidence-backed `rescue/<contest>/<challenge>/HANDOFF.md`. It does not
-call Claude, move the original archive, or create another runtime.
+Whole-contest Intake and Triage run only when explicitly requested and do not
+affect a Solve. On “클로드 구조대 준비해라”, stop the attack and use the handoff
+skill to write one evidence-backed `rescue/<contest>/<challenge>/HANDOFF.md`.

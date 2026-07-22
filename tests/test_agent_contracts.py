@@ -1,26 +1,24 @@
 from pathlib import Path
 
 
-def test_skills_and_agents_define_sol_native_contract() -> None:
+def test_skills_and_agents_define_dynamic_native_worker_contract() -> None:
     intake = Path(".codex/skills/ctf-intake/SKILL.md").read_text()
     triage = Path(".codex/skills/ctf-triage/SKILL.md").read_text()
     solve = Path(".codex/skills/ctf-solve/SKILL.md").read_text()
     agents = Path("AGENTS.md").read_text()
     for required in (
-        "current user-opened", "spawn_queue", "spawn_agent", 'fork_turns=\"none\"',
-        "actual returned native", "independent", "exploit-first", "tool-driven",
-        "Root does not wait", "ATTACK_PATH_FOUND", "next two meaningful tool actions",
-        "recording failure never blocks execution", "swarm-replace", "90 minutes",
-        "flag-found", "interrupt_agent", "automatic submission is forbidden",
-        "Whole-contest Intake, Triage",
+        "current user-opened", "worker-spawn-packet", "spawn_agent", 'fork_turns="none"',
+        "worker-spawn-confirm", "sol-xhigh", "terra-high", "luna-high",
+        "Root immediately", "completed command", "logging failure never",
+        "worker-replace", "90 minutes", "flag-found", "interrupt_agent",
+        "A human submits", "Whole-contest",
     ):
         assert required in solve
     assert "--session-input-json" in solve
     assert "optional legacy/admin" in intake
-    assert "current user-opened Sol session" in agents
-    assert "prepare only that challenge" in agents
+    assert "current user-opened Root Sol session" in agents
+    assert "prepare only that" in agents
     assert "never Solve prerequisites" in agents
-    assert "only user-maintained contest input" not in agents
     assert "not a Solve prerequisite" in triage and "triage-finalize" in triage
 
 
@@ -34,7 +32,7 @@ def test_solve_docs_do_not_require_contest_wide_handoffs() -> None:
     )
     for forbidden in (
         "run intake first", "run triage first", "open a new solve session",
-        "choose by difficulty",
+        "choose by difficulty", "contest allocator",
     ):
         assert forbidden not in text
     assert "intake\n→ triage\n→ board" not in text
@@ -42,13 +40,45 @@ def test_solve_docs_do_not_require_contest_wide_handoffs() -> None:
 
 
 def test_removed_engine_contracts_are_absent_from_live_surface() -> None:
-    source = Path("ctf_os/agent_tools/__main__.py").read_text()
+    source = "\n".join(
+        Path(path).read_text()
+        for path in (
+            "ctf_os/agent_tools/__main__.py", "ctf_os/swarm.py", "ctf_os/solve_launch.py",
+        )
+    )
     for forbidden in (
         "race-plan-start", "branch-admit", "PRIMITIVE_CANDIDATE",
         "PRIMITIVE_CONFIRMED", "working-poc-commit", "control-action",
         "benchmark-start", "fixed-race", "adaptive-race", "sol-only",
+        "INITIAL_LANES", "spawn_queue", "initial_child_roles",
+        "planned_child_width", "SPAWN_REQUIRED",
     ):
         assert forbidden not in source
+
+
+def test_live_contract_has_no_fixed_initial_lane_names() -> None:
+    text = "\n".join(
+        Path(path).read_text()
+        for path in (
+            "AGENTS.md", "README.md", ".codex/skills/ctf-solve/SKILL.md",
+            "ctf_os/resources/agent-policy.md", "ctf_os/swarm.py", "ctf_os/solve_launch.py",
+        )
+    )
+    for forbidden in ("exploit-first", "tool-driven", '"independent"'):
+        assert forbidden not in text
+
+
+def test_required_model_profiles_are_short_and_present() -> None:
+    expected = {
+        "ctf_sol_xhigh": "gpt-5.6-sol",
+        "ctf_terra_high": "gpt-5.6-terra",
+        "ctf_luna_high": "gpt-5.6-luna",
+        "ctf_sol_max": "gpt-5.6-sol",
+    }
+    for profile, model in expected.items():
+        text = Path(f".codex/agents/{profile}.toml").read_text()
+        assert f'name = "{profile}"' in text and f'model = "{model}"' in text
+        assert len(text.splitlines()) < 20
 
 
 def test_runtime_has_no_model_launcher_or_legacy_product_surface() -> None:
@@ -73,6 +103,6 @@ def test_competition_docs_preserve_minimum_boundaries() -> None:
     text = (Path("AGENTS.md").read_text() + Path("ctf_os/resources/agent-policy.md").read_text()).casefold()
     for required in (
         "host docker socket", "ssh", "browser", "personal cloud", "cloud metadata",
-        "undeclared private", "never submit", "native delegation",
+        "undeclared private", "never submit", "native",
     ):
         assert required in text
