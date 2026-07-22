@@ -9,8 +9,9 @@ judge. The selected challenge owns the machine and session until a flag, the
 
 ```text
 challenge-local prepare
-→ Root attacks immediately
-→ Root may spawn 0–3 native Sol/Terra/Luna workers
+→ create/prove the Root category sandbox
+→ Root attacks immediately through sandbox-exec
+→ Root may create 0–3 sandbox-backed native Sol/Terra/Luna workers
 → actual commands, artifacts, and attack mutation
 → declared remote
 → first format-valid target-observed flag
@@ -18,27 +19,51 @@ challenge-local prepare
 → human submission
 ```
 
-Only this Solve path exists. Whole-contest Intake and Triage are optional administration, never
-prerequisites or input to the live Solve.
+Only this Solve path exists. Whole-contest Intake and Triage are optional
+administration, never prerequisites or input to the live Solve.
 
-Python prepares isolated challenge context, worker-private paths, sandbox
-metadata, deadlines, packets, native identity receipts, execution events, and
-artifacts. It never calls a model API, starts or stops a native model, approves a
-payload or remote request, or submits a flag. Root owns native lifecycle.
+Python prepares isolated challenge context, worker-private paths, category
+sandbox metadata, deadlines, packets, native identity receipts, execution
+events, and artifacts. It never calls a model API, starts or stops a native
+model, approves a payload or remote request, or submits a flag. Root owns native
+and sandbox lifecycle.
+
+## Mandatory category sandbox execution
+
+Preparation alone does not authorize host-side challenge execution. Before any
+challenge file inspection, analyzer, debugger, compiler, script, payload,
+solver, or remote request, Root must create or prove a live sandbox at the
+current run's `workers/root/sandbox.json`. The image is selected from the
+challenge category and preflight recommendation. If a managed local service is
+present, Root starts or reuses it before sandbox creation so the sandbox attaches
+to the existing scoped service network.
+
+Every challenge command from Root runs through `sandbox-exec` with the Root
+sandbox metadata. Only CTF-OS controller operations may run on the host. A
+sandbox creation or liveness failure is an exact environment blocker; Root and
+workers must never fall back to host challenge tools.
+
+A worker packet names a lane and its `worker_paths.metadata_path`. Root creates
+and probes that exact lane's category sandbox before native `spawn_agent`. The
+child receives the returned `agent_profile` and `spawn_agent_args`, then runs
+every challenge command through `sandbox-exec` with its lane identity and
+metadata path. A packet or native thread without a live sandbox is not an active
+attack lane. Durable artifacts are exported from the lane sandbox before they
+are shared or handed off.
 
 ## Identity, isolation, and resources
 
 Each challenge snapshot has a deterministic `challenge_instance_id`; each fresh
 execution has a distinct `attempt_id` and `run_id`. A fresh attempt inherits no
 artifact, cache, child identity, sandbox, service, or solver state. Input is
-read-only. Every worker has private writable `work`, `evidence`, and `artifacts`
-paths in the selected category sandbox.
+read-only. Root and every worker have private writable `work`, `evidence`, and
+`artifacts` paths in the selected category sandbox.
 
 Root includes itself in model concurrency four, so at most three native children
 may run. Model lane state is separate from local process/resource state. Reuse
-the existing sandbox, service, GPU, and resource scheduler foundations. Create a
-private service only for real isolation, and do not replicate services merely
-because another model was spawned. Root alone owns the shared service and global
+the existing service, GPU, and resource scheduler foundations. Create a private
+service only for real isolation, and do not replicate services merely because
+another model was spawned. Root alone owns the shared service and global
 resource changes.
 
 ## Optional workers
@@ -55,18 +80,21 @@ context_mode
 `fresh` contains only the selected problem, prepared input, and declared remote;
 it carries no Root facts or failure context. `directed` may additionally carry
 bounded confirmed facts, an actual failed command and output, one artifact, and
-an exact blocker. Neither context kind has additional creation preconditions.
+an exact blocker. Neither context kind has additional packet-creation
+preconditions, but native spawn always requires a live lane sandbox.
 
 - Sol xhigh finds a new attack mechanism and drives one path through actual
-  execution.
-- Terra high turns a supplied direction into an executable artifact, runs it,
-  and adapts it to the declared remote without returning to broad recon.
+  sandbox execution.
+- Terra high turns a supplied direction into an executable artifact, runs it in
+  the assigned sandbox, and adapts it to the declared remote without returning
+  to broad recon.
 - Luna high performs only the assigned mechanical extraction, normalization,
-  batching, comparison, brute-force, or decode work and stops at an exact
-  blocker when broader judgment is needed.
+  batching, comparison, brute-force, or decode work in the assigned sandbox and
+  stops at an exact blocker when broader judgment is needed.
 
 A native thread ID is required before a worker is `RUNNING`. A failed spawn may
-be retried once while Root keeps attacking.
+be retried once while Root keeps attacking. When a native start is abandoned,
+Root cleans the unused lane sandbox.
 
 ## Attack, status, and replacement
 
@@ -76,30 +104,35 @@ payload or meaningful local response is enough to strike remotely. Execution
 comes before recording; a failed event write never blocks or invalidates an
 already completed command.
 
-Valid progress is an actual command, executable artifact, primitive, working
-PoC, remote result, useful failure, exact blocker, or flag candidate. Status is
-compact execution history, not a score. Root may stop or replace a worker that
-repeats an unchanged failure, only explains, leaves its role, duplicates an
-attack family without value, or avoids the declared remote without reason.
-Python does not judge those semantics.
+Valid progress is a sandbox-backed actual command, executable artifact,
+primitive, working PoC, remote result, useful failure, exact blocker, or flag
+candidate. Status is compact execution history, not a score. Root may stop a
+worker that repeats an unchanged failure, only explains, leaves its role,
+duplicates an attack family without value, or avoids the declared remote without
+reason. Root then confirms native stop, exports useful artifacts, cleans that
+sandbox, and creates a fresh sandbox for any replacement. Python does not judge
+those semantics.
 
 From minute 60, one Sol max endgame worker may replace an existing native worker
 only if all of these are recorded: an executable partial attack path, two actual
 exploit or remote outputs, an exact reasoning blocker that is not an environment,
 dependency, target, rate-limit, connection, or tool failure, and a concrete next
-attack. Its lease ends after ten minutes or two actual attacks, whichever comes
-first. At minute 90, stop and cancel workers, write only executed attacks, the
-leading path, exact blocker, artifact, and next attack, and never auto-extend.
+attack. Its own category sandbox is created and probed before native spawn. Its
+lease ends after ten minutes or two actual attacks, whichever comes first. At
+minute 90, stop and cancel workers, export useful artifacts, clean worker and
+Root sandboxes and managed services, write only executed attacks, the leading
+path, exact blocker, artifact, and next attack, and never auto-extend.
 
 ## Flag and submission
 
 The first candidate wins only when it matches the challenge format, appears in
 actual challenge or declared-target output, and is not a placeholder. Display it
 immediately, cancel sibling workers, and stop analysis. Never submit
-automatically. Human `WRONG` rejects only that candidate; Root resumes directly
-and may freely create a fresh worker. Human `ACCEPTED` seals the attempt and
-triggers cleanup of CTF-OS-owned workers, sandboxes, services, processes, and
-resources.
+automatically. Keep the Root sandbox alive while waiting for the human result.
+Human `WRONG` rejects only that candidate; Root resumes directly in the same
+sandbox and may create a fresh sandbox-backed worker. Human `ACCEPTED` seals the
+attempt and triggers export and cleanup of CTF-OS-owned workers, sandboxes,
+services, processes, and resources.
 
 ## Scope and handoff
 
@@ -113,5 +146,6 @@ logged, and redacted. Unsafe AI artifacts remain sandboxed and
 
 “클로드 구조대 준비해라” and equivalent requests terminate the Solve before any
 new attack. Write one evidence-backed repository-local
-`rescue/<contest>/<challenge>/HANDOFF.md`, verify it, and stop. Never call Claude,
-move the original ZIP, or create another runtime.
+`rescue/<contest>/<challenge>/HANDOFF.md`, verify it, interrupt native workers,
+export useful artifacts, clean CTF-OS runtime resources, and stop. Never call
+Claude, move the original ZIP, or create another runtime.
