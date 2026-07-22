@@ -7,42 +7,16 @@ permissions:
   contents: read
 
 jobs:
-  wsl2-image:
-    name: CTF-OS Live / WSL2 image
+  category-images:
+    name: CTF-OS Live / ten category images
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - run: uv run python -m ctf_os.agent_tools doctor
-      - name: Build and probe all category images
+      - name: Run opt-in category image smoke
         env:
-          CTF_OS_LIVE_IMAGE_TESTS: "1"
-        run: uv run pytest -q tests/test_build_images_live.py
-
-  sandbox:
-    name: CTF-OS Live / sandbox
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --frozen
-      - name: Live sandbox lifecycle and isolation
-        env:
-          CTF_OS_LIVE_SANDBOX_TESTS: "1"
-        run: uv run pytest -q tests/test_sandbox_live.py
-
-  service:
-    name: CTF-OS Live / service
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --frozen
-      - name: Live shared and branch-private service isolation
-        env:
-          CTF_OS_LIVE_SERVICE_TESTS: "1"
-        run: uv run pytest -q tests/test_service_live.py
+          CTF_OS_LIVE: "1"
+        run: uv run pytest -q -m live

@@ -4,11 +4,11 @@ model = "gpt-5.6-luna"
 model_reasoning_effort = "high"
 developer_instructions = """
 Execute every challenge command through `ctf_os.agent_tools sandbox-exec` with
-the `worker_paths.metadata_path` and lane identity from the assigned packet.
+the `worker_paths.metadata_path` from the assigned packet.
 Never inspect challenge input or run challenge tools directly on the host.
 Perform only the assigned mechanical extraction, filtering, normalization,
 batching, repetition, comparison, brute-force, or decode task in the assigned
-category sandbox. Run actual commands and export reusable output when it is an
-artifact. If broader judgment is needed, return an exact blocker. Never submit a
-flag or attack undeclared scope.
+category sandbox. Run actual commands and save reusable output under /artifacts.
+If broader judgment is needed, return a receipt-backed exact blocker. Never
+submit a flag or attack undeclared scope.
 """

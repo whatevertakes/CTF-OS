@@ -1,8 +1,7 @@
-"""Challenge-local preparation for one selected CTF challenge."""
+"""Challenge-local, non-executing input preparation."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,347 +10,45 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
-from .archive import ArchiveError, ArchiveLimits, bounded_source_files, copy_tree_without_links, extract_archive
+from .archive import (
+    ArchiveError,
+    ArchiveLimits,
+    bounded_source_files,
+    copy_tree_without_links,
+    extract_archive,
+)
 from .contest import ChallengeSpec, ContestManifest
 from .sandbox.network import parse_remotes
-from .session_input import SESSION_INPUT_NAME, session_input_fingerprint, session_source_paths
-from .workspace import (
-    CURRENT_FINGERPRINT_SCHEME, atomic_json, atomic_text, bind_input_fingerprint, challenge_root, preflight_lock,
-    resolve_active_run, safe_under,
+from .workspace import atomic_json
+
+
+ARCHIVE_SUFFIXES = (
+    ".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
 )
-
-
-ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".7z", ".rar")
-CONTEXT_FILE_LIMIT = 20
-PREFLIGHT_SCHEMA_VERSION = 1
-PREFLIGHT_RECORD_NAME = "CHALLENGE-PREFLIGHT.json"
-ADMIN_INTAKE_DIR = "admin-intake"
-_ARCHIVE_LIMITS = {
+LIMITS = {
     "standard": ArchiveLimits(),
     "large": ArchiveLimits(max_files=20_000, max_file_bytes=2 * 1024**3, max_total_bytes=8 * 1024**3),
     "large-forensic": ArchiveLimits(max_files=100_000, max_file_bytes=16 * 1024**3, max_total_bytes=64 * 1024**3),
 }
+PRIORITY_LIMIT = 20
 
 
-def preflight_record_path(
-    root: Path, manifest: ContestManifest, challenge: ChallengeSpec,
-) -> Path:
-    return challenge_root(root, manifest, challenge) / PREFLIGHT_RECORD_NAME
+class PreflightError(ValueError):
+    pass
 
 
-def prepare_selected_challenge(
-    repo: str | Path,
-    manifest: ContestManifest,
-    challenge: ChallengeSpec,
-    *,
-    force_materialize: bool = False,
-) -> dict[str, object]:
-    """Prepare exactly one selected challenge under its workspace-local lock."""
-
-    root = Path(repo).resolve()
-    destination = challenge_root(root, manifest, challenge)
-    if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
-        raise ValueError(f"selected challenge workspace is missing or unsafe: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
-    for name in (PREFLIGHT_RECORD_NAME, "inventory.json", "CONTEXT.md"):
-        path = destination / name
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise ValueError(f"selected challenge generated path is unsafe: {path}")
-    with preflight_lock(destination):
-        if not force_materialize:
-            try:
-                return load_challenge_preflight(root, manifest, challenge)
-            except ValueError:
-                # Missing, stale, or corrupt local state is repaired below.  An
-                # existing prepared tree is never trusted when its record did
-                # not pass strict validation.
-                force_materialize = (destination / "input").exists()
-        record = _inspect_challenge(
-            root, manifest, challenge, force_materialize=force_materialize,
-        )
-        atomic_json(destination / PREFLIGHT_RECORD_NAME, record)
-        return record
-
-
-def inspect_challenge_for_admin(
-    repo: str | Path,
-    manifest: ContestManifest,
-    challenge: ChallengeSpec,
-    *,
-    force_materialize: bool = False,
-) -> dict[str, object]:
-    """Inspect one challenge in legacy/admin storage without mutating Solve state."""
-
-    root = Path(repo).resolve()
-    destination = safe_under(
-        root / "output",
-        Path(manifest.slug) / ADMIN_INTAKE_DIR / challenge.category / challenge.workspace_name,
-    )
-    if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
-        raise ValueError(f"admin Intake workspace is missing or unsafe: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
-    for name in ("inventory.json", "CONTEXT.md"):
-        path = destination / name
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise ValueError(f"admin Intake generated path is unsafe: {path}")
-    with preflight_lock(destination):
-        return _inspect_challenge(
-            root,
-            manifest,
-            challenge,
-            force_materialize=force_materialize,
-            destination=destination,
-            bind_solve_state=False,
-        )
-
-
-def load_challenge_preflight(
-    repo: str | Path,
-    manifest: ContestManifest,
-    challenge: ChallengeSpec,
-) -> dict[str, object]:
-    """Strictly load and validate the selected challenge's local preparation record."""
-
-    root = Path(repo).resolve()
-    destination = challenge_root(root, manifest, challenge)
-    path = destination / PREFLIGHT_RECORD_NAME
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"Challenge runtime state is not prepared: local preflight record is missing or unsafe: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Challenge runtime state is not prepared: local preflight record is unreadable") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != PREFLIGHT_SCHEMA_VERSION:
-        raise ValueError("Challenge runtime state is not prepared: local preflight schema is invalid")
-    if payload.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
-        raise ValueError("Challenge runtime state is stale because its fingerprint scheme is unsupported")
-    if any(key in payload for key in ("contest", "challenges", "summary")):
-        raise ValueError("Challenge runtime state is not prepared: local preflight contains contest-wide data")
-    selected = payload.get("challenge")
-    if not isinstance(selected, dict):
-        raise ValueError("Challenge runtime state is not prepared: selected challenge identity is invalid")
-    expected_identity = {
-        "id": challenge.id, "key": challenge.key,
-        "category": challenge.category, "name": challenge.name,
-    }
-    if any(selected.get(key) != value for key, value in expected_identity.items()):
-        raise ValueError("Challenge runtime state is stale because selected challenge identity changed")
-    typed_fields = (
-        ("authorized_targets", list),
-        ("priority_files", list),
-        ("files", list),
-        ("important_metadata", dict),
-        ("observation_hints", list),
-        ("recommended_environment", dict),
-        ("service_plan", dict),
-    )
-    for field, expected_type in typed_fields:
-        if not isinstance(payload.get(field), expected_type):
-            raise ValueError(f"Challenge runtime state is not prepared: local preflight {field} is invalid")
-    if any(not isinstance(value, str) for value in payload["priority_files"]):
-        raise ValueError("Challenge runtime state is not prepared: local preflight priority_files are invalid")
-    if any(not isinstance(value, str) for value in payload["observation_hints"]):
-        raise ValueError("Challenge runtime state is not prepared: local preflight observation_hints are invalid")
-    if any(not isinstance(value, dict) for value in payload["files"]):
-        raise ValueError("Challenge runtime state is not prepared: local preflight files are invalid")
-    if any(not isinstance(value, dict) for value in payload["authorized_targets"]):
-        raise ValueError("Challenge runtime state is not prepared: local preflight authorized_targets are invalid")
-    prepared_input_bytes(payload)
-    blockers = payload.get("blockers")
-    if not isinstance(blockers, list) or any(not isinstance(value, str) for value in blockers):
-        raise ValueError("Challenge runtime state is not prepared: local preflight blockers are invalid")
-    if payload.get("status") != "READY":
-        detail = "; ".join(value for value in blockers if value.strip()) or "unknown blocker"
-        raise ValueError(f"The selected challenge remains BLOCKED: {detail}")
-    source_fingerprint = _fingerprint(payload.get("source_fingerprint"), "source")
-    if source_fingerprint != current_source_fingerprint(manifest, challenge):
-        raise ValueError("Challenge runtime state is stale because the selected challenge source fingerprint changed")
-    prepared = destination / "input"
-    declared = payload.get("prepared_input")
-    if not isinstance(declared, str) or not declared:
-        raise ValueError("Challenge runtime state is not prepared: prepared_input is missing or invalid")
-    try:
-        declared_path = Path(declared).resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("Challenge runtime state is not prepared: prepared_input cannot be resolved") from exc
-    if declared_path != prepared.resolve(strict=False):
-        raise ValueError("Challenge runtime state is not prepared: prepared_input escapes the selected challenge workspace")
-    if prepared.is_symlink() or not prepared.is_dir():
-        raise ValueError("Challenge runtime state is stale because prepared challenge input is missing or unsafe")
-    prepared_fingerprint = _fingerprint(payload.get("prepared_fingerprint"), "prepared")
-    if prepared_fingerprint != prepared_tree_fingerprint(prepared):
-        raise ValueError("Challenge runtime state is stale because the prepared challenge input fingerprint changed")
-    inventory_path = destination / "inventory.json"
-    context_path = destination / "CONTEXT.md"
-    if inventory_path.is_symlink() or not inventory_path.is_file():
-        raise ValueError("Challenge runtime state is not prepared: inventory is missing or unsafe")
-    try:
-        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Challenge runtime state is not prepared: inventory is unreadable") from exc
-    if inventory != {"schema_version": 1, "files": payload["files"]}:
-        raise ValueError("Challenge runtime state is stale because inventory was changed")
-    if context_path.is_symlink() or not context_path.is_file():
-        raise ValueError("Challenge runtime state is not prepared: context is missing or unsafe")
-    if context_path.read_text(encoding="utf-8") != render_context(manifest, payload):
-        raise ValueError("Challenge runtime state is stale because context was changed")
-    expected_targets = [target.to_dict() for target in parse_remotes(challenge.remotes)]
-    if payload.get("authorized_targets") != expected_targets:
-        raise ValueError("Challenge runtime state is stale because selected challenge scope changed or was tampered")
-    run_root = resolve_active_run(destination, input_fingerprint=source_fingerprint)
-    state_path = run_root / "STATE.json"
-    if state_path.is_symlink():
-        raise ValueError("Challenge runtime state is not prepared: challenge state is a symlink")
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError("Challenge runtime state is not prepared: challenge state is unreadable") from exc
-        if not isinstance(state, dict) or state.get("challenge_id") != challenge.id:
-            raise ValueError("Challenge runtime state is not prepared: challenge state identity is invalid")
-        if state.get("input_fingerprint") != source_fingerprint:
-            raise ValueError("Challenge runtime state is stale because challenge state fingerprint changed")
-        if state.get("fingerprint_scheme") != CURRENT_FINGERPRINT_SCHEME:
-            raise ValueError("Challenge runtime state is stale because challenge state fingerprint scheme changed")
-    return dict(payload)
-
-
-def prepared_input_bytes(record: Mapping[str, object]) -> int:
-    """Return the one authoritative prepared-input size after consistency checks."""
-
-    metadata = record.get("important_metadata")
-    if not isinstance(metadata, Mapping):
-        raise ValueError("prepared input important_metadata must be an object")
-    total = metadata.get("total_bytes")
-    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-        raise ValueError("prepared input total_bytes must be a non-negative integer")
-    files = record.get("files")
-    if not isinstance(files, list) or any(not isinstance(row, Mapping) for row in files):
-        raise ValueError("prepared input files must be an array of objects")
-    sizes: list[int] = []
-    for row in files:
-        size = row.get("size")
-        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-            raise ValueError("prepared input file size must be a non-negative integer")
-        sizes.append(size)
-    observed = sum(sizes)
-    if total != observed:
-        raise ValueError(
-            f"prepared input total_bytes conflicts with file inventory: {total} != {observed}"
-        )
-    targets = record.get("authorized_targets")
-    remote_only = not files and isinstance(targets, list) and bool(targets)
-    if total == 0 and not remote_only:
-        raise ValueError("zero-byte prepared input is valid only for a remote-only challenge")
-    return total
-
-
-def _fingerprint(value: object, label: str) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
-        raise ValueError(f"Challenge runtime state is not prepared: {label} fingerprint is invalid")
-    return value
-
-
-def _inspect_challenge(
-    root: Path,
-    manifest: ContestManifest,
-    challenge: ChallengeSpec,
-    *,
-    force_materialize: bool = False,
-    destination: Path | None = None,
-    bind_solve_state: bool = True,
-) -> dict[str, object]:
-    destination = destination or challenge_root(root, manifest, challenge)
-    base: dict[str, object] = challenge.to_dict() | {
-        "schema_version": PREFLIGHT_SCHEMA_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "challenge": challenge.to_dict(),
-        "status": "BLOCKED", "blockers": [], "authorized_targets": [],
-        "source_paths": [], "files": [], "archives": [], "docker": {},
-        "runtime": [], "subtype": None, "attack_surface": [], "hypotheses": [],
-        "recommended_tools": [], "read_paths": [], "read_on_demand": [],
-        "state_summary": {"status": "PREPARED", "branches": 0, "flag_candidate": False},
-        "context_path": str(destination / "CONTEXT.md"),
-        "inventory_path": str(destination / "inventory.json"),
-        "priority_files": [], "priority_file_metadata": [], "important_metadata": {},
-        "recommended_image": "ctf-os-sandbox:base", "recommended_resource_profile": "light",
-        "recommended_profile": "base", "setup_cost": "low",
-        "special_permission_requirement": [], "needs_review": False,
-        "containerized_challenge": False, "service_plan": {"kind": "none", "status": "UNAVAILABLE", "safe_to_start": False, "services": []},
-        "workspace_path": str(destination), "prepared_input": str(destination / "input"),
-        "source_fingerprint": None, "prepared_fingerprint": None,
-        "fingerprint_scheme": CURRENT_FINGERPRINT_SCHEME,
-        "observation_hints": [], "recommended_environment": {},
-    }
-    try:
-        base["authorized_targets"] = [target.to_dict() for target in parse_remotes(challenge.remotes)]
-        sources = _match_sources(manifest, challenge)
-        base["source_paths"] = [str(path) for path in sources]
-        if not sources and not challenge.remotes:
-            raise ValueError("contest.md entry has no matching directory/archive and no authorized remote")
-        session_fingerprint = session_input_fingerprint(destination / SESSION_INPUT_NAME)
-        input_dir, archive_records, fingerprint, prepared_fingerprint = _materialize(
-            destination, challenge, sources, force=force_materialize,
-            session_fingerprint=session_fingerprint,
-        )
-        base["archives"] = archive_records
-        base["source_fingerprint"] = fingerprint
-        base["session_input_fingerprint"] = session_fingerprint
-        base["prepared_fingerprint"] = prepared_fingerprint
-        files = [_inspect_file(input_dir, path) for path in _regular_files(input_dir)] if input_dir.exists() else []
-        base["files"] = files
-        atomic_json(destination / "inventory.json", {"schema_version": 1, "files": files})
-        preflight = _preflight(challenge, input_dir, files)
-        base.update(preflight)
-        base["observation_hints"] = list(preflight.get("initial_attack_surface", []))
-        base["recommended_environment"] = {
-            "image": preflight.get("recommended_image"),
-            "resource_profile": preflight.get("recommended_resource_profile"),
-            "profile": preflight.get("recommended_profile"),
-            "service_plan": preflight.get("service_plan"),
-        }
-        base["read_paths"] = [str(manifest.path), str(destination / "CONTEXT.md")]
-        base["read_on_demand"] = [str(input_dir), str(destination / "inventory.json")]
-        if bind_solve_state:
-            run_root = bind_input_fingerprint(
-                destination, challenge, fingerprint,
-                legacy_fingerprints=(_legacy_source_fingerprint(challenge, sources),),
-            )
-            base["read_paths"].extend([
-                str(run_root / "STATE.json"), str(run_root / "FINDINGS.md"),
-            ])
-            base["read_on_demand"].extend([
-                str(run_root / "evidence.log"), str(run_root / "workers"),
-            ])
-        base["status"] = "READY"
-        destination.mkdir(parents=True, exist_ok=True)
-        atomic_text(destination / "CONTEXT.md", render_context(manifest, base))
-    except Exception as exc:
-        base["blockers"] = [str(exc)]
-        destination.mkdir(parents=True, exist_ok=True)
-        atomic_text(destination / "CONTEXT.md", render_context(manifest, base))
-    return base
-
-
-def _match_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> list[Path]:
-    session_sources = session_source_paths(manifest, challenge)
-    if session_sources is not None:
-        return session_sources
-    category_root = manifest.path.parent / challenge.category
-    if not category_root.exists() and challenge.category == "forensic":
-        alias = manifest.path.parent / "forensics"
-        category_root = alias if alias.exists() else category_root
-    if not category_root.is_dir() or category_root.is_symlink():
-        return []
+def challenge_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> tuple[Path, ...]:
+    category = manifest.path.parent / challenge.category
+    if category.is_symlink() or not category.is_dir():
+        return ()
     wanted = {challenge.name.casefold(), challenge.workspace_name.casefold()}
     matches: list[Path] = []
-    for entry in category_root.iterdir():
+    for entry in category.iterdir():
         if entry.is_symlink():
             continue
         if entry.is_dir() and entry.name.casefold() in wanted:
@@ -359,628 +56,151 @@ def _match_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> list[
             continue
         if entry.is_file():
             lower = entry.name.casefold()
-            for suffix in ARCHIVE_SUFFIXES:
-                if lower.endswith(suffix) and lower[:-len(suffix)] in wanted:
-                    matches.append(entry)
-                    break
-    return sorted(matches, key=lambda path: path.name.casefold())
+            if any(lower.endswith(suffix) and lower[: -len(suffix)] in wanted for suffix in ARCHIVE_SUFFIXES):
+                matches.append(entry)
+    return tuple(sorted(matches, key=lambda value: value.name.casefold()))
 
 
-def _materialize(
-    destination: Path,
-    challenge: ChallengeSpec,
-    sources: list[Path],
-    *,
-    force: bool = False,
-    session_fingerprint: str | None = None,
-) -> tuple[Path, list[dict[str, object]], str, str]:
-    limits = _ARCHIVE_LIMITS[challenge.input_profile]
-    fingerprint = _source_fingerprint(challenge, sources, session_fingerprint=session_fingerprint)
-    input_dir = destination / "input"
-    marker = destination / ".input-fingerprint"
-    metadata_path = destination / ".archive-metadata.json"
-    old = destination / ".old-input"
-    if any(path.is_symlink() for path in (input_dir, marker, metadata_path, old)):
-        raise ArchiveError("prepared input metadata paths must not be symlinks")
-    if input_dir.exists() and not input_dir.is_dir():
-        raise ArchiveError("prepared input path must be a directory")
-    if marker.exists() and not marker.is_file():
-        raise ArchiveError("prepared input fingerprint marker must be a regular file")
-    if metadata_path.exists() and not metadata_path.is_file():
-        raise ArchiveError("prepared archive metadata must be a regular file")
-    if old.exists() and not old.is_dir():
-        raise ArchiveError("stale prepared input path must be a directory")
-    if input_dir.is_dir():
-        prepared_tree_fingerprint(input_dir)
-    if not force and input_dir.is_dir() and marker.is_file() and marker.read_text() == fingerprint:
-        cached = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else _archive_metadata(sources)
-        return input_dir, cached, fingerprint, prepared_tree_fingerprint(input_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".input-", dir=destination))
-    archives: list[dict[str, object]] = []
-    try:
-        for source in sources:
-            if source.is_dir():
-                copy_tree_without_links(source, staging, limits)
-            else:
-                lower = source.name.casefold()
-                if lower.endswith((".7z", ".rar")):
-                    raise ArchiveError(f"{source.name}: safe built-in extraction is unavailable; unpack it into a named directory")
-                if any(lower.endswith(suffix) for suffix in ARCHIVE_SUFFIXES):
-                    members = extract_archive(source, staging, limits)
-                    archives.append({"path": str(source), "sha256": _sha256(source), "size": source.stat().st_size, "members": members, "extracted": True})
-                else:
-                    if source.stat().st_size > limits.max_file_bytes:
-                        raise ArchiveError(f"source file exceeds size limit: {source.name}")
-                    target = staging / source.name
-                    if target.exists():
-                        raise ArchiveError(f"session source file name collision: {source.name}")
-                    shutil.copy2(source, target, follow_symlinks=False)
-            prepared_tree_fingerprint(staging)
-        _make_read_only(staging)
-        if old.exists():
-            _remove_generated_tree(old)
-        if input_dir.exists():
-            os.replace(input_dir, old)
-        os.replace(staging, input_dir)
-        if old.exists():
-            _remove_generated_tree(old)
-        atomic_text(marker, fingerprint)
-        atomic_json(destination / ".archive-metadata.json", archives)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return input_dir, archives, fingerprint, prepared_tree_fingerprint(input_dir)
-
-
-def _source_fingerprint(
-    challenge: ChallengeSpec, sources: list[Path], *, session_fingerprint: str | None = None,
-) -> str:
-    # Deliberately exclude ordinal selectors, score, and contest-wide metadata.
-    # Renumbering or editing a sibling challenge must not stale this workspace.
-    selected_identity_and_input = {
-        "id": challenge.id,
-        "key": challenge.key,
+def input_fingerprint(manifest: ContestManifest, challenge: ChallengeSpec) -> str:
+    sources = challenge_sources(manifest, challenge)
+    if not sources and not challenge.remotes:
+        raise PreflightError("challenge has neither a matching input nor a declared target")
+    digest = hashlib.sha256()
+    identity = {
+        "contest": manifest.slug,
+        "challenge_id": challenge.id,
         "category": challenge.category,
         "name": challenge.name,
         "description": challenge.description,
         "hint": challenge.hint,
         "remotes": list(challenge.remotes),
-        "flag_format": challenge.flag_format,
         "flag_pattern": challenge.flag_pattern,
         "input_profile": challenge.input_profile,
     }
-    digest = hashlib.sha256(
-        json.dumps(selected_identity_and_input, ensure_ascii=False, sort_keys=True).encode()
-    )
-    if session_fingerprint is not None:
-        digest.update(b"session-input\0")
-        digest.update(bytes.fromhex(session_fingerprint))
+    digest.update(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode())
+    limits = LIMITS[challenge.input_profile]
     for source in sources:
-        digest.update(b"file\0" if source.is_file() else b"directory\0")
+        digest.update(("D\0" if source.is_dir() else "F\0").encode())
         digest.update(source.name.encode())
         if source.is_file():
-            digest.update(bytes.fromhex(_sha256(source)))
-        else:
-            total = 0
-            limits = _ARCHIVE_LIMITS[challenge.input_profile]
-            for path in bounded_source_files(source, limits):
-                size = path.stat().st_size
-                if size > limits.max_file_bytes:
-                    raise ArchiveError(f"source file exceeds size limit: {path.relative_to(source)}")
-                total += size
-                if total > limits.max_total_bytes:
-                    raise ArchiveError("source directory exceeds total size limit")
-                digest.update(path.relative_to(source).as_posix().encode())
-                digest.update(bytes.fromhex(_sha256(path)))
+            digest.update(bytes.fromhex(file_hash(source)))
+            continue
+        total = 0
+        for path in bounded_source_files(source, limits):
+            total += path.stat().st_size
+            if total > limits.max_total_bytes:
+                raise PreflightError("challenge input exceeds its bounded profile")
+            digest.update(path.relative_to(source).as_posix().encode())
+            digest.update(bytes.fromhex(file_hash(path)))
     return digest.hexdigest()
 
 
-def _legacy_source_fingerprint(challenge: ChallengeSpec, sources: list[Path]) -> str:
-    """Reproduce the pre challenge-local fingerprint only for safe migration."""
+def prepare_input(
+    manifest: ContestManifest,
+    challenge: ChallengeSpec,
+    run_root: Path,
+    *,
+    expected_fingerprint: str,
+) -> dict[str, Any]:
+    """Materialize only the selected challenge into this fresh run."""
 
-    digest = hashlib.sha256(
-        json.dumps(challenge.to_dict(), ensure_ascii=False, sort_keys=True).encode()
-    )
-    for source in sources:
-        digest.update(source.name.encode())
-        if source.is_file():
-            digest.update(bytes.fromhex(_sha256(source)))
-        else:
-            limits = _ARCHIVE_LIMITS[challenge.input_profile]
-            total = 0
-            for path in bounded_source_files(source, limits):
-                size = path.stat().st_size
-                if size > limits.max_file_bytes:
-                    raise ArchiveError(f"source file exceeds size limit: {path.relative_to(source)}")
-                total += size
-                if total > limits.max_total_bytes:
-                    raise ArchiveError("source directory exceeds total size limit")
-                digest.update(path.relative_to(source).as_posix().encode())
-                digest.update(bytes.fromhex(_sha256(path)))
-    return digest.hexdigest()
-
-
-def current_source_fingerprint(manifest: ContestManifest, challenge: ChallengeSpec) -> str:
-    destination = challenge_root(manifest.path.parents[2], manifest, challenge)
-    return _source_fingerprint(
-        challenge, _match_sources(manifest, challenge),
-        session_fingerprint=session_input_fingerprint(destination / SESSION_INPUT_NAME),
-    )
-
-
-def prepared_tree_fingerprint(root: Path) -> str:
-    digest = hashlib.sha256()
-    total = 0
-    # Profile-specific limits are enforced while materializing source input.  Use
-    # the largest accepted profile here so later integrity checks can hash a
-    # legitimate large-forensic workspace without weakening bounded extraction.
-    limits = _ARCHIVE_LIMITS["large-forensic"]
-    for path in bounded_source_files(root, limits):
-        size = path.stat().st_size
-        if size > limits.max_file_bytes:
-            raise ArchiveError(f"prepared file exceeds size limit: {path.relative_to(root)}")
-        total += size
-        if total > limits.max_total_bytes:
-            raise ArchiveError("prepared input exceeds total size limit")
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(bytes.fromhex(_sha256(path)))
-    return digest.hexdigest()
-
-
-def _archive_metadata(sources: list[Path]) -> list[dict[str, object]]:
-    return [
-        {
-            "path": str(path), "sha256": _sha256(path), "size": path.stat().st_size,
-            "extracted": any(path.name.casefold().endswith(suffix) for suffix in ARCHIVE_SUFFIXES),
-        }
-        for path in sources if path.is_file()
-    ]
-
-
-def _regular_files(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    result: list[Path] = []
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise ArchiveError(f"symlink found in prepared input: {path}")
-        if path.is_file():
-            result.append(path)
-    return sorted(result, key=lambda path: path.relative_to(root).as_posix())
-
-
-def _inspect_file(root: Path, path: Path) -> dict[str, object]:
-    kind = _command_output(["file", "-b", str(path)]) or "unknown"
-    mime = _command_output(["file", "-b", "--mime-type", str(path)]) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    record: dict[str, object] = {
-        "path": path.relative_to(root).as_posix(), "size": path.stat().st_size,
-        "sha256": _sha256(path), "mime": mime, "kind": kind,
+    if input_fingerprint(manifest, challenge) != expected_fingerprint:
+        raise PreflightError("challenge input changed between selection and materialization")
+    destination = run_root / "input"
+    if destination.exists() or destination.is_symlink():
+        raise PreflightError("fresh run input path already exists")
+    staging = Path(tempfile.mkdtemp(prefix=".input-", dir=run_root))
+    archives: list[dict[str, Any]] = []
+    limits = LIMITS[challenge.input_profile]
+    try:
+        for source in challenge_sources(manifest, challenge):
+            if source.is_dir():
+                copy_tree_without_links(source, staging, limits)
+            else:
+                members = extract_archive(source, staging, limits)
+                archives.append({
+                    "name": source.name,
+                    "sha256": file_hash(source),
+                    "bytes": source.stat().st_size,
+                    "members": len(members),
+                })
+        _validate_tree(staging, limits)
+        _make_read_only(staging)
+        os.replace(staging, destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    inventory = inventory_tree(destination)
+    prepared_fingerprint = tree_hash(destination)
+    targets = [target.to_dict() for target in parse_remotes(challenge.remotes)]
+    service_plan = detect_service(destination, challenge.category)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input_fingerprint": expected_fingerprint,
+        "prepared_fingerprint": prepared_fingerprint,
+        "prepared_input": str(destination),
+        "read_only": True,
+        "files": inventory,
+        "file_count": len(inventory),
+        "total_bytes": sum(int(row["size"]) for row in inventory),
+        "archives": archives,
+        "priority_files": _priority_files(inventory),
+        "declared_targets": targets,
+        "service_plan": service_plan,
     }
-    with path.open("rb") as handle:
-        magic = handle.read(4)
-    if magic == b"\x7fELF":
-        header = _command_output(["readelf", "-h", str(path)], limit=64_000)
-        program = _command_output(["readelf", "-W", "-l", str(path)], limit=64_000)
-        dynamic = _command_output(["readelf", "-W", "-d", str(path)], limit=64_000)
-        record["elf"] = {
-            "architecture": _readelf_value(header, "Machine"),
-            "type": _readelf_value(header, "Type"),
-            "nx": "GNU_STACK" in program and "RWE" not in program,
-            "pie": "DYN" in (_readelf_value(header, "Type") or ""),
-            "relro": "full" if "BIND_NOW" in dynamic else ("partial" if "GNU_RELRO" in program else "none"),
-            "stripped": "stripped" in kind.casefold(),
-        }
+    atomic_json(run_root / "INPUT.json", record)
     return record
 
 
-def _preflight(challenge: ChallengeSpec, input_dir: Path, files: list[dict[str, object]]) -> dict[str, object]:
-    names = [str(item["path"]).casefold() for item in files]
-    category = challenge.category
-    dockerfiles = [str(item["path"]) for item in files if str(item["path"]).casefold().endswith("dockerfile") or "/dockerfile" in str(item["path"]).casefold()]
-    compose = [str(item["path"]) for item in files if str(item["path"]).casefold().endswith(("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"))]
-    dependency_files = [name for name in names if name.endswith(("requirements.txt", "pyproject.toml", "package.json", "go.mod", "cargo.toml", "gemfile"))]
-    text_sample = "\n".join(_small_text(path) for path in _regular_files(input_dir)[:100]) if input_dir.exists() else ""
-    runtime: list[str] = []
-    subtype = None
-    if any(name.endswith(".py") for name in names): runtime.append("python")
-    if "package.json" in names or any(name.endswith((".js", ".ts")) for name in names): runtime.append("node")
-    if any("flask" in line.casefold() for line in text_sample.splitlines()): subtype = "Flask web application"
-    elif "django" in text_sample.casefold(): subtype = "Django web application"
-    elif "express" in text_sample.casefold(): subtype = "Express web application"
-    elif category == "pwn" and any("elf" in str(item["kind"]).casefold() for item in files): subtype = "native ELF binary"
-    elif category == "rev": subtype = "binary/static reverse engineering"
-    elif category == "crypto": subtype = "cryptographic solver"
-    surfaces = {
-        "pwn": ["I/O protocol", "memory-corruption primitives", "mitigations and libc coupling"],
-        "web": ["routes and authentication", "source-to-sink data flow", "container/dependency trust boundaries"],
-        "rev": ["entry point and imports", "validation routine", "packing or anti-analysis"],
-        "crypto": ["parameters and entropy", "input/output equations", "known weak construction families"],
-        "forensic": ["file signatures and metadata", "embedded/recovered objects", "timeline and provenance"],
-        "misc": ["file/protocol classification", "encoding layers", "runtime restrictions"],
-        "cloud": ["identity and policy boundaries", "metadata/service endpoints", "deployment manifests"],
-    }.get(category, ["file/protocol classification", "runtime and trust boundaries", "category-specific attack surface"])
-    hypotheses = [f"Inspect {surface} first" for surface in surfaces[:2]]
-    default_tools = {
-        "pwn": ["file", "readelf", "checksec", "gdb", "pwntools"],
-        "web": ["rg", "curl", "python", "docker compose (only if required)"],
-        "rev": ["strings", "objdump", "gdb", "radare2/ghidra on demand"],
-        "crypto": ["python", "sympy", "pycryptodome", "z3 on demand"],
-        "forensic": ["file", "exiftool", "binwalk", "tshark on demand"],
-        "misc": ["file", "xxd", "python3", "ffmpeg", "OpenCV", "zbarimg"],
-        "osint": ["whois", "dig", "httpx", "chromium", "exiftool", "tesseract", "yt-dlp"],
-        "ai": ["file", "binwalk", "PyTorch", "ONNX Runtime", "transformers", "tokenizers"],
-        "cloud": ["jq", "yq", "aws", "az", "gcloud", "kubectl", "helm", "terraform", "OPA", "checkov"],
-    }.get(category, ["file", "rg", "xxd", "python3"])
-    service_plan = _service_plan(challenge, input_dir, dockerfiles, compose)
-    priority_metadata = _priority_files(files)
-    total_size = sum(int(item["size"]) for item in files)
-    elf_count = sum(bool(item.get("elf")) for item in files)
-    recommended_resource = _recommended_resource_profile(challenge, names, total_size, len(files), elf_count, bool(dockerfiles or compose))
-    recommended_profile, signal_tools = _recommended_profile(category, names, text_sample)
-    recommended_image = f"ctf-os-sandbox:{recommended_profile}"
-    tools = list(dict.fromkeys(default_tools + signal_tools))
-    special_permissions = _special_permissions(names, text_sample)
-    needs_review = bool(special_permissions) or str(service_plan.get("status")) == "NEEDS_REVIEW"
-    setup_cost = "high" if recommended_resource in {"heavy", "large-forensic"} else ("medium" if recommended_resource == "standard" else "low")
-    return {
-        "docker": {"dockerfiles": dockerfiles, "compose_files": compose, "dependency_files": dependency_files},
-        "runtime": sorted(set(runtime)), "subtype": subtype,
-        "attack_surface": surfaces, "hypotheses": hypotheses, "recommended_tools": tools,
-        "initial_attack_surface": surfaces,
-        "priority_files": [str(item["path"]) for item in priority_metadata],
-        "priority_file_metadata": priority_metadata,
-        "important_metadata": {
-            "file_count": len(files), "total_bytes": total_size, "elf_count": elf_count,
-            "dependency_files": dependency_files, "input_profile": challenge.input_profile,
-        },
-        "recommended_image": recommended_image,
-        "recommended_profile": recommended_profile,
-        "recommended_resource_profile": recommended_resource,
-        "setup_cost": setup_cost,
-        "special_permission_requirement": special_permissions,
-        "needs_review": needs_review,
-        "containerized_challenge": bool(dockerfiles or compose),
-        "service_plan": service_plan,
-    }
-
-
-def _recommended_profile(category: str, names: list[str], text_sample: str) -> tuple[str, list[str]]:
-    """Choose a category image without exposing a user-selectable sub-profile."""
-    profile = {
-        "pwn": "pwn", "jail": "pwn", "web": "web", "blockchain": "web",
-        "rev": "rev", "mobile": "rev", "hardware": "rev", "windows": "rev",
-        "crypto": "crypto", "forensic": "forensic", "misc": "misc",
-        "osint": "osint", "ai": "ai", "cloud": "cloud",
-    }.get(category, "base")
-    blob = " ".join(names) + " " + text_sample[:128_000].casefold()
-    suffixes = tuple(Path(name).suffix for name in names)
-    tools: list[str] = []
-    if any(token in blob for token in ("bzimage", "initramfs", "vmlinuz")):
-        profile, tools = "pwn", ["qemu-system", "cpio", "gdb-multiarch", "pahole"]
-    elif any(name.endswith((".apk", ".aab", ".dex", ".jar", ".wasm")) for name in names):
-        profile, tools = "rev", ["jadx", "apktool", "wasm-objdump", "wasmtime"]
-    elif any(name.endswith((".onnx", ".pt", ".pth", ".h5", ".hdf5", ".safetensors", ".joblib")) for name in names):
-        profile, tools = "ai", ["PyTorch", "ONNX Runtime", "transformers", "tokenizers", "h5dump"]
-    elif any(name.endswith((".tf", ".tfvars", "chart.yaml", "values.yaml")) or "kustomization" in name or "/templates/" in name for name in names):
-        profile, tools = "cloud", ["terraform", "kubectl", "helm", "OPA", "conftest", "checkov"]
-    elif category == "misc" and any(name.endswith((".wav", ".mp3", ".flac", ".mp4", ".avi", ".mkv")) or "qr" in name or "barcode" in name for name in names):
-        profile, tools = "misc", ["ffmpeg", "sox", "OpenCV", "zbarimg"]
-    elif category == "misc" and any(token in blob for token in ("domain", "geolocation", "map clue", "wayback", "username correlation")):
-        profile, tools = "osint", ["whois", "dig", "chromium", "tesseract", "exiftool"]
-    return profile, tools
-
-
-def _special_permissions(names: list[str], text_sample: str) -> list[str]:
-    blob = " ".join(names) + " " + text_sample[:128_000].casefold()
-    requirements: list[str] = []
-    if any(token in blob for token in ("/dev/kvm", "kvm", "hardware acceleration")):
-        requirements.append("KVM device access requires explicit human approval; QEMU TCG remains available")
-    if any(token in blob for token in ("/dev/tty", "/dev/usb", "serial device", "usb device")):
-        requirements.append("physical or special device access requires explicit human approval")
-    if any(token in blob for token in ("cuda", "/dev/nvidia", "gpu required")):
-        requirements.append("GPU/CUDA device access requires explicit human approval; CPU is the default")
-    return requirements
-
-
-def _recommended_resource_profile(
-    challenge: ChallengeSpec, names: list[str], total_size: int, file_count: int,
-    elf_count: int, containerized: bool,
-) -> str:
-    if challenge.input_profile == "large-forensic":
-        return "large-forensic"
-    forensic_markers = (".pcap", ".pcapng", ".raw", ".mem", ".vmem", ".vmdk", ".e01", ".dd", ".img")
-    heavy_tools = ("volatility", "ghidra", "angr", "sage", "firmware")
-    if challenge.category == "forensic" and total_size >= 1024**3:
-        return "large-forensic"
-    if (
-        total_size >= 512 * 1024**2 or file_count >= 5_000
-        or any(name.endswith(forensic_markers) for name in names)
-        or any(marker in name for name in names for marker in heavy_tools)
-        or (challenge.category in {"rev", "crypto", "forensic", "ai"} and total_size >= 128 * 1024**2)
-    ):
-        return "heavy"
-    if containerized or challenge.category in {"pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud", "mobile", "windows"} or elf_count:
-        return "standard"
-    return "light"
-
-
-def _priority_files(files: list[dict[str, object]]) -> list[dict[str, object]]:
-    def rank(item: dict[str, object]) -> tuple[int, int, str]:
-        name = str(item["path"]).casefold()
-        score = 0
-        if item.get("elf"): score += 100
-        if name.endswith(("dockerfile", "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")): score += 90
-        if name.endswith(("requirements.txt", "pyproject.toml", "package.json", "go.mod", "cargo.toml", "gemfile")): score += 70
-        if name.endswith((".py", ".c", ".cc", ".cpp", ".h", ".js", ".ts", ".php", ".java", ".go", ".rs")): score += 50
-        if any(token in name for token in ("main", "server", "app", "chall", "flag", "readme")): score += 30
-        return (-score, int(item["size"]), name)
-
-    selected = sorted(files, key=rank)[:CONTEXT_FILE_LIMIT]
-    return [{key: item[key] for key in ("path", "size", "sha256", "mime", "kind") if key in item} | ({"elf": item["elf"]} if item.get("elf") else {}) for item in selected]
-
-
-def _service_plan(challenge: ChallengeSpec, input_dir: Path, dockerfiles: list[str], compose_files: list[str]) -> dict[str, object]:
-    if compose_files:
-        return _compose_service_plan(challenge, input_dir, compose_files)
-    if dockerfiles:
-        dockerfile = dockerfiles[0]
-        text = _small_text(input_dir / dockerfile)
-        ports = _dockerfile_ports(text)
-        build_context = str(Path(dockerfile).parent) or "."
-        build_args = _dockerfile_variables(text, "ARG")
-        environment = _dockerfile_variables(text, "ENV")
-        service = {
-            "name": "chall", "image": None, "build_context": build_context,
-            "dockerfile": dockerfile, "build_args": build_args,
-            "exposed_ports": ports, "mapped_ports": [],
-            "environment": environment,
-            "healthcheck": _dockerfile_instruction(text, "HEALTHCHECK"),
-            "depends_on": [], "command": _dockerfile_instruction(text, "CMD"),
-            "entrypoint": _dockerfile_instruction(text, "ENTRYPOINT"),
-            "volumes": [], "devices": [], "cap_add": [], "privileged": False,
-            "network_mode": None, "pid": None, "ipc": None,
-            "docker_socket_mount": False, "host_path_mounts": [], "external_image_pull": True,
-        }
-        _add_internal_targets(service, challenge.category)
-        return {
-            "kind": "dockerfile", "status": "READY", "safe_to_start": True, "review_reasons": [],
-            "compose_files": [], "build_context": build_context, "dockerfile": Path(dockerfile).name,
-            "build_args": build_args, "environment": environment, "services": [service],
-        }
-    return {"kind": "none", "status": "UNAVAILABLE", "safe_to_start": False, "review_reasons": ["no Dockerfile or Compose file"], "services": []}
-
-
-def _compose_service_plan(challenge: ChallengeSpec, input_dir: Path, compose_files: list[str]) -> dict[str, object]:
-    compose_path = input_dir / compose_files[0]
+def validate_prepared_input(run_root: Path) -> tuple[Path, dict[str, Any]]:
+    path = run_root / "input"
+    record_path = run_root / "INPUT.json"
+    if path.is_symlink() or not path.is_dir() or record_path.is_symlink() or not record_path.is_file():
+        raise PreflightError("prepared input is missing or unsafe")
     try:
-        document = yaml.safe_load(compose_path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
-        return {
-            "kind": "compose", "status": "NEEDS_REVIEW", "safe_to_start": False,
-            "review_reasons": [f"cannot parse {compose_files[0]}: {exc}"],
-            "compose_file": compose_files[0], "compose_files": compose_files, "services": [],
-        }
-    raw_services = document.get("services") if isinstance(document, dict) else None
-    if not isinstance(raw_services, dict) or not raw_services:
-        return {
-            "kind": "compose", "status": "NEEDS_REVIEW", "safe_to_start": False,
-            "review_reasons": ["Compose document has no services mapping"],
-            "compose_file": compose_files[0], "compose_files": compose_files, "services": [],
-        }
-    services: list[dict[str, object]] = []
-    review: list[str] = []
-    for name in sorted(raw_services):
-        raw = raw_services[name]
-        if not isinstance(raw, dict):
-            review.append(f"service {name}: configuration is not a mapping")
-            continue
-        build = raw.get("build")
-        build_context: str | None = None
-        dockerfile: str | None = None
-        build_args: object = {}
-        if isinstance(build, str):
-            build_context = build
-            dockerfile = "Dockerfile"
-        elif isinstance(build, dict):
-            build_context = str(build.get("context", "."))
-            dockerfile = str(build.get("dockerfile", "Dockerfile"))
-            build_args = build.get("args") or {}
-        if build_context is not None:
-            if "$" in build_context:
-                review.append(f"service {name}: interpolated build context requires review: {build_context}")
-            resolved_context = (compose_path.parent / build_context).resolve()
-            try:
-                resolved_context.relative_to(input_dir.resolve())
-            except ValueError:
-                review.append(f"service {name}: build context escapes challenge input: {build_context}")
-        ports = [_compose_port(value) for value in _as_list(raw.get("ports"))]
-        expose = [_port_number(value) for value in _as_list(raw.get("expose"))]
-        exposed = sorted({port for port in expose + [item["target"] for item in ports] if port is not None})
-        volumes = _as_list(raw.get("volumes"))
-        host_mounts: list[str] = []
-        docker_socket = False
-        for volume in volumes:
-            source, target, bind = _volume_parts(volume)
-            if target == "/var/run/docker.sock" or source == "/var/run/docker.sock":
-                docker_socket = True
-                review.append(f"service {name}: Docker socket mount is forbidden")
-            if bind and source:
-                host_mounts.append(source)
-                if "$" in source or source.startswith("~"):
-                    review.append(f"service {name}: interpolated or home-relative bind mount requires review: {source}")
-                resolved_source = (compose_path.parent / source).resolve() if not Path(source).is_absolute() else Path(source).resolve()
-                try:
-                    resolved_source.relative_to(input_dir.resolve())
-                except ValueError:
-                    review.append(f"service {name}: bind mount escapes challenge input: {source}")
-                if resolved_source == Path("/"):
-                    review.append(f"service {name}: host root mount is forbidden")
-        privileged = bool(raw.get("privileged", False))
-        network_mode, pid, ipc = raw.get("network_mode"), raw.get("pid"), raw.get("ipc")
-        devices = _as_list(raw.get("devices"))
-        cap_add = [str(value) for value in _as_list(raw.get("cap_add"))]
-        if privileged: review.append(f"service {name}: privileged mode is forbidden")
-        if str(network_mode).casefold() == "host": review.append(f"service {name}: host network mode is forbidden")
-        if str(pid).casefold() == "host": review.append(f"service {name}: host PID namespace is forbidden")
-        if str(ipc).casefold() == "host": review.append(f"service {name}: host IPC namespace is forbidden")
-        if devices: review.append(f"service {name}: host device mappings require review")
-        broad_caps = [cap for cap in cap_add if cap.upper() not in {"NET_BIND_SERVICE"}]
-        if broad_caps: review.append(f"service {name}: broad capabilities require review: {', '.join(broad_caps)}")
-        service: dict[str, object] = {
-            "name": str(name), "image": raw.get("image"), "build_context": build_context,
-            "dockerfile": dockerfile, "build_args": build_args, "exposed_ports": exposed,
-            "mapped_ports": ports, "environment": _environment(raw.get("environment")),
-            "healthcheck": raw.get("healthcheck"), "depends_on": _depends_on(raw.get("depends_on")),
-            "command": raw.get("command"), "entrypoint": raw.get("entrypoint"),
-            "volumes": volumes, "devices": devices, "cap_add": cap_add,
-            "privileged": privileged, "network_mode": network_mode, "pid": pid, "ipc": ipc,
-            "docker_socket_mount": docker_socket, "host_path_mounts": host_mounts,
-            "external_image_pull": bool(raw.get("image")) and build is None,
-        }
-        _add_internal_targets(service, challenge.category)
-        services.append(service)
-    return {
-        "kind": "compose", "status": "NEEDS_REVIEW" if review else "READY",
-        "safe_to_start": not review, "review_reasons": sorted(set(review)),
-        "compose_file": compose_files[0], "compose_files": compose_files, "services": services,
-    }
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError("prepared input record is unreadable") from exc
+    if not isinstance(record, dict) or record.get("schema_version") != 1:
+        raise PreflightError("prepared input record schema is unsupported")
+    if Path(str(record.get("prepared_input"))).resolve() != path.resolve():
+        raise PreflightError("prepared input record escapes this run")
+    if record.get("prepared_fingerprint") != tree_hash(path):
+        raise PreflightError("prepared input was modified after materialization")
+    for item in path.rglob("*"):
+        if item.is_symlink():
+            raise PreflightError("prepared input contains a symlink")
+        if item.stat().st_mode & 0o222:
+            raise PreflightError("prepared input is not read-only")
+    return path, record
 
 
-def _as_list(value: object) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
+def inventory_tree(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in bounded_source_files(root, LIMITS["large-forensic"]):
+        relative = path.relative_to(root).as_posix()
+        rows.append({
+            "path": relative,
+            "size": path.stat().st_size,
+            "sha256": file_hash(path),
+            "mime": mimetypes.guess_type(relative)[0] or "application/octet-stream",
+        })
+    return rows
 
 
-def _compose_port(value: object) -> dict[str, object]:
-    if isinstance(value, dict):
-        return {
-            "target": _port_number(value.get("target")), "published": _port_number(value.get("published")),
-            "host_ip": value.get("host_ip"), "protocol": str(value.get("protocol", "tcp")),
-        }
-    text = str(value)
-    protocol = text.rsplit("/", 1)[1] if "/" in text else "tcp"
-    text = text.rsplit("/", 1)[0]
-    parts = text.rsplit(":", 2)
-    return {
-        "target": _port_number(parts[-1]),
-        "published": _port_number(parts[-2]) if len(parts) >= 2 else None,
-        "host_ip": parts[0] if len(parts) == 3 else None, "protocol": protocol,
-    }
+def tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for row in inventory_tree(root):
+        digest.update(str(row["path"]).encode())
+        digest.update(int(row["size"]).to_bytes(8, "big"))
+        digest.update(bytes.fromhex(str(row["sha256"])))
+    return digest.hexdigest()
 
 
-def _port_number(value: object) -> int | None:
-    try:
-        text = str(value).split("-", 1)[0]
-        number = int(text)
-    except (TypeError, ValueError):
-        return None
-    return number if 0 < number <= 65535 else None
-
-
-def _volume_parts(value: object) -> tuple[str | None, str | None, bool]:
-    if isinstance(value, dict):
-        source = value.get("source")
-        target = value.get("target")
-        return (str(source) if source is not None else None, str(target) if target is not None else None, value.get("type") == "bind")
-    parts = str(value).split(":")
-    if len(parts) < 2:
-        return None, parts[0] or None, False
-    source, target = parts[0], parts[1]
-    bind = source.startswith((".", "/", "~"))
-    return source, target, bind
-
-
-def _environment(value: object) -> object:
-    if isinstance(value, dict):
-        return {str(key): item for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
-    return _as_list(value)
-
-
-def _depends_on(value: object) -> list[str]:
-    if isinstance(value, dict):
-        return sorted(str(key) for key in value)
-    return sorted(str(item) for item in _as_list(value))
-
-
-def _add_internal_targets(service: dict[str, object], category: str) -> None:
-    ports = [int(port) for port in service.get("exposed_ports", []) if isinstance(port, int)]
-    host = str(service["name"])
-    scheme = "http" if category in {"web", "blockchain"} else "tcp"
-    targets = [f"{scheme}://{host}:{port}" if scheme == "http" else f"{host}:{port}" for port in ports]
-    service["internal_targets"] = targets
-    service["internal_target"] = targets[0] if targets else None
-    service["port"] = ports[0] if ports else None
-    service["expected_local_service_url"] = targets[0] if targets else None
-
-
-def _dockerfile_ports(text: str) -> list[int]:
-    result: set[int] = set()
-    for value in _dockerfile_instructions(text, "EXPOSE"):
-        for item in value.split():
-            port = _port_number(item.split("/", 1)[0])
-            if port:
-                result.add(port)
-    return sorted(result)
-
-
-def _dockerfile_instructions(text: str, instruction: str) -> list[str]:
-    prefix = instruction.casefold() + " "
-    return [line.strip()[len(prefix):].strip() for line in text.splitlines() if line.strip().casefold().startswith(prefix)]
-
-
-def _dockerfile_instruction(text: str, instruction: str) -> str | None:
-    values = _dockerfile_instructions(text, instruction)
-    return values[-1] if values else None
-
-
-def _dockerfile_variables(text: str, instruction: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for value in _dockerfile_instructions(text, instruction):
-        # This deliberately handles the common KEY=value form. Shell-style
-        # multi-key ENV is recorded only when unambiguous; Docker remains the
-        # source of truth for the actual image configuration.
-        if instruction == "ENV" and "=" not in value and len(value.split(None, 1)) == 2:
-            key, item = value.split(None, 1)
-            result[key] = item
-            continue
-        for token in value.split():
-            key, separator, item = token.partition("=")
-            if key and separator:
-                result[key] = item
-            elif instruction == "ARG" and key:
-                result[key] = ""
-    return result
-
-
-def _small_text(path: Path) -> str:
-    if path.stat().st_size > 512_000:
-        return ""
-    try:
-        return path.read_text(encoding="utf-8", errors="ignore")[:64_000]
-    except OSError:
-        return ""
-
-
-def _readelf_value(output: str, key: str) -> str | None:
-    for line in output.splitlines():
-        if line.strip().startswith(f"{key}:"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-def _command_output(argv: list[str], *, limit: int = 16_000) -> str:
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return ""
-    return result.stdout[:limit].strip()
-
-
-def _sha256(path: Path) -> str:
+def file_hash(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise PreflightError(f"input file is unsafe: {path}")
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
@@ -988,74 +208,247 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def detect_service(input_root: Path, category: str) -> dict[str, Any]:
+    dockerfiles = [path for path in input_root.rglob("Dockerfile") if path.is_file() and not path.is_symlink()]
+    compose = [
+        path for name in ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
+        for path in input_root.rglob(name) if path.is_file() and not path.is_symlink()
+    ]
+    if compose:
+        return _compose_plan(input_root, compose[0], category)
+    if dockerfiles:
+        relative = dockerfiles[0].relative_to(input_root)
+        text = dockerfiles[0].read_text(encoding="utf-8", errors="replace")[:256_000]
+        ports = _dockerfile_ports(text)
+        if not ports:
+            return {
+                "kind": "none", "safe": True, "services": [],
+                "review_reasons": ["Dockerfile has no declared service port and remains input-only"],
+            }
+        bases, base_reasons = _dockerfile_bases(text)
+        return {
+            "kind": "dockerfile",
+            "safe": not base_reasons,
+            "source": relative.as_posix(),
+            "context": relative.parent.as_posix() or ".",
+            "base_images": bases,
+            "services": [{
+                "name": "challenge",
+                "ports": ports,
+                "endpoints": _endpoints("challenge", ports, category),
+            }],
+            "review_reasons": base_reasons,
+        }
+    return {"kind": "none", "safe": True, "services": [], "review_reasons": []}
+
+
+def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]:
+    relative = path.relative_to(input_root).as_posix()
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": [str(exc)]}
+    raw_services = document.get("services") if isinstance(document, Mapping) else None
+    if not isinstance(raw_services, Mapping) or not raw_services:
+        return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": ["compose has no services"]}
+    reasons: list[str] = []
+    services: list[dict[str, Any]] = []
+    base_images: set[str] = set()
+    runtime_images: set[str] = set()
+    for section in ("networks", "volumes", "configs", "secrets"):
+        entries = document.get(section) if isinstance(document, Mapping) else None
+        if not isinstance(entries, Mapping):
+            continue
+        for name, settings in entries.items():
+            if isinstance(settings, Mapping) and (settings.get("external") or settings.get("name")):
+                reasons.append(f"top-level {section} {name} references a non-project-scoped resource")
+    for name, raw in raw_services.items():
+        if not isinstance(raw, Mapping):
+            reasons.append(f"service {name} is not a mapping")
+            continue
+        if raw.get("privileged") is True:
+            reasons.append(f"service {name} requests privileged mode")
+        for key in ("network_mode", "pid", "ipc", "userns_mode", "uts", "cgroup", "runtime"):
+            if raw.get(key):
+                reasons.append(f"service {name} requests explicit {key}")
+        if raw.get("devices"):
+            reasons.append(f"service {name} requests host devices")
+        if raw.get("cap_add"):
+            reasons.append(f"service {name} requests added capabilities")
+        for key in ("extra_hosts", "external_links", "secrets", "configs"):
+            if raw.get(key):
+                reasons.append(f"service {name} requests unsafe {key}")
+        if raw.get("build"):
+            build_bases, build_reasons = _compose_build(input_root, path.parent, raw["build"])
+            base_images.update(build_bases)
+            reasons.extend(f"service {name} {reason}" for reason in build_reasons)
+        elif raw.get("image"):
+            image = str(raw["image"])
+            if "$" in image:
+                reasons.append(f"service {name} uses a dynamic image reference")
+            else:
+                runtime_images.add(image)
+        env_files = raw.get("env_file") or []
+        if isinstance(env_files, (str, Mapping)):
+            env_files = [env_files]
+        for env_file in env_files:
+            value = env_file.get("path") if isinstance(env_file, Mapping) else env_file
+            if not _compose_reference_is_scoped(input_root, path.parent, str(value or ""), file=True):
+                reasons.append(f"service {name} env_file escapes prepared input")
+        for volume in raw.get("volumes") or []:
+            if isinstance(volume, Mapping):
+                text = str(volume.get("source") or "")
+                if volume.get("type") == "bind":
+                    reasons.append(f"service {name} requests a host bind mount")
+            else:
+                text = str(volume)
+            if "/var/run/docker.sock" in text:
+                reasons.append(f"service {name} requests the Docker socket")
+            source = text.split(":", 1)[0]
+            if source.startswith(("/", "~", ".")) or "/" in source or "\\" in source:
+                reasons.append(f"service {name} requests a host bind mount")
+        ports = _compose_ports(raw)
+        services.append({
+            "name": str(name),
+            "ports": ports,
+            "endpoints": _endpoints(str(name), ports, category),
+            "build": bool(raw.get("build")),
+        })
+    if services and not any(service["ports"] for service in services):
+        reasons.append("compose declares no challenge service port")
+    return {
+        "kind": "compose",
+        "safe": not reasons,
+        "source": relative,
+        "base_images": sorted(base_images),
+        "runtime_images": sorted(runtime_images),
+        "services": services,
+        "review_reasons": sorted(set(reasons)),
+    }
+
+
+def _compose_ports(raw: Mapping[str, Any]) -> list[int]:
+    result: set[int] = set()
+    for value in list(raw.get("expose") or []) + list(raw.get("ports") or []):
+        if isinstance(value, Mapping):
+            candidate = value.get("target")
+        else:
+            candidate = str(value).split("/", 1)[0].rsplit(":", 1)[-1].split("-", 1)[0]
+        try:
+            number = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if 0 < number < 65536:
+            result.add(number)
+    return sorted(result)
+
+
+def _dockerfile_ports(text: str) -> list[int]:
+    result: set[int] = set()
+    for line in text.splitlines():
+        if not line.strip().casefold().startswith("expose "):
+            continue
+        for value in line.strip().split()[1:]:
+            try:
+                port = int(value.split("/", 1)[0])
+            except ValueError:
+                continue
+            if 0 < port < 65536:
+                result.add(port)
+    return sorted(result)
+
+
+def _dockerfile_bases(text: str) -> tuple[list[str], list[str]]:
+    images: list[str] = []
+    stages: set[str] = set()
+    reasons: list[str] = []
+    for raw in text.splitlines():
+        match = re.match(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$", raw, re.I)
+        if not match:
+            continue
+        image, stage = match.group(1), match.group(2)
+        if "$" in image:
+            reasons.append("Dockerfile uses a dynamic FROM image")
+        elif image.casefold() != "scratch" and image.casefold() not in stages:
+            images.append(image)
+        if stage:
+            stages.add(stage.casefold())
+    if not images and not any(line.lstrip().upper().startswith("FROM ") for line in text.splitlines()):
+        reasons.append("Dockerfile has no bounded FROM instruction")
+    return sorted(set(images)), reasons
+
+
+def _compose_build(
+    input_root: Path, compose_root: Path, value: object
+) -> tuple[list[str], list[str]]:
+    reasons: list[str] = []
+    if isinstance(value, str):
+        context_value = value
+        dockerfile_value = "Dockerfile"
+    elif isinstance(value, Mapping):
+        context_value = str(value.get("context", "."))
+        dockerfile_value = str(value.get("dockerfile", "Dockerfile"))
+        for key in ("ssh", "secrets", "additional_contexts", "entitlements"):
+            if value.get(key):
+                reasons.append(f"build requests {key}")
+    else:
+        return [], ["build must be a local string or mapping"]
+    if not _compose_reference_is_scoped(input_root, compose_root, context_value, file=False):
+        return [], reasons + ["build context escapes prepared input"]
+    context = (compose_root / context_value).resolve()
+    dockerfile = (context / dockerfile_value).resolve()
+    try:
+        dockerfile.relative_to(input_root.resolve())
+    except ValueError:
+        return [], reasons + ["build Dockerfile escapes prepared input"]
+    if dockerfile.is_symlink() or not dockerfile.is_file():
+        return [], reasons + ["build Dockerfile is missing or unsafe"]
+    bases, base_reasons = _dockerfile_bases(
+        dockerfile.read_text(encoding="utf-8", errors="replace")[:256_000]
+    )
+    return bases, reasons + base_reasons
+
+
+def _compose_reference_is_scoped(
+    input_root: Path, relative_root: Path, value: str, *, file: bool
+) -> bool:
+    if not value or "://" in value or value.startswith(("~", "/")):
+        return False
+    target = (relative_root / value).resolve()
+    try:
+        target.relative_to(input_root.resolve())
+    except ValueError:
+        return False
+    return not target.is_symlink() and (target.is_file() if file else target.is_dir())
+
+
+def _endpoints(host: str, ports: list[int], category: str) -> list[str]:
+    scheme = "http" if category == "web" else "tcp"
+    return [f"{scheme}://{host}:{port}" for port in ports]
+
+
+def _priority_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def rank(row: Mapping[str, Any]) -> tuple[int, int, str]:
+        name = str(row["path"]).casefold()
+        score = 0
+        if name.endswith(("dockerfile", "compose.yml", "compose.yaml")):
+            score += 100
+        if name.endswith((".py", ".c", ".cc", ".cpp", ".js", ".ts", ".php", ".go", ".rs")):
+            score += 70
+        if any(token in name for token in ("chall", "main", "server", "app", "flag", "readme")):
+            score += 30
+        return (-score, int(row["size"]), name)
+    return [dict(row) for row in sorted(files, key=rank)[:PRIORITY_LIMIT]]
+
+
+def _validate_tree(root: Path, limits: ArchiveLimits) -> None:
+    files = bounded_source_files(root, limits)
+    total = sum(path.stat().st_size for path in files)
+    if total > limits.max_total_bytes:
+        raise ArchiveError("materialized challenge exceeds its total size limit")
+
+
 def _make_read_only(root: Path) -> None:
     for path in sorted(root.rglob("*"), reverse=True):
         path.chmod(0o555 if path.is_dir() else 0o444)
     root.chmod(0o555)
-
-
-def _remove_generated_tree(root: Path) -> None:
-    for path in root.rglob("*"):
-        if path.is_dir():
-            path.chmod(0o755)
-        else:
-            path.chmod(0o644)
-    root.chmod(0o755)
-    shutil.rmtree(root)
-
-
-def render_context(manifest: ContestManifest, record: dict[str, object]) -> str:
-    challenge = f"{record['category']}/{record['name']}"
-    lines = [f"# Context — {challenge}", "", f"- Number: {int(record['number']):02d}", f"- Stable ID: `{record['id']}`", f"- Status: **{record['status']}**", f"- Contest: {manifest.name}"]
-    for label, key in (("Score", "score"), ("Description", "description"), ("Hint", "hint"), ("Flag format", "flag_format")):
-        if record.get(key) is not None:
-            lines.append(f"- {label}: {record[key]}")
-    lines.extend(["", "## Authorized targets", ""])
-    targets = record.get("authorized_targets") or []
-    lines.extend(f"- `{target['declared']}`" for target in targets) if targets else lines.append("- None")
-    metadata = record.get("important_metadata") or {}
-    lines.extend([
-        "", "## Prepared evidence", "", f"- Input: `{record['prepared_input']}`",
-        f"- Fingerprint: `{record.get('source_fingerprint')}`",
-        f"- Files: {metadata.get('file_count', 0)} ({metadata.get('total_bytes', 0)} bytes total)",
-        f"- Full inventory: `{record['inventory_path']}`",
-        f"- Recommended image: `{record.get('recommended_image')}`",
-        f"- Recommended resource profile: `{record.get('recommended_resource_profile')}`",
-        f"- Setup cost: `{record.get('setup_cost')}`",
-        f"- NEEDS_REVIEW: `{bool(record.get('needs_review'))}`",
-        "", f"## Priority files (top {CONTEXT_FILE_LIMIT})", "",
-    ])
-    for item in record.get("priority_file_metadata", []):
-        details = item.get("elf")
-        lines.append(f"- `{item['path']}` — {item['size']} bytes — `{item['sha256']}` — {item['kind']}" + (f" — ELF {details}" if details else ""))
-    if not record.get("priority_file_metadata"):
-        lines.append("- None")
-    service_plan = record.get("service_plan") or {}
-    lines.extend([
-        "", "## Local challenge service", "",
-        f"- Kind: `{service_plan.get('kind', 'none')}`",
-        f"- Safe to start automatically: `{bool(service_plan.get('safe_to_start'))}`",
-    ])
-    for service in service_plan.get("services", []):
-        lines.append(f"- `{service.get('name')}` → {', '.join(service.get('internal_targets') or []) or 'no detected port'}")
-    for reason in service_plan.get("review_reasons", []):
-        lines.append(f"- NEEDS_REVIEW: {reason}")
-    for reason in record.get("special_permission_requirement", []):
-        lines.append(f"- NEEDS_REVIEW: {reason}")
-    warning_values = list(record.get("warnings") or [])
-    lines.extend(["", "## Manifest warnings", ""])
-    lines.extend(
-        f"- **{warning['severity']}** line {warning['line']}: {warning['message']}"
-        for warning in warning_values
-    ) if warning_values else lines.append("- None")
-    for heading, key in (
-        ("Preflight observation hints", "observation_hints"),
-        ("Preflight inspection directions", "hypotheses"),
-        ("Recommended tools", "recommended_tools"),
-        ("Blockers", "blockers"),
-        ("Solve session read paths", "read_paths"),
-    ):
-        lines.extend(["", f"## {heading}", ""])
-        values = record.get(key) or []
-        lines.extend(f"- {value}" for value in values) if values else lines.append("- None")
-    return "\n".join(lines) + "\n"

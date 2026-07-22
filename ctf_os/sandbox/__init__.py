@@ -1,9 +1,9 @@
-"""Docker isolation primitives used only through the internal agent tool."""
+"""Race sandbox lifecycle and interactive sessions."""
 
-from .resources import RESOURCE_PROFILES, ResourceError, sandbox_gc, sandbox_status
-from .runtime import SandboxError, build_run_argv, export_artifacts, stage_artifacts
+from .resources import MAX_RACE_CONCURRENCY, RESOURCE_PROFILES, ResourceError
+from .runtime import SandboxError, SandboxSpec, build_run_argv, cleanup, create, execute, probe_service_connectivity
 
 __all__ = [
-    "RESOURCE_PROFILES", "ResourceError", "SandboxError", "build_run_argv",
-    "export_artifacts", "sandbox_gc", "sandbox_status", "stage_artifacts",
+    "MAX_RACE_CONCURRENCY", "RESOURCE_PROFILES", "ResourceError", "SandboxError",
+    "SandboxSpec", "build_run_argv", "cleanup", "create", "execute", "probe_service_connectivity",
 ]

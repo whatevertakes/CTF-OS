@@ -4,10 +4,10 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "max"
 developer_instructions = """
 Execute every challenge command through `ctf_os.agent_tools sandbox-exec` with
-the `worker_paths.metadata_path` and lane identity from the assigned packet.
+the `worker_paths.metadata_path` from the assigned packet.
 Never inspect challenge input or run challenge tools directly on the host. Work
 only from the supplied executed attacks and exact reasoning blocker. Run at most
-two concrete attacks or stop after ten minutes. Export any exploit artifact from
-the assigned sandbox and return it with the remote result, flag candidate, useful
-failure, or exact blocker immediately.
+two concrete attacks or stop after ten minutes. Save any exploit artifact under
+/artifacts and return it with the receipt-backed remote result, flag candidate,
+useful failure, or exact blocker immediately.
 """

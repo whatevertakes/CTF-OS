@@ -1,1373 +1,689 @@
+"""Single-challenge race controller CLI.
+
+This module prepares state and sandboxes.  It never calls a model API, starts
+or interrupts a native agent, or submits a flag.
+"""
+
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 import sys
+from typing import Any, Mapping, Sequence
 
-from ..challenge import SelectionError, resolve_selector
-from ..challenge_scope import remove_challenge_secrets
-from ..contest import ContestError, discover_contests, select_contest
-from ..evidence import append_finding
+from ..blackboard import append_verified_event
+from ..contest import discover_contests, resolve_selector, select_contest
 from ..doctor import run_doctor
-from ..resources.scheduler import (
-    PRIORITIES as RESOURCE_PRIORITIES, ResourceLedger, ResourceRequest, default_request,
-    detect_capacity, infer_workload, parse_bytes, sample_docker_stats,
+from ..flag import StreamingDetector, record_candidate
+from ..handoff import load_markdown, save_handoff
+from ..images import select_image, smoke_images
+from ..preflight import input_fingerprint, prepare_input, validate_prepared_input
+from ..race import (
+    attach_lane_sandbox,
+    confirm_native_spawn,
+    initialize_race,
+    load_race,
+    mark_lane_prepare_failed,
+    mark_prepare_failed,
+    mark_root_ready,
+    note_command_receipt,
+    note_event,
+    reserve_lanes,
+    reserve_max_endgame,
+    set_service_context,
+    status as race_status,
+    stop_confirmed,
+    terminate,
 )
-from ..oast import create_oast, oast_events, poll_oast
-from ..replay import run_replay
-from ..problems import sync_contest_manifest
-from ..session_input import parse_session_input, resolve_session_challenge
-from ..preflight import (
-    load_challenge_preflight, prepare_selected_challenge, prepared_input_bytes,
-    prepared_tree_fingerprint,
-)
-from ..scaffold import initialize_contest
-from ..sandbox.network import parse_remotes
-from ..sandbox.resources import sandbox_gc, sandbox_status
-from ..sandbox.preparation import prepare_sandbox_spec
+from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.runtime import (
-    cleanup, create, execute, export_artifacts, inspect_sandbox_runtime,
-    probe_service_connectivity, resize, select_local_sandbox_image,
+    SandboxSpec, cleanup, create, execute, load_metadata, probe_service_connectivity,
 )
-from ..service import (
-    ServiceActor, ServiceSpec, service_build, service_cleanup, service_inspect,
-    service_attachment, service_logs, service_plan, service_restart, service_start,
-    service_reset, service_status, service_stop,
+from ..sandbox.session import (
+    close_session,
+    list_sessions,
+    list_tools,
+    open_session,
+    read as session_read,
+    send as session_send,
+    tool_help,
+    tool_version,
 )
-from ..solve_launch import build_solve_launch_context, save_solve_launch_context
-from ..swarm import (
-    GENERAL_MODEL_PROFILES, confirm_native_spawn, create_worker_packet, ensure_prepare_scope,
-    flag_found, high_value_events, initialize_swarm,
-    record_attack_event, record_command_after_execution, record_spawn_failure,
-    replace_worker, start_max_endgame, stop_confirmed,
-    submission_result as record_swarm_submission_result,
-    terminate_for_handoff, worker_status,
-)
-from ..triage import finalize_triage, prepare_triage
-from ..timeouts import timeout_seconds
-from ..tui import resource_panel
-from ..workspace import (
-    atomic_json, challenge_root, challenge_workspace, initialize_solve_files,
-    list_attempts, recover_run_state, resolve_active_run, resolve_run_raw, resume_attempt, safe_under,
-    resolve_exact_run, show_attempt, start_fresh_attempt, state_lock, target_revisions,
-)
-from ..claude_handoff import save_handoff
+from ..service import ServiceActor, ServiceSpec, cleanup_service, load_service, prepare_service
+from ..workspace import clear_active, create_run, resolve_run, utc_now
 
 
 def build_parser() -> argparse.ArgumentParser:
-    child_surface = os.environ.get("CTF_OS_SESSION_ROLE") == "child"
-    parser = argparse.ArgumentParser(prog="python -m ctf_os.agent_tools", description="Internal JSON tools for the active Sol session")
+    parser = argparse.ArgumentParser(
+        prog="python -m ctf_os.agent_tools",
+        description="Verified asynchronous portfolio race controller for one authorized CTF challenge",
+    )
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
-    init_contest = commands.add_parser(
-        "init-contest",
-        help="create an incoming contest workspace",
-        description="Create a contest workspace using the contest name supplied by the user.",
-    )
-    init_contest.add_argument(
-        "name",
-        metavar="CONTEST_NAME",
-        help="contest directory and manifest name (for example: 'My CTF 2026')",
-    )
-    inspect = commands.add_parser("inspect-contest")
-    inspect.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    inspect.add_argument("--contest")
-    intake = commands.add_parser("intake")
-    intake.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    intake.add_argument("--contest")
-    triage_prepare = commands.add_parser("triage-prepare")
-    triage_prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    triage_prepare.add_argument("--contest")
-    triage_finalize = commands.add_parser("triage-finalize")
-    triage_finalize.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    triage_finalize.add_argument("--contest")
-    triage_finalize.add_argument("--assessments-json", required=True)
-    prepare = commands.add_parser(
-        "prepare-challenge",
-        description=(
-            "Prepare one challenge and resume its current attempt by default. "
-            "Use --fresh-attempt for independent execution; every Solve uses the first-to-flag swarm."
-        ),
-    )
-    prepare.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    prepare.add_argument("selector")
-    prepare.add_argument("--contest")
-    prepare.add_argument("--session-input-json")
-    prepare.add_argument("--fresh-attempt", action="store_true")
-    prepare.add_argument("--resume-run-id")
-    prepare.add_argument("--attempt-id")
-    prepare.add_argument("--transformation-seed")
-    prepare.add_argument(
-        "--auto-sandbox", action=argparse.BooleanOptionalAction, default=True,
-        help=(
-            "automatically start a Root sandbox from the recommended local image, "
-            "falling back to ctf-os-sandbox:base (default: enabled)"
-        ),
-    )
-    if not child_surface:
-        attempt_start = commands.add_parser("attempt-start", help="start one isolated fresh attempt")
-        attempt_start.add_argument("selector"); attempt_start.add_argument("--contest")
-        attempt_start.add_argument("--attempt-id"); attempt_start.add_argument("--transformation-seed")
-        _add_session_args(attempt_start)
-        attempt_resume = commands.add_parser("attempt-resume", help="resume current or exact prior attempt")
-        attempt_resume.add_argument("selector"); attempt_resume.add_argument("--contest")
-        attempt_resume.add_argument("--run-id"); _add_session_args(attempt_resume)
-        attempt_list = commands.add_parser("attempt-list", help="list prior isolated attempts")
-        attempt_list.add_argument("selector"); attempt_list.add_argument("--contest"); _add_session_args(attempt_list)
-        attempt_show = commands.add_parser("attempt-show", help="show an exact prior attempt")
-        attempt_show.add_argument("selector"); attempt_show.add_argument("--contest")
-        attempt_show.add_argument("--run-id", required=True); _add_session_args(attempt_show)
-        repair_run_parser = commands.add_parser("repair-run")
-        repair_run_parser.add_argument("selector"); repair_run_parser.add_argument("--contest")
-        repair_run_parser.add_argument("--run-id"); _add_session_args(repair_run_parser)
-        handoff_save = commands.add_parser(
-            "claude-handoff-save",
-            help=argparse.SUPPRESS,
-            description="Store the current exact run's manually composed HANDOFF.md.",
-        )
-        handoff_save.add_argument("selector"); handoff_save.add_argument("--contest", required=True)
-        handoff_save.add_argument("--run-id", required=True)
-        handoff_save.add_argument("--markdown-file", required=True)
-        _add_session_args(handoff_save)
-    resource_status = commands.add_parser("resource-status")
-    resource_status.add_argument("--contest")
-    if not child_surface:
-        resource_plan = commands.add_parser("resource-plan")
-        resource_plan.add_argument("selector"); resource_plan.add_argument("--contest"); _add_session_args(resource_plan)
-        rebalance = commands.add_parser("scheduler-rebalance")
-        rebalance.add_argument("selector"); rebalance.add_argument("--contest")
-        rebalance.add_argument("--apply", dest="apply", action="store_true")
-        rebalance.add_argument("--dry-run", dest="apply", action="store_false")
-        rebalance.set_defaults(apply=True)
-        _add_session_args(rebalance)
-        sandbox_resize = commands.add_parser("sandbox-resize")
-        sandbox_resize.add_argument("metadata"); sandbox_resize.add_argument("--cpus", type=float); sandbox_resize.add_argument("--memory")
-        _add_session_args(sandbox_resize)
-    resource_request = commands.add_parser("resource-request")
-    resource_request.add_argument("selector"); resource_request.add_argument("--contest")
-    resource_request.add_argument("--workload-class"); resource_request.add_argument("--priority", choices=RESOURCE_PRIORITIES)
-    resource_request.add_argument("--command", dest="workload_commands", action="append", default=[])
-    resource_request.add_argument("--min-cpus", type=float); resource_request.add_argument("--preferred-cpus", type=float); resource_request.add_argument("--max-cpus", type=float)
-    resource_request.add_argument("--min-memory"); resource_request.add_argument("--preferred-memory"); resource_request.add_argument("--max-memory"); resource_request.add_argument("--storage")
-    resource_request.add_argument("--gpu-required", action="store_true"); resource_request.add_argument("--gpu-preferred", action="store_true"); resource_request.add_argument("--gpu-memory")
-    resource_request.add_argument("--parallelizable", action=argparse.BooleanOptionalAction, default=None)
-    resource_request.add_argument("--elastic", action=argparse.BooleanOptionalAction, default=None)
-    resource_request.add_argument("--preemptible", action=argparse.BooleanOptionalAction, default=None)
-    _add_session_args(resource_request)
-    resource_update = commands.add_parser("resource-update")
-    resource_update.add_argument("selector"); resource_update.add_argument("--contest")
-    resource_update.add_argument("--priority", choices=RESOURCE_PRIORITIES); resource_update.add_argument("--workload-class")
-    resource_update.add_argument("--progress-json"); resource_update.add_argument("--state")
-    resource_update.add_argument("--parallelizable", action=argparse.BooleanOptionalAction, default=None)
-    _add_session_args(resource_update)
-    resource_release = commands.add_parser("resource-release")
-    resource_release.add_argument("selector"); resource_release.add_argument("--contest"); resource_release.add_argument("--reason", required=True)
-    _add_session_args(resource_release)
-    resource_history = commands.add_parser("resource-history")
-    resource_history.add_argument("selector"); resource_history.add_argument("--contest"); resource_history.add_argument("--limit", type=int, default=200)
-    _add_session_args(resource_history)
-    resource_sample = commands.add_parser("resource-sample")
-    resource_sample.add_argument("selector"); resource_sample.add_argument("--contest"); resource_sample.add_argument("--sample-json"); resource_sample.add_argument("--metadata")
-    _add_session_args(resource_sample)
-    if not child_surface:
-        sandbox_create = commands.add_parser("sandbox-create")
-        sandbox_create.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-        sandbox_create.add_argument("selector")
-        sandbox_create.add_argument("--contest")
-        sandbox_create.add_argument("--branch", required=True)
-        sandbox_create.add_argument("--image")
-        sandbox_create.add_argument("--resource-profile")
-        sandbox_create.add_argument(
-            "--service", action="store_true",
-            help="require attachment to the existing managed service (active services attach automatically)",
-        )
-        _add_session_args(sandbox_create, default_role="child")
-    sandbox_exec = commands.add_parser("sandbox-exec")
-    sandbox_exec.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sandbox_exec.add_argument("--metadata", dest="metadata_option")
-    sandbox_exec.add_argument("--timeout", type=int, default=300)
-    sandbox_exec.add_argument("--timeout-profile")
-    sandbox_exec.add_argument("--retain-on-timeout", action=argparse.BooleanOptionalAction, default=None)
-    sandbox_exec.add_argument("argv", nargs=argparse.REMAINDER)
-    _add_session_args(sandbox_exec)
-    sandbox_cleanup = commands.add_parser("sandbox-cleanup")
-    sandbox_cleanup.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sandbox_cleanup.add_argument("metadata")
-    _add_session_args(sandbox_cleanup)
-    sandbox_export = commands.add_parser("sandbox-export")
-    sandbox_export.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sandbox_export.add_argument("metadata")
-    _add_session_args(sandbox_export)
-    sandbox_status_parser = commands.add_parser("sandbox-status")
-    _add_session_args(sandbox_status_parser)
-    if not child_surface:
-        sandbox_gc_parser = commands.add_parser("sandbox-gc")
-        _add_session_args(sandbox_gc_parser)
-    doctor_parser = commands.add_parser("doctor")
-    doctor_parser.add_argument("selector", nargs="?")
-    doctor_parser.add_argument("--contest")
-    doctor_parser.add_argument("--run-id")
-    _add_session_args(doctor_parser)
-    service_commands = (
-        ("service-plan", "service-status", "service-logs", "service-inspect")
-        if child_surface else
-        ("service-plan", "service-build", "service-start", "service-restart", "service-status",
-         "service-logs", "service-inspect", "service-stop", "service-cleanup")
-    )
-    for name in service_commands:
-        service = commands.add_parser(name)
-        service.add_argument("selector")
-        service.add_argument("--contest")
-        _add_session_args(service)
-    private_service_commands = (
-        "branch-service-plan", "branch-service-build", "branch-service-start",
-        "branch-service-restart", "branch-service-status", "branch-service-logs",
-        "branch-service-reset", "branch-service-inspect", "branch-service-stop", "branch-service-cleanup",
-    )
-    for name in private_service_commands:
-        service = commands.add_parser(name)
-        service.add_argument("selector"); service.add_argument("--contest")
-        service.add_argument("--branch", required=True)
-        _add_session_args(service, default_role="child")
 
-    attack_event = commands.add_parser("attack-event")
-    attack_event.add_argument("selector"); attack_event.add_argument("--contest")
-    attack_event.add_argument("--lane", required=True); attack_event.add_argument("--type", required=True)
-    attack_event.add_argument("--summary", required=True); attack_event.add_argument("--artifact")
-    attack_event.add_argument("--observed-output"); attack_event.add_argument("--next-attack")
-    attack_event.add_argument("argv", nargs=argparse.REMAINDER); _add_session_args(attack_event)
-    attack_events = commands.add_parser("attack-events-show")
-    attack_events.add_argument("selector"); attack_events.add_argument("--contest"); attack_events.add_argument("--since")
-    _add_session_args(attack_events)
-    oast_create = commands.add_parser("oast-create")
-    oast_create.add_argument("selector"); oast_create.add_argument("--contest")
-    oast_create.add_argument("--branch", required=True); oast_create.add_argument("--provider-url", required=True)
-    _add_session_args(oast_create)
-    oast_poll = commands.add_parser("oast-poll")
-    oast_poll.add_argument("selector"); oast_poll.add_argument("--contest"); oast_poll.add_argument("--oast-id", required=True)
-    _add_session_args(oast_poll)
-    oast_show = commands.add_parser("oast-events")
-    oast_show.add_argument("selector"); oast_show.add_argument("--contest"); oast_show.add_argument("--oast-id", required=True)
-    _add_session_args(oast_show)
-    if not child_surface:
-        worker_show = commands.add_parser("worker-status")
-        worker_show.add_argument("selector"); worker_show.add_argument("--contest"); _add_session_args(worker_show)
-        spawn_packet = commands.add_parser("worker-spawn-packet")
-        spawn_packet.add_argument("selector"); spawn_packet.add_argument("--contest")
-        _add_worker_packet_args(spawn_packet); _add_session_args(spawn_packet)
-        spawn_confirm = commands.add_parser("worker-spawn-confirm")
-        spawn_confirm.add_argument("selector"); spawn_confirm.add_argument("--contest")
-        spawn_confirm.add_argument("--lane", required=True); spawn_confirm.add_argument("--native-session", required=True)
-        spawn_confirm.add_argument("--operation-id"); _add_session_args(spawn_confirm)
-        spawn_failed = commands.add_parser("worker-spawn-failed")
-        spawn_failed.add_argument("selector"); spawn_failed.add_argument("--contest")
-        spawn_failed.add_argument("--lane", required=True); spawn_failed.add_argument("--error", required=True)
-        _add_session_args(spawn_failed)
-        replacement = commands.add_parser("worker-replace")
-        replacement.add_argument("selector"); replacement.add_argument("--contest")
-        replacement.add_argument("--lane", required=True)
-        replacement.add_argument("--reason", required=True); replacement.add_argument("--native-stop-session")
-        _add_worker_packet_args(replacement)
-        _add_session_args(replacement)
-        endgame = commands.add_parser("worker-endgame")
-        endgame.add_argument("selector"); endgame.add_argument("--contest")
-        endgame.add_argument("--lane", required=True); endgame.add_argument("--native-stop-session", required=True)
-        _add_session_args(endgame)
-        stop = commands.add_parser("worker-stop-confirm")
-        stop.add_argument("selector"); stop.add_argument("--contest")
-        stop.add_argument("--lane", required=True); stop.add_argument("--native-session", required=True)
-        _add_session_args(stop)
-        found = commands.add_parser("flag-found")
-        found.add_argument("selector"); found.add_argument("--contest"); found.add_argument("--lane", required=True)
-        found.add_argument("--candidate", required=True); found.add_argument("--observed-output", required=True)
-        found.add_argument("--artifact"); found.add_argument("--source", required=True)
-        found.add_argument("argv", nargs=argparse.REMAINDER); _add_session_args(found)
-        submission = commands.add_parser("submission-result")
-        submission.add_argument("selector"); submission.add_argument("--contest")
-        submission.add_argument("--run-id", required=True); submission.add_argument("--candidate", required=True)
-        submission.add_argument("--result", required=True, choices=("accepted", "wrong")); _add_session_args(submission)
-    if not child_surface:
-        replay = commands.add_parser("replay")
-        replay.add_argument("selector")
-        replay.add_argument("--contest")
-        _add_session_args(replay)
-        finding = commands.add_parser("record-finding")
-        finding.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-        finding.add_argument("selector")
-        finding.add_argument("--contest")
-        finding.add_argument("--branch", required=True)
-        finding.add_argument("--status", required=True, choices=("supported", "rejected", "inconclusive"))
-        finding.add_argument("--summary", required=True)
-        finding.add_argument("--evidence", required=True)
-        _add_session_args(finding)
+    prepare = commands.add_parser("race-prepare", help="select, materialize, and create the Root sandbox")
+    _selection_args(prepare)
+    prepare.add_argument("--docker", default="docker")
+    prepare.add_argument("--dry-run", action="store_true", help="prepare fresh state but do not start service/sandbox")
+
+    bootstrap = commands.add_parser("race-bootstrap", help="prepare all requested private native-worker lanes")
+    _selection_args(bootstrap)
+    group = bootstrap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--lanes-json")
+    group.add_argument("--lanes-file")
+    bootstrap.add_argument("--docker", default="docker")
+
+    confirm = commands.add_parser("race-spawn-confirm", help="record the native thread identity returned by Root")
+    confirm.add_argument("--run-id")
+    confirm.add_argument("--lane", required=True)
+    confirm.add_argument("--native-session", required=True)
+
+    endgame = commands.add_parser("race-endgame", help="prepare the single qualified post-minute-60 Sol max replacement")
+    endgame.add_argument("--run-id")
+    endgame.add_argument("--replaces-lane", required=True)
+    endgame.add_argument("--task", required=True)
+    endgame.add_argument("--attack-family", required=True)
+    endgame.add_argument("--docker", default="docker")
+
+    show = commands.add_parser("race-status", help="return mechanical progress, duplicate, and stagnation signals")
+    show.add_argument("--run-id")
+
+    stop = commands.add_parser("race-stop-confirm", help="confirm that Root interrupted one native child")
+    stop.add_argument("--run-id")
+    stop.add_argument("--lane", required=True)
+    stop.add_argument("--native-session", required=True)
+    stop.add_argument("--docker", default="docker")
+
+    end = commands.add_parser("race-end", help="mark timeout, handoff, or explicit stop and return cancel targets")
+    end.add_argument("--run-id")
+    end.add_argument("--reason", required=True, choices=("TIMED_OUT", "HANDOFF", "STOPPED"))
+
+    handoff = commands.add_parser("race-handoff", help="terminate the exact race and save one manual HANDOFF.md")
+    handoff.add_argument("--run-id")
+    handoff.add_argument("--markdown-file", required=True)
+
+    clean = commands.add_parser("race-cleanup", help="clean exact-run sandboxes/service after native stops")
+    clean.add_argument("--run-id")
+    clean.add_argument("--docker", default="docker")
+
+    sandbox_exec = commands.add_parser("sandbox-exec", help="execute one argv in an already prepared lane sandbox")
+    sandbox_exec.add_argument("--metadata", required=True)
+    sandbox_exec.add_argument("--timeout", type=int, default=300)
+    sandbox_exec.add_argument("--target-identity")
+    sandbox_exec.add_argument("argv", nargs=argparse.REMAINDER)
+
+    board = commands.add_parser("blackboard-add", help="append one claim backed by an existing execution receipt")
+    board.add_argument("--receipt", required=True)
+    board.add_argument("--type", required=True)
+    board.add_argument("--artifact")
+
+    session_open_parser = commands.add_parser("session-open")
+    session_open_parser.add_argument("--metadata", required=True)
+    session_open_parser.add_argument("--session", required=True)
+    session_open_parser.add_argument("--kind", required=True, choices=("shell", "remote", "debugger"))
+    session_open_parser.add_argument("--target-identity")
+    session_open_parser.add_argument("argv", nargs=argparse.REMAINDER)
+
+    session_send_parser = commands.add_parser("session-send")
+    session_send_parser.add_argument("--metadata", required=True)
+    session_send_parser.add_argument("--session", required=True)
+    session_send_parser.add_argument("--data", required=True)
+    session_send_parser.add_argument("--timeout", type=int, default=10)
+
+    session_read_parser = commands.add_parser("session-read")
+    session_read_parser.add_argument("--metadata", required=True)
+    session_read_parser.add_argument("--session", required=True)
+    session_read_parser.add_argument("--limit", type=int, default=65536)
+    session_read_parser.add_argument("--timeout", type=int, default=10)
+
+    session_close_parser = commands.add_parser("session-close")
+    session_close_parser.add_argument("--metadata", required=True)
+    session_close_parser.add_argument("--session", required=True)
+    session_close_parser.add_argument("--timeout", type=int, default=10)
+
+    session_list_parser = commands.add_parser("session-list")
+    session_list_parser.add_argument("--metadata", required=True)
+
+    tools = commands.add_parser("list-tools")
+    tools.add_argument("--metadata", required=True)
+    help_parser = commands.add_parser("tool-help")
+    help_parser.add_argument("name")
+    help_parser.add_argument("--metadata", required=True)
+    version = commands.add_parser("tool-version")
+    version.add_argument("name")
+    version.add_argument("--metadata", required=True)
+
+    doctor = commands.add_parser("doctor", help="pre-contest host/image diagnostics; never part of race-prepare")
+    doctor.add_argument("--docker", default="docker")
+    image_smoke = commands.add_parser("image-smoke", help="inspect all ten local category images")
+    image_smoke.add_argument("--docker", default="docker")
     return parser
 
 
-def _add_session_args(parser: argparse.ArgumentParser, *, default_role: str = "sol") -> None:
-    parser.add_argument("--session-id", default=os.environ.get("CTF_OS_SESSION_ID"))
-    parser.add_argument(
-        "--session-role", choices=("sol", "child"),
-        default=os.environ.get("CTF_OS_SESSION_ROLE", default_role),
-    )
-    parser.add_argument("--parent-session-id", default=os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main"))
-    parser.add_argument("--recover-stale", action="store_true")
-
-
-def _add_worker_packet_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model-profile", required=True, choices=GENERAL_MODEL_PROFILES)
-    parser.add_argument("--role", required=True)
-    task = parser.add_mutually_exclusive_group(required=True)
-    task.add_argument("--task")
-    task.add_argument("--task-file")
-    parser.add_argument("--context-mode", required=True, choices=("fresh", "directed"))
-    parser.add_argument("--facts-json")
-    parser.add_argument("--failure-command-json")
-    parser.add_argument("--failure-output")
-    parser.add_argument("--artifact")
-    parser.add_argument("--exact-blocker")
-
-
-def _worker_request(args: argparse.Namespace, *, root: Path) -> dict[str, object]:
-    task = getattr(args, "task", None)
-    task_file = getattr(args, "task_file", None)
-    if task_file:
-        path = Path(task_file)
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("--task-file must be a regular non-symlink file")
-        resolved = path.resolve()
-        if not any(resolved.is_relative_to(base) for base in (root.resolve(), Path("/tmp").resolve())):
-            raise ValueError("--task-file must stay under the repository or /tmp")
-        if path.stat().st_size > 16 * 1024:
-            raise ValueError("--task-file exceeds 16 KiB")
-        task = path.read_text(encoding="utf-8")
-    facts = _json_string_list(getattr(args, "facts_json", None), "--facts-json")
-    failure_command = _json_string_list(
-        getattr(args, "failure_command_json", None), "--failure-command-json",
-    )
-    return {
-        "model_profile": args.model_profile, "role": args.role, "task": task,
-        "context_mode": args.context_mode, "facts": facts,
-        "failure_command": failure_command, "failure_output": args.failure_output,
-        "artifact": args.artifact, "exact_blocker": args.exact_blocker,
-    }
-
-
-def _json_string_list(value: str | None, label: str) -> list[str]:
-    if not value:
-        return []
-    parsed = json.loads(value)
-    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
-        raise ValueError(f"{label} must contain a JSON array of strings")
-    return parsed
-
-
-def main(argv: list[str] | None = None) -> int:
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    direct_argv_commands = {"attack-event", "flag-found"}
-    separator = raw_argv.index("--") if "--" in raw_argv else -1
-    controls = raw_argv[:separator] if separator >= 0 else raw_argv
-    direct_command = next((name for name in direct_argv_commands if name in controls), None)
-    if separator >= 0 and direct_command is not None:
-        command_argv = raw_argv[separator + 1:]
-        args = parser.parse_args(controls)
-        args.argv = command_argv
-    else:
-        args = parser.parse_args(raw_argv)
-    root = Path(args.repo).resolve()
+    args = parser.parse_args(argv)
+    repo = Path(args.repo).resolve()
     try:
-        result = dispatch(root, args)
+        result = dispatch(args, repo)
     except Exception as exc:
-        payload: dict[str, object] = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
-        if isinstance(exc, SelectionError):
-            payload["candidates"] = list(exc.candidates)
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return 2
-    command_ok = not (
-        args.command == "doctor" and isinstance(result, dict) and result.get("ok") is False
-    )
-    print(json.dumps({"ok": command_ok, "result": result}, ensure_ascii=False, sort_keys=True))
-    return 0 if command_ok else 1
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
+    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
-def dispatch(root: Path, args: argparse.Namespace) -> object:
-    if args.command == "init-contest":
-        return initialize_contest(root, args.name)
-    if args.command == "doctor":
-        result = run_doctor(root)
-        if args.selector:
-            manifest = select_contest(discover_contests(root / "incoming"), args.contest)
-            challenge = resolve_session_challenge(root, manifest, args.selector)
-            selected = resolve_run_raw(
-                challenge_root(root, manifest, challenge), run_id=args.run_id,
-            )
-            result["selected_run"] = _doctor_selected_run(selected)
-        elif args.run_id:
-            raise ValueError("doctor run options require an exact challenge selector")
-        return result
-    if args.command == "sandbox-status":
-        return sandbox_status()
-    if args.command == "resource-status":
-        capacity = detect_capacity(workspace=root)
-        payload = capacity.to_dict()
-        if args.contest:
-            payload["contest"] = args.contest
-        return payload
-    if args.command == "sandbox-resize":
-        _require_sol(args, "Only the parent Sol session may apply sandbox resize operations.")
-        metadata = _load_metadata(root, args.metadata)
-        session_id, role = _caller(args, metadata=metadata)
-        _validate_resize_budget(metadata, args.cpus, args.memory, detect_capacity(workspace=root).to_dict())
-        try:
-            return resize(metadata, cpus=args.cpus, memory=args.memory, session_id=session_id, session_role=role)
-        except Exception as exc:
-            resource_ledger = ResourceLedger(Path(str(metadata["branch_root"])).parents[1])
-            if resource_ledger.state_path.exists():
-                resource_ledger.append_history(
-                    "RESIZE_FAILURE", str(metadata.get("session_id") or metadata.get("branch")),
-                    {"requested_cpus": args.cpus, "requested_memory": args.memory, "reason": str(exc)},
-                )
-            raise
-    if args.command == "sandbox-gc":
-        _require_sol(args, "Only the parent Sol session may garbage-collect managed sandboxes.")
-        expired = _cleanup_expired_timeout_retention(root, args.parent_session_id)
-        result = sandbox_gc()
-        result["expired_timeout_retention"] = expired
-        return result
-    if args.command == "inspect-contest":
-        sync_contest_manifest(root, args.contest)
-        contest = select_contest(discover_contests(root / "incoming"), args.contest)
-        return contest.to_dict()
-    if args.command == "intake":
-        from ..intake import run_intake
-
-        payload = run_intake(root, args.contest)
-        contest = payload["contest"]
+def dispatch(args: argparse.Namespace, repo: Path) -> Any:
+    if args.command == "race-prepare":
+        return _race_prepare(repo, args)
+    if args.command == "race-bootstrap":
+        return _race_bootstrap(repo, args)
+    if args.command == "race-spawn-confirm":
+        run = resolve_run(repo, args.run_id)
+        return confirm_native_spawn(run, lane_id=args.lane, native_session=args.native_session)
+    if args.command == "race-endgame":
+        return _race_endgame(repo, args)
+    if args.command == "race-status":
+        return race_status(resolve_run(repo, args.run_id))
+    if args.command == "race-stop-confirm":
+        run = resolve_run(repo, args.run_id)
+        lane = stop_confirmed(run, lane_id=args.lane, native_session=args.native_session)
+        metadata_path = run / "workers" / str(args.lane) / "sandbox.json"
+        if not metadata_path.is_file() or metadata_path.is_symlink():
+            raise ValueError("stopped lane has no safe private sandbox metadata to clean")
         return {
-            "contest": contest["name"], "summary": payload["summary"],
-            "index_path": str(root / "output" / contest["slug"] / "intake.json"),
-            "markdown_path": str(root / "output" / contest["slug"] / "INTAKE.md"),
-            "challenges": [
-                {"number": r["number"], "key": r["key"], "status": r["status"], "blockers": r["blockers"]}
-                for r in payload["challenges"]
-            ],
+            "lane": lane,
+            "sandbox_cleanup": cleanup(load_metadata(metadata_path), docker=args.docker),
+            "artifacts_preserved": str(run / "workers" / str(args.lane) / "artifacts"),
         }
-    if args.command == "triage-prepare":
-        return prepare_triage(root, args.contest)
-    if args.command == "triage-finalize":
-        try:
-            assessments = json.loads(args.assessments_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError("--assessments-json must be valid JSON") from exc
-        return finalize_triage(root, args.contest, assessments)
+    if args.command == "race-end":
+        return terminate(resolve_run(repo, args.run_id), reason=args.reason)
+    if args.command == "race-handoff":
+        return _race_handoff(repo, args)
+    if args.command == "race-cleanup":
+        return _race_cleanup(repo, args)
     if args.command == "sandbox-exec":
-        misplaced = {
-            "--timeout", "--timeout-profile", "--session-id", "--session-role",
-            "--parent-session-id", "--recover-stale", "--metadata",
-            "--retain-on-timeout", "--no-retain-on-timeout",
-        }
-        if any(token in misplaced for token in args.argv):
-            raise ValueError(
-                "Invalid sandbox-exec option placement. Place --timeout-profile, --session-id, "
-                "and other CTF-OS options before `--`. Everything after `--` is the container command."
-            )
-        raw_command = list(args.argv)
-        metadata_path = args.metadata_option
-        if metadata_path is None and raw_command and raw_command[0] != "--":
-            metadata_path = raw_command.pop(0)  # backward-compatible positional metadata
-        if not metadata_path:
-            raise ValueError("sandbox-exec requires --metadata before `--`")
-        metadata = _load_metadata(root, metadata_path)
-        execution_state = json.loads((Path(str(metadata["branch_root"])).parents[1] / "STATE.json").read_text(encoding="utf-8"))
-        if execution_state.get("sealed"):
-            raise ValueError("sealed run is immutable; only terminal cleanup is allowed")
-        command = raw_command
-        if command and command[0] == "--":
-            command.pop(0)
-        session_id, role = _caller(args, metadata=metadata)
-        timeout = timeout_seconds(args.timeout_profile) if args.timeout_profile else args.timeout
-        result = execute(
-            metadata, command, timeout, session_id=session_id, session_role=role,
-            timeout_profile=args.timeout_profile, retain_on_timeout=args.retain_on_timeout,
+        return _sandbox_exec(Path(args.metadata), args)
+    if args.command == "blackboard-add":
+        return _blackboard_add(Path(args.receipt), args)
+    if args.command == "session-open":
+        metadata = load_metadata(Path(args.metadata))
+        _attack_timeout(metadata, 30)
+        return open_session(
+            metadata, session_id=args.session, kind=args.kind,
+            command=_optional_remainder(args.argv), target_identity=args.target_identity,
         )
-        result["attack_event"] = record_command_after_execution(
-            Path(str(metadata["branch_root"])).parents[1],
-            lane_id=str(metadata.get("branch") or session_id), command=command, result=result,
+    if args.command == "session-send":
+        metadata = load_metadata(Path(args.metadata))
+        return session_send(
+            metadata, session_id=args.session, data=args.data,
+            timeout=_attack_timeout(metadata, args.timeout),
         )
-        return result
-    if args.command == "sandbox-cleanup":
-        metadata = _load_metadata(root, args.metadata)
-        session_id, role = _caller(args, metadata=metadata)
-        result = cleanup(metadata, session_id=session_id, session_role=role)
-        result["challenge_secrets_cleanup"] = remove_challenge_secrets(Path(str(metadata["branch_root"])))
-        return result
-    if args.command == "sandbox-export":
-        metadata = _load_metadata(root, args.metadata)
-        session_id, role = _caller(args, metadata=metadata)
-        return export_artifacts(metadata, session_id=session_id, session_role=role)
-
-    if args.command == "prepare-challenge":
-        if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
-            raise ValueError(
-                "DENIED_CONTROLLER_ACTION: only Root may prepare a challenge and bootstrap its sandbox"
-            )
-        if args.resume_run_id and (
-            args.fresh_attempt or args.attempt_id or args.transformation_seed
-        ):
-            raise ValueError("--resume-run-id conflicts with fresh-attempt identity options")
-        manifest, challenge, record = _prepare_challenge_same_session(
-            root, args.contest, args.selector, args.session_input_json,
+    if args.command == "session-read":
+        return _session_read(Path(args.metadata), args)
+    if args.command == "session-close":
+        return close_session(
+            load_metadata(Path(args.metadata)), session_id=args.session, timeout=args.timeout,
         )
-        workspace = challenge_root(root, manifest, challenge)
-        solve_root = (
-            resume_attempt(workspace, run_id=args.resume_run_id)
-            if args.resume_run_id else
-            initialize_solve_files(
-                workspace, challenge, str(record["source_fingerprint"]),
-                fresh_attempt=args.fresh_attempt, attempt_id=args.attempt_id,
-                transformation_seed=args.transformation_seed,
-            )
-        )
-        parent_session_id = os.environ.get("CTF_OS_PARENT_SESSION_ID", "sol-main")
-        swarm = initialize_swarm(
-            solve_root, challenge=challenge, record=record,
-            root_session=parent_session_id,
-        )
-        root_sandbox = _prepare_root_sandbox(
-            root=root, manifest=manifest, challenge=challenge, record=record,
-            workspace=workspace, solve_root=solve_root,
-            parent_session_id=parent_session_id, enabled=bool(args.auto_sandbox),
-        )
-        launch_state = json.loads((solve_root / "STATE.json").read_text(encoding="utf-8"))
-        launch_context = build_solve_launch_context(challenge, record)
-        launch_context["run_id"] = launch_state.get("run_id")
-        launch_context["attempt_id"] = launch_state.get("attempt_id")
-        launch_context["challenge_instance_id"] = launch_state.get("challenge_instance_id")
-        launch_context["target_revision"] = launch_state.get("target_revision")
-        launch_context["execution_environment"] = root_sandbox
-        launch_context["root_lane"]["sandbox_status"] = root_sandbox["status"]
-        launch_context["root_lane"]["sandbox_metadata_path"] = root_sandbox.get("metadata_path")
-        launch_path = save_solve_launch_context(solve_root, launch_context)
-        compatibility_launch_path = save_solve_launch_context(workspace, launch_context)
-        prepared = _compact_prepare(challenge, record, solve_root, launch_context, compatibility_launch_path)
-        prepared["authoritative_solve_launch_path"] = str(launch_path)
-        prepared["attempt_id"] = launch_state.get("attempt_id")
-        prepared["challenge_instance_id"] = launch_state.get("challenge_instance_id")
-        prepared["solve_engine"] = "first-to-flag"
-        prepared["swarm"] = swarm
-        prepared["root_sandbox"] = root_sandbox
-        return prepared
-
-    if args.command == "attempt-start":
-        _require_sol(args, "Only Sol may start a fresh attempt.")
-        manifest, challenge, record = _prepare_challenge_same_session(
-            root, args.contest, args.selector, None,
-        )
-        workspace = challenge_root(root, manifest, challenge)
-        run = start_fresh_attempt(
-            workspace, challenge, str(record["source_fingerprint"]),
-            attempt_id=args.attempt_id, transformation_seed=args.transformation_seed,
-        )
-        return show_attempt(run, run_id=run.name)
-
-    if args.command in {"attempt-resume", "attempt-list", "attempt-show"}:
-        _require_sol(args, "Only Sol may resolve prior attempts.")
-        manifest, challenge, _record = _load_challenge_strict(root, args.contest, args.selector)
-        workspace = challenge_root(root, manifest, challenge)
-        if args.command == "attempt-list":
-            return {"attempts": list_attempts(workspace)}
-        if args.command == "attempt-show":
-            return show_attempt(workspace, run_id=args.run_id)
-        run = resume_attempt(workspace, run_id=args.run_id)
-        return show_attempt(run, run_id=run.name)
-
-    if args.command == "claude-handoff-save":
-        _require_sol(args, "Only the current parent Sol session may save a Claude handoff.")
-        manifest = select_contest(discover_contests(root / "incoming"), args.contest)
-        challenge = resolve_session_challenge(root, manifest, args.selector)
-        workspace = challenge_root(root, manifest, challenge)
-        current = resolve_active_run(workspace, migrate=False)
-        run = resolve_exact_run(workspace, args.run_id)
-        if current != run:
-            raise ValueError("requested run_id is not the current exact run")
-        run_manifest_path = run / "RUN_MANIFEST.json"
-        if run_manifest_path.is_symlink() or not run_manifest_path.is_file():
-            raise ValueError("current run manifest is missing or unsafe")
-        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
-        run_challenge = run_manifest.get("challenge")
-        if (
-            not isinstance(run_challenge, dict)
-            or run_manifest.get("run_id") != args.run_id
-            or run_challenge.get("challenge_id") != challenge.id
-        ):
-            raise ValueError("current run manifest does not match the selected challenge/run")
-        path = save_handoff(
-            root, contest=manifest.slug, challenge=challenge.id,
-            markdown_file=Path(args.markdown_file),
-        )
-        termination = terminate_for_handoff(run)
-        return {
-            "contest": manifest.slug, "challenge": challenge.id,
-            "run_id": run.name, "path": str(path),
-            "relative_path": str(path.relative_to(root)),
-            "termination": termination,
-        }
-
-    manifest, challenge, record = _load_challenge_strict(root, args.contest, args.selector)
-    if os.environ.get("CTF_OS_SESSION_ROLE") == "child":
-        if (
-            os.environ.get("CTF_OS_CHALLENGE_ID") != challenge.id
-            or os.environ.get("CTF_OS_CONTEST_SLUG") != manifest.slug
-        ):
-            raise ValueError("DENIED_CHALLENGE_SCOPE: child session may access only its assigned challenge")
-    current_fingerprint = str(record["source_fingerprint"])
-    workspace = challenge_root(root, manifest, challenge)
-    solve_root = initialize_solve_files(workspace, challenge, current_fingerprint)
-    if args.command == "repair-run":
-        _require_sol(args, "Only Root may repair the exact run state.")
-        selected = solve_root if not args.run_id else safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
-        if selected.is_symlink() or not selected.is_dir():
-            raise ValueError("repair run does not exist in this challenge workspace")
-        return {"run_id": selected.name, "state": recover_run_state(selected, force=True)}
-    ledger = ResourceLedger(solve_root)
-    if args.command == "resource-request":
-        session_id, role = _caller(args)
-        inferred = infer_workload(
-            command=args.workload_commands,
-            files=[str(item.get("path", "")) for item in record.get("files", []) if isinstance(item, dict)],
-            role=session_id, category=challenge.category, override=args.workload_class,
-        )
-        overrides = _resource_overrides(args)
-        request = default_request(
-            contest=manifest.slug, challenge_id=challenge.id, session_id=session_id,
-            workload_class=str(inferred["workload_class"]), priority=args.priority,
-            input_bytes=prepared_input_bytes(record), gpu_required=args.gpu_required,
-            gpu_preferred=True if args.gpu_preferred else None, overrides=overrides,
-        )
-        return ledger.request(request, actor_session_id=session_id, actor_role=role, inference=inferred)
-    if args.command == "resource-update":
-        session_id, role = _caller(args)
-        progress = None
-        if args.progress_json:
-            progress = json.loads(args.progress_json)
-            if not isinstance(progress, dict):
-                raise ValueError("--progress-json must contain an object")
-        result = ledger.update(session_id, actor_session_id=session_id, actor_role=role, changes={
-            "priority": args.priority, "workload_class": args.workload_class,
-            "parallelizable": args.parallelizable, "progress": progress, "state": args.state,
-        })
-        return result
-    if args.command == "resource-release":
-        session_id, role = _caller(args)
-        if role == "child" and session_id != os.environ.get("CTF_OS_SESSION_ID"):
-            raise ValueError("child may release only its own resource request")
-        return ledger.release(
-            session_id, args.reason, actor_session_id=session_id, actor_role=role,
-        )
-    if args.command == "resource-history":
-        session_id, role = _caller(args)
-        rows = ledger.history(args.limit)
-        if role == "child":
-            rows = [row for row in rows if row.get("session_id") == session_id]
-        return {"history": rows}
-    if args.command == "resource-sample":
-        session_id, role = _caller(args)
-        if args.sample_json:
-            sample = json.loads(args.sample_json)
-            if not isinstance(sample, dict):
-                raise ValueError("--sample-json must contain an object")
-        else:
-            metadata = _load_metadata(root, args.metadata) if args.metadata else None
-            if role == "child" and metadata is not None and metadata.get("session_id") != session_id:
-                raise ValueError("child may sample only its own sandbox")
-            samples = sample_docker_stats()["samples"]
-            container = str(metadata.get("name")) if metadata else ""
-            sample = next((row for row in samples if row.get("container") == container), None)
-            if sample is None:
-                raise ValueError("no Docker utilization sample found for the requested sandbox")
-        observation = ledger.sample(session_id, sample)
-        return observation
-    if args.command in {"resource-plan", "scheduler-rebalance"}:
-        _require_sol(args, "Only the parent Sol session may plan or apply global allocations.")
-        capacity = detect_capacity(workspace=root)
-        plan = (
-            ledger.plan(capacity)
-            if args.command == "resource-plan"
-            else ledger.rebalance(capacity)
-        )
-        if args.command == "scheduler-rebalance" and args.apply:
-            plan["applied_resizes"] = _apply_resize_plan(root, solve_root, plan, args)
-            ledger.reconcile_apply(plan, plan["applied_resizes"])
-        elif args.command == "scheduler-rebalance":
-            plan["apply_required"] = True
-        return plan
-    if args.command.startswith("service-"):
-        spec = _service_spec(manifest, challenge, record, solve_root)
-        actor = _service_actor(args)
-        operation = {
-            "service-plan": service_plan, "service-build": service_build,
-            "service-start": service_start, "service-restart": service_restart,
-            "service-status": service_status, "service-logs": service_logs,
-            "service-inspect": service_inspect, "service-stop": service_stop,
-            "service-cleanup": service_cleanup,
-        }[args.command]
-        return operation(spec) if args.command == "service-plan" else operation(spec, actor=actor)
-    if args.command.startswith("branch-service-"):
-        session_id, role = _caller(args, branch=args.branch)
-        if session_id != args.branch and role == "child":
-            raise ValueError("DENIED_SERVICE_LIFECYCLE: child may operate only its own branch-private service")
-        spec = _service_spec(manifest, challenge, record, solve_root, branch_id=args.branch)
-        actor = ServiceActor(
-            session_id=session_id, role=role, parent_session_id=args.parent_session_id,
-            recover_stale=bool(args.recover_stale),
-        )
-        operation = {
-            "branch-service-plan": service_plan, "branch-service-build": service_build,
-            "branch-service-start": service_start, "branch-service-restart": service_restart,
-            "branch-service-reset": service_reset,
-            "branch-service-status": service_status, "branch-service-logs": service_logs,
-            "branch-service-inspect": service_inspect, "branch-service-stop": service_stop,
-            "branch-service-cleanup": service_cleanup,
-        }[args.command]
-        return operation(spec) if args.command == "branch-service-plan" else operation(spec, actor=actor)
-    if args.command == "worker-status":
-        _require_sol(args, "Only Root may inspect all native worker status.")
-        return worker_status(solve_root)
-    if args.command == "attack-events-show":
-        return {"events": high_value_events(solve_root, since=args.since)}
-    if args.command == "attack-event":
-        session_id, role = _caller(args)
-        if role == "child" and session_id != args.lane:
-            raise ValueError("DENIED_SESSION_IDENTITY: child may write only its own lane")
-        argv = list(args.argv)
-        if argv and argv[0] == "--":
-            argv.pop(0)
-        return record_attack_event(
-            solve_root, lane_id=args.lane, event_type=args.type, summary=args.summary,
-            command=argv, artifact=args.artifact, observed_output=args.observed_output,
-            next_attack=args.next_attack,
-        )
-    if args.command == "worker-spawn-packet":
-        _require_sol(args, "Only Root may prepare a native child packet.")
-        return create_worker_packet(solve_root, **_worker_request(args, root=root))
-    if args.command == "worker-spawn-confirm":
-        _require_sol(args, "Only Root may confirm native child start.")
-        return confirm_native_spawn(
-            solve_root, lane_id=args.lane, native_session=args.native_session,
-            operation_id=args.operation_id,
-        )
-    if args.command == "worker-spawn-failed":
-        _require_sol(args, "Only Root may record native child start failure.")
-        return record_spawn_failure(solve_root, lane_id=args.lane, error=args.error)
-    if args.command == "worker-replace":
-        _require_sol(args, "Only Root may replace a native worker.")
-        return replace_worker(
-            solve_root, lane_id=args.lane, reason=args.reason,
-            native_stop_session=args.native_stop_session, **_worker_request(args, root=root),
-        )
-    if args.command == "worker-endgame":
-        _require_sol(args, "Only Root may promote a bounded Sol max endgame worker.")
-        return start_max_endgame(
-            solve_root, lane_id=args.lane, native_stop_session=args.native_stop_session,
-        )
-    if args.command == "worker-stop-confirm":
-        _require_sol(args, "Only Root may confirm native child stop.")
-        return stop_confirmed(
-            solve_root, lane_id=args.lane, native_session=args.native_session,
-        )
-    if args.command == "flag-found":
-        _require_sol(args, "Only Root may judge and display a flag candidate.")
-        argv = list(args.argv)
-        if argv and argv[0] == "--":
-            argv.pop(0)
-        return flag_found(
-            solve_root, lane_id=args.lane, candidate=args.candidate,
-            flag_pattern=challenge.flag_pattern, challenge_key=challenge.key,
-            command=argv, observed_output=args.observed_output,
-            artifact=args.artifact, source=args.source,
-        )
-    if args.command == "oast-create":
-        session_id, role = _caller(args, branch=args.branch)
-        if role == "child" and session_id != args.branch:
-            raise ValueError("DENIED_CHALLENGE_SCOPE: child may create OAST only for its own branch")
-        return create_oast(
-            solve_root, challenge_id=challenge.id, input_fingerprint=current_fingerprint,
-            branch_id=args.branch, provider_base=args.provider_url,
-        )
-    if args.command == "oast-poll":
-        return poll_oast(solve_root, oast_id=args.oast_id, input_fingerprint=current_fingerprint)
-    if args.command == "oast-events":
-        return {"events": oast_events(solve_root, oast_id=args.oast_id, input_fingerprint=current_fingerprint)}
-    if args.command == "submission-result":
-        _require_sol(args, "Only Root may record the human submission result.")
-        terminal_run = safe_under(challenge_workspace(solve_root) / "runs", Path(args.run_id))
-        if terminal_run.is_symlink() or not terminal_run.is_dir():
-            raise ValueError("submission run does not exist in this challenge workspace")
-        return record_swarm_submission_result(
-            terminal_run, candidate=args.candidate, result=args.result,
-        )
-    if args.command == "replay":
-        _require_sol(args, "Only the parent Sol session may make the final replay judgment.")
-        return run_replay(root, manifest, challenge, record, service_actor=_service_actor(args))
-    if args.command == "sandbox-create":
-        branch_root = solve_root / "workers" / args.branch
-        session_id, session_role = _caller(args, branch=args.branch)
-        return _create_sandbox_runtime(
-            repo_root=root, manifest=manifest, challenge=challenge, record=record,
-            workspace=workspace, solve_root=solve_root, branch=args.branch,
-            branch_root=branch_root, session_id=session_id,
-            parent_session_id=args.parent_session_id, session_role=session_role,
-            image_override=args.image, resource_profile_override=args.resource_profile,
-            require_service=bool(args.service),
-            service_actor=_service_actor(args, child_default=True),
-            run_id=solve_root.name,
-        )
-    if args.command == "record-finding":
-        _require_sol(args, "Only Root may append shared findings.")
-        return append_finding(solve_root, args.branch, args.summary, args.evidence, args.status)
-    raise ValueError(f"unsupported internal command: {args.command}")
+    if args.command == "session-list":
+        return list_sessions(load_metadata(Path(args.metadata)))
+    if args.command == "list-tools":
+        return list_tools(str(load_metadata(Path(args.metadata))["category"]))
+    if args.command == "tool-help":
+        metadata = load_metadata(Path(args.metadata))
+        return tool_help(str(metadata["category"]), args.name)
+    if args.command == "tool-version":
+        metadata = load_metadata(Path(args.metadata))
+        _attack_timeout(metadata, 20)
+        return tool_version(metadata, args.name)
+    if args.command == "doctor":
+        return run_doctor(repo, docker=args.docker)
+    if args.command == "image-smoke":
+        return smoke_images(docker=args.docker)
+    raise ValueError(f"unsupported command: {args.command}")
 
 
-def _service_spec(
-    manifest, challenge, record: dict[str, object], solve_root: Path,
-    *, branch_id: str | None = None,
-) -> ServiceSpec:
-    plan = record.get("service_plan")
-    if not isinstance(plan, dict) or not plan.get("kind"):
-        raise ValueError("challenge preparation found no Dockerfile/Compose service plan")
-    return ServiceSpec(
-        contest_slug=manifest.slug, challenge_id=challenge.id,
-        source=challenge_workspace(solve_root) / "input", workspace=solve_root, service_plan=plan,
-        branch_id=branch_id,
+def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    selected_at = utc_now()
+    manifest, challenge = _select(repo, args.contest, args.selector)
+    fingerprint = input_fingerprint(manifest, challenge)
+    run, run_manifest = create_run(
+        repo, manifest, challenge, input_fingerprint=fingerprint, now=selected_at
     )
-
-
-def _resource_overrides(args: argparse.Namespace) -> dict[str, object]:
-    mapping = {
-        "min_cpus": args.min_cpus, "preferred_cpus": args.preferred_cpus, "max_cpus": args.max_cpus,
-        "min_memory_bytes": parse_bytes(args.min_memory) if args.min_memory else None,
-        "preferred_memory_bytes": parse_bytes(args.preferred_memory) if args.preferred_memory else None,
-        "max_memory_bytes": parse_bytes(args.max_memory) if args.max_memory else None,
-        "storage_bytes": parse_bytes(args.storage) if args.storage else None,
-        "gpu_memory_bytes": parse_bytes(args.gpu_memory) if args.gpu_memory else None,
-        "parallelizable": args.parallelizable, "elastic": args.elastic, "preemptible": args.preemptible,
-    }
-    return {key: value for key, value in mapping.items() if value is not None}
-
-
-def _validate_resize_budget(metadata: dict[str, object], cpus: float | None, memory: str | None, capacity: dict[str, object]) -> None:
-    resources = metadata.get("resources") if isinstance(metadata.get("resources"), dict) else {}
-    current_cpus = float(resources.get("cpus") or 0)
-    current_memory = parse_bytes(resources.get("memory") or 0)
-    desired_cpus = cpus if cpus is not None else current_cpus
-    desired_memory = parse_bytes(memory) if memory is not None else current_memory
-    cpu = capacity.get("cpu") if isinstance(capacity.get("cpu"), dict) else {}
-    ram = capacity.get("memory") if isinstance(capacity.get("memory"), dict) else {}
-    projected_cpu = float(cpu.get("reserved", 0)) - current_cpus + desired_cpus
-    projected_memory = int(ram.get("reserved_bytes", 0)) - current_memory + desired_memory
-    if projected_cpu > float(cpu.get("usable", 0)) + 1e-9:
-        raise ValueError("sandbox resize would invade the host CPU reserve")
-    if projected_memory > int(ram.get("usable_bytes", 0)):
-        raise ValueError("sandbox resize would invade the host memory reserve")
-
-
-def _apply_resize_plan(root: Path, solve_root: Path, plan: dict[str, object], args: argparse.Namespace) -> list[dict[str, object]]:
-    results = []
-    for action in plan.get("resize_actions", []):
-        if not isinstance(action, dict) or action.get("action") != "RESIZE":
-            continue
-        session_id = str(action.get("session_id", ""))
-        metadata_path = solve_root / "workers" / session_id / "sandbox.json"
-        if not metadata_path.is_file():
-            results.append({"session_id": session_id, "applied": False, "reason": "sandbox metadata not found"})
-            continue
-        try:
-            metadata = _load_metadata(root, str(metadata_path))
-            target = action.get("to") if isinstance(action.get("to"), dict) else {}
-            receipt = resize(
-                metadata, cpus=float(target["cpus"]), memory=int(target["memory_bytes"]),
-                session_id=str(getattr(args, "parent_session_id", "sol-main")), session_role="sol",
-            )
-        except Exception as exc:
-            results.append({"session_id": session_id, "applied": False, "reason": str(exc)})
-        else:
-            results.append({"session_id": session_id, "applied": True, "receipt": receipt})
-    return results
-
-
-def _cleanup_released_sandboxes(root: Path, solve_root: Path, plan: dict[str, object], parent_session_id: str) -> list[dict[str, object]]:
-    results = []
-    for released in plan.get("released", []):
-        if not isinstance(released, dict) or not released.get("session_id"):
-            continue
-        session_id = str(released["session_id"])
-        metadata_path = solve_root / "workers" / session_id / "sandbox.json"
-        if not metadata_path.is_file():
-            results.append({"session_id": session_id, "reclaimed": True, "reason": "no running sandbox metadata"})
-            continue
-        try:
-            metadata = _load_metadata(root, str(metadata_path))
-            cleanup_receipt = cleanup(metadata, session_id=parent_session_id, session_role="sol")
-        except Exception as exc:
-            results.append({"session_id": session_id, "reclaimed": False, "reason": str(exc), "recommendation": "Sol should export and clean this sandbox manually"})
-        else:
-            results.append({"session_id": session_id, "reclaimed": True, "receipt": cleanup_receipt})
-    return results
-
-
-def _caller(
-    args: argparse.Namespace, *, metadata: dict[str, object] | None = None, branch: str | None = None,
-) -> tuple[str, str]:
-    role = str(getattr(args, "session_role", "sol"))
-    configured = getattr(args, "session_id", None)
-    environment_role = os.environ.get("CTF_OS_SESSION_ROLE")
-    if environment_role == "child":
-        environment_id = os.environ.get("CTF_OS_SESSION_ID")
-        if role != "child" or not environment_id or configured != environment_id:
-            raise ValueError("DENIED_SESSION_IDENTITY: child session identity cannot be overridden")
-        return environment_id, "child"
-    if configured:
-        session_id = str(configured)
-    elif role == "child":
-        if not branch:
-            raise ValueError("child session calls require --session-id")
-        session_id = branch
-    else:
-        session_id = str(getattr(args, "parent_session_id", "sol-main"))
-    return session_id, role
-
-
-def _service_actor(args: argparse.Namespace, *, child_default: bool = False) -> ServiceActor:
-    role = str(getattr(args, "session_role", "sol"))
-    if child_default and getattr(args, "session_id", None) is None and role == "child" and not os.environ.get("CTF_OS_SESSION_ROLE"):
-        session_id = "sandbox-bootstrap"
-    else:
-        session_id, role = _caller(args)
-    return ServiceActor(
-        session_id=session_id, role=role, parent_session_id=str(args.parent_session_id),
-        recover_stale=bool(getattr(args, "recover_stale", False)),
-    )
-
-
-def _require_sol(args: argparse.Namespace, message: str) -> None:
-    session_id, role = _caller(args)
-    if role != "sol" or session_id != str(args.parent_session_id):
-        raise ValueError(f"DENIED_CONTROLLER_ACTION: {message}")
-
-
-def _create_sandbox_runtime(
-    *, repo_root: Path, manifest, challenge, record: dict[str, object],
-    workspace: Path, solve_root: Path, branch: str, branch_root: Path,
-    session_id: str, parent_session_id: str, session_role: str,
-    image_override: str | None, resource_profile_override: str | None,
-    require_service: bool, service_actor: ServiceActor, run_id: str | None,
-) -> dict[str, object]:
-    """Prepare and start a sandbox through the single shared lifecycle path."""
-
-    prepared = prepare_sandbox_spec(
-        repo_root=repo_root, manifest=manifest, challenge=challenge, record=record,
-        workspace=workspace, solve_root=solve_root, branch=branch,
-        branch_root=branch_root, session_id=session_id,
-        parent_session_id=parent_session_id, session_role=session_role,
-        image_override=image_override, resource_profile_override=resource_profile_override,
-        require_service=require_service, run_id=run_id,
-        prepared_fingerprint_reader=prepared_tree_fingerprint,
-        service_inspector=service_inspect, service_actor=service_actor,
-    )
-    spec = prepared.spec
-    guard = (
-        service_attachment(
-            prepared.attachment_service,
-            actor=ServiceActor(
-                parent_session_id, role="sol", parent_session_id=parent_session_id,
-            ),
-        )
-        if prepared.attachment_service is not None else nullcontext()
-    )
-    with guard:
-        metadata = create(spec)
-        try:
-            if spec.service_network:
-                metadata["connectivity_probe"] = probe_service_connectivity(metadata)
-                atomic_json(Path(str(metadata["metadata_path"])), metadata)
-        except Exception:
-            cleanup(metadata)
-            raise
-    return metadata
-
-
-def _prepare_root_sandbox(
-    *, root: Path, manifest, challenge, record: dict[str, object],
-    workspace: Path, solve_root: Path, parent_session_id: str, enabled: bool,
-) -> dict[str, object]:
-    """Create or reuse the Root lane sandbox, with an explicit local-image fallback."""
-
-    receipt_path = solve_root / "ROOT-SANDBOX.json"
-    branch = "root"
-    branch_root = solve_root / "workers" / branch
-    metadata_path = branch_root / "sandbox.json"
-    recommended = str(record.get("recommended_image") or "ctf-os-sandbox:base")
-    service_plan = record.get("service_plan")
-    managed_service = (
-        isinstance(service_plan, dict)
-        and service_plan.get("kind") in {"dockerfile", "compose"}
-    )
-    manual_command = [
-        sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root),
-        "sandbox-create", str(challenge.key), "--contest", str(manifest.slug),
-        "--branch", branch, "--session-role", "sol",
-        "--parent-session-id", parent_session_id,
-        *(["--service"] if managed_service else []),
-    ]
-
-    def persist(payload: dict[str, object]) -> dict[str, object]:
-        payload = {"schema_version": 1, "receipt_path": str(receipt_path), **payload}
-        atomic_json(receipt_path, payload)
-        return payload
-
-    if not enabled:
-        return persist({
-            "status": "DISABLED", "mode": "manual", "automatic": False,
-            "recommended_image": recommended, "selected_image": None,
-            "fallback_used": False, "manual_create_command": manual_command,
-        })
-
-    if metadata_path.is_file() and not metadata_path.is_symlink():
-        try:
-            existing = _load_metadata(root, str(metadata_path))
-            runtime = inspect_sandbox_runtime(existing)
-        except Exception as exc:
-            return persist({
-                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
-                "recommended_image": recommended, "selected_image": None,
-                "fallback_used": False,
-                "reason": f"existing Root sandbox metadata is unusable: {exc}"[:1000],
-                "manual_create_command": manual_command,
-            })
-        if runtime.get("exists") and runtime.get("running") and runtime.get("owned"):
-            prior = None
-            if receipt_path.is_file() and not receipt_path.is_symlink():
-                try:
-                    prior = json.loads(receipt_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    prior = None
-            if isinstance(prior, dict) and prior.get("status") == "READY":
-                return prior
-            selected = str(existing.get("image") or recommended)
-            return persist(_ready_root_sandbox_receipt(
-                root=root, metadata=existing, recommended=recommended,
-                selected=selected, fallback_used=selected != recommended,
-                image_selection={"status": "RUNNING_SANDBOX_REUSED", "checks": []},
-                resource_profile=str(existing.get("resource_profile") or "standard"),
-                resource_fallback_used=False,
-            ))
-        if runtime.get("exists") and not runtime.get("owned"):
-            return persist({
-                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
-                "recommended_image": recommended, "selected_image": None,
-                "fallback_used": False,
-                "reason": str(runtime.get("reason") or "existing container is not CTF-OS-owned")[:1000],
-                "manual_create_command": manual_command,
-            })
-
-    selection = select_local_sandbox_image(recommended)
-    selected = selection.get("selected_image")
-    if not isinstance(selected, str) or not selected:
-        runtime_failure = next((
-            check for check in selection.get("checks", [])
-            if isinstance(check, dict) and check.get("runtime_available") is False
-        ), None)
-        profile = recommended.rsplit(":", 1)[-1]
-        profiles = [profile] if profile == "base" else [profile, "base"]
-        unavailable = {
-            "status": "UNAVAILABLE", "mode": "unavailable", "automatic": True,
-            "recommended_image": recommended, "selected_image": None,
-            "fallback_used": False, "image_selection": selection,
-            "manual_create_command": manual_command,
-        }
-        if runtime_failure is not None:
-            unavailable.update({
-                "reason": f"Docker runtime is unavailable: {runtime_failure.get('reason', 'inspect failed')}"[:1000],
-                "recovery_command": [
-                    sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root), "doctor",
-                ],
-            })
-        else:
-            unavailable.update({
-                "reason": "neither the recommended image nor ctf-os-sandbox:base is locally available",
-                "build_command": ["bash", str(root / "sandbox" / "build-images.sh"), *profiles],
-            })
-        return persist(unavailable)
-
-    selected_manual_command = [*manual_command, "--image", selected]
-
-    if metadata_path.is_file() and not metadata_path.is_symlink():
-        try:
-            stale = _load_metadata(root, str(metadata_path))
-            cleanup(stale, session_id=parent_session_id, session_role="sol")
-        except Exception as exc:
-            return persist({
-                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
-                "recommended_image": recommended, "selected_image": selected,
-                "fallback_used": bool(selection.get("fallback_used")),
-                "image_selection": selection,
-                "reason": f"stale Root sandbox cleanup failed: {exc}"[:1000],
-                "manual_create_command": selected_manual_command,
-            })
-
-    recommended_profile = str(record.get("recommended_resource_profile") or "standard")
-    selected_profile = recommended_profile
-    initial_failure: str | None = None
     try:
-        metadata = _create_sandbox_runtime(
-            repo_root=root, manifest=manifest, challenge=challenge, record=record,
-            workspace=workspace, solve_root=solve_root, branch=branch,
-            branch_root=branch_root, session_id=parent_session_id,
-            parent_session_id=parent_session_id, session_role="sol",
-            image_override=selected, resource_profile_override=None,
-            require_service=managed_service,
-            service_actor=ServiceActor(
-                parent_session_id, role="sol", parent_session_id=parent_session_id,
-            ),
-            run_id=solve_root.name,
+        input_record = prepare_input(
+            manifest, challenge, run, expected_fingerprint=fingerprint
         )
+    except Exception:
+        clear_active(repo, run_id=run.name)
+        raise
+    input_ready_at = utc_now()
+    image = select_image(challenge.category, docker=args.docker)
+    service: dict[str, Any] = {
+        "status": "NOT_PREPARED", "network": None, "endpoints": [], "lifecycle_owner": "root",
+    }
+    race = initialize_race(
+        run,
+        run_manifest=run_manifest,
+        input_record=input_record,
+        image=image,
+        service=service,
+        selected_at=selected_at,
+        input_ready_at=input_ready_at,
+    )
+    if args.dry_run:
+        mark_prepare_failed(run, "dry-run requested; no service or sandbox was started")
+        clear_active(repo, run_id=run.name)
+        return _prepare_result(run, input_record, image, service, load_race(run), dry_run=True)
+    if not image["image_available"]:
+        mark_prepare_failed(run, str(image["reason"]))
+        clear_active(repo, run_id=run.name)
+        return _prepare_result(run, input_record, image, service, load_race(run))
+    root_sandbox: dict[str, Any] | None = None
+    try:
+        service_spec = ServiceSpec(
+            run_id=run.name,
+            challenge_id=challenge.id,
+            source=run / "input",
+            run_root=run,
+            plan=input_record["service_plan"],
+        )
+        service = prepare_service(
+            service_spec, actor=ServiceActor(lane_id="root", role="root"), docker=args.docker
+        )
+        set_service_context(run, service)
+        targets = () if service.get("status") == "READY" else resolve_targets(parse_remotes(challenge.remotes))
+        root_sandbox = create(SandboxSpec(
+            run_id=run.name,
+            contest_slug=manifest.slug,
+            challenge_id=challenge.id,
+            category=challenge.category,
+            lane_id="root",
+            source=run / "input",
+            lane_root=run / "workers" / "root",
+            input_fingerprint=fingerprint,
+            image=str(image["selected_image"]),
+            targets=targets,
+            service_network=str(service["network"]) if service.get("status") == "READY" else None,
+            service_endpoints=tuple(str(value) for value in service.get("endpoints", [])),
+            resource_profile=_resource_profile(input_record),
+            race_lane_count=0,
+        ), docker=args.docker)
+        if service.get("status") == "READY":
+            root_sandbox["service_probe"] = probe_service_connectivity(root_sandbox, docker=args.docker)
+        race = mark_root_ready(run, root_sandbox)
     except Exception as exc:
-        initial_failure = str(exc)
-        resource_limited = any(marker in initial_failure.casefold() for marker in (
-            "sandbox admission refused", "resource scheduler cannot admit sandbox minimum",
-        ))
-        if not resource_limited or recommended_profile == "light":
-            return persist({
-                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
-                "recommended_image": recommended, "selected_image": selected,
-                "fallback_used": bool(selection.get("fallback_used")),
-                "image_selection": selection, "reason": initial_failure[:1000],
-                "manual_create_command": selected_manual_command,
-            })
-        selected_profile = "light"
+        race = mark_prepare_failed(run, str(exc))
+        service = service | {"prepare_error": str(exc)}
+        if root_sandbox is not None:
+            try:
+                cleanup(root_sandbox, docker=args.docker)
+            except Exception as cleanup_exc:
+                service["cleanup_error"] = str(cleanup_exc)
+        if service.get("status") == "READY":
+            try:
+                service_cleanup = cleanup_service(
+                    service, actor=ServiceActor("root", "root"), docker=args.docker
+                )
+                if not service_cleanup["cleaned"]:
+                    service["cleanup_error"] = "; ".join(service_cleanup["failures"])
+            except Exception as cleanup_exc:
+                service["cleanup_error"] = str(cleanup_exc)
+        if "cleanup_error" not in service:
+            clear_active(repo, run_id=run.name)
+    return _prepare_result(run, input_record, image, service, race)
+
+
+def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    manifest, challenge = _select(repo, args.contest, args.selector)
+    run = resolve_run(repo)
+    race = load_race(run)
+    if race["challenge"]["id"] != challenge.id or race["contest"]["slug"] != manifest.slug:
+        raise ValueError("selector does not match the exact active race")
+    specifications = _lane_json(args)
+    reserved = reserve_lanes(run, specifications)
+    source, input_record = validate_prepared_input(run)
+    service_network = race.get("service_network")
+    service_endpoints = tuple(str(value) for value in race.get("service_endpoints", []))
+    targets = () if service_network else resolve_targets(parse_remotes(challenge.remotes))
+    packets: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for lane in reserved:
         try:
-            metadata = _create_sandbox_runtime(
-                repo_root=root, manifest=manifest, challenge=challenge, record=record,
-                workspace=workspace, solve_root=solve_root, branch=branch,
-                branch_root=branch_root, session_id=parent_session_id,
-                parent_session_id=parent_session_id, session_role="sol",
-                image_override=selected, resource_profile_override=selected_profile,
-                require_service=managed_service,
-                service_actor=ServiceActor(
-                    parent_session_id, role="sol", parent_session_id=parent_session_id,
-                ),
-                run_id=solve_root.name,
-            )
-        except Exception as retry_exc:
-            return persist({
-                "status": "CREATE_FAILED", "mode": "unavailable", "automatic": True,
-                "recommended_image": recommended, "selected_image": selected,
-                "fallback_used": bool(selection.get("fallback_used")),
-                "image_selection": selection,
-                "reason": str(retry_exc)[:1000],
-                "initial_failure": initial_failure[:1000],
-                "manual_create_command": selected_manual_command,
-            })
-    return persist(_ready_root_sandbox_receipt(
-        root=root, metadata=metadata, recommended=recommended,
-        selected=selected, fallback_used=bool(selection.get("fallback_used")),
-        image_selection=selection,
-        resource_profile=selected_profile,
-        resource_fallback_used=selected_profile != recommended_profile,
-    ))
-
-
-def _ready_root_sandbox_receipt(
-    *, root: Path, metadata: dict[str, object], recommended: str,
-    selected: str, fallback_used: bool, image_selection: dict[str, object],
-    resource_profile: str, resource_fallback_used: bool,
-) -> dict[str, object]:
-    metadata_path = str(metadata["metadata_path"])
-    return {
-        "status": "READY", "mode": "sandbox", "automatic": True,
-        "recommended_image": recommended, "selected_image": selected,
-        "fallback_used": fallback_used, "image_selection": image_selection,
-        "resource_profile": resource_profile,
-        "resource_fallback_used": resource_fallback_used,
-        "container": metadata.get("name"), "metadata_path": metadata_path,
-        "work_path": metadata.get("work_path"),
-        "evidence_path": metadata.get("evidence_path"),
-        "artifacts_path": str(Path(str(metadata["branch_root"])) / "artifacts"),
-        "exec_command_prefix": [
-            sys.executable, "-m", "ctf_os.agent_tools", "--repo", str(root),
-            "sandbox-exec", "--metadata", metadata_path, "--",
-        ],
-    }
-
-
-
-def _compact_prepare(
-    challenge,
-    record: dict[str, object],
-    solve_root: Path,
-    launch_context: dict[str, object],
-    launch_path: Path,
-) -> dict[str, object]:
-    workspace = challenge_workspace(solve_root)
-    priority = list(launch_context["priority_files"])
-    important_metadata = dict(launch_context["important_metadata"])
-    return {
-        "challenge": challenge.to_dict(),
-        "priority_files": priority,
-        "important_metadata": important_metadata,
-        "problem_information": dict(launch_context["problem_information"]),
-        "observation_hints": list(launch_context["observation_hints"]),
-        "recommended_environment": dict(launch_context["recommended_environment"]),
-        "service_plan": record.get("service_plan", {}),
-        "state_summary": _state_summary(solve_root),
-        "read_on_demand": [
-            str(workspace / "inventory.json"), str(solve_root / "evidence.log"),
-            str(solve_root / "findings.jsonl"), str(solve_root / "workers"),
-        ],
-        "solve_launch_path": str(launch_path),
-        "solve_launch_context": launch_context,
-        "preflight_record_path": str(workspace / "CHALLENGE-PREFLIGHT.json"),
-        "solve_root": str(workspace),
-        "run_root": str(solve_root),
-        "run_id": launch_context.get("run_id"),
-    }
-
-
-def _state_summary(solve_root: Path) -> dict[str, object]:
-    path = solve_root / "STATE.json"
-    if not path.is_file():
-        return {}
-    state = json.loads(path.read_text(encoding="utf-8"))
-    return {key: state.get(key) for key in (
-        "status", "replay_verdict", "flag_candidate", "branches", "input_fingerprint", "updated_at",
-    )}
-
-
-def _prepare_challenge_same_session(
-    root: Path, contest_selector: str | None, selector: str,
-    session_input_json: str | None = None,
-):
-    """Prepare only the selected challenge in the current Sol session."""
-
-    manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-    packet = parse_session_input(session_input_json) if session_input_json else None
-    challenge = resolve_session_challenge(root, manifest, selector, packet)
-    ensure_prepare_scope(root / "output", challenge_id=challenge.id)
-    try:
-        record = prepare_selected_challenge(root, manifest, challenge)
-    except Exception as exc:
-        raise ValueError(f"Same-session challenge-local preflight failed because {exc}") from exc
-    if record.get("status") != "READY":
-        blockers = [str(value) for value in record.get("blockers", []) if str(value).strip()]
-        detail = "; ".join(blockers) or "no blocker detail was recorded"
-        raise ValueError(f"The selected challenge remains BLOCKED: {detail}")
-    return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
-
-
-def _load_challenge_strict(root: Path, contest_selector: str | None, selector: str):
-    """Load already-prepared selected state without whole-contest repair."""
-
-    manifest = select_contest(discover_contests(root / "incoming"), contest_selector)
-    challenge = resolve_session_challenge(root, manifest, selector)
-    return manifest, challenge, load_challenge_preflight(root, manifest, challenge)
-
-
-def _load_metadata(root: Path, value: str) -> dict[str, object]:
-    path = Path(value)
-    if not path.is_absolute():
-        path = root / path
-    path = path.resolve()
-    output = (root / "output").resolve()
-    try:
-        path.relative_to(output)
-    except ValueError as exc:
-        raise ValueError("sandbox metadata must be below repository output/") from exc
-    if path.name != "sandbox.json" or not path.is_file() or path.is_symlink():
-        raise ValueError("sandbox metadata path is missing or unsafe")
-    metadata = json.loads(path.read_text(encoding="utf-8"))
-    if Path(str(metadata.get("branch_root", ""))).resolve() != path.parent:
-        raise ValueError("sandbox metadata branch root does not match its location")
-    if Path(str(metadata.get("metadata_path", ""))).resolve() != path:
-        raise ValueError("sandbox metadata self-path does not match its location")
-    branch_root = path.parent
-    branch = str(metadata.get("branch", ""))
-    if branch_root.parent.name != "workers" or branch_root.name != branch:
-        raise ValueError("sandbox metadata is not in its declared workers/<branch> directory")
-    challenge_state = branch_root.parents[1] / "STATE.json"
-    if not challenge_state.is_file():
-        raise ValueError("sandbox metadata has no challenge STATE.json")
-    state = json.loads(challenge_state.read_text(encoding="utf-8"))
-    if state.get("challenge_id") != metadata.get("challenge_id"):
-        raise ValueError("sandbox metadata challenge id does not match STATE.json")
-    if state.get("input_fingerprint") != metadata.get("input_fingerprint"):
-        raise ValueError("sandbox metadata input fingerprint is stale")
-    expected_labels = {
-        "ctf-os": "true", "ctf-os.contest": str(metadata.get("contest_slug", "")),
-        "ctf-os.challenge_id": str(metadata.get("challenge_id", "")), "ctf-os.branch": branch,
-    }
-    if metadata.get("labels") != expected_labels:
-        raise ValueError("sandbox metadata labels are not canonical")
-    return metadata
-
-
-def _cleanup_expired_timeout_retention(root: Path, sol_session_id: str) -> list[dict[str, object]]:
-    """Clean retained timeout sandboxes whose conservative TTL has expired."""
-    cleaned: list[dict[str, object]] = []
-    for receipt_path in sorted((root / "output").glob("**/workers/*/timeout-receipt.json")):
-        if receipt_path.is_symlink() or not receipt_path.is_file():
-            continue
-        try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            recorded = datetime.fromisoformat(str(receipt["recorded_at"]).replace("Z", "+00:00"))
-            ttl = int(receipt.get("retention_ttl_seconds", 21600))
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if receipt.get("status") != "TIMED_OUT_RETAINED" or ttl < 1:
-            continue
-        if (datetime.now(timezone.utc) - recorded).total_seconds() < ttl:
-            continue
-        metadata_path = receipt_path.parent / "sandbox.json"
-        try:
-            metadata = _load_metadata(root, str(metadata_path))
-            result = cleanup(metadata, session_id=sol_session_id, session_role="sol")
-            cleaned.append({"metadata": str(metadata_path), **result})
+            metadata = create(SandboxSpec(
+                run_id=run.name,
+                contest_slug=manifest.slug,
+                challenge_id=challenge.id,
+                category=challenge.category,
+                lane_id=str(lane["lane_id"]),
+                source=source,
+                lane_root=run / "workers" / str(lane["lane_id"]),
+                input_fingerprint=str(input_record["input_fingerprint"]),
+                image=str(race["selected_image"]),
+                targets=targets,
+                service_network=str(service_network) if service_network else None,
+                service_endpoints=service_endpoints,
+                resource_profile=_resource_profile(input_record),
+                race_lane_count=1 + len(packets),
+            ), docker=args.docker)
+            packets.append(attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata))
         except Exception as exc:
-            cleaned.append({"metadata": str(metadata_path), "removed": False, "error": str(exc)})
-    return cleaned
-
-
-def _doctor_selected_run(run: Path) -> dict[str, object]:
-    """Read-only first-to-flag health for one explicitly selected exact run."""
-
-    state_path = run / "STATE.json"
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state_health = "VALID" if isinstance(state, dict) else "CORRUPT"
-    except (OSError, json.JSONDecodeError):
-        state = None
-        state_health = "MISSING" if not state_path.exists() else "CORRUPT"
-    swarm_path = run / "SWARM.json"
-    swarm_health = "MISSING"
-    if swarm_path.is_file() and not swarm_path.is_symlink():
-        try:
-            swarm = json.loads(swarm_path.read_text(encoding="utf-8"))
-            swarm_health = "VALID" if isinstance(swarm, dict) else "CORRUPT"
-        except (OSError, json.JSONDecodeError):
-            swarm_health = "CORRUPT"
+            mark_lane_prepare_failed(run, lane_id=str(lane["lane_id"]), reason=str(exc))
+            failures.append({"lane_id": str(lane["lane_id"]), "error": str(exc)})
     return {
-        "run_id": run.name, "path": str(run), "state_health": state_health,
-        "state_status": state.get("status") if isinstance(state, dict) else None,
-        "swarm_health": swarm_health,
-        "repair_performed": False,
+        "run_id": run.name,
+        "packets": packets,
+        "failures": failures,
+        "native_spawn_performed": False,
+        "next_action": "Root passes each spawn_agent_args to native spawn_agent immediately while continuing its own attack.",
     }
 
 
-def _csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    run = resolve_run(repo, args.run_id)
+    race = load_race(run)
+    lane = reserve_max_endgame(
+        run,
+        replaced_lane_id=args.replaces_lane,
+        task=args.task,
+        attack_family=args.attack_family,
+    )
+    source, input_record = validate_prepared_input(run)
+    service_network = race.get("service_network")
+    service_endpoints = tuple(str(value) for value in race.get("service_endpoints", []))
+    remotes = race["challenge"].get("remotes", [])
+    targets = () if service_network else resolve_targets(parse_remotes(remotes))
+    try:
+        metadata = create(SandboxSpec(
+            run_id=run.name,
+            contest_slug=str(race["contest"]["slug"]),
+            challenge_id=str(race["challenge"]["id"]),
+            category=str(race["challenge"]["category"]),
+            lane_id=str(lane["lane_id"]),
+            source=source,
+            lane_root=run / "workers" / str(lane["lane_id"]),
+            input_fingerprint=str(input_record["input_fingerprint"]),
+            image=str(race["selected_image"]),
+            targets=targets,
+            service_network=str(service_network) if service_network else None,
+            service_endpoints=service_endpoints,
+            resource_profile=_resource_profile(input_record),
+            race_lane_count=sum(
+                row["status"] not in {"STOPPED", "WON"}
+                for row in load_race(run)["lanes"] if row["lane_id"] != lane["lane_id"]
+            ),
+        ), docker=args.docker)
+        packet = attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata)
+    except Exception as exc:
+        mark_lane_prepare_failed(run, lane_id=str(lane["lane_id"]), reason=str(exc))
+        raise
+    return {
+        "run_id": run.name,
+        "packet": packet,
+        "lease_seconds": 600,
+        "max_actual_attacks": 2,
+        "native_spawn_performed": False,
+    }
+
+
+def _sandbox_exec(metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    metadata = load_metadata(metadata_path)
+    run = Path(str(metadata["lane_root"])).resolve().parents[1]
+    race = load_race(run)
+    lane = next(row for row in race["lanes"] if row["lane_id"] == metadata["lane_id"])
+    detector = StreamingDetector(str(race.get("flag_pattern") or ""))
+    receipt = execute(
+        metadata,
+        _remainder(args.argv),
+        timeout=_attack_timeout(metadata, args.timeout),
+        target_identity=args.target_identity,
+        candidate_probe=detector.feed,
+    )
+    warnings: list[str] = []
+    winner = None
+    if receipt.get("flag_candidate"):
+        winner = record_candidate(
+            run,
+            lane_id=str(metadata["lane_id"]),
+            attack_family=str(lane["attack_family"]),
+            candidate=str(receipt["flag_candidate"]),
+            receipt=receipt,
+        )
+    try:
+        note_command_receipt(run, receipt)
+        event = append_verified_event(
+            run,
+            event_type="COMMAND_RESULT",
+            lane_id=str(metadata["lane_id"]),
+            attack_family=str(lane["attack_family"]),
+            receipt=receipt,
+        )
+        note_event(run, event)
+    except Exception as exc:
+        warnings.append(f"post-execution blackboard write failed: {exc}")
+    return {"receipt": receipt, "winner": winner, "warnings": warnings}
+
+
+def _blackboard_add(receipt_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError("receipt path is missing or unsafe")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict):
+        raise ValueError("receipt must be a JSON object")
+    lane_root = receipt_path.parent.parent
+    run = lane_root.parents[1]
+    race = load_race(run)
+    lane = next(row for row in race["lanes"] if row["lane_id"] == receipt["lane_id"])
+    event = append_verified_event(
+        run,
+        event_type=args.type,
+        lane_id=str(receipt["lane_id"]),
+        attack_family=str(lane["attack_family"]),
+        receipt=receipt,
+        artifact=args.artifact,
+    )
+    note_event(run, event)
+    return event
+
+
+def _session_read(metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    metadata = load_metadata(metadata_path)
+    receipt = session_read(
+        metadata, session_id=args.session, limit=args.limit,
+        timeout=_attack_timeout(metadata, args.timeout),
+    )
+    run = Path(str(metadata["lane_root"])).resolve().parents[1]
+    race = load_race(run)
+    lane = next(row for row in race["lanes"] if row["lane_id"] == metadata["lane_id"])
+    detector = StreamingDetector(str(race.get("flag_pattern") or ""))
+    candidate = detector.feed(str(receipt["observed_output"]))
+    winner = None
+    if candidate:
+        winner = record_candidate(
+            run,
+            lane_id=str(metadata["lane_id"]),
+            attack_family=str(lane["attack_family"]),
+            candidate=candidate,
+            receipt=receipt,
+        )
+    warnings: list[str] = []
+    try:
+        note_command_receipt(run, receipt)
+        event = append_verified_event(
+            run,
+            event_type="COMMAND_RESULT",
+            lane_id=str(metadata["lane_id"]),
+            attack_family=str(lane["attack_family"]),
+            receipt=receipt,
+        )
+        note_event(run, event)
+    except Exception as exc:
+        warnings.append(f"post-execution blackboard write failed: {exc}")
+    return {"receipt": receipt, "winner": winner, "warnings": warnings}
+
+
+def _race_handoff(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    run = resolve_run(repo, args.run_id)
+    race = load_race(run)
+    terminated = terminate(run, reason="HANDOFF")
+    markdown = load_markdown(Path(args.markdown_file))
+    destination = save_handoff(
+        repo,
+        contest=str(race["contest"]["name"]),
+        challenge=f"{race['challenge']['category']}-{race['challenge']['name']}",
+        run_id=run.name,
+        markdown=markdown,
+    )
+    return terminated | {
+        "handoff_path": str(destination),
+        "next_action": "Root interrupts every cancel target, then runs race-cleanup for this exact run.",
+    }
+
+
+def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    run = resolve_run(repo, args.run_id)
+    race = load_race(run)
+    if race["status"] not in {"WON", "TIMED_OUT", "HANDOFF", "STOPPED"}:
+        raise ValueError("race cleanup requires a terminal race state")
+    cleaned: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for lane in race["lanes"]:
+        metadata_path = run / "workers" / str(lane["lane_id"]) / "sandbox.json"
+        if not metadata_path.exists():
+            continue
+        try:
+            cleaned.append(cleanup(load_metadata(metadata_path), docker=args.docker))
+        except Exception as exc:
+            failures.append({"scope": str(lane["lane_id"]), "error": str(exc)})
+    service_path = run / "service" / "service.json"
+    if service_path.exists():
+        try:
+            service_cleanup = cleanup_service(
+                load_service(service_path), actor=ServiceActor("root", "root"), docker=args.docker
+            )
+            cleaned.append(service_cleanup)
+            if not service_cleanup["cleaned"]:
+                failures.extend(
+                    {"scope": "service", "error": str(error)}
+                    for error in service_cleanup["failures"]
+                )
+        except Exception as exc:
+            failures.append({"scope": "service", "error": str(exc)})
+    if not failures:
+        clear_active(repo, run_id=run.name)
+    return {"run_id": run.name, "cleaned": cleaned, "failures": failures, "active_cleared": not failures}
+
+
+def _prepare_result(
+    run: Path,
+    input_record: Mapping[str, Any],
+    image: Mapping[str, Any],
+    service: Mapping[str, Any],
+    race: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    root = next(row for row in race["lanes"] if row["lane_id"] == "root")
+    sandbox = root.get("sandbox")
+    return {
+        "contest": race["contest"],
+        "challenge": race["challenge"],
+        "run_id": race["run_id"],
+        "attempt_id": race["attempt_id"],
+        "challenge_instance_id": race["challenge_instance_id"],
+        "run_root": str(run),
+        "prepared_input": {
+            "path": input_record["prepared_input"],
+            "read_only": True,
+            "fingerprint": input_record["prepared_fingerprint"],
+        },
+        "declared_targets": race["declared_targets"],
+        "recommended_image": image["recommended_image"],
+        "selected_image": image["selected_image"],
+        "image_availability": image,
+        "root_sandbox": sandbox or {"status": "UNAVAILABLE", "reason": race.get("prepare_blocker")},
+        "service": service,
+        "service_endpoints": race["service_endpoints"],
+        "flag_pattern": race["flag_pattern"],
+        "priority_files": race["priority_files"],
+        "deadline": race["deadline"],
+        "lanes": [{"lane_id": row["lane_id"], "status": row["status"], "attack_family": row["attack_family"]} for row in race["lanes"]],
+        "attack_ready": race["attack_ready"],
+        "dry_run": dry_run,
+        "next_root_action": (
+            {"exec_command_prefix": sandbox["exec_command_prefix"], "instruction": "append the highest-probability attack argv and execute now"}
+            if sandbox else
+            {"blocked": True, "recovery_command": image.get("recovery_command"), "reason": race.get("prepare_blocker")}
+        ),
+    }
+
+
+def _selection_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("selector")
+    parser.add_argument("--contest")
+
+
+def _select(repo: Path, contest_selector: str | None, challenge_selector: str):
+    manifest = select_contest(discover_contests(repo / "incoming"), contest_selector)
+    return manifest, resolve_selector(manifest.challenges, challenge_selector)
+
+
+def _lane_json(args: argparse.Namespace) -> list[Mapping[str, Any]]:
+    if args.lanes_file:
+        path = Path(args.lanes_file)
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
+            raise ValueError("lanes file is missing, unsafe, or too large")
+        raw = path.read_text(encoding="utf-8")
+    else:
+        raw = args.lanes_json
+    value = json.loads(raw)
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError("lanes JSON must be an array of objects")
+    return value
+
+
+def _remainder(values: Sequence[str]) -> list[str]:
+    result = list(values)
+    if result[:1] == ["--"]:
+        result = result[1:]
+    if not result:
+        raise ValueError("an argv is required after --")
+    return result
+
+
+def _optional_remainder(values: Sequence[str]) -> list[str] | None:
+    result = list(values)
+    if result[:1] == ["--"]:
+        result = result[1:]
+    return result or None
+
+
+def _resource_profile(input_record: Mapping[str, Any]) -> str:
+    total = int(input_record.get("total_bytes", 0))
+    if total > 2 * 1024**3:
+        return "large-forensic"
+    if total > 256 * 1024**2:
+        return "heavy"
+    return "standard"
+
+
+def _attack_timeout(metadata: Mapping[str, Any], requested: int) -> int:
+    if requested < 1:
+        raise ValueError("attack timeout must be positive")
+    run = Path(str(metadata["lane_root"])).resolve().parents[1]
+    race = load_race(run)
+    if race.get("status") != "ACTIVE":
+        raise ValueError(f"race is not attack-active: {race.get('status')}")
+    remaining = (datetime.fromisoformat(str(race["deadline"])) - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= 0:
+        terminal = terminate(run, reason="TIMED_OUT")
+        raise ValueError(
+            "90-minute race deadline has passed; native cancel targets: "
+            + json.dumps(terminal["cancel_targets"], sort_keys=True)
+        )
+    return max(1, min(requested, int(remaining) or 1))
 
 
 if __name__ == "__main__":

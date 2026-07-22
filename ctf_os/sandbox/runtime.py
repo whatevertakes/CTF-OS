@@ -1,305 +1,107 @@
+"""Docker lifecycle for automatically prepared race lanes."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
 import re
-import shutil
+import selectors
 import subprocess
-import tarfile
-import tempfile
-from typing import Mapping, Sequence
-from urllib.parse import urlparse
+import time
+from typing import Any, Callable, Mapping, Sequence
+import uuid
+from urllib.parse import urlsplit
 
-from ..evidence import append_evidence
-from ..resources.scheduler import (
-    ResourceLedger, ResourceRequest, allocation_environment, default_request, parse_bytes,
-)
+from ..workspace import atomic_json, atomic_text, validate_identifier
 from .network import ResolvedTarget
-from .resources import ResourceError, admit, admission_lock, parse_size_bytes, resource_profile
+from .resources import ResourceError, admit, parse_size_bytes, resource_profile
+
+
+MAX_CAPTURE = 64 * 1024
+MAX_COMMAND_SECONDS = 1800
 
 
 class SandboxError(RuntimeError):
     pass
 
 
-def inspect_local_image(image: str, *, docker: str = "docker") -> dict[str, object]:
-    """Inspect one local sandbox image without pulling or building it."""
-
-    if not image or any(character in image for character in "\r\n\0"):
-        raise SandboxError("sandbox image reference is invalid")
-    try:
-        result = _run(
-            [docker, "image", "inspect", image, "--format", "{{json .Id}}"],
-            timeout=20,
-        )
-    except SandboxError as exc:
-        return {
-            "image": image, "available": False, "runtime_available": False,
-            "reason": str(exc),
-        }
-    if result.returncode == 0:
-        try:
-            image_id = json.loads(result.stdout.strip())
-        except json.JSONDecodeError:
-            image_id = result.stdout.strip()
-        return {
-            "image": image, "available": True, "runtime_available": True,
-            "image_id": str(image_id or ""),
-        }
-    reason = (result.stderr or result.stdout or "Docker image inspect failed").strip()
-    missing = any(
-        marker in reason.casefold()
-        for marker in ("no such image", "no such object", "not found")
-    )
-    return {
-        "image": image, "available": False, "runtime_available": missing,
-        "reason": reason[:1000],
-    }
-
-
-def select_local_sandbox_image(
-    recommended_image: str, *, fallback_image: str = "ctf-os-sandbox:base",
-    docker: str = "docker",
-) -> dict[str, object]:
-    """Choose the first available local image, preferring the recommendation."""
-
-    candidates = list(dict.fromkeys((recommended_image, fallback_image)))
-    checks: list[dict[str, object]] = []
-    for candidate in candidates:
-        check = inspect_local_image(candidate, docker=docker)
-        checks.append(check)
-        if check["available"]:
-            return {
-                "status": "AVAILABLE", "recommended_image": recommended_image,
-                "selected_image": candidate,
-                "fallback_used": candidate != recommended_image,
-                "checks": checks,
-            }
-        if check.get("runtime_available") is False:
-            break
-    return {
-        "status": "UNAVAILABLE", "recommended_image": recommended_image,
-        "selected_image": None, "fallback_used": False, "checks": checks,
-    }
-
-
-def inspect_sandbox_runtime(
-    metadata: Mapping[str, object], *, docker: str = "docker",
-) -> dict[str, object]:
-    """Return whether persisted metadata still names a running owned sandbox."""
-
-    name = _metadata_name(dict(metadata))
-    try:
-        raw = _inspect_runtime(name, docker=docker)
-    except SandboxError as exc:
-        return {"exists": False, "running": False, "owned": False, "reason": str(exc)}
-    config = raw.get("Config") if isinstance(raw.get("Config"), Mapping) else {}
-    labels = config.get("Labels") if isinstance(config.get("Labels"), Mapping) else {}
-    expected = metadata.get("runtime_labels")
-    if not isinstance(expected, Mapping):
-        expected = metadata.get("labels") if isinstance(metadata.get("labels"), Mapping) else {}
-    owned = bool(expected) and all(labels.get(key) == value for key, value in expected.items())
-    state = raw.get("State") if isinstance(raw.get("State"), Mapping) else {}
-    return {
-        "exists": True, "running": state.get("Running") is True,
-        "owned": owned, "status": state.get("Status"),
-        "reason": None if owned else "container labels do not match sandbox metadata",
-    }
-
-
 @dataclass(frozen=True, slots=True)
 class SandboxSpec:
+    run_id: str
     contest_slug: str
     challenge_id: str
-    branch: str
+    category: str
+    lane_id: str
     source: Path
-    branch_root: Path
-    input_fingerprint: str = "unbound"
-    target_revision: int = 1
-    input_bytes: int = 0
+    lane_root: Path
+    input_fingerprint: str
+    image: str
     targets: tuple[ResolvedTarget, ...] = ()
-    image: str = "ctf-os-sandbox:base"
-    resource_profile: str = "standard"
-    memory: str | None = None
-    cpus: float | None = None
-    pids: int | None = None
-    storage: str | None = None
     service_network: str | None = None
-    local_endpoints: tuple[str, ...] = ()
-    session_id: str = "sol-main"
-    parent_session_id: str = "sol-main"
-    session_role: str = "sol"
-    service_context: Mapping[str, object] | None = None
-    category: str | None = None
-    gpu_enabled: bool = False
-    gpu_device: int | None = None
-    gpu_requested: bool | None = None
-    gpu_backend: str | None = None
-    gpu_fallback: str | None = None
-    workload_class: str | None = None
-    resource_priority: str | None = None
-    resource_request_override: Mapping[str, object] | None = None
-    run_id: str | None = None
-
-    def __post_init__(self) -> None:
-        try:
-            profile = resource_profile(self.resource_profile)
-        except ResourceError as exc:
-            raise SandboxError(str(exc)) from exc
-        if self.memory is None:
-            object.__setattr__(self, "memory", profile.memory)
-        if self.cpus is None:
-            object.__setattr__(self, "cpus", profile.cpus)
-        if self.pids is None:
-            object.__setattr__(self, "pids", profile.pids)
-        if self.storage is None:
-            object.__setattr__(self, "storage", profile.storage)
-        if self.workload_class is None:
-            object.__setattr__(self, "workload_class", {
-                "light": "quick-recon", "standard": "independent-full-solve",
-                "heavy": "custom-cpu-bound", "large-forensic": "forensic-extraction",
-            }.get(self.resource_profile, "independent-full-solve"))
-        if self.resource_priority is None:
-            object.__setattr__(self, "resource_priority", "NORMAL")
-        if self.gpu_requested is None:
-            object.__setattr__(self, "gpu_requested", self.gpu_enabled)
-        if self.gpu_enabled:
-            object.__setattr__(self, "gpu_backend", self.gpu_backend or "nvidia")
-            object.__setattr__(self, "gpu_fallback", None)
-        else:
-            object.__setattr__(self, "gpu_backend", None)
-            object.__setattr__(self, "gpu_fallback", self.gpu_fallback or "CPU")
+    service_endpoints: tuple[str, ...] = ()
+    resource_profile: str = "standard"
+    race_lane_count: int = 0
 
     @property
     def name(self) -> str:
-        raw = f"ctf-os-{self.contest_slug}-{self.challenge_id}-{self.branch}"
-        safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", raw).strip("-.").lower()
-        return safe[:100] + "-" + hashlib.sha256(raw.encode()).hexdigest()[:10]
+        raw = f"ctf-os-{self.run_id}-{self.lane_id}"
+        prefix = re.sub(r"[^a-z0-9_.-]+", "-", raw.casefold()).strip("-.")[:80]
+        return f"{prefix}-{hashlib.sha256(raw.encode()).hexdigest()[:10]}"
 
     @property
     def labels(self) -> dict[str, str]:
-        labels = {
-            "ctf-os": "true", "ctf-os.contest": self.contest_slug,
-            "ctf-os.challenge_id": self.challenge_id, "ctf-os.branch": self.branch,
+        return {
+            "org.ctf-os.managed": "true",
+            "org.ctf-os.kind": "sandbox",
+            "org.ctf-os.run-id": self.run_id,
+            "org.ctf-os.challenge-id": self.challenge_id,
+            "org.ctf-os.lane-id": self.lane_id,
+            "org.ctf-os.category": self.category,
         }
-        if self.run_id:
-            labels["ctf-os.run_id"] = self.run_id
-        return labels
-
-    @property
-    def runtime_labels(self) -> dict[str, str]:
-        labels = {
-            **self.labels,
-            "ctf-os.kind": "sandbox",
-            "ctf-os.resource_profile": self.resource_profile,
-            "ctf-os.memory_bytes": str(parse_size_bytes(str(self.memory))),
-            "ctf-os.storage_bytes": str(parse_size_bytes(str(self.storage))),
-            "ctf-os.session_id": self.session_id,
-            "ctf-os.parent_session_id": self.parent_session_id,
-            "ctf-os.session_role": self.session_role,
-            "ctf-os.workload_class": str(self.workload_class),
-            "ctf-os.resource_priority": str(self.resource_priority),
-            "ctf-os.gpu_requested": str(bool(self.gpu_requested)).lower(),
-            "ctf-os.gpu_assigned": str(self.gpu_enabled).lower(),
-        }
-        if self.gpu_backend:
-            labels["ctf-os.gpu_backend"] = self.gpu_backend
-        if self.gpu_fallback:
-            labels["ctf-os.gpu_fallback"] = self.gpu_fallback
-        return labels
-
-    @property
-    def resource_request(self) -> ResourceRequest:
-        if self.resource_request_override is not None:
-            return ResourceRequest.from_mapping(self.resource_request_override)
-        return default_request(
-            contest=self.contest_slug, challenge_id=self.challenge_id,
-            session_id=self.session_id, workload_class=str(self.workload_class),
-            priority=str(self.resource_priority),
-            input_bytes=self.input_bytes,
-            overrides={
-                "min_cpus": min(float(self.cpus), float(self.cpus)),
-                "preferred_cpus": float(self.cpus), "max_cpus": max(float(self.cpus), float(self.cpus)),
-                "min_memory_bytes": parse_size_bytes(str(self.memory)),
-                "preferred_memory_bytes": parse_size_bytes(str(self.memory)),
-                "max_memory_bytes": parse_size_bytes(str(self.memory)),
-                "storage_bytes": parse_size_bytes(str(self.storage)),
-                "gpu_preferred": bool(self.gpu_requested),
-                "gpu_memory_bytes": 4 * 1024**3 if self.gpu_requested else 0,
-            },
-        )
 
 
-def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
+def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
     _validate_spec(spec)
-    context = (spec.branch_root / "context").resolve()
-    policy = json.dumps([target.to_dict() for target in spec.targets], separators=(",", ":"))
-    local_policy = json.dumps(list(spec.local_endpoints), separators=(",", ":"))
-    allocation = {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}
-    resource_env = allocation_environment(allocation, spec.resource_request)
-    mutable_mounts = [
-        "--tmpfs", f"/work:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-        "--tmpfs", f"/evidence:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-        "--tmpfs", f"/artifacts:rw,exec,nosuid,nodev,size={spec.storage},mode=1777",
-    ]
+    profile = resource_profile(spec.resource_profile)
+    targets = json.dumps([row.to_dict() for row in spec.targets], separators=(",", ":"))
+    endpoints = json.dumps(list(spec.service_endpoints), separators=(",", ":"))
     argv = [
-        docker, "run", "--detach", "--name", spec.name, "--read-only",
-        "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+        docker, "run", "--detach", "--name", spec.name,
+        "--read-only", "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
+        # The entrypoint uses these only to change uid/gid and permanently drops
+        # them before the lane command starts.
         "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP",
-        "--memory", spec.memory, "--cpus", str(spec.cpus), "--pids-limit", str(spec.pids),
-        "--ulimit", "nofile=1024:1024", "--ulimit", "nproc=256:256",
-        "--mount", f"type=bind,src={spec.source},dst=/challenge,readonly",
-        *mutable_mounts,
-        "--mount", f"type=bind,src={context},dst=/context,readonly",
+        "--memory", profile.memory, "--cpus", str(profile.cpus),
+        "--pids-limit", str(profile.pids),
+        "--ulimit", "nofile=2048:2048", "--ulimit", "nproc=512:512",
+        "--mount", f"type=bind,src={spec.source.resolve()},dst=/challenge,readonly",
+        "--mount", f"type=bind,src={(spec.lane_root / 'work').resolve()},dst=/work",
+        "--mount", f"type=bind,src={(spec.lane_root / 'evidence').resolve()},dst=/evidence",
+        "--mount", f"type=bind,src={(spec.lane_root / 'artifacts').resolve()},dst=/artifacts",
+        "--mount", f"type=bind,src={(spec.lane_root / 'context').resolve()},dst=/context,readonly",
         "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
-        "--env", f"CTF_OS_ALLOWED_ENDPOINTS_JSON={policy}",
-        "--env", f"CTF_OS_LOCAL_ENDPOINTS_JSON={local_policy}",
-        "--env", f"CTF_OS_SESSION_ID={spec.session_id}",
-        "--env", f"CTF_OS_PARENT_SESSION_ID={spec.parent_session_id}",
-        "--env", f"CTF_OS_SESSION_ROLE={spec.session_role}",
-        "--env", f"CTF_OS_CONTEST_SLUG={spec.contest_slug}",
+        "--env", f"CTF_OS_ALLOWED_ENDPOINTS_JSON={targets}",
+        "--env", f"CTF_OS_LOCAL_ENDPOINTS_JSON={endpoints}",
+        "--env", f"CTF_OS_RUN_ID={spec.run_id}",
         "--env", f"CTF_OS_CHALLENGE_ID={spec.challenge_id}",
+        "--env", f"CTF_OS_LANE_ID={spec.lane_id}",
+        "--env", "HF_HUB_OFFLINE=1",
+        "--env", "TRANSFORMERS_OFFLINE=1",
     ]
-    for key, value in resource_env.items():
-        argv.extend(["--env", f"{key}={value}"])
-    category = (spec.category or spec.image.rsplit(":", 1)[-1]).casefold()
-    if category in {"pwn", "rev", "misc"}:
-        argv.extend([
-            "--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined",
-            "--ulimit", "core=-1:-1",
-        ])
-    if category == "forensic":
-        argv.extend(["--cap-add", "SYS_ADMIN", "--security-opt", "seccomp=unconfined"])
-        for device in ("/dev/loop-control", "/dev/loop0", "/dev/loop1", "/dev/loop2", "/dev/loop3"):
-            if Path(device).exists():
-                argv.extend(["--device", f"{device}:{device}:rwm"])
-    if spec.gpu_enabled:
-        selector = f"device={spec.gpu_device}" if spec.gpu_device is not None else "all"
-        argv.extend([
-            "--gpus", selector,
-            "--env", "CTF_OS_GPU_AVAILABLE=1",
-            "--env", "CTF_OS_GPU_ENABLED=1",
-            "--env", "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
-        ])
-    # Rootless Podman needs only namespace-management syscalls for local OCI
-    # inspection. Keep Docker's default deny list otherwise; mount and other
-    # CAP_SYS_ADMIN-gated syscalls remain blocked and every capability is still dropped.
-    if spec.image == "ctf-os-sandbox:cloud":
-        seccomp = Path(__file__).resolve().parents[2] / "sandbox" / "seccomp-rootless.json"
-        if not seccomp.is_file() or seccomp.is_symlink():
-            raise SandboxError("rootless Podman seccomp profile is missing or unsafe")
-        argv.extend(["--security-opt", f"seccomp={seccomp}"])
-    for key, value in spec.runtime_labels.items():
+    for key, value in spec.labels.items():
         argv.extend(["--label", f"{key}={value}"])
+    if spec.category in {"pwn", "rev"}:
+        argv.extend(["--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined"])
+    if spec.category == "cloud":
+        seccomp = Path(__file__).resolve().parents[2] / "sandbox" / "seccomp-rootless.json"
+        if seccomp.is_symlink() or not seccomp.is_file():
+            raise SandboxError("cloud sandbox seccomp profile is missing or unsafe")
+        argv.extend(["--security-opt", f"seccomp={seccomp}"])
     if spec.service_network:
-        # NET_ADMIN exists only while entrypoint installs the exact service-only
-        # egress policy; setpriv drops it before any worker command executes.
         argv.extend(["--network", spec.service_network, "--cap-add", "NET_ADMIN"])
     elif spec.targets:
         argv.extend(["--network", "bridge", "--cap-add", "NET_ADMIN"])
@@ -311,788 +113,469 @@ def build_run_argv(spec: SandboxSpec, docker: str = "docker") -> list[str]:
     return argv
 
 
-def create(spec: SandboxSpec, *, docker: str = "docker") -> dict[str, object]:
-    _prepare_branch_root(spec)
-    metadata: dict[str, object] = {
-        "schema_version": 2, "name": spec.name, "contest_slug": spec.contest_slug,
-        "challenge_id": spec.challenge_id, "branch": spec.branch,
-        "source": str(spec.source), "branch_root": str(spec.branch_root),
-        "labels": spec.labels, "image": spec.image,
-        "runtime_labels": spec.runtime_labels,
-        "resource_profile": spec.resource_profile,
-        "resources": {"memory": spec.memory, "cpus": spec.cpus, "pids": spec.pids, "storage": spec.storage},
-        "service_network": spec.service_network,
-        "local_endpoints": list(spec.local_endpoints),
-        "session_id": spec.session_id,
-        "parent_session_id": spec.parent_session_id,
-        "session_role": spec.session_role,
-        "service_context": dict(spec.service_context or {}),
-        "category": spec.category,
-        "gpu_enabled": spec.gpu_enabled,
-        "gpu_device": spec.gpu_device,
-        "gpu_backend": spec.gpu_backend,
-        "gpu_requested": bool(spec.gpu_requested),
-        "gpu_assigned": spec.gpu_enabled,
-        "gpu_fallback": spec.gpu_fallback,
-        "resource_request": spec.resource_request.to_dict(),
-        "allocation_env": allocation_environment(
-            {"cpus": spec.cpus, "memory_bytes": parse_size_bytes(str(spec.memory))}, spec.resource_request,
-        ),
-        "work_path": str((spec.branch_root / "work").resolve()),
-        "evidence_path": str((spec.branch_root / "evidence").resolve()),
-        "logs_path": str((spec.branch_root / "logs").resolve()),
-        "context_path": str((spec.branch_root / "context").resolve()),
-        "metadata_path": str(spec.branch_root / "sandbox.json"),
-        "input_fingerprint": spec.input_fingerprint,
-        "target_revision": spec.target_revision,
-        "authorized_targets": [target.to_dict() for target in spec.targets],
-    }
+def create(
+    spec: SandboxSpec,
+    *,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    _prepare_lane_root(spec)
     try:
-        with admission_lock():
-            admit(
-                spec.resource_profile, requested_memory_bytes=parse_size_bytes(str(spec.memory)),
-                requested_cpus=float(spec.cpus), requested_storage_bytes=parse_size_bytes(str(spec.storage)),
-                docker=docker,
-            )
-            result = _run(build_run_argv(spec, docker), timeout=120)
+        capacity = admit(
+            spec.resource_profile,
+            race_lane_count=spec.race_lane_count,
+            docker=docker,
+            runner=runner,
+        )
     except ResourceError as exc:
         raise SandboxError(str(exc)) from exc
+    result = _run(runner, build_run_argv(spec, docker=docker), timeout=120)
     if result.returncode:
-        if "already in use" not in result.stderr.casefold() and "conflict" not in result.stderr.casefold():
-            _rollback_failed_create(spec, docker=docker)
         raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
+    inspected = _run(
+        runner,
+        [docker, "inspect", spec.name, "--format", "{{.State.Running}}"],
+        timeout=30,
+    )
+    if inspected.returncode or inspected.stdout.strip() != "true":
+        state = _run(
+            runner, [docker, "inspect", spec.name, "--format", "{{json .State}}"], timeout=30
+        )
+        logs = _run(runner, [docker, "logs", "--tail", "40", spec.name], timeout=30)
+        _run(runner, [docker, "rm", "--force", spec.name], timeout=30)
+        detail = (logs.stderr or logs.stdout or state.stdout or inspected.stderr).strip()
+        raise SandboxError(
+            "sandbox was created but did not become running"
+            + (f": {detail[-4096:]}" if detail else "")
+        )
+    metadata_path = spec.lane_root / "sandbox.json"
+    target_identities = [row.target.declared for row in spec.targets]
+    target_identities.extend(spec.service_endpoints)
+    metadata: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "READY",
+        "name": spec.name,
+        "run_id": spec.run_id,
+        "challenge_id": spec.challenge_id,
+        "category": spec.category,
+        "lane_id": spec.lane_id,
+        "image": spec.image,
+        "source": str(spec.source.resolve()),
+        "lane_root": str(spec.lane_root.resolve()),
+        "metadata_path": str(metadata_path.resolve()),
+        "input_fingerprint": spec.input_fingerprint,
+        "labels": spec.labels,
+        "authorized_targets": [row.to_dict() for row in spec.targets],
+        "target_identities": target_identities,
+        "service_network": spec.service_network,
+        "service_endpoints": list(spec.service_endpoints),
+        "paths": {
+            "input": "/challenge",
+            "work": "/work",
+            "evidence": "/evidence",
+            "artifacts": "/artifacts",
+            "host_work": str((spec.lane_root / "work").resolve()),
+            "host_evidence": str((spec.lane_root / "evidence").resolve()),
+            "host_artifacts": str((spec.lane_root / "artifacts").resolve()),
+        },
+        "resource_profile": spec.resource_profile,
+        "capacity_at_create": capacity,
+        "created_at": _now(),
+        "exec_command_prefix": [
+            "uv", "run", "python", "-m", "ctf_os.agent_tools", "sandbox-exec",
+            "--metadata", str(metadata_path.resolve()), "--",
+        ],
+    }
     try:
-        _write_json(spec.branch_root / "sandbox.json", metadata)
-        append_evidence(spec.branch_root.parents[1] / "evidence.log", "sandbox_create", {
-            "branch": spec.branch, "container": spec.name,
-            "gpu_requested": bool(spec.gpu_requested),
-            "gpu_assigned": spec.gpu_enabled,
-            "gpu_device": spec.gpu_device,
-            "gpu_backend": spec.gpu_backend,
-            "gpu_fallback": spec.gpu_fallback,
-        })
+        atomic_json(metadata_path, metadata)
     except Exception:
-        removed = _run([docker, "rm", "--force", spec.name], timeout=30)
-        if removed.returncode:
-            raise SandboxError(f"sandbox started but rollback cleanup failed: {removed.stderr.strip()}")
+        _run(runner, [docker, "rm", "--force", spec.name], timeout=30)
         raise
     return metadata
 
 
+def load_metadata(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise SandboxError("sandbox metadata is missing or unsafe")
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SandboxError("sandbox metadata is unreadable") from exc
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
+        raise SandboxError("sandbox metadata schema is unsupported")
+    if Path(str(metadata.get("metadata_path"))).resolve() != path.resolve():
+        raise SandboxError("sandbox metadata path identity mismatch")
+    lane_root = Path(str(metadata.get("lane_root", ""))).resolve()
+    if path.parent.resolve() != lane_root:
+        raise SandboxError("sandbox metadata escapes its lane")
+    return metadata
+
+
 def execute(
-    metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str = "docker",
-    session_id: str | None = None, session_role: str | None = None,
-    timeout_profile: str | None = None, retain_on_timeout: bool | None = None,
-) -> dict[str, object]:
-    _authorize_sandbox(metadata, session_id, session_role, "execute")
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    with _sandbox_lock(branch_root):
-        return _execute_locked(
-            metadata, command, timeout, docker=docker,
-            timeout_profile=timeout_profile, retain_on_timeout=retain_on_timeout,
-        )
-
-
-def probe_service_connectivity(metadata: dict[str, object], *, docker: str = "docker") -> dict[str, object]:
-    """Prove that an attached worker can resolve and reach its managed service."""
-    endpoints = metadata.get("local_endpoints")
-    if not isinstance(endpoints, list) or not endpoints:
-        raise SandboxError("managed service attachment has no declared endpoint")
-    endpoint = str(endpoints[0])
-    host, port = _endpoint_host_port(endpoint)
-    code = (
-        "import socket,sys; "
-        "s=socket.create_connection((sys.argv[1],int(sys.argv[2])),5); "
-        "print('CTF_OS_SERVICE_CONNECTED',sys.argv[1],sys.argv[2]); s.close()"
-    )
-    result = execute(metadata, ["python3", "-c", code, host, str(port)], 10, docker=docker)
-    if result.get("exit_code") != 0 or "CTF_OS_SERVICE_CONNECTED" not in str(result.get("stdout", "")):
-        raise SandboxError(
-            f"managed service connectivity probe failed for {endpoint}: "
-            f"{str(result.get('stderr', '')).strip() or 'connection was not established'}"
-        )
-    return {"endpoint": endpoint, "host": host, "port": port, "connected": True}
-
-
-def _endpoint_host_port(endpoint: str) -> tuple[str, int]:
-    text = endpoint.strip()
-    if text.casefold().startswith("nc "):
-        parts = text.split()
-        if len(parts) == 3 and parts[2].isdigit():
-            return parts[1], int(parts[2])
-    parsed = urlparse(text if "://" in text else f"tcp://{text}")
-    if parsed.hostname and parsed.port:
-        return parsed.hostname, parsed.port
-    raise SandboxError(f"managed service endpoint has no host and port: {endpoint}")
-
-
-def _execute_locked(
-    metadata: dict[str, object], command: Sequence[str], timeout: int, *, docker: str,
-    timeout_profile: str | None = None, retain_on_timeout: bool | None = None,
-) -> dict[str, object]:
-    if not command or timeout < 1 or timeout > 1800:
-        raise SandboxError("command is required and timeout must be between 1 and 1800 seconds")
+    metadata: Mapping[str, Any],
+    command: Sequence[str],
+    *,
+    timeout: int = 300,
+    target_identity: str | None = None,
+    candidate_probe: Callable[[str], str | None] | None = None,
+    docker: str = "docker",
+) -> dict[str, Any]:
+    if not command or any("\x00" in value for value in command):
+        raise SandboxError("a non-empty NUL-free argv is required")
+    if timeout < 1 or timeout > MAX_COMMAND_SECONDS:
+        raise SandboxError(f"timeout must be between 1 and {MAX_COMMAND_SECONDS} seconds")
     name = _metadata_name(metadata)
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    prior_timeout = branch_root / "timeout-receipt.json"
-    if prior_timeout.is_file() and not prior_timeout.is_symlink():
-        try:
-            prior = json.loads(prior_timeout.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SandboxError("retained timeout receipt is malformed") from exc
-        if prior.get("status") == "TIMED_OUT_RETAINED":
-            prior_pgid = str(prior.get("exec_process_group_id") or "")
-            if prior_pgid.isdigit():
-                remaining = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
-            else:
-                raise SandboxError("retained timeout lacks a process-group receipt; Sol cleanup is required")
-            if remaining.stdout.split():
-                _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "kill -KILL -\"$1\" 2>/dev/null || true", "sh", prior_pgid], timeout=15)
-                checked = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", prior_pgid], timeout=15)
-                if checked.stdout.split():
-                    raise SandboxError("retained sandbox still has orphan worker processes; Sol cleanup is required")
-    execution_id = hashlib.sha256(f"{_utc_now()}:{os.getpid()}:{list(command)}".encode()).hexdigest()[:16]
-    pid_file = f"/tmp/ctf-os-exec-{execution_id}.pid"
-    argv = [docker, "exec", "--user", "1001:1001", "--workdir", "/work"]
-    for key, value in _metadata_allocation_env(metadata).items():
-        argv.extend(["--env", f"{key}={value}"])
-    # Docker exec commonly starts its process as a process-group leader.  A bare
-    # `setsid` then forks and lets that parent exit successfully, which loses the
-    # real command's exit status.  Force the fork, wait for the session child,
-    # and have that child record its own PID (also its PGID) before exec.
-    argv.extend([
-        name, "setsid", "--fork", "--wait", "sh", "-c",
+    lane_root = Path(str(metadata["lane_root"])).resolve()
+    receipt_id = uuid.uuid4().hex
+    pid_file = f"/tmp/ctf-os-exec-{receipt_id}.pid"
+    argv = [
+        docker, "exec", "--user", "1001:1001", "--workdir", "/work", name,
+        "setsid", "--fork", "--wait", "sh", "-c",
         "umask 077; echo $$ >\"$1\"; shift; exec \"$@\"",
         "ctf-os-exec", pid_file, *command,
-    ])
-    before = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") else None
-    result = _run(argv, timeout=timeout)
-    after = _firewall_counters(name, docker, list(metadata.get("authorized_targets", []))) if metadata.get("authorized_targets") and result.returncode != 124 else None
-    from ..timeouts import retain_sandbox_on_timeout
-    retained = result.returncode == 124 and retain_sandbox_on_timeout(timeout_profile, retain_on_timeout)
-    orphan_check = None
-    process_group_id = None
-    if retained:
-        pid_result = _run([docker, "exec", "--user", "1001:1001", name, "cat", pid_file], timeout=15)
-        process_group_id = pid_result.stdout.strip() if pid_result.returncode == 0 and pid_result.stdout.strip().isdigit() else None
-        if process_group_id:
-            terminated = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "kill -TERM -\"$1\" 2>/dev/null || true; sleep 1; kill -KILL -\"$1\" 2>/dev/null || true", "sh", process_group_id], timeout=15)
-            orphan_check = _run([docker, "exec", "--user", "1001:1001", name, "sh", "-c", "ps -o pid=,stat= --sid \"$1\" 2>/dev/null | awk '$2 !~ /^Z/'", "sh", process_group_id], timeout=15)
-        else:
-            terminated = subprocess.CompletedProcess([], 1, "", "missing process group receipt")
-            orphan_check = subprocess.CompletedProcess([], 1, "", "missing process group receipt")
-        orphan_check = {"termination_exit_code": terminated.returncode, "remaining_pids": orphan_check.stdout.split()}
-    cleanup_record = _cleanup_locked(metadata, docker=docker) if result.returncode == 124 and not retained else None
-    timeout_status = "TIMED_OUT_RETAINED" if retained else "TIMED_OUT_CLEANED" if result.returncode == 124 else None
-    record = {
-        "command": list(command), "exit_code": result.returncode,
-        "timed_out": result.returncode == 124, "stdout": result.stdout[-64_000:],
-        "stderr": result.stderr[-64_000:],
-        "input_fingerprint": metadata.get("input_fingerprint"),
-        "authorized_targets": metadata.get("authorized_targets", []),
-        "authorized_network_observed": (
-            before is not None and after is not None
-            and after["target_packets"] > before["target_packets"]
-            and after["established_packets"] > before["established_packets"]
-        ),
-        "authorized_network_target_indices": (
-            [
-                index for index, packets in enumerate(after.get("target_packets_by_index", []))
-                if index < len(before.get("target_packets_by_index", []))
-                and packets > before["target_packets_by_index"][index]
-            ]
-            if before is not None and after is not None
-            and after["established_packets"] > before["established_packets"]
-            else []
-        ),
-        "artifacts_exported": bool(cleanup_record and cleanup_record.get("artifact_export")),
-        "timeout_profile": timeout_profile, "timeout_status": timeout_status,
-        "container_retained": retained,
-        "exec_process_group_id": process_group_id,
+    ]
+    started_at = _now()
+    started = time.monotonic()
+    resolved_target = _target_identity(metadata, target_identity)
+    before_packets = firewall_packets(metadata, resolved_target, docker=docker)
+    logs = lane_root / "logs"
+    logs.mkdir(exist_ok=True)
+    stdout_path = logs / f"{receipt_id}.stdout"
+    stderr_path = logs / f"{receipt_id}.stderr"
+    combined_path = logs / f"{receipt_id}.combined"
+    candidate: str | None = None
+    timed_out = False
+    capture = bytearray()
+    digest = _NormalizedDigest()
+    try:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise SandboxError(f"required executable not found: {docker}") from exc
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None and process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, ("stdout", stdout_path))
+    selector.register(process.stderr, selectors.EVENT_READ, ("stderr", stderr_path))
+    handles = {
+        "stdout": _secure_binary_file(stdout_path),
+        "stderr": _secure_binary_file(stderr_path),
+        "combined": _secure_binary_file(combined_path),
     }
-    if orphan_check is not None:
-        record["orphan_process_check"] = orphan_check
-    if cleanup_record is not None:
-        record["cleanup"] = cleanup_record
-    challenge_root = branch_root.parents[1]
-    append_evidence(branch_root / "logs" / "commands.jsonl", "sandbox_exec", record)
-    append_evidence(challenge_root / "evidence.log", "sandbox_exec", {"branch": metadata["branch"], **record})
-    if timeout_status:
-        receipt = branch_root / "timeout-receipt.json"
-        _write_json(receipt, {
-            "schema_version": 1, "status": timeout_status, "profile": timeout_profile,
-            "command": list(command), "container": name, "recorded_at": _utc_now(),
-            "retention_ttl_seconds": int(metadata.get("timeout_retention_ttl_seconds", 21600)),
-            "orphan_process_check": orphan_check,
-            "exec_process_group_id": process_group_id,
-        })
-        progress_dir = branch_root / "progress"
-        progress_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(progress_dir / "timeout-checkpoint.json", {
-            "schema_version": 1, "type": "TIMEOUT_CHECKPOINT", "status": timeout_status,
-            "profile": timeout_profile, "command": list(command), "recorded_at": _utc_now(),
-            "next_action": "continue a bounded slice in this sandbox" if retained else "recreate the sandbox before retry",
-        })
-    return record
-
-
-def resize(
-    metadata: dict[str, object], *, cpus: float | None = None, memory: str | int | None = None,
-    docker: str = "docker", session_id: str | None = None, session_role: str | None = None,
-) -> dict[str, object]:
-    """Safely update a running sandbox and preserve the prior allocation on failure."""
-    _authorize_sandbox(metadata, session_id, session_role, "resize")
-    if cpus is None and memory is None:
-        raise SandboxError("sandbox resize requires --cpus and/or --memory")
-    if cpus is not None and cpus <= 0:
-        raise SandboxError("sandbox CPU allocation must be positive")
-    requested_memory = parse_bytes(memory) if memory is not None else None
-    if requested_memory is not None and requested_memory <= 0:
-        raise SandboxError("sandbox memory allocation must be positive")
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    with _sandbox_lock(branch_root):
-        name = _metadata_name(metadata)
-        before = _inspect_runtime(name, docker=docker)
-        labels = before.get("Config", {}).get("Labels", {}) or {}
-        if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
-            raise SandboxError("refusing resize: container labels do not match sandbox metadata")
-        host = before.get("HostConfig", {}) or {}
-        old_cpus = _host_cpus(host)
-        old_memory = int(host.get("Memory") or parse_size_bytes(str(metadata.get("resources", {}).get("memory", "1g"))))
-        usage = _container_memory_usage(name, docker=docker)
-        if requested_memory is not None and requested_memory < usage:
-            raise SandboxError(
-                f"refusing memory shrink below current usage: requested {requested_memory}, usage {usage}"
-            )
-        argv = [docker, "update"]
-        if cpus is not None:
-            argv.extend(["--cpus", str(cpus)])
-        if requested_memory is not None:
-            argv.extend(["--memory", str(requested_memory)])
-        argv.append(name)
-        result = _run(argv, timeout=60)
-        if result.returncode:
-            raise SandboxError(f"sandbox resize failed; previous allocation retained: {result.stderr.strip()}")
-        after = _inspect_runtime(name, docker=docker)
-        updated_host = after.get("HostConfig", {}) or {}
-        actual_cpus = _host_cpus(updated_host)
-        actual_memory = int(updated_host.get("Memory") or old_memory)
-        expected_cpus = cpus if cpus is not None else old_cpus
-        expected_memory = requested_memory if requested_memory is not None else old_memory
-        if abs(actual_cpus - expected_cpus) > .01 or actual_memory != expected_memory:
-            # Best-effort rollback to keep metadata and live state coherent.
-            _run([docker, "update", "--cpus", str(old_cpus), "--memory", str(old_memory), name], timeout=60)
-            raise SandboxError("sandbox resize verification failed; rolled back to previous allocation")
-        resources = dict(metadata.get("resources") or {})
-        resources["cpus"] = actual_cpus
-        resources["memory"] = str(actual_memory)
-        metadata["resources"] = resources
-        request_raw = metadata.get("resource_request")
-        request = ResourceRequest.from_mapping(request_raw if isinstance(request_raw, Mapping) else metadata)
-        allocation = {"cpus": actual_cpus, "memory_bytes": actual_memory}
-        metadata["allocation_env"] = allocation_environment(allocation, request)
-        metadata["schema_version"] = max(2, int(metadata.get("schema_version", 1)))
-        metadata_path = Path(str(metadata.get("metadata_path") or branch_root / "sandbox.json"))
-        if metadata_path.parent == branch_root:
-            _write_json(metadata_path, metadata)
-        context = branch_root / "context" / "allocation.json"
-        _write_json(context, {"schema_version": 1, "allocation": allocation, "environment": metadata["allocation_env"], "updated_at": _utc_now()})
-        context.chmod(0o444)
-        record = {
-            "container": name, "session_id": metadata.get("session_id"),
-            "before": {"cpus": old_cpus, "memory_bytes": old_memory},
-            "after": {"cpus": actual_cpus, "memory_bytes": actual_memory},
-            "memory_usage_bytes": usage, "verified": True, "at": _utc_now(),
-        }
-        append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_resize", record)
-        ledger = ResourceLedger(branch_root.parents[1])
-        if ledger.state_path.exists():
-            ledger.record_resize(str(metadata.get("session_id") or metadata.get("branch")), record)
-        return record
+    try:
+        while selector.get_map():
+            if time.monotonic() - started >= timeout:
+                timed_out = True
+                _kill_exec(name, pid_file, docker=docker)
+                process.terminate()
+            events = selector.select(timeout=0.1)
+            if not events and process.poll() is not None:
+                events = [(key, None) for key in list(selector.get_map().values())]
+            for key, _mask in events:
+                stream, _path = key.data
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                handles[stream].write(chunk)
+                handles["combined"].write(chunk)
+                digest.update(chunk)
+                capture.extend(chunk)
+                if len(capture) > MAX_CAPTURE:
+                    del capture[:-MAX_CAPTURE]
+                if candidate is None and candidate_probe is not None:
+                    candidate = candidate_probe(chunk.decode("utf-8", errors="replace"))
+                    if candidate is not None:
+                        _kill_exec(name, pid_file, docker=docker)
+            if timed_out and process.poll() is None and time.monotonic() - started > timeout + 2:
+                process.kill()
+        return_code = process.wait(timeout=5)
+    finally:
+        selector.close()
+        for handle in handles.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+    observed = capture.decode("utf-8", errors="replace")
+    after_packets = firewall_packets(metadata, resolved_target, docker=docker)
+    target_observed = (
+        resolved_target == f"challenge:{metadata['challenge_id']}"
+        or (
+            before_packets is not None and after_packets is not None
+            and after_packets > before_packets
+        )
+    )
+    receipt = {
+        "schema_version": 1,
+        "receipt_id": receipt_id,
+        "run_id": metadata["run_id"],
+        "lane_id": metadata["lane_id"],
+        "argv": list(command),
+        "argv_family": argv_family(command),
+        "exit_code": 124 if timed_out else return_code,
+        "timed_out": timed_out,
+        "observed_output": observed,
+        "output_truncated": combined_path.stat().st_size > MAX_CAPTURE,
+        "output_hash": digest.hexdigest(),
+        "target_identity": resolved_target,
+        "target_observed": target_observed,
+        "target_packets_before": before_packets,
+        "target_packets_after": after_packets,
+        "started_at": started_at,
+        "finished_at": _now(),
+        "duration_seconds": round(time.monotonic() - started, 6),
+        "stdout_artifact": str(stdout_path.relative_to(lane_root)),
+        "stderr_artifact": str(stderr_path.relative_to(lane_root)),
+        "combined_artifact": str(combined_path.relative_to(lane_root)),
+        "flag_candidate": candidate,
+    }
+    atomic_json(lane_root / "logs" / f"{receipt_id}.json", receipt)
+    return receipt
 
 
 def cleanup(
-    metadata: dict[str, object], *, docker: str = "docker",
-    session_id: str | None = None, session_role: str | None = None,
-) -> dict[str, object]:
-    _authorize_sandbox(metadata, session_id, session_role, "cleanup")
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    with _sandbox_lock(branch_root):
-        return _cleanup_locked(metadata, docker=docker)
-
-
-def _cleanup_locked(metadata: dict[str, object], *, docker: str) -> dict[str, object]:
+    metadata: Mapping[str, Any],
+    *,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
     name = _metadata_name(metadata)
-    inspect = _run([docker, "inspect", name, "--format", "{{json .Config.Labels}}"], timeout=20)
-    export_record: dict[str, object] | None = None
-    retained_exports: dict[str, object] = {}
-    export_errors: dict[str, str] = {}
-    if inspect.returncode == 0:
-        try:
-            labels = json.loads(inspect.stdout)
-        except json.JSONDecodeError as exc:
-            raise SandboxError("cannot verify sandbox labels before cleanup") from exc
-        if any(labels.get(key) != value for key, value in dict(metadata["labels"]).items()):
-            raise SandboxError("refusing cleanup: container labels do not match sandbox metadata")
-        branch_root = Path(str(metadata["branch_root"])).resolve()
-        exports = (
-            ("artifacts", branch_root / "artifacts", "/artifacts", "artifact"),
-            ("work", branch_root / "work", "/work", "work"),
-            ("evidence", branch_root / "evidence", "/evidence", "evidence"),
-        )
-        for key, destination, container_root, label in exports:
-            try:
-                exported = _export_artifacts(
-                    name, destination, docker=docker,
-                    container_root=container_root, label=label,
-                )
-                if key == "artifacts":
-                    export_record = exported
-                else:
-                    retained_exports[key] = exported
-            except Exception as exc:
-                # Try every independent tree before removing the expensive
-                # container; one malformed tree must not discard the others.
-                export_errors[key] = str(exc)
-        removed = _run([docker, "rm", "--force", name], timeout=30)
-        if removed.returncode:
-            raise SandboxError(f"sandbox cleanup failed: {removed.stderr.strip()}")
-    elif "no such object" not in inspect.stderr.casefold():
-        raise SandboxError(f"cannot inspect sandbox before cleanup: {inspect.stderr.strip() or 'unknown Docker error'}")
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    record: dict[str, object] = {
-        "removed": inspect.returncode == 0, "container": name,
-        "artifact_export": export_record, "retained_exports": retained_exports,
-    }
-    if "artifacts" in export_errors:
-        record["artifact_export_error"] = export_errors["artifacts"]
-    if export_errors:
-        record["export_errors"] = export_errors
-    append_evidence(branch_root.parents[1] / "evidence.log", "sandbox_cleanup", {"branch": metadata["branch"], **record})
-    ledger = ResourceLedger(branch_root.parents[1])
-    if ledger.state_path.exists():
-        session_id = str(metadata.get("session_id") or metadata.get("branch"))
-        resource_state = ledger.load()
-        observation = resource_state.get("observations", {}).get(session_id, {})
-        if (
-            session_id in resource_state.get("requests", {})
-            and (
-                not isinstance(observation, Mapping)
-                or observation.get("state") != "RELEASED"
-            )
-        ):
-            ledger.release(session_id, "sandbox cleanup")
-    return record
-
-
-def export_artifacts(
-    metadata: dict[str, object], *, docker: str = "docker",
-    session_id: str | None = None, session_role: str | None = None,
-) -> dict[str, object]:
-    _authorize_sandbox(metadata, session_id, session_role, "export")
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    with _sandbox_lock(branch_root):
-        name = _metadata_name(metadata)
-        record = _export_artifacts(name, branch_root / "artifacts", docker=docker)
-        record["retained_exports"] = {
-            "work": _export_artifacts(
-                name, branch_root / "work", docker=docker, container_root="/work", label="work",
-            ),
-            "evidence": _export_artifacts(
-                name, branch_root / "evidence", docker=docker, container_root="/evidence", label="evidence",
-            ),
-        }
-        append_evidence(
-            branch_root.parents[1] / "evidence.log",
-            "sandbox_export",
-            {"branch": metadata["branch"], "container": name, **record},
-        )
-        return record
-
-
-def stage_artifacts(
-    metadata: dict[str, object], source: Path, destination: str = "", *, docker: str = "docker"
-) -> dict[str, object]:
-    branch_root = Path(str(metadata["branch_root"])).resolve()
-    with _sandbox_lock(branch_root):
-        if source.is_symlink():
-            raise SandboxError("artifact staging source must not be a symlink")
-        source = source.resolve()
-        solve_root = branch_root.parents[1]
-        try:
-            source.relative_to(solve_root)
-        except ValueError as exc:
-            raise SandboxError("artifact staging source must stay inside the selected challenge workspace") from exc
-        files, total = _validate_staging_source(source)
-        relative = Path(destination)
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-            if destination:
-                raise SandboxError("artifact staging destination must be a safe relative path")
-        target = "/artifacts" + (f"/{relative.as_posix()}" if destination else "")
-        name = _metadata_name(metadata)
-        created = _run([docker, "exec", "--user", "1001:1001", name, "mkdir", "-p", "--", target], timeout=30)
-        if created.returncode:
-            raise SandboxError(f"artifact staging cannot create destination: {created.stderr.strip()}")
-        _stream_tree_to_container(source, name, target, docker=docker)
-        record = {"source": str(source), "destination": target, "files": files, "bytes": total}
-        append_evidence(
-            branch_root.parents[1] / "evidence.log", "sandbox_stage_artifacts",
-            {"branch": metadata["branch"], "container": name, **record},
-        )
-        return record
-
-
-def _sandbox_lock(branch_root: Path):
-    lock_path = branch_root / ".sandbox.lock"
-    if lock_path.is_symlink():
-        raise SandboxError("sandbox lock must not be a symlink")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    lock = os.fdopen(descriptor, "a+")
-    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-
-    class _LockContext:
-        def __enter__(self):
-            return lock
-
-        def __exit__(self, exc_type, exc, traceback):
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
-
-    return _LockContext()
-
-
-def _rollback_failed_create(spec: SandboxSpec, *, docker: str) -> None:
-    inspected = _run([docker, "inspect", spec.name, "--format", "{{json .Config.Labels}}"], timeout=20)
+    inspected = _run(runner, [docker, "inspect", name], timeout=30)
     if inspected.returncode:
-        return
+        return {"container": name, "removed": False, "already_absent": True}
     try:
-        labels = json.loads(inspected.stdout)
-    except json.JSONDecodeError:
-        return
-    if any(labels.get(key) != value for key, value in spec.runtime_labels.items()):
-        return
-    _run([docker, "rm", "--force", spec.name], timeout=30)
+        row = json.loads(inspected.stdout)[0]
+        labels = row.get("Config", {}).get("Labels", {}) or {}
+    except (json.JSONDecodeError, IndexError, TypeError) as exc:
+        raise SandboxError("Docker returned malformed sandbox inspect data") from exc
+    expected = metadata.get("labels") if isinstance(metadata.get("labels"), Mapping) else {}
+    if any(labels.get(key) != value for key, value in expected.items()):
+        raise SandboxError("refusing to remove container whose labels do not match metadata")
+    normalized = _run(
+        runner,
+        [
+            docker, "exec", "--user", "0:0", name, "sh", "-c",
+            "chown -R \"$1:$2\" /work /evidence /artifacts && "
+            "find /work /evidence /artifacts -type d -exec chmod u+rwx {} +",
+            "ctf-os-finalize", str(os.getuid()), str(os.getgid()),
+        ],
+        timeout=60,
+    )
+    result = _run(runner, [docker, "rm", "--force", name], timeout=30)
+    if result.returncode:
+        raise SandboxError(f"sandbox cleanup failed: {result.stderr.strip()}")
+    return {
+        "container": name,
+        "removed": True,
+        "already_absent": False,
+        "host_ownership_normalized": normalized.returncode == 0,
+        "normalization_warning": normalized.stderr.strip() if normalized.returncode else None,
+    }
+
+
+def probe_service_connectivity(
+    metadata: Mapping[str, Any], *, docker: str = "docker"
+) -> dict[str, Any]:
+    endpoints = [str(value) for value in metadata.get("service_endpoints", [])]
+    if not endpoints:
+        raise SandboxError("service-attached sandbox has no declared endpoint")
+    results: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        parsed = urlsplit(endpoint if "://" in endpoint else f"tcp://{endpoint}")
+        if not parsed.hostname or not parsed.port:
+            raise SandboxError(f"service endpoint is invalid: {endpoint}")
+        code = (
+            "import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),5); "
+            "s.close(); print('CONNECTED')"
+        )
+        result = subprocess.run(
+            [
+                docker, "exec", "--user", "1001:1001", str(metadata["name"]),
+                "python3", "-c", code, parsed.hostname, str(parsed.port),
+            ],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode or "CONNECTED" not in result.stdout:
+            raise SandboxError(
+                f"Root sandbox cannot reach prepared challenge service {endpoint}: "
+                f"{(result.stderr or result.stdout).strip()[-2048:]}"
+            )
+        results.append({"endpoint": endpoint, "connected": True})
+    return {"connected": True, "endpoints": results}
+
+
+def argv_family(command: Sequence[str]) -> str:
+    executable = Path(command[0]).name.casefold()
+    stable: list[str] = [executable]
+    for value in command[1:4]:
+        if value.startswith("-"):
+            stable.append(value.split("=", 1)[0])
+        elif "/" in value or "." in Path(value).name:
+            stable.append(Path(value).suffix.casefold() or "path")
+        else:
+            stable.append("arg")
+    return ":".join(stable)
+
+
+def firewall_packets(
+    metadata: Mapping[str, Any], target_identity: str, *, docker: str = "docker"
+) -> int | None:
+    """Return packets accepted by the exact target rule, or None for local challenge output."""
+
+    if target_identity == f"challenge:{metadata.get('challenge_id')}":
+        return None
+    address: str | None = None
+    port: int | None = None
+    for row in metadata.get("authorized_targets", []):
+        if isinstance(row, Mapping) and row.get("declared") == target_identity:
+            address = str(row.get("ip") or "")
+            try:
+                port = int(row.get("port"))
+            except (TypeError, ValueError):
+                return 0
+            break
+    if port is None and target_identity in metadata.get("service_endpoints", []):
+        parsed = urlsplit(target_identity if "://" in target_identity else f"tcp://{target_identity}")
+        try:
+            port = parsed.port
+        except ValueError:
+            return 0
+    if port is None:
+        return 0
+    name = _metadata_name(metadata)
+    total = 0
+    for tool in ("iptables-save", "ip6tables-save"):
+        try:
+            result = subprocess.run(
+                [docker, "exec", "--user", "0:0", name, tool, "-c"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return 0
+        if result.returncode:
+            return 0
+        for line in result.stdout.splitlines():
+            counter = re.match(r"^\[([0-9]+):[0-9]+\]\s+", line)
+            if not counter or f"--dport {port}" not in line:
+                continue
+            if address and f"-d {address}/" not in line:
+                continue
+            total += int(counter.group(1))
+    return total
+
+
+def _prepare_lane_root(spec: SandboxSpec) -> None:
+    validate_identifier(spec.lane_id, "lane id")
+    if spec.lane_root.is_symlink():
+        raise SandboxError("lane root must not be a symlink")
+    spec.lane_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    for name in ("work", "evidence", "artifacts"):
+        path = spec.lane_root / name
+        path.mkdir(mode=0o777)
+        # mkdir honors the controller umask; the container uid is deliberately
+        # unrelated to the host user, while the 0700 lane parent keeps these
+        # mounts private from other host users.
+        path.chmod(0o777)
+    (spec.lane_root / "logs").mkdir(mode=0o700)
+    (spec.lane_root / "context").mkdir(mode=0o755)
+    context = {
+        "schema_version": 1,
+        "run_id": spec.run_id,
+        "challenge_id": spec.challenge_id,
+        "lane_id": spec.lane_id,
+        "input": {"path": "/challenge", "read_only": True, "fingerprint": spec.input_fingerprint},
+        "paths": {"work": "/work", "evidence": "/evidence", "artifacts": "/artifacts"},
+        "declared_targets": [row.to_dict() for row in spec.targets],
+        "service_endpoints": list(spec.service_endpoints),
+    }
+    atomic_json(spec.lane_root / "context" / "lane.json", context)
+    (spec.lane_root / "context" / "lane.json").chmod(0o444)
 
 
 def _validate_spec(spec: SandboxSpec) -> None:
-    if not spec.source.is_dir() or spec.source.is_symlink():
-        raise SandboxError(f"prepared challenge input is missing or unsafe: {spec.source}")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", spec.branch):
-        raise SandboxError("branch id must contain only letters, numbers, dot, underscore or dash")
-    for label, value in (("session id", spec.session_id), ("parent session id", spec.parent_session_id)):
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
-            raise SandboxError(f"{label} is invalid")
-    if spec.session_role not in {"sol", "child"}:
-        raise SandboxError("session role must be sol or child")
-    if spec.session_role == "child" and spec.session_id == spec.parent_session_id:
-        raise SandboxError("child session id must differ from its parent session id")
-    if spec.gpu_device is not None and not spec.gpu_enabled:
-        raise SandboxError("GPU device selection requires GPU passthrough to be enabled")
-    if spec.gpu_backend not in {None, "nvidia"}:
-        raise SandboxError("only the NVIDIA GPU backend is supported")
-    if spec.gpu_fallback not in {None, "CPU"}:
-        raise SandboxError("GPU fallback must be CPU when present")
-    if spec.cpus is None or spec.pids is None or spec.cpus <= 0 or spec.pids < 1:
-        raise SandboxError("sandbox CPU and PID limits must be positive")
-    try:
-        parse_size_bytes(str(spec.memory))
-        parse_size_bytes(str(spec.storage))
-    except ResourceError as exc:
-        raise SandboxError(str(exc)) from exc
-    if spec.targets and (spec.service_network or spec.local_endpoints):
-        raise SandboxError("organizer remote targets and local challenge service endpoints must use separate sandboxes")
-    if spec.service_network:
-        if not re.fullmatch(r"ctf-os-net-[a-z0-9][a-z0-9_.-]{0,100}", spec.service_network):
-            raise SandboxError("local challenge network must use a ctf-os-net-* scoped name")
-        if not spec.local_endpoints:
-            raise SandboxError("local challenge network requires at least one declared local endpoint")
-    elif spec.local_endpoints:
-        raise SandboxError("local challenge endpoints require a scoped service network")
-    for endpoint in spec.local_endpoints:
-        if not endpoint or len(endpoint) > 512 or any(character in endpoint for character in "\r\n\0"):
-            raise SandboxError("local challenge endpoint is invalid")
+    for value, label in ((spec.run_id, "run id"), (spec.challenge_id, "challenge id"), (spec.lane_id, "lane id")):
+        validate_identifier(value, label)
+    if spec.source.is_symlink() or not spec.source.is_dir():
+        raise SandboxError("prepared challenge input is missing or unsafe")
+    if spec.source.stat().st_mode & 0o222:
+        raise SandboxError("prepared challenge input must be read-only")
+    if spec.targets and spec.service_network:
+        raise SandboxError("a sandbox cannot join both a remote and challenge-service network")
+    if bool(spec.service_network) != bool(spec.service_endpoints):
+        raise SandboxError("service network and endpoints must be supplied together")
+    if spec.service_network and not re.fullmatch(r"ctf-os-net-[a-z0-9_.-]{1,100}", spec.service_network):
+        raise SandboxError("service network is not race-scoped")
+    parse_size_bytes(resource_profile(spec.resource_profile).storage)
 
 
-def _prepare_branch_root(spec: SandboxSpec) -> None:
-    """Create durable, worker-private host directories before Docker mounts them."""
-    if spec.branch_root.is_symlink():
-        raise SandboxError("worker root must not be a symlink")
-    spec.branch_root.mkdir(parents=True, exist_ok=True)
-    context_payload = {
-        "schema_version": 1,
-        "session_id": spec.session_id,
-        "parent_session_id": spec.parent_session_id,
-        "challenge_id": spec.challenge_id,
-        "role": spec.session_role,
-        "input": {"path": "/challenge", "read_only": True, "fingerprint": spec.input_fingerprint},
-        "work": {"path": "/work", "private": True},
-        "evidence": {"path": "/evidence", "private": True},
-        "managed_service": dict(spec.service_context or {}),
-    }
-    for name in ("work", "evidence", "artifacts", "logs", "context"):
-        path = spec.branch_root / name
-        if path.is_symlink():
-            raise SandboxError(f"worker {name} path must not be a symlink")
-        path.mkdir(exist_ok=True)
-        # These paths are mounted only into this worker container. World write is
-        # needed because the unprivileged container uid need not match the host uid.
-        path.chmod(0o777 if name in {"work", "evidence", "artifacts"} else (0o755 if name == "context" else 0o700))
-    context_file = spec.branch_root / "context" / "session.json"
-    if context_file.is_symlink() or (context_file.exists() and not context_file.is_file()):
-        raise SandboxError("worker session context path is unsafe")
-    if context_file.exists():
-        context_file.chmod(0o600)
-    _write_json(context_file, context_payload)
-    context_file.chmod(0o444)
+def _target_identity(metadata: Mapping[str, Any], requested: str | None) -> str:
+    identities = [str(value) for value in metadata.get("target_identities", [])]
+    if requested is not None:
+        if requested not in identities:
+            raise SandboxError("target identity was not declared for this sandbox")
+        return requested
+    if len(identities) == 1:
+        return identities[0]
+    if identities:
+        return "UNSPECIFIED_DECLARED_TARGET"
+    return f"challenge:{metadata['challenge_id']}"
 
 
-def _metadata_name(metadata: dict[str, object]) -> str:
+def _metadata_name(metadata: Mapping[str, Any]) -> str:
     name = str(metadata.get("name", ""))
-    if not re.fullmatch(r"ctf-os-[a-zA-Z0-9_.-]+", name):
-        raise SandboxError("invalid sandbox metadata/container name")
+    if not re.fullmatch(r"ctf-os-[a-z0-9_.-]{1,110}", name):
+        raise SandboxError("invalid sandbox container identity")
     return name
 
 
-def _authorize_sandbox(
-    metadata: Mapping[str, object], session_id: str | None, session_role: str | None, action: str,
-) -> None:
-    """Enforce worker ownership when a model-facing caller identity is supplied."""
-    if session_id is None and session_role is None:
-        return  # Backwards-compatible trusted in-process controller path.
-    if session_role not in {"sol", "child"} or not session_id:
-        raise SandboxError("sandbox caller must provide a valid session id and role")
-    owner = str(metadata.get("session_id", ""))
-    parent = str(metadata.get("parent_session_id", ""))
-    if session_role == "sol":
-        if session_id != parent:
-            raise SandboxError(
-                f"DENIED_SANDBOX_ACCESS: Sol session {session_id} does not own worker parent scope {parent}"
-            )
-        return
-    if session_id != owner:
-        raise SandboxError(
-            f"DENIED_SANDBOX_ACCESS: child session {session_id} may not {action} worker sandbox owned by {owner}"
-        )
+def _kill_exec(name: str, pid_file: str, *, docker: str) -> None:
+    subprocess.run(
+        [
+            docker, "exec", "--user", "1001:1001", name, "sh", "-c",
+            "p=$(cat \"$1\" 2>/dev/null || true); [ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null || true",
+            "ctf-os-kill", pid_file,
+        ],
+        capture_output=True, timeout=10, check=False,
+    )
 
 
-def _run(argv: Sequence[str], timeout: int) -> subprocess.CompletedProcess[str]:
+def _secure_binary_file(path: Path):
+    if path.is_symlink() or path.exists():
+        raise SandboxError(f"command log path is unsafe: {path}")
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    return os.fdopen(descriptor, "wb")
+
+
+class _NormalizedDigest:
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256()
+        self._pending_cr = False
+
+    def update(self, chunk: bytes) -> None:
+        data = chunk
+        if self._pending_cr:
+            data = b"\r" + data
+            self._pending_cr = False
+        if data.endswith(b"\r"):
+            data = data[:-1]
+            self._pending_cr = True
+        self._digest.update(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+
+    def hexdigest(self) -> str:
+        if self._pending_cr:
+            self._digest.update(b"\n")
+            self._pending_cr = False
+        return self._digest.hexdigest()
+
+
+def _run(
+    runner: Callable[..., subprocess.CompletedProcess[str]], argv: Sequence[str], *, timeout: int
+) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return subprocess.CompletedProcess(list(argv), 124, stdout, stderr + "\ncommand timed out")
+        return runner(list(argv), capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         raise SandboxError(f"required executable not found: {argv[0]}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(f"controller command failed: {exc}") from exc
 
 
-def _inspect_runtime(name: str, *, docker: str) -> dict[str, object]:
-    result = _run([docker, "inspect", name], timeout=30)
-    if result.returncode:
-        raise SandboxError(f"cannot inspect sandbox runtime: {result.stderr.strip()}")
-    try:
-        payload = json.loads(result.stdout)
-        raw = payload[0]
-    except (json.JSONDecodeError, IndexError, TypeError) as exc:
-        raise SandboxError("Docker returned malformed sandbox inspect data") from exc
-    if not isinstance(raw, dict):
-        raise SandboxError("Docker returned malformed sandbox inspect data")
-    return raw
-
-
-def _host_cpus(host: Mapping[str, object]) -> float:
-    nano = int(host.get("NanoCpus") or 0)
-    if nano:
-        return nano / 1_000_000_000
-    quota = int(host.get("CpuQuota") or 0)
-    period = int(host.get("CpuPeriod") or 0)
-    return quota / period if quota and period else 0.0
-
-
-def _container_memory_usage(name: str, *, docker: str) -> int:
-    result = _run([docker, "stats", "--no-stream", "--format", "{{json .}}", name], timeout=30)
-    if result.returncode or not result.stdout.strip():
-        raise SandboxError("cannot measure current memory usage before resize")
-    try:
-        raw = json.loads(result.stdout.splitlines()[0])
-    except json.JSONDecodeError as exc:
-        raise SandboxError("Docker returned malformed memory usage before resize") from exc
-    text = str(raw.get("MemUsage") or raw.get("Mem Usage") or "")
-    usage = text.split("/", 1)[0].strip()
-    match = re.fullmatch(r"([0-9.]+)\s*([kmgt]?i?b|b)", usage, re.I)
-    if not match:
-        raise SandboxError("Docker did not report current memory usage before resize")
-    unit = match.group(2).casefold().replace("ib", "").replace("b", "")
-    return int(float(match.group(1)) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[unit])
-
-
-def _metadata_allocation_env(metadata: Mapping[str, object]) -> dict[str, str]:
-    stored = metadata.get("allocation_env")
-    if isinstance(stored, Mapping) and stored:
-        return {str(key): str(value) for key, value in stored.items()}
-    resources = metadata.get("resources") if isinstance(metadata.get("resources"), Mapping) else {}
-    request_raw = metadata.get("resource_request")
-    request = ResourceRequest.from_mapping(request_raw if isinstance(request_raw, Mapping) else metadata)
-    return allocation_environment({
-        "cpus": float(resources.get("cpus") or request.preferred_cpus),
-        "memory_bytes": parse_bytes(resources.get("memory") or request.preferred_memory_bytes),
-    }, request)
-
-
-def _utc_now() -> str:
+def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _firewall_counters(container: str, docker: str, targets: list[object]) -> dict[str, object]:
-    ipv4 = _run([docker, "exec", "--user", "0:0", container, "iptables-save", "-c"], timeout=10)
-    ipv6 = _run([docker, "exec", "--user", "0:0", container, "ip6tables-save", "-c"], timeout=10)
-    if ipv4.returncode or ipv6.returncode:
-        raise SandboxError("cannot read authorized firewall counters for remote verification")
-    target_packets = 0
-    target_packets_by_index = [0 for _target in targets]
-    established_packets = 0
-    rules = ipv4.stdout.splitlines() + ipv6.stdout.splitlines()
-    for line in rules:
-        counter = re.match(r"^\[([0-9]+):[0-9]+\]\s+", line)
-        if not counter:
-            continue
-        packets = int(counter.group(1))
-        if "--ctstate RELATED,ESTABLISHED" in line or "--ctstate ESTABLISHED,RELATED" in line:
-            established_packets += packets
-        for index, target in enumerate(targets):
-            if not isinstance(target, dict):
-                continue
-            address = str(target.get("ip", ""))
-            port = str(target.get("port", ""))
-            if address and f"--dport {port}" in line and (f"-d {address}/32" in line or f"-d {address}/128" in line):
-                target_packets += packets
-                target_packets_by_index[index] += packets
-                break
-    return {
-        "target_packets": target_packets,
-        "target_packets_by_index": target_packets_by_index,
-        "established_packets": established_packets,
-    }
-
-
-def _export_artifacts(
-    container: str, destination: Path, *, docker: str,
-    container_root: str = "/artifacts", label: str = "artifact",
-) -> dict[str, object]:
-    if destination.is_symlink():
-        raise SandboxError("artifact destination must not be a symlink")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        for existing in destination.rglob("*"):
-            if existing.is_symlink() or (not existing.is_dir() and not existing.is_file()):
-                raise SandboxError(f"artifact destination contains a link/special file: {existing}")
-    staging = Path(tempfile.mkdtemp(prefix=f".{label}-", dir=destination.parent))
-    try:
-        try:
-            result = subprocess.run(
-                [docker, "exec", "--user", "1001:1001", container, "tar", "-C", container_root, "-cf", "-", "."],
-                capture_output=True, timeout=60, check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            raise SandboxError(f"{label} export failed: {exc}") from exc
-        if result.returncode:
-            raise SandboxError(f"{label} export failed: {result.stderr.decode(errors='replace').strip()}")
-        files = 0
-        total = 0
-        members = 0
-        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r|") as archive:
-            for member in archive:
-                members += 1
-                if members > 2_000:
-                    raise SandboxError(f"{label} export exceeds member limit")
-                relative_text = member.name.removeprefix("./")
-                if relative_text in {"", "."}:
-                    continue
-                relative = Path(relative_text)
-                if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-                    raise SandboxError(f"{label} export rejected unsafe path: {member.name!r}")
-                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                    raise SandboxError(f"{label} export rejected link/special file: {member.name!r}")
-                target = staging / relative
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                if not member.isfile():
-                    raise SandboxError(f"{label} export rejected unsupported member: {member.name!r}")
-                files += 1
-                total += member.size
-                if files > 2_000 or total > 512 * 1024 * 1024:
-                    raise SandboxError(f"{label} export exceeds file or byte limit")
-                source = archive.extractfile(member)
-                if source is None:
-                    raise SandboxError(f"{label} export cannot read member: {member.name!r}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with source, target.open("xb") as output:
-                    shutil.copyfileobj(source, output, length=1024 * 1024)
-        if files > 2_000 or total > 512 * 1024 * 1024:
-            raise SandboxError(f"{label} export exceeds file or byte limit")
-        old = destination.parent / f".{label}-old"
-        if old.exists():
-            if old.is_symlink():
-                raise SandboxError("stale artifact backup is a symlink")
-            shutil.rmtree(old)
-        if destination.exists():
-            os.replace(destination, old)
-        try:
-            os.replace(staging, destination)
-        except Exception:
-            if old.exists() and not destination.exists():
-                os.replace(old, destination)
-            raise
-        if old.exists():
-            shutil.rmtree(old)
-        return {"destination": str(destination), "files": files, "bytes": total}
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
-
-
-def _validate_staging_source(source: Path) -> tuple[int, int]:
-    if not source.is_dir():
-        raise SandboxError(f"artifact staging source is not a directory: {source}")
-    files = 0
-    total = 0
-    for path in source.rglob("*"):
-        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
-            raise SandboxError(f"artifact staging rejected link/special file: {path}")
-        if path.is_file():
-            files += 1
-            total += path.stat().st_size
-            if files > 2_000 or total > 512 * 1024 * 1024:
-                raise SandboxError("artifact staging exceeds file or byte limit")
-    return files, total
-
-
-def _stream_tree_to_container(source: Path, container: str, target: str, *, docker: str) -> None:
-    """Stream a checked tree into the tmpfs; `docker cp` rejects read-only rootfs."""
-    argv = [
-        docker, "exec", "--interactive", "--user", "1001:1001", container,
-        "tar", "--no-same-owner", "--no-same-permissions", "-C", target, "-xf", "-",
-    ]
-    try:
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except FileNotFoundError as exc:
-        raise SandboxError(f"required executable not found: {docker}") from exc
-    assert process.stdin is not None
-    try:
-        with tarfile.open(fileobj=process.stdin, mode="w|") as archive:
-            for path in sorted(source.rglob("*"), key=lambda item: item.relative_to(source).as_posix()):
-                archive.add(path, arcname=path.relative_to(source).as_posix(), recursive=False)
-        process.stdin.close()
-        stderr = process.stderr.read() if process.stderr is not None else b""
-        code = process.wait(timeout=120)
-    except (BrokenPipeError, subprocess.TimeoutExpired, OSError) as exc:
-        process.kill()
-        process.wait()
-        raise SandboxError(f"artifact staging stream failed: {exc}") from exc
-    if code:
-        raise SandboxError(f"artifact staging copy failed: {stderr.decode(errors='replace').strip()}")
-
-
-def _write_json(path: Path, payload: object) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

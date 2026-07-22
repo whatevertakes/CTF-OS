@@ -29,7 +29,7 @@ def extract_archive(archive: Path, destination: Path, limits: ArchiveLimits = Ar
         return _extract_zip(archive, destination, limits)
     if lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2")):
         return _extract_tar(archive, destination, limits)
-    raise ArchiveError(f"unsupported archive format for safe intake extraction: {archive.name}")
+    raise ArchiveError(f"unsupported archive format for safe challenge extraction: {archive.name}")
 
 
 def _safe_relative(name: str) -> Path:

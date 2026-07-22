@@ -10,7 +10,7 @@ build/
 dist/
 *.egg-info/
 
-# Generated intake/solve state and user-supplied contest inputs.
+# Generated race state and user-supplied contest inputs.
 incoming/
 output/*
 !output/.gitkeep
@@ -18,7 +18,6 @@ output/*
 *.sqlite
 *.sqlite3
 *.log
-benchmarks/results/
 /config.yaml
 /local.*.yaml
 

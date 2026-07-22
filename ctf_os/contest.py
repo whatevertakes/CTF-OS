@@ -1,4 +1,4 @@
-"""Parse the internal Intake manifest: ``incoming/<contest>/contest.md``."""
+"""Parse and select one organizer-supplied contest challenge."""
 
 from __future__ import annotations
 
@@ -10,11 +10,20 @@ import re
 import unicodedata
 from pathlib import Path
 
-from .categories import canonical_category, playbook_category
+from .categories import canonical_category
 
 
 class ContestError(ValueError):
     pass
+
+
+class SelectionError(ValueError):
+    def __init__(self, message: str, *, candidates: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.candidates = candidates
+
+    def payload(self) -> dict[str, object]:
+        return {"error": str(self), "candidates": list(self.candidates)}
 
 
 def safe_name(value: str, *, fallback: str = "item") -> str:
@@ -62,10 +71,6 @@ class ChallengeSpec:
     def key(self) -> str:
         return f"{self.category}/{self.name}"
 
-    @property
-    def playbook_category(self) -> str:
-        return playbook_category(self.category)
-
     def to_dict(self) -> dict[str, object]:
         return {
             "number": self.number, "id": self.id, "selector": f"{self.number:02d}",
@@ -75,7 +80,6 @@ class ChallengeSpec:
             "remotes": list(self.remotes), "flag_format": self.flag_format,
             "flag_pattern": self.flag_pattern,
             "input_profile": self.input_profile,
-            "playbook_category": self.playbook_category,
             "warnings": [warning.to_dict() for warning in self.warnings],
         }
 
@@ -277,6 +281,29 @@ def select_contest(contests: tuple[ContestManifest, ...], selector: str | None) 
         return matches[0]
     candidates = ", ".join(c.name for c in (matches or contests)) or "none"
     raise ContestError(f"contest selection is ambiguous or missing; candidates: {candidates}")
+
+
+def resolve_selector(challenges: tuple[ChallengeSpec, ...], selector: str) -> ChallengeSpec:
+    if "\n" in selector or "\r" in selector:
+        raise SelectionError("challenge selector must be one exact line")
+    raw = unicodedata.normalize("NFKC", selector).strip()
+    number = re.fullmatch(r"0*([1-9][0-9]*)\s*(?:번(?:\s*문제)?)?", raw)
+    if number:
+        wanted = int(number.group(1))
+        matches = [challenge for challenge in challenges if challenge.number == wanted]
+    else:
+        folded = raw.casefold()
+        exact = [
+            challenge for challenge in challenges
+            if challenge.key.casefold() == folded or challenge.id.casefold() == folded
+        ]
+        matches = exact or [challenge for challenge in challenges if challenge.name.casefold() == folded]
+    if len(matches) == 1:
+        return matches[0]
+    candidates = tuple(f"{challenge.number:02d} {challenge.key}" for challenge in (matches or challenges))
+    if not matches:
+        raise SelectionError(f"challenge selector did not match: {selector!r}", candidates=candidates)
+    raise SelectionError(f"ambiguous challenge selector: {selector!r}", candidates=candidates)
 
 
 def _normalize_key(value: str) -> str:

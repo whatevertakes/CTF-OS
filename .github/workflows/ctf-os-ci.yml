@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    name: CTF-OS / first-to-flag engine
+    name: CTF-OS / verified race engine
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -22,21 +22,13 @@ jobs:
       - run: uv sync --frozen
       - name: Full pytest suite
         run: uv run pytest -q
-      - name: First-to-flag integration contract
-        run: uv run pytest -q tests/test_first_to_flag.py tests/test_agent_contracts.py
+      - name: Race integration contract
+        run: uv run pytest -q tests/test_prepare_images.py tests/test_race_bootstrap.py tests/test_flag_fastpath.py
       - name: Compile Python sources and tests
-        run: python -m compileall -q ctf_os tests
+        run: uv run python -m compileall -q ctf_os tests
+      - name: CLI and package smoke
+        run: |
+          uv run python -m ctf_os.agent_tools --help
+          uv build
       - name: Patch whitespace validation
         run: git diff --check
-
-  package-build:
-    name: CTF-OS / package-build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --frozen
-      - run: uv build

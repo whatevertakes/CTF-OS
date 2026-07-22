@@ -1,153 +1,168 @@
 # CTF-OS
 
-CTF-OS is a one-challenge, Sol-native first-to-flag environment for authorized
-CTFs. It preserves challenge/attempt isolation, read-only inputs, mandatory
-category sandboxes, declared-target scope, process/GPU resources, manual
-submission, and manual Claude handoff.
+허가된 CTF 문제 하나를 준비하고, 격리된 sandbox에서 풀이 명령을 실행하는 도구다. 플래그 제출은 자동화하지 않는다.
 
-```text
-prepare selected challenge
-→ create/prove Root category sandbox
-→ Root Sol xhigh attacks through sandbox-exec
-→ optional 0–3 sandbox-backed Sol/Terra/Luna native workers
-→ actual commands, artifacts, and attack mutation
-→ declared remote
-→ first valid target-observed flag
-→ sibling cancellation and human submission
-```
+## 1. 대회 전에 준비하기
 
-There is one live Solve engine. The selected challenge owns the machine and
-session until a flag, the 90-minute cutoff, or a Claude handoff. Challenge tools
-never run directly on the host.
-
-## Setup
+Docker와 `uv`가 설치된 환경에서 의존성과 category image를 준비한다.
 
 ```bash
 uv sync --frozen
-bash sandbox/build-images.sh
+sandbox/build-images.sh
 uv run python -m ctf_os.agent_tools doctor
 ```
 
-`doctor` checks every category image and its required tools. A Solve does not
-silently fall back to host tools when an image or Docker runtime is unavailable.
+풀이 중에는 image를 새로 빌드하거나 내려받지 않는다. `doctor`가 실패하면 대회 전에 원인을 해결한다.
 
-## Root Solve flow
+## 2. 문제 파일 배치하기
 
-Initialize a contest workspace if needed, then prepare only the selected problem:
+대회 입력은 `incoming/<대회>/` 아래에 둔다.
 
-```bash
-uv run python -m ctf_os.agent_tools init-contest 'My CTF 2026'
-uv run python -m ctf_os.agent_tools prepare-challenge 'web/Challenge' --contest 'My CTF 2026'
+```text
+incoming/
+└── Demo CTF/
+    ├── contest.md
+    └── web/
+        └── Example/
+            ├── app.py
+            └── Dockerfile
 ```
 
-Preparation returns direct attack context and zero native workers. It
-inspects local images without pulling and automatically reuses or creates the
-Root sandbox. The recommended category image is preferred and
-`ctf-os-sandbox:base` is the fallback. A resource-admission failure gets one
-bounded retry with the `light` profile. `root_sandbox.exec_command_prefix` is
-the immediate execution entry point when `root_sandbox.status` is `READY`:
+`contest.md` 예시:
+
+```markdown
+# 대회명: Demo CTF
+- 플래그 패턴: \ACTF\{[^}\r\n]+\}\Z
+
+### web/Example
+- 설명: Example challenge
+- 원격: https://example.invalid/
+```
+
+원격 주소가 여러 개면 `- 원격:`을 여러 번 적는다. 문제별 플래그 형식이나 패턴은 해당 문제 항목에 따로 적을 수 있다.
+
+## 3. 문제 하나 준비하기
 
 ```bash
-# Append the real command to the prefix returned by prepare-challenge, for example:
+uv run python -m ctf_os.agent_tools race-prepare \
+  'web/Example' --contest 'Demo CTF'
+```
+
+명령은 JSON으로 준비 결과를 반환한다. 다음 두 값을 먼저 확인한다.
+
+```text
+attack_ready: true
+root_sandbox.status: READY
+```
+
+결과의 `root_sandbox.metadata_path`가 이후 명령에 사용할 sandbox metadata 경로다. 별도의 sandbox 생성 명령은 필요 없다.
+
+## 4. 풀이 명령 실행하기
+
+문제 파일 확인, 분석기, 컴파일러, 스크립트와 원격 요청은 모두 `sandbox-exec`로 실행한다.
+
+```bash
 uv run python -m ctf_os.agent_tools sandbox-exec \
-  --metadata '<run_root>/workers/root/sandbox.json' \
-  --session-id sol-main --session-role sol --parent-session-id sol-main \
-  -- file /challenge/app.py
+  --metadata '<root_sandbox.metadata_path>' -- \
+  file /challenge/app.py
 ```
 
-The decision and recovery details are persisted in `<run>/ROOT-SANDBOX.json` and
-included as `execution_environment` in `SOLVE-LAUNCH.json`. If neither image is
-available, preparation does not run challenge artifacts on the host; it returns
-the exact `sandbox/build-images.sh <profile> base` command. If a managed local
-service is not running, start it with the controller commands and recover the
-Root sandbox with `sandbox-create --branch root --session-role sol --service`.
-Use `--no-auto-sandbox` only when intentionally managing the Root sandbox
-manually.
-
-Every analyzer, debugger, compiler, script, exploit, and remote request runs
-through the returned metadata. Inside the image, `/challenge` is read-only,
-`/work` is mutable, and durable output goes to `/artifacts`. Host execution is
-reserved for CTF-OS controller commands.
-
-## Sandbox-backed native workers
-
-Root begins its own attack immediately through the ready sandbox. When useful,
-Root creates one optional packet:
+원격 요청에는 `contest.md`에 적은 값을 그대로 `--target-identity`로 전달한다.
 
 ```bash
-uv run python -m ctf_os.agent_tools worker-spawn-packet 'web/Challenge' \
-  --contest 'My CTF 2026' --model-profile terra-high --role builder \
-  --context-mode directed --task 'Turn the current request path into remote exploit.py'
-```
-
-Profiles are `sol-xhigh` for a new attack mechanism, `terra-high` for an
-executable artifact, and `luna-high` for bounded mechanical work. A packet does
-not start a model. Root reads its `lane_id`, `agent_profile`,
-`spawn_agent_args`, and `worker_paths.metadata_path`, creates and probes the
-lane sandbox, and only then calls native `spawn_agent`:
-
-```bash
-uv run python -m ctf_os.agent_tools sandbox-create 'web/Challenge' \
-  --contest 'My CTF 2026' --branch terra-1 \
-  --session-id terra-1 --session-role child --parent-session-id sol-main
-
 uv run python -m ctf_os.agent_tools sandbox-exec \
-  --metadata '<run_root>/workers/terra-1/sandbox.json' \
-  --session-id terra-1 --session-role child --parent-session-id sol-main \
-  -- true
+  --metadata '<root_sandbox.metadata_path>' \
+  --target-identity 'https://example.invalid/' -- \
+  curl -fsS https://example.invalid/
 ```
 
-Root passes the packet's `agent_profile` and `spawn_agent_args` to native
-`spawn_agent` with `fork_turns="none"`, then records the returned identity:
+긴 셸이나 원격 연결은 persistent session을 사용한다.
 
 ```bash
-uv run python -m ctf_os.agent_tools worker-spawn-confirm 'web/Challenge' \
-  --contest 'My CTF 2026' --lane terra-1 --native-session '<thread-id>'
+uv run python -m ctf_os.agent_tools session-open \
+  --metadata '<root_sandbox.metadata_path>' \
+  --session solve-shell --kind shell -- /bin/bash
+
+uv run python -m ctf_os.agent_tools session-send \
+  --metadata '<root_sandbox.metadata_path>' \
+  --session solve-shell --data $'ls -la /challenge\n' --timeout 10
+
+uv run python -m ctf_os.agent_tools session-read \
+  --metadata '<root_sandbox.metadata_path>' \
+  --session solve-shell --limit 65536 --timeout 2
+
+uv run python -m ctf_os.agent_tools session-close \
+  --metadata '<root_sandbox.metadata_path>' \
+  --session solve-shell
 ```
 
-Only a lane with both a live category sandbox and an actual native identity is a
-running attack worker. Root plus at most three native children keeps model
-concurrency at four. Each worker executes exclusively through its own metadata
-path and exports durable artifacts before sharing them.
+설치된 도구는 필요할 때 조회한다.
 
-## Events, replacement, and cleanup
+```bash
+uv run python -m ctf_os.agent_tools list-tools \
+  --metadata '<root_sandbox.metadata_path>'
+uv run python -m ctf_os.agent_tools tool-help gdb \
+  --metadata '<root_sandbox.metadata_path>'
+uv run python -m ctf_os.agent_tools tool-version gdb \
+  --metadata '<root_sandbox.metadata_path>'
+```
 
-`SWARM.json` holds compact attempt/worker state and `ATTACK_EVENTS.jsonl` holds
-post-execution facts. `sandbox-exec` records completed commands best-effort;
-event-write failure cannot block an already completed attack.
+## 5. 병렬 worker 준비하기
 
-`worker-status` exposes compact real-output history. Root may interrupt an
-unproductive worker, confirm the stop, export useful artifacts, clean its
-sandbox, and create a fresh category sandbox for a replacement. Python does not
-score role quality.
+필요한 경우 최대 세 lane을 한 번에 준비한다. 각 lane에는 서로 다른 `attack_family`와 구체적인 작업을 지정한다.
 
-After minute 60, `worker-endgame` may replace one qualified worker with
-`ctf_sol_max`. Qualification requires an executable partial path, two actual
-attack outputs, an exact non-environment reasoning blocker, and a concrete next
-attack. Max also receives a live category sandbox before native spawn. The lease
-is ten minutes or two attacks. The 90-minute cutoff writes
-`artifacts/TIMEOUT_HANDOFF.md`, returns cancel targets, cleans runtime resources,
-and never extends.
+```bash
+uv run python -m ctf_os.agent_tools race-bootstrap \
+  'web/Example' --contest 'Demo CTF' --lanes-json '[
+    {
+      "model_profile": "sol-xhigh",
+      "role": "alternate attacker",
+      "task": "test protocol state transitions",
+      "context_mode": "fresh",
+      "attack_family": "protocol-state"
+    }
+  ]'
+```
 
-## Flag and isolation
+반환된 각 lane의 `spawn_agent_args`로 native worker를 시작하고, 실제 thread ID를 기록한다.
 
-A usable payload or meaningful local response is enough to attack the declared
-remote. `flag-found` accepts only a format-valid non-placeholder candidate that
-appears in actual target output with an exact executed command. It chooses the
-first winner and returns native sibling cancel targets. CTF-OS never submits;
-`submission-result` records human `wrong` or `accepted` feedback.
+```bash
+uv run python -m ctf_os.agent_tools race-spawn-confirm \
+  --run-id '<run_id>' --lane '<lane_id>' \
+  --native-session '<thread_id>'
+```
 
-- Keep the Root sandbox alive after a candidate so `wrong` resumes immediately.
-- On `accepted`, timeout, or Claude handoff, export needed artifacts and clean all
-  CTF-OS-owned worker/Root sandboxes, services, processes, and resources.
-- A fresh attempt inherits no artifact, cache, native identity, sandbox, service,
-  or solver state.
-- Input is read-only; each lane writes only in private `work`, `evidence`, and
-  `artifacts` paths.
-- Sandboxes enforce organizer-declared target scope and block host/private data.
-- Shared service and global resource changes remain Root-only.
+worker를 중단한 뒤에는 같은 thread ID로 종료를 확인한다.
 
-Whole-contest Intake and Triage run only when explicitly requested and do not
-affect a Solve. On “클로드 구조대 준비해라”, stop the attack, use the handoff
-skill to write one evidence-backed `rescue/<contest>/<challenge>/HANDOFF.md`,
-then terminate and clean the current CTF-OS runtime.
+```bash
+uv run python -m ctf_os.agent_tools race-stop-confirm \
+  --run-id '<run_id>' --lane '<lane_id>' \
+  --native-session '<thread_id>'
+```
+
+## 6. 상태 확인과 종료
+
+현재 진행 상황, 중복 실행과 정체 신호를 확인한다.
+
+```bash
+uv run python -m ctf_os.agent_tools race-status --run-id '<run_id>'
+```
+
+실제 실행 결과에서 유효한 플래그 후보가 검출되면 결과에 즉시 표시된다. 다른 worker를 중단한 뒤 사람이 직접 제출한다.
+
+풀이를 중단할 때는 run을 종료한 다음 CTF-OS가 만든 해당 run의 자원만 정리한다.
+
+```bash
+uv run python -m ctf_os.agent_tools race-end \
+  --run-id '<run_id>' --reason STOPPED
+
+uv run python -m ctf_os.agent_tools race-cleanup \
+  --run-id '<run_id>'
+```
+
+모든 명령과 옵션은 다음처럼 확인할 수 있다.
+
+```bash
+uv run python -m ctf_os.agent_tools --help
+uv run python -m ctf_os.agent_tools race-prepare --help
+```

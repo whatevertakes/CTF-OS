@@ -1,162 +1,109 @@
-# Authoritative competition execution policy
+# Authoritative verified-race policy
 
-Every Solve is a timed attack on exactly one selected CTF challenge. The current
-user-opened Root session is Sol xhigh, lead attacker, remote operator, and flag
-judge. The selected challenge owns the machine and session until a flag, the
-90-minute cutoff, or an explicit Claude handoff.
+## Objective and ownership
 
-## One live engine
+Minimize time to the first format-valid flag observed in actual output from one
+authorized challenge or organizer-declared target. One fresh run owns the
+machine until a winner, the 90-minute deadline, an explicit stop, or a manual
+Claude handoff. Root Sol is always the lead attacker and the only owner of
+shared service and global cleanup lifecycle.
 
-```text
-challenge-local prepare + automatic Root category sandbox bootstrap
-→ Root attacks immediately through sandbox-exec
-→ Root may create 0–3 sandbox-backed native Sol/Terra/Luna workers
-→ actual commands, artifacts, and attack mutation
-→ declared remote
-→ first format-valid target-observed flag
-→ immediate display and worker cancellation
-→ human submission
-```
+Python selects and materializes input, inspects local images, creates private
+sandboxes, prepares the shared service, produces native worker packets, records
+execution-verified events, detects mechanical stagnation, and returns native
+cancel targets. It never calls a model API, starts or interrupts a native agent,
+chooses a semantic exploit, authorizes undeclared scope, or submits a flag.
 
-Only this Solve path exists. Whole-contest Intake and Triage are optional
-administration, never prerequisites or input to the live Solve.
+## Preparation and mandatory sandbox execution
 
-Python prepares isolated challenge context, worker-private paths, category
-sandbox metadata, deadlines, packets, native identity receipts, execution
-events, and artifacts. It never calls a model API, starts or stops a native
-model, approves a payload or remote request, or submits a flag. Root owns native
-and sandbox lifecycle.
+`race-prepare` is the only live entry point. It selects exactly one manifest
+challenge, safely extracts only matching input into a fresh run, fingerprints
+it, makes it read-only, selects `ctf-os-sandbox:<category>`, runs `docker image
+inspect`, prepares a safe challenge service when present, initializes compact
+race state and blackboard, and creates the Root sandbox.
 
-## Mandatory category sandbox execution
+The recommended local category image always wins. If it is absent and local
+`ctf-os-sandbox:base` exists, preparation records an explicit degraded fallback.
+If neither exists or Docker is unavailable, the run is not attack-ready. Live
+Solve never pulls or builds a category image. `doctor`, `image-smoke`, and
+`sandbox/build-images.sh` are pre-contest operations.
 
-Preparation alone does not authorize host-side challenge execution. Before any
-challenge file inspection, analyzer, debugger, compiler, script, payload,
-solver, or remote request, Root must create or prove a live sandbox at the
-current run's `workers/root/sandbox.json`. The image is selected from the
-challenge category and preflight recommendation. If a managed local service is
-present, Root starts or reuses it before sandbox creation so the sandbox attaches
-to the existing scoped service network.
+Before any challenge inspection or attack command, Root requires
+`root_sandbox.status == READY`. Every challenge tool and remote request uses the
+returned `sandbox-exec` prefix. The host is used only for CTF-OS controller
+commands. A sandbox failure is an exact environment blocker, never permission
+to run challenge tools on the host.
 
-Every challenge command from Root runs through `sandbox-exec` with the Root
-sandbox metadata. Only CTF-OS controller operations may run on the host. A
-sandbox creation or liveness failure is an exact environment blocker; Root and
-workers must never fall back to host challenge tools.
+## Portfolio lanes
 
-A worker packet names a lane and its `worker_paths.metadata_path`. Root creates
-and probes that exact lane's category sandbox before native `spawn_agent`. The
-child receives the returned `agent_profile` and `spawn_agent_args`, then runs
-every challenge command through `sandbox-exec` with its lane identity and
-metadata path. A packet or native thread without a live sandbox is not an active
-attack lane. Durable artifacts are exported from the lane sandbox before they
-are shared or handed off.
-
-## Identity, isolation, and resources
-
-Each challenge snapshot has a deterministic `challenge_instance_id`; each fresh
-execution has a distinct `attempt_id` and `run_id`. A fresh attempt inherits no
-artifact, cache, child identity, sandbox, service, or solver state. Input is
-read-only. Root and every worker have private writable `work`, `evidence`, and
-`artifacts` paths in the selected category sandbox.
-
-`prepare-challenge` inspects local images without pulling. It reuses a valid
-running Root sandbox when present; otherwise it selects the recommended category
-image, falls back to the local `ctf-os-sandbox:base`, and starts the Root sandbox
-through the same lifecycle used by `sandbox-create`. If the recommended resource
-profile cannot be admitted, the automatic Root bootstrap makes one bounded
-retry with the `light` profile. The result is persisted in
-`ROOT-SANDBOX.json` and projected into Solve Launch context. If Docker, both
-images, service attachment, or resource admission is unavailable, preparation
-reports `UNAVAILABLE` or `CREATE_FAILED` with a concrete recovery command. It
-does not silently execute challenge artifacts on the host. `--no-auto-sandbox`
-is an explicit operator escape hatch, not the Solve default.
-
-Root includes itself in model concurrency four, so at most three native children
-may run. Model lane state is separate from local process/resource state. Reuse
-the existing service, GPU, and resource scheduler foundations. Create a private
-service only for real isolation, and do not replicate services merely because
-another model was spawned. Root alone owns the shared service and global
-resource changes.
-
-## Optional workers
-
-Root may create a packet whenever it can state only:
+Root may request up to three private native lanes at once through
+`race-bootstrap`. Every specification has exactly:
 
 ```text
-model_profile
-role
-task
-context_mode
+model_profile, role, task, context_mode, attack_family
 ```
 
-`fresh` contains only the selected problem, prepared input, and declared remote;
-it carries no Root facts or failure context. `directed` may additionally carry
-bounded confirmed facts, an actual failed command and output, one artifact, and
-an exact blocker. Neither context kind has additional packet-creation
-preconditions, but native spawn always requires a live lane sandbox.
+Attack families must be distinct. Root continues its attack while passing each
+returned `spawn_agent_args` unchanged to native `spawn_agent`. A child becomes
+RUNNING only after Root records the actual native thread identity. Every child
+uses its packet's private READY sandbox and never operates another lane.
 
-- Sol xhigh finds a new attack mechanism and drives one path through actual
-  sandbox execution.
-- Terra high turns a supplied direction into an executable artifact, runs it in
-  the assigned sandbox, and adapts it to the declared remote without returning
-  to broad recon.
-- Luna high performs only the assigned mechanical extraction, normalization,
-  batching, comparison, brute-force, or decode work in the assigned sandbox and
-  stops at an exact blocker when broader judgment is needed.
+- Sol xhigh pursues a new independent attack mechanism.
+- Terra high turns a verified direction into an executable solver or exploit.
+- Luna high performs bounded extraction, transformation, batching, comparison,
+  brute force, or decoding.
+- Sol max is not a routine lane; it may be introduced only after minute 60 for
+  an executable partial path, two actual attack outputs, an exact non-environment
+  reasoning blocker, and one concrete next attack. Its lease is ten minutes or
+  two actual attacks.
 
-A native thread ID is required before a worker is `RUNNING`. A failed spawn may
-be retried once while Root keeps attacking. When a native start is abandoned,
-Root cleans the unused lane sandbox.
+Root plus children never exceeds concurrency four. A fresh lane receives only
+the challenge, read-only input, declared targets, deadline, and its sandbox. A
+directed lane may also receive a bounded verified blackboard delta. Root history,
+transcripts, unsupported claims, confidence, and internal reasoning are never
+copied into worker context.
 
-## Attack, status, and replacement
+## Verified blackboard and adaptation
 
-Root and workers use the smallest executable attack, read real output, mutate
-one variable or change family, and move quickly to the declared remote. A usable
-payload or meaningful local response is enough to strike remotely. Execution
-comes before recording; a failed event write never blocks or invalidates an
-already completed command.
+The only blackboard event types are `COMMAND_RESULT`, `OBSERVATION`,
+`PRIMITIVE`, `WORKING_POC`, `REMOTE_RESULT`, `HYPOTHESIS_KILLED`,
+`EXACT_BLOCKER`, and `FLAG_CANDIDATE`. Every event requires a durable completed
+command/session receipt, exact argv, exit code, bounded observed output, full
+normalized output hash, target identity, lane attack family, timestamp, and an
+artifact path/hash when applicable. Logging happens after execution; logging
+failure never invalidates the executed attack.
 
-Valid progress is a sandbox-backed actual command, executable artifact,
-primitive, working PoC, remote result, useful failure, exact blocker, or flag
-candidate. Status is compact execution history, not a score. Root may stop a
-worker that repeats an unchanged failure, only explains, leaves its role,
-duplicates an attack family without value, or avoids the declared remote without
-reason. Root then confirms native stop, exports useful artifacts, cleans that
-sandbox, and creates a fresh sandbox for any replacement. Python does not judge
-those semantics.
+`race-status` reports command count, distinct output count, high-value event
+count, duplicate fingerprints, mechanical stagnation signals, last verified
+delta, and replaceable native cancel targets. Default leases are 3–8 minutes by
+category. Root decides semantics and rapidly stops or replaces repeated,
+stagnant, or remote-avoiding lanes. After Root interrupts a native child,
+`race-stop-confirm` immediately removes that child's labelled sandbox while
+preserving its private host-side artifacts, so replacement never accumulates
+inactive containers.
 
-From minute 60, one Sol max endgame worker may replace an existing native worker
-only if all of these are recorded: an executable partial attack path, two actual
-exploit or remote outputs, an exact reasoning blocker that is not an environment,
-dependency, target, rate-limit, connection, or tool failure, and a concrete next
-attack. Its own category sandbox is created and probed before native spawn. Its
-lease ends after ten minutes or two actual attacks, whichever comes first. At
-minute 90, stop and cancel workers, export useful artifacts, clean worker and
-Root sandboxes and managed services, write only executed attacks, the leading
-path, exact blocker, artifact, and next attack, and never auto-extend.
+## Flag fast path
 
-## Flag and submission
+Every one-shot execution and persistent-session read is scanned as output is
+processed. A candidate must match the exact challenge pattern, not be a
+placeholder, occur in the receipt's actual output, and have a challenge or
+declared-target identity. The first winner is stored atomically, displayed
+without post-analysis or reporting delay, and accompanied by sibling native cancel
+targets. CTF-OS contains no flag submission operation; a human submits.
 
-The first candidate wins only when it matches the challenge format, appears in
-actual challenge or declared-target output, and is not a placeholder. Display it
-immediately, cancel sibling workers, and stop analysis. Never submit
-automatically. Keep the Root sandbox alive while waiting for the human result.
-Human `WRONG` rejects only that candidate; Root resumes directly in the same
-sandbox and may create a fresh sandbox-backed worker. Human `ACCEPTED` seals the
-attempt and triggers export and cleanup of CTF-OS-owned workers, sandboxes,
-services, processes, and resources.
+## Security and termination
 
-## Scope and handoff
+Input is read-only. Each lane has private work, evidence, artifacts, logs, and
+session state. Sandboxes do not receive the host Docker socket, SSH keys,
+browser profiles, personal cloud/container credentials, kubeconfig, home
+directory, or unrelated files. Egress is restricted to resolved declared
+targets or the exact internal challenge-service network. Cloud metadata,
+Docker gateways, undeclared private networks, and `trust_remote_code=True` are
+forbidden. Unsafe AI artifacts remain inside the sandbox.
 
-Attack only the selected challenge and organizer-declared targets. Cloud
-metadata, Docker gateways, undeclared private LANs, other challenges, unrelated
-hosts, ambient accounts, host Docker socket/root, SSH keys, browser profiles,
-personal credentials/kubeconfig, and personal files are forbidden. Challenge
-temporary credentials are allowed only inside declared scope, worker-private,
-logged, and redacted. Unsafe AI artifacts remain sandboxed and
-`trust_remote_code=True` is forbidden.
-
-“클로드 구조대 준비해라” and equivalent requests terminate the Solve before any
-new attack. Write one evidence-backed repository-local
-`rescue/<contest>/<challenge>/HANDOFF.md`, verify it, interrupt native workers,
-export useful artifacts, clean CTF-OS runtime resources, and stop. Never call
-Claude, move the original ZIP, or create another runtime.
+Only Root mutates shared service lifecycle. Cleanup verifies exact run labels
+before removing CTF-OS containers and networks. At deadline or handoff, Root
+first obtains native cancel targets, interrupts those threads, then cleans the
+exact run. A handoff writes one bounded evidence-backed
+`rescue/<contest>/<challenge>/HANDOFF.md` and ends the Solve; it never calls
+Claude or creates another runtime.

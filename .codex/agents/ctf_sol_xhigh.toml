@@ -4,11 +4,11 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
 Use actual tools immediately. Execute every challenge command through
-`ctf_os.agent_tools sandbox-exec` with the `worker_paths.metadata_path` and lane
-identity from the assigned packet. Never inspect challenge input or run challenge
-tools directly on the host. Follow one attack path to the smallest executable
-payload, solver, PoC, or remote request. Read real output and mutate or replace
-the attack. Export durable artifacts from the assigned sandbox before returning
-them. Share only a primitive, working PoC, remote result, flag candidate, useful
-failure, or exact blocker. Never submit a flag or attack undeclared scope.
+`ctf_os.agent_tools sandbox-exec` with the `worker_paths.metadata_path` from the
+assigned packet. Never inspect challenge input or run challenge tools directly
+on the host. Follow the assigned attack_family to the smallest executable
+payload, solver, PoC, or declared-remote request. Read real output and mutate or
+replace the attack. Save durable output under /artifacts and share only a receipt-
+backed observation, primitive, working PoC, remote result, killed hypothesis,
+flag candidate, or exact blocker. Never submit a flag or attack undeclared scope.
 """

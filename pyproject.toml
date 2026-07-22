@@ -1,7 +1,7 @@
 [project]
 name = "ctf-os"
-version = "3.0.0"
-description = "Competition-first Sol-native race tools for authorized CTF solving"
+version = "4.0.0"
+description = "Verified asynchronous portfolio racing for authorized CTF challenges"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0.2"]
 
@@ -15,9 +15,6 @@ include = ["ctf_os*"]
 [tool.setuptools.package-data]
 ctf_os = [
   "resources/agent-policy.md",
-  "resources/run-workspace-migration.md",
-  "resources/timeout-profiles.yaml",
-  "resources/knowledge/playbooks/*.md",
 ]
 
 [dependency-groups]
@@ -26,3 +23,4 @@ dev = ["pytest>=8.0"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["live: opt-in tests requiring locally built Docker category images"]

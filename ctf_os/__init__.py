@@ -1,3 +1,3 @@
-"""Sol-native support tools for authorized CTF work."""
+"""Verified asynchronous portfolio racing for authorized CTF challenges."""
 
-__version__ = "2.0.0"
+__version__ = "4.0.0"

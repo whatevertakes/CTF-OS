@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from ctf_os.flag import FlagError, StreamingDetector, record_candidate, valid_candidate
+from ctf_os.race import RaceError, attach_lane_sandbox, confirm_native_spawn, load_race, reserve_lanes, terminate
+
+from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt, _spec
+
+
+def test_streaming_detector_handles_chunk_boundaries_and_rejects_placeholders() -> None:
+    detector = StreamingDetector(r"\ACTF\{[^}\r\n]+\}\Z")
+    assert detector.feed("noise CTF{rea") is None
+    assert detector.feed("l_flag} trailing") == "CTF{real_flag}"
+    assert not valid_candidate("CTF{example_flag}", r"\ACTF\{[^}]+\}\Z")
+    assert not valid_candidate("OTHER{x}", r"\ACTF\{[^}]+\}\Z")
+
+
+def test_first_target_observed_candidate_wins_atomically_and_returns_sibling_cancel_targets(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    lanes = reserve_lanes(run, [_spec("source-dataflow"), _spec("protocol-state")])
+    for index, lane in enumerate(lanes):
+        attach_lane_sandbox(run, lane_id=lane["lane_id"], sandbox=fake_sandbox(run, challenge, lane["lane_id"]))
+        confirm_native_spawn(run, lane_id=lane["lane_id"], native_session=f"thread-{index}")
+    first_receipt = _receipt(run, challenge, lanes[0]["lane_id"], "target says CTF{first}", receipt_id="flag-one")
+    first = record_candidate(
+        run, lane_id=lanes[0]["lane_id"], attack_family=lanes[0]["attack_family"],
+        candidate="CTF{first}", receipt=first_receipt,
+    )
+    assert first["first"] is True
+    assert first["display"] == "CTF{first}"
+    assert first["manual_submission_required"] is True
+    assert first["cancel_targets"] == [{"lane_id": lanes[1]["lane_id"], "native_session": "thread-1"}]
+    second_receipt = _receipt(run, challenge, lanes[1]["lane_id"], "CTF{second}", receipt_id="flag-two")
+    second = record_candidate(
+        run, lane_id=lanes[1]["lane_id"], attack_family=lanes[1]["attack_family"],
+        candidate="CTF{second}", receipt=second_receipt,
+    )
+    assert second["first"] is False
+    assert second["winner"]["candidate"] == "CTF{first}"
+    assert load_race(run)["winner"]["candidate"] == "CTF{first}"
+
+
+def test_candidate_requires_actual_receipt_output_and_declared_target(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    receipt = _receipt(run, challenge, "root", "no candidate here")
+    with pytest.raises(FlagError, match="not present"):
+        record_candidate(
+            run, lane_id="root", attack_family="root-primary", candidate="CTF{missing}", receipt=receipt
+        )
+    wrong_target = _receipt(run, challenge, "root", "CTF{real}", target="https://undeclared.invalid", receipt_id="wrong-target")
+    with pytest.raises(FlagError, match="declared target"):
+        record_candidate(
+            run, lane_id="root", attack_family="root-primary", candidate="CTF{real}", receipt=wrong_target
+        )
+
+
+def test_declared_remote_identity_alone_is_not_a_target_observation(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo, remote="nc ctf.example 31337")
+    receipt = _receipt(
+        run, challenge, "root", "CTF{echoed}", target="nc ctf.example 31337", receipt_id="no-packets"
+    )
+    receipt["target_observed"] = False
+    (run / "workers" / "root" / "logs" / "no-packets.json").write_text(
+        __import__("json").dumps(receipt), encoding="utf-8"
+    )
+    with pytest.raises(FlagError, match="no actual"):
+        record_candidate(
+            run, lane_id="root", attack_family="root-primary", candidate="CTF{echoed}", receipt=receipt
+        )
+
+
+def test_candidate_receipt_must_match_the_durable_execution(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    receipt = _receipt(run, challenge, "root", "CTF{durable}", receipt_id="tampered-flag")
+    durable = dict(receipt)
+    durable["observed_output"] = "different output"
+    (run / "workers" / "root" / "logs" / "tampered-flag.json").write_text(
+        __import__("json").dumps(durable), encoding="utf-8"
+    )
+    with pytest.raises(FlagError, match="durable execution"):
+        record_candidate(
+            run, lane_id="root", attack_family="root-primary",
+            candidate="CTF{durable}", receipt=receipt,
+        )
+
+
+def test_candidate_cannot_win_after_the_exact_race_terminates(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    terminate(run, reason="TIMED_OUT")
+    receipt = _receipt(run, challenge, "root", "CTF{late}", receipt_id="late-flag")
+    with pytest.raises(RaceError, match="non-active"):
+        record_candidate(
+            run, lane_id="root", attack_family="root-primary",
+            candidate="CTF{late}", receipt=receipt,
+        )
