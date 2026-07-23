@@ -1,0 +1,16 @@
+verbose = 0
+lemmeknow_min_rarity = 0.0
+lemmeknow_max_rarity = 0.0
+lemmeknow_tags = []
+lemmeknow_exclude_tags = []
+lemmeknow_boundaryless = false
+human_checker_on = false
+timeout = 5
+api_mode = false
+
+[colourscheme]
+informational = "255,215,0"
+warning = "255,0,0"
+statement = "255,255,255"
+question = "255,215,0"
+success = "0,255,0"

@@ -170,7 +170,8 @@ def open_session(
     observed_identity = target_identity or f"challenge:{metadata['challenge_id']}"
     packets_before = firewall_packets(metadata, observed_identity, docker=docker)
     shell = (
-        "set -eu; d=$1; shift; mkdir -p \"$d\"; mkfifo \"$d/in\"; : >\"$d/out\"; "
+        "set -eu; d=$1; shift; ulimit -f 131072; "
+        "mkdir -p \"$d\"; mkfifo \"$d/in\"; : >\"$d/out\"; "
         "(tail -f /dev/null >\"$d/in\") & echo $! >\"$d/keeper\"; "
         "setsid \"$@\" <\"$d/in\" >>\"$d/out\" 2>&1 & echo $! >\"$d/pid\""
     )
@@ -324,9 +325,10 @@ def close_session(
         [docker, "exec", "--user", "1001:1001", str(metadata["name"]), "sh", "-c", script, "ctf-os-close", state["container_dir"]],
         timeout=_timeout(timeout),
     )
-    state["status"] = "STOPPED"
-    state["closed_at"] = _now()
-    atomic_json(_state_path(Path(str(metadata["lane_root"])), session_id), state)
+    if result.returncode == 0:
+        state["status"] = "STOPPED"
+        state["closed_at"] = _now()
+        atomic_json(_state_path(Path(str(metadata["lane_root"])), session_id), state)
     return {"session_id": session_id, "stopped": result.returncode == 0, "stderr": result.stderr[-4096:]}
 
 

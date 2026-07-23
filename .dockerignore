@@ -1,0 +1,8 @@
+.git
+.codex
+.pytest_cache
+.venv
+**/__pycache__
+incoming
+output
+rescue

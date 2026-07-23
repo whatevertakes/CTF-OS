@@ -10,7 +10,7 @@ from ctf_os.blackboard import (
     BlackboardError, append_verified_event, duplicate_signals, events, output_hash,
 )
 from ctf_os.race import (
-    attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup, load_race,
+    RaceError, attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup, load_race,
     note_command_receipt, note_event, reserve_lanes, status, stop_confirmed,
 )
 from ctf_os.workspace import atomic_json, utc_now
@@ -54,6 +54,20 @@ def test_blackboard_rejects_claim_without_durable_execution_receipt(repo: Path) 
     with pytest.raises(BlackboardError, match="no durable"):
         append_verified_event(
             run, event_type="OBSERVATION", lane_id="root", attack_family="root-primary", receipt=receipt
+        )
+
+
+def test_blackboard_receipt_id_cannot_escape_lane_logs(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    receipt = _receipt(run, challenge, "root", "observed")
+    receipt["receipt_id"] = "../artifacts/forged"
+    with pytest.raises(BlackboardError, match="receipt id"):
+        append_verified_event(
+            run,
+            event_type="OBSERVATION",
+            lane_id="root",
+            attack_family="root-primary",
+            receipt=receipt,
         )
 
 
@@ -104,6 +118,26 @@ def test_duplicate_lane_and_stagnation_signals_use_mechanical_fingerprints(repo:
     assert any("duplicate-other-lane" in row["stagnation_signals"] for row in child_rows)
     assert all(row["actual_command_count"] == 1 for row in child_rows)
     assert report["metrics"]["duplicate_attack_ratio"] > 0
+
+
+def test_native_session_identity_cannot_be_reused_across_lanes(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    note_command_receipt(
+        run,
+        _receipt(run, challenge, "root", "root attack", receipt_id="root-before-lanes"),
+    )
+    lanes = reserve_lanes(run, [_spec("one"), _spec("two")])
+    for lane in lanes:
+        attach_lane_sandbox(
+            run,
+            lane_id=lane["lane_id"],
+            sandbox=fake_sandbox(run, challenge, lane["lane_id"]),
+        )
+    confirm_native_spawn(run, lane_id=lanes[0]["lane_id"], native_session="thread-1")
+    with pytest.raises(RaceError, match="already attached"):
+        confirm_native_spawn(
+            run, lane_id=lanes[1]["lane_id"], native_session="thread-1"
+        )
 
 
 def test_timestamps_and_timeout_are_bound_to_the_exact_run(repo: Path) -> None:

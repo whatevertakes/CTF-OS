@@ -49,7 +49,7 @@ Run only repository-local, non-destructive checks:
 ```bash
 git status --short
 git diff --check
-uv run pytest -q
+env -u CTF_OS_LIVE uv run pytest -q -m 'not live'
 uv run python -m ctf_os.agent_tools --help
 uv run python -m ctf_os.agent_tools init-contest --help
 uv run python -m ctf_os.agent_tools race-prepare --help

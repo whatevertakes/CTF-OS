@@ -23,6 +23,7 @@ from .resources import ResourceError, admit, parse_size_bytes, resource_profile
 
 MAX_CAPTURE = 64 * 1024
 MAX_COMMAND_SECONDS = 1800
+MAX_COMMAND_LOG_BYTES = 64 * 1024 * 1024
 
 
 class SandboxError(RuntimeError):
@@ -252,6 +253,8 @@ def execute(
     combined_path = logs / f"{receipt_id}.combined"
     candidate: str | None = None
     timed_out = False
+    output_limited = False
+    logged_bytes = 0
     capture = bytearray()
     digest = _NormalizedDigest()
     try:
@@ -282,6 +285,12 @@ def execute(
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
+                logged_bytes += len(chunk)
+                if logged_bytes > MAX_COMMAND_LOG_BYTES:
+                    output_limited = True
+                    _kill_exec(name, pid_file, docker=docker)
+                    process.terminate()
+                    continue
                 handles[stream].write(chunk)
                 handles["combined"].write(chunk)
                 digest.update(chunk)
@@ -293,6 +302,8 @@ def execute(
                     if candidate is not None:
                         _kill_exec(name, pid_file, docker=docker)
             if timed_out and process.poll() is None and time.monotonic() - started > timeout + 2:
+                process.kill()
+            if output_limited and process.poll() is None:
                 process.kill()
         return_code = process.wait(timeout=5)
     finally:
@@ -317,8 +328,9 @@ def execute(
         "lane_id": metadata["lane_id"],
         "argv": list(command),
         "argv_family": argv_family(command),
-        "exit_code": 124 if timed_out else return_code,
+        "exit_code": 124 if timed_out else 125 if output_limited else return_code,
         "timed_out": timed_out,
+        "output_limited": output_limited,
         "observed_output": observed,
         "output_truncated": combined_path.stat().st_size > MAX_CAPTURE,
         "output_hash": digest.hexdigest(),
@@ -347,13 +359,21 @@ def cleanup(
     name = _metadata_name(metadata)
     inspected = _run(runner, [docker, "inspect", name], timeout=30)
     if inspected.returncode:
-        return {"container": name, "removed": False, "already_absent": True}
+        detail = (inspected.stderr or inspected.stdout).strip()
+        if re.search(r"(?i)no such (?:object|container)", detail):
+            return {"container": name, "removed": False, "already_absent": True}
+        raise SandboxError(
+            "sandbox ownership inspection failed"
+            + (f": {detail[-4096:]}" if detail else "")
+        )
     try:
         row = json.loads(inspected.stdout)[0]
         labels = row.get("Config", {}).get("Labels", {}) or {}
     except (json.JSONDecodeError, IndexError, TypeError) as exc:
         raise SandboxError("Docker returned malformed sandbox inspect data") from exc
-    expected = metadata.get("labels") if isinstance(metadata.get("labels"), Mapping) else {}
+    expected = metadata.get("labels")
+    if not isinstance(expected, Mapping) or not expected:
+        raise SandboxError("sandbox metadata has no ownership labels")
     if any(labels.get(key) != value for key, value in expected.items()):
         raise SandboxError("refusing to remove container whose labels do not match metadata")
     normalized = _run(

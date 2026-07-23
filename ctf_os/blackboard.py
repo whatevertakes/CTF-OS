@@ -161,6 +161,8 @@ def _validate_receipt(run_root: Path, lane_id: str, receipt: Mapping[str, Any]) 
         raise BlackboardError("execution receipt argv is invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", str(receipt["output_hash"])):
         raise BlackboardError("execution receipt output hash is invalid")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", str(receipt["receipt_id"])):
+        raise BlackboardError("execution receipt id is invalid")
     receipt_path = run_root / "workers" / lane_id / "logs" / f"{receipt['receipt_id']}.json"
     if receipt_path.is_symlink() or not receipt_path.is_file():
         raise BlackboardError("claim has no durable command/session receipt")
@@ -168,7 +170,10 @@ def _validate_receipt(run_root: Path, lane_id: str, receipt: Mapping[str, Any]) 
         durable = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BlackboardError("durable execution receipt is unreadable") from exc
-    for field in ("receipt_id", "run_id", "lane_id", "argv", "exit_code", "output_hash", "target_identity"):
+    for field in (
+        "receipt_id", "run_id", "lane_id", "argv", "argv_family", "exit_code",
+        "observed_output", "output_hash", "target_identity", "target_observed", "finished_at",
+    ):
         if durable.get(field) != receipt.get(field):
             raise BlackboardError(f"execution receipt was changed after execution: {field}")
 

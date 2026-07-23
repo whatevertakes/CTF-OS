@@ -4,6 +4,7 @@ source /opt/ctf-os/install/lib.sh
 
 WAYBACKURLS_COMMIT=8d27cf3e3031de01179e8ba9127e968eb01008e9
 THEHARVESTER_COMMIT=d36e326f7738c821900332af3f058c60e69149a3
+THEHARVESTER_SHA256=606898a3f800485116abcece48853eb3736f8aac16168888e4bfcc67df21e8b4
 apt_install \
   whois dnsutils traceroute chromium chromium-driver libimage-exiftool-perl imagemagick \
   tesseract-ocr ffmpeg git-lfs poppler-utils golang-go libgl1 libglib2.0-0
@@ -23,7 +24,7 @@ ln -s /opt/holehe-venv/bin/holehe /usr/local/bin/holehe
 
 python3 -m venv /opt/theharvester-venv
 /opt/theharvester-venv/bin/pip install --no-cache-dir \
-  "https://github.com/laramies/theHarvester/archive/${THEHARVESTER_COMMIT}.tar.gz"
+  "https://github.com/laramies/theHarvester/archive/${THEHARVESTER_COMMIT}.tar.gz#sha256=${THEHARVESTER_SHA256}"
 ln -s /opt/theharvester-venv/bin/theHarvester /usr/local/bin/theHarvester
 
 GOBIN=/usr/local/bin go install "github.com/tomnomnom/waybackurls@${WAYBACKURLS_COMMIT}"

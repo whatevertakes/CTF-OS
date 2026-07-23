@@ -47,33 +47,39 @@ done
 
 command -v docker >/dev/null || { echo "Docker CLI not found. Install Docker before building sandbox images." >&2; exit 69; }
 
-# Public base/tool downloads and even daemon discovery must not inherit Docker
+# Public base/tool downloads and even daemon discovery must never inherit Docker
 # Desktop or personal registry credentials.
-if [[ -z "${DOCKER_CONFIG:-}" ]]; then
-  BUILD_DOCKER_CONFIG="$(mktemp -d "${TMPDIR:-/tmp}/ctf-os-docker-config.XXXXXX")"
-  trap 'rm -rf -- "$BUILD_DOCKER_CONFIG"' EXIT
-  printf '%s\n' '{"auths":{}}' >"$BUILD_DOCKER_CONFIG/config.json"
-  # DOCKER_CONFIG also controls the per-user CLI plugin directory. Preserve
-  # an installed Compose v2 binary while keeping registry credentials absent.
-  USER_HOME_DIR="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-  for compose_candidate in \
-      "${USER_HOME_DIR:-/nonexistent}/.docker/cli-plugins/docker-compose" \
-      /usr/libexec/docker/cli-plugins/docker-compose \
-      /usr/local/libexec/docker/cli-plugins/docker-compose \
-      /usr/lib/docker/cli-plugins/docker-compose \
-      /usr/local/lib/docker/cli-plugins/docker-compose; do
-    [[ -x "$compose_candidate" ]] || continue
-    candidate_version="$("$compose_candidate" version --short 2>/dev/null || true)"
-    candidate_major="${candidate_version#v}"; candidate_major="${candidate_major%%.*}"
-    if [[ "$candidate_major" == "2" ]]; then
-      mkdir -p "$BUILD_DOCKER_CONFIG/cli-plugins"
-      ln -s "$(readlink -f "$compose_candidate")" "$BUILD_DOCKER_CONFIG/cli-plugins/docker-compose"
-      break
-    fi
+BUILD_DOCKER_CONFIG="$(mktemp -d "${TMPDIR:-/tmp}/ctf-os-docker-config.XXXXXX")"
+BUILD_STAGE_TAGS=()
+cleanup_build() {
+  local stage
+  for stage in "${BUILD_STAGE_TAGS[@]}"; do
+    docker image rm "$stage" >/dev/null 2>&1 || true
   done
-  export DOCKER_CONFIG="$BUILD_DOCKER_CONFIG"
-  echo "Using an isolated Docker configuration for public image pulls."
-fi
+  rm -rf -- "$BUILD_DOCKER_CONFIG"
+}
+trap cleanup_build EXIT
+printf '%s\n' '{"auths":{}}' >"$BUILD_DOCKER_CONFIG/config.json"
+# DOCKER_CONFIG also controls the per-user CLI plugin directory. Preserve
+# an installed Compose v2 binary while keeping registry credentials absent.
+USER_HOME_DIR="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+for compose_candidate in \
+    "${USER_HOME_DIR:-/nonexistent}/.docker/cli-plugins/docker-compose" \
+    /usr/libexec/docker/cli-plugins/docker-compose \
+    /usr/local/libexec/docker/cli-plugins/docker-compose \
+    /usr/lib/docker/cli-plugins/docker-compose \
+    /usr/local/lib/docker/cli-plugins/docker-compose; do
+  [[ -x "$compose_candidate" ]] || continue
+  candidate_version="$("$compose_candidate" version --short 2>/dev/null || true)"
+  candidate_major="${candidate_version#v}"; candidate_major="${candidate_major%%.*}"
+  if [[ "$candidate_major" == "2" ]]; then
+    mkdir -p "$BUILD_DOCKER_CONFIG/cli-plugins"
+    ln -s "$(readlink -f "$compose_candidate")" "$BUILD_DOCKER_CONFIG/cli-plugins/docker-compose"
+    break
+  fi
+done
+export DOCKER_CONFIG="$BUILD_DOCKER_CONFIG"
+echo "Using an isolated Docker configuration for public image pulls."
 
 if ! server_info="$(docker info --format '{{.ServerVersion}}|{{.OSType}}|{{.Architecture}}|{{.DockerRootDir}}' 2>&1)"; then
   if [[ "$server_info" == *"permission denied"* || "$server_info" == *"Permission denied"* ]]; then
@@ -118,21 +124,26 @@ if [[ -n "$docker_root" && -d "$docker_root" ]]; then
 fi
 
 export DOCKER_BUILDKIT=1
+lock_sha256="$(sha256sum "$ROOT/sandbox/tool-versions.lock" | awk '{print $1}')"
 declare -a SUCCEEDED=() FAILED=() DETAILS=()
 overall_start="$(date +%s)"
+generation="$(date -u +%Y%m%d%H%M%S)-$$"
 
 for profile in "${PROFILES[@]}"; do
   tag="ctf-os-sandbox:${profile}"
+  stage_tag="ctf-os-sandbox-build:${generation}-${profile}"
+  BUILD_STAGE_TAGS+=("$stage_tag")
   started="$(date +%s)"
-  echo "[$profile] BUILD start -> $tag"
+  echo "[$profile] BUILD start -> $stage_tag"
   if docker build \
       --progress=plain \
       --build-arg "CTF_OS_PROFILE=${profile}" \
+      --build-arg "CTF_OS_LOCK_SHA256=${lock_sha256}" \
       --file "$ROOT/sandbox/Dockerfile.sandbox" \
-      --tag "$tag" \
+      --tag "$stage_tag" \
       "$ROOT"; then
     elapsed=$(( $(date +%s) - started ))
-    metadata="$(docker image inspect "$tag" --format '{{.Id}}|{{.Size}}' 2>/dev/null || true)"
+    metadata="$(docker image inspect "$stage_tag" --format '{{.Id}}|{{.Size}}' 2>/dev/null || true)"
     image_id="${metadata%%|*}"; size_bytes="${metadata#*|}"
     [[ "$metadata" == *"|"* ]] || { image_id="unknown"; size_bytes="0"; }
     if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then size_human="$(numfmt --to=iec-i --suffix=B "$size_bytes")"; else size_human="unknown"; fi
@@ -163,3 +174,10 @@ if (( ${#FAILED[@]} )); then
   echo "Failed profiles: ${FAILED[*]}" >&2
   exit 1
 fi
+
+echo "Promoting verified image generation: $generation"
+for profile in "${PROFILES[@]}"; do
+  docker image tag \
+    "ctf-os-sandbox-build:${generation}-${profile}" \
+    "ctf-os-sandbox:${profile}"
+done

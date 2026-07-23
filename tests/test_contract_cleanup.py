@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import tomllib
 
 import pytest
 
@@ -15,7 +16,7 @@ from ctf_os.agent_tools.__main__ import build_parser
 from ctf_os.contest import parse_contest, resolve_selector
 from ctf_os.handoff import save_handoff
 from ctf_os.preflight import input_fingerprint
-from ctf_os.race import terminate
+from ctf_os.race import load_race, terminate
 from ctf_os.workspace import WorkspaceError, create_run
 
 from conftest import make_race
@@ -67,6 +68,23 @@ def test_manual_handoff_terminates_only_exact_run_and_writes_one_file(repo: Path
     assert list(destination.parent.glob("HANDOFF.md")) == [destination]
 
 
+def test_unsafe_handoff_destination_is_rejected_before_termination(
+    repo: Path, tmp_path: Path
+) -> None:
+    _manifest, _challenge, run, _race = make_race(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "rescue").symlink_to(outside, target_is_directory=True)
+    markdown_path = tmp_path / "HANDOFF.md"
+    markdown_path.write_text(f"# Handoff\n\nRun: `{run.name}`\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="rescue root"):
+        cli._race_handoff(
+            repo,
+            argparse.Namespace(run_id=run.name, markdown_file=str(markdown_path)),
+        )
+    assert load_race(run)["status"] == "ACTIVE"
+
+
 def test_terminal_race_still_owns_resources_until_exact_cleanup(repo: Path) -> None:
     manifest, challenge, run, _race = make_race(repo)
     terminate(run, reason="STOPPED")
@@ -75,6 +93,19 @@ def test_terminal_race_still_owns_resources_until_exact_cleanup(repo: Path) -> N
             repo, manifest, challenge,
             input_fingerprint=input_fingerprint(manifest, challenge),
         )
+
+
+def test_user_supplied_sandbox_metadata_must_match_attached_race(
+    repo: Path, tmp_path: Path
+) -> None:
+    _manifest, _challenge, run, race = make_race(repo)
+    metadata_path = Path(race["lanes"][0]["sandbox"]["metadata_path"])
+    assert cli._authorized_metadata(repo, metadata_path)["run_id"] == run.name
+    forged = json.loads(metadata_path.read_text(encoding="utf-8"))
+    forged["name"] = "unrelated-container"
+    metadata_path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match the race"):
+        cli._authorized_metadata(repo, metadata_path)
 
 
 def test_race_cleanup_reports_failure_and_keeps_active_run(
@@ -108,6 +139,52 @@ def test_cli_help_and_package_data_smoke() -> None:
     assert "sandbox" + "-create" not in result.stdout
     policy = Path("ctf_os/resources/agent-policy.md")
     assert policy.is_file() and "verified" in policy.read_text(encoding="utf-8").casefold()
+
+
+def test_ares_has_noninteractive_first_run_configuration() -> None:
+    config = Path("sandbox/config/ares.toml")
+    settings = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert settings["human_checker_on"] is False
+    assert settings["timeout"] == 5
+    assert settings["colourscheme"]["success"] == "0,255,0"
+
+    dockerfile = Path("sandbox/Dockerfile.sandbox").read_text(encoding="utf-8")
+    entrypoint = Path("sandbox/entrypoint.sh").read_text(encoding="utf-8")
+    assert "COPY sandbox/config/ares.toml /opt/ctf-os/ares-config.toml" in dockerfile
+    assert 'if [ ! -e "$HOME/Ares/config.toml" ]' in entrypoint
+    assert 'install -m 0600 /opt/ctf-os/ares-config.toml "$HOME/Ares/config.toml"' in entrypoint
+    assert 'export JAVA_TOOL_OPTIONS="-Duser.home=$HOME"' in entrypoint
+
+
+def test_sandbox_build_is_credential_isolated_lock_bound_and_atomic() -> None:
+    build = Path("sandbox/build-images.sh").read_text(encoding="utf-8")
+    dockerfile = Path("sandbox/Dockerfile.sandbox").read_text(encoding="utf-8")
+
+    assert 'BUILD_DOCKER_CONFIG="$(mktemp -d ' in build
+    assert 'printf \'%s\\n\' \'{"auths":{}}\' >"$BUILD_DOCKER_CONFIG/config.json"' in build
+    assert '--build-arg "CTF_OS_LOCK_SHA256=${lock_sha256}"' in build
+    assert 'ctf-os-sandbox-build:${generation}-${profile}' in build
+    failure_check = build.index('if (( ${#FAILED[@]} )); then')
+    promotion = build.index('echo "Promoting verified image generation:')
+    assert failure_check < promotion
+    assert 'org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}"' in dockerfile
+
+
+def test_remote_installer_archives_are_digest_pinned() -> None:
+    installers = (
+        "sandbox/install/rev.sh",
+        "sandbox/install/web.sh",
+        "sandbox/install/cloud.sh",
+        "sandbox/install/crypto.sh",
+        "sandbox/install/forensic.sh",
+        "sandbox/install/osint.sh",
+    )
+    for path in installers:
+        source = Path(path).read_text(encoding="utf-8")
+        assert (
+            "download_sha256" in source
+            or "#sha256=${" in source
+        ), path
 
 
 def test_init_contest_creates_fresh_manifest_and_challenge_folder(tmp_path: Path) -> None:
@@ -157,6 +234,32 @@ def test_all_category_images_run_live_smoke() -> None:
             capture_output=True, text=True, timeout=60, check=False,
         )
         assert result.returncode == 0, f"{profile}: {result.stderr}"
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+@pytest.mark.parametrize("profile", ("crypto", "misc"))
+def test_ares_decodes_on_first_fresh_sandbox_command(profile: str) -> None:
+    result = subprocess.run(
+        [
+            "docker", "run", "--rm", "--read-only", "--network", "none",
+            "--cap-drop", "ALL",
+            "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP",
+            "--cap-add", "CHOWN", "--cap-add", "DAC_READ_SEARCH",
+            "--security-opt", "no-new-privileges",
+            "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
+            "--tmpfs", "/work:rw,exec,nosuid,nodev,size=256m,mode=0777",
+            "--tmpfs", "/artifacts:rw,nosuid,nodev,size=128m,mode=0777",
+            "--tmpfs", "/home/ctf/.cache:rw,nosuid,nodev,size=256m,mode=0700,uid=1001,gid=1001",
+            f"ctf-os-sandbox:{profile}",
+            "sh", "-ec",
+            'test "$(stat -c %a "$HOME/Ares/config.toml")" = 600; '
+            "ares -t SGVsbG8sIENURi1PUyE= -d | tee /artifacts/ares-first.out; "
+            "grep -q 'Hello, CTF-OS!' /artifacts/ares-first.out",
+        ],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.live

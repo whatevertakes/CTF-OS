@@ -23,7 +23,7 @@ debugger, script, solver, payload, and remote request runs through
 `sandbox-exec`. Only controller commands run on the host. `race-bootstrap`
 remains blocked until that Root attack produces a durable command receipt.
 
-Root may bootstrap zero to three native children in one request. Each lane spec
+Root may bootstrap one to three native children in one request. Each lane spec
 contains exactly `model_profile`, `role`, `task`, `context_mode`, and a distinct
 `attack_family`. Pass every returned `spawn_agent_args` unchanged to native
 `spawn_agent`, then record the returned thread with `race-spawn-confirm`. Python

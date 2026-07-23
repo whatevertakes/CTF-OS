@@ -22,11 +22,13 @@ WORKDIR /challenge
 
 FROM rust:1.85.1-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS ares-builder
 ARG ARES_COMMIT=f0df3efa0272bbc7c1b8fa14f06b6104fdd287d1
+ARG ARES_SHA256=c9c2d831eec10a032afb846d751ada575fc3c880fa790e4ae01a69a8375fa183
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && curl --fail --location --retry 3 --silent --show-error \
        "https://github.com/bee-san/Ares/archive/${ARES_COMMIT}.tar.gz" \
        --output /tmp/ares.tar.gz \
+    && echo "${ARES_SHA256}  /tmp/ares.tar.gz" | sha256sum -c - \
     && mkdir /tmp/ares \
     && tar -xzf /tmp/ares.tar.gz -C /tmp/ares --strip-components=1 \
     && cargo build --manifest-path /tmp/ares/Cargo.toml --release --locked
@@ -141,12 +143,15 @@ RUN /opt/ctf-os/install/cloud.sh
 
 FROM profile-${CTF_OS_PROFILE} AS final
 ARG CTF_OS_PROFILE
+ARG CTF_OS_LOCK_SHA256
 COPY sandbox/sandbox-tools.txt /tools.txt
 COPY sandbox/tool-versions.lock /opt/ctf-os/tool-versions.lock
+COPY sandbox/config/ares.toml /opt/ctf-os/ares-config.toml
 COPY sandbox/entrypoint.sh /usr/local/bin/ctf-os-entrypoint
 RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint
 LABEL org.ctf-os.sandbox="true" \
       org.ctf-os.profile="${CTF_OS_PROFILE}" \
-      org.ctf-os.build-policy="pre-contest-pinned"
+      org.ctf-os.build-policy="pre-contest-pinned" \
+      org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}"
 ENTRYPOINT ["/usr/local/bin/ctf-os-entrypoint"]
 CMD ["sleep", "infinity"]

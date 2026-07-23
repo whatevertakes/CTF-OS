@@ -315,5 +315,9 @@ def _run(
             timeout=timeout,
             check=False,
         )
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(list(argv), 124, "", str(exc))
+    except OSError as exc:
+        return subprocess.CompletedProcess(list(argv), 126, "", str(exc))

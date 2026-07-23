@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+import regex as safe_regex
+
 from .blackboard import BlackboardError, append_verified_event
 from .race import load_race, record_winner
 
@@ -26,19 +28,24 @@ class StreamingDetector:
         if not pattern or len(pattern) > 2048:
             raise FlagError("a bounded challenge flag pattern is required")
         try:
-            self.pattern = re.compile(pattern)
-        except re.error as exc:
+            self.pattern = safe_regex.compile(pattern)
+        except safe_regex.error as exc:
             raise FlagError(f"challenge flag pattern is invalid: {exc}") from exc
         self.buffer = ""
         self.seen: set[str] = set()
 
     def feed(self, chunk: str) -> str | None:
         self.buffer = (self.buffer + chunk)[-8192:]
-        candidates = [match.group(0) for match in _TOKEN.finditer(self.buffer)]
-        # Non-braced organizer formats remain supported without allowing an
-        # unbounded regex search over command output.
-        candidates.extend(token for token in re.split(r"[\s'\"`,;]+", self.buffer) if 1 <= len(token) <= 1024)
-        for candidate in candidates:
+        candidates = [
+            (match.start(), match.group(0)) for match in _TOKEN.finditer(self.buffer)
+        ]
+        # Preserve chronological order while supporting non-braced organizer
+        # formats without applying an organizer regex to the whole output.
+        candidates.extend(
+            (match.start(), match.group(0))
+            for match in re.finditer(r"[^\s'\"`,;]{1,1024}", self.buffer)
+        )
+        for _offset, candidate in sorted(candidates, key=lambda row: row[0]):
             if candidate in self.seen:
                 continue
             self.seen.add(candidate)
@@ -47,11 +54,17 @@ class StreamingDetector:
         return None
 
 
-def valid_candidate(candidate: str, pattern: re.Pattern[str] | str | None) -> bool:
+def valid_candidate(candidate: str, pattern: Any | str | None) -> bool:
     if not candidate or len(candidate) > 1024 or _PLACEHOLDERS.search(candidate):
         return False
-    compiled = re.compile(pattern) if isinstance(pattern, str) else pattern
-    return bool(compiled and compiled.fullmatch(candidate))
+    try:
+        compiled = safe_regex.compile(pattern) if isinstance(pattern, str) else pattern
+        return bool(
+            compiled
+            and compiled.fullmatch(candidate, timeout=0.02, concurrent=True)
+        )
+    except (safe_regex.error, TimeoutError):
+        return False
 
 
 def record_candidate(
@@ -84,6 +97,8 @@ def record_candidate(
     if receipt.get("target_observed") is not True:
         raise FlagError("candidate has no actual challenge/declared-target observation receipt")
     receipt_id = str(receipt.get("receipt_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", receipt_id):
+        raise FlagError("candidate receipt id is invalid")
     durable = run_root / "workers" / lane_id / "logs" / f"{receipt_id}.json"
     if durable.is_symlink() or not durable.is_file():
         raise FlagError("candidate has no durable command/session receipt")

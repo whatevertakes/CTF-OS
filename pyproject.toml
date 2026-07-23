@@ -3,7 +3,7 @@ name = "ctf-os"
 version = "4.0.0"
 description = "Verified asynchronous portfolio racing for authorized CTF challenges"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6.0.2"]
+dependencies = ["PyYAML>=6.0.2", "regex==2026.7.19"]
 
 [build-system]
 requires = ["setuptools>=68"]

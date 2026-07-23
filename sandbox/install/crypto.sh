@@ -3,7 +3,9 @@ set -Eeuo pipefail
 source /opt/ctf-os/install/lib.sh
 
 CADO_NFS_COMMIT=90aec67f9a8f0badd0a20d1bbe4c1c2ed2e3c507
+CADO_NFS_SHA256=4b4821009af9364abd16f4d45bd6dcb3aedeef3c8855f002389508a23e5c1841
 RSACTFTOOL_COMMIT=7c98848f1945de3e67a420871e8672f5ad9aa5d5
+RSACTFTOOL_SHA256=813b25af898b95f23dd2d43abc63c912fcdb1a8923f257a32718eafec458ab78
 
 apt_install \
   sagemath pari-gp gap maxima libgmp-dev libmpfr-dev libmpc-dev libecm-dev \
@@ -20,10 +22,10 @@ ln -sf /usr/bin/maxima-sage /usr/local/bin/maxima
 pip_install -r /opt/ctf-os/requirements/crypto.txt
 # RsaCtfTool's historical dependency caps would downgrade the hardened common
 # HTTP/crypto layer. Its required runtime dependencies are pinned above.
-pip_install --no-deps "https://github.com/RsaCtfTool/RsaCtfTool/archive/${RSACTFTOOL_COMMIT}.tar.gz"
+pip_install --no-deps "https://github.com/RsaCtfTool/RsaCtfTool/archive/${RSACTFTOOL_COMMIT}.tar.gz#sha256=${RSACTFTOOL_SHA256}"
 if ! command -v RsaCtfTool >/dev/null && command -v RsaCtfTool.py >/dev/null; then ln -s "$(command -v RsaCtfTool.py)" /usr/local/bin/RsaCtfTool; fi
 
-download "https://github.com/cado-nfs/cado-nfs/archive/${CADO_NFS_COMMIT}.tar.gz" /tmp/cado-nfs.tar.gz
+download_sha256 "https://github.com/cado-nfs/cado-nfs/archive/${CADO_NFS_COMMIT}.tar.gz" /tmp/cado-nfs.tar.gz "$CADO_NFS_SHA256"
 mkdir /tmp/cado-nfs && tar -xzf /tmp/cado-nfs.tar.gz -C /tmp/cado-nfs --strip-components=1
 cmake -S /tmp/cado-nfs -B /tmp/cado-build -DCMAKE_BUILD_TYPE=Release
 # This is the only source build with a large native graph. Six jobs is bounded

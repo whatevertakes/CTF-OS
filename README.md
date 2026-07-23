@@ -52,15 +52,25 @@ uv run python -m ctf_os.agent_tools race-prepare \
 
 ## 4. 이미지와 도구 확인
 
-전체 이미지, GPU passthrough, CUDA 실행 상태는 다음 명령으로 다시 확인한다.
+전체 이미지의 현재 도구 잠금 해시·프로필·플랫폼과 GPU passthrough,
+CUDA 실행 상태는 다음 명령으로 다시 확인한다. CPU 이미지 항목은
+구조적 신원 검사이며, 실제 도구 실행은 이미지 빌드 스모크와 라이브
+통합 테스트가 담당한다.
 
 ```bash
 uv run python -m ctf_os.agent_tools doctor
 ```
 
-준비된 sandbox의 카테고리별 도구 카탈로그는 `list-tools`, 개별 사용법과
-버전은 `tool-help`, `tool-version`으로 확인한다. 현재 추가 도구는 다음과
-같다.
+준비된 sandbox 메타데이터 경로를 사용해 카테고리별 도구 카탈로그와
+개별 사용법·버전을 확인한다.
+
+```bash
+uv run python -m ctf_os.agent_tools list-tools --metadata '<run>/workers/root/sandbox.json'
+uv run python -m ctf_os.agent_tools tool-help --metadata '<run>/workers/root/sandbox.json' pwndbg
+uv run python -m ctf_os.agent_tools tool-version --metadata '<run>/workers/root/sandbox.json' pwndbg
+```
+
+현재 추가 도구는 다음과 같다.
 
 - pwn: pwndbg, pwninit, angrop
 - forensic: StegSeek

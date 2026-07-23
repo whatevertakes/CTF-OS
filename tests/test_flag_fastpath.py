@@ -22,6 +22,15 @@ def test_streaming_detector_handles_chunk_boundaries_and_rejects_placeholders() 
     assert not valid_candidate("OTHER{x}", r"\ACTF\{[^}]+\}\Z")
 
 
+def test_streaming_detector_returns_chronologically_first_matching_token() -> None:
+    detector = StreamingDetector(r"(?:ABC|CTF\{x\})")
+    assert detector.feed("ABC CTF{x}") == "ABC"
+
+
+def test_adversarial_flag_regex_is_time_bounded() -> None:
+    assert valid_candidate("a" * 1023 + "!", r"(a+)+$") is False
+
+
 def test_first_target_observed_candidate_wins_atomically_and_returns_sibling_cancel_targets(repo: Path) -> None:
     _manifest, challenge, run, _race = make_race(repo)
     note_command_receipt(

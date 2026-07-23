@@ -17,7 +17,7 @@ from ..blackboard import append_verified_event
 from ..contest import discover_contests, initialize_contest, resolve_selector, select_contest
 from ..doctor import run_doctor
 from ..flag import StreamingDetector, record_candidate
-from ..handoff import load_markdown, save_handoff
+from ..handoff import load_markdown, save_handoff, validate_handoff
 from ..images import select_image, smoke_images
 from ..preflight import input_fingerprint, prepare_input, validate_prepared_input
 from ..race import (
@@ -226,37 +226,39 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
     if args.command == "sandbox-gc":
         return sandbox_gc(docker=args.docker)
     if args.command == "sandbox-exec":
-        return _sandbox_exec(Path(args.metadata), args)
+        return _sandbox_exec(repo, Path(args.metadata), args)
     if args.command == "blackboard-add":
         return _blackboard_add(Path(args.receipt), args)
     if args.command == "session-open":
-        metadata = load_metadata(Path(args.metadata))
+        metadata = _authorized_metadata(repo, Path(args.metadata))
         _attack_timeout(metadata, 30)
         return open_session(
             metadata, session_id=args.session, kind=args.kind,
             command=_optional_remainder(args.argv), target_identity=args.target_identity,
         )
     if args.command == "session-send":
-        metadata = load_metadata(Path(args.metadata))
+        metadata = _authorized_metadata(repo, Path(args.metadata))
         return session_send(
             metadata, session_id=args.session, data=args.data,
             timeout=_attack_timeout(metadata, args.timeout),
         )
     if args.command == "session-read":
-        return _session_read(Path(args.metadata), args)
+        return _session_read(repo, Path(args.metadata), args)
     if args.command == "session-close":
         return close_session(
-            load_metadata(Path(args.metadata)), session_id=args.session, timeout=args.timeout,
+            _authorized_metadata(repo, Path(args.metadata)),
+            session_id=args.session,
+            timeout=args.timeout,
         )
     if args.command == "session-list":
-        return list_sessions(load_metadata(Path(args.metadata)))
+        return list_sessions(_authorized_metadata(repo, Path(args.metadata)))
     if args.command == "list-tools":
-        return list_tools(str(load_metadata(Path(args.metadata))["category"]))
+        return list_tools(str(_authorized_metadata(repo, Path(args.metadata))["category"]))
     if args.command == "tool-help":
-        metadata = load_metadata(Path(args.metadata))
+        metadata = _authorized_metadata(repo, Path(args.metadata))
         return tool_help(str(metadata["category"]), args.name)
     if args.command == "tool-version":
-        metadata = load_metadata(Path(args.metadata))
+        metadata = _authorized_metadata(repo, Path(args.metadata))
         _attack_timeout(metadata, 20)
         return tool_version(metadata, args.name)
     if args.command == "doctor":
@@ -449,8 +451,8 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _sandbox_exec(metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
-    metadata = load_metadata(metadata_path)
+def _sandbox_exec(repo: Path, metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    metadata = _authorized_metadata(repo, metadata_path)
     run = Path(str(metadata["lane_root"])).resolve().parents[1]
     race = load_race(run)
     lane = next(row for row in race["lanes"] if row["lane_id"] == metadata["lane_id"])
@@ -509,8 +511,8 @@ def _blackboard_add(receipt_path: Path, args: argparse.Namespace) -> dict[str, A
     return event
 
 
-def _session_read(metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
-    metadata = load_metadata(metadata_path)
+def _session_read(repo: Path, metadata_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    metadata = _authorized_metadata(repo, metadata_path)
     receipt = session_read(
         metadata, session_id=args.session, limit=args.limit,
         timeout=_attack_timeout(metadata, args.timeout),
@@ -545,17 +547,57 @@ def _session_read(metadata_path: Path, args: argparse.Namespace) -> dict[str, An
     return {"receipt": receipt, "winner": winner, "warnings": warnings}
 
 
+def _authorized_metadata(repo: Path, metadata_path: Path) -> dict[str, Any]:
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        raise ValueError("sandbox metadata path is missing or unsafe")
+    metadata_path = metadata_path.resolve()
+    metadata = load_metadata(metadata_path)
+    lane_root = Path(str(metadata["lane_root"]))
+    if lane_root.is_symlink():
+        raise ValueError("sandbox lane root is unsafe")
+    lane_root = lane_root.resolve()
+    try:
+        run = lane_root.parents[1]
+    except IndexError as exc:
+        raise ValueError("sandbox lane root is malformed") from exc
+    authoritative_run = resolve_run(repo, run.name).resolve()
+    if run != authoritative_run:
+        raise ValueError("sandbox metadata does not belong to the active repository run")
+    lane_id = str(metadata["lane_id"])
+    expected_path = (run / "workers" / lane_id / "sandbox.json").resolve()
+    if metadata_path != expected_path or lane_root != expected_path.parent:
+        raise ValueError("sandbox metadata is not the authoritative lane record")
+    race = load_race(run)
+    lane = next(
+        (row for row in race.get("lanes", []) if row.get("lane_id") == lane_id),
+        None,
+    )
+    sandbox = lane.get("sandbox") if isinstance(lane, Mapping) else None
+    if not isinstance(sandbox, Mapping):
+        raise ValueError("sandbox lane is not attached to the exact race")
+    for field in ("name", "run_id", "lane_id", "challenge_id", "category"):
+        if sandbox.get(field) != metadata.get(field):
+            raise ValueError(f"sandbox metadata does not match the race: {field}")
+    if sandbox.get("metadata_path") != str(metadata_path):
+        raise ValueError("sandbox metadata path does not match the race")
+    return metadata
+
+
 def _race_handoff(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(repo, args.run_id)
     race = load_race(run)
-    terminated = terminate(run, reason="HANDOFF")
     markdown = load_markdown(Path(args.markdown_file))
+    handoff_args = {
+        "contest": str(race["contest"]["name"]),
+        "challenge": f"{race['challenge']['category']}-{race['challenge']['name']}",
+        "run_id": run.name,
+        "markdown": markdown,
+    }
+    validate_handoff(repo, **handoff_args)
+    terminated = terminate(run, reason="HANDOFF")
     destination = save_handoff(
         repo,
-        contest=str(race["contest"]["name"]),
-        challenge=f"{race['challenge']['category']}-{race['challenge']['name']}",
-        run_id=run.name,
-        markdown=markdown,
+        **handoff_args,
     )
     return terminated | {
         "handoff_path": str(destination),

@@ -29,6 +29,22 @@ def load_markdown(path: Path) -> str:
 
 
 def save_handoff(repo: Path, *, contest: str, challenge: str, run_id: str, markdown: str) -> Path:
+    destination = validate_handoff(
+        repo,
+        contest=contest,
+        challenge=challenge,
+        run_id=run_id,
+        markdown=markdown,
+    )
+    rescue = (repo / "rescue").resolve()
+    _safe_directories(rescue, destination.parent)
+    atomic_text(destination, markdown)
+    return destination
+
+
+def validate_handoff(
+    repo: Path, *, contest: str, challenge: str, run_id: str, markdown: str
+) -> Path:
     data = markdown.encode("utf-8")
     if not data or len(data) > MAX_HANDOFF_BYTES:
         raise HandoffError("handoff markdown must contain 1..32768 UTF-8 bytes")
@@ -36,12 +52,18 @@ def save_handoff(repo: Path, *, contest: str, challenge: str, run_id: str, markd
         raise HandoffError("handoff must identify the exact terminated run_id")
     contest_name = safe_component(contest, "contest")
     challenge_name = safe_component(challenge, "challenge")
-    rescue = (repo / "rescue").resolve()
+    rescue_path = repo / "rescue"
+    if rescue_path.is_symlink():
+        raise HandoffError("rescue root is unsafe")
+    rescue = rescue_path.resolve()
     destination = rescue / contest_name / challenge_name / "HANDOFF.md"
-    _safe_directories(rescue, destination.parent)
+    cursor = rescue
+    for part in (contest_name, challenge_name):
+        cursor = cursor / part
+        if cursor.is_symlink() or (cursor.exists() and not cursor.is_dir()):
+            raise HandoffError("handoff directory is unsafe")
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise HandoffError("handoff destination is unsafe")
-    atomic_text(destination, markdown)
     return destination
 
 

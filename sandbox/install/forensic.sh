@@ -3,6 +3,7 @@ set -Eeuo pipefail
 source /opt/ctf-os/install/lib.sh
 
 STEGSEEK_VERSION=0.6
+STEGSEEK_SHA256=7218c0e0d0cc81e31678eac6d63d1af46eccd6a0d4a9299e3b68b11e7bfc92f3
 apt_install \
   sleuthkit foremost libimage-exiftool-perl binwalk tshark tcpdump testdisk dcfldd \
   xfsprogs e2fsprogs ntfs-3g steghide imagemagick tesseract-ocr pngcheck \
@@ -11,7 +12,7 @@ pip_install -r /opt/ctf-os/requirements/forensic.txt
 if ! command -v vol >/dev/null && command -v vol.py >/dev/null; then ln -s "$(command -v vol.py)" /usr/local/bin/vol; fi
 gem install zsteg --version 0.2.13 --no-document
 
-download "https://github.com/RickdeJager/stegseek/releases/download/v${STEGSEEK_VERSION}/stegseek_${STEGSEEK_VERSION}-1.deb" /tmp/stegseek.deb
+download_sha256 "https://github.com/RickdeJager/stegseek/releases/download/v${STEGSEEK_VERSION}/stegseek_${STEGSEEK_VERSION}-1.deb" /tmp/stegseek.deb "$STEGSEEK_SHA256"
 apt-get update
 apt-get install -y --no-install-recommends /tmp/stegseek.deb
 rm -rf /var/lib/apt/lists/* /tmp/stegseek.deb

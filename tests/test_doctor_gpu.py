@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from subprocess import TimeoutExpired
 
 from ctf_os.doctor import (
     GPU_AI_ONNX_PROBE,
@@ -42,6 +43,15 @@ def test_gpu_checks_skip_cleanly_when_host_has_no_nvidia_gpu() -> None:
         "--query-gpu=index,name,driver_version",
         "--format=csv,noheader,nounits",
     ]]
+
+
+def test_gpu_probe_timeout_is_a_failure_not_no_gpu_skip() -> None:
+    def runner(argv, **kwargs):
+        raise TimeoutExpired(argv, kwargs["timeout"])
+
+    checks = _gpu_checks(_images("base"), docker="docker", runner=runner)
+    assert checks[0]["name"] == "gpu-host-driver"
+    assert checks[0]["status"] == "FAIL"
 
 
 def test_gpu_checks_run_scoped_real_operation_probes() -> None:

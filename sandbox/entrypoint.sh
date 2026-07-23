@@ -14,6 +14,7 @@ export XDG_CONFIG_HOME=/work/home/.config
 export XDG_CACHE_HOME=/work/home/.cache
 export XDG_RUNTIME_DIR=/work/runtime
 export TMPDIR=/work/tmp
+export JAVA_TOOL_OPTIONS="-Duser.home=$HOME"
 export AWS_SHARED_CREDENTIALS_FILE=/work/credentials/aws
 export AWS_CONFIG_FILE=/work/credentials/aws-config
 export AZURE_CONFIG_DIR=/work/credentials/azure
@@ -24,6 +25,12 @@ export KUBECONFIG=/work/credentials/kubeconfig
 setpriv --reuid=ctf --regid=ctf --init-groups -- sh -c '
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" /work/credentials
   chmod 0700 "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" /work/credentials
+  if command -v ares >/dev/null 2>&1; then
+    mkdir -p "$HOME/Ares"
+    if [ ! -e "$HOME/Ares/config.toml" ]; then
+      install -m 0600 /opt/ctf-os/ares-config.toml "$HOME/Ares/config.toml"
+    fi
+  fi
 '
 
 apply_firewall() {

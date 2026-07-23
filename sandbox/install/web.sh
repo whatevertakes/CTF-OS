@@ -13,6 +13,7 @@ DALFOX_SHA256=ef48d30c183cead88eb89da10bdc1a7fa58a484d175319096075b470f3652fd4
 SEMGREP_VERSION=1.127.1
 SEMGREP_SHA256=068fbd6e35b684356d14e7bb759b40d31d43cd9bfe88e4d209e18f91fda7ff8b
 SSTIMAP_COMMIT=d4f09055b15967b0e2265f20eb348a7ec2f25a2c
+SSTIMAP_SHA256=6afd688be9faa6888279e1587c1f63bb580e52f086d1ebe994edde5e3c0b691d
 
 apt_install \
   nodejs npm php-cli php-curl php-sqlite3 sqlite3 redis-tools \
@@ -49,7 +50,7 @@ tar -xzf /tmp/dalfox.tar.gz -C /tmp/dalfox-extract --strip-components=1
 install -m 0755 /tmp/dalfox-extract/dalfox /usr/local/bin/dalfox
 rm -rf /tmp/nuclei /tmp/nuclei.zip /tmp/nuclei-templates.tar.gz /tmp/dalfox-extract /tmp/dalfox.tar.gz
 
-download "https://github.com/vladko312/SSTImap/archive/${SSTIMAP_COMMIT}.tar.gz" /tmp/sstimap.tar.gz
+download_sha256 "https://github.com/vladko312/SSTImap/archive/${SSTIMAP_COMMIT}.tar.gz" /tmp/sstimap.tar.gz "$SSTIMAP_SHA256"
 mkdir -p /opt/sstimap
 tar -xzf /tmp/sstimap.tar.gz -C /opt/sstimap --strip-components=1
 rm -f /tmp/sstimap.tar.gz

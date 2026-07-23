@@ -78,7 +78,7 @@ failure never invalidates the executed attack.
 
 `race-status` reports command count, distinct output count, high-value event
 count, duplicate fingerprints, mechanical stagnation signals, last verified
-delta, and replaceable native cancel targets. Default leases are 3–8 minutes by
+delta, and replaceable native cancel targets. Default leases are 4–8 minutes by
 category. Root decides semantics and rapidly stops or replaces repeated,
 stagnant, or remote-avoiding lanes. After Root interrupts a native child,
 `race-stop-confirm` immediately removes that child's labelled sandbox while
@@ -89,8 +89,9 @@ Only `STOPPED` children free a replacement slot.
 
 ## Flag fast path
 
-Every one-shot execution and persistent-session read is scanned as output is
-processed. A candidate must match the exact challenge pattern, not be a
+Every one-shot execution is scanned as output is streamed; each bounded
+persistent-session read is scanned immediately after its receipt is captured.
+A candidate must match the exact challenge pattern, not be a
 placeholder, occur in the receipt's actual output, and have a challenge or
 declared-target identity. The first winner is stored atomically, displayed
 without post-analysis or reporting delay, and accompanied by sibling native cancel
@@ -104,7 +105,8 @@ browser profiles, personal cloud/container credentials, kubeconfig, home
 directory, or unrelated files. Egress is restricted to resolved declared
 targets or the exact internal challenge-service network. Cloud metadata,
 Docker gateways, undeclared private networks, and `trust_remote_code=True` are
-forbidden. Unsafe AI artifacts remain inside the sandbox.
+forbidden. Unsafe AI artifacts may persist only in lane-private host directories
+and are never opened or executed automatically by the host controller.
 
 Only Root mutates shared service lifecycle. Cleanup verifies exact run labels
 before removing CTF-OS containers and networks. At deadline or handoff, Root

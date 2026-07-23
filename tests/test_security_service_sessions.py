@@ -13,7 +13,8 @@ from ctf_os.preflight import detect_service
 from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
 from ctf_os.sandbox.runtime import SandboxError, SandboxSpec, build_run_argv, cleanup
 from ctf_os.sandbox.session import (
-    SessionError, list_tools, open_session, read as session_read, tool_help, tool_version,
+    SessionError, close_session, list_tools, open_session, read as session_read,
+    tool_help, tool_version,
 )
 from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, prepare_service
 
@@ -75,6 +76,57 @@ def test_dangerous_compose_is_blocked_before_service_lifecycle(tmp_path: Path) -
     plan = detect_service(input_root, "web")
     assert plan["safe"] is False
     assert any("Docker socket" in reason for reason in plan["review_reasons"])
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    (
+        "    use_api_socket: true\n",
+        "    volumes_from: [other]\n",
+        "    logging: {driver: syslog, options: {syslog-address: tcp://127.0.0.1:1}}\n",
+        "    security_opt: [seccomp=unconfined]\n",
+        "    volumes: ['${PWD}:/host']\n",
+        "    extends: {file: ../../host.yml, service: other}\n",
+    ),
+)
+def test_compose_host_and_daemon_escape_surfaces_are_rejected(
+    tmp_path: Path, fragment: str
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n  chall:\n    image: demo\n    expose: [8000]\n" + fragment,
+        encoding="utf-8",
+    )
+    plan = detect_service(input_root, "web")
+    assert plan["safe"] is False
+    assert plan["review_reasons"]
+
+
+def test_compose_named_volume_driver_opts_cannot_bind_host(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n  chall:\n    image: demo\n    expose: [8000]\n"
+        "    volumes: [data:/data]\n"
+        "volumes:\n  data:\n    driver: local\n"
+        "    driver_opts: {type: none, o: bind, device: /}\n",
+        encoding="utf-8",
+    )
+    plan = detect_service(input_root, "web")
+    assert plan["safe"] is False
+    assert any("custom driver" in reason for reason in plan["review_reasons"])
+
+
+def test_oversized_service_descriptor_is_rejected_without_parsing(
+    tmp_path: Path
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_bytes(b" " * (1024 * 1024 + 1))
+    plan = detect_service(input_root, "web")
+    assert plan["safe"] is False
+    assert any("exceeds" in reason for reason in plan["review_reasons"])
 
 
 def test_compose_build_context_cannot_escape_prepared_input(tmp_path: Path) -> None:
@@ -159,6 +211,7 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
         metadata, session_id="dbg-main", kind="debugger", command=["gdb", "-q", "/challenge/chall"], runner=runner
     )
     assert state["status"] == "RUNNING"
+    assert any("ulimit -f 131072" in value for value in calls[0])
     receipt = session_read(metadata, session_id="dbg-main", runner=runner)
     assert receipt["observed_output"] == "gdb output\n"
     assert (run / "workers" / "root" / "logs" / f"{receipt['receipt_id']}.json").is_file()
@@ -288,6 +341,47 @@ def test_cleanup_requires_successful_chown_before_container_removal() -> None:
     assert result["normalization_warning"] is None
     assert [argv[1] for argv in calls] == ["inspect", "exec", "rm"]
     assert calls[1][2:4] == ["--user", "0:0"]
+
+
+def test_cleanup_does_not_treat_docker_daemon_failure_as_absent() -> None:
+    metadata = {
+        "name": "ctf-os-run-root",
+        "labels": {"org.ctf-os.run-id": "run-1"},
+    }
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "daemon unavailable")
+
+    with pytest.raises(SandboxError, match="inspection failed"):
+        cleanup(metadata, runner=runner)
+
+
+def test_failed_session_close_remains_retryable(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo, category="pwn")
+    metadata = fake_sandbox(run, challenge, "root", "ctf-os-sandbox:pwn")
+
+    def open_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    open_session(
+        metadata,
+        session_id="retry-close",
+        kind="shell",
+        command=["sh"],
+        runner=open_runner,
+    )
+
+    def fail_runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "docker exec failed")
+
+    result = close_session(
+        metadata, session_id="retry-close", runner=fail_runner
+    )
+    state = json.loads(
+        (run / "workers" / "root" / "sessions" / "retry-close.json").read_text()
+    )
+    assert result["stopped"] is False
+    assert state["status"] == "RUNNING"
 
 
 @pytest.mark.live

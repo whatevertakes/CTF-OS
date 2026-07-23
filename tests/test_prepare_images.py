@@ -9,7 +9,7 @@ import pytest
 
 import ctf_os.agent_tools.__main__ as cli
 from ctf_os.categories import CATEGORIES, canonical_category
-from ctf_os.images import recommended_image, select_image
+from ctf_os.images import expected_lock_sha256, recommended_image, select_image
 from ctf_os.preflight import input_fingerprint, prepare_input, validate_prepared_input
 from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv, create
 from ctf_os.workspace import create_run
@@ -20,7 +20,19 @@ from conftest import write_challenge
 def _image_result(image: str, *, available: set[str]) -> subprocess.CompletedProcess[str]:
     if image not in available:
         return subprocess.CompletedProcess([], 1, "", "not found")
-    payload = [{"Id": f"sha256:{image}", "Size": 123, "Config": {"Labels": {"org.ctf-os.sandbox": "true"}}}]
+    profile = image.removeprefix("ctf-os-sandbox:")
+    payload = [{
+        "Id": f"sha256:{profile}",
+        "Size": 123,
+        "Os": "linux",
+        "Architecture": "amd64",
+        "Config": {"Labels": {
+            "org.ctf-os.sandbox": "true",
+            "org.ctf-os.profile": profile,
+            "org.ctf-os.build-policy": "pre-contest-pinned",
+            "org.ctf-os.lock-sha256": expected_lock_sha256(),
+        }},
+    }]
     return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
 
 
@@ -31,7 +43,7 @@ def test_all_ten_categories_select_their_recommended_image() -> None:
         runner = lambda argv, **kwargs: _image_result(argv[-1], available={expected})
         selected = select_image(category, runner=runner)
         assert recommended_image(category) == expected
-        assert selected["selected_image"] == expected
+        assert selected["selected_image"] == f"sha256:{category}"
         assert selected["status"] == "AVAILABLE"
     with pytest.raises(ValueError):
         canonical_category("mobile")
@@ -41,11 +53,32 @@ def test_missing_category_image_degrades_only_to_existing_base_and_otherwise_fai
     base_runner = lambda argv, **kwargs: _image_result(argv[-1], available={"ctf-os-sandbox:base"})
     degraded = select_image("pwn", runner=base_runner)
     assert degraded["status"] == "DEGRADED"
-    assert degraded["selected_image"] == "ctf-os-sandbox:base"
+    assert degraded["selected_image"] == "sha256:base"
     missing = select_image("pwn", runner=lambda argv, **kwargs: _image_result(argv[-1], available=set()))
     assert missing["status"] == "UNAVAILABLE"
     assert missing["selected_image"] is None
     assert missing["image_available"] is False
+
+
+def test_image_selection_rejects_wrong_profile_policy_and_platform() -> None:
+    def runner(argv, **kwargs):
+        payload = [{
+            "Id": "sha256:wrong",
+            "Size": 1,
+            "Os": "windows",
+            "Architecture": "amd64",
+            "Config": {"Labels": {
+                "org.ctf-os.sandbox": "true",
+                "org.ctf-os.profile": "pwn",
+                "org.ctf-os.build-policy": "unknown",
+                "org.ctf-os.lock-sha256": expected_lock_sha256(),
+            }},
+        }]
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    selected = select_image("web", runner=runner)
+    assert selected["status"] == "UNAVAILABLE"
+    assert selected["image_available"] is False
 
 
 def test_materialization_is_fresh_read_only_and_does_not_modify_incoming(repo: Path) -> None:

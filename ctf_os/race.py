@@ -302,6 +302,12 @@ def confirm_native_spawn(run_root: Path, *, lane_id: str, native_session: str) -
     with state_lock(run_root):
         race = load_race(run_root)
         lane = _lane(race, lane_id)
+        if any(
+            row.get("native_session") == native_session
+            for row in race.get("lanes", [])
+            if row.get("lane_id") != lane_id
+        ):
+            raise RaceError("native session identity is already attached to another lane")
         if lane["status"] != "PREPARED" or not isinstance(lane.get("sandbox"), Mapping):
             raise RaceError("native spawn requires a prepared, READY private sandbox")
         if lane["sandbox"].get("status") != "READY":

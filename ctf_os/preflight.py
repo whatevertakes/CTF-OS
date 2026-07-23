@@ -36,6 +36,7 @@ LIMITS = {
     "large-forensic": ArchiveLimits(max_files=100_000, max_file_bytes=16 * 1024**3, max_total_bytes=64 * 1024**3),
 }
 PRIORITY_LIMIT = 20
+MAX_SERVICE_DESCRIPTOR_BYTES = 1024 * 1024
 
 
 class PreflightError(ValueError):
@@ -209,16 +210,26 @@ def file_hash(path: Path) -> str:
 
 
 def detect_service(input_root: Path, category: str) -> dict[str, Any]:
-    dockerfiles = [path for path in input_root.rglob("Dockerfile") if path.is_file() and not path.is_symlink()]
+    dockerfiles = sorted(
+        (path for path in input_root.rglob("Dockerfile") if path.is_file() and not path.is_symlink()),
+        key=lambda value: value.relative_to(input_root).as_posix(),
+    )
     compose = [
         path for name in ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
         for path in input_root.rglob(name) if path.is_file() and not path.is_symlink()
     ]
+    compose.sort(key=lambda value: value.relative_to(input_root).as_posix())
     if compose:
         return _compose_plan(input_root, compose[0], category)
     if dockerfiles:
         relative = dockerfiles[0].relative_to(input_root)
-        text = dockerfiles[0].read_text(encoding="utf-8", errors="replace")[:256_000]
+        try:
+            text = _read_service_descriptor(dockerfiles[0], errors="replace")
+        except PreflightError as exc:
+            return {
+                "kind": "dockerfile", "safe": False, "source": relative.as_posix(),
+                "services": [], "review_reasons": [str(exc)],
+            }
         ports = _dockerfile_ports(text)
         if not ports:
             return {
@@ -245,13 +256,15 @@ def detect_service(input_root: Path, category: str) -> dict[str, Any]:
 def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]:
     relative = path.relative_to(input_root).as_posix()
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        document = yaml.safe_load(_read_service_descriptor(path)) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, PreflightError) as exc:
         return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": [str(exc)]}
     raw_services = document.get("services") if isinstance(document, Mapping) else None
     if not isinstance(raw_services, Mapping) or not raw_services:
         return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": ["compose has no services"]}
     reasons: list[str] = []
+    if isinstance(document, Mapping) and document.get("include"):
+        reasons.append("compose requests external include files")
     services: list[dict[str, Any]] = []
     base_images: set[str] = set()
     runtime_images: set[str] = set()
@@ -262,6 +275,10 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
         for name, settings in entries.items():
             if isinstance(settings, Mapping) and (settings.get("external") or settings.get("name")):
                 reasons.append(f"top-level {section} {name} references a non-project-scoped resource")
+            if section == "volumes" and isinstance(settings, Mapping) and (
+                settings.get("driver") or settings.get("driver_opts")
+            ):
+                reasons.append(f"top-level volume {name} requests a custom driver or host path")
     for name, raw in raw_services.items():
         if not isinstance(raw, Mapping):
             reasons.append(f"service {name} is not a mapping")
@@ -271,6 +288,14 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
         for key in ("network_mode", "pid", "ipc", "userns_mode", "uts", "cgroup", "runtime"):
             if raw.get(key):
                 reasons.append(f"service {name} requests explicit {key}")
+        for key in (
+            "use_api_socket", "volumes_from", "logging", "security_opt",
+            "credential_spec", "device_cgroup_rules", "extends", "label_file",
+            "gpus", "group_add", "cgroup_parent", "sysctls", "ulimits",
+            "oom_score_adj", "isolation", "volume_driver",
+        ):
+            if raw.get(key):
+                reasons.append(f"service {name} requests unsafe {key}")
         if raw.get("devices"):
             reasons.append(f"service {name} requests host devices")
         if raw.get("cap_add"):
@@ -302,6 +327,8 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
                     reasons.append(f"service {name} requests a host bind mount")
             else:
                 text = str(volume)
+            if "$" in text:
+                reasons.append(f"service {name} uses a dynamic volume reference")
             if "/var/run/docker.sock" in text:
                 reasons.append(f"service {name} requests the Docker socket")
             source = text.split(":", 1)[0]
@@ -388,7 +415,10 @@ def _compose_build(
     elif isinstance(value, Mapping):
         context_value = str(value.get("context", "."))
         dockerfile_value = str(value.get("dockerfile", "Dockerfile"))
-        for key in ("ssh", "secrets", "additional_contexts", "entitlements"):
+        for key in (
+            "ssh", "secrets", "additional_contexts", "entitlements",
+            "dockerfile_inline",
+        ):
             if value.get(key):
                 reasons.append(f"build requests {key}")
     else:
@@ -403,10 +433,22 @@ def _compose_build(
         return [], reasons + ["build Dockerfile escapes prepared input"]
     if dockerfile.is_symlink() or not dockerfile.is_file():
         return [], reasons + ["build Dockerfile is missing or unsafe"]
-    bases, base_reasons = _dockerfile_bases(
-        dockerfile.read_text(encoding="utf-8", errors="replace")[:256_000]
-    )
+    try:
+        text = _read_service_descriptor(dockerfile, errors="replace")
+    except PreflightError as exc:
+        return [], reasons + [str(exc)]
+    bases, base_reasons = _dockerfile_bases(text)
     return bases, reasons + base_reasons
+
+
+def _read_service_descriptor(path: Path, *, errors: str = "strict") -> str:
+    if path.is_symlink() or not path.is_file():
+        raise PreflightError("service descriptor is missing or unsafe")
+    if path.stat().st_size > MAX_SERVICE_DESCRIPTOR_BYTES:
+        raise PreflightError(
+            f"service descriptor exceeds {MAX_SERVICE_DESCRIPTOR_BYTES} bytes"
+        )
+    return path.read_text(encoding="utf-8", errors=errors)
 
 
 def _compose_reference_is_scoped(
