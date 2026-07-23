@@ -25,6 +25,20 @@ MAX_CAPTURE = 64 * 1024
 MAX_COMMAND_SECONDS = 1800
 MAX_COMMAND_LOG_BYTES = 64 * 1024 * 1024
 COMMAND_HEARTBEAT_SECONDS = 5.0
+USER_EXEC_ENV = (
+    "HOME=/work/home",
+    "XDG_CONFIG_HOME=/work/home/.config",
+    "XDG_CACHE_HOME=/work/home/.cache",
+    "XDG_DATA_HOME=/work/home/.local/share",
+    "XDG_RUNTIME_DIR=/work/runtime",
+    "TMPDIR=/work/tmp",
+    "JAVA_TOOL_OPTIONS=-Duser.home=/work/home",
+    "AWS_SHARED_CREDENTIALS_FILE=/work/credentials/aws",
+    "AWS_CONFIG_FILE=/work/credentials/aws-config",
+    "AZURE_CONFIG_DIR=/work/credentials/azure",
+    "CLOUDSDK_CONFIG=/work/credentials/gcloud",
+    "KUBECONFIG=/work/credentials/kubeconfig",
+)
 
 
 class SandboxError(RuntimeError):
@@ -253,7 +267,7 @@ def execute(
     receipt_id = uuid.uuid4().hex
     pid_file = f"/tmp/ctf-os-exec-{receipt_id}.pid"
     argv = [
-        docker, "exec", "--user", "1001:1001", "--workdir", "/work", name,
+        *user_exec_prefix(metadata, docker=docker, workdir="/work"),
         "setsid", "--fork", "--wait", "sh", "-c",
         "umask 077; echo $$ >\"$1\"; shift; exec \"$@\"",
         "ctf-os-exec", pid_file, *command,
@@ -484,7 +498,7 @@ def probe_service_connectivity(
         )
         result = subprocess.run(
             [
-                docker, "exec", "--user", "1001:1001", str(metadata["name"]),
+                *user_exec_prefix(metadata, docker=docker),
                 "python3", "-c", code, parsed.hostname, str(parsed.port),
             ],
             capture_output=True, text=True, timeout=10, check=False,
@@ -627,6 +641,30 @@ def _metadata_name(metadata: Mapping[str, Any]) -> str:
     if not re.fullmatch(r"ctf-os-[a-z0-9_.-]{1,110}", name):
         raise SandboxError("invalid sandbox container identity")
     return name
+
+
+def user_exec_prefix(
+    metadata: Mapping[str, Any],
+    *,
+    docker: str = "docker",
+    interactive: bool = False,
+    detach: bool = False,
+    workdir: str | None = None,
+) -> list[str]:
+    """Build a credential-isolated docker exec prefix for the sandbox user."""
+
+    argv = [docker, "exec"]
+    if interactive:
+        argv.append("--interactive")
+    if detach:
+        argv.append("--detach")
+    argv.extend(["--user", "1001:1001"])
+    if workdir is not None:
+        argv.extend(["--workdir", workdir])
+    for value in USER_EXEC_ENV:
+        argv.extend(["--env", value])
+    argv.append(_metadata_name(metadata))
+    return argv
 
 
 def _kill_exec(name: str, pid_file: str, *, docker: str) -> None:

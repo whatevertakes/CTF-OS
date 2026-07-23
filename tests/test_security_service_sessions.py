@@ -11,7 +11,14 @@ import pytest
 from ctf_os.archive import ArchiveError, extract_archive
 from ctf_os.preflight import detect_service
 from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
-from ctf_os.sandbox.runtime import SandboxError, SandboxSpec, build_run_argv, cleanup
+from ctf_os.sandbox.runtime import (
+    USER_EXEC_ENV,
+    SandboxError,
+    SandboxSpec,
+    build_run_argv,
+    cleanup,
+    user_exec_prefix,
+)
 from ctf_os.sandbox.session import (
     SessionError, close_session, list_tools, open_session, read as session_read,
     tool_help, tool_version,
@@ -45,6 +52,32 @@ def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credenti
     assert "CTF_OS_ALLOWED_ENDPOINTS_JSON" in joined
     assert joined.count("--cap-add CHOWN") == 1
     assert joined.count("--cap-add DAC_READ_SEARCH") == 1
+
+
+def test_user_docker_exec_prefix_carries_only_lane_private_state(
+    repo: Path,
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo, category="cloud")
+    metadata = fake_sandbox(
+        run, challenge, "root", "ctf-os-sandbox:cloud",
+    )
+    argv = user_exec_prefix(
+        metadata,
+        interactive=True,
+        detach=True,
+        workdir="/work",
+    )
+    assert argv[:6] == [
+        "docker", "exec", "--interactive", "--detach", "--user", "1001:1001",
+    ]
+    assert "--workdir" in argv
+    for value in USER_EXEC_ENV:
+        assert argv.count(value) == 1
+        assert argv[argv.index(value) - 1] == "--env"
+        assert "/work" in value.split("=", 1)[1]
+    joined = " ".join(argv).casefold()
+    for forbidden in ("/home/choijiwng-kali", ".ssh", "host.docker.internal"):
+        assert forbidden not in joined
 
 
 def test_metadata_gateways_private_networks_and_undeclared_targets_are_rejected() -> None:
@@ -220,6 +253,7 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
     )
     assert state["status"] == "RUNNING"
     assert any("ulimit -f 131072" in value for value in calls[0])
+    assert all(value in calls[0] for value in USER_EXEC_ENV)
     receipt = session_read(metadata, session_id="dbg-main", runner=runner)
     assert receipt["observed_output"] == "gdb output\n"
     assert (run / "workers" / "root" / "logs" / f"{receipt['receipt_id']}.json").is_file()

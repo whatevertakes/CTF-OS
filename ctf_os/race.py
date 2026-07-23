@@ -397,7 +397,7 @@ def begin_lane_cleanup_retry(run_root: Path, *, lane_id: str) -> dict[str, Any]:
 
 
 def confirm_native_spawn(run_root: Path, *, lane_id: str, native_session: str) -> dict[str, Any]:
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,255}", native_session):
+    if not _valid_native_session(native_session):
         raise RaceError("native session identity is invalid")
     with state_lock(run_root):
         race = load_race(run_root)
@@ -408,13 +408,23 @@ def confirm_native_spawn(run_root: Path, *, lane_id: str, native_session: str) -
             if row.get("lane_id") != lane_id
         ):
             raise RaceError("native session identity is already attached to another lane")
-        if lane["status"] != "PREPARED" or not isinstance(lane.get("sandbox"), Mapping):
+        attached = lane.get("native_session")
+        if attached is not None:
+            if attached != native_session:
+                raise RaceError("lane is already attached to a different native session")
+            return dict(lane)
+        if (
+            lane["status"] in {"STOPPING", "CLEANUP_FAILED", "STOPPED"}
+            or not isinstance(lane.get("sandbox"), Mapping)
+        ):
             raise RaceError("native spawn requires a prepared, READY private sandbox")
         if lane["sandbox"].get("status") != "READY":
             raise RaceError("native spawn requires a READY private sandbox")
         lane["native_session"] = native_session
-        lane["status"] = "RUNNING"
-        lane["spawned_at"] = utc_now()
+        if lane["status"] == "PREPARED":
+            lane["status"] = "RUNNING"
+        if lane.get("spawned_at") is None:
+            lane["spawned_at"] = utc_now()
         _write(run_root, race)
         return dict(lane)
 
@@ -825,7 +835,10 @@ def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, An
         f"Role: {lane['role']}\nTask: {lane['task']}\n"
         f"Context JSON: {json.dumps(context, ensure_ascii=False, sort_keys=True)}"
     )
-    task_name = str(lane["lane_id"]).replace("-", "_")
+    task_name = _native_task_name(
+        str(lane["lane_id"]),
+        str(race["attempt_id"]),
+    )
     spawn_args: dict[str, str] = {
         "task_name": task_name,
         "fork_turns": "none",
@@ -861,6 +874,29 @@ def _normalize_specification(row: Mapping[str, Any]) -> dict[str, str]:
         if not values[field] or len(values[field]) > (128 if field == "role" else 4096):
             raise RaceError(f"lane {field} is empty or too long")
     return values
+
+
+def _valid_native_session(value: str) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= 256:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_.:/-]+", value):
+        return False
+    if "/" not in value:
+        return value[0].isalnum()
+    parts = value.split("/")
+    if value.startswith("/"):
+        parts = parts[1:]
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9_.:-]+", part) for part in parts)
+
+
+def _native_task_name(lane_id: str, attempt_id: str) -> str:
+    lane = re.sub(r"[^a-z0-9_]+", "_", lane_id.casefold()).strip("_")
+    attempt = re.sub(r"[^a-z0-9_]+", "_", attempt_id.casefold()).strip("_")
+    if not lane or not attempt:
+        raise RaceError("native task identity cannot be derived")
+    return f"{lane}_{attempt[:16]}"[:63]
 
 
 def _stagnation_signals(

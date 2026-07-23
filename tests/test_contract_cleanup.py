@@ -45,6 +45,46 @@ def test_deleted_modules_and_cli_commands_are_absent() -> None:
         assert not relative.with_suffix(".py").exists()
 
 
+@pytest.mark.parametrize(
+    ("command", "result"),
+    (
+        ("doctor", {"ok": False, "checks": []}),
+        ("image-smoke", {"all_available": False, "profiles": []}),
+    ),
+)
+def test_failed_diagnostics_return_nonzero_and_truthful_wrapper(
+    repo: Path,
+    monkeypatch,
+    capsys,
+    command: str,
+    result: dict,
+) -> None:
+    monkeypatch.setattr(cli, "dispatch", lambda args, root: result)
+    assert cli.main(["--repo", str(repo), command]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"ok": False, "result": result}
+
+
+@pytest.mark.parametrize(
+    ("command", "result"),
+    (
+        ("doctor", {"ok": True, "checks": []}),
+        ("image-smoke", {"all_available": True, "profiles": []}),
+    ),
+)
+def test_successful_diagnostics_return_zero(
+    repo: Path,
+    monkeypatch,
+    capsys,
+    command: str,
+    result: dict,
+) -> None:
+    monkeypatch.setattr(cli, "dispatch", lambda args, root: result)
+    assert cli.main(["--repo", str(repo), command]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"ok": True, "result": result}
+
+
 def test_python_controller_has_no_native_model_start_stop_or_flag_submission_code() -> None:
     source = Path("ctf_os")
     python = "\n".join(path.read_text(encoding="utf-8") for path in source.rglob("*.py"))
@@ -289,7 +329,16 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
                 *base, "sandbox-exec", "--metadata", metadata, "--",
                 "sh", "-c",
                 "test -r /challenge/input.txt && test ! -w /challenge/input.txt && "
-                "grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status",
+                "grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status && "
+                "test \"$HOME\" = /work/home && "
+                "test \"$XDG_CONFIG_HOME\" = /work/home/.config && "
+                "test \"$XDG_CACHE_HOME\" = /work/home/.cache && "
+                "test \"$XDG_DATA_HOME\" = /work/home/.local/share && "
+                "test \"$XDG_RUNTIME_DIR\" = /work/runtime && "
+                "test \"$AWS_CONFIG_FILE\" = /work/credentials/aws-config && "
+                "test \"$AZURE_CONFIG_DIR\" = /work/credentials/azure && "
+                "test \"$CLOUDSDK_CONFIG\" = /work/credentials/gcloud && "
+                "test \"$KUBECONFIG\" = /work/credentials/kubeconfig",
             ],
             capture_output=True, text=True, timeout=60, check=False,
         )
@@ -313,7 +362,11 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
         )
         assert opened.returncode == 0, opened.stdout + opened.stderr
         sent = subprocess.run(
-            [*base, "session-send", "--metadata", metadata, "--session", "shell-one", "--data", "printf 'SESSION_OK\\n'\n"],
+            [
+                *base, "session-send", "--metadata", metadata,
+                "--session", "shell-one", "--data",
+                "printf 'SESSION_OK:%s:%s\\n' \"$HOME\" \"$CLOUDSDK_CONFIG\"\n",
+            ],
             capture_output=True, text=True, timeout=30, check=False,
         )
         assert sent.returncode == 0, sent.stdout + sent.stderr
@@ -325,10 +378,10 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
             )
             assert read.returncode == 0, read.stdout + read.stderr
             session_output += json.loads(read.stdout)["result"]["receipt"]["observed_output"]
-            if "SESSION_OK" in session_output:
+            if "SESSION_OK:/work/home:/work/credentials/gcloud" in session_output:
                 break
             time.sleep(0.05)
-        assert "SESSION_OK" in session_output
+        assert "SESSION_OK:/work/home:/work/credentials/gcloud" in session_output
         closed = subprocess.run(
             [*base, "session-close", "--metadata", metadata, "--session", "shell-one"],
             capture_output=True, text=True, timeout=30, check=False,

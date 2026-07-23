@@ -31,6 +31,67 @@ P0_TOOLS = {
     },
 }
 
+INSTALL_REQUIRED_COMMANDS = {
+    "base": {
+        "python3", "curl", "wget", "git", "jq", "rg", "file", "objdump",
+        "strings", "readelf", "nm", "xxd", "nmap", "gcc", "g++", "cmake",
+        "clang", "ruby", "java",
+    },
+    "pwn": {
+        "ctf-ghidra-headless", "capa", "frida", "frida-ps", "gdb",
+        "gdb-multiarch", "pwndbg", "patchelf", "checksec", "ROPgadget",
+        "ropper", "one_gadget", "pwninit", "seccomp-tools", "musl-gcc",
+        "qemu-aarch64", "qemu-arm", "qemu-mips", "qemu-mipsel",
+        "qemu-riscv64", "qemu-system-x86_64", "qemu-system-aarch64",
+        "cpio", "afl-fuzz", "afl-showmap", "afl-clang-fast",
+        "afl-clang-fast++", "afl-qemu-trace", "valgrind", "boo", "cargo",
+        "cargo-fuzz", "rustc",
+    },
+    "web": {
+        "node", "npm", "php", "sqlite3", "redis-cli", "psql", "mysql",
+        "chromium", "chromedriver", "ffuf", "nuclei", "ctf-nuclei-scan",
+        "dalfox", "semgrep", "sqlmap", "sstimap", "schemathesis",
+    },
+    "rev": {
+        "java", "javac", "analyzeHeadless", "ctf-ghidra-headless", "frida",
+        "frida-ps", "capa", "r2", "gdb", "gdb-multiarch", "jadx",
+        "jadx-gui", "apktool", "wasm-objdump", "upx", "wasmtime", "mono",
+        "qemu-aarch64", "qemu-arm", "qemu-mips", "qemu-mipsel",
+        "qemu-riscv64", "qemu-system-x86_64", "qemu-system-aarch64",
+        "qemu-system-riscv64", "qemu-img", "jazzer",
+    },
+    "crypto": {
+        "sage", "RsaCtfTool", "cado-nfs", "gp", "gap", "maxima", "hashcat",
+        "ares",
+    },
+    "forensic": {
+        "vol", "mmls", "fls", "icat", "foremost", "exiftool", "binwalk",
+        "tshark", "tcpdump", "testdisk", "photorec", "dcfldd", "steghide",
+        "stegseek", "zsteg", "convert", "tesseract", "pngcheck", "ffmpeg",
+        "sox",
+    },
+    "misc": {
+        "ffmpeg", "sox", "convert", "tesseract", "tshark", "binwalk",
+        "exiftool", "dot", "parallel", "podman", "zbarimg", "barcode", "php",
+        "lua", "perl", "node", "npm", "ares",
+    },
+    "osint": {
+        "whois", "dig", "nslookup", "host", "traceroute", "chromium",
+        "exiftool", "convert", "tesseract", "ffmpeg", "yt-dlp", "git-lfs",
+        "pdftotext", "waybackurls", "sherlock", "maigret", "holehe",
+        "theHarvester",
+    },
+    "ai": {
+        "protoc", "h5dump", "ncdump", "dot", "jupyter", "modelscan",
+        "fickling",
+    },
+    "cloud": {
+        "aws", "az", "gcloud", "kubectl", "helm", "terraform", "tofu",
+        "podman", "skopeo", "oras", "cosign", "trivy", "syft", "grype",
+        "kustomize", "opa", "conftest", "checkov", "semgrep", "yq",
+    },
+}
+
 
 def test_p0_installed_commands_are_exposed_with_help() -> None:
     for category, expected in P0_TOOLS.items():
@@ -38,6 +99,25 @@ def test_p0_installed_commands_are_exposed_with_help() -> None:
         assert expected <= exposed
         for name in expected:
             assert tool_help(category, name)["hint"]
+
+
+def test_every_installer_required_solver_command_is_exposed_with_help() -> None:
+    for category, required in INSTALL_REQUIRED_COMMANDS.items():
+        exposed = set(list_tools(category)["tools"])
+        assert required <= exposed, (
+            category,
+            sorted(required - exposed),
+        )
+        for name in required:
+            assert tool_help(category, name)["hint"].strip()
+
+
+def test_every_catalog_entry_has_help_and_a_probe_command() -> None:
+    for category in session._TOOLS:
+        for name in list_tools(category)["tools"]:
+            assert tool_help(category, name)["hint"].strip()
+            command = session._VERSION_COMMANDS.get(name, (name, "--version"))
+            assert command and all(command)
 
 
 def test_p1_and_p2_tools_are_exposed_only_in_their_selected_images() -> None:

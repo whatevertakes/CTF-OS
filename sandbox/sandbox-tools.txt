@@ -8,6 +8,36 @@ Images: base, pwn, web, rev, crypto, forensic, misc, osint, ai, cloud.
 The exact profile additions are the executable install scripts in
 sandbox/install/. Missing required commands or imports fail the image build and
 the same capability families are independently checked by `doctor`.
+The model-facing command inventory is `ctf_os/sandbox/session.py::_TOOLS`.
+`list-tools`, `tool-help`, and `tool-version` expose that inventory inside an
+assigned sandbox. Tests require every solver-facing command asserted by the
+install scripts to appear in that inventory, carry non-empty help, and pass a
+live version probe in its category image. Debian dependency binaries that are
+not intended as solver tools remain outside the inventory.
+
+Controller discovery surface, in addition to the common base commands:
+
+- pwn: GDB/Pwndbg and gdb-multiarch; Ghidra headless, capa, Frida; ROP and
+  binary patching tools; musl and cross-architecture QEMU; Valgrind; AFL++
+  compiler, QEMU, corpus, and execution tools; boofuzz, Atheris, Rust,
+  cargo-fuzz, and system QEMU.
+- web: HTTP discovery and scanners; the constrained `ctf-nuclei-scan` wrapper;
+  SQLi, SSTI, XSS, Semgrep, Schemathesis, Chromium, and local web/database
+  runtimes.
+- rev: GDB multiarch, Ghidra, capa, Frida, radare2, JADX/Apktool, Java/Mono,
+  WebAssembly, Jazzer, and user/system QEMU.
+- crypto: Sage, Z3, OpenSSL, Ares, RsaCtfTool, CADO-NFS, PARI/GP, GAP, Maxima,
+  and Hashcat.
+- forensic: Volatility, Sleuth Kit, carving, packet tools, TestDisk/PhotoRec,
+  steganography, metadata, OCR, image, audio, and video tools.
+- misc: media/OCR, packet/file analysis, Graphviz, GNU Parallel, rootless
+  Podman, barcode/QR, common scripting runtimes, and Ares.
+- osint: DNS/routing, Chromium, metadata/OCR/media/PDF, yt-dlp, Wayback URLs,
+  Sherlock, Maigret, Holehe, and theHarvester.
+- ai: ONNX Runtime, Safetensors, pickletools, Protobuf/HDF5/NetCDF inspection,
+  Graphviz/Jupyter, ModelScan, and Fickling.
+- cloud: provider, Kubernetes, IaC, rootless container/registry, signature,
+  SBOM/vulnerability, policy, and configuration scanners.
 
 Pwn and Rev share an explicit foreign-binary runtime for dynamically linked
 i386, ARM hard-float, AArch64, MIPSEL, and RISC-V 64 ELF files. ARM-family,

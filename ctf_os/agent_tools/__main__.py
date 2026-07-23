@@ -211,8 +211,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
-    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
+    succeeded = _command_succeeded(args.command, result)
+    print(json.dumps(
+        {"ok": succeeded, "result": result},
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ))
+    return 0 if succeeded else 1
 
 
 def dispatch(args: argparse.Namespace, repo: Path) -> Any:
@@ -297,6 +303,17 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
     if args.command == "image-smoke":
         return smoke_images(docker=args.docker)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _command_succeeded(command: str, result: Any) -> bool:
+    if command == "doctor":
+        return isinstance(result, Mapping) and result.get("ok") is True
+    if command == "image-smoke":
+        return (
+            isinstance(result, Mapping)
+            and result.get("all_available") is True
+        )
+    return True
 
 
 def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
