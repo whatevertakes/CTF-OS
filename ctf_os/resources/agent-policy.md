@@ -5,14 +5,16 @@
 Minimize time to the first format-valid flag observed in actual output from one
 authorized challenge or organizer-declared target. One fresh run owns the
 machine until a winner, the 90-minute deadline, an explicit stop, or a manual
-Claude handoff. Root Sol is always the lead attacker and the only owner of
-shared service and global cleanup lifecycle.
+Claude handoff. Root Sol is always the lead attacker and the only authority for
+challenge-service and global cleanup lifecycle.
 
 Python selects and materializes input, inspects local images, creates private
-sandboxes, prepares the shared service, produces native worker packets, records
-execution-verified events, detects mechanical stagnation, and returns native
-cancel targets. It never calls a model API, starts or interrupts a native agent,
-chooses a semantic exploit, authorizes undeclared scope, or submits a flag.
+sandboxes, prepares lane-isolated local services, produces native worker packets, records
+execution-verified events, detects mechanical stagnation, emits exact native
+action plans, and batch-reconciles returned native identities. It automatically
+runs a supervision pass after each one-shot command and persistent-session read.
+It never calls a model API, starts or interrupts a native agent, chooses a
+semantic exploit, authorizes undeclared scope, or submits a flag.
 
 ## Preparation and mandatory sandbox execution
 
@@ -21,6 +23,10 @@ challenge, safely extracts only matching input into a fresh run, fingerprints
 it, makes it read-only, selects `ctf-os-sandbox:<category>`, runs `docker image
 inspect`, prepares a safe challenge service when present, initializes compact
 race state and blackboard, and creates the Root sandbox.
+
+Preparation records Root's declared model profile and whether it came from an
+explicit CLI value or the Sol Ultra policy default. Benchmark comparisons use
+that field instead of assuming Root is Sol xhigh.
 
 The recommended local category image always wins. If it is absent and local
 `ctf-os-sandbox:base` exists, preparation records an explicit degraded fallback.
@@ -46,23 +52,27 @@ has exactly:
 model_profile, role, task, context_mode, attack_family
 ```
 
-Attack families must be distinct. Root continues its attack while passing each
-returned `spawn_agent_args` unchanged to native `spawn_agent`. A child becomes
-RUNNING only after Root records the actual native thread identity. Every child
-uses its packet's private READY sandbox and never operates another lane.
+Attack families must be distinct. Root continues its attack while executing only
+the returned native `SPAWN` actions and passing each `spawn_agent_args` unchanged
+to native `spawn_agent`. Root records all returned thread identities in one
+`race-reconcile` batch. A child becomes RUNNING only after that reconciliation.
+Every child uses its packet's private READY sandbox and never operates another
+lane.
 
+- Sol Ultra is available for a full independent high-reasoning attack lane.
+- Sol max is available from bootstrap when its cost is justified; the legacy
+  minute-60 endgame route remains a bounded fallback.
 - Sol xhigh pursues a new independent attack mechanism.
 - Terra high turns a verified direction into an executable solver or exploit.
 - Luna high performs bounded extraction, transformation, batching, comparison,
   brute force, or decoding.
-- Sol max is not a routine lane; it may be introduced only after minute 60 for
-  an executable partial path, two actual attack outputs, an exact non-environment
-  reasoning blocker, and one concrete next attack. Its lease is ten minutes or
-  two actual attacks.
 
 Root plus children never exceeds concurrency four. A fresh lane receives only
 the challenge, read-only input, declared targets, deadline, and its sandbox. A
-directed lane may also receive a bounded verified blackboard delta. Root history,
+directed lane may also receive a bounded verified blackboard delta. Every
+execution-verified artifact is copied once into a content-addressed immutable
+exchange and exposed through each lane's read-only `/shared-artifacts` inbox, so
+an executable partial can be continued without reimplementation. Root history,
 transcripts, unsupported claims, confidence, and internal reasoning are never
 copied into worker context.
 
@@ -76,16 +86,28 @@ normalized output hash, target identity, lane attack family, timestamp, and an
 artifact path/hash when applicable. Logging happens after execution; logging
 failure never invalidates the executed attack.
 
-`race-status` reports command count, distinct output count, high-value event
+Supervision reports command count, distinct output count, high-value event
 count, duplicate fingerprints, mechanical stagnation signals, last verified
-delta, and replaceable native cancel targets. Default leases are 4–8 minutes by
-category. Root decides semantics and rapidly stops or replaces repeated,
-stagnant, or remote-avoiding lanes. After Root interrupts a native child,
-`race-stop-confirm` immediately removes that child's labelled sandbox while
-preserving its private host-side artifacts, so replacement never accumulates
-inactive containers. It records `STOPPING` before cleanup, reaches `STOPPED`
-only after cleanup succeeds, and records `CLEANUP_FAILED` on any cleanup error.
-Only `STOPPED` children free a replacement slot.
+delta, in-flight commands/sessions, and exact native actions. One-shot commands
+write a durable heartbeat while running, so a quiet Ghidra, Sage, symbolic,
+forensic, brute-force, or remote-stabilization job is never classified as
+stagnant while its heartbeat is live. Status polling itself is not a stagnation
+signal. Default leases are 4–8 minutes by category. Root decides semantics and
+executes returned native `INTERRUPT` actions. It then records all interrupt
+results in one `race-reconcile` batch, which removes each labelled sandbox and
+its private service while preserving artifacts. Cleanup records `STOPPING`
+before work, reaches `STOPPED` only after every private resource is gone, and
+records `CLEANUP_FAILED` on any error. Only `STOPPED` children free a replacement
+slot. A controller cleanup failure is retried through `race-lane-cleanup`
+without another native interruption.
+
+Capacity admission reserves the aggregate limits of every running managed
+sandbox and challenge-service container, keeps 2 GiB and one CPU for the host,
+and downshifts a sandbox profile only when the stronger profile cannot fit.
+Local challenge services use a private container and internal network per lane
+by default while reusing the same verified run-scoped image. This prevents
+cross-lane account, process, heap, token, and mutable-state interference.
+Organizer-hosted remote targets cannot be cloned and remain explicitly shared.
 
 ## Flag fast path
 
@@ -108,9 +130,11 @@ Docker gateways, undeclared private networks, and `trust_remote_code=True` are
 forbidden. Unsafe AI artifacts may persist only in lane-private host directories
 and are never opened or executed automatically by the host controller.
 
-Only Root mutates shared service lifecycle. Cleanup verifies exact run labels
-before removing CTF-OS containers and networks. At deadline or handoff, Root
-first obtains native cancel targets, interrupts those threads, then cleans the
-exact run. A handoff writes one bounded evidence-backed
+Only Root invokes controller operations that mutate service lifecycle. The
+controller may create and clean lane-private service instances on Root's behalf.
+Cleanup verifies exact run and service-instance labels before removing CTF-OS
+containers and networks. At deadline or handoff, Root first obtains native
+cancel targets, interrupts those threads, batch-reconciles the results, then
+cleans the exact run. A handoff writes one bounded evidence-backed
 `rescue/<contest>/<challenge>/HANDOFF.md` and ends the Solve; it never calls
 Claude or creates another runtime.

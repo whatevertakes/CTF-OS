@@ -1,0 +1,1 @@
+boofuzz @ https://files.pythonhosted.org/packages/0d/cf/9934fad8c317ef5e82b5ba92a14e9690a7ce851f86f279ea6a49deaae1f4/boofuzz-0.4.2-py3-none-any.whl#sha256=474776e1e51c30a2b858b82663cafd05a043b812ca9e06c64b60cdf35efbb12c

@@ -12,7 +12,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from .workspace import atomic_json, atomic_text
+from .sandbox.resources import ResourceError, admit_fixed
+from .workspace import atomic_json, atomic_text, state_lock
 
 
 class ServiceError(RuntimeError):
@@ -43,7 +44,7 @@ class ServiceActor:
 
     def require_root(self) -> None:
         if self.lane_id != "root" or self.role != "root":
-            raise ServiceError("only Root may mutate shared challenge service lifecycle")
+            raise ServiceError("only Root may mutate challenge service lifecycle")
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +54,16 @@ class ServiceSpec:
     source: Path
     run_root: Path
     plan: Mapping[str, Any]
+    instance_id: str = "root"
 
     @property
     def suffix(self) -> str:
+        return hashlib.sha256(
+            f"{self.run_id}\0{self.instance_id}".encode()
+        ).hexdigest()[:12]
+
+    @property
+    def image_suffix(self) -> str:
         return hashlib.sha256(self.run_id.encode()).hexdigest()[:12]
 
     @property
@@ -64,7 +72,7 @@ class ServiceSpec:
 
     @property
     def image(self) -> str:
-        return f"ctf-os-challenge:{self.suffix}"
+        return f"ctf-os-challenge:{self.image_suffix}"
 
     @property
     def container(self) -> str:
@@ -76,13 +84,27 @@ class ServiceSpec:
 
     @property
     def metadata_path(self) -> Path:
-        return self.run_root / "service" / "service.json"
+        if self.instance_id == "root":
+            return self.run_root / "service" / "service.json"
+        return (
+            self.run_root / "service" / "instances" / self.instance_id / "service.json"
+        )
 
     @property
     def labels(self) -> dict[str, str]:
         return {
             "org.ctf-os.managed": "true",
             "org.ctf-os.kind": "service",
+            "org.ctf-os.run-id": self.run_id,
+            "org.ctf-os.challenge-id": self.challenge_id,
+            "org.ctf-os.service-instance": self.instance_id,
+        }
+
+    @property
+    def image_labels(self) -> dict[str, str]:
+        return {
+            "org.ctf-os.managed": "true",
+            "org.ctf-os.kind": "service-image",
             "org.ctf-os.run-id": self.run_id,
             "org.ctf-os.challenge-id": self.challenge_id,
         }
@@ -108,14 +130,50 @@ def prepare_service(
             + "; ".join(str(value) for value in spec.plan.get("review_reasons", []))
         )
     _validate_spec(spec)
+    with state_lock(spec.run_root / "resources"):
+        return _prepare_service_locked(
+            spec,
+            kind=kind,
+            docker=docker,
+            runner=runner,
+        )
+
+
+def _prepare_service_locked(
+    spec: ServiceSpec,
+    *,
+    kind: str,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
     if spec.metadata_path.is_file() and not spec.metadata_path.is_symlink():
         existing = load_service(spec.metadata_path)
         if existing.get("run_id") == spec.run_id and _service_running(existing, docker=docker, runner=runner):
             return existing | {"attached": True}
     _require_local_images(spec, docker=docker, runner=runner)
+    service_count = max(
+        1,
+        len([
+            row for row in spec.plan.get("services", [])
+            if isinstance(row, Mapping)
+        ]),
+    )
+    try:
+        capacity = admit_fixed(
+            memory=f"{2 * service_count}g",
+            cpus=float(2 * service_count),
+            purpose=f"challenge-service:{spec.instance_id}",
+            docker=docker,
+            runner=runner,
+        )
+    except ResourceError as exc:
+        raise ServiceError(str(exc)) from exc
     service_root = spec.metadata_path.parent
-    if service_root.is_symlink():
-        raise ServiceError("service runtime root must not be a symlink")
+    cursor = spec.run_root
+    for part in service_root.relative_to(spec.run_root).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ServiceError("service runtime path must not contain a symlink")
     service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     _ensure_network(spec, docker=docker, runner=runner)
     try:
@@ -140,14 +198,31 @@ def prepare_service(
         "run_id": spec.run_id,
         "challenge_id": spec.challenge_id,
         "kind": kind,
+        "instance_id": spec.instance_id,
+        "isolation": "private-instance",
         "network": spec.network,
         "endpoints": endpoints,
         "lifecycle_owner": "root",
         "labels": spec.labels,
         "runtime": runtime,
+        "capacity_at_create": capacity,
         "metadata_path": str(spec.metadata_path.resolve()),
     }
-    atomic_json(spec.metadata_path, metadata)
+    try:
+        atomic_json(spec.metadata_path, metadata)
+    except Exception as exc:
+        cleanup_result = cleanup_service(
+            metadata,
+            actor=ServiceActor("root", "root"),
+            docker=docker,
+            runner=runner,
+        )
+        if cleanup_result["failures"]:
+            raise ServiceError(
+                "service metadata write failed and cleanup was incomplete: "
+                + "; ".join(cleanup_result["failures"])
+            ) from exc
+        raise
     return metadata | {"attached": False}
 
 
@@ -208,8 +283,12 @@ def cleanup_service(
             if result.returncode and "No such" not in result.stderr:
                 failures.append(result.stderr.strip() or "service container removal failed")
         image = str(runtime.get("image", ""))
-        if re.fullmatch(r"ctf-os-challenge:[a-f0-9]{12}", image):
-            if _image_has_labels(image, metadata.get("labels", {}), docker=docker, runner=runner):
+        image_labels = runtime.get("image_labels", {})
+        if (
+            runtime.get("owns_image") is True
+            and re.fullmatch(r"ctf-os-challenge:[a-f0-9]{12}", image)
+        ):
+            if _image_has_labels(image, image_labels, docker=docker, runner=runner):
                 result = _run(runner, [docker, "image", "rm", image], timeout=60)
                 if result.returncode and "No such" not in result.stderr:
                     failures.append(result.stderr.strip() or "service image removal failed")
@@ -241,12 +320,18 @@ def _start_dockerfile(
     build_argv = [
         docker, "build", "--pull=false", "--network", "none", "--file", str(dockerfile)
     ]
-    for key, value in spec.labels.items():
+    for key, value in spec.image_labels.items():
         build_argv.extend(["--label", f"{key}={value}"])
-    build_argv.extend(["--tag", spec.image, str(context)])
-    built = _run(runner, build_argv, timeout=900)
-    if built.returncode:
-        raise ServiceError(f"challenge service build failed: {built.stderr.strip()}")
+    image_exists = _image_has_labels(
+        spec.image, spec.image_labels, docker=docker, runner=runner
+    )
+    owns_image = image_exists and spec.instance_id == "root"
+    if not image_exists:
+        build_argv.extend(["--tag", spec.image, str(context)])
+        built = _run(runner, build_argv, timeout=900)
+        if built.returncode:
+            raise ServiceError(f"challenge service build failed: {built.stderr.strip()}")
+        owns_image = True
     argv = [
         docker, "run", "--detach", "--name", spec.container,
         "--network", spec.network, "--network-alias", "challenge",
@@ -262,7 +347,10 @@ def _start_dockerfile(
     argv.append(spec.image)
     started = _run(runner, argv, timeout=120)
     if started.returncode:
-        _remove_owned_image(spec.image, spec.labels, docker=docker, runner=runner)
+        if owns_image:
+            _remove_owned_image(
+                spec.image, spec.image_labels, docker=docker, runner=runner
+            )
         raise ServiceError(f"challenge service start failed: {started.stderr.strip()}")
     running = _run(
         runner, [docker, "inspect", spec.container, "--format", "{{.State.Running}}"], timeout=30
@@ -270,12 +358,21 @@ def _start_dockerfile(
     if running.returncode or running.stdout.strip() != "true":
         logs = _run(runner, [docker, "logs", "--tail", "40", spec.container], timeout=30)
         _run(runner, [docker, "rm", "--force", spec.container], timeout=30)
-        _remove_owned_image(spec.image, spec.labels, docker=docker, runner=runner)
+        if owns_image:
+            _remove_owned_image(
+                spec.image, spec.image_labels, docker=docker, runner=runner
+            )
         raise ServiceError(
             "challenge service exited during startup: "
             + (logs.stderr or logs.stdout or running.stderr).strip()[-4096:]
         )
-    return {"container": spec.container, "image": spec.image, "compose_files": []}
+    return {
+        "container": spec.container,
+        "image": spec.image,
+        "owns_image": owns_image,
+        "image_labels": spec.image_labels,
+        "compose_files": [],
+    }
 
 
 def _start_compose(
@@ -485,7 +582,9 @@ def _cleanup_failed_start(
     elif kind == "dockerfile":
         if _container_has_labels(spec.container, spec.labels, docker=docker, runner=runner):
             _run(runner, [docker, "rm", "--force", spec.container], timeout=60)
-        _remove_owned_image(spec.image, spec.labels, docker=docker, runner=runner)
+        # _start_dockerfile removes a newly built image on its own failure
+        # paths.  An existing image is race-shared and must survive a private
+        # lane instance failing to start.
     if _network_has_labels(spec.network, spec.labels, docker=docker, runner=runner):
         _run(runner, [docker, "network", "rm", spec.network], timeout=30)
 
@@ -497,6 +596,10 @@ def _validate_spec(spec: ServiceSpec) -> None:
         raise ServiceError("service source must be the read-only prepared input")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{1,127}", spec.run_id):
         raise ServiceError("service run id is invalid")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", spec.instance_id):
+        raise ServiceError("service instance id is invalid")
+    if spec.run_root.is_symlink():
+        raise ServiceError("service run root must not be a symlink")
 
 
 def _require_local_images(

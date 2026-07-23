@@ -16,7 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 import uuid
 from urllib.parse import urlsplit
 
-from ..workspace import atomic_json, atomic_text, validate_identifier
+from ..workspace import atomic_json, atomic_text, state_lock, validate_identifier
 from .network import ResolvedTarget
 from .resources import ResourceError, admit, parse_size_bytes, resource_profile
 
@@ -24,6 +24,7 @@ from .resources import ResourceError, admit, parse_size_bytes, resource_profile
 MAX_CAPTURE = 64 * 1024
 MAX_COMMAND_SECONDS = 1800
 MAX_COMMAND_LOG_BYTES = 64 * 1024 * 1024
+COMMAND_HEARTBEAT_SECONDS = 5.0
 
 
 class SandboxError(RuntimeError):
@@ -44,6 +45,7 @@ class SandboxSpec:
     targets: tuple[ResolvedTarget, ...] = ()
     service_network: str | None = None
     service_endpoints: tuple[str, ...] = ()
+    artifact_inbox: Path | None = None
     resource_profile: str = "standard"
     race_lane_count: int = 0
 
@@ -100,6 +102,13 @@ def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
         "--env", "HF_HUB_OFFLINE=1",
         "--env", "TRANSFORMERS_OFFLINE=1",
     ]
+    if spec.artifact_inbox is not None:
+        argv.extend([
+            "--mount",
+            f"type=bind,src={spec.artifact_inbox.resolve()},dst=/shared-artifacts,readonly",
+            "--env",
+            "CTF_OS_SHARED_ARTIFACTS=/shared-artifacts",
+        ])
     for key, value in spec.labels.items():
         argv.extend(["--label", f"{key}={value}"])
     if spec.category in {"pwn", "rev"}:
@@ -127,35 +136,38 @@ def create(
     docker: str = "docker",
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
-    _prepare_lane_root(spec)
-    try:
-        capacity = admit(
-            spec.resource_profile,
-            race_lane_count=spec.race_lane_count,
-            docker=docker,
-            runner=runner,
+    _validate_spec(spec)
+    resource_scope = spec.lane_root.resolve().parents[1] / "resources"
+    with state_lock(resource_scope):
+        try:
+            capacity = admit(
+                spec.resource_profile,
+                race_lane_count=spec.race_lane_count,
+                docker=docker,
+                runner=runner,
+            )
+        except ResourceError as exc:
+            raise SandboxError(str(exc)) from exc
+        _prepare_lane_root(spec)
+        result = _run(runner, build_run_argv(spec, docker=docker), timeout=120)
+        if result.returncode:
+            raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
+        inspected = _run(
+            runner,
+            [docker, "inspect", spec.name, "--format", "{{.State.Running}}"],
+            timeout=30,
         )
-    except ResourceError as exc:
-        raise SandboxError(str(exc)) from exc
-    result = _run(runner, build_run_argv(spec, docker=docker), timeout=120)
-    if result.returncode:
-        raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
-    inspected = _run(
-        runner,
-        [docker, "inspect", spec.name, "--format", "{{.State.Running}}"],
-        timeout=30,
-    )
-    if inspected.returncode or inspected.stdout.strip() != "true":
-        state = _run(
-            runner, [docker, "inspect", spec.name, "--format", "{{json .State}}"], timeout=30
-        )
-        logs = _run(runner, [docker, "logs", "--tail", "40", spec.name], timeout=30)
-        _run(runner, [docker, "rm", "--force", spec.name], timeout=30)
-        detail = (logs.stderr or logs.stdout or state.stdout or inspected.stderr).strip()
-        raise SandboxError(
-            "sandbox was created but did not become running"
-            + (f": {detail[-4096:]}" if detail else "")
-        )
+        if inspected.returncode or inspected.stdout.strip() != "true":
+            state = _run(
+                runner, [docker, "inspect", spec.name, "--format", "{{json .State}}"], timeout=30
+            )
+            logs = _run(runner, [docker, "logs", "--tail", "40", spec.name], timeout=30)
+            _run(runner, [docker, "rm", "--force", spec.name], timeout=30)
+            detail = (logs.stderr or logs.stdout or state.stdout or inspected.stderr).strip()
+            raise SandboxError(
+                "sandbox was created but did not become running"
+                + (f": {detail[-4096:]}" if detail else "")
+            )
     metadata_path = spec.lane_root / "sandbox.json"
     target_identities = [row.target.declared for row in spec.targets]
     target_identities.extend(spec.service_endpoints)
@@ -177,11 +189,15 @@ def create(
         "target_identities": target_identities,
         "service_network": spec.service_network,
         "service_endpoints": list(spec.service_endpoints),
+        "artifact_inbox": (
+            str(spec.artifact_inbox.resolve()) if spec.artifact_inbox is not None else None
+        ),
         "paths": {
             "input": "/challenge",
             "work": "/work",
             "evidence": "/evidence",
             "artifacts": "/artifacts",
+            "shared_artifacts": "/shared-artifacts" if spec.artifact_inbox is not None else None,
             "host_work": str((spec.lane_root / "work").resolve()),
             "host_evidence": str((spec.lane_root / "evidence").resolve()),
             "host_artifacts": str((spec.lane_root / "artifacts").resolve()),
@@ -257,9 +273,49 @@ def execute(
     logged_bytes = 0
     capture = bytearray()
     digest = _NormalizedDigest()
+    last_output_at: str | None = None
+    running_root = logs / "running"
+    if running_root.is_symlink():
+        raise SandboxError("running command state directory is a symlink")
+    running_root.mkdir(mode=0o700, exist_ok=True)
+    running_path = running_root / f"{receipt_id}.json"
+    last_heartbeat = 0.0
+    heartbeat_error: str | None = None
+
+    def heartbeat(*, force: bool = False) -> None:
+        nonlocal heartbeat_error, last_heartbeat
+        current = time.monotonic()
+        if not force and current - last_heartbeat < COMMAND_HEARTBEAT_SECONDS:
+            return
+        try:
+            atomic_json(running_path, {
+                "schema_version": 1,
+                "receipt_id": receipt_id,
+                "run_id": metadata["run_id"],
+                "lane_id": metadata["lane_id"],
+                "argv": list(command),
+                "argv_family": argv_family(command),
+                "target_identity": resolved_target,
+                "pid_file": pid_file,
+                "started_at": started_at,
+                "heartbeat_at": _now(),
+                "last_output_at": last_output_at,
+                "observed_bytes": logged_bytes,
+                "status": "RUNNING",
+            })
+        except Exception as exc:
+            heartbeat_error = str(exc)[:2048]
+        last_heartbeat = current
+
+    heartbeat(force=True)
     try:
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError as exc:
+        try:
+            if running_path.exists():
+                running_path.unlink()
+        except OSError:
+            pass
         raise SandboxError(f"required executable not found: {docker}") from exc
     selector = selectors.DefaultSelector()
     assert process.stdout is not None and process.stderr is not None
@@ -272,6 +328,7 @@ def execute(
     }
     try:
         while selector.get_map():
+            heartbeat()
             if time.monotonic() - started >= timeout:
                 timed_out = True
                 _kill_exec(name, pid_file, docker=docker)
@@ -286,6 +343,7 @@ def execute(
                     selector.unregister(key.fileobj)
                     continue
                 logged_bytes += len(chunk)
+                last_output_at = _now()
                 if logged_bytes > MAX_COMMAND_LOG_BYTES:
                     output_limited = True
                     _kill_exec(name, pid_file, docker=docker)
@@ -345,8 +403,14 @@ def execute(
         "stderr_artifact": str(stderr_path.relative_to(lane_root)),
         "combined_artifact": str(combined_path.relative_to(lane_root)),
         "flag_candidate": candidate,
+        "heartbeat_error": heartbeat_error,
     }
     atomic_json(lane_root / "logs" / f"{receipt_id}.json", receipt)
+    try:
+        if running_path.exists():
+            running_path.unlink()
+    except OSError:
+        pass
     return receipt
 
 
@@ -535,6 +599,13 @@ def _validate_spec(spec: SandboxSpec) -> None:
         raise SandboxError("service network and endpoints must be supplied together")
     if spec.service_network and not re.fullmatch(r"ctf-os-net-[a-z0-9_.-]{1,100}", spec.service_network):
         raise SandboxError("service network is not race-scoped")
+    if spec.artifact_inbox is not None:
+        inbox = spec.artifact_inbox
+        if inbox.is_symlink() or not inbox.is_dir():
+            raise SandboxError("lane artifact inbox is missing or unsafe")
+        expected = (spec.lane_root.resolve().parents[1] / "exchange" / "inbox" / spec.lane_id)
+        if inbox.resolve() != expected.resolve():
+            raise SandboxError("lane artifact inbox identity mismatch")
     parse_size_bytes(resource_profile(spec.resource_profile).storage)
 
 

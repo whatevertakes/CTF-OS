@@ -21,18 +21,42 @@ _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
 
 _TOOLS: dict[str, tuple[str, ...]] = {
     "base": ("bash", "python3", "rg", "file", "strings", "xxd", "curl", "nc", "socat"),
-    "pwn": ("python3", "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools", "objdump", "readelf", "strace"),
-    "web": ("curl", "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "sstimap", "python3"),
-    "rev": ("gdb", "ctf-ghidra-headless", "capa", "r2", "objdump", "qemu-x86_64", "python3"),
-    "crypto": ("python3", "sage", "openssl", "z3", "ares"),
-    "forensic": ("file", "binwalk", "exiftool", "tshark", "vol", "foremost", "stegseek", "python3"),
-    "misc": ("python3", "ffmpeg", "sox", "zbarimg", "tesseract", "file", "ares"),
-    "osint": (
-        "whois", "dig", "curl", "tesseract", "exiftool", "sherlock", "maigret",
-        "holehe", "theHarvester", "python3",
+    "pwn": (
+        "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools",
+        "objdump", "readelf", "strace", "ltrace", "patchelf", "ROPgadget",
+        "ropper", "one_gadget", "valgrind", "afl-fuzz", "afl-showmap",
+        "afl-cmin", "afl-tmin", "afl-qemu-trace", "boo", "atheris",
+        "cargo-fuzz", "qemu-x86_64", "qemu-i386", "qemu-aarch64",
+        "qemu-arm", "qemu-mips", "qemu-mipsel", "qemu-riscv64",
+        "qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-arm",
+        "qemu-system-riscv32", "qemu-system-riscv64", "qemu-img",
     ),
-    "ai": ("python3", "onnxruntime", "safetensors", "pickletools"),
-    "cloud": ("terraform", "kubectl", "helm", "opa", "conftest", "checkov", "podman"),
+    "web": (
+        "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "sstimap",
+        "dalfox", "schemathesis", "chromium", "chromedriver", "node", "npm",
+        "php", "sqlite3", "redis-cli", "psql", "mysql",
+    ),
+    "rev": (
+        "gdb", "ctf-ghidra-headless", "capa", "r2", "objdump", "jadx",
+        "apktool", "frida", "frida-ps", "upx", "wasm-objdump", "wasm2wat",
+        "wasmtime", "jazzer", "qemu-x86_64", "qemu-i386", "qemu-aarch64",
+        "qemu-arm", "qemu-mips", "qemu-mipsel", "qemu-riscv64",
+        "qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-arm",
+        "qemu-system-riscv32", "qemu-system-riscv64", "qemu-img",
+    ),
+    "crypto": ("sage", "openssl", "z3", "ares"),
+    "forensic": ("binwalk", "exiftool", "tshark", "vol", "foremost", "stegseek"),
+    "misc": ("ffmpeg", "sox", "zbarimg", "tesseract", "ares"),
+    "osint": (
+        "whois", "dig", "tesseract", "exiftool", "sherlock", "maigret",
+        "holehe", "theHarvester",
+    ),
+    "ai": ("onnxruntime", "safetensors", "pickletools"),
+    "cloud": (
+        "aws", "az", "gcloud", "kubectl", "helm", "terraform", "tofu",
+        "podman", "skopeo", "oras", "cosign", "trivy", "syft", "grype",
+        "kustomize", "opa", "conftest", "checkov", "semgrep", "yq",
+    ),
 }
 _HELP = {
     "ctf-ghidra-headless": "ctf-ghidra-headless INPUT [TIMEOUT_SECONDS] exports bounded decompilation.",
@@ -52,6 +76,25 @@ _HELP = {
     "sherlock": "Run Sherlock only for public, challenge-scoped usernames and declared egress.",
     "maigret": "Run Maigret only for public, challenge-scoped usernames and declared egress.",
     "theHarvester": "Run theHarvester only against public challenge domains and declared egress.",
+    "afl-fuzz": "Run AFL++ as `afl-fuzz -i CORPUS -o FINDINGS -- TARGET`; keep corpora and findings below /work or /artifacts.",
+    "afl-showmap": "Use `afl-showmap -o MAP -- TARGET` for one bounded coverage-map probe.",
+    "afl-cmin": "Use `afl-cmin -i CORPUS -o MINIMIZED -- TARGET` to minimize an AFL++ corpus.",
+    "afl-tmin": "Use `afl-tmin -i TESTCASE -o MINIMIZED -- TARGET` to minimize one AFL++ testcase.",
+    "afl-qemu-trace": "Use through AFL++ QEMU mode (`afl-fuzz -Q` or `afl-showmap -Q`), not as a general system emulator.",
+    "boo": "Boofuzz installs the real `boo` CLI; import `boofuzz` in a Python harness for protocol fuzzing.",
+    "atheris": "Atheris is a Python library: write a TestOneInput callback, then run the harness with bounded libFuzzer flags such as `-runs=100`.",
+    "cargo-fuzz": "Run the installed binary as `cargo fuzz`; the pinned nightly toolchain and an offline libfuzzer-sys cache are preinstalled.",
+    "valgrind": "Use `valgrind --tool=memcheck --leak-check=full TARGET` for bounded dynamic memory analysis.",
+    "schemathesis": "Run `schemathesis run SCHEMA` against a declared API target; use `--max-examples` or `--max-time` to bound a probe.",
+    "jazzer": "Compile a Java fuzz target with `/opt/jazzer/jazzer_standalone.jar`, then run `jazzer --cp=CLASSPATH --target_class=CLASS -runs=N`.",
+    "chromium": "Use `/usr/bin/chromium --headless --no-sandbox` or Playwright's system Chromium integration inside the sandbox.",
+    "chromedriver": "Use `/usr/bin/chromedriver` with the matching Debian Chromium build.",
+    "qemu-aarch64": "Run AArch64 Linux user-mode binaries with the `/usr/aarch64-linux-gnu` sysroot when dynamically linked.",
+    "qemu-arm": "Run ARM Linux user-mode binaries with the `/usr/arm-linux-gnueabihf` sysroot when dynamically linked.",
+    "qemu-mipsel": "Run MIPSEL Linux user-mode binaries with the `/usr/mipsel-linux-gnu` sysroot when dynamically linked.",
+    "qemu-riscv64": "Run RISC-V 64 Linux user-mode binaries with the `/usr/riscv64-linux-gnu` sysroot when dynamically linked.",
+    "wasm-objdump": "Use WABT's `wasm-objdump` to inspect WebAssembly sections and disassembly.",
+    "wasm2wat": "Use WABT's `wasm2wat` to convert a WebAssembly module to text.",
 }
 _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
     "nc": (
@@ -78,7 +121,7 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
     ),
     "semgrep": (
         "sh", "-ec",
-        "grep '^semgrep=' /opt/ctf-os/tool-versions.lock",
+        "command -v semgrep >/dev/null; grep '^semgrep=' /opt/ctf-os/tool-versions.lock",
     ),
     "ffuf": ("ffuf", "-V"),
     "ctf-ghidra-headless": (
@@ -126,6 +169,53 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
         "/opt/theharvester-venv/bin/python", "-c",
         "from importlib.metadata import version; print(version('theHarvester'))",
     ),
+    "afl-fuzz": (
+        "sh", "-ec",
+        "command -v afl-fuzz >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-showmap": (
+        "sh", "-ec",
+        "command -v afl-showmap >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-cmin": (
+        "sh", "-ec",
+        "command -v afl-cmin >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-tmin": (
+        "sh", "-ec",
+        "command -v afl-tmin >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-qemu-trace": (
+        "sh", "-ec",
+        "command -v afl-qemu-trace >/dev/null; grep '^qemuafl_commit=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "boo": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('boofuzz'))",
+    ),
+    "ropper": (
+        "sh", "-ec",
+        "command -v ropper >/dev/null; python3 -c \"from importlib.metadata import version; print(version('ropper'))\"",
+    ),
+    "atheris": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('atheris'))",
+    ),
+    "cargo-fuzz": ("cargo-fuzz", "--version"),
+    "schemathesis": ("schemathesis", "--version"),
+    "az": ("az", "version"),
+    "gcloud": ("gcloud", "version"),
+    "aws": ("aws", "--version"),
+    "kubectl": ("kubectl", "version", "--client=true"),
+    "helm": ("helm", "version", "--short"),
+    "terraform": ("terraform", "version"),
+    "tofu": ("tofu", "version"),
+    "oras": ("oras", "version"),
+    "cosign": ("cosign", "version"),
+    "syft": ("syft", "version"),
+    "grype": ("grype", "version"),
+    "kustomize": ("kustomize", "version"),
+    "checkov": ("checkov", "--version"),
 }
 
 

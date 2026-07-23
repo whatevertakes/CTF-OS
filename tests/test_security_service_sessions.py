@@ -165,6 +165,14 @@ def test_compose_override_resets_host_ports_and_networks(tmp_path: Path) -> None
 
     def runner(argv, **kwargs):
         calls.append(list(argv))
+        if argv[1:2] == ["info"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps({"MemTotal": 32 * 1024**3, "NCPU": 16}),
+                "",
+            )
+        if argv[1:2] == ["ps"] and "--status" not in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[1:3] == ["network", "inspect"]:
             return subprocess.CompletedProcess(argv, 1, "", "not found")
         if "ps" in argv and "--status" in argv:

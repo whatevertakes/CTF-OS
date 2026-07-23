@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping
 
 from .workspace import append_jsonl, read_json, read_jsonl, state_lock
@@ -19,6 +21,7 @@ EVENT_TYPES = frozenset({
 SHAREABLE_TYPES = EVENT_TYPES - {"COMMAND_RESULT", "FLAG_CANDIDATE"}
 HIGH_VALUE_TYPES = frozenset({"PRIMITIVE", "WORKING_POC", "REMOTE_RESULT", "FLAG_CANDIDATE"})
 MAX_OBSERVED = 16 * 1024
+MAX_SHARED_ARTIFACT_BYTES = 512 * 1024 * 1024
 
 
 class BlackboardError(ValueError):
@@ -42,7 +45,7 @@ def append_verified_event(
         raise BlackboardError("event attack_family does not match its lane")
     _validate_receipt(run_root, lane_id, receipt)
     observed_full = str(receipt.get("observed_output", ""))
-    artifact_path, artifact_hash = _artifact(run_root, lane_id, artifact)
+    artifact_path, artifact_hash, artifact_size = _artifact(run_root, lane_id, artifact)
     if event_type != "COMMAND_RESULT" and not observed_full and artifact_path is None:
         raise BlackboardError("verified claim requires observed output or an actual artifact")
     target = str(receipt["target_identity"])
@@ -65,6 +68,8 @@ def append_verified_event(
         "output_hash": output_hash,
         "artifact_path": artifact_path,
         "artifact_hash": artifact_hash,
+        "artifact_size": artifact_size,
+        "shared_artifact_path": None,
         "target_identity": target,
         "timestamp": str(receipt.get("finished_at") or _now()),
     }
@@ -80,7 +85,26 @@ def append_verified_event(
         prior = events(run_root)
         if any(row.get("receipt_id") == event["receipt_id"] and row.get("event_type") == event_type for row in prior):
             raise BlackboardError("this receipt and event type were already recorded")
+        if artifact_path is not None and artifact_hash is not None:
+            shared = _publish_artifact(
+                run_root,
+                lane_id=lane_id,
+                relative=artifact_path,
+                expected_hash=artifact_hash,
+                expected_size=int(artifact_size or 0),
+            )
+            event["shared_artifact_path"] = shared
         append_jsonl(run_root / "BLACKBOARD.jsonl", event)
+        if event["shared_artifact_path"] is not None:
+            try:
+                _expose_snapshot(
+                    run_root,
+                    str(event["shared_artifact_path"]),
+                )
+            except BlackboardError as exc:
+                # The append-only event remains authoritative. A later inbox
+                # registration backfills this immutable snapshot.
+                event["artifact_exchange_warning"] = str(exc)[:2048]
     return event
 
 
@@ -178,13 +202,62 @@ def _validate_receipt(run_root: Path, lane_id: str, receipt: Mapping[str, Any]) 
             raise BlackboardError(f"execution receipt was changed after execution: {field}")
 
 
-def _artifact(run_root: Path, lane_id: str, value: str | None) -> tuple[str | None, str | None]:
+def register_artifact_inbox(run_root: Path, lane_id: str) -> Path:
+    """Create one lane's read-only-mounted inbox and backfill verified snapshots."""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", lane_id):
+        raise BlackboardError("artifact inbox lane id is invalid")
+    exchange = _exchange_root(run_root)
+    inbox = exchange / "inbox" / lane_id
+    if inbox.is_symlink():
+        raise BlackboardError("artifact inbox is a symlink")
+    inbox.mkdir(parents=True, mode=0o755, exist_ok=True)
+    inbox.chmod(0o755)
+    for row in events(run_root):
+        shared = row.get("shared_artifact_path")
+        if isinstance(shared, str):
+            _link_snapshot(exchange, inbox, shared)
+    return inbox
+
+
+def shared_artifacts(run_root: Path) -> list[dict[str, Any]]:
+    """Return compact immutable artifact manifests accepted by the blackboard."""
+
+    return [
+        {
+            "lane_id": row.get("lane_id"),
+            "artifact_path": row.get("artifact_path"),
+            "artifact_hash": row.get("artifact_hash"),
+            "artifact_size": row.get("artifact_size"),
+            "shared_artifact_path": row.get("shared_artifact_path"),
+            "container_path": (
+                f"/shared-artifacts/{row['shared_artifact_path']}"
+                if row.get("shared_artifact_path") else None
+            ),
+            "timestamp": row.get("timestamp"),
+        }
+        for row in events(run_root)
+        if row.get("shared_artifact_path")
+    ]
+
+
+def _artifact(
+    run_root: Path, lane_id: str, value: str | None
+) -> tuple[str | None, str | None, int | None]:
     if value is None:
-        return None, None
+        return None, None, None
     relative = Path(value)
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         raise BlackboardError("artifact must be a safe lane-artifacts-relative path")
-    root = (run_root / "workers" / lane_id / "artifacts").resolve()
+    raw_root = run_root / "workers" / lane_id / "artifacts"
+    if raw_root.is_symlink() or not raw_root.is_dir():
+        raise BlackboardError("lane artifact root is missing or unsafe")
+    root = raw_root.resolve()
+    cursor = raw_root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise BlackboardError("artifact path contains a symlink")
     path = (root / relative).resolve()
     try:
         path.relative_to(root)
@@ -192,11 +265,170 @@ def _artifact(run_root: Path, lane_id: str, value: str | None) -> tuple[str | No
         raise BlackboardError("artifact escapes its lane") from exc
     if path.is_symlink() or not path.is_file():
         raise BlackboardError("artifact does not exist as a regular lane-private file")
+    source_fd = _open_artifact_fd(raw_root, relative)
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise BlackboardError("artifact is not a regular lane-private file")
+        size = before.st_size
+        if size > MAX_SHARED_ARTIFACT_BYTES:
+            raise BlackboardError(
+                f"artifact exceeds the {MAX_SHARED_ARTIFACT_BYTES}-byte verified exchange limit"
+            )
+        digest = hashlib.sha256()
+        while chunk := os.read(source_fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(source_fd)
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise BlackboardError("artifact changed while hashing")
+        return relative.as_posix(), digest.hexdigest(), size
+    finally:
+        os.close(source_fd)
+
+
+def _exchange_root(run_root: Path) -> Path:
+    exchange = run_root / "exchange"
+    if exchange.is_symlink():
+        raise BlackboardError("artifact exchange root is a symlink")
+    store = exchange / "store"
+    inbox = exchange / "inbox"
+    for path in (exchange, store, inbox):
+        if path.is_symlink():
+            raise BlackboardError("artifact exchange contains a symlink")
+        path.mkdir(parents=True, mode=0o755, exist_ok=True)
+        path.chmod(0o755)
+    return exchange
+
+
+def _publish_artifact(
+    run_root: Path,
+    *,
+    lane_id: str,
+    relative: str,
+    expected_hash: str,
+    expected_size: int,
+) -> str:
+    source_root = run_root / "workers" / lane_id / "artifacts"
+    exchange = _exchange_root(run_root)
+    filename = Path(relative).name
+    shared_relative = Path(expected_hash) / filename
+    destination_dir = exchange / "store" / expected_hash
+    destination = destination_dir / filename
+    if destination_dir.is_symlink() or destination.is_symlink():
+        raise BlackboardError("artifact exchange destination is unsafe")
+    destination_dir.mkdir(mode=0o755, exist_ok=True)
+    destination_dir.chmod(0o755)
+    if not destination.exists():
+        temporary = destination.with_name(f".{filename}.{os.getpid()}.tmp")
+        source_fd = _open_artifact_fd(source_root, Path(relative))
+        destination_fd: int | None = None
+        try:
+            before = os.fstat(source_fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+                raise BlackboardError("artifact changed before immutable snapshot")
+            destination_fd = os.open(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o444,
+            )
+            digest = hashlib.sha256()
+            copied = 0
+            while chunk := os.read(source_fd, 1024 * 1024):
+                copied += len(chunk)
+                if copied > MAX_SHARED_ARTIFACT_BYTES:
+                    raise BlackboardError("artifact exceeded the verified exchange limit while copying")
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    if written <= 0:
+                        raise BlackboardError("artifact snapshot write made no progress")
+                    view = view[written:]
+            os.fsync(destination_fd)
+            after = os.fstat(source_fd)
+            if (
+                copied != expected_size
+                or digest.hexdigest() != expected_hash
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise BlackboardError("artifact changed while creating immutable snapshot")
+            os.close(destination_fd)
+            destination_fd = None
+            os.replace(temporary, destination)
+            destination.chmod(0o444)
+        finally:
+            os.close(source_fd)
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if temporary.exists():
+                temporary.unlink()
+    elif _hash_file(destination) != expected_hash or destination.stat().st_size != expected_size:
+        raise BlackboardError("content-addressed artifact exchange collision")
+    return shared_relative.as_posix()
+
+
+def _expose_snapshot(run_root: Path, shared_relative: str) -> None:
+    exchange = _exchange_root(run_root)
+    for inbox in sorted((exchange / "inbox").iterdir()):
+        if inbox.is_dir() and not inbox.is_symlink():
+            _link_snapshot(exchange, inbox, shared_relative)
+
+
+def _link_snapshot(exchange: Path, inbox: Path, shared_relative: str) -> None:
+    relative = Path(shared_relative)
+    if (
+        relative.is_absolute()
+        or len(relative.parts) != 2
+        or not re.fullmatch(r"[0-9a-f]{64}", relative.parts[0])
+        or relative.parts[1] in {"", ".", ".."}
+    ):
+        raise BlackboardError("shared artifact path is invalid")
+    source = exchange / "store" / relative
+    destination = inbox / relative
+    if source.is_symlink() or not source.is_file():
+        raise BlackboardError("shared artifact snapshot is missing or unsafe")
+    if destination.is_symlink():
+        raise BlackboardError("artifact inbox destination is a symlink")
+    destination.parent.mkdir(mode=0o755, exist_ok=True)
+    destination.parent.chmod(0o755)
+    if not destination.exists():
+        os.link(source, destination, follow_symlinks=False)
+    elif os.stat(source, follow_symlinks=False).st_ino != os.stat(
+        destination, follow_symlinks=False
+    ).st_ino:
+        raise BlackboardError("artifact inbox path collision")
+
+
+def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
-    return relative.as_posix(), digest.hexdigest()
+    return digest.hexdigest()
+
+
+def _open_artifact_fd(root: Path, relative: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        raise BlackboardError("lane artifact root cannot be opened safely") from exc
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                child_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise BlackboardError("artifact path cannot be traversed safely") from exc
+            os.close(directory_fd)
+            directory_fd = child_fd
+        try:
+            return os.open(relative.parts[-1], flags, dir_fd=directory_fd)
+        except OSError as exc:
+            raise BlackboardError("artifact cannot be opened safely") from exc
+    finally:
+        os.close(directory_fd)
 
 
 def _validate_target_identity(race: Mapping[str, Any], value: str) -> None:
@@ -217,7 +449,8 @@ def _lane(race: Mapping[str, Any], lane_id: str) -> Mapping[str, Any]:
 def _compact(row: Mapping[str, Any]) -> dict[str, Any]:
     return {key: row.get(key) for key in (
         "event_type", "lane_id", "attack_family", "argv", "exit_code", "observed_output",
-        "output_hash", "artifact_path", "artifact_hash", "target_identity", "timestamp",
+        "output_hash", "artifact_path", "artifact_hash", "artifact_size",
+        "shared_artifact_path", "target_identity", "timestamp",
     )}
 
 

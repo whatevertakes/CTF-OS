@@ -80,7 +80,14 @@ def fake_sandbox(run: Path, challenge: Any, lane_id: str, image: str = "ctf-os-s
     return value
 
 
-def make_race(repo: Path, *, category: str = "web", remote: str | None = None):
+def make_race(
+    repo: Path,
+    *,
+    category: str = "web",
+    remote: str | None = None,
+    root_model_profile: str = "sol-ultra",
+    root_model_profile_source: str = "policy-default",
+):
     manifest, challenge = write_challenge(
         repo, category=category, remote=remote, files={"app.py": b"print('hello')\n"}
     )
@@ -96,6 +103,8 @@ def make_race(repo: Path, *, category: str = "web", remote: str | None = None):
         service={"network": None, "endpoints": []},
         selected_at=selected,
         input_ready_at=utc_now(),
+        root_model_profile=root_model_profile,
+        root_model_profile_source=root_model_profile_source,
     )
     root = fake_sandbox(run, challenge, "root", f"ctf-os-sandbox:{category}")
     race = mark_root_ready(run, root)
