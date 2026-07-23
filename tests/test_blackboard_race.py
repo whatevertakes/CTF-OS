@@ -10,8 +10,8 @@ from ctf_os.blackboard import (
     BlackboardError, append_verified_event, duplicate_signals, events, output_hash,
 )
 from ctf_os.race import (
-    attach_lane_sandbox, confirm_native_spawn, load_race, note_event, reserve_lanes,
-    status,
+    attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup, load_race,
+    note_command_receipt, note_event, reserve_lanes, status, stop_confirmed,
 )
 from ctf_os.workspace import atomic_json, utc_now
 
@@ -79,6 +79,10 @@ def test_output_and_artifact_fingerprints_are_exact_and_append_only(repo: Path) 
 
 def test_duplicate_lane_and_stagnation_signals_use_mechanical_fingerprints(repo: Path) -> None:
     _manifest, challenge, run, race = make_race(repo)
+    note_command_receipt(
+        run,
+        _receipt(run, challenge, "root", "root attack", receipt_id="root-before-lanes"),
+    )
     lanes = reserve_lanes(run, [_spec("source-dataflow"), _spec("protocol-state")])
     for index, lane in enumerate(lanes):
         attach_lane_sandbox(run, lane_id=lane["lane_id"], sandbox=fake_sandbox(run, challenge, lane["lane_id"]))
@@ -124,3 +128,29 @@ def test_status_counts_durable_commands_even_without_blackboard_event(repo: Path
     report = status(run)
     assert report["lanes"][0]["actual_command_count"] == 1
     assert report["lanes"][0]["new_output_count"] == 1
+
+
+def test_timeout_preserves_cleanup_failure_state(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    note_command_receipt(
+        run,
+        _receipt(run, challenge, "root", "root attack", receipt_id="root-before-cleanup"),
+    )
+    lane = reserve_lanes(run, [_spec("cleanup-failure")])[0]
+    attach_lane_sandbox(
+        run, lane_id=lane["lane_id"],
+        sandbox=fake_sandbox(run, challenge, lane["lane_id"]),
+    )
+    confirm_native_spawn(
+        run, lane_id=lane["lane_id"], native_session="thread-cleanup-failure"
+    )
+    stop_confirmed(
+        run, lane_id=lane["lane_id"], native_session="thread-cleanup-failure"
+    )
+    finish_lane_cleanup(run, lane_id=lane["lane_id"], error="docker unavailable")
+
+    deadline = datetime.fromisoformat(load_race(run)["deadline"]) + timedelta(seconds=1)
+    report = status(run, now=deadline)
+    child = next(row for row in report["lanes"] if row["lane_id"] == lane["lane_id"])
+    assert child["status"] == "CLEANUP_FAILED"
+    assert child["cleanup_error"] == "docker unavailable"

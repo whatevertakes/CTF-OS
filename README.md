@@ -62,7 +62,7 @@ uv run python -m ctf_os.agent_tools doctor
 버전은 `tool-help`, `tool-version`으로 확인한다. 현재 추가 도구는 다음과
 같다.
 
-- pwn: pwninit, angrop
+- pwn: pwndbg, pwninit, angrop
 - forensic: StegSeek
 - misc, crypto: Ares
 - web: SSTImap

@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 
 from ctf_os.flag import FlagError, StreamingDetector, record_candidate, valid_candidate
-from ctf_os.race import RaceError, attach_lane_sandbox, confirm_native_spawn, load_race, reserve_lanes, terminate
+from ctf_os.race import (
+    RaceError, attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup,
+    load_race, note_command_receipt, reserve_lanes, stop_confirmed, terminate,
+)
 
 from conftest import fake_sandbox, make_race
 from test_blackboard_race import _receipt, _spec
@@ -21,6 +24,10 @@ def test_streaming_detector_handles_chunk_boundaries_and_rejects_placeholders() 
 
 def test_first_target_observed_candidate_wins_atomically_and_returns_sibling_cancel_targets(repo: Path) -> None:
     _manifest, challenge, run, _race = make_race(repo)
+    note_command_receipt(
+        run,
+        _receipt(run, challenge, "root", "root attack", receipt_id="root-before-lanes"),
+    )
     lanes = reserve_lanes(run, [_spec("source-dataflow"), _spec("protocol-state")])
     for index, lane in enumerate(lanes):
         attach_lane_sandbox(run, lane_id=lane["lane_id"], sandbox=fake_sandbox(run, challenge, lane["lane_id"]))
@@ -86,6 +93,46 @@ def test_candidate_receipt_must_match_the_durable_execution(repo: Path) -> None:
             run, lane_id="root", attack_family="root-primary",
             candidate="CTF{durable}", receipt=receipt,
         )
+
+
+def test_winner_preserves_sibling_cleanup_failure_state(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    note_command_receipt(
+        run,
+        _receipt(run, challenge, "root", "root attack", receipt_id="root-before-cleanup"),
+    )
+    lanes = reserve_lanes(run, [_spec("winner-family"), _spec("cleanup-family")])
+    for index, lane in enumerate(lanes):
+        attach_lane_sandbox(
+            run, lane_id=lane["lane_id"],
+            sandbox=fake_sandbox(run, challenge, lane["lane_id"]),
+        )
+        confirm_native_spawn(
+            run, lane_id=lane["lane_id"], native_session=f"thread-{index}"
+        )
+    cleanup_lane = lanes[1]
+    stop_confirmed(
+        run, lane_id=cleanup_lane["lane_id"], native_session="thread-1"
+    )
+    finish_lane_cleanup(
+        run, lane_id=cleanup_lane["lane_id"], error="docker rm failed"
+    )
+
+    winning_receipt = _receipt(
+        run, challenge, lanes[0]["lane_id"], "CTF{winner}",
+        receipt_id="winner-with-cleanup-failure",
+    )
+    record_candidate(
+        run, lane_id=lanes[0]["lane_id"],
+        attack_family=lanes[0]["attack_family"],
+        candidate="CTF{winner}", receipt=winning_receipt,
+    )
+    persisted = next(
+        row for row in load_race(run)["lanes"]
+        if row["lane_id"] == cleanup_lane["lane_id"]
+    )
+    assert persisted["status"] == "CLEANUP_FAILED"
+    assert persisted["cleanup_error"] == "docker rm failed"
 
 
 def test_candidate_cannot_win_after_the_exact_race_terminates(repo: Path) -> None:

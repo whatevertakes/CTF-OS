@@ -20,12 +20,12 @@ MAX_READ = 64 * 1024
 _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
 
 _TOOLS: dict[str, tuple[str, ...]] = {
-    "base": ("bash", "python3", "rg", "file", "strings", "xxd", "curl", "nc", "socat", "gdb"),
+    "base": ("bash", "python3", "rg", "file", "strings", "xxd", "curl", "nc", "socat"),
     "pwn": ("python3", "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools", "objdump", "readelf", "strace"),
     "web": ("curl", "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "sstimap", "python3"),
-    "rev": ("gdb", "ghidra", "ctf-ghidra-headless", "capa", "r2", "objdump", "qemu-x86_64", "python3"),
+    "rev": ("gdb", "ctf-ghidra-headless", "capa", "r2", "objdump", "qemu-x86_64", "python3"),
     "crypto": ("python3", "sage", "openssl", "z3", "ares"),
-    "forensic": ("file", "binwalk", "exiftool", "tshark", "volatility3", "foremost", "stegseek", "python3"),
+    "forensic": ("file", "binwalk", "exiftool", "tshark", "vol", "foremost", "stegseek", "python3"),
     "misc": ("python3", "ffmpeg", "sox", "zbarimg", "tesseract", "file", "ares"),
     "osint": (
         "whois", "dig", "curl", "tesseract", "exiftool", "sherlock", "maigret",
@@ -38,8 +38,14 @@ _HELP = {
     "ctf-ghidra-headless": "ctf-ghidra-headless INPUT [TIMEOUT_SECONDS] exports bounded decompilation.",
     "nuclei": "Use ctf-nuclei-scan with the bundled offline challenge templates.",
     "gdb": "Use gdb in a persistent debugger session for interactive breakpoints and memory inspection.",
-    "nc": "Open only the organizer-declared host and port present in lane context.",
+    "pwndbg": "Run `pwndbg -q BINARY` in a persistent debugger session for enhanced GDB analysis.",
     "angrop": "Import angrop from Python to generate ROP chains for an angr project.",
+    "vol": "Run Volatility 3 as `vol`; use `vol --help` to list framework options.",
+    "onnxruntime": "Import onnxruntime from Python; it is a library, not a standalone command.",
+    "safetensors": "Import safetensors from Python; it is a library, not a standalone command.",
+    "pickletools": "Run the standard-library disassembler as `python3 -m pickletools`.",
+    "nc": "Use `nc -h` for usage; connect only to an organizer-declared host and port.",
+    "socat": "Use `socat -h` for usage; connect only to an organizer-declared endpoint.",
     "ares": "Use Ares for automatic decoding; keep generated output below /artifacts.",
     "sstimap": "Run SSTImap only against an organizer-declared HTTP(S) target.",
     "holehe": "Holehe performs an online update check at startup and requires declared egress.",
@@ -48,10 +54,66 @@ _HELP = {
     "theHarvester": "Run theHarvester only against public challenge domains and declared egress.",
 }
 _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
+    "nc": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "netcat-openbsd",
+    ),
+    "socat": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "socat",
+    ),
     "angrop": (
         "python3", "-c",
         "from importlib.metadata import version; print(version('angrop'))",
     ),
+    "checksec": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('pwntools'))",
+    ),
+    "pwndbg": (
+        "pwndbg", "--batch", "-q", "-ex",
+        "pi import pwndbg; print(pwndbg.__version__)", "-ex", "quit",
+    ),
+    "httpx": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('httpx'))",
+    ),
+    "semgrep": (
+        "sh", "-ec",
+        "grep '^semgrep=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "ffuf": ("ffuf", "-V"),
+    "ctf-ghidra-headless": (
+        "sh", "-ec",
+        "grep '^ghidra=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "openssl": ("openssl", "version"),
+    "binwalk": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('binwalk'))",
+    ),
+    "vol": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('volatility3'))",
+    ),
+    "foremost": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "foremost",
+    ),
+    "ffmpeg": ("ffmpeg", "-version"),
+    "dig": ("dig", "-v"),
+    "onnxruntime": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('onnxruntime-gpu'))",
+    ),
+    "safetensors": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('safetensors'))",
+    ),
+    "pickletools": (
+        "python3", "-c",
+        "import platform; print(f'Python {platform.python_version()} stdlib pickletools')",
+    ),
+    "kubectl": ("kubectl", "version", "--client=true"),
+    "helm": ("helm", "version", "--short"),
+    "opa": ("opa", "version"),
     "ares": (
         "sh", "-ec",
         "ares --help >/dev/null; grep '^ares=' /opt/ctf-os/tool-versions.lock",
@@ -98,8 +160,8 @@ def open_session(
     argv = list(command or (["bash", "--noprofile", "--norc", "-i"] if kind == "shell" else []))
     if not argv or any(not value or "\x00" in value for value in argv):
         raise SessionError("persistent session requires a non-empty NUL-free argv")
-    if kind == "debugger" and Path(argv[0]).name not in {"gdb", "lldb"}:
-        raise SessionError("debugger session command must start with gdb or lldb")
+    if kind == "debugger" and Path(argv[0]).name not in {"gdb", "lldb", "pwndbg"}:
+        raise SessionError("debugger session command must start with gdb, lldb, or pwndbg")
     lane_root = Path(str(metadata["lane_root"])).resolve()
     state_path = _state_path(lane_root, session_id)
     if state_path.exists() or state_path.is_symlink():

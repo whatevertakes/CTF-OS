@@ -23,6 +23,7 @@ from ..preflight import input_fingerprint, prepare_input, validate_prepared_inpu
 from ..race import (
     attach_lane_sandbox,
     confirm_native_spawn,
+    finish_lane_cleanup,
     initialize_race,
     load_race,
     mark_lane_prepare_failed,
@@ -201,11 +202,19 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         run = resolve_run(repo, args.run_id)
         lane = stop_confirmed(run, lane_id=args.lane, native_session=args.native_session)
         metadata_path = run / "workers" / str(args.lane) / "sandbox.json"
-        if not metadata_path.is_file() or metadata_path.is_symlink():
-            raise ValueError("stopped lane has no safe private sandbox metadata to clean")
+        try:
+            if not metadata_path.is_file() or metadata_path.is_symlink():
+                raise ValueError(
+                    "stopped lane has no safe private sandbox metadata to clean"
+                )
+            cleanup_result = cleanup(load_metadata(metadata_path), docker=args.docker)
+        except Exception as exc:
+            finish_lane_cleanup(run, lane_id=args.lane, error=str(exc))
+            raise
+        lane = finish_lane_cleanup(run, lane_id=args.lane)
         return {
             "lane": lane,
-            "sandbox_cleanup": cleanup(load_metadata(metadata_path), docker=args.docker),
+            "sandbox_cleanup": cleanup_result,
             "artifacts_preserved": str(run / "workers" / str(args.lane) / "artifacts"),
         }
     if args.command == "race-end":
@@ -583,9 +592,19 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 )
         except Exception as exc:
             failures.append({"scope": "service", "error": str(exc)})
-    if not failures:
-        clear_active(repo, run_id=run.name)
-    return {"run_id": run.name, "cleaned": cleaned, "failures": failures, "active_cleared": not failures}
+    result = {
+        "run_id": run.name,
+        "cleaned": cleaned,
+        "failures": failures,
+        "active_cleared": False,
+    }
+    if failures:
+        raise RuntimeError(
+            "race cleanup incomplete: "
+            + json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        )
+    clear_active(repo, run_id=run.name)
+    return result | {"active_cleared": True}
 
 
 def _prepare_result(

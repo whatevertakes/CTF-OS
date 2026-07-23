@@ -20,7 +20,8 @@ attack the challenge from the host.
 Root is the lead attacker, not a coordinator. Immediately append an actual
 attack argv to `next_root_action.exec_command_prefix`. Every analyzer, compiler,
 debugger, script, solver, payload, and remote request runs through
-`sandbox-exec`. Only controller commands run on the host.
+`sandbox-exec`. Only controller commands run on the host. `race-bootstrap`
+remains blocked until that Root attack produces a durable command receipt.
 
 Root may bootstrap zero to three native children in one request. Each lane spec
 contains exactly `model_profile`, `role`, `task`, `context_mode`, and a distinct
@@ -36,9 +37,10 @@ artifact, and Luna high for bounded mechanical work. Stop or replace a lane as
 soon as `race-status` shows repeated execution/output, no command progress,
 unchanged artifacts, duplicate work, or a remote-ready primitive without a
 remote attempt. After interrupting a child, call `race-stop-confirm` to remove
-its private sandbox while preserving artifacts, then replace it. Share only
-events accepted by the append-only blackboard after their command/session
-receipt exists.
+its private sandbox while preserving artifacts, then replace it. Cleanup keeps
+the lane in `STOPPING` or `CLEANUP_FAILED`; only `STOPPED` frees its replacement
+slot. Share only events accepted by the append-only blackboard after their
+command/session receipt exists.
 
 All sandbox command and persistent-session output is flag-scanned. The first
 non-placeholder candidate matching the challenge pattern and observed from the

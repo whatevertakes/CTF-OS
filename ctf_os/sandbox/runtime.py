@@ -73,8 +73,12 @@ def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
         docker, "run", "--detach", "--name", spec.name,
         "--read-only", "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
         # The entrypoint uses these only to change uid/gid and permanently drops
-        # them before the lane command starts.
+        # them before the lane command starts. CHOWN and DAC_READ_SEARCH are
+        # retained only in the container configuration so the Root-owned
+        # cleanup exec can traverse 0700 output directories and return their
+        # contents to the controller uid/gid.
         "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP",
+        "--cap-add", "CHOWN", "--cap-add", "DAC_READ_SEARCH",
         "--memory", profile.memory, "--cpus", str(profile.cpus),
         "--pids-limit", str(profile.pids),
         "--ulimit", "nofile=2048:2048", "--ulimit", "nproc=512:512",
@@ -356,12 +360,17 @@ def cleanup(
         runner,
         [
             docker, "exec", "--user", "0:0", name, "sh", "-c",
-            "chown -R \"$1:$2\" /work /evidence /artifacts && "
-            "find /work /evidence /artifacts -type d -exec chmod u+rwx {} +",
+            "chown -R \"$1:$2\" /work /evidence /artifacts",
             "ctf-os-finalize", str(os.getuid()), str(os.getgid()),
         ],
         timeout=60,
     )
+    if normalized.returncode:
+        detail = (normalized.stderr or normalized.stdout).strip()
+        raise SandboxError(
+            "sandbox ownership normalization failed before removal"
+            + (f": {detail[-4096:]}" if detail else "")
+        )
     result = _run(runner, [docker, "rm", "--force", name], timeout=30)
     if result.returncode:
         raise SandboxError(f"sandbox cleanup failed: {result.stderr.strip()}")
@@ -369,8 +378,8 @@ def cleanup(
         "container": name,
         "removed": True,
         "already_absent": False,
-        "host_ownership_normalized": normalized.returncode == 0,
-        "normalization_warning": normalized.stderr.strip() if normalized.returncode else None,
+        "host_ownership_normalized": True,
+        "normalization_warning": None,
     }
 
 

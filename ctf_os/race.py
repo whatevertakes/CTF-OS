@@ -18,7 +18,11 @@ MAX_CHILDREN = 3
 RACE_SECONDS = 90 * 60
 LANE_STATES = frozenset({
     "PREPARED", "RUNNING", "EXECUTING", "PRIMITIVE_FOUND", "BUILDING_EXPLOIT",
-    "REMOTE_TESTING", "STAGNANT", "CANCEL_REQUIRED", "STOPPED", "WON",
+    "REMOTE_TESTING", "STAGNANT", "CANCEL_REQUIRED", "STOPPING",
+    "CLEANUP_FAILED", "STOPPED", "WON",
+})
+NON_EXECUTING_LANE_STATES = frozenset({
+    "STOPPING", "CLEANUP_FAILED", "STOPPED", "WON",
 })
 TERMINAL_STATUSES = frozenset({"WON", "TIMED_OUT", "HANDOFF", "STOPPED"})
 MODEL_PROFILES = frozenset({"sol-xhigh", "terra-high", "luna-high"})
@@ -144,7 +148,20 @@ def reserve_lanes(run_root: Path, specifications: Sequence[Mapping[str, Any]]) -
     with state_lock(run_root):
         race = load_race(run_root)
         _require_active(race)
-        active = [lane for lane in race["lanes"] if lane["lane_id"] != "root" and lane["status"] not in {"STOPPED", "WON"}]
+        root_receipts = _receipts(run_root, "root")
+        if not root_receipts:
+            raise RaceError(
+                "race-bootstrap requires Root to complete and record an actual "
+                "sandbox attack command first"
+            )
+        if race["timestamps"].get("root_first_command_at") is None:
+            first_finished_at = str(root_receipts[0].get("finished_at") or "")
+            _parse_time(first_finished_at)
+            race["timestamps"]["root_first_command_at"] = first_finished_at
+        active = [
+            lane for lane in race["lanes"]
+            if lane["lane_id"] != "root" and lane["status"] != "STOPPED"
+        ]
         if len(active) + len(normalized) > MAX_CHILDREN:
             raise RaceError("Root plus native children may not exceed concurrency four")
         used_families = {str(lane["attack_family"]) for lane in race["lanes"]}
@@ -312,7 +329,10 @@ def note_event(run_root: Path, event: Mapping[str, Any]) -> None:
             "WORKING_POC": "BUILDING_EXPLOIT",
             "REMOTE_RESULT": "REMOTE_TESTING",
         }
-        if event_type in transitions and lane["status"] not in {"CANCEL_REQUIRED", "STOPPED", "WON"}:
+        if (
+            event_type in transitions
+            and lane["status"] not in NON_EXECUTING_LANE_STATES | {"CANCEL_REQUIRED"}
+        ):
             lane["status"] = transitions[event_type]
         if event_type == "PRIMITIVE" and race["timestamps"]["first_primitive_at"] is None:
             race["timestamps"]["first_primitive_at"] = timestamp
@@ -342,7 +362,7 @@ def note_command_receipt(run_root: Path, receipt: Mapping[str, Any]) -> None:
             and race["timestamps"]["first_remote_attempt_at"] is None
         ):
             race["timestamps"]["first_remote_attempt_at"] = timestamp
-        if lane["status"] not in {"CANCEL_REQUIRED", "STOPPED", "WON"}:
+        if lane["status"] not in NON_EXECUTING_LANE_STATES | {"CANCEL_REQUIRED"}:
             lane["status"] = "EXECUTING"
         lane["last_verified_at"] = timestamp
         _write(run_root, race)
@@ -385,7 +405,10 @@ def record_winner(
         race["timestamps"]["first_flag_candidate_at"] = timestamp
         lane["status"] = "WON"
         for sibling in race["lanes"]:
-            if sibling["lane_id"] != lane_id and sibling["status"] not in {"STOPPED", "WON"}:
+            if (
+                sibling["lane_id"] != lane_id
+                and sibling["status"] not in NON_EXECUTING_LANE_STATES
+            ):
                 sibling["status"] = "CANCEL_REQUIRED"
         targets = cancel_targets(race, excluding=lane_id)
         _write(run_root, race)
@@ -400,7 +423,7 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             race["status"] = "TIMED_OUT"
             race["attack_ready"] = False
             for lane in race["lanes"]:
-                if lane["status"] not in {"STOPPED", "WON"}:
+                if lane["status"] not in NON_EXECUTING_LANE_STATES:
                     lane["status"] = "CANCEL_REQUIRED"
         ledger = events(run_root)
         duplicates = duplicate_signals(run_root)
@@ -423,14 +446,22 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 commands >= int(lane.get("max_actual_attacks", 2))
                 or current >= _parse_time(str(lane.get("spawned_at") or lane["prepared_at"])) + timedelta(seconds=600)
             )
-            if max_exhausted and lane["status"] not in {"PREPARED", "STOPPED", "WON"}:
+            if (
+                max_exhausted
+                and lane["status"] not in NON_EXECUTING_LANE_STATES | {"PREPARED"}
+            ):
                 signals.append("sol-max-lease-exhausted")
                 lane["status"] = "CANCEL_REQUIRED"
-            elif signals and lane["status"] not in {"PREPARED", "CANCEL_REQUIRED", "STOPPED", "WON"}:
+            elif (
+                signals
+                and lane["status"]
+                not in NON_EXECUTING_LANE_STATES | {"PREPARED", "CANCEL_REQUIRED"}
+            ):
                 lane["status"] = "STAGNANT"
             rows.append({
                 "lane_id": lane["lane_id"],
                 "status": lane["status"],
+                "cleanup_error": lane.get("cleanup_error"),
                 "attack_family": lane["attack_family"],
                 "actual_command_count": commands,
                 "new_output_count": new_outputs,
@@ -459,6 +490,8 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
 
 
 def stop_confirmed(run_root: Path, *, lane_id: str, native_session: str) -> dict[str, Any]:
+    """Record native termination and reserve the lane until sandbox cleanup finishes."""
+
     with state_lock(run_root):
         race = load_race(run_root)
         lane = _lane(race, lane_id)
@@ -466,8 +499,41 @@ def stop_confirmed(run_root: Path, *, lane_id: str, native_session: str) -> dict
             raise RaceError("Root is ended through timeout, handoff, or cleanup")
         if lane.get("native_session") != native_session:
             raise RaceError("native stop confirmation does not match the lane")
-        lane["status"] = "STOPPED"
-        lane["stopped_at"] = utc_now()
+        if lane["status"] in {"STOPPED", "WON"}:
+            raise RaceError(f"lane cannot begin cleanup from {lane['status']}")
+        lane["status"] = "STOPPING"
+        lane["native_stopped_at"] = lane.get("native_stopped_at") or utc_now()
+        lane["cleanup_attempts"] = int(lane.get("cleanup_attempts", 0)) + 1
+        _write(run_root, race)
+        return dict(lane)
+
+
+def finish_lane_cleanup(
+    run_root: Path,
+    *,
+    lane_id: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Persist the sandbox cleanup result before a lane can free its slot."""
+
+    with state_lock(run_root):
+        race = load_race(run_root)
+        lane = _lane(race, lane_id)
+        if lane_id == "root":
+            raise RaceError("Root is ended through timeout, handoff, or cleanup")
+        if lane["status"] != "STOPPING":
+            raise RaceError("lane cleanup result requires a STOPPING lane")
+        now = utc_now()
+        if error is None:
+            lane["status"] = "STOPPED"
+            lane["stopped_at"] = now
+            lane["cleanup_completed_at"] = now
+            lane.pop("cleanup_error", None)
+            lane.pop("cleanup_failed_at", None)
+        else:
+            lane["status"] = "CLEANUP_FAILED"
+            lane["cleanup_error"] = error[:4096]
+            lane["cleanup_failed_at"] = now
         _write(run_root, race)
         return dict(lane)
 
@@ -483,7 +549,7 @@ def terminate(run_root: Path, *, reason: str) -> dict[str, Any]:
         race["attack_ready"] = False
         race["ended_at"] = utc_now()
         for lane in race["lanes"]:
-            if lane["status"] not in {"STOPPED", "WON"}:
+            if lane["status"] not in NON_EXECUTING_LANE_STATES:
                 lane["status"] = "CANCEL_REQUIRED"
         targets = cancel_targets(race)
         _write(run_root, race)
@@ -507,7 +573,7 @@ def cancel_targets(race: Mapping[str, Any], *, excluding: str | None = None) -> 
         and lane.get("lane_id") != excluding
         and lane.get("lane_id") != "root"
         and lane.get("native_session")
-        and lane.get("status") not in {"STOPPED", "WON"}
+        and lane.get("status") not in NON_EXECUTING_LANE_STATES
     ]
 
 

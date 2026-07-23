@@ -37,7 +37,10 @@ to run challenge tools on the host.
 ## Portfolio lanes
 
 Root may request up to three private native lanes at once through
-`race-bootstrap`. Every specification has exactly:
+`race-bootstrap`, but only after Root has completed an actual sandbox attack
+command with a durable receipt. If post-execution metric logging failed,
+bootstrap recovers `root_first_command_at` from that receipt. Every specification
+has exactly:
 
 ```text
 model_profile, role, task, context_mode, attack_family
@@ -80,7 +83,9 @@ category. Root decides semantics and rapidly stops or replaces repeated,
 stagnant, or remote-avoiding lanes. After Root interrupts a native child,
 `race-stop-confirm` immediately removes that child's labelled sandbox while
 preserving its private host-side artifacts, so replacement never accumulates
-inactive containers.
+inactive containers. It records `STOPPING` before cleanup, reaches `STOPPED`
+only after cleanup succeeds, and records `CLEANUP_FAILED` on any cleanup error.
+Only `STOPPED` children free a replacement slot.
 
 ## Flag fast path
 

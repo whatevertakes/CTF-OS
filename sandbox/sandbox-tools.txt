@@ -12,8 +12,9 @@ the same capability families are independently checked by `doctor`.
 Pwn and Rev share an explicit foreign-binary runtime for dynamically linked
 i386, ARM hard-float, AArch64, MIPSEL, and RISC-V 64 ELF files. ARM-family,
 MIPSEL, and RISC-V execution uses qemu-user with Debian cross sysroots rather
-than host binfmt registration. Pwn additionally provides pwninit, angrop,
-seccomp-tools, and musl-gcc. Rev provides TCG-only system QEMU for x86, ARM,
+than host binfmt registration. Pwn additionally provides the pinned portable
+Pwndbg GDB frontend, pwninit, angrop, seccomp-tools, and musl-gcc. Rev provides
+TCG-only system QEMU for x86, ARM,
 and miscellaneous targets, qemu-img, SeaBIOS, OVMF, ARM UEFI firmware, and
 Debian's QEMU U-Boot firmware images.
 

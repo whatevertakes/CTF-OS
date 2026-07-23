@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import os
@@ -9,6 +10,7 @@ import time
 
 import pytest
 
+import ctf_os.agent_tools.__main__ as cli
 from ctf_os.agent_tools.__main__ import build_parser
 from ctf_os.contest import parse_contest, resolve_selector
 from ctf_os.handoff import save_handoff
@@ -68,6 +70,28 @@ def test_manual_handoff_terminates_only_exact_run_and_writes_one_file(repo: Path
 def test_terminal_race_still_owns_resources_until_exact_cleanup(repo: Path) -> None:
     manifest, challenge, run, _race = make_race(repo)
     terminate(run, reason="STOPPED")
+    with pytest.raises(WorkspaceError, match="race-cleanup"):
+        create_run(
+            repo, manifest, challenge,
+            input_fingerprint=input_fingerprint(manifest, challenge),
+        )
+
+
+def test_race_cleanup_reports_failure_and_keeps_active_run(
+    repo: Path, monkeypatch
+) -> None:
+    manifest, challenge, run, _race = make_race(repo)
+    terminate(run, reason="STOPPED")
+
+    def failed_cleanup(metadata, docker="docker"):
+        raise RuntimeError("ownership normalization failed")
+
+    monkeypatch.setattr(cli, "cleanup", failed_cleanup)
+    with pytest.raises(RuntimeError, match="race cleanup incomplete"):
+        cli._race_cleanup(
+            repo,
+            argparse.Namespace(run_id=run.name, docker="docker"),
+        )
     with pytest.raises(WorkspaceError, match="race-cleanup"):
         create_run(
             repo, manifest, challenge,
@@ -160,12 +184,26 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
         executed = subprocess.run(
             [
                 *base, "sandbox-exec", "--metadata", metadata, "--",
-                "sh", "-c", "test -r /challenge/input.txt && test ! -w /challenge/input.txt",
+                "sh", "-c",
+                "test -r /challenge/input.txt && test ! -w /challenge/input.txt && "
+                "grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status",
             ],
             capture_output=True, text=True, timeout=60, check=False,
         )
         assert executed.returncode == 0, executed.stdout + executed.stderr
         assert json.loads(executed.stdout)["result"]["receipt"]["exit_code"] == 0
+        created = subprocess.run(
+            [
+                *base, "sandbox-exec", "--metadata", metadata, "--",
+                "sh", "-c",
+                "mkdir -m 700 /work/private && "
+                "printf solver > /work/private/solver.py && chmod 600 /work/private/solver.py && "
+                "printf artifact > /artifacts/result.bin && chmod 600 /artifacts/result.bin",
+            ],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert created.returncode == 0, created.stdout + created.stderr
+        assert json.loads(created.stdout)["result"]["receipt"]["exit_code"] == 0
         opened = subprocess.run(
             [*base, "session-open", "--metadata", metadata, "--session", "shell-one", "--kind", "shell"],
             capture_output=True, text=True, timeout=30, check=False,
@@ -197,7 +235,15 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
         subprocess.run([*base, "race-end", "--run-id", run_id, "--reason", "STOPPED"], capture_output=True, text=True, timeout=30, check=False)
         cleaned = subprocess.run([*base, "race-cleanup", "--run-id", run_id], capture_output=True, text=True, timeout=60, check=False)
     assert cleaned.returncode == 0, cleaned.stdout + cleaned.stderr
-    assert json.loads(cleaned.stdout)["result"]["active_cleared"] is True
+    cleanup_result = json.loads(cleaned.stdout)["result"]
+    assert cleanup_result["active_cleared"] is True
+    assert cleanup_result["cleaned"][0]["host_ownership_normalized"] is True
+    lane_root = Path(metadata).parent
+    for path in (lane_root / "work" / "private", lane_root / "work" / "private" / "solver.py",
+                 lane_root / "artifacts" / "result.bin"):
+        assert path.stat().st_uid == os.getuid()
+    assert (lane_root / "work" / "private" / "solver.py").read_text() == "solver"
+    assert (lane_root / "artifacts" / "result.bin").read_text() == "artifact"
 
 
 @pytest.mark.live
@@ -266,3 +312,136 @@ def test_live_root_owned_service_is_prepared_probed_and_fully_cleaned(tmp_path: 
         ["docker", "image", "inspect", service_image], capture_output=True, text=True, check=False
     )
     assert image.returncode != 0
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+def test_live_declared_target_firewall_allows_only_exact_ip_and_port(
+    tmp_path: Path,
+) -> None:
+    suffix = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
+    allowed_name = f"ctf-os-live-allowed-{suffix}"
+    blocked_name = f"ctf-os-live-blocked-{suffix}"
+    targets = (allowed_name, blocked_name)
+    base = ["python", "-m", "ctf_os.agent_tools", "--repo", str(tmp_path)]
+    run_id: str | None = None
+    cleaned: subprocess.CompletedProcess[str] | None = None
+
+    try:
+        for name in targets:
+            started = subprocess.run(
+                [
+                    "docker", "run", "--detach", "--rm", "--name", name,
+                    "--network", "bridge", "ctf-os-sandbox:base",
+                    "python3", "-m", "http.server", "8000",
+                ],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            assert started.returncode == 0, started.stdout + started.stderr
+
+        addresses: dict[str, str] = {}
+        for name in targets:
+            inspected = subprocess.run(
+                [
+                    "docker", "inspect", "--format",
+                    "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                    name,
+                ],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            assert inspected.returncode == 0, inspected.stdout + inspected.stderr
+            addresses[name] = inspected.stdout.strip()
+            assert addresses[name]
+
+        challenge = tmp_path / "incoming" / "Live Remote" / "base" / "Firewall"
+        challenge.mkdir(parents=True)
+        (tmp_path / "output").mkdir()
+        declared = json.dumps(
+            {
+                "host": addresses[allowed_name],
+                "port": 8000,
+                "protocol": "http",
+                "organizer_declared": True,
+            },
+            separators=(",", ":"),
+        )
+        (challenge.parents[1] / "contest.md").write_text(
+            "# Contest: Live Remote\n"
+            "- flag_pattern: \\ACTF\\{[^}]+\\}\\Z\n\n"
+            "### base/Firewall\n"
+            "- description: declared-target firewall smoke\n"
+            f"- remote: {declared}\n",
+            encoding="utf-8",
+        )
+        (challenge / "input.txt").write_text("firewall\n", encoding="utf-8")
+
+        prepared = subprocess.run(
+            [*base, "race-prepare", "1", "--contest", "Live Remote"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+        result = json.loads(prepared.stdout)["result"]
+        assert result["attack_ready"] is True
+        run_id = result["run_id"]
+        metadata = result["root_sandbox"]["metadata_path"]
+        identity = result["root_sandbox"]["authorized_targets"][0]["declared"]
+
+        allowed = subprocess.run(
+            [
+                *base, "sandbox-exec", "--metadata", metadata,
+                "--target", identity, "--",
+                "python3", "-c",
+                (
+                    "import urllib.request,sys; "
+                    "print(urllib.request.urlopen(sys.argv[1],timeout=3).status)"
+                ),
+                f"http://{addresses[allowed_name]}:8000/",
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+        allowed_receipt = json.loads(allowed.stdout)["result"]["receipt"]
+        assert allowed_receipt["exit_code"] == 0
+        assert allowed_receipt["target_observed"] is True
+        assert allowed_receipt["target_packets_after"] > allowed_receipt["target_packets_before"]
+
+        blocked = subprocess.run(
+            [
+                *base, "sandbox-exec", "--metadata", metadata,
+                "--target", identity, "--timeout", "5", "--",
+                "python3", "-c",
+                (
+                    "import socket,sys; "
+                    "socket.create_connection((sys.argv[1],int(sys.argv[2])),1)"
+                ),
+                addresses[blocked_name], "8000",
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert blocked.returncode == 0, blocked.stdout + blocked.stderr
+        blocked_receipt = json.loads(blocked.stdout)["result"]["receipt"]
+        assert blocked_receipt["exit_code"] != 0
+        assert blocked_receipt["target_observed"] is False
+        assert (
+            blocked_receipt["target_packets_after"]
+            == blocked_receipt["target_packets_before"]
+        )
+    finally:
+        if run_id is not None:
+            subprocess.run(
+                [*base, "race-end", "--run-id", run_id, "--reason", "STOPPED"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            cleaned = subprocess.run(
+                [*base, "race-cleanup", "--run-id", run_id],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+        for name in targets:
+            subprocess.run(
+                ["docker", "rm", "--force", name],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+
+    assert cleaned is not None
+    assert cleaned.returncode == 0, cleaned.stdout + cleaned.stderr
+    assert json.loads(cleaned.stdout)["result"]["active_cleared"] is True

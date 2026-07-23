@@ -10,11 +10,12 @@ import pytest
 import ctf_os.agent_tools.__main__ as cli
 from ctf_os.blackboard import append_verified_event
 from ctf_os.race import (
-    RaceError, confirm_native_spawn, load_race, reserve_lanes, reserve_max_endgame,
-    stop_confirmed,
+    RaceError, confirm_native_spawn, finish_lane_cleanup, load_race,
+    note_command_receipt, reserve_lanes, reserve_max_endgame, stop_confirmed,
 )
 
 from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt
 
 
 def _spec(family: str, profile: str = "sol-xhigh", mode: str = "fresh") -> dict[str, str]:
@@ -27,8 +28,18 @@ def _spec(family: str, profile: str = "sol-xhigh", mode: str = "fresh") -> dict[
     }
 
 
+def _record_root_attack(run: Path, challenge) -> dict:
+    receipt = _receipt(
+        run, challenge, "root", "root attack completed",
+        receipt_id="root-first-attack",
+    )
+    note_command_receipt(run, receipt)
+    return receipt
+
+
 def test_bootstrap_returns_three_private_ready_sandboxes_and_exact_native_args(repo: Path, monkeypatch) -> None:
     manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
     specifications = [_spec("source-dataflow"), _spec("protocol-state"), _spec("parser-confusion", "terra-high", "directed")]
 
     def fake_create(spec, docker="docker"):
@@ -57,9 +68,10 @@ def test_bootstrap_returns_three_private_ready_sandboxes_and_exact_native_args(r
 
 
 def test_root_plus_three_is_hard_limit_and_families_must_be_distinct(repo: Path) -> None:
-    _manifest, _challenge, run, _race = make_race(repo)
+    _manifest, challenge, run, _race = make_race(repo)
     with pytest.raises(RaceError, match="distinct"):
         reserve_lanes(run, [_spec("injection"), _spec("injection")])
+    _record_root_attack(run, challenge)
     reserve_lanes(run, [_spec("a-family"), _spec("b-family"), _spec("c-family")])
     with pytest.raises(RaceError, match="concurrency four"):
         reserve_lanes(run, [_spec("d-family")])
@@ -67,6 +79,7 @@ def test_root_plus_three_is_hard_limit_and_families_must_be_distinct(repo: Path)
 
 def test_native_lane_is_not_running_until_root_confirms_real_thread(repo: Path) -> None:
     _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
     lane = reserve_lanes(run, [_spec("behavioral-differential")])[0]
     from ctf_os.race import attach_lane_sandbox
     attach_lane_sandbox(run, lane_id=lane["lane_id"], sandbox=fake_sandbox(run, challenge, lane["lane_id"]))
@@ -80,6 +93,7 @@ def test_native_stop_confirmation_cleans_private_sandbox_before_replacement(
     repo: Path, monkeypatch
 ) -> None:
     _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
     lane = reserve_lanes(run, [_spec("bounded-old-family")])[0]
     from ctf_os.race import attach_lane_sandbox
     attach_lane_sandbox(
@@ -106,14 +120,98 @@ def test_native_stop_confirmation_cleans_private_sandbox_before_replacement(
     assert cleaned == [lane["lane_id"]]
 
 
+def test_cleanup_failure_keeps_slot_until_retry_succeeds(
+    repo: Path, monkeypatch
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
+    lanes = reserve_lanes(
+        run,
+        [_spec("old-family"), _spec("peer-family"), _spec("third-family")],
+    )
+    old = lanes[0]
+    from ctf_os.race import attach_lane_sandbox
+    attach_lane_sandbox(
+        run, lane_id=old["lane_id"],
+        sandbox=fake_sandbox(run, challenge, old["lane_id"]),
+    )
+    confirm_native_spawn(
+        run, lane_id=old["lane_id"], native_session="thread-cleanup-retry"
+    )
+    attempts = 0
+
+    def flaky_cleanup(metadata, docker="docker"):
+        nonlocal attempts
+        attempts += 1
+        assert next(
+            row for row in load_race(run)["lanes"]
+            if row["lane_id"] == old["lane_id"]
+        )["status"] == "STOPPING"
+        if attempts == 1:
+            raise RuntimeError("docker rm failed")
+        return {
+            "container": metadata["name"],
+            "removed": False,
+            "already_absent": True,
+        }
+
+    monkeypatch.setattr(cli, "cleanup", flaky_cleanup)
+    stop_args = argparse.Namespace(
+        command="race-stop-confirm", run_id=run.name, lane=old["lane_id"],
+        native_session="thread-cleanup-retry", docker="docker",
+    )
+    with pytest.raises(RuntimeError, match="docker rm failed"):
+        cli.dispatch(stop_args, repo)
+    failed = next(
+        row for row in load_race(run)["lanes"]
+        if row["lane_id"] == old["lane_id"]
+    )
+    assert failed["status"] == "CLEANUP_FAILED"
+    assert failed["cleanup_error"] == "docker rm failed"
+    with pytest.raises(RaceError, match="concurrency four"):
+        reserve_lanes(run, [_spec("replacement-blocked")])
+
+    retried = cli.dispatch(stop_args, repo)
+    assert retried["lane"]["status"] == "STOPPED"
+    assert retried["lane"]["cleanup_attempts"] == 2
+    assert attempts == 2
+    replacement = reserve_lanes(run, [_spec("replacement-allowed")])
+    assert replacement[0]["status"] == "PREPARED"
+
+
+def test_bootstrap_requires_durable_root_receipt_and_recovers_metric(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    with pytest.raises(RaceError, match="actual sandbox attack command"):
+        reserve_lanes(run, [_spec("too-early")])
+
+    race_path = run / "RACE.json"
+    state = json.loads(race_path.read_text(encoding="utf-8"))
+    state["timestamps"]["root_first_command_at"] = datetime.now(timezone.utc).isoformat()
+    race_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(RaceError, match="actual sandbox attack command"):
+        reserve_lanes(run, [_spec("timestamp-only")])
+
+    receipt = _receipt(
+        run, challenge, "root", "durable despite metric logging failure",
+        receipt_id="root-durable-only",
+    )
+    state = json.loads(race_path.read_text(encoding="utf-8"))
+    state["timestamps"]["root_first_command_at"] = None
+    race_path.write_text(json.dumps(state), encoding="utf-8")
+    lanes = reserve_lanes(run, [_spec("after-real-command")])
+    assert lanes[0]["status"] == "PREPARED"
+    assert load_race(run)["timestamps"]["root_first_command_at"] == receipt["finished_at"]
+
+
 def test_sol_max_is_one_bounded_qualified_post_minute_60_replacement(repo: Path) -> None:
     _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
     old = reserve_lanes(run, [_spec("initial-mechanism")])[0]
     from ctf_os.race import attach_lane_sandbox
     attach_lane_sandbox(run, lane_id=old["lane_id"], sandbox=fake_sandbox(run, challenge, old["lane_id"]))
     confirm_native_spawn(run, lane_id=old["lane_id"], native_session="thread-old")
     stop_confirmed(run, lane_id=old["lane_id"], native_session="thread-old")
-    from test_blackboard_race import _receipt
+    finish_lane_cleanup(run, lane_id=old["lane_id"])
     artifact = run / "workers" / "root" / "artifacts" / "partial.py"
     artifact.write_text("print('partial')\n", encoding="utf-8")
     for event_type, output, identifier, artifact_name in (

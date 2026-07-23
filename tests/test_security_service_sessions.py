@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import zipfile
@@ -10,7 +11,7 @@ import pytest
 from ctf_os.archive import ArchiveError, extract_archive
 from ctf_os.preflight import detect_service
 from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
-from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
+from ctf_os.sandbox.runtime import SandboxError, SandboxSpec, build_run_argv, cleanup
 from ctf_os.sandbox.session import (
     SessionError, list_tools, open_session, read as session_read, tool_help, tool_version,
 )
@@ -41,6 +42,8 @@ def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credenti
         assert forbidden not in joined.casefold()
     assert "--network bridge" in joined
     assert "CTF_OS_ALLOWED_ENDPOINTS_JSON" in joined
+    assert joined.count("--cap-add CHOWN") == 1
+    assert joined.count("--cap-add DAC_READ_SEARCH") == 1
 
 
 def test_metadata_gateways_private_networks_and_undeclared_targets_are_rejected() -> None:
@@ -162,6 +165,12 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
     assert list_tools("pwn")["tools"]
     assert "gdb" in tool_help("pwn", "gdb")["hint"]
 
+    pwndbg_state = open_session(
+        metadata, session_id="dbg-pwndbg", kind="debugger",
+        command=["pwndbg", "-q", "/challenge/chall"], runner=runner,
+    )
+    assert pwndbg_state["argv"][0] == "pwndbg"
+
 
 def test_added_image_tools_are_exposed_by_category() -> None:
     expected = {
@@ -178,6 +187,19 @@ def test_added_image_tools_are_exposed_by_category() -> None:
             assert tool_help(category, tool)["hint"]
 
 
+def test_catalog_uses_real_commands_and_does_not_advertise_missing_tools() -> None:
+    assert "gdb" not in list_tools("base")["tools"]
+    assert "gdb" not in list_tools("web")["tools"]
+    assert "gdb" in list_tools("pwn")["tools"]
+    assert "gdb" in list_tools("rev")["tools"]
+    assert "pwndbg" in list_tools("pwn")["tools"]
+    assert "ghidra" not in list_tools("rev")["tools"]
+    assert "ctf-ghidra-headless" in list_tools("rev")["tools"]
+    assert "volatility3" not in list_tools("forensic")["tools"]
+    assert "vol" in list_tools("forensic")["tools"]
+    assert "python3 -m pickletools" in tool_help("ai", "pickletools")["hint"]
+
+
 def test_tool_version_uses_offline_safe_probe_for_python_only_tool(repo: Path) -> None:
     _manifest, challenge, run, _race = make_race(repo, category="pwn")
     metadata = fake_sandbox(run, challenge, "root", "ctf-os-sandbox:pwn")
@@ -191,6 +213,112 @@ def test_tool_version_uses_offline_safe_probe_for_python_only_tool(repo: Path) -
     assert result == {"tool": "angrop", "available": True, "output": "9.2.12.post3\n"}
     assert calls[0][-3:-1] == ["python3", "-c"]
     assert "--version" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("category", "name", "expected_tail"),
+    [
+        ("base", "nc", ("dpkg-query", "--show", "--showformat=${Version}\n", "netcat-openbsd")),
+        ("pwn", "pwndbg", ("pwndbg", "--batch", "-q", "-ex", "pi import pwndbg; print(pwndbg.__version__)", "-ex", "quit")),
+        ("web", "ffuf", ("ffuf", "-V")),
+        ("rev", "ctf-ghidra-headless", ("sh", "-ec", "grep '^ghidra=' /opt/ctf-os/tool-versions.lock")),
+        ("forensic", "vol", ("python3", "-c", "from importlib.metadata import version; print(version('volatility3'))")),
+        ("ai", "onnxruntime", ("python3", "-c", "from importlib.metadata import version; print(version('onnxruntime-gpu'))")),
+        ("cloud", "kubectl", ("kubectl", "version", "--client=true")),
+    ],
+)
+def test_tool_version_uses_exact_probe_for_nonstandard_tools(
+    repo: Path, category: str, name: str, expected_tail: tuple[str, ...]
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo, category=category)
+    metadata = fake_sandbox(run, challenge, "root", f"ctf-os-sandbox:{category}")
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "version\n", "")
+
+    assert tool_version(metadata, name, runner=runner)["available"] is True
+    assert tuple(calls[0][-len(expected_tail):]) == expected_tail
+
+
+def test_cleanup_does_not_remove_sandbox_when_ownership_normalization_fails() -> None:
+    metadata = {
+        "name": "ctf-os-run-root",
+        "labels": {"org.ctf-os.run-id": "run-1"},
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps([{"Config": {"Labels": {"org.ctf-os.run-id": "run-1"}}}]),
+                "",
+            )
+        if argv[1:4] == ["exec", "--user", "0:0"]:
+            return subprocess.CompletedProcess(argv, 1, "", "permission denied")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(SandboxError, match="normalization failed"):
+        cleanup(metadata, runner=runner)
+    assert not any(argv[1:3] == ["rm", "--force"] for argv in calls)
+
+
+def test_cleanup_requires_successful_chown_before_container_removal() -> None:
+    metadata = {
+        "name": "ctf-os-run-root",
+        "labels": {"org.ctf-os.run-id": "run-1"},
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps([{"Config": {"Labels": {"org.ctf-os.run-id": "run-1"}}}]),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    result = cleanup(metadata, runner=runner)
+    assert result["host_ownership_normalized"] is True
+    assert result["normalization_warning"] is None
+    assert [argv[1] for argv in calls] == ["inspect", "exec", "rm"]
+    assert calls[1][2:4] == ["--user", "0:0"]
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+def test_every_catalog_tool_has_a_working_version_probe(tmp_path: Path) -> None:
+    for category in (
+        "base", "pwn", "web", "rev", "crypto",
+        "forensic", "misc", "osint", "ai", "cloud",
+    ):
+        suffix = abs(hash((str(tmp_path), category)))
+        name = f"ctf-os-tool-catalog-{category}-{suffix:x}"[:63]
+        started = subprocess.run(
+            [
+                "docker", "run", "--detach", "--rm", "--name", name,
+                "--network", "none", f"ctf-os-sandbox:{category}", "sleep", "infinity",
+            ],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert started.returncode == 0, started.stdout + started.stderr
+        try:
+            metadata = {"category": category, "name": name}
+            for tool in list_tools(category)["tools"]:
+                result = tool_version(metadata, tool)
+                assert result["available"] is True, (
+                    f"{category}/{tool}: {result['output']}"
+                )
+        finally:
+            subprocess.run(
+                ["docker", "rm", "--force", name],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
 
 
 def test_remote_session_requires_exact_declared_identity(repo: Path) -> None:
