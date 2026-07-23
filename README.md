@@ -49,3 +49,24 @@ uv run python -m ctf_os.agent_tools race-prepare \
 ```
 
 결과에서 `attack_ready: true`와 `root_sandbox.status: READY`를 확인한 뒤, 반환된 `next_root_action`으로 바로 풀이를 시작한다.
+
+## 4. 이미지와 도구 확인
+
+전체 이미지, GPU passthrough, CUDA 실행 상태는 다음 명령으로 다시 확인한다.
+
+```bash
+uv run python -m ctf_os.agent_tools doctor
+```
+
+준비된 sandbox의 카테고리별 도구 카탈로그는 `list-tools`, 개별 사용법과
+버전은 `tool-help`, `tool-version`으로 확인한다. 현재 추가 도구는 다음과
+같다.
+
+- pwn: pwninit, angrop
+- forensic: StegSeek
+- misc, crypto: Ares
+- web: SSTImap
+- osint: Sherlock, Maigret, Holehe, theHarvester
+
+전체 이미지 구성과 보안 제약은 `sandbox/sandbox-tools.txt`, 정확한 고정
+버전과 커밋은 `sandbox/tool-versions.lock`이 기준이다.

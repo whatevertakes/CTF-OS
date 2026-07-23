@@ -16,6 +16,7 @@ apt_install \
   build-essential meson ninja-build pkg-config libzip-dev liblz4-dev libssl-dev \
   ocl-icd-libopencl1
 pip_install -r /opt/ctf-os/requirements/rev.txt
+register_python_library_dirs nvidia.cuda_nvrtc nvidia.cuda_runtime
 
 download "https://github.com/radareorg/radare2/archive/refs/tags/${RADARE2_VERSION}.tar.gz" /tmp/radare2.tar.gz
 mkdir /tmp/radare2 && tar -xzf /tmp/radare2.tar.gz -C /tmp/radare2 --strip-components=1
@@ -39,6 +40,7 @@ install -m 0755 "/tmp/wasmtime-v${WASMTIME_VERSION}-x86_64-linux/wasmtime" /usr/
 rm -rf /tmp/radare2* /tmp/jadx.zip /tmp/upx* /tmp/wasmtime*
 
 for command in r2 gdb gdb-multiarch jadx apktool wasm-objdump upx wasmtime mono qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 qemu-system-riscv64 qemu-img; do require_command "$command"; done
-for module in angr unicorn capstone keystone lief pefile elftools pyopencl; do require_import "$module"; done
+for module in angr unicorn capstone keystone lief pefile elftools pyopencl cupy; do require_import "$module"; done
+python3 -c 'import ctypes; ctypes.CDLL("libnvrtc.so.12"); ctypes.CDLL("libcudart.so.12")'
 /usr/local/bin/ctf-os-binary-runtime-smoke
 /usr/local/bin/ctf-os-system-qemu-smoke

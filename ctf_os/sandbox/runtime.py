@@ -84,6 +84,9 @@ def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
         "--mount", f"type=bind,src={(spec.lane_root / 'artifacts').resolve()},dst=/artifacts",
         "--mount", f"type=bind,src={(spec.lane_root / 'context').resolve()},dst=/context,readonly",
         "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
+        # Hashcat resolves its kernel cache through the passwd home even when
+        # HOME/XDG_CACHE_HOME point at the lane-private /work mount.
+        "--tmpfs", "/home/ctf/.cache:rw,nosuid,nodev,size=256m,mode=0700,uid=1001,gid=1001",
         "--env", f"CTF_OS_ALLOWED_ENDPOINTS_JSON={targets}",
         "--env", f"CTF_OS_LOCAL_ENDPOINTS_JSON={endpoints}",
         "--env", f"CTF_OS_RUN_ID={spec.run_id}",

@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_DEFAULT_TIMEOUT=120
+export PIP_RETRIES=5
 
 apt_install() {
   apt-get update
@@ -35,4 +37,51 @@ require_command() {
 
 require_import() {
   python3 -c "import $1" || { echo "required Python import missing after install: $1" >&2; exit 1; }
+}
+
+register_python_library_dirs() {
+  python3 - "$@" <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import sys
+
+library_dirs = []
+for module in sys.argv[1:]:
+    spec = find_spec(module)
+    if spec is None or not spec.submodule_search_locations:
+        raise SystemExit(f"Python library package is missing: {module}")
+    package = Path(next(iter(spec.submodule_search_locations)))
+    library_dir = package / "lib"
+    if not library_dir.is_dir():
+        raise SystemExit(f"Python library directory is missing: {library_dir}")
+    library_dirs.append(str(library_dir))
+
+Path("/etc/ld.so.conf.d/ctf-os-python-libraries.conf").write_text(
+    "\n".join(library_dirs) + "\n",
+    encoding="utf-8",
+)
+PY
+  ldconfig
+}
+
+link_python_library() {
+  local module="$1" library="$2" link_name="$3" library_path
+  library_path="$(
+    python3 - "$module" "$library" <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import sys
+
+module, library = sys.argv[1:]
+spec = find_spec(module)
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit(f"Python library package is missing: {module}")
+library_path = Path(next(iter(spec.submodule_search_locations))) / "lib" / library
+if not library_path.is_file():
+    raise SystemExit(f"Python library is missing: {library_path}")
+print(library_path)
+PY
+  )"
+  ln -sf "$library_path" "/usr/local/lib/$link_name"
+  ldconfig
 }

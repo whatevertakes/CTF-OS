@@ -21,13 +21,16 @@ _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
 
 _TOOLS: dict[str, tuple[str, ...]] = {
     "base": ("bash", "python3", "rg", "file", "strings", "xxd", "curl", "nc", "socat", "gdb"),
-    "pwn": ("python3", "gdb", "pwndbg", "checksec", "pwninit", "seccomp-tools", "objdump", "readelf", "strace"),
-    "web": ("curl", "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "python3"),
+    "pwn": ("python3", "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools", "objdump", "readelf", "strace"),
+    "web": ("curl", "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "sstimap", "python3"),
     "rev": ("gdb", "ghidra", "ctf-ghidra-headless", "capa", "r2", "objdump", "qemu-x86_64", "python3"),
-    "crypto": ("python3", "sage", "openssl", "z3"),
-    "forensic": ("file", "binwalk", "exiftool", "tshark", "volatility3", "foremost", "python3"),
-    "misc": ("python3", "ffmpeg", "sox", "zbarimg", "tesseract", "file"),
-    "osint": ("whois", "dig", "curl", "tesseract", "exiftool", "python3"),
+    "crypto": ("python3", "sage", "openssl", "z3", "ares"),
+    "forensic": ("file", "binwalk", "exiftool", "tshark", "volatility3", "foremost", "stegseek", "python3"),
+    "misc": ("python3", "ffmpeg", "sox", "zbarimg", "tesseract", "file", "ares"),
+    "osint": (
+        "whois", "dig", "curl", "tesseract", "exiftool", "sherlock", "maigret",
+        "holehe", "theHarvester", "python3",
+    ),
     "ai": ("python3", "onnxruntime", "safetensors", "pickletools"),
     "cloud": ("terraform", "kubectl", "helm", "opa", "conftest", "checkov", "podman"),
 }
@@ -36,6 +39,31 @@ _HELP = {
     "nuclei": "Use ctf-nuclei-scan with the bundled offline challenge templates.",
     "gdb": "Use gdb in a persistent debugger session for interactive breakpoints and memory inspection.",
     "nc": "Open only the organizer-declared host and port present in lane context.",
+    "angrop": "Import angrop from Python to generate ROP chains for an angr project.",
+    "ares": "Use Ares for automatic decoding; keep generated output below /artifacts.",
+    "sstimap": "Run SSTImap only against an organizer-declared HTTP(S) target.",
+    "holehe": "Holehe performs an online update check at startup and requires declared egress.",
+    "sherlock": "Run Sherlock only for public, challenge-scoped usernames and declared egress.",
+    "maigret": "Run Maigret only for public, challenge-scoped usernames and declared egress.",
+    "theHarvester": "Run theHarvester only against public challenge domains and declared egress.",
+}
+_VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
+    "angrop": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('angrop'))",
+    ),
+    "ares": (
+        "sh", "-ec",
+        "ares --help >/dev/null; grep '^ares=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "holehe": (
+        "/opt/holehe-venv/bin/python", "-c",
+        "from importlib.metadata import version; print(version('holehe'))",
+    ),
+    "theHarvester": (
+        "/opt/theharvester-venv/bin/python", "-c",
+        "from importlib.metadata import version; print(version('theHarvester'))",
+    ),
 }
 
 
@@ -274,9 +302,10 @@ def tool_version(
 ) -> dict[str, Any]:
     if name not in list_tools(str(metadata["category"]))["tools"]:
         raise SessionError("tool is not exposed for this category")
+    command = _VERSION_COMMANDS.get(name, (name, "--version"))
     result = _run(
         runner,
-        [docker, "exec", "--user", "1001:1001", str(metadata["name"]), "sh", "-c", "command -v \"$1\" && \"$1\" --version 2>&1 | head -n 4", "ctf-os-version", name],
+        [docker, "exec", "--user", "1001:1001", str(metadata["name"]), *command],
         timeout=20,
     )
     return {"tool": name, "available": result.returncode == 0, "output": (result.stdout + result.stderr)[-4096:]}

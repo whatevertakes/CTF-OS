@@ -25,7 +25,8 @@ chmod 0755 /usr/local/bin/pwninit
 for command in gdb gdb-multiarch patchelf checksec ROPgadget ropper one_gadget pwninit seccomp-tools musl-gcc qemu-aarch64 qemu-arm qemu-mips qemu-mipsel qemu-riscv64 qemu-system-x86_64 qemu-system-aarch64 cpio; do
   require_command "$command"
 done
-for module in pwn angr unicorn capstone keystone z3; do require_import "$module"; done
+for module in pwn angr angrop unicorn capstone keystone z3; do require_import "$module"; done
+python3 -c 'import angr, angrop; assert angr.Project and angrop'
 pwninit --version
 seccomp-tools --version
 musl-gcc --version

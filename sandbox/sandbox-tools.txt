@@ -12,7 +12,7 @@ the same capability families are independently checked by `doctor`.
 Pwn and Rev share an explicit foreign-binary runtime for dynamically linked
 i386, ARM hard-float, AArch64, MIPSEL, and RISC-V 64 ELF files. ARM-family,
 MIPSEL, and RISC-V execution uses qemu-user with Debian cross sysroots rather
-than host binfmt registration. Pwn additionally provides pwninit,
+than host binfmt registration. Pwn additionally provides pwninit, angrop,
 seccomp-tools, and musl-gcc. Rev provides TCG-only system QEMU for x86, ARM,
 and miscellaneous targets, qemu-img, SeaBIOS, OVMF, ARM UEFI firmware, and
 Debian's QEMU U-Boot firmware images.
@@ -24,10 +24,13 @@ the fixed offline rules at `/opt/capa-rules`. `ctf-ghidra-headless INPUT
 decompilation and log below `/artifacts`. Pwn adds AFL++ compiler instrumentation,
 ASan/UBSan builds, `afl-showmap`, bounded `afl-fuzz`, and a separately pinned
 `afl-qemu-trace`; this does not replace the system/cross-architecture QEMU layer.
+Rev keeps PyOpenCL for CPU and native-Linux OpenCL analysis and provides CuPy
+with pinned CUDA 12 userspace libraries for NVIDIA GPU kernels, including on
+WSL2 where an NVIDIA OpenCL ICD may be unavailable.
 
 Web provides Debian Chromium and chromedriver, Playwright configured by probes
 to launch `/usr/bin/chromium` without a downloaded browser bundle, and pinned
-ffuf. It also provides Nuclei with the fixed snapshot at
+ffuf and SSTImap. It also provides Nuclei with the fixed snapshot at
 `/opt/nuclei-templates`, sqlmap, Dalfox, and Semgrep CE with the deliberately
 small local sink rules at `/opt/ctf-os/rules/semgrep`. `ctf-nuclei-scan` accepts
 one explicit HTTP(S) target and one pinned local template, disables update and
@@ -49,6 +52,12 @@ KVM or arbitrary physical devices, host network/PID, and privileged mode are
 never mounted by the sandbox runtime. A locally verified NVIDIA GPU may be
 passed through with Docker's scoped GPU device request; all other device needs
 are reported NEEDS_REVIEW.
+Crypto's hashcat uses its CUDA backend when a verified NVIDIA GPU is passed
+through and retains PoCL as an explicit CPU fallback.
+Crypto and Misc provide the pinned Ares automatic decoder. Forensic provides
+StegSeek. OSINT provides isolated, pinned Sherlock, Maigret, Holehe, and
+theHarvester environments so their dependency sets cannot downgrade the common
+runtime.
 Misc/cloud permit only the additional namespace, mount, and chroot syscalls
 needed by single-ID rootless Podman; capabilities, no-new-privileges, read-only
 root, private tmpfs storage, and network policy still apply.

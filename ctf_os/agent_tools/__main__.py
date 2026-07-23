@@ -38,6 +38,7 @@ from ..race import (
     terminate,
 )
 from ..sandbox.network import parse_remotes, resolve_targets
+from ..sandbox.resources import sandbox_gc
 from ..sandbox.runtime import (
     SandboxSpec, cleanup, create, execute, load_metadata, probe_service_connectivity,
 )
@@ -111,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     clean = commands.add_parser("race-cleanup", help="clean exact-run sandboxes/service after native stops")
     clean.add_argument("--run-id")
     clean.add_argument("--docker", default="docker")
+
+    gc = commands.add_parser("sandbox-gc", help="remove only stopped, label-validated CTF-OS sandboxes")
+    gc.add_argument("--docker", default="docker")
 
     sandbox_exec = commands.add_parser("sandbox-exec", help="execute one argv in an already prepared lane sandbox")
     sandbox_exec.add_argument("--metadata", required=True)
@@ -210,6 +214,8 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         return _race_handoff(repo, args)
     if args.command == "race-cleanup":
         return _race_cleanup(repo, args)
+    if args.command == "sandbox-gc":
+        return sandbox_gc(docker=args.docker)
     if args.command == "sandbox-exec":
         return _sandbox_exec(Path(args.metadata), args)
     if args.command == "blackboard-add":

@@ -6,7 +6,7 @@ import platform
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from .categories import CATEGORIES
 from .images import smoke_images
@@ -14,6 +14,75 @@ from .images import smoke_images
 
 PROFILES = CATEGORIES
 IMAGES = tuple(f"ctf-os-sandbox:{profile}" for profile in PROFILES)
+
+GPU_AI_TORCH_PROBE = """
+import torch
+assert torch.version.cuda is not None
+assert torch.cuda.is_available()
+values = torch.arange(1024, device="cuda", dtype=torch.float32)
+assert values.sum().item() == 523776
+torch.cuda.synchronize()
+print(torch.version.cuda, torch.cuda.get_device_name(0))
+"""
+
+GPU_AI_ONNX_PROBE = """
+import numpy as np
+import torch
+import onnxruntime as ort
+from onnx import TensorProto, helper
+assert "CUDAExecutionProvider" in ort.get_available_providers()
+node = helper.make_node("Add", ["x", "x"], ["y"])
+graph = helper.make_graph(
+    [node], "gpu-smoke",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [4])],
+)
+model = helper.make_model(
+    graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9,
+)
+session = ort.InferenceSession(
+    model.SerializeToString(),
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+assert session.get_providers()[0] == "CUDAExecutionProvider"
+result = session.run(None, {"x": np.ones(4, dtype=np.float32)})[0]
+assert result.tolist() == [2.0, 2.0, 2.0, 2.0]
+print(session.get_providers())
+"""
+
+GPU_CRYPTO_HASHCAT_PROBE = """
+mkdir -p "$HOME/.local/share/hashcat"
+printf '%s\n' 5f4dcc3b5aa765d61d8327deb882cf99 > /work/hash
+printf '%s\n' password > /work/words
+hashcat -m 0 -a 0 --backend-ignore-opencl --potfile-disable --quiet \
+  --outfile /work/cracked /work/hash /work/words
+grep -qx '5f4dcc3b5aa765d61d8327deb882cf99:password' /work/cracked
+hashcat -I --backend-ignore-opencl
+"""
+
+GPU_REV_CUPY_PROBE = r"""
+import cupy as cp
+values = cp.arange(64, dtype=cp.uint32)
+output = cp.empty_like(values)
+kernel = cp.RawKernel(r'''
+extern "C" __global__
+void candidate_check(const unsigned int *input, unsigned int *output) {
+    unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < 64) output[i] = input[i] * input[i] + 7;
+}
+''', "candidate_check")
+kernel((1,), (64,), (values, output))
+cp.cuda.runtime.deviceSynchronize()
+assert cp.all(output == values * values + 7).item()
+print(cp.cuda.runtime.getDeviceProperties(0)["name"].decode())
+"""
+
+GPU_PROBES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("gpu-ai-torch", "ai", ("python3", "-c", GPU_AI_TORCH_PROBE)),
+    ("gpu-ai-onnx", "ai", ("python3", "-c", GPU_AI_ONNX_PROBE)),
+    ("gpu-crypto-hashcat", "crypto", ("sh", "-ec", GPU_CRYPTO_HASHCAT_PROBE)),
+    ("gpu-rev-cupy", "rev", ("python3", "-c", GPU_REV_CUPY_PROBE)),
+)
 
 
 def run_doctor(
@@ -69,6 +138,13 @@ def run_doctor(
         "ok": images["all_available"],
         "detail": images["profiles"],
     })
+    checks.extend(
+        _gpu_checks(
+            images,
+            docker=docker,
+            runner=runner,
+        )
+    )
     return {
         "schema_version": 1,
         "ok": all(check["ok"] for check in checks),
@@ -77,3 +153,167 @@ def run_doctor(
         "build_command": ["sandbox/build-images.sh"],
         "solve_builds_images": False,
     }
+
+
+def _gpu_checks(
+    images: Mapping[str, Any],
+    *,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str, *, skipped: bool = False) -> None:
+        checks.append({
+            "name": name,
+            "ok": ok,
+            "status": "SKIPPED" if skipped else "PASS" if ok else "FAIL",
+            "detail": detail[-8_000:],
+        })
+
+    host = _run(
+        runner,
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=20,
+    )
+    host_detail = (host.stdout or host.stderr).strip()
+    no_gpu = (
+        host.returncode == 127
+        or "no devices were found" in host_detail.casefold()
+        or (host.returncode == 0 and not host.stdout.strip())
+    )
+    if no_gpu:
+        add(
+            "gpu-host-driver",
+            True,
+            host_detail or "no NVIDIA GPU detected; CPU profiles remain available",
+            skipped=True,
+        )
+        for name in ("gpu-docker-passthrough", *(row[0] for row in GPU_PROBES)):
+            add(name, True, "no usable host NVIDIA GPU; GPU probe not run", skipped=True)
+        return checks
+    if host.returncode:
+        add("gpu-host-driver", False, host_detail or "nvidia-smi failed")
+        for name in ("gpu-docker-passthrough", *(row[0] for row in GPU_PROBES)):
+            add(name, True, "host NVIDIA driver failed; GPU probe not run", skipped=True)
+        return checks
+    add("gpu-host-driver", True, host_detail)
+
+    present = {
+        str(row.get("image", "")).removeprefix("ctf-os-sandbox:"): bool(row.get("available"))
+        for row in images.get("profiles", [])
+        if isinstance(row, Mapping)
+    }
+    if not present.get("base", False):
+        add(
+            "gpu-docker-passthrough",
+            False,
+            "ctf-os-sandbox:base is absent; cannot validate scoped GPU passthrough",
+        )
+        for name, _profile, _command in GPU_PROBES:
+            add(name, True, "GPU passthrough was not validated", skipped=True)
+        return checks
+
+    passthrough = _gpu_image_probe(
+        "base",
+        (
+            "nvidia-smi",
+            "--query-gpu=index,name",
+            "--format=csv,noheader,nounits",
+        ),
+        docker=docker,
+        runner=runner,
+    )
+    passthrough_detail = (passthrough.stdout or passthrough.stderr).strip()
+    passthrough_ok = passthrough.returncode == 0 and bool(passthrough.stdout.strip())
+    add(
+        "gpu-docker-passthrough",
+        passthrough_ok,
+        passthrough_detail or "container nvidia-smi failed",
+    )
+    if not passthrough_ok:
+        for name, _profile, _command in GPU_PROBES:
+            add(name, True, "Docker GPU passthrough unavailable; probe not run", skipped=True)
+        return checks
+
+    for name, profile, command in GPU_PROBES:
+        if not present.get(profile, False):
+            add(name, True, f"ctf-os-sandbox:{profile} is absent", skipped=True)
+            continue
+        result = _gpu_image_probe(
+            profile,
+            command,
+            docker=docker,
+            runner=runner,
+        )
+        detail = "\n".join(
+            stream.strip() for stream in (result.stdout, result.stderr) if stream.strip()
+        )
+        add(name, result.returncode == 0, detail or "real GPU operation passed")
+    return checks
+
+
+def _gpu_image_probe(
+    profile: str,
+    command: Sequence[str],
+    *,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> subprocess.CompletedProcess[str]:
+    argv = [
+        docker,
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--gpus",
+        "all",
+        "--network",
+        "none",
+        "--read-only",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--user",
+        "1001:1001",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+        "--tmpfs",
+        "/work:rw,nosuid,nodev,size=256m,mode=1777",
+        "--tmpfs",
+        "/home/ctf/.cache:rw,nosuid,nodev,size=256m,mode=0700,uid=1001,gid=1001",
+        "--env",
+        "HOME=/work",
+        "--env",
+        "XDG_DATA_HOME=/work/.local/share",
+        "--env",
+        "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        "--entrypoint",
+        command[0],
+        f"ctf-os-sandbox:{profile}",
+        *command[1:],
+    ]
+    return _run(runner, argv, timeout=90)
+
+
+def _run(
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    argv: Sequence[str],
+    *,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return runner(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(list(argv), 127, "", str(exc))

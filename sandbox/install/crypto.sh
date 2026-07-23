@@ -9,6 +9,11 @@ apt_install \
   sagemath pari-gp gap maxima libgmp-dev libmpfr-dev libmpc-dev libecm-dev \
   libhwloc-dev libopenmpi-dev openmpi-bin python3-mpi4py \
   hashcat ocl-icd-libopencl1 pocl-opencl-icd
+pip_install nvidia-cuda-nvrtc-cu12==12.6.77
+register_python_library_dirs nvidia.cuda_nvrtc
+# Hashcat 6.2 loads the unversioned NVRTC soname with dlopen(), while NVIDIA's
+# runtime wheel intentionally ships only libnvrtc.so.12.
+link_python_library nvidia.cuda_nvrtc libnvrtc.so.12 libnvrtc.so
 # Debian's GCL-backed Maxima needs a seccomp relaxation merely to start. Sage
 # also ships an ECL-backed Maxima that works under the default sandbox policy.
 ln -sf /usr/bin/maxima-sage /usr/local/bin/maxima
@@ -29,6 +34,8 @@ cmake --install /tmp/cado-build
 ln -s /usr/local/bin/cado-nfs.py /usr/local/bin/cado-nfs
 rm -rf /tmp/cado-nfs* /tmp/cado-build
 
-for command in sage RsaCtfTool cado-nfs gp gap maxima hashcat; do require_command "$command"; done
+for command in sage RsaCtfTool cado-nfs gp gap maxima hashcat ares; do require_command "$command"; done
 hashcat --version
+ares --help >/dev/null
+python3 -c 'import ctypes; ctypes.CDLL("libnvrtc.so")'
 for module in z3 gmpy2 Crypto fpylll cysignals sympy cryptography ecdsa; do require_import "$module"; done

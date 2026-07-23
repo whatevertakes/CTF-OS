@@ -18,3 +18,4 @@ rm -rf /var/lib/apt/lists/* /tmp/stegseek.deb
 
 for command in vol mmls fls icat foremost exiftool binwalk tshark tcpdump testdisk photorec dcfldd steghide stegseek zsteg convert tesseract pngcheck ffmpeg sox; do require_command "$command"; done
 for module in volatility3 scapy pyshark oletools pdfminer magic PIL numpy scipy capstone; do require_import "$module"; done
+stegseek --version

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /opt/sstimap
+exec python3 sstimap.py "$@"

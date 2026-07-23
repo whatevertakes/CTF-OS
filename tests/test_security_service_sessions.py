@@ -12,7 +12,7 @@ from ctf_os.preflight import detect_service
 from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
 from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
 from ctf_os.sandbox.session import (
-    SessionError, list_tools, open_session, read as session_read, tool_help,
+    SessionError, list_tools, open_session, read as session_read, tool_help, tool_version,
 )
 from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, prepare_service
 
@@ -35,6 +35,7 @@ def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credenti
     joined = " ".join(argv)
     assert f"src={source.resolve()},dst=/challenge,readonly" in joined
     assert "dst=/work" in joined and "dst=/evidence" in joined and "dst=/artifacts" in joined
+    assert "/home/ctf/.cache:rw,nosuid,nodev,size=256m,mode=0700,uid=1001,gid=1001" in argv
     assert "/var/run/docker.sock" not in joined
     for forbidden in (".ssh", "kubeconfig", ".aws", "chrome", "host.docker.internal"):
         assert forbidden not in joined.casefold()
@@ -160,6 +161,36 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
     assert (run / "workers" / "root" / "logs" / f"{receipt['receipt_id']}.json").is_file()
     assert list_tools("pwn")["tools"]
     assert "gdb" in tool_help("pwn", "gdb")["hint"]
+
+
+def test_added_image_tools_are_exposed_by_category() -> None:
+    expected = {
+        "pwn": {"pwninit", "angrop"},
+        "forensic": {"stegseek"},
+        "misc": {"ares"},
+        "crypto": {"ares"},
+        "web": {"sstimap"},
+        "osint": {"sherlock", "maigret", "holehe", "theHarvester"},
+    }
+    for category, tools in expected.items():
+        assert tools <= set(list_tools(category)["tools"])
+        for tool in tools:
+            assert tool_help(category, tool)["hint"]
+
+
+def test_tool_version_uses_offline_safe_probe_for_python_only_tool(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(repo, category="pwn")
+    metadata = fake_sandbox(run, challenge, "root", "ctf-os-sandbox:pwn")
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "9.2.12.post3\n", "")
+
+    result = tool_version(metadata, "angrop", runner=runner)
+    assert result == {"tool": "angrop", "available": True, "output": "9.2.12.post3\n"}
+    assert calls[0][-3:-1] == ["python3", "-c"]
+    assert "--version" not in calls[0]
 
 
 def test_remote_session_requires_exact_declared_identity(repo: Path) -> None:

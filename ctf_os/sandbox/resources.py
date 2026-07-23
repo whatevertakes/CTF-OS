@@ -101,3 +101,68 @@ def admit(
     if status["host_cpus"] and profile.cpus > max(0.5, float(status["host_cpus"]) - 1.0):
         raise ResourceError("sandbox CPU request exceeds the reserved host budget")
     return status | {"admitted_profile": profile.to_dict()}
+
+
+def sandbox_gc(
+    *,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Remove only stopped containers carrying a validated CTF-OS sandbox label set."""
+    identifiers: set[str] = set()
+    for label in ("org.ctf-os.managed=true", "ctf-os=true"):
+        try:
+            listed = runner(
+                [
+                    docker, "ps", "--all", "--filter", f"label={label}",
+                    "--format", "{{.ID}}",
+                ],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise ResourceError(f"cannot list managed sandboxes: {exc}") from exc
+        if listed.returncode:
+            raise ResourceError(listed.stderr.strip() or "cannot list managed sandboxes")
+        identifiers.update(row.strip() for row in listed.stdout.splitlines() if row.strip())
+
+    removed: list[str] = []
+    skipped: list[dict[str, str]] = []
+    failures: list[dict[str, str]] = []
+    for identifier in sorted(identifiers):
+        inspected = runner(
+            [docker, "inspect", identifier],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        if inspected.returncode:
+            skipped.append({"container": identifier, "reason": "inspect failed or container disappeared"})
+            continue
+        try:
+            raw = json.loads(inspected.stdout)[0]
+            labels = raw.get("Config", {}).get("Labels", {}) or {}
+            state = raw.get("State", {}) or {}
+            name = str(raw.get("Name", identifier)).removeprefix("/")
+        except (IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise ResourceError(f"Docker returned malformed inspect data for {identifier}") from exc
+        current = (
+            labels.get("org.ctf-os.managed") == "true"
+            and labels.get("org.ctf-os.kind") == "sandbox"
+        )
+        legacy = labels.get("ctf-os") == "true" and labels.get("ctf-os.kind") == "sandbox"
+        if not (current or legacy):
+            skipped.append({"container": name, "reason": "managed sandbox labels did not validate"})
+            continue
+        if bool(state.get("Running")) or str(state.get("Status", "")).casefold() == "running":
+            skipped.append({"container": name, "reason": "sandbox is running"})
+            continue
+        removed_result = runner(
+            [docker, "rm", identifier],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if removed_result.returncode:
+            failures.append({
+                "container": name,
+                "error": removed_result.stderr.strip() or "docker rm failed",
+            })
+        else:
+            removed.append(name)
+    return {"removed": removed, "skipped": skipped, "failures": failures}

@@ -20,6 +20,17 @@ RUN groupadd --gid 1001 ctf \
 
 WORKDIR /challenge
 
+FROM rust:1.85.1-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS ares-builder
+ARG ARES_COMMIT=f0df3efa0272bbc7c1b8fa14f06b6104fdd287d1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl --fail --location --retry 3 --silent --show-error \
+       "https://github.com/bee-san/Ares/archive/${ARES_COMMIT}.tar.gz" \
+       --output /tmp/ares.tar.gz \
+    && mkdir /tmp/ares \
+    && tar -xzf /tmp/ares.tar.gz -C /tmp/ares --strip-components=1 \
+    && cargo build --manifest-path /tmp/ares/Cargo.toml --release --locked
+
 FROM common AS profile-base
 
 FROM common AS binary-analysis
@@ -63,17 +74,17 @@ ENV NUCLEI_TEMPLATES=/opt/nuclei-templates \
 COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
 COPY sandbox/install/web.sh sandbox/install/web-verify.sh /opt/ctf-os/install/
 COPY sandbox/smoke/web-runtime.py /usr/local/bin/ctf-os-web-runtime-smoke
-COPY sandbox/bin/ctf-nuclei-scan /usr/local/bin/ctf-nuclei-scan
+COPY sandbox/bin/ctf-nuclei-scan sandbox/bin/sstimap /usr/local/bin/
 COPY sandbox/rules/nuclei /opt/ctf-os/rules/nuclei
 COPY sandbox/rules/semgrep /opt/ctf-os/rules/semgrep
-RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke /usr/local/bin/ctf-nuclei-scan \
+RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke /usr/local/bin/ctf-nuclei-scan /usr/local/bin/sstimap \
     && /opt/ctf-os/install/web.sh
 RUN chmod 0755 /opt/ctf-os/install/web-verify.sh \
     && /opt/ctf-os/install/web-verify.sh
 
 FROM web-tools AS profile-web
 COPY sandbox/smoke/web-security.sh /usr/local/bin/ctf-os-web-security-smoke
-RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke \
+RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke /usr/local/bin/sstimap \
     && /usr/local/bin/ctf-os-web-security-smoke
 
 FROM binary-analysis AS profile-rev
@@ -87,6 +98,7 @@ RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-*-smoke \
 FROM common AS profile-crypto
 COPY sandbox/requirements/crypto.txt /opt/ctf-os/requirements/crypto.txt
 COPY sandbox/install/crypto.sh /opt/ctf-os/install/crypto.sh
+COPY --from=ares-builder /tmp/ares/target/release/ares /usr/local/bin/ares
 RUN /opt/ctf-os/install/crypto.sh
 RUN sage -c 'assert 2^10 == 1024; assert GF(7)(3)^2 == 2'
 
@@ -98,6 +110,7 @@ RUN /opt/ctf-os/install/forensic.sh
 FROM common AS profile-misc
 COPY sandbox/requirements/misc.txt /opt/ctf-os/requirements/misc.txt
 COPY sandbox/install/misc.sh /opt/ctf-os/install/misc.sh
+COPY --from=ares-builder /tmp/ares/target/release/ares /usr/local/bin/ares
 RUN /opt/ctf-os/install/misc.sh
 
 FROM common AS profile-osint

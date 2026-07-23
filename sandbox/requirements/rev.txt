@@ -4,3 +4,6 @@ pyelftools==0.32
 pefile==2024.8.26
 lief==0.16.6
 pyopencl==2026.1.2
+cupy-cuda12x==13.6.0
+nvidia-cuda-nvrtc-cu12==12.6.77
+nvidia-cuda-runtime-cu12==12.6.77
