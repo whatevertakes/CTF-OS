@@ -52,8 +52,9 @@ uv run python -m ctf_os.agent_tools race-prepare \
 
 ## 4. 이미지와 도구 확인
 
-전체 이미지의 현재 도구 잠금 해시·프로필·플랫폼과 GPU passthrough,
-CUDA 실행 상태는 다음 명령으로 다시 확인한다. CPU 이미지 항목은
+전체 이미지의 현재 도구 잠금 해시·전체 sandbox 빌드 입력 해시·
+프로필·플랫폼과 GPU passthrough, CUDA 실행 상태는 다음 명령으로
+다시 확인한다. CPU 이미지 항목은
 구조적 신원 검사이며, 실제 도구 실행은 이미지 빌드 스모크와 라이브
 통합 테스트가 담당한다.
 

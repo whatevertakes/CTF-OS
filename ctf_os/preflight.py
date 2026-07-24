@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import mimetypes
 import os
-from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -25,7 +26,6 @@ from .archive import (
 from .contest import ChallengeSpec, ContestManifest
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json
-
 
 ARCHIVE_SUFFIXES = (
     ".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2",
@@ -137,7 +137,7 @@ def prepare_input(
     service_plan = detect_service(destination, challenge.category)
     record: dict[str, Any] = {
         "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "input_fingerprint": expected_fingerprint,
         "prepared_fingerprint": prepared_fingerprint,
         "prepared_input": str(destination),
@@ -256,13 +256,16 @@ def detect_service(input_root: Path, category: str) -> dict[str, Any]:
 def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]:
     relative = path.relative_to(input_root).as_posix()
     try:
-        document = yaml.safe_load(_read_service_descriptor(path)) or {}
+        descriptor = _read_service_descriptor(path)
+        document = yaml.safe_load(descriptor) or {}
     except (OSError, UnicodeDecodeError, yaml.YAMLError, PreflightError) as exc:
         return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": [str(exc)]}
     raw_services = document.get("services") if isinstance(document, Mapping) else None
     if not isinstance(raw_services, Mapping) or not raw_services:
         return {"kind": "compose", "safe": False, "source": relative, "services": [], "review_reasons": ["compose has no services"]}
     reasons: list[str] = []
+    if _compose_uses_controller_interpolation(descriptor):
+        reasons.append("compose requests controller environment interpolation")
     if isinstance(document, Mapping) and document.get("include"):
         reasons.append("compose requests external include files")
     services: list[dict[str, Any]] = []
@@ -313,6 +316,21 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
                 reasons.append(f"service {name} uses a dynamic image reference")
             else:
                 runtime_images.add(image)
+        environment = raw.get("environment")
+        if isinstance(environment, Mapping):
+            for key, value in environment.items():
+                if value is None:
+                    reasons.append(
+                        f"service {name} environment {key} inherits the controller value"
+                    )
+        elif isinstance(environment, list):
+            for value in environment:
+                if not isinstance(value, str) or "=" not in value:
+                    reasons.append(
+                        f"service {name} environment entry inherits the controller value"
+                    )
+        elif environment is not None:
+            reasons.append(f"service {name} environment declaration is unsupported")
         env_files = raw.get("env_file") or []
         if isinstance(env_files, (str, Mapping)):
             env_files = [env_files]
@@ -354,6 +372,11 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
     }
 
 
+def _compose_uses_controller_interpolation(descriptor: str) -> bool:
+    escaped_removed = descriptor.replace("$$", "")
+    return re.search(r"\$(?:\{?[A-Za-z_])", escaped_removed) is not None
+
+
 def _compose_ports(raw: Mapping[str, Any]) -> list[int]:
     result: set[int] = set()
     for value in list(raw.get("expose") or []) + list(raw.get("ports") or []):
@@ -390,7 +413,7 @@ def _dockerfile_bases(text: str) -> tuple[list[str], list[str]]:
     stages: set[str] = set()
     reasons: list[str] = []
     for raw in text.splitlines():
-        match = re.match(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$", raw, re.I)
+        match = re.match(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$", raw, re.IGNORECASE)
         if not match:
             continue
         image, stage = match.group(1), match.group(2)

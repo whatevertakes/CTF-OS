@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import regex as safe_regex
 
@@ -19,7 +20,11 @@ class FlagError(ValueError):
 
 _TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,48}\{[^{}\r\n]{1,512}\}")
 _PLACEHOLDERS = re.compile(
-    r"(?i)(?:example|sample|placeholder|dummy|fake|test|redacted|your[_ -]?flag|flag[_ -]?here)"
+    r"(?i)(?:"
+    r"(?:example|sample|placeholder|dummy|fake|test|redacted)(?:[_ -]?flag)?"
+    r"|your[_ -]?flag"
+    r"|flag[_ -]?here"
+    r")\Z"
 )
 
 
@@ -55,7 +60,7 @@ class StreamingDetector:
 
 
 def valid_candidate(candidate: str, pattern: Any | str | None) -> bool:
-    if not candidate or len(candidate) > 1024 or _PLACEHOLDERS.search(candidate):
+    if not candidate or len(candidate) > 1024 or _is_placeholder(candidate):
         return False
     try:
         compiled = safe_regex.compile(pattern) if isinstance(pattern, str) else pattern
@@ -65,6 +70,15 @@ def valid_candidate(candidate: str, pattern: Any | str | None) -> bool:
         )
     except (safe_regex.error, TimeoutError):
         return False
+
+
+def _is_placeholder(candidate: str) -> bool:
+    start = candidate.find("{")
+    if start >= 0 and candidate.endswith("}"):
+        value = candidate[start + 1:-1]
+    else:
+        value = candidate
+    return _PLACEHOLDERS.fullmatch(value.strip()) is not None
 
 
 def record_candidate(

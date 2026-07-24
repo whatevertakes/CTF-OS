@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt
 
 import ctf_os.agent_tools.__main__ as cli
 from ctf_os.blackboard import append_verified_event
 from ctf_os.race import (
-    RaceError, confirm_native_spawn, finish_lane_cleanup, load_race,
-    note_command_receipt, reserve_lanes, reserve_max_endgame, stop_confirmed,
+    RaceError,
+    confirm_native_spawn,
+    finish_lane_cleanup,
+    load_race,
+    note_command_receipt,
+    reserve_lanes,
+    reserve_max_endgame,
+    stop_confirmed,
 )
-
-from conftest import fake_sandbox, make_race
-from test_blackboard_race import _receipt
 
 
 def _spec(family: str, profile: str = "sol-xhigh", mode: str = "fresh") -> dict[str, str]:
@@ -38,7 +43,7 @@ def _record_root_attack(run: Path, challenge) -> dict:
 
 
 def test_bootstrap_returns_three_private_ready_sandboxes_and_exact_native_args(repo: Path, monkeypatch) -> None:
-    manifest, challenge, run, _race = make_race(repo)
+    _manifest, challenge, run, _race = make_race(repo)
     _record_root_attack(run, challenge)
     specifications = [_spec("source-dataflow"), _spec("protocol-state"), _spec("parser-confusion", "terra-high", "directed")]
 
@@ -272,7 +277,7 @@ def test_bootstrap_requires_durable_root_receipt_and_recovers_metric(repo: Path)
 
     race_path = run / "RACE.json"
     state = json.loads(race_path.read_text(encoding="utf-8"))
-    state["timestamps"]["root_first_command_at"] = datetime.now(timezone.utc).isoformat()
+    state["timestamps"]["root_first_command_at"] = datetime.now(UTC).isoformat()
     race_path.write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(RaceError, match="actual sandbox attack command"):
         reserve_lanes(run, [_spec("timestamp-only")])

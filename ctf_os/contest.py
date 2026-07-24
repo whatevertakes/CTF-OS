@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from difflib import SequenceMatcher
 import hashlib
 import json
 import os
 import re
 import tempfile
 import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from .categories import canonical_category
@@ -189,7 +189,7 @@ class ContestManifest:
         }
 
 
-_TITLE = re.compile(r"^#\s*(?:(?:대회명|contest(?:\s+name)?)\s*[:：]\s*)?(.+?)\s*$", re.I)
+_TITLE = re.compile(r"^#\s*(?:(?:대회명|contest(?:\s+name)?)\s*[:：]\s*)?(.+?)\s*$", re.IGNORECASE)
 _H3 = re.compile(r"^###\s+(.+?)\s*$")
 _FIELD = re.compile(r"^\s*-\s*([^:：]+)\s*[:：]\s*(.*?)\s*$")
 _ALIASES = {

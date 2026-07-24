@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
 import subprocess
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt
+from test_race_bootstrap import _spec
 
 import ctf_os.agent_tools.__main__ as cli
 from ctf_os.blackboard import (
@@ -24,14 +27,10 @@ from ctf_os.race import (
     reserve_lanes,
     status,
 )
-from ctf_os.sandbox.resources import ResourceError, admit, admission_status
+from ctf_os.sandbox.resources import ResourceError, admission_status, admit
 from ctf_os.sandbox.runtime import SandboxSpec, build_run_argv
 from ctf_os.service import ServiceSpec
 from ctf_os.workspace import atomic_json
-
-from conftest import fake_sandbox, make_race
-from test_blackboard_race import _receipt
-from test_race_bootstrap import _spec
 
 
 def _record_root_attack(run: Path, challenge) -> None:
@@ -100,7 +99,7 @@ def test_root_sol_max_is_not_subject_to_child_endgame_lease(repo: Path) -> None:
                 receipt_id=f"root-max-{index}",
             ),
         )
-    later = datetime.now(timezone.utc) + timedelta(minutes=20)
+    later = datetime.now(UTC) + timedelta(minutes=20)
     root = status(run, now=later)["lanes"][0]
     assert root["status"] != "CANCEL_REQUIRED"
     assert "sol-max-lease-exhausted" not in root["stagnation_signals"]
@@ -222,7 +221,7 @@ def test_live_command_heartbeat_suppresses_false_stagnation(repo: Path) -> None:
     attach_lane_sandbox(run, lane_id=lane["lane_id"], sandbox=sandbox)
     running = run / "workers" / lane["lane_id"] / "logs" / "running"
     running.mkdir()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     atomic_json(running / "active.json", {
         "schema_version": 1,
         "receipt_id": "active",

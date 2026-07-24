@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-from pathlib import Path
+import json
+import os
 import subprocess
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
 
 from .categories import CATEGORIES
 
@@ -16,6 +18,49 @@ class ImageError(RuntimeError):
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def expected_build_sha256(repo_root: Path | None = None) -> str:
+    root = (
+        repo_root.resolve()
+        if repo_root is not None
+        else Path(__file__).resolve().parents[1]
+    )
+    sandbox = root / "sandbox"
+    if sandbox.is_symlink() or not sandbox.is_dir():
+        raise ImageError("sandbox build inputs are unavailable or unsafe")
+    paths = [sandbox, *sandbox.rglob("*")]
+    dockerignore = root / ".dockerignore"
+    if dockerignore.exists() or dockerignore.is_symlink():
+        paths.append(dockerignore)
+    if not paths:
+        raise ImageError("sandbox build inputs are empty")
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda value: value.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        try:
+            mode = path.lstat().st_mode & 0o7777
+            if path.is_symlink():
+                kind = b"symlink"
+                content = os.readlink(path).encode("utf-8")
+            elif path.is_dir():
+                kind = b"directory"
+                content = b""
+            elif path.is_file():
+                kind = b"file"
+                content = path.read_bytes()
+            else:
+                raise ImageError(f"unsupported sandbox build input: {path}")
+        except OSError as exc:
+            raise ImageError(f"sandbox build input is unreadable: {path}: {exc}") from exc
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(kind).to_bytes(8, "big"))
+        digest.update(kind)
+        digest.update(mode.to_bytes(4, "big"))
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def expected_lock_sha256() -> str:
@@ -87,6 +132,13 @@ def inspect_image(
             "image": image,
             "available": False,
             "reason": "image was not built from the current tool version lock",
+        }
+    expected_build = expected_build_sha256()
+    if labels.get("org.ctf-os.build-sha256") != expected_build:
+        return {
+            "image": image,
+            "available": False,
+            "reason": "image was not built from the current sandbox build inputs",
         }
     if operating_system != "linux" or architecture not in {"amd64", "x86_64"}:
         return {

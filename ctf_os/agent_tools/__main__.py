@@ -7,15 +7,20 @@ or interrupts a native agent, or submits a flag.
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
-from datetime import datetime, timezone
 import json
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-import sys
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ..blackboard import append_verified_event, register_artifact_inbox
-from ..contest import discover_contests, initialize_contest, resolve_selector, select_contest
+from ..contest import (
+    discover_contests,
+    initialize_contest,
+    resolve_selector,
+    select_contest,
+)
 from ..doctor import run_doctor
 from ..flag import StreamingDetector, record_candidate
 from ..handoff import load_markdown, save_handoff, validate_handoff
@@ -24,6 +29,7 @@ from ..preflight import input_fingerprint, prepare_input, validate_prepared_inpu
 from ..race import (
     attach_lane_sandbox,
     begin_lane_cleanup_retry,
+    cancel_targets,
     confirm_native_spawn,
     finish_lane_cleanup,
     initialize_race,
@@ -37,14 +43,21 @@ from ..race import (
     reserve_max_endgame,
     set_lane_service_context,
     set_service_context,
-    status as race_status,
     stop_confirmed,
     terminate,
+)
+from ..race import (
+    status as race_status,
 )
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import sandbox_gc
 from ..sandbox.runtime import (
-    SandboxError, SandboxSpec, cleanup, create, execute, load_metadata,
+    SandboxError,
+    SandboxSpec,
+    cleanup,
+    create,
+    execute,
+    load_metadata,
     probe_service_connectivity,
 )
 from ..sandbox.session import (
@@ -52,12 +65,23 @@ from ..sandbox.session import (
     list_sessions,
     list_tools,
     open_session,
-    read as session_read,
-    send as session_send,
     tool_help,
     tool_version,
 )
-from ..service import ServiceActor, ServiceSpec, cleanup_service, load_service, prepare_service
+from ..sandbox.session import (
+    read as session_read,
+)
+from ..sandbox.session import (
+    send as session_send,
+)
+from ..service import (
+    ServiceActor,
+    ServiceCleanupError,
+    ServiceSpec,
+    cleanup_service,
+    load_service,
+    prepare_service,
+)
 from ..workspace import clear_active, create_run, resolve_run, utc_now
 
 
@@ -208,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo = Path(args.repo).resolve()
     try:
         result = dispatch(args, repo)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
     succeeded = _command_succeeded(args.command, result)
@@ -394,13 +418,27 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
         if service.get("status") == "READY":
             root_sandbox["service_probe"] = probe_service_connectivity(root_sandbox, docker=args.docker)
         race = mark_root_ready(run, root_sandbox)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, ServiceCleanupError):
+            service = dict(exc.service)
+            service["cleanup_error"] = "; ".join(exc.failures)
+            try:
+                set_service_context(run, service)
+            except Exception as context_exc:  # noqa: BLE001
+                service["cleanup_error"] += (
+                    f"; service recovery state write failed: {context_exc}"
+                )
+        elif "cleanup was incomplete" in str(exc):
+            service = service | {
+                "status": "CLEANUP_FAILED",
+                "cleanup_error": str(exc),
+            }
         race = mark_prepare_failed(run, str(exc))
         service = service | {"prepare_error": str(exc)}
         if root_sandbox is not None:
             try:
                 cleanup(root_sandbox, docker=args.docker)
-            except Exception as cleanup_exc:
+            except Exception as cleanup_exc:  # noqa: BLE001
                 service["cleanup_error"] = str(cleanup_exc)
         if service.get("status") == "READY":
             try:
@@ -409,7 +447,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 )
                 if not service_cleanup["cleaned"]:
                     service["cleanup_error"] = "; ".join(service_cleanup["failures"])
-            except Exception as cleanup_exc:
+            except Exception as cleanup_exc:  # noqa: BLE001
                 service["cleanup_error"] = str(cleanup_exc)
         if "cleanup_error" not in service:
             clear_active(repo, run_id=run.name)
@@ -492,12 +530,12 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                     metadata, docker=args.docker
                 )
             packets.append(attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             cleanup_errors: list[str] = []
             if metadata is not None:
                 try:
                     cleanup(metadata, docker=args.docker)
-                except Exception as cleanup_exc:
+                except Exception as cleanup_exc:  # noqa: BLE001
                     cleanup_errors.append(f"sandbox: {cleanup_exc}")
             if lane_service is not None and lane_service.get("status") == "READY":
                 try:
@@ -509,7 +547,7 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                     cleanup_errors.extend(
                         str(value) for value in cleaned_service.get("failures", [])
                     )
-                except Exception as cleanup_exc:
+                except Exception as cleanup_exc:  # noqa: BLE001
                     cleanup_errors.append(str(cleanup_exc))
             reason = str(exc)
             if cleanup_errors:
@@ -611,7 +649,7 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
         if metadata is not None:
             try:
                 cleanup(metadata, docker=args.docker)
-            except Exception as cleanup_exc:
+            except Exception as cleanup_exc:  # noqa: BLE001
                 cleanup_errors.append(f"sandbox: {cleanup_exc}")
         if lane_service is not None and lane_service.get("status") == "READY":
             try:
@@ -624,7 +662,7 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                     f"service: {value}"
                     for value in service_cleanup.get("failures", [])
                 )
-            except Exception as cleanup_exc:
+            except Exception as cleanup_exc:  # noqa: BLE001
                 cleanup_errors.append(f"service: {cleanup_exc}")
         reason = str(exc)
         if cleanup_errors:
@@ -678,7 +716,7 @@ def _sandbox_exec(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
             receipt=receipt,
         )
         note_event(run, event)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         warnings.append(f"post-execution blackboard write failed: {exc}")
     return {
         "receipt": receipt,
@@ -693,7 +731,7 @@ def _blackboard_add(receipt_path: Path, args: argparse.Namespace) -> dict[str, A
         raise ValueError("receipt path is missing or unsafe")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if not isinstance(receipt, dict):
-        raise ValueError("receipt must be a JSON object")
+        raise ValueError("receipt must be a JSON object")  # noqa: TRY004
     lane_root = receipt_path.parent.parent
     run = lane_root.parents[1]
     race = load_race(run)
@@ -741,7 +779,7 @@ def _session_read(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
             receipt=receipt,
         )
         note_event(run, event)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         warnings.append(f"post-execution blackboard write failed: {exc}")
     return {
         "receipt": receipt,
@@ -778,7 +816,7 @@ def _authorized_metadata(repo: Path, metadata_path: Path) -> dict[str, Any]:
     )
     sandbox = lane.get("sandbox") if isinstance(lane, Mapping) else None
     if not isinstance(sandbox, Mapping):
-        raise ValueError("sandbox lane is not attached to the exact race")
+        raise ValueError("sandbox lane is not attached to the exact race")  # noqa: TRY004
     for field in ("name", "run_id", "lane_id", "challenge_id", "category"):
         if sandbox.get(field) != metadata.get(field):
             raise ValueError(f"sandbox metadata does not match the race: {field}")
@@ -872,7 +910,7 @@ def _race_reconcile(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 })
             else:
                 raise ValueError("native event action must be SPAWNED or INTERRUPTED")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failures.append({
                 "index": str(index),
                 "lane_id": lane_id,
@@ -925,7 +963,7 @@ def _finish_controller_lane_cleanup(
             if not metadata_path.is_file() or metadata_path.is_symlink():
                 raise ValueError("stopped lane has no safe private sandbox metadata to clean")
             cleanup_result = cleanup(load_metadata(metadata_path), docker=docker)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failures.append(("sandbox", str(exc)))
     service_path = (
         run / "service" / "instances" / lane_id / "service.json"
@@ -943,7 +981,7 @@ def _finish_controller_lane_cleanup(
                 ("service", str(value))
                 for value in service_result.get("failures", [])
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failures.append(("service", str(exc)))
     if failures:
         error = (
@@ -972,6 +1010,38 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     race = load_race(run)
     if race["status"] not in {"WON", "TIMED_OUT", "HANDOFF", "STOPPED"}:
         raise ValueError("race cleanup requires a terminal race state")
+    unresolved_native = [
+        {
+            "lane_id": str(lane.get("lane_id")),
+            "status": str(lane.get("status")),
+            "native_session": str(lane.get("native_session")),
+        }
+        for lane in race.get("lanes", [])
+        if isinstance(lane, Mapping)
+        and lane.get("lane_id") != "root"
+        and lane.get("native_session")
+        and not (
+            lane.get("status") in {"STOPPED", "WON"}
+            or (
+                lane.get("status") == "CLEANUP_FAILED"
+                and lane.get("native_stopped_at")
+            )
+        )
+    ]
+    pending_cancel_targets = cancel_targets(race)
+    if unresolved_native or pending_cancel_targets:
+        raise ValueError(
+            "race cleanup requires every native child to be interrupted and "
+            "reconciled first: "
+            + json.dumps(
+                {
+                    "unresolved_native": unresolved_native,
+                    "cancel_targets": pending_cancel_targets,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     cleaned: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for lane in race["lanes"]:
@@ -980,7 +1050,7 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             continue
         try:
             cleaned.append(cleanup(load_metadata(metadata_path), docker=args.docker))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failures.append({"scope": str(lane["lane_id"]), "error": str(exc)})
     service_root = run / "service"
     service_paths = (
@@ -996,7 +1066,9 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     root_service_path = service_root / "service.json"
     if root_service_path.exists():
         service_paths.append(root_service_path)
+    attempted_service_paths: set[str] = set()
     for service_path in service_paths:
+        attempted_service_paths.add(str(service_path.resolve()))
         try:
             if service_path.is_symlink() or not service_path.is_file():
                 raise ValueError("service metadata path is unsafe")
@@ -1009,8 +1081,32 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                     {"scope": "service", "error": str(error)}
                     for error in service_cleanup["failures"]
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failures.append({"scope": "service", "error": str(exc)})
+    recovery_service = race.get("service_context")
+    if isinstance(recovery_service, Mapping) and recovery_service.get("runtime"):
+        recovery_path = str(
+            Path(str(recovery_service.get("metadata_path", ""))).resolve()
+        )
+        if recovery_path not in attempted_service_paths:
+            try:
+                if recovery_service.get("run_id") != run.name:
+                    raise ValueError(
+                        "service recovery state does not belong to this exact run"
+                    )
+                service_cleanup = cleanup_service(
+                    recovery_service,
+                    actor=ServiceActor("root", "root"),
+                    docker=args.docker,
+                )
+                cleaned.append(service_cleanup)
+                if not service_cleanup["cleaned"]:
+                    failures.extend(
+                        {"scope": "service", "error": str(error)}
+                        for error in service_cleanup["failures"]
+                    )
+            except Exception as exc:  # noqa: BLE001
+                failures.append({"scope": "service-recovery", "error": str(exc)})
     result = {
         "run_id": run.name,
         "cleaned": cleaned,
@@ -1159,7 +1255,7 @@ def _attack_timeout(metadata: Mapping[str, Any], requested: int) -> int:
     race = load_race(run)
     if race.get("status") != "ACTIVE":
         raise ValueError(f"race is not attack-active: {race.get('status')}")
-    remaining = (datetime.fromisoformat(str(race["deadline"])) - datetime.now(timezone.utc)).total_seconds()
+    remaining = (datetime.fromisoformat(str(race["deadline"])) - datetime.now(UTC)).total_seconds()
     if remaining <= 0:
         terminal = terminate(run, reason="TIMED_OUT")
         raise ValueError(

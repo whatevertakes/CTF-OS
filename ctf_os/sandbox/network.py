@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import ipaddress
 import json
 import re
 import socket
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -17,7 +17,7 @@ class NetworkPolicyError(ValueError):
 PROTOCOLS = frozenset({"tcp", "udp", "http", "https", "tls", "websocket", "wss", "dns", "ssh", "grpc", "custom"})
 TCP_PROTOCOLS = frozenset({"tcp", "http", "https", "tls", "websocket", "wss", "ssh", "grpc", "custom"})
 UDP_PROTOCOLS = frozenset({"udp", "dns"})
-_NC = re.compile(r"nc\s+([^\s]+)\s+([0-9]{1,5})", re.I)
+_NC = re.compile(r"nc\s+([^\s]+)\s+([0-9]{1,5})", re.IGNORECASE)
 _HOST_PORT = re.compile(r"\[([^]]+)]:(\d{1,5})\Z|([^:]+):(\d{1,5})\Z")
 _HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
 _FORBIDDEN_NAMES = {

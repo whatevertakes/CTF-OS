@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import tarfile
 import zipfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 
 class ArchiveError(ValueError):
@@ -23,7 +23,14 @@ class ArchiveLimits:
     max_ratio: int = 200
 
 
-def extract_archive(archive: Path, destination: Path, limits: ArchiveLimits = ArchiveLimits()) -> list[str]:
+DEFAULT_LIMITS = ArchiveLimits()
+
+
+def extract_archive(
+    archive: Path,
+    destination: Path,
+    limits: ArchiveLimits = DEFAULT_LIMITS,
+) -> list[str]:
     lower = archive.name.casefold()
     if lower.endswith(".zip"):
         return _extract_zip(archive, destination, limits)
@@ -100,50 +107,61 @@ def _extract_zip(archive: Path, root: Path, limits: ArchiveLimits) -> list[str]:
 
 def _extract_tar(archive: Path, root: Path, limits: ArchiveLimits) -> list[str]:
     try:
-        handle = tarfile.open(archive, mode="r:*")
+        with tarfile.open(archive, mode="r:*") as handle:
+            return _extract_tar_members(handle, root, limits)
     except (tarfile.TarError, OSError) as exc:
         raise ArchiveError(f"damaged tar archive {archive.name}: {exc}") from exc
+
+
+def _extract_tar_members(
+    handle: tarfile.TarFile,
+    root: Path,
+    limits: ArchiveLimits,
+) -> list[str]:
     names: list[str] = []
     total = 0
     seen: set[str] = set()
-    with handle:
-        members = handle.getmembers()
-        if len(members) > limits.max_files:
-            raise ArchiveError(f"tar has too many members: {len(members)} > {limits.max_files}")
-        for member in members:
-            target = _target(root, member.name)
-            key = str(target).casefold()
-            if key in seen:
-                raise ArchiveError(f"duplicate archive destination: {member.name!r}")
-            seen.add(key)
-            if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                raise ArchiveError(f"tar link/device member rejected: {member.name!r}")
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            if not member.isfile():
-                raise ArchiveError(f"unsupported tar member rejected: {member.name!r}")
-            if member.size > limits.max_file_bytes:
-                raise ArchiveError(f"tar member exceeds size limit: {member.name!r}")
-            total += member.size
-            if total > limits.max_total_bytes:
-                raise ArchiveError("tar expanded size exceeds total limit")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = handle.extractfile(member)
-            if source is None:
-                raise ArchiveError(f"cannot read tar member: {member.name!r}")
-            copied = 0
-            with source, target.open("xb") as output:
-                while chunk := source.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > member.size or copied > limits.max_file_bytes:
-                        raise ArchiveError(f"tar member expanded beyond declared limit: {member.name!r}")
-                    output.write(chunk)
-            names.append(member.name)
+    members = handle.getmembers()
+    if len(members) > limits.max_files:
+        raise ArchiveError(f"tar has too many members: {len(members)} > {limits.max_files}")
+    for member in members:
+        target = _target(root, member.name)
+        key = str(target).casefold()
+        if key in seen:
+            raise ArchiveError(f"duplicate archive destination: {member.name!r}")
+        seen.add(key)
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+            raise ArchiveError(f"tar link/device member rejected: {member.name!r}")
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise ArchiveError(f"unsupported tar member rejected: {member.name!r}")
+        if member.size > limits.max_file_bytes:
+            raise ArchiveError(f"tar member exceeds size limit: {member.name!r}")
+        total += member.size
+        if total > limits.max_total_bytes:
+            raise ArchiveError("tar expanded size exceeds total limit")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = handle.extractfile(member)
+        if source is None:
+            raise ArchiveError(f"cannot read tar member: {member.name!r}")
+        copied = 0
+        with source, target.open("xb") as output:
+            while chunk := source.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > member.size or copied > limits.max_file_bytes:
+                    raise ArchiveError(f"tar member expanded beyond declared limit: {member.name!r}")
+                output.write(chunk)
+        names.append(member.name)
     return names
 
 
-def copy_tree_without_links(source: Path, destination: Path, limits: ArchiveLimits = ArchiveLimits()) -> list[str]:
+def copy_tree_without_links(
+    source: Path,
+    destination: Path,
+    limits: ArchiveLimits = DEFAULT_LIMITS,
+) -> list[str]:
     copied: list[str] = []
     total = 0
     for path in bounded_source_files(source, limits):
@@ -163,7 +181,10 @@ def copy_tree_without_links(source: Path, destination: Path, limits: ArchiveLimi
     return copied
 
 
-def bounded_source_files(source: Path, limits: ArchiveLimits = ArchiveLimits()) -> list[Path]:
+def bounded_source_files(
+    source: Path,
+    limits: ArchiveLimits = DEFAULT_LIMITS,
+) -> list[Path]:
     stack = [source]
     files: list[Path] = []
     members = 0

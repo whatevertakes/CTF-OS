@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import re
 import subprocess
-from typing import Any, Callable, Mapping, Sequence
 import uuid
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from ..blackboard import output_hash
 from ..workspace import atomic_json, atomic_text
 from .runtime import firewall_packets, user_exec_prefix
-
 
 SESSION_KINDS = frozenset({"shell", "remote", "debugger"})
 MAX_READ = 64 * 1024
@@ -340,8 +340,6 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
     "az": ("az", "version"),
     "gcloud": ("gcloud", "version"),
     "aws": ("aws", "--version"),
-    "kubectl": ("kubectl", "version", "--client=true"),
-    "helm": ("helm", "version", "--short"),
     "terraform": ("terraform", "version"),
     "tofu": ("tofu", "version"),
     "oras": ("oras", "version"),
@@ -649,4 +647,4 @@ def _run(
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

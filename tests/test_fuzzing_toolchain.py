@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from ctf_os.sandbox import session
 from ctf_os.sandbox.session import list_tools, tool_help, tool_version
-
 
 P0_TOOLS = {
     "pwn": {

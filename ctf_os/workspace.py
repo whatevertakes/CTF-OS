@@ -6,19 +6,19 @@ projects an older state schema.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import secrets
-from typing import Any, Iterator, Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from .contest import ChallengeSpec, ContestManifest
-
 
 RUN_SCHEMA_VERSION = 1
 ACTIVE_SCHEMA_VERSION = 1
@@ -30,7 +30,7 @@ class WorkspaceError(ValueError):
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def safe_under(root: Path, relative: Path) -> Path:

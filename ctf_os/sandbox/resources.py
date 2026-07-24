@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import json
 import re
 import subprocess
-from typing import Any, Callable
-
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from typing import Any
 
 GIB = 1024**3
 MAX_RACE_CONCURRENCY = 4

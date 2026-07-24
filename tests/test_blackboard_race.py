@@ -1,21 +1,31 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
 
 from ctf_os.blackboard import (
-    BlackboardError, append_verified_event, duplicate_signals, events, output_hash,
+    BlackboardError,
+    append_verified_event,
+    duplicate_signals,
+    events,
+    output_hash,
 )
 from ctf_os.race import (
-    RaceError, attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup, load_race,
-    note_command_receipt, note_event, reserve_lanes, status, stop_confirmed,
+    RaceError,
+    attach_lane_sandbox,
+    confirm_native_spawn,
+    finish_lane_cleanup,
+    load_race,
+    note_command_receipt,
+    note_event,
+    reserve_lanes,
+    status,
+    stop_confirmed,
 )
 from ctf_os.workspace import atomic_json, utc_now
-
-from conftest import fake_sandbox, make_race
 
 
 def _spec(family: str) -> dict[str, str]:
@@ -92,7 +102,7 @@ def test_output_and_artifact_fingerprints_are_exact_and_append_only(repo: Path) 
 
 
 def test_duplicate_lane_and_stagnation_signals_use_mechanical_fingerprints(repo: Path) -> None:
-    _manifest, challenge, run, race = make_race(repo)
+    _manifest, challenge, run, _race = make_race(repo)
     note_command_receipt(
         run,
         _receipt(run, challenge, "root", "root attack", receipt_id="root-before-lanes"),
@@ -112,7 +122,7 @@ def test_duplicate_lane_and_stagnation_signals_use_mechanical_fingerprints(repo:
         note_event(run, event)
     duplicates = duplicate_signals(run)
     assert duplicates and duplicates[0]["reason"] == "same-execution-output"
-    later = datetime.now(timezone.utc) + timedelta(minutes=10)
+    later = datetime.now(UTC) + timedelta(minutes=10)
     report = status(run, now=later)
     child_rows = report["lanes"][1:]
     assert any("duplicate-other-lane" in row["stagnation_signals"] for row in child_rows)
@@ -141,7 +151,7 @@ def test_native_session_identity_cannot_be_reused_across_lanes(repo: Path) -> No
 
 
 def test_timestamps_and_timeout_are_bound_to_the_exact_run(repo: Path) -> None:
-    _manifest, challenge, run, race = make_race(repo)
+    _manifest, challenge, run, _race = make_race(repo)
     receipt = _receipt(run, challenge, "root", "primitive")
     event = append_verified_event(
         run, event_type="PRIMITIVE", lane_id="root", attack_family="root-primary", receipt=receipt

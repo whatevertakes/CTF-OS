@@ -3,15 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt, _spec
 
 from ctf_os.flag import FlagError, StreamingDetector, record_candidate, valid_candidate
 from ctf_os.race import (
-    RaceError, attach_lane_sandbox, confirm_native_spawn, finish_lane_cleanup,
-    load_race, note_command_receipt, reserve_lanes, stop_confirmed, terminate,
+    RaceError,
+    attach_lane_sandbox,
+    confirm_native_spawn,
+    finish_lane_cleanup,
+    load_race,
+    note_command_receipt,
+    reserve_lanes,
+    stop_confirmed,
+    terminate,
 )
-
-from conftest import fake_sandbox, make_race
-from test_blackboard_race import _receipt, _spec
 
 
 def test_streaming_detector_handles_chunk_boundaries_and_rejects_placeholders() -> None:
@@ -20,6 +26,15 @@ def test_streaming_detector_handles_chunk_boundaries_and_rejects_placeholders() 
     assert detector.feed("l_flag} trailing") == "CTF{real_flag}"
     assert not valid_candidate("CTF{example_flag}", r"\ACTF\{[^}]+\}\Z")
     assert not valid_candidate("OTHER{x}", r"\ACTF\{[^}]+\}\Z")
+
+
+def test_placeholder_detection_does_not_reject_words_containing_test() -> None:
+    pattern = r"\AACTF\{[^}\r\n]+\}\Z"
+
+    assert valid_candidate("ACTF{contest_winner}", pattern)
+    assert valid_candidate("ACTF{latest_solution}", pattern)
+    assert not valid_candidate("ACTF{test}", pattern)
+    assert not valid_candidate("ACTF{example_flag}", pattern)
 
 
 def test_streaming_detector_returns_chronologically_first_matching_token() -> None:

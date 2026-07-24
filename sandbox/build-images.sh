@@ -46,6 +46,7 @@ for profile in "${PROFILES[@]}"; do
 done
 
 command -v docker >/dev/null || { echo "Docker CLI not found. Install Docker before building sandbox images." >&2; exit 69; }
+command -v python3 >/dev/null || { echo "Python 3 is required to hash sandbox build inputs." >&2; exit 69; }
 
 # Public base/tool downloads and even daemon discovery must never inherit Docker
 # Desktop or personal registry credentials.
@@ -125,6 +126,10 @@ fi
 
 export DOCKER_BUILDKIT=1
 lock_sha256="$(sha256sum "$ROOT/sandbox/tool-versions.lock" | awk '{print $1}')"
+build_sha256="$(
+  PYTHONPATH="$ROOT" python3 -c \
+    'from ctf_os.images import expected_build_sha256; print(expected_build_sha256())'
+)"
 declare -a SUCCEEDED=() FAILED=() DETAILS=()
 overall_start="$(date +%s)"
 generation="$(date -u +%Y%m%d%H%M%S)-$$"
@@ -139,6 +144,7 @@ for profile in "${PROFILES[@]}"; do
       --progress=plain \
       --build-arg "CTF_OS_PROFILE=${profile}" \
       --build-arg "CTF_OS_LOCK_SHA256=${lock_sha256}" \
+      --build-arg "CTF_OS_BUILD_SHA256=${build_sha256}" \
       --file "$ROOT/sandbox/Dockerfile.sandbox" \
       --tag "$stage_tag" \
       "$ROOT"; then

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-from pathlib import Path
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
-
 
 if os.geteuid() == 0:
     raise SystemExit("web runtime smoke must run as the non-root ctf user")

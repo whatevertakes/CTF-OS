@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 import hashlib
+import json
 import os
-from pathlib import Path
 import subprocess
 import time
 import tomllib
+from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
+from test_blackboard_race import _receipt, _spec
 
 import ctf_os.agent_tools.__main__ as cli
 from ctf_os.agent_tools.__main__ import build_parser
@@ -18,9 +20,6 @@ from ctf_os.handoff import save_handoff
 from ctf_os.preflight import input_fingerprint
 from ctf_os.race import load_race, terminate
 from ctf_os.workspace import WorkspaceError, create_run
-
-from conftest import make_race
-
 
 DELETED_MODULES = (
     "ctf_os." + "in" + "take", "ctf_os." + "tri" + "age", "ctf_os." + "problems",
@@ -170,6 +169,51 @@ def test_race_cleanup_reports_failure_and_keeps_active_run(
         )
 
 
+def test_race_cleanup_rejects_a_live_native_child_and_keeps_exact_run(
+    repo: Path, monkeypatch
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    cli.note_command_receipt(
+        run,
+        _receipt(
+            run, challenge, "root", "root attack",
+            receipt_id="root-before-live-child",
+        ),
+    )
+    child = cli.reserve_lanes(run, [_spec("live-child")])[0]
+    cli.attach_lane_sandbox(
+        run,
+        lane_id=child["lane_id"],
+        sandbox=fake_sandbox(run, challenge, child["lane_id"]),
+    )
+    cli.confirm_native_spawn(
+        run,
+        lane_id=child["lane_id"],
+        native_session="thread-still-live",
+    )
+    terminated = terminate(run, reason="STOPPED")
+    cleanup_calls: list[str] = []
+
+    def fake_cleanup(metadata, docker="docker"):
+        cleanup_calls.append(str(metadata["lane_id"]))
+        return {"removed": True}
+
+    monkeypatch.setattr(cli, "cleanup", fake_cleanup)
+
+    with pytest.raises(ValueError, match="native"):
+        cli._race_cleanup(
+            repo,
+            argparse.Namespace(run_id=run.name, docker="docker"),
+        )
+
+    assert terminated["cancel_targets"] == [{
+        "lane_id": child["lane_id"],
+        "native_session": "thread-still-live",
+    }]
+    assert cleanup_calls == []
+    assert cli.resolve_run(repo, run.name) == run
+
+
 def test_cli_help_and_package_data_smoke() -> None:
     result = subprocess.run(
         ["python", "-m", "ctf_os.agent_tools", "--help"], capture_output=True, text=True, check=False
@@ -219,11 +263,13 @@ def test_sandbox_build_is_credential_isolated_lock_bound_and_atomic() -> None:
     assert 'BUILD_DOCKER_CONFIG="$(mktemp -d ' in build
     assert 'printf \'%s\\n\' \'{"auths":{}}\' >"$BUILD_DOCKER_CONFIG/config.json"' in build
     assert '--build-arg "CTF_OS_LOCK_SHA256=${lock_sha256}"' in build
+    assert '--build-arg "CTF_OS_BUILD_SHA256=${build_sha256}"' in build
     assert 'ctf-os-sandbox-build:${generation}-${profile}' in build
     failure_check = build.index('if (( ${#FAILED[@]} )); then')
     promotion = build.index('echo "Promoting verified image generation:')
     assert failure_check < promotion
     assert 'org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}"' in dockerfile
+    assert 'org.ctf-os.build-sha256="${CTF_OS_BUILD_SHA256}"' in dockerfile
 
 
 def test_remote_installer_archives_are_digest_pinned() -> None:
@@ -309,9 +355,11 @@ def test_ares_decodes_on_first_fresh_sandbox_command(profile: str) -> None:
             "--tmpfs", "/home/ctf/.cache:rw,nosuid,nodev,size=256m,mode=0700,uid=1001,gid=1001",
             f"ctf-os-sandbox:{profile}",
             "sh", "-ec",
-            'test "$(stat -c %a "$HOME/Ares/config.toml")" = 600; '
-            "ares -t SGVsbG8sIENURi1PUyE= -d | tee /artifacts/ares-first.out; "
-            "grep -q 'Hello, CTF-OS!' /artifacts/ares-first.out",
+            (
+                'test "$(stat -c %a "$HOME/Ares/config.toml")" = 600; '
+                "ares -t SGVsbG8sIENURi1PUyE= -d | tee /artifacts/ares-first.out; "
+                "grep -q 'Hello, CTF-OS!' /artifacts/ares-first.out"
+            ),
         ],
         capture_output=True, text=True, timeout=60, check=False,
     )
@@ -344,17 +392,19 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
             [
                 *base, "sandbox-exec", "--metadata", metadata, "--",
                 "sh", "-c",
-                "test -r /challenge/input.txt && test ! -w /challenge/input.txt && "
-                "grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status && "
-                "test \"$HOME\" = /work/home && "
-                "test \"$XDG_CONFIG_HOME\" = /work/home/.config && "
-                "test \"$XDG_CACHE_HOME\" = /work/home/.cache && "
-                "test \"$XDG_DATA_HOME\" = /work/home/.local/share && "
-                "test \"$XDG_RUNTIME_DIR\" = /work/runtime && "
-                "test \"$AWS_CONFIG_FILE\" = /work/credentials/aws-config && "
-                "test \"$AZURE_CONFIG_DIR\" = /work/credentials/azure && "
-                "test \"$CLOUDSDK_CONFIG\" = /work/credentials/gcloud && "
-                "test \"$KUBECONFIG\" = /work/credentials/kubeconfig",
+                (
+                    "test -r /challenge/input.txt && test ! -w /challenge/input.txt && "
+                    "grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status && "
+                    "test \"$HOME\" = /work/home && "
+                    "test \"$XDG_CONFIG_HOME\" = /work/home/.config && "
+                    "test \"$XDG_CACHE_HOME\" = /work/home/.cache && "
+                    "test \"$XDG_DATA_HOME\" = /work/home/.local/share && "
+                    "test \"$XDG_RUNTIME_DIR\" = /work/runtime && "
+                    "test \"$AWS_CONFIG_FILE\" = /work/credentials/aws-config && "
+                    "test \"$AZURE_CONFIG_DIR\" = /work/credentials/azure && "
+                    "test \"$CLOUDSDK_CONFIG\" = /work/credentials/gcloud && "
+                    "test \"$KUBECONFIG\" = /work/credentials/kubeconfig"
+                ),
             ],
             capture_output=True, text=True, timeout=60, check=False,
         )
@@ -364,9 +414,11 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
             [
                 *base, "sandbox-exec", "--metadata", metadata, "--",
                 "sh", "-c",
-                "mkdir -m 700 /work/private && "
-                "printf solver > /work/private/solver.py && chmod 600 /work/private/solver.py && "
-                "printf artifact > /artifacts/result.bin && chmod 600 /artifacts/result.bin",
+                (
+                    "mkdir -m 700 /work/private && "
+                    "printf solver > /work/private/solver.py && chmod 600 /work/private/solver.py && "
+                    "printf artifact > /artifacts/result.bin && chmod 600 /artifacts/result.bin"
+                ),
             ],
             capture_output=True, text=True, timeout=60, check=False,
         )

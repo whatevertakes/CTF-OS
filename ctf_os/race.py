@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import re
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 from .blackboard import (
     HIGH_VALUE_TYPES,
@@ -16,7 +17,6 @@ from .blackboard import (
     verified_delta,
 )
 from .workspace import atomic_json, read_json, state_lock, utc_now
-
 
 RACE_SCHEMA_VERSION = 2
 MAX_CONCURRENCY = 4
@@ -97,6 +97,7 @@ def initialize_race(
         "image_status": image.get("status"),
         "service_endpoints": list(service.get("endpoints", [])),
         "service_network": service.get("network"),
+        "service_context": dict(service),
         "service_isolation": service_isolation,
         "service_instances": {},
         "status": "PREPARING",
@@ -151,9 +152,10 @@ def set_service_context(run_root: Path, service: Mapping[str, Any]) -> dict[str,
         race["service_endpoints"] = list(service.get("endpoints", []))
         race["service_network"] = service.get("network")
         race["service_status"] = service.get("status")
-        if service.get("status") == "READY":
+        race["service_context"] = dict(service)
+        if service.get("status") in {"READY", "CLEANUP_FAILED"}:
             race["service_instances"]["root"] = {
-                "status": "READY",
+                "status": service.get("status"),
                 "instance_id": service.get("instance_id", "root"),
                 "network": service.get("network"),
                 "endpoints": list(service.get("endpoints", [])),
@@ -271,7 +273,7 @@ def reserve_max_endgame(
 ) -> dict[str, Any]:
     """Reserve the one bounded Max lane only from an executable endgame state."""
 
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     if not task.strip() or len(task) > 4096:
         raise RaceError("Sol max requires one bounded concrete next attack")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", attack_family):
@@ -532,7 +534,7 @@ def record_winner(
 
 
 def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     with state_lock(run_root):
         race = load_race(run_root)
         if race["status"] not in TERMINAL_STATUSES and current >= _parse_time(str(race["deadline"])):
@@ -1127,7 +1129,7 @@ def _lane(race: Mapping[str, Any], lane_id: str) -> dict[str, Any]:
 def _require_active(race: Mapping[str, Any]) -> None:
     if race.get("status") not in {"ACTIVE", "PREPARING"}:
         raise RaceError(f"race is not active: {race.get('status')}")
-    if _parse_time(str(race["deadline"])) <= datetime.now(timezone.utc):
+    if _parse_time(str(race["deadline"])) <= datetime.now(UTC):
         raise RaceError("race deadline has passed")
 
 
@@ -1139,7 +1141,7 @@ def _parse_time(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         raise RaceError("race timestamp must include a timezone")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _optional_time(value: object) -> datetime | None:

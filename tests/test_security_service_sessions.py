@@ -2,30 +2,51 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
+import time
 import zipfile
+from pathlib import Path
 
 import pytest
+from conftest import fake_sandbox, make_race
 
+import ctf_os.service as service_module
 from ctf_os.archive import ArchiveError, extract_archive
 from ctf_os.preflight import detect_service
-from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
+from ctf_os.sandbox.network import (
+    NetworkPolicyError,
+    ResolvedTarget,
+    Target,
+    parse_remotes,
+)
 from ctf_os.sandbox.runtime import (
     USER_EXEC_ENV,
     SandboxError,
     SandboxSpec,
     build_run_argv,
     cleanup,
+    execute,
     user_exec_prefix,
 )
 from ctf_os.sandbox.session import (
-    SessionError, close_session, list_tools, open_session, read as session_read,
-    tool_help, tool_version,
+    SessionError,
+    close_session,
+    list_tools,
+    open_session,
+    tool_help,
+    tool_version,
 )
-from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, prepare_service
-
-from conftest import fake_sandbox, make_race
+from ctf_os.sandbox.session import (
+    read as session_read,
+)
+from ctf_os.service import (
+    ServiceActor,
+    ServiceCleanupError,
+    ServiceError,
+    ServiceSpec,
+    cleanup_service,
+    prepare_service,
+)
 
 
 def _podman_sandbox_spec(tmp_path: Path, category: str) -> SandboxSpec:
@@ -176,6 +197,55 @@ def test_compose_host_and_daemon_escape_surfaces_are_rejected(
     assert plan["review_reasons"]
 
 
+@pytest.mark.parametrize(
+    "fragment",
+    (
+        "    environment: [AWS_SECRET_ACCESS_KEY]\n",
+        "    environment: {AWS_SECRET_ACCESS_KEY: null}\n",
+        "    environment: {TOKEN: '${AWS_SECRET_ACCESS_KEY}'}\n",
+        "    command: ['sh', '-c', 'printf %s ${AWS_SECRET_ACCESS_KEY}']\n",
+    ),
+)
+def test_compose_cannot_inherit_or_interpolate_controller_environment(
+    tmp_path: Path, fragment: str
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n  chall:\n    image: demo\n    expose: [8000]\n" + fragment,
+        encoding="utf-8",
+    )
+
+    plan = detect_service(input_root, "web")
+
+    assert plan["safe"] is False
+    assert any(
+        "environment" in reason.casefold() or "interpolation" in reason.casefold()
+        for reason in plan["review_reasons"]
+    )
+
+
+def test_compose_literal_environment_and_escaped_container_dollar_are_allowed(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n"
+        "  chall:\n"
+        "    image: demo\n"
+        "    expose: [8000]\n"
+        "    environment: [MODE=challenge]\n"
+        "    command: ['sh', '-c', 'printf %s $$HOME']\n",
+        encoding="utf-8",
+    )
+
+    plan = detect_service(input_root, "web")
+
+    assert plan["safe"] is True
+    assert plan["review_reasons"] == []
+
+
 def test_compose_named_volume_driver_opts_cannot_bind_host(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     input_root.mkdir()
@@ -223,7 +293,9 @@ def test_dockerfile_without_declared_port_is_not_misclassified_as_a_service(tmp_
     assert plan["safe"] is True
 
 
-def test_compose_override_resets_host_ports_and_networks(tmp_path: Path) -> None:
+def test_compose_override_resets_host_ports_and_networks(
+    tmp_path: Path, monkeypatch
+) -> None:
     input_root = tmp_path / "input"
     input_root.mkdir()
     (input_root / "compose.yml").write_text(
@@ -234,10 +306,12 @@ def test_compose_override_resets_host_ports_and_networks(tmp_path: Path) -> None
     for path in input_root.rglob("*"):
         path.chmod(0o444 if path.is_file() else 0o555)
     input_root.chmod(0o555)
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict]] = []
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "host-secret-must-not-cross")
+    monkeypatch.setenv("CTF_OS_SYNTHETIC_SENTINEL", "host-only")
 
     def runner(argv, **kwargs):
-        calls.append(list(argv))
+        calls.append((list(argv), dict(kwargs)))
         if argv[1:2] == ["info"]:
             return subprocess.CompletedProcess(
                 argv, 0,
@@ -260,9 +334,203 @@ def test_compose_override_resets_host_ports_and_networks(tmp_path: Path) -> None
     override = Path(metadata["runtime"]["compose_files"][1]).read_text(encoding="utf-8")
     assert "ports: !reset []" in override
     assert "networks: !reset" in override
-    assert any(argv[1:3] == ["network", "create"] and "--internal" in argv for argv in calls)
-    compose_up = next(argv for argv in calls if "up" in argv)
+    assert any(
+        argv[1:3] == ["network", "create"] and "--internal" in argv
+        for argv, _kwargs in calls
+    )
+    compose_up, compose_kwargs = next(
+        (argv, kwargs) for argv, kwargs in calls if "up" in argv
+    )
     assert compose_up[-2:] == ["--pull", "never"]
+    assert "--env-file" in compose_up
+    empty_env = Path(compose_up[compose_up.index("--env-file") + 1])
+    assert empty_env.read_text(encoding="utf-8") == ""
+    controller_env = compose_kwargs["env"]
+    assert "AWS_SECRET_ACCESS_KEY" not in controller_env
+    assert "CTF_OS_SYNTHETIC_SENTINEL" not in controller_env
+    assert Path(controller_env["HOME"]).is_relative_to(spec.metadata_path.parent)
+    assert Path(controller_env["DOCKER_CONFIG"]).is_relative_to(
+        spec.metadata_path.parent
+    )
+
+
+def test_flag_candidate_forces_a_term_ignoring_exec_to_finish_promptly(
+    tmp_path: Path,
+) -> None:
+    lane_root = tmp_path / "workers" / "root"
+    lane_root.mkdir(parents=True)
+    fake_docker = tmp_path / "fake-docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  [ \"$arg\" = ctf-os-kill ] && exit 0\n"
+        "done\n"
+        "trap '' TERM\n"
+        "printf 'ACTF{prompt_flag}\\n'\n"
+        "exec sleep 3\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    metadata = {
+        "name": "ctf-os-run-root",
+        "run_id": "run",
+        "challenge_id": "challenge1",
+        "lane_id": "root",
+        "lane_root": str(lane_root),
+        "target_identities": ["challenge:challenge1"],
+    }
+
+    started = time.monotonic()
+    receipt = execute(
+        metadata,
+        ["solver"],
+        candidate_probe=lambda output: (
+            "ACTF{prompt_flag}" if "ACTF{prompt_flag}" in output else None
+        ),
+        docker=str(fake_docker),
+    )
+    elapsed = time.monotonic() - started
+
+    assert receipt["flag_candidate"] == "ACTF{prompt_flag}"
+    assert elapsed < 1.5
+
+
+def test_service_metadata_failure_exposes_structured_cleanup_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n"
+        "  chall:\n"
+        "    image: ctf-os-sandbox:base\n"
+        "    expose: [8000]\n",
+        encoding="utf-8",
+    )
+    plan = detect_service(input_root, "web")
+    for path in input_root.rglob("*"):
+        path.chmod(0o444 if path.is_file() else 0o555)
+    input_root.chmod(0o555)
+    network_created = False
+
+    def runner(argv, **_kwargs):
+        nonlocal network_created
+        if argv[1:2] == ["info"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps({"MemTotal": 32 * 1024**3, "NCPU": 16}),
+                "",
+            )
+        if argv[1:2] == ["ps"] and "--status" not in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[1:3] == ["network", "create"]:
+            network_created = True
+            return subprocess.CompletedProcess(argv, 0, "network\n", "")
+        if argv[1:3] == ["network", "inspect"]:
+            if not network_created:
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps([{"Internal": True, "Labels": spec.labels}]),
+                "",
+            )
+        if "down" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "compose down failed")
+        if "ps" in argv and "--status" in argv:
+            return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+    spec = ServiceSpec(
+        run_id="run-compose-failure",
+        challenge_id="challenge1",
+        source=input_root,
+        run_root=tmp_path / "run",
+        plan=plan,
+    )
+    real_atomic_json = service_module.atomic_json
+
+    def fail_service_metadata(path, payload):
+        if path == spec.metadata_path:
+            raise OSError("synthetic metadata write failure")
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(service_module, "atomic_json", fail_service_metadata)
+
+    with pytest.raises(ServiceCleanupError) as raised:
+        prepare_service(
+            spec,
+            actor=ServiceActor("root", "root"),
+            runner=runner,
+        )
+
+    assert raised.value.service["status"] == "CLEANUP_FAILED"
+    assert raised.value.service["runtime"]["project"] == spec.project
+    assert raised.value.failures == ("compose down failed",)
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    os.environ.get("CTF_OS_LIVE") != "1",
+    reason="set CTF_OS_LIVE=1",
+)
+def test_live_compose_controller_environment_is_not_inherited(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    (input_root / "compose.yml").write_text(
+        "services:\n"
+        "  chall:\n"
+        "    image: ctf-os-sandbox:base\n"
+        "    entrypoint: []\n"
+        "    environment: [CTF_OS_SYNTHETIC_SENTINEL]\n"
+        "    command:\n"
+        "      - sh\n"
+        "      - -ec\n"
+        "      - test -z \"$$CTF_OS_SYNTHETIC_SENTINEL\"; "
+        "exec python3 -m http.server 8000\n"
+        "    expose: [8000]\n",
+        encoding="utf-8",
+    )
+    input_root.chmod(0o555)
+    (input_root / "compose.yml").chmod(0o444)
+    monkeypatch.setenv("CTF_OS_SYNTHETIC_SENTINEL", "host-secret")
+    spec = ServiceSpec(
+        run_id="run-compose-live",
+        challenge_id="challenge1",
+        source=input_root,
+        run_root=tmp_path / "run",
+        plan={
+            "kind": "compose",
+            "safe": True,
+            "source": "compose.yml",
+            "base_images": [],
+            "runtime_images": ["ctf-os-sandbox:base"],
+            "services": [{
+                "name": "chall",
+                "ports": [8000],
+                "endpoints": ["http://chall:8000"],
+                "build": False,
+            }],
+            "review_reasons": [],
+        },
+    )
+    metadata: dict | None = None
+
+    try:
+        metadata = prepare_service(
+            spec,
+            actor=ServiceActor("root", "root"),
+        )
+        assert metadata["status"] == "READY"
+    finally:
+        if metadata is not None:
+            result = cleanup_service(
+                metadata,
+                actor=ServiceActor("root", "root"),
+            )
+            assert result["cleaned"] is True
 
 
 def test_only_root_can_change_service_lifecycle(tmp_path: Path) -> None:

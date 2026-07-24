@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
+import os
 import re
 import subprocess
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -18,6 +20,19 @@ from .workspace import atomic_json, atomic_text, state_lock
 
 class ServiceError(RuntimeError):
     pass
+
+
+class ServiceCleanupError(ServiceError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        service: Mapping[str, Any],
+        failures: Sequence[str],
+    ) -> None:
+        super().__init__(message)
+        self.service = dict(service)
+        self.failures = tuple(str(value) for value in failures)
 
 
 class _ResetList(list):
@@ -218,9 +233,16 @@ def _prepare_service_locked(
             runner=runner,
         )
         if cleanup_result["failures"]:
-            raise ServiceError(
+            failures = [str(value) for value in cleanup_result["failures"]]
+            recovery = metadata | {
+                "status": "CLEANUP_FAILED",
+                "cleanup_failures": failures,
+            }
+            raise ServiceCleanupError(
                 "service metadata write failed and cleanup was incomplete: "
-                + "; ".join(cleanup_result["failures"])
+                + "; ".join(failures),
+                service=recovery,
+                failures=failures,
             ) from exc
         raise
     return metadata | {"attached": False}
@@ -266,14 +288,16 @@ def cleanup_service(
     runtime = metadata.get("runtime") if isinstance(metadata.get("runtime"), Mapping) else {}
     failures: list[str] = []
     if runtime.get("compose_files"):
-        argv = [docker, "compose"]
+        service_root = _compose_service_root(runtime)
+        env_file, controller_env = _prepare_compose_controller(service_root)
+        argv = [docker, "compose", "--env-file", str(env_file)]
         for path in runtime["compose_files"]:
             argv.extend(["--file", str(path)])
         argv.extend([
             "--project-name", str(runtime["project"]), "down", "--volumes",
             "--remove-orphans", "--rmi", "local",
         ])
-        result = _run(runner, argv, timeout=120)
+        result = _run(runner, argv, timeout=120, env=controller_env)
         if result.returncode:
             failures.append(result.stderr.strip() or "compose down failed")
     elif runtime.get("container"):
@@ -382,7 +406,9 @@ def _start_compose(
     runner: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
     source = _scoped(spec.source, str(spec.plan["source"]), directory=False)
-    override = spec.metadata_path.parent / "compose.race.yml"
+    service_root = spec.metadata_path.parent
+    override = service_root / "compose.race.yml"
+    env_file, controller_env = _prepare_compose_controller(service_root)
     services: dict[str, Any] = {}
     for row in spec.plan.get("services", []):
         if not isinstance(row, Mapping):
@@ -408,19 +434,22 @@ def _start_compose(
     }
     atomic_text(override, yaml.dump(document, Dumper=_ComposeDumper, sort_keys=True))
     argv = [
-        docker, "compose", "--file", str(source), "--file", str(override),
+        docker, "compose", "--env-file", str(env_file),
+        "--file", str(source), "--file", str(override),
         "--project-name", spec.project, "up", "--detach", "--build", "--pull", "never",
     ]
-    started = _run(runner, argv, timeout=900)
+    started = _run(runner, argv, timeout=900, env=controller_env)
     if started.returncode:
         raise ServiceError(f"challenge compose start failed: {started.stderr.strip()}")
     running = _run(
         runner,
         [
-            docker, "compose", "--file", str(source), "--file", str(override),
+            docker, "compose", "--env-file", str(env_file),
+            "--file", str(source), "--file", str(override),
             "--project-name", spec.project, "ps", "--status", "running", "--quiet",
         ],
         timeout=30,
+        env=controller_env,
     )
     expected = len(services)
     if running.returncode or len([line for line in running.stdout.splitlines() if line]) != expected:
@@ -432,6 +461,7 @@ def _start_compose(
         "compose_files": [str(source), str(override)],
         "project": spec.project,
         "service_count": expected,
+        "compose_env_file": str(env_file),
     }
 
 
@@ -480,11 +510,13 @@ def _service_running(
         )
         return result.returncode == 0 and result.stdout.strip() == "true"
     if runtime.get("compose_files"):
-        argv = [docker, "compose"]
+        service_root = _compose_service_root(runtime)
+        env_file, controller_env = _prepare_compose_controller(service_root)
+        argv = [docker, "compose", "--env-file", str(env_file)]
         for path in runtime["compose_files"]:
             argv.extend(["--file", str(path)])
         argv.extend(["--project-name", str(runtime["project"]), "ps", "--status", "running", "--quiet"])
-        result = _run(runner, argv, timeout=30)
+        result = _run(runner, argv, timeout=30, env=controller_env)
         running = len([line for line in result.stdout.splitlines() if line])
         return (
             result.returncode == 0
@@ -570,14 +602,19 @@ def _cleanup_failed_start(
         source = spec.source / str(spec.plan.get("source", ""))
         override = spec.metadata_path.parent / "compose.race.yml"
         if source.is_file() and override.is_file():
+            env_file, controller_env = _prepare_compose_controller(
+                spec.metadata_path.parent
+            )
             _run(
                 runner,
                 [
-                    docker, "compose", "--file", str(source), "--file", str(override),
+                    docker, "compose", "--env-file", str(env_file),
+                    "--file", str(source), "--file", str(override),
                     "--project-name", spec.project, "down", "--volumes", "--remove-orphans",
                     "--rmi", "local",
                 ],
                 timeout=120,
+                env=controller_env,
             )
     elif kind == "dockerfile":
         if _container_has_labels(spec.container, spec.labels, docker=docker, runner=runner):
@@ -640,11 +677,59 @@ def _scoped(root: Path, relative: str, *, directory: bool) -> Path:
 
 
 def _run(
-    runner: Callable[..., subprocess.CompletedProcess[str]], argv: Sequence[str], *, timeout: int
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    argv: Sequence[str],
+    *,
+    timeout: int,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return runner(list(argv), capture_output=True, text=True, timeout=timeout, check=False)
+        kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+            "check": False,
+        }
+        if env is not None:
+            kwargs["env"] = dict(env)
+        return runner(list(argv), **kwargs)
     except FileNotFoundError as exc:
         raise ServiceError(f"required executable not found: {argv[0]}") from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ServiceError(f"service controller command failed: {exc}") from exc
+
+
+def _compose_service_root(runtime: Mapping[str, Any]) -> Path:
+    configured = runtime.get("compose_env_file")
+    if configured:
+        return Path(str(configured)).parent
+    files = runtime.get("compose_files")
+    if isinstance(files, Sequence) and not isinstance(files, (str, bytes)) and files:
+        return Path(str(files[-1])).parent
+    raise ServiceError("compose runtime has no controller state path")
+
+
+def _prepare_compose_controller(
+    service_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    if service_root.is_symlink():
+        raise ServiceError("compose controller state path must not be a symlink")
+    service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    controller_home = service_root / "controller-home"
+    docker_config = service_root / "docker-config"
+    for path in (controller_home, docker_config):
+        if path.is_symlink():
+            raise ServiceError("compose controller directory must not be a symlink")
+        path.mkdir(mode=0o700, exist_ok=True)
+    env_file = service_root / "compose.empty.env"
+    atomic_text(env_file, "")
+    atomic_text(docker_config / "config.json", '{"auths":{}}\n')
+    controller_env = {
+        key: value
+        for key in ("PATH", "LANG", "LC_ALL")
+        if (value := os.environ.get(key))
+    }
+    controller_env.setdefault("PATH", os.defpath)
+    controller_env["HOME"] = str(controller_home)
+    controller_env["DOCKER_CONFIG"] = str(docker_config)
+    return env_file, controller_env

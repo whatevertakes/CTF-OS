@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import platform
-from pathlib import Path
 import re
 import subprocess
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
 from .categories import CATEGORIES
 from .images import smoke_images
-
 
 PROFILES = CATEGORIES
 IMAGES = tuple(f"ctf-os-sandbox:{profile}" for profile in PROFILES)

@@ -158,6 +158,7 @@ RUN /opt/ctf-os/install/cloud.sh
 FROM profile-${CTF_OS_PROFILE} AS final
 ARG CTF_OS_PROFILE
 ARG CTF_OS_LOCK_SHA256
+ARG CTF_OS_BUILD_SHA256
 COPY sandbox/sandbox-tools.txt /tools.txt
 COPY sandbox/tool-versions.lock /opt/ctf-os/tool-versions.lock
 COPY sandbox/config/ares.toml /opt/ctf-os/ares-config.toml
@@ -166,6 +167,7 @@ RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint
 LABEL org.ctf-os.sandbox="true" \
       org.ctf-os.profile="${CTF_OS_PROFILE}" \
       org.ctf-os.build-policy="pre-contest-pinned" \
-      org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}"
+      org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}" \
+      org.ctf-os.build-sha256="${CTF_OS_BUILD_SHA256}"
 ENTRYPOINT ["/usr/local/bin/ctf-os-entrypoint"]
 CMD ["sleep", "infinity"]

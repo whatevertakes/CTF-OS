@@ -2,29 +2,30 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import selectors
 import subprocess
 import time
-from typing import Any, Callable, Mapping, Sequence
 import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
-from ..workspace import atomic_json, atomic_text, state_lock, validate_identifier
+from ..workspace import atomic_json, state_lock, validate_identifier
 from .network import ResolvedTarget
 from .resources import ResourceError, admit, parse_size_bytes, resource_profile
-
 
 MAX_CAPTURE = 64 * 1024
 MAX_COMMAND_SECONDS = 1800
 MAX_COMMAND_LOG_BYTES = 64 * 1024 * 1024
 COMMAND_HEARTBEAT_SECONDS = 5.0
+FLAG_TERMINATION_GRACE_SECONDS = 0.5
 USER_EXEC_ENV = (
     "HOME=/work/home",
     "XDG_CONFIG_HOME=/work/home/.config",
@@ -284,6 +285,8 @@ def execute(
     stderr_path = logs / f"{receipt_id}.stderr"
     combined_path = logs / f"{receipt_id}.combined"
     candidate: str | None = None
+    candidate_detected_at: float | None = None
+    candidate_forced = False
     timed_out = False
     output_limited = False
     logged_bytes = 0
@@ -319,7 +322,7 @@ def execute(
                 "observed_bytes": logged_bytes,
                 "status": "RUNNING",
             })
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             heartbeat_error = str(exc)[:2048]
         last_heartbeat = current
 
@@ -374,7 +377,29 @@ def execute(
                 if candidate is None and candidate_probe is not None:
                     candidate = candidate_probe(chunk.decode("utf-8", errors="replace"))
                     if candidate is not None:
-                        _kill_exec(name, pid_file, docker=docker)
+                        candidate_detected_at = time.monotonic()
+                        _kill_exec(
+                            name,
+                            pid_file,
+                            docker=docker,
+                            timeout_seconds=FLAG_TERMINATION_GRACE_SECONDS,
+                        )
+            if (
+                candidate_detected_at is not None
+                and not candidate_forced
+                and process.poll() is None
+                and time.monotonic() - candidate_detected_at
+                >= FLAG_TERMINATION_GRACE_SECONDS
+            ):
+                candidate_forced = True
+                _kill_exec(
+                    name,
+                    pid_file,
+                    docker=docker,
+                    signal="KILL",
+                    timeout_seconds=FLAG_TERMINATION_GRACE_SECONDS,
+                )
+                process.kill()
             if timed_out and process.poll() is None and time.monotonic() - started > timeout + 2:
                 process.kill()
             if output_limited and process.poll() is None:
@@ -669,15 +694,31 @@ def user_exec_prefix(
     return argv
 
 
-def _kill_exec(name: str, pid_file: str, *, docker: str) -> None:
-    subprocess.run(
-        [
-            docker, "exec", "--user", "1001:1001", name, "sh", "-c",
-            "p=$(cat \"$1\" 2>/dev/null || true); [ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null || true",
-            "ctf-os-kill", pid_file,
-        ],
-        capture_output=True, timeout=10, check=False,
-    )
+def _kill_exec(
+    name: str,
+    pid_file: str,
+    *,
+    docker: str,
+    signal: str = "TERM",
+    timeout_seconds: float = 10,
+) -> bool:
+    if signal not in {"TERM", "KILL"}:
+        raise SandboxError("unsupported sandbox exec termination signal")
+    try:
+        result = subprocess.run(
+            [
+                docker, "exec", "--user", "1001:1001", name, "sh", "-c",
+                (
+                    "p=$(cat \"$1\" 2>/dev/null || true); "
+                    "[ -n \"$p\" ] && kill -\"$2\" -\"$p\" 2>/dev/null || true"
+                ),
+                "ctf-os-kill", pid_file, signal,
+            ],
+            capture_output=True, timeout=timeout_seconds, check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _secure_binary_file(path: Path):
@@ -721,4 +762,4 @@ def _run(
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from .workspace import append_jsonl, read_json, read_jsonl, state_lock
-
 
 EVENT_TYPES = frozenset({
     "COMMAND_RESULT", "OBSERVATION", "PRIMITIVE", "WORKING_POC", "REMOTE_RESULT",
@@ -455,4 +455,4 @@ def _compact(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
