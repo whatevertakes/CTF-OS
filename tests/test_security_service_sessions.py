@@ -712,6 +712,68 @@ def test_cleanup_requires_successful_chown_before_container_removal() -> None:
     assert calls[1][2:4] == ["--user", "0:0"]
 
 
+def test_cleanup_restarts_stopped_sandbox_before_ownership_normalization() -> None:
+    metadata = {
+        "name": "ctf-os-run-root",
+        "labels": {"org.ctf-os.run-id": "run-1"},
+    }
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps([{
+                    "Config": {"Labels": {"org.ctf-os.run-id": "run-1"}},
+                    "State": {"Running": False},
+                }]),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    result = cleanup(metadata, runner=runner)
+    assert result["removed"] is True
+    assert result["restarted_for_normalization"] is True
+    assert [argv[1] for argv in calls] == ["inspect", "start", "exec", "rm"]
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+def test_live_cleanup_restarts_a_stopped_sandbox(tmp_path: Path) -> None:
+    spec = _podman_sandbox_spec(tmp_path, "base")
+    started = subprocess.run(
+        build_run_argv(spec),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    try:
+        stopped = subprocess.run(
+            ["docker", "stop", spec.name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+        result = cleanup({"name": spec.name, "labels": spec.labels})
+        assert result["removed"] is True
+        assert result["host_ownership_normalized"] is True
+        assert result["restarted_for_normalization"] is True
+    finally:
+        subprocess.run(
+            ["docker", "rm", "--force", spec.name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+
 def test_cleanup_does_not_treat_docker_daemon_failure_as_absent() -> None:
     metadata = {
         "name": "ctf-os-run-root",

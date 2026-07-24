@@ -47,7 +47,14 @@ def write_challenge(
     return manifest, manifest.challenges[0]
 
 
-def fake_sandbox(run: Path, challenge: Any, lane_id: str, image: str = "ctf-os-sandbox:web") -> dict[str, Any]:
+def fake_sandbox(
+    run: Path,
+    challenge: Any,
+    lane_id: str,
+    image: str = "ctf-os-sandbox:web",
+    *,
+    remote_execution: str = "agent",
+) -> dict[str, Any]:
     lane_root = run / "workers" / lane_id
     for name in ("work", "evidence", "artifacts", "logs", "context", "sessions"):
         (lane_root / name).mkdir(parents=True, exist_ok=True)
@@ -65,6 +72,7 @@ def fake_sandbox(run: Path, challenge: Any, lane_id: str, image: str = "ctf-os-s
         "lane_root": str(lane_root),
         "metadata_path": str(metadata_path),
         "input_fingerprint": "0" * 64,
+        "remote_execution": remote_execution,
         "labels": {"org.ctf-os.kind": "sandbox"},
         "target_identities": [f"challenge:{challenge.id}"],
         "paths": {
@@ -108,6 +116,12 @@ def make_race(
         root_model_profile_source=root_model_profile_source,
         remote_execution=remote_execution,
     )
-    root = fake_sandbox(run, challenge, "root", f"ctf-os-sandbox:{category}")
+    root = fake_sandbox(
+        run,
+        challenge,
+        "root",
+        f"ctf-os-sandbox:{category}",
+        remote_execution=remote_execution,
+    )
     race = mark_root_ready(run, root)
     return manifest, challenge, run, race

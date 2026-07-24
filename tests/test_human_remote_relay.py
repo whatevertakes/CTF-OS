@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,15 +12,26 @@ from test_blackboard_race import _receipt
 from test_race_bootstrap import _spec
 
 import ctf_os.agent_tools.__main__ as cli
-from ctf_os.blackboard import append_verified_event
+from ctf_os.blackboard import (
+    BlackboardError,
+    append_verified_event,
+    human_relay_blocks_promotion,
+)
+from ctf_os.flag import FlagError, record_candidate
 from ctf_os.race import (
     attach_lane_sandbox,
+    load_race,
     note_command_receipt,
     reserve_lanes,
     status,
 )
 from ctf_os.sandbox.network import ResolvedTarget, Target
-from ctf_os.sandbox.runtime import SandboxError, SandboxSpec, build_run_argv
+from ctf_os.sandbox.runtime import (
+    SandboxError,
+    SandboxSpec,
+    build_run_argv,
+    target_observation,
+)
 
 
 def _sandbox_spec(
@@ -91,6 +104,38 @@ def test_human_relay_rejects_an_authorized_organizer_target(tmp_path: Path) -> N
         build_run_argv(_sandbox_spec(tmp_path, targets=(target,)))
 
 
+def test_human_relay_local_output_is_not_a_target_observation() -> None:
+    observed, source = target_observation(
+        {
+            "challenge_id": "challenge1",
+            "remote_execution": "human-relay",
+        },
+        "challenge:challenge1",
+        before_packets=None,
+        after_packets=None,
+    )
+    assert observed is False
+    assert source == "human-relay-local-analysis"
+
+
+def test_human_relay_local_service_packet_is_still_verified() -> None:
+    observed, source = target_observation(
+        {
+            "challenge_id": "challenge1",
+            "remote_execution": "human-relay",
+        },
+        "http://challenge:8080",
+        before_packets=4,
+        after_packets=5,
+    )
+    assert observed is True
+    assert source == "network-packet"
+
+
+def test_human_relay_service_packet_still_cannot_promote_external_text() -> None:
+    assert human_relay_blocks_promotion({"remote_execution": "human-relay"})
+
+
 def test_human_relay_packet_keeps_target_but_requires_participant_execution(
     repo: Path,
 ) -> None:
@@ -125,6 +170,105 @@ def test_human_relay_packet_keeps_target_but_requires_participant_execution(
     assert context["human_remote_relay"]["action_marker"] == "HUMAN_REMOTE_ACTION"
     assert "never send one through any agent tool" in message
     assert "HUMAN_REMOTE_RESULT" in message
+
+
+def test_human_relay_local_echo_cannot_be_promoted_to_winner(repo: Path) -> None:
+    _manifest, challenge, run, _race = make_race(
+        repo,
+        remote="nc ctf.example 31337",
+        remote_execution="human-relay",
+    )
+    receipt = _receipt(
+        run,
+        challenge,
+        "root",
+        "participant returned CTF{external_result}",
+        receipt_id="human-relay-unverified-flag",
+    )
+
+    with pytest.raises(FlagError, match="human-relay"):
+        record_candidate(
+            run,
+            lane_id="root",
+            attack_family="root-primary",
+            candidate="CTF{external_result}",
+            receipt=receipt,
+        )
+
+
+def test_human_relay_local_echo_cannot_be_a_verified_remote_event(
+    repo: Path,
+) -> None:
+    _manifest, challenge, run, _race = make_race(
+        repo,
+        remote="nc ctf.example 31337",
+        remote_execution="human-relay",
+    )
+    receipt = _receipt(
+        run,
+        challenge,
+        "root",
+        "HUMAN_REMOTE_RESULT: organizer response",
+        receipt_id="human-relay-unverified-event",
+    )
+
+    with pytest.raises(BlackboardError, match="human-relay"):
+        append_verified_event(
+            run,
+            event_type="REMOTE_RESULT",
+            lane_id="root",
+            attack_family="root-primary",
+            receipt=receipt,
+        )
+
+
+def test_human_relay_cli_displays_but_does_not_promote_candidate(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _manifest, challenge, run, _race = make_race(
+        repo,
+        remote="nc ctf.example 31337",
+        remote_execution="human-relay",
+    )
+    receipt = _receipt(
+        run,
+        challenge,
+        "root",
+        "participant returned CTF{external_result}",
+        receipt_id="human-relay-cli-candidate",
+    )
+    receipt["flag_candidate"] = "CTF{external_result}"
+    monkeypatch.setattr(cli, "execute", lambda *_args, **_kwargs: receipt)
+
+    result = cli._sandbox_exec(
+        repo,
+        run / "workers" / "root" / "sandbox.json",
+        argparse.Namespace(
+            argv=["printf", "CTF{external_result}"],
+            target_identity=None,
+            timeout=30,
+        ),
+    )
+
+    assert result["winner"] is None
+    assert any("not promoted" in warning for warning in result["warnings"])
+    assert load_race(run)["winner"] is None
+
+
+def test_human_relay_metadata_mode_cannot_be_downgraded(repo: Path) -> None:
+    _manifest, _challenge, run, _race = make_race(
+        repo,
+        remote="nc ctf.example 31337",
+        remote_execution="human-relay",
+    )
+    metadata_path = run / "workers" / "root" / "sandbox.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["remote_execution"] = "agent"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="remote_execution"):
+        cli._authorized_metadata(repo, metadata_path)
 
 
 @pytest.mark.parametrize(

@@ -9,8 +9,8 @@
 - **OS/아키텍처**: Linux `x86_64` (Ubuntu·Kali·Debian 계열에서 검증). 이미지는 `linux/amd64` 전용이라 ARM(Apple Silicon 등)에서는 빌드되지 않는다. WSL2는 리눅스 파일시스템(`/home/...`) 아래에 클론한다(Windows 드라이브 `/mnt/c` 금지).
 - **Docker Engine** + **Docker Compose v2 플러그인(>=2.24)**. Compose는 이미지 빌드에는 필요 없지만 `doctor`와 대회용 로컬 서비스 기동에 필요하다.
 - **`uv`** (Python 3.11+ 관리).
-- **디스크**: 프로필 하나당 수 GB. 열 개 전체 빌드는 40–60 GiB, 수 시간 소요.
-- **GPU는 선택**: 없으면 자동으로 CPU로 동작한다(`ai`/`crypto`/`rev`의 GPU 경로만 비활성).
+- **디스크**: 프로필 하나당 수 GB. 열 개 전체 빌드는 40–60 GiB, 수 시간 소요. 빌드 스크립트는 선택 빌드에 최소 20 GiB(프로필당 6 GiB로 증가), 전체 10개 빌드에 60 GiB의 여유 공간을 사전 요구한다.
+- **GPU는 선택**: 없으면 자동으로 CPU로 동작한다(`ai`/`crypto`/`rev`의 GPU 경로만 비활성). 현재 고정된 CUDA 12.6 도구는 compute capability 9.0까지 허용하며, RTX 50 계열(sm_120)처럼 더 새로운 GPU는 커널 오류를 내기 전에 CPU로 자동 전환한다.
 
 Docker와 `uv`가 설치된 환경에서 한 번 실행한다.
 

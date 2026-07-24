@@ -13,7 +13,7 @@ from typing import Any
 
 from ..blackboard import output_hash
 from ..workspace import atomic_json, atomic_text
-from .runtime import firewall_packets, user_exec_prefix
+from .runtime import firewall_packets, target_observation, user_exec_prefix
 
 SESSION_KINDS = frozenset({"shell", "remote", "debugger"})
 MAX_READ = 64 * 1024
@@ -519,12 +519,15 @@ def read(
     if chunk_bytes < 0 or chunk_bytes > limit or total_bytes < cursor_before + chunk_bytes:
         raise SessionError("session read returned invalid bounded byte counts")
     packets_after = firewall_packets(metadata, str(state["target_identity"]), docker=docker)
-    target_observed = (
-        state["target_identity"] == f"challenge:{metadata['challenge_id']}"
-        or (
-            state.get("target_packets_before") is not None and packets_after is not None
-            and int(packets_after) > int(state["target_packets_before"])
-        )
+    target_observed, observation_source = target_observation(
+        metadata,
+        str(state["target_identity"]),
+        before_packets=(
+            int(state["target_packets_before"])
+            if state.get("target_packets_before") is not None
+            else None
+        ),
+        after_packets=packets_after,
     )
     liveness = session_liveness(
         Path(str(metadata["lane_root"])), state, now_epoch=datetime.now(UTC).timestamp()
@@ -559,6 +562,7 @@ def read(
         "output_hash": output_hash(output),
         "target_identity": state["target_identity"],
         "target_observed": target_observed,
+        "observation_source": observation_source,
         "target_packets_before": state.get("target_packets_before"),
         "target_packets_after": packets_after,
         "started_at": started_at,

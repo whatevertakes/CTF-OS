@@ -9,6 +9,7 @@ from ctf_os.doctor import (
     GPU_REV_CUPY_PROBE,
     _gpu_checks,
 )
+from ctf_os.sandbox.gpu import HOST_GPU_COMPUTE_QUERY
 
 
 def _images(*profiles: str) -> dict[str, object]:
@@ -59,6 +60,8 @@ def test_gpu_checks_run_scoped_real_operation_probes() -> None:
 
     def runner(argv, **kwargs):
         calls.append(list(argv))
+        if list(argv) == list(HOST_GPU_COMPUTE_QUERY):
+            return subprocess.CompletedProcess(argv, 0, "0, 8.9\n", "")
         if argv[0] == "nvidia-smi":
             return subprocess.CompletedProcess(argv, 0, "0, RTX Test, 999.1\n", "")
         if argv[:2] == ["docker", "run"]:
@@ -74,6 +77,7 @@ def test_gpu_checks_run_scoped_real_operation_probes() -> None:
     assert all(check["ok"] for check in checks)
     assert {check["name"] for check in checks} == {
         "gpu-host-driver",
+        "gpu-compute-compatibility",
         "gpu-docker-passthrough",
         "gpu-ai-torch",
         "gpu-ai-onnx",
@@ -94,6 +98,8 @@ def test_gpu_checks_run_scoped_real_operation_probes() -> None:
 
 def test_gpu_check_reports_one_failed_image_probe() -> None:
     def runner(argv, **kwargs):
+        if list(argv) == list(HOST_GPU_COMPUTE_QUERY):
+            return subprocess.CompletedProcess(argv, 0, "0, 8.9\n", "")
         if argv[0] == "nvidia-smi":
             return subprocess.CompletedProcess(argv, 0, "0, RTX Test, 999.1\n", "")
         if "ctf-os-sandbox:crypto" in argv:
@@ -111,6 +117,31 @@ def test_gpu_check_reports_one_failed_image_probe() -> None:
     assert by_name["gpu-crypto-hashcat"]["status"] == "FAIL"
     assert "CUDA backend unavailable" in by_name["gpu-crypto-hashcat"]["detail"]
     assert by_name["gpu-rev-cupy"]["ok"] is True
+
+
+def test_gpu_checks_treat_blackwell_as_an_explicit_cpu_fallback() -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if list(argv) == list(HOST_GPU_COMPUTE_QUERY):
+            return subprocess.CompletedProcess(argv, 0, "0, 12.0\n", "")
+        if argv[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(argv, 0, "0, RTX 5060, 999.1\n", "")
+        raise AssertionError(f"unsupported GPU must not reach Docker: {argv}")
+
+    checks = _gpu_checks(
+        _images("base", "ai", "crypto", "rev"),
+        docker="docker",
+        runner=runner,
+    )
+    by_name = {check["name"]: check for check in checks}
+
+    assert all(check["ok"] for check in checks)
+    assert by_name["gpu-compute-compatibility"]["status"] == "SKIPPED"
+    assert "12.0" in by_name["gpu-compute-compatibility"]["detail"]
+    assert "9.0" in by_name["gpu-compute-compatibility"]["detail"]
+    assert all(call[:2] != ["docker", "run"] for call in calls)
 
 
 def test_gpu_probe_contracts_use_cuda_without_relaxing_security() -> None:

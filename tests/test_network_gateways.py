@@ -61,6 +61,45 @@ def test_non_gateway_private_target_still_allowed_with_runtime_set() -> None:
     assert declared[0].host == "10.8.0.5"
 
 
+def test_cgnat_target_requires_explicit_organizer_declaration() -> None:
+    with pytest.raises(NetworkPolicyError, match="organizer_declared"):
+        parse_remotes(
+            [{"host": "100.64.0.42", "port": 31337, "protocol": "tcp"}]
+        )
+
+
+def test_cgnat_target_is_allowed_when_explicitly_organizer_declared() -> None:
+    declared = parse_remotes(
+        [{
+            "host": "100.64.0.42",
+            "port": 31337,
+            "protocol": "tcp",
+            "organizer_declared": True,
+        }]
+    )
+    assert declared[0].host == "100.64.0.42"
+
+
+@pytest.mark.parametrize(
+    ("host", "message"),
+    (
+        ("::ffff:169.254.169.254", "metadata"),
+        ("::ffff:172.17.0.1", "gateway"),
+    ),
+)
+def test_ipv4_mapped_ipv6_cannot_bypass_always_forbidden_targets(
+    host: str,
+    message: str,
+) -> None:
+    with pytest.raises(NetworkPolicyError, match=message):
+        parse_remotes([{
+            "host": host,
+            "port": 80,
+            "protocol": "http",
+            "organizer_declared": True,
+        }])
+
+
 def test_collect_docker_gateways_malformed_inspect_fails_closed() -> None:
     with pytest.raises(NetworkPolicyError, match="malformed"):
         collect_docker_gateways(runner=_fake_network_runner("{not json"))

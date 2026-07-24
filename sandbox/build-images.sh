@@ -52,9 +52,16 @@ contains_profile() {
   for candidate in "${ALL_PROFILES[@]}"; do [[ "$candidate" == "$wanted" ]] && return 0; done
   return 1
 }
+declare -A SELECTED_PROFILES=()
 for profile in "${PROFILES[@]}"; do
   contains_profile "$profile" || { echo "Unknown profile: $profile" >&2; echo "Supported: ${ALL_PROFILES[*]}" >&2; exit 64; }
+  if [[ -n "${SELECTED_PROFILES[$profile]+present}" ]]; then
+    echo "Duplicate profile: $profile" >&2
+    exit 64
+  fi
+  SELECTED_PROFILES["$profile"]=1
 done
+selected_profile_count="${#SELECTED_PROFILES[@]}"
 
 command -v docker >/dev/null || { echo "Docker CLI not found. Install Docker before building sandbox images." >&2; exit 69; }
 command -v python3 >/dev/null || { echo "Python 3 is required to hash sandbox build inputs." >&2; exit 69; }
@@ -125,15 +132,27 @@ docker build --help >/dev/null 2>&1 || { echo "docker build is unavailable for t
 docker run --help >/dev/null 2>&1 || { echo "docker run is unavailable for the current daemon/CLI." >&2; exit 69; }
 
 free_kib="$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')"
-minimum_kib=$((20 * 1024 * 1024))
+selective_build_minimum_gib=20
+full_build_minimum_gib=60
+per_profile_build_minimum_gib=6
+minimum_gib=$((selected_profile_count * per_profile_build_minimum_gib))
+if (( minimum_gib < selective_build_minimum_gib )); then
+  minimum_gib="$selective_build_minimum_gib"
+fi
+build_scope="selected-profile build"
+if (( selected_profile_count == ${#ALL_PROFILES[@]} )); then
+  minimum_gib="$full_build_minimum_gib"
+  build_scope="full 10-profile build"
+fi
+minimum_kib=$((minimum_gib * 1024 * 1024))
 if [[ ! "$free_kib" =~ ^[0-9]+$ ]] || (( free_kib < minimum_kib )); then
-  echo "Insufficient disk space: the full toolchain build requires at least 20 GiB free (found $((free_kib / 1024 / 1024)) GiB)." >&2
+  echo "Insufficient disk space: the $build_scope requires at least ${minimum_gib} GiB free (found $((free_kib / 1024 / 1024)) GiB)." >&2
   exit 70
 fi
 if [[ -n "$docker_root" && -d "$docker_root" ]]; then
   docker_free_kib="$(df -Pk "$docker_root" | awk 'NR==2 {print $4}')"
   if [[ ! "$docker_free_kib" =~ ^[0-9]+$ ]] || (( docker_free_kib < minimum_kib )); then
-    echo "Insufficient Docker data-root space: at least 20 GiB free is required." >&2
+    echo "Insufficient Docker data-root space: the $build_scope requires at least ${minimum_gib} GiB free." >&2
     exit 70
   fi
 fi

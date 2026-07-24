@@ -52,6 +52,10 @@ the exact working directory, argv, timeout, and full-output capture command.
 Participant-supplied `HUMAN_REMOTE_RESULT` content is unverified external input:
 it may guide analysis but may not become an execution-verified receipt, verified
 blackboard event, target-observed flag, or automatic winner.
+Because a sandbox cannot prove that pasted external text came from a local
+service response, human-relay mode never promotes any sandbox receipt to a
+verified remote result, flag event, or winner. Detected candidates remain
+visible for the participant's manual decision and submission.
 
 ## Portfolio lanes
 

@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -237,7 +238,7 @@ def detect_service(input_root: Path, category: str) -> dict[str, Any]:
                 "review_reasons": ["Dockerfile has no declared service port and remains input-only"],
             }
         bases, base_reasons = _dockerfile_bases(text)
-        reasons = base_reasons + _dockerfile_hazards(text)
+        reasons = sorted(set(base_reasons + _dockerfile_hazards(text)))
         return {
             "kind": "dockerfile",
             "safe": not reasons,
@@ -399,10 +400,15 @@ def _compose_ports(raw: Mapping[str, Any]) -> list[int]:
 
 def _dockerfile_ports(text: str) -> list[int]:
     result: set[int] = set()
-    for line in text.splitlines():
-        if not line.strip().casefold().startswith("expose "):
+    instructions, _reasons = _dockerfile_instructions(text)
+    for instruction, arguments in instructions:
+        if instruction != "EXPOSE":
             continue
-        for value in line.strip().split()[1:]:
+        try:
+            values = shlex.split(arguments, posix=True)
+        except ValueError:
+            continue
+        for value in values:
             try:
                 port = int(value.split("/", 1)[0])
             except ValueError:
@@ -420,51 +426,286 @@ def _dockerfile_hazards(text: str) -> list[str]:
     URL or registry during the live Solve build.
     """
 
-    reasons: list[str] = []
+    instructions, reasons = _dockerfile_instructions(text)
     stages: set[str] = set()
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    for instruction, arguments in instructions:
+        if instruction == "FROM":
+            _image, stage, from_reasons = _dockerfile_from(arguments)
+            reasons.extend(from_reasons)
+            if stage:
+                stages.add(stage.casefold())
             continue
-        from_match = re.match(r"^FROM\s+.+?(?:\s+AS\s+(\S+))?\s*$", line, re.IGNORECASE)
-        if from_match and from_match.group(1):
-            stages.add(from_match.group(1).casefold())
-        upper = line.upper()
-        if upper.startswith("ADD "):
-            tokens = [token for token in line.split()[1:] if not token.startswith("--")]
-            sources = tokens[:-1] if len(tokens) > 1 else tokens
+        if instruction in {"ADD", "COPY"}:
+            sources, options, source_reasons = _dockerfile_copy_arguments(
+                arguments, instruction=instruction
+            )
+            reasons.extend(source_reasons)
             for source in sources:
-                if re.match(r"(?i)^(?:https?|git|ftp)://", source):
-                    reasons.append("Dockerfile ADD fetches a remote URL")
+                if _dockerfile_remote_source(source):
+                    reasons.append(
+                        f"Dockerfile {instruction} fetches a remote URL"
+                    )
                 if "$" in source:
-                    reasons.append("Dockerfile ADD uses a dynamic source")
-        if upper.startswith("COPY "):
-            from_ref = re.search(r"(?i)(?:^|\s)--from=(\S+)", line)
-            if from_ref:
-                ref = from_ref.group(1).casefold()
+                    reasons.append(
+                        f"Dockerfile {instruction} uses a dynamic source"
+                    )
+            if instruction == "COPY" and "from" in options:
+                ref = options["from"].casefold()
+                if "$" in ref:
+                    reasons.append(
+                        "Dockerfile COPY --from uses a dynamic image or stage"
+                    )
                 if ref not in stages and not ref.isdigit():
-                    reasons.append("Dockerfile COPY --from references an external image")
+                    reasons.append(
+                        "Dockerfile COPY --from references an external image"
+                    )
+        if instruction == "RUN":
+            reasons.extend(_dockerfile_run_hazards(arguments, stages))
     return sorted(set(reasons))
 
 
 def _dockerfile_bases(text: str) -> tuple[list[str], list[str]]:
     images: list[str] = []
     stages: set[str] = set()
-    reasons: list[str] = []
-    for raw in text.splitlines():
-        match = re.match(r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$", raw, re.IGNORECASE)
-        if not match:
+    instructions, reasons = _dockerfile_instructions(text)
+    saw_from = False
+    for instruction, arguments in instructions:
+        if instruction != "FROM":
             continue
-        image, stage = match.group(1), match.group(2)
+        saw_from = True
+        image, stage, from_reasons = _dockerfile_from(arguments)
+        reasons.extend(from_reasons)
+        if not image:
+            continue
         if "$" in image:
             reasons.append("Dockerfile uses a dynamic FROM image")
         elif image.casefold() != "scratch" and image.casefold() not in stages:
             images.append(image)
         if stage:
             stages.add(stage.casefold())
-    if not images and not any(line.lstrip().upper().startswith("FROM ") for line in text.splitlines()):
+    if not saw_from:
         reasons.append("Dockerfile has no bounded FROM instruction")
-    return sorted(set(images)), reasons
+    return sorted(set(images)), sorted(set(reasons))
+
+
+_DOCKERFILE_KEYWORDS = frozenset({
+    "ADD", "ARG", "CMD", "COPY", "ENTRYPOINT", "ENV", "EXPOSE", "FROM",
+    "HEALTHCHECK", "LABEL", "MAINTAINER", "ONBUILD", "RUN", "SHELL",
+    "STOPSIGNAL", "USER", "VOLUME", "WORKDIR",
+})
+_DOCKERFILE_BOOLEAN_COPY_OPTIONS = frozenset({
+    "keep-git-dir", "link", "parents",
+})
+_DOCKERFILE_OPTION = re.compile(
+    r"^--([a-z][a-z0-9-]*)(?:=([^\s]+))?(?:\s+|$)",
+    re.IGNORECASE,
+)
+
+
+def _dockerfile_instructions(
+    text: str,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse bounded logical Dockerfile instructions without executing a frontend.
+
+    The Docker daemon can fetch a custom syntax frontend before build networking
+    is applied, so parser directives are rejected. Physical continuation lines
+    are joined before ADD/COPY/FROM analysis; malformed or unsupported grammar
+    fails closed instead of being silently ignored.
+    """
+
+    reasons: list[str] = []
+    if "\x00" in text:
+        return [], ["Dockerfile contains a NUL byte"]
+    lines = text.splitlines()
+    escape = "\\"
+    for raw in lines:
+        directive = re.match(
+            r"^\s*#\s*(syntax|escape|check)\s*=\s*(.*?)\s*$",
+            raw,
+            re.IGNORECASE,
+        )
+        if not directive:
+            continue
+        reasons.append(
+            f"Dockerfile parser directive {directive.group(1).casefold()} "
+            "is not permitted in isolated preflight"
+        )
+        if directive.group(1).casefold() == "escape":
+            value = directive.group(2)
+            if value in {"\\", "`"}:
+                escape = value
+
+    logical: list[str] = []
+    pending = ""
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        physical = raw.rstrip()
+        trailing = len(physical) - len(physical.rstrip(escape))
+        continued = trailing % 2 == 1
+        if continued:
+            physical = physical[:-1].rstrip()
+        piece = physical.strip()
+        pending = f"{pending} {piece}".strip() if pending else piece
+        if continued:
+            continue
+        logical.append(pending)
+        pending = ""
+    if pending:
+        reasons.append("Dockerfile has a dangling line continuation")
+        logical.append(pending)
+
+    instructions: list[tuple[str, str]] = []
+    for line in logical:
+        match = re.fullmatch(r"([A-Za-z]+)(?:\s+(.*))?", line, re.DOTALL)
+        if not match:
+            reasons.append("Dockerfile contains an unparseable instruction")
+            continue
+        instruction = match.group(1).upper()
+        arguments = (match.group(2) or "").strip()
+        if instruction not in _DOCKERFILE_KEYWORDS:
+            reasons.append(
+                f"Dockerfile uses unsupported instruction {instruction}"
+            )
+            continue
+        if not arguments and instruction not in {"ARG"}:
+            reasons.append(f"Dockerfile {instruction} has no arguments")
+        if re.search(r"(?:^|\s)<<-?\s*['\"]?[A-Za-z0-9_.-]+", arguments):
+            reasons.append(
+                "Dockerfile heredoc syntax is unsupported by isolated preflight"
+            )
+        if instruction == "ONBUILD":
+            reasons.append(
+                "Dockerfile ONBUILD defers an instruction beyond isolated preflight"
+            )
+        instructions.append((instruction, arguments))
+    return instructions, sorted(set(reasons))
+
+
+def _dockerfile_from(
+    arguments: str,
+) -> tuple[str | None, str | None, list[str]]:
+    try:
+        tokens = shlex.split(arguments, posix=True)
+    except ValueError:
+        return None, None, ["Dockerfile FROM arguments are malformed"]
+    while tokens and tokens[0].startswith("--"):
+        if re.fullmatch(r"--platform=\S+", tokens[0], re.IGNORECASE):
+            tokens.pop(0)
+            continue
+        return None, None, ["Dockerfile FROM uses an unsupported option"]
+    if len(tokens) == 1:
+        return tokens[0], None, []
+    if (
+        len(tokens) == 3
+        and tokens[1].casefold() == "as"
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tokens[2])
+    ):
+        return tokens[0], tokens[2], []
+    return None, None, ["Dockerfile FROM arguments are malformed"]
+
+
+def _dockerfile_copy_arguments(
+    arguments: str,
+    *,
+    instruction: str,
+) -> tuple[list[str], dict[str, str], list[str]]:
+    remaining = arguments.lstrip()
+    options: dict[str, str] = {}
+    reasons: list[str] = []
+    while remaining.startswith("--"):
+        match = _DOCKERFILE_OPTION.match(remaining)
+        if not match:
+            return [], options, [
+                f"Dockerfile {instruction} options are malformed"
+            ]
+        name = match.group(1).casefold()
+        value = match.group(2)
+        if value is None and name not in _DOCKERFILE_BOOLEAN_COPY_OPTIONS:
+            reasons.append(
+                f"Dockerfile {instruction} option --{name} requires a bounded value"
+            )
+        options[name] = value or "true"
+        remaining = remaining[match.end():].lstrip()
+    try:
+        if remaining.startswith("["):
+            decoded = json.loads(remaining)
+            if (
+                not isinstance(decoded, list)
+                or len(decoded) < 2
+                or any(not isinstance(value, str) for value in decoded)
+            ):
+                raise ValueError
+            tokens = decoded
+        else:
+            tokens = shlex.split(remaining, posix=True)
+    except (json.JSONDecodeError, ValueError):
+        return [], options, reasons + [
+            f"Dockerfile {instruction} source list is malformed"
+        ]
+    if len(tokens) < 2:
+        return [], options, reasons + [
+            f"Dockerfile {instruction} requires a source and destination"
+        ]
+    return tokens[:-1], options, reasons
+
+
+def _dockerfile_remote_source(source: str) -> bool:
+    return bool(
+        re.match(r"(?i)^[a-z][a-z0-9+.-]*://", source)
+        or re.match(r"^[^/@:\s]+@[^/:\s]+:.+", source)
+    )
+
+
+def _dockerfile_run_hazards(arguments: str, stages: set[str]) -> list[str]:
+    """Reject BuildKit RUN options that can bypass an offline service build."""
+
+    reasons: list[str] = []
+    remaining = arguments.lstrip()
+    while remaining.startswith("--"):
+        match = _DOCKERFILE_OPTION.match(remaining)
+        if not match:
+            return reasons + ["Dockerfile RUN options are malformed"]
+        name = match.group(1).casefold()
+        value = match.group(2) or ""
+        if name == "network" and value.casefold() != "none":
+            reasons.append("Dockerfile RUN requests a non-isolated network")
+        elif name == "security":
+            reasons.append("Dockerfile RUN requests an unsafe security mode")
+        elif name == "device":
+            reasons.append("Dockerfile RUN requests a build device")
+        elif name == "mount":
+            mount = {
+                key.casefold(): item
+                for token in value.split(",")
+                for key, separator, item in [token.partition("=")]
+                if separator
+            }
+            mount_type = mount.get("type", "bind").casefold()
+            if mount_type in {"cache", "secret", "ssh"}:
+                reasons.append(
+                    "Dockerfile RUN mount requests persistent/credential state"
+                )
+            elif mount_type not in {"bind", "tmpfs"}:
+                reasons.append(
+                    "Dockerfile RUN mount uses an unsupported mount type"
+                )
+            source = mount.get("from")
+            if source:
+                ref = source.casefold()
+                if "$" in ref:
+                    reasons.append(
+                        "Dockerfile RUN mount uses a dynamic image or stage"
+                    )
+                elif ref not in stages and not ref.isdigit():
+                    reasons.append(
+                        "Dockerfile RUN mount references an external image"
+                    )
+        else:
+            reasons.append(f"Dockerfile RUN uses unsupported option --{name}")
+        remaining = remaining[match.end():].lstrip()
+    return reasons
 
 
 def _compose_build(
@@ -479,7 +720,8 @@ def _compose_build(
         dockerfile_value = str(value.get("dockerfile", "Dockerfile"))
         for key in (
             "ssh", "secrets", "additional_contexts", "entitlements",
-            "dockerfile_inline", "privileged", "extra_hosts", "cache_to",
+            "dockerfile_inline", "privileged", "extra_hosts", "cache_from",
+            "cache_to",
             "ulimits", "shm_size", "isolation", "tags",
         ):
             if value.get(key):

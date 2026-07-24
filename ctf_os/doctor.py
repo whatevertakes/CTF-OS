@@ -11,7 +11,12 @@ from typing import Any
 
 from .categories import CATEGORIES
 from .images import smoke_images
-from .sandbox.gpu import HOST_GPU_QUERY, NVIDIA_DRIVER_CAPABILITIES
+from .sandbox.gpu import (
+    HOST_GPU_QUERY,
+    MAX_GPU_COMPUTE_CAPABILITY,
+    NVIDIA_DRIVER_CAPABILITIES,
+    host_gpu_compute_capabilities,
+)
 
 PROFILES = CATEGORIES
 IMAGES = tuple(f"ctf-os-sandbox:{profile}" for profile in PROFILES)
@@ -188,15 +193,62 @@ def _gpu_checks(
             host_detail or "no NVIDIA GPU detected; CPU profiles remain available",
             skipped=True,
         )
-        for name in ("gpu-docker-passthrough", *(row[0] for row in GPU_PROBES)):
+        for name in (
+            "gpu-compute-compatibility",
+            "gpu-docker-passthrough",
+            *(row[0] for row in GPU_PROBES),
+        ):
             add(name, True, "no usable host NVIDIA GPU; GPU probe not run", skipped=True)
         return checks
     if host.returncode:
         add("gpu-host-driver", False, host_detail or "nvidia-smi failed")
-        for name in ("gpu-docker-passthrough", *(row[0] for row in GPU_PROBES)):
+        for name in (
+            "gpu-compute-compatibility",
+            "gpu-docker-passthrough",
+            *(row[0] for row in GPU_PROBES),
+        ):
             add(name, True, "host NVIDIA driver failed; GPU probe not run", skipped=True)
         return checks
     add("gpu-host-driver", True, host_detail)
+
+    capabilities, capability_detail = host_gpu_compute_capabilities(runner)
+    maximum = (
+        f"{MAX_GPU_COMPUTE_CAPABILITY[0]}.{MAX_GPU_COMPUTE_CAPABILITY[1]}"
+    )
+    unsupported = (
+        []
+        if capabilities is None
+        else [
+            value
+            for value in capabilities
+            if tuple(int(part) for part in value.split(".", 1))
+            > MAX_GPU_COMPUTE_CAPABILITY
+        ]
+    )
+    if capabilities is None or unsupported:
+        reason = (
+            f"host compute capability {', '.join(unsupported)} exceeds pinned "
+            f"CUDA maximum {maximum}; CPU profiles remain available"
+            if unsupported
+            else (
+                "host compute capability could not be verified; CPU profiles "
+                f"remain available ({capability_detail})"
+            )
+        )
+        add(
+            "gpu-compute-compatibility",
+            True,
+            reason,
+            skipped=True,
+        )
+        for name in ("gpu-docker-passthrough", *(row[0] for row in GPU_PROBES)):
+            add(name, True, "GPU is not admitted; CPU fallback selected", skipped=True)
+        return checks
+    add(
+        "gpu-compute-compatibility",
+        True,
+        f"compute capabilities {', '.join(capabilities)} are supported through {maximum}",
+    )
 
     present = {
         str(row.get("image", "")).removeprefix("ctf-os-sandbox:"): bool(row.get("available"))

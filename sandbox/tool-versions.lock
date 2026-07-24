@@ -18,9 +18,9 @@ RsaCtfTool_sha256=813b25af898b95f23dd2d43abc63c912fcdb1a8923f257a32718eafec458ab
 cado-nfs=90aec67f9a8f0badd0a20d1bbe4c1c2ed2e3c507
 cado-nfs_sha256=4b4821009af9364abd16f4d45bd6dcb3aedeef3c8855f002389508a23e5c1841
 # GPU (CUDA 12.6 / cu126) toolchain. NOTE: these cu126 wheels ship kernels up to
-# sm_90 and do NOT include sm_120 (RTX 50-series / Blackwell). On such a card GPU
-# work in ai/crypto/rev fails at run time ("no kernel image is available"); the
-# CPU path still works. Bumping to cu128 is pending real 50-series verification.
+# sm_90 and do NOT include sm_120 (RTX 50-series / Blackwell). Runtime admission
+# therefore selects the CPU path before starting ai/crypto/rev GPU work (and
+# blocks an explicit `required` policy). cu128 awaits real 50-series verification.
 # See also sandbox/install/ai.sh (torch cu126) and sandbox/requirements/rev.txt.
 cupy-cuda12x=13.6.0
 nvidia-cuda-nvrtc-cu12=12.6.77

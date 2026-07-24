@@ -9,6 +9,7 @@ import pytest
 
 from ctf_os.doctor import HOST_GPU_QUERY as DOCTOR_HOST_GPU_QUERY
 from ctf_os.sandbox.gpu import (
+    HOST_GPU_COMPUTE_QUERY,
     HOST_GPU_QUERY,
     GpuError,
     admit_gpu,
@@ -25,7 +26,19 @@ def _no_gpu_runner(argv, **kwargs):
 
 def _full_gpu_runner(argv, **kwargs):
     if list(argv) == list(HOST_GPU_QUERY):
+        return subprocess.CompletedProcess(argv, 0, "0, RTX 4060 Ti, 999.1\n", "")
+    if list(argv) == list(HOST_GPU_COMPUTE_QUERY):
+        return subprocess.CompletedProcess(argv, 0, "0, 8.9\n", "")
+    if argv[:2] == ["docker", "run"]:
+        return subprocess.CompletedProcess(argv, 0, "0, RTX 4060 Ti\n", "")
+    raise AssertionError(f"unexpected: {argv}")
+
+
+def _blackwell_gpu_runner(argv, **kwargs):
+    if list(argv) == list(HOST_GPU_QUERY):
         return subprocess.CompletedProcess(argv, 0, "0, RTX 5060, 999.1\n", "")
+    if list(argv) == list(HOST_GPU_COMPUTE_QUERY):
+        return subprocess.CompletedProcess(argv, 0, "0, 12.0\n", "")
     if argv[:2] == ["docker", "run"]:
         return subprocess.CompletedProcess(argv, 0, "0, RTX 5060\n", "")
     raise AssertionError(f"unexpected: {argv}")
@@ -52,6 +65,19 @@ def test_auto_admits_when_host_and_passthrough_verify() -> None:
     decision = admit_gpu("auto", "crypto", runner=_full_gpu_runner)
     assert decision["admitted"] is True
     assert decision["degraded"] is False
+
+
+def test_auto_falls_back_before_passing_unsupported_blackwell_gpu() -> None:
+    decision = admit_gpu("auto", "ai", runner=_blackwell_gpu_runner)
+    assert decision["admitted"] is False
+    assert decision["degraded"] is True
+    assert "12.0" in decision["reason"]
+    assert "9.0" in decision["reason"]
+
+
+def test_required_rejects_unsupported_blackwell_gpu() -> None:
+    with pytest.raises(GpuError, match=r"12\.0.*9\.0"):
+        admit_gpu("required", "rev", runner=_blackwell_gpu_runner)
 
 
 def test_required_without_gpu_is_an_exact_blocker() -> None:

@@ -437,12 +437,11 @@ def execute(
             handle.close()
     observed = capture.decode("utf-8", errors="replace")
     after_packets = firewall_packets(metadata, resolved_target, docker=docker)
-    target_observed = (
-        resolved_target == f"challenge:{metadata['challenge_id']}"
-        or (
-            before_packets is not None and after_packets is not None
-            and after_packets > before_packets
-        )
+    target_observed, observation_source = target_observation(
+        metadata,
+        resolved_target,
+        before_packets=before_packets,
+        after_packets=after_packets,
     )
     receipt = {
         "schema_version": 1,
@@ -459,6 +458,7 @@ def execute(
         "output_hash": digest.hexdigest(),
         "target_identity": resolved_target,
         "target_observed": target_observed,
+        "observation_source": observation_source,
         "target_packets_before": before_packets,
         "target_packets_after": after_packets,
         "started_at": started_at,
@@ -498,6 +498,7 @@ def cleanup(
     try:
         row = json.loads(inspected.stdout)[0]
         labels = row.get("Config", {}).get("Labels", {}) or {}
+        running = (row.get("State", {}) or {}).get("Running")
     except (json.JSONDecodeError, IndexError, TypeError) as exc:
         raise SandboxError("Docker returned malformed sandbox inspect data") from exc
     expected = metadata.get("labels")
@@ -505,6 +506,16 @@ def cleanup(
         raise SandboxError("sandbox metadata has no ownership labels")
     if any(labels.get(key) != value for key, value in expected.items()):
         raise SandboxError("refusing to remove container whose labels do not match metadata")
+    restarted = False
+    if running is False:
+        started = _run(runner, [docker, "start", name], timeout=30)
+        if started.returncode:
+            detail = (started.stderr or started.stdout).strip()
+            raise SandboxError(
+                "stopped sandbox could not be restarted for ownership normalization"
+                + (f": {detail[-4096:]}" if detail else "")
+            )
+        restarted = True
     normalized = _run(
         runner,
         [
@@ -528,6 +539,7 @@ def cleanup(
         "removed": True,
         "already_absent": False,
         "host_ownership_normalized": True,
+        "restarted_for_normalization": restarted,
         "normalization_warning": None,
     }
 
@@ -624,6 +636,36 @@ def firewall_packets(
                 continue
             total += int(counter.group(1))
     return total
+
+
+def target_observation(
+    metadata: Mapping[str, Any],
+    target_identity: str,
+    *,
+    before_packets: int | None,
+    after_packets: int | None,
+) -> tuple[bool, str]:
+    """Classify whether output has an execution-backed challenge provenance.
+
+    A human-relay sandbox cannot prove that text printed by a local command did
+    not originate in an externally supplied HUMAN_REMOTE_RESULT. Consequently,
+    challenge-local output remains a useful command receipt but is deliberately
+    not promoted to a target-observation receipt in that mode. Root-owned local
+    services and agent-executed remotes still require an increasing firewall
+    packet counter.
+    """
+
+    if (
+        before_packets is not None
+        and after_packets is not None
+        and after_packets > before_packets
+    ):
+        return True, "network-packet"
+    if target_identity == f"challenge:{metadata.get('challenge_id')}":
+        if str(metadata.get("remote_execution", "agent")) == "human-relay":
+            return False, "human-relay-local-analysis"
+        return True, "challenge-local-analysis"
+    return False, "no-target-packet"
 
 
 def _prepare_lane_root(spec: SandboxSpec) -> None:

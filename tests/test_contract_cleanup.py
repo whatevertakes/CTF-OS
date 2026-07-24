@@ -273,6 +273,10 @@ def test_sandbox_build_is_credential_isolated_lock_bound_and_atomic() -> None:
     assert failure_check < promotion
     assert 'org.ctf-os.lock-sha256="${CTF_OS_LOCK_SHA256}"' in dockerfile
     assert 'org.ctf-os.build-sha256="${CTF_OS_BUILD_SHA256}"' in dockerfile
+    assert "full_build_minimum_gib=60" in build
+    assert "selective_build_minimum_gib=20" in build
+    assert "per_profile_build_minimum_gib=6" in build
+    assert "selected_profile_count" in build
 
 
 def test_remote_installer_archives_are_digest_pinned() -> None:
@@ -458,6 +462,15 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
             capture_output=True, text=True, timeout=30, check=False,
         )
         assert closed.returncode == 0, closed.stdout + closed.stderr
+        sandbox_name = result["root_sandbox"]["name"]
+        stopped = subprocess.run(
+            ["docker", "stop", sandbox_name],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert stopped.returncode == 0, stopped.stdout + stopped.stderr
     finally:
         subprocess.run([*base, "race-end", "--run-id", run_id, "--reason", "STOPPED"], capture_output=True, text=True, timeout=30, check=False)
         cleaned = subprocess.run([*base, "race-cleanup", "--run-id", run_id], capture_output=True, text=True, timeout=60, check=False)
@@ -465,6 +478,7 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
     cleanup_result = json.loads(cleaned.stdout)["result"]
     assert cleanup_result["active_cleared"] is True
     assert cleanup_result["cleaned"][0]["host_ownership_normalized"] is True
+    assert cleanup_result["cleaned"][0]["restarted_for_normalization"] is True
     lane_root = Path(metadata).parent
     for path in (lane_root / "work" / "private", lane_root / "work" / "private" / "solver.py",
                  lane_root / "artifacts" / "result.bin"):

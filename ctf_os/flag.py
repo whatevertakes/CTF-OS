@@ -10,7 +10,11 @@ from typing import Any
 
 import regex as safe_regex
 
-from .blackboard import BlackboardError, append_verified_event
+from .blackboard import (
+    BlackboardError,
+    append_verified_event,
+    human_relay_blocks_promotion,
+)
 from .race import load_race, record_winner
 from .sandbox.session import MAX_FLAG_TAIL
 
@@ -152,6 +156,10 @@ def record_candidate(
     allowed.update(str(value) for value in race.get("service_endpoints", []))
     if target not in allowed:
         raise FlagError("candidate was not observed from the challenge or a declared target")
+    if human_relay_blocks_promotion(race):
+        raise FlagError(
+            "human-relay participant output cannot become an automatic winner"
+        )
     if receipt.get("target_observed") is not True:
         raise FlagError("candidate has no actual challenge/declared-target observation receipt")
     receipt_id = str(receipt.get("receipt_id", ""))

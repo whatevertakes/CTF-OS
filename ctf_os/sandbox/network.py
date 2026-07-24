@@ -312,14 +312,32 @@ def _validate_address(
     value: str, *, organizer_declared: bool, blocked_gateways: frozenset[str] = _DOCKER_GATEWAYS
 ) -> None:
     address = ipaddress.ip_address(value)
-    canonical = str(address)
+    effective = getattr(address, "ipv4_mapped", None) or address
+    canonical = str(effective)
+    canonical_gateways = {
+        str(getattr(candidate, "ipv4_mapped", None) or candidate)
+        for raw in blocked_gateways
+        for candidate in [ipaddress.ip_address(raw)]
+    }
     if canonical in _METADATA_IPS:
         raise NetworkPolicyError(f"cloud metadata endpoint is always forbidden: {value}")
     # A real Docker gateway is forbidden even for organizer-declared private
     # targets: reaching it means reaching a service on the host.
-    if canonical in blocked_gateways:
+    if canonical in canonical_gateways:
         raise NetworkPolicyError(f"Docker host gateway is always forbidden: {value}")
-    if address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
+    if (
+        effective.is_loopback
+        or effective.is_link_local
+        or effective.is_multicast
+        or effective.is_unspecified
+        or effective.is_reserved
+    ):
         raise NetworkPolicyError(f"remote address is not permitted unicast: {value}")
-    if address.is_private and not organizer_declared:
-        raise NetworkPolicyError(f"private/VPN target requires organizer_declared=true: {value}")
+    # RFC 6598 shared CGNAT space (100.64.0.0/10) is neither `is_private` nor
+    # globally reachable according to ipaddress. Treat every non-global unicast
+    # address like private/VPN space so an implicit declaration cannot reach a
+    # carrier, overlay, or host-adjacent network.
+    if not effective.is_global and not organizer_declared:
+        raise NetworkPolicyError(
+            f"private/VPN/non-global target requires organizer_declared=true: {value}"
+        )

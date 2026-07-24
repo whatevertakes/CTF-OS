@@ -16,7 +16,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..blackboard import append_verified_event, register_artifact_inbox
+from ..blackboard import (
+    append_verified_event,
+    human_relay_blocks_promotion,
+    register_artifact_inbox,
+)
 from ..contest import (
     discover_contests,
     initialize_contest,
@@ -729,13 +733,22 @@ def _sandbox_exec(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
     warnings: list[str] = []
     winner = None
     if receipt.get("flag_candidate"):
-        winner = record_candidate(
-            run,
-            lane_id=str(metadata["lane_id"]),
-            attack_family=str(lane["attack_family"]),
-            candidate=str(receipt["flag_candidate"]),
-            receipt=receipt,
-        )
+        if (
+            receipt.get("target_observed") is True
+            and not human_relay_blocks_promotion(race)
+        ):
+            winner = record_candidate(
+                run,
+                lane_id=str(metadata["lane_id"]),
+                attack_family=str(lane["attack_family"]),
+                candidate=str(receipt["flag_candidate"]),
+                receipt=receipt,
+            )
+        else:
+            warnings.append(
+                "candidate detected in unverified human-relay/local output; "
+                "it was not promoted to a winner"
+            )
     try:
         note_command_receipt(run, receipt)
         event = append_verified_event(
@@ -795,29 +808,38 @@ def _session_read(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
         detector.buffer = prior_tail
     candidate = detector.feed(str(receipt["observed_output"]))
     winner = None
+    warnings: list[str] = []
     if candidate:
-        current_output = str(receipt["observed_output"])
-        if candidate in current_output:
-            winner = record_candidate(
-                run,
-                lane_id=str(metadata["lane_id"]),
-                attack_family=str(lane["attack_family"]),
-                candidate=candidate,
-                receipt=receipt,
+        if (
+            receipt.get("target_observed") is not True
+            or human_relay_blocks_promotion(race)
+        ):
+            warnings.append(
+                "candidate detected in unverified human-relay/local output; "
+                "it was not promoted to a winner"
             )
         else:
-            winner = record_candidate(
-                run,
-                lane_id=str(metadata["lane_id"]),
-                attack_family=str(lane["attack_family"]),
-                candidate=candidate,
-                receipt=receipt,
-                boundary={
-                    "receipt_id": receipt.get("session_prior_receipt_id"),
-                    "tail": prior_tail,
-                },
-            )
-    warnings: list[str] = []
+            current_output = str(receipt["observed_output"])
+            if candidate in current_output:
+                winner = record_candidate(
+                    run,
+                    lane_id=str(metadata["lane_id"]),
+                    attack_family=str(lane["attack_family"]),
+                    candidate=candidate,
+                    receipt=receipt,
+                )
+            else:
+                winner = record_candidate(
+                    run,
+                    lane_id=str(metadata["lane_id"]),
+                    attack_family=str(lane["attack_family"]),
+                    candidate=candidate,
+                    receipt=receipt,
+                    boundary={
+                        "receipt_id": receipt.get("session_prior_receipt_id"),
+                        "tail": prior_tail,
+                    },
+                )
     try:
         note_command_receipt(run, receipt)
         event = append_verified_event(
@@ -869,6 +891,15 @@ def _authorized_metadata(repo: Path, metadata_path: Path) -> dict[str, Any]:
     for field in ("name", "run_id", "lane_id", "challenge_id", "category"):
         if sandbox.get(field) != metadata.get(field):
             raise ValueError(f"sandbox metadata does not match the race: {field}")
+    expected_remote_execution = str(race.get("remote_execution", "agent"))
+    if (
+        str(metadata.get("remote_execution", "agent")) != expected_remote_execution
+        or str(sandbox.get("remote_execution", expected_remote_execution))
+        != expected_remote_execution
+    ):
+        raise ValueError(
+            "sandbox metadata does not match the race: remote_execution"
+        )
     if sandbox.get("metadata_path") != str(metadata_path):
         raise ValueError("sandbox metadata path does not match the race")
     return metadata

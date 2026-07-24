@@ -9,6 +9,7 @@ default `auto` policy silently falls back to CPU when a GPU cannot be admitted.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -26,6 +27,15 @@ HOST_GPU_QUERY = (
     "--query-gpu=index,name,driver_version",
     "--format=csv,noheader,nounits",
 )
+# The pinned CUDA 12.6/cu126 wheels advertise kernels only through sm_90.
+# Query this separately so the long-standing doctor inventory output stays
+# stable while admission can fail closed for a newer architecture.
+HOST_GPU_COMPUTE_QUERY = (
+    "nvidia-smi",
+    "--query-gpu=index,compute_cap",
+    "--format=csv,noheader,nounits",
+)
+MAX_GPU_COMPUTE_CAPABILITY = (9, 0)
 
 
 class GpuError(RuntimeError):
@@ -66,6 +76,34 @@ def host_gpu_present(
     if result.returncode != 0:
         return False, detail or "nvidia-smi failed"
     return bool(result.stdout.strip()), detail or "no NVIDIA GPU detected"
+
+
+def host_gpu_compute_capabilities(
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> tuple[tuple[str, ...] | None, str]:
+    """Return normalized host compute capabilities, failing closed if unknown."""
+
+    result = _run(runner, list(HOST_GPU_COMPUTE_QUERY), timeout=20)
+    detail = (result.stdout or result.stderr).strip()
+    if result.returncode != 0:
+        return None, detail or "nvidia-smi compute-capability query failed"
+    capabilities: list[str] = []
+    for line in result.stdout.splitlines():
+        fields = [value.strip() for value in line.split(",")]
+        if len(fields) != 2 or not fields[0].isdigit():
+            return None, "nvidia-smi returned malformed compute-capability data"
+        match = re.fullmatch(r"([0-9]{1,2})\.([0-9]{1,2})", fields[1])
+        if not match:
+            return None, "nvidia-smi returned malformed compute-capability data"
+        capabilities.append(f"{int(match.group(1))}.{int(match.group(2))}")
+    if not capabilities:
+        return None, "nvidia-smi returned no compute-capability data"
+    return tuple(capabilities), detail
+
+
+def _compute_capability(value: str) -> tuple[int, int]:
+    major, minor = value.split(".", 1)
+    return int(major), int(minor)
 
 
 def docker_gpu_passthrough(
@@ -112,6 +150,7 @@ def admit_gpu(
         "requested": False,
         "admitted": False,
         "degraded": False,
+        "compute_capabilities": [],
         "reason": "",
     }
     if policy == "off":
@@ -129,6 +168,39 @@ def admit_gpu(
             raise GpuError(f"gpu required but no usable host NVIDIA GPU: {host_detail}")
         decision["degraded"] = True
         decision["reason"] = f"no host GPU; CPU fallback ({host_detail})"
+        return decision
+    capabilities, capability_detail = host_gpu_compute_capabilities(runner)
+    if capabilities is None:
+        if policy == "required":
+            raise GpuError(
+                "gpu required but host compute capability could not be verified: "
+                f"{capability_detail}"
+            )
+        decision["degraded"] = True
+        decision["reason"] = (
+            "host GPU compute capability is unverified; "
+            f"CPU fallback ({capability_detail})"
+        )
+        return decision
+    decision["compute_capabilities"] = list(capabilities)
+    unsupported = [
+        value
+        for value in capabilities
+        if _compute_capability(value) > MAX_GPU_COMPUTE_CAPABILITY
+    ]
+    if unsupported:
+        observed = ", ".join(unsupported)
+        supported = (
+            f"{MAX_GPU_COMPUTE_CAPABILITY[0]}.{MAX_GPU_COMPUTE_CAPABILITY[1]}"
+        )
+        detail = (
+            f"host compute capability {observed} exceeds pinned CUDA maximum "
+            f"{supported}"
+        )
+        if policy == "required":
+            raise GpuError(f"gpu required but {detail}")
+        decision["degraded"] = True
+        decision["reason"] = f"{detail}; CPU fallback"
         return decision
     passthrough_ok, passthrough_detail = docker_gpu_passthrough(
         image=image, docker=docker, runner=runner

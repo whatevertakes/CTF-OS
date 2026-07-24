@@ -28,6 +28,19 @@ class BlackboardError(ValueError):
     pass
 
 
+def human_relay_blocks_promotion(race: Mapping[str, Any]) -> bool:
+    """Return whether a receipt cannot exclude human-relay external input.
+
+    Organizer requests are participant-executed in human-relay mode. A local
+    command can echo that participant result and can also make an unrelated
+    packet to a Root-owned service. Therefore no sandbox receipt in this mode is
+    eligible for automatic remote-result/flag promotion. Command receipts and
+    ordinary local observations remain available with their explicit provenance.
+    """
+
+    return str(race.get("remote_execution", "agent")) == "human-relay"
+
+
 def append_verified_event(
     run_root: Path,
     *,
@@ -50,8 +63,15 @@ def append_verified_event(
         raise BlackboardError("verified claim requires observed output or an actual artifact")
     target = str(receipt["target_identity"])
     _validate_target_identity(race, target)
-    if event_type in {"REMOTE_RESULT", "FLAG_CANDIDATE"} and receipt.get("target_observed") is not True:
-        raise BlackboardError("remote/flag event requires an actual target-observation receipt")
+    if event_type in {"REMOTE_RESULT", "FLAG_CANDIDATE"}:
+        if human_relay_blocks_promotion(race):
+            raise BlackboardError(
+                "human-relay participant output cannot become a verified remote/flag event"
+            )
+        if receipt.get("target_observed") is not True:
+            raise BlackboardError(
+                "remote/flag event requires an actual target-observation receipt"
+            )
     output_hash = str(receipt["output_hash"])
     argv = [str(value) for value in receipt["argv"]]
     event = {
@@ -71,6 +91,8 @@ def append_verified_event(
         "artifact_size": artifact_size,
         "shared_artifact_path": None,
         "target_identity": target,
+        "target_observed": receipt.get("target_observed") is True,
+        "observation_source": str(receipt.get("observation_source") or "legacy"),
         "timestamp": str(receipt.get("finished_at") or _now()),
     }
     event["fingerprint"] = hashlib.sha256(json.dumps({
@@ -194,10 +216,13 @@ def _validate_receipt(run_root: Path, lane_id: str, receipt: Mapping[str, Any]) 
         durable = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BlackboardError("durable execution receipt is unreadable") from exc
-    for field in (
+    fields = [
         "receipt_id", "run_id", "lane_id", "argv", "argv_family", "exit_code",
         "observed_output", "output_hash", "target_identity", "target_observed", "finished_at",
-    ):
+    ]
+    if "observation_source" in receipt or "observation_source" in durable:
+        fields.append("observation_source")
+    for field in fields:
         if durable.get(field) != receipt.get(field):
             raise BlackboardError(f"execution receipt was changed after execution: {field}")
 
