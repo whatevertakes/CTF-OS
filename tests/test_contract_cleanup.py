@@ -181,6 +181,22 @@ def test_cli_help_and_package_data_smoke() -> None:
     assert policy.is_file() and "verified" in policy.read_text(encoding="utf-8").casefold()
 
 
+def test_ctf_solve_skill_matches_authoritative_profile_and_reconcile_contract() -> None:
+    policy = Path("ctf_os/resources/agent-policy.md").read_text(encoding="utf-8")
+    skill = Path(".codex/skills/ctf-solve/SKILL.md").read_text(encoding="utf-8")
+    normalized_skill = " ".join(skill.split())
+
+    assert "Sol Ultra policy default" in policy
+    assert "`root_model_profile` and `root_model_profile_source`" in normalized_skill
+    assert "policy default is Sol Ultra" in normalized_skill
+    assert "current Root session is Sol xhigh" not in normalized_skill
+    assert "one `race-reconcile` call" in normalized_skill
+    assert "SPAWNED" in normalized_skill and "INTERRUPTED" in normalized_skill
+    assert "Sol max is available only through `race-endgame`" not in normalized_skill
+    assert "`race-spawn-confirm`" not in normalized_skill
+    assert "`race-stop-confirm`" not in normalized_skill
+
+
 def test_ares_has_noninteractive_first_run_configuration() -> None:
     config = Path("sandbox/config/ares.toml")
     settings = tomllib.loads(config.read_text(encoding="utf-8"))

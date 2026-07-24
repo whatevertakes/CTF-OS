@@ -28,6 +28,29 @@ from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, prepare_serv
 from conftest import fake_sandbox, make_race
 
 
+def _podman_sandbox_spec(tmp_path: Path, category: str) -> SandboxSpec:
+    root = tmp_path / category
+    source = root / "input"
+    source.mkdir(parents=True)
+    source.chmod(0o555)
+    lane_root = root / "workers" / "root"
+    for name in ("work", "evidence", "artifacts", "context"):
+        path = lane_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o755 if name == "context" else 0o777)
+    return SandboxSpec(
+        run_id=f"run-{category}",
+        contest_slug="demo",
+        challenge_id="challenge1",
+        category=category,
+        lane_id="root",
+        source=source,
+        lane_root=lane_root,
+        input_fingerprint="0" * 64,
+        image=f"ctf-os-sandbox:{category}",
+    )
+
+
 def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credentials(tmp_path: Path) -> None:
     source = tmp_path / "input"
     source.mkdir()
@@ -52,6 +75,23 @@ def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credenti
     assert "CTF_OS_ALLOWED_ENDPOINTS_JSON" in joined
     assert joined.count("--cap-add CHOWN") == 1
     assert joined.count("--cap-add DAC_READ_SEARCH") == 1
+
+
+@pytest.mark.parametrize(
+    ("category", "expects_rootless_seccomp"),
+    (("cloud", True), ("misc", True), ("web", False)),
+)
+def test_rootless_podman_seccomp_is_scoped_to_advertised_categories(
+    tmp_path: Path,
+    category: str,
+    expects_rootless_seccomp: bool,
+) -> None:
+    argv = build_run_argv(_podman_sandbox_spec(tmp_path, category))
+    seccomp = (
+        Path(__file__).resolve().parents[1] / "sandbox" / "seccomp-rootless.json"
+    )
+    security_opt = f"seccomp={seccomp}"
+    assert (security_opt in argv) is expects_rootless_seccomp
 
 
 def test_user_docker_exec_prefix_carries_only_lane_private_state(
@@ -455,6 +495,46 @@ def test_every_catalog_tool_has_a_working_version_probe(tmp_path: Path) -> None:
                 ["docker", "rm", "--force", name],
                 capture_output=True, text=True, timeout=30, check=False,
             )
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+@pytest.mark.parametrize("category", ("cloud", "misc"))
+def test_rootless_podman_info_runs_in_hardened_catalog_sandbox(
+    tmp_path: Path,
+    category: str,
+) -> None:
+    spec = _podman_sandbox_spec(tmp_path, category)
+    run_argv = build_run_argv(spec)
+    started = subprocess.run(
+        run_argv,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    try:
+        result = subprocess.run(
+            [
+                *user_exec_prefix({"name": spec.name}, workdir="/work"),
+                "podman",
+                "info",
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        info = json.loads(result.stdout)
+        assert info["host"]["security"]["rootless"] is True
+    finally:
+        cleaned = cleanup({"name": spec.name, "labels": spec.labels})
+        assert cleaned["host_ownership_normalized"] is True
+        assert cleaned["removed"] is True
 
 
 def test_remote_session_requires_exact_declared_identity(repo: Path) -> None:

@@ -127,10 +127,12 @@ def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
         argv.extend(["--label", f"{key}={value}"])
     if spec.category in {"pwn", "rev"}:
         argv.extend(["--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined"])
-    if spec.category == "cloud":
+    if spec.category in {"cloud", "misc"}:
         seccomp = Path(__file__).resolve().parents[2] / "sandbox" / "seccomp-rootless.json"
         if seccomp.is_symlink() or not seccomp.is_file():
-            raise SandboxError("cloud sandbox seccomp profile is missing or unsafe")
+            raise SandboxError(
+                f"{spec.category} sandbox rootless seccomp profile is missing or unsafe"
+            )
         argv.extend(["--security-opt", f"seccomp={seccomp}"])
     if spec.service_network:
         argv.extend(["--network", spec.service_network, "--cap-add", "NET_ADMIN"])
