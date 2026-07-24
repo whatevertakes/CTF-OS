@@ -32,6 +32,9 @@ DELETED_COMMANDS = (
     "prepare" + "-challenge", "sandbox" + "-create", "re" + "play", "in" + "take",
     "tri" + "age-prepare", "resource" + "-request", "sched" + "uler-rebalance",
     "worker" + "-spawn-packet", "submission" + "-result",
+    # Legacy per-lane confirmation commands: native results now flow only through
+    # the single race-reconcile batch.
+    "race-spawn-confirm", "race-stop-confirm",
 )
 
 

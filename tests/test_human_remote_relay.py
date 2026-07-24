@@ -53,6 +53,9 @@ def test_human_relay_omits_declared_targets_without_resolving_them() -> None:
         ("nc definitely-does-not-resolve.invalid 31337",),
         service_network=None,
         remote_execution="human-relay",
+        # A docker binary that cannot exist: if human-relay ever stopped
+        # short-circuiting and tried to resolve, invoking it would raise.
+        docker="/nonexistent/docker-must-not-run",
     )
     assert targets == ()
 

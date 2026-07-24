@@ -39,12 +39,7 @@ def safe_name(value: str, *, fallback: str = "item") -> str:
 def initialize_contest(root: str | Path, contest: str, challenge_key: str) -> dict[str, object]:
     """Create the minimal fresh-schema input location for one challenge."""
     contest_name = unicodedata.normalize("NFKC", contest).strip()
-    if (
-        not contest_name
-        or contest_name in {".", ".."}
-        or any(character in contest_name for character in ("/", "\\", "\0", "\r", "\n"))
-    ):
-        raise ContestError("contest name must be one safe directory name")
+    _reject_unsafe_component(contest_name, kind="contest name", raw=contest)
     category, challenge_name = _parse_heading(challenge_key)
     incoming = Path(root).resolve() / "incoming"
     _ensure_directory(incoming)
@@ -338,7 +333,13 @@ def parse_contest(path: str | Path) -> ContestManifest:
 
 
 def discover_contests(root: str | Path) -> tuple[ContestManifest, ...]:
-    incoming = Path(root).resolve()
+    incoming_raw = Path(root)
+    # Reject a symlinked incoming root before resolving it: resolve() would follow
+    # the link silently and let an attacker select manifests/input from outside
+    # the repository.
+    if incoming_raw.is_symlink():
+        raise ContestError(f"incoming path must not be a symlink: {incoming_raw}")
+    incoming = incoming_raw.resolve()
     if not incoming.is_dir():
         return ()
     manifests: list[ContestManifest] = []
@@ -423,18 +424,38 @@ def _unknown_field_warning(raw: str, normalized: str, line: int, scope: str) -> 
     )
 
 
+def _reject_unsafe_component(value: str, *, kind: str, raw: str) -> None:
+    """Fail closed on any name that is not one safe directory component.
+
+    The value must already be NFKC-normalized so that fullwidth or otherwise
+    compatibility-equivalent separators (．． ／ ＼) have folded to their ASCII
+    form before this check runs.
+    """
+    if not value or value in {".", ".."}:
+        raise ContestError(f"unsafe {kind}: {raw!r}")
+    for character in value:
+        # Explicit path separators plus Unicode control (Cc, includes NUL, CR,
+        # LF, tab, ESC), format (Cf, includes zero-width joiners), and surrogate
+        # (Cs) characters can never appear in a safe single directory name.
+        if character in ("/", "\\", "\0") or unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+            raise ContestError(f"unsafe {kind}: {raw!r}")
+
+
 def _parse_heading(value: str) -> tuple[str, str]:
-    parts = value.split("/", 1)
+    # Normalize the whole heading first so compatibility separators fold into
+    # ASCII before we split or validate; validating raw text would let ／ and
+    # ．． slip past and only become dangerous after a later normalization.
+    normalized = unicodedata.normalize("NFKC", value)
+    parts = normalized.split("/", 1)
     if len(parts) != 2:
         raise ContestError(f"challenge heading must be category/name: {value!r}")
     category_text, name = (part.strip() for part in parts)
-    if not name or name in {".", ".."} or any(c in name for c in ("/", "\\", "\0")):
-        raise ContestError(f"unsafe challenge name: {value!r}")
+    _reject_unsafe_component(name, kind="challenge name", raw=value)
     try:
         category = canonical_category(category_text)
     except ValueError as exc:
         raise ContestError(str(exc)) from exc
-    return category, unicodedata.normalize("NFKC", name)
+    return category, name
 
 
 def _format_pattern(value: str) -> str:

@@ -4,7 +4,8 @@ import ipaddress
 import json
 import re
 import socket
-from collections.abc import Mapping, Sequence
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -25,6 +26,13 @@ _FORBIDDEN_NAMES = {
     "metadata.google.internal", "metadata", "instance-data",
 }
 _METADATA_IPS = frozenset({"169.254.169.254", "fd00:ec2::254", "100.100.100.200"})
+# Docker/Docker-Desktop default bridge gateways. These are always-blocked as a
+# fail-closed floor for offline validation (fingerprinting, parsing) where no
+# live daemon inspection has run yet. The authoritative, complete gateway set is
+# collected at live sandbox preparation by collect_docker_gateways() below, which
+# discovers the real per-network gateways (including custom address pools and
+# IPv6) that this static list cannot know about. Policy: an address that is an
+# actual runtime Docker gateway is rejected even when organizer_declared=true.
 _DOCKER_GATEWAYS = frozenset({"172.17.0.1", "172.18.0.1", "192.168.65.1"})
 _DEFAULT_PORTS = {
     "http": 80, "https": 443, "tls": 443, "websocket": 80, "wss": 443,
@@ -67,12 +75,73 @@ class ResolvedTarget:
         return self.target.to_dict() | {"ip": self.address}
 
 
-def parse_remotes(values: Sequence[str | Mapping[str, Any]]) -> tuple[Target, ...]:
+def collect_docker_gateways(
+    *,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> frozenset[str]:
+    """Read-only inspect every Docker network and return all gateway addresses.
+
+    The result always contains the static default floor and additionally every
+    real IPv4/IPv6 gateway the daemon currently exposes. Raises NetworkPolicyError
+    on any inspection failure so live sandbox preparation fails closed rather than
+    granting egress against an unknown gateway set.
+    """
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return runner(argv, capture_output=True, text=True, timeout=30, check=False)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            raise NetworkPolicyError(f"cannot inspect Docker networks: {exc}") from exc
+
+    listed = _run([docker, "network", "ls", "--format", "{{.ID}}"])
+    if listed.returncode:
+        raise NetworkPolicyError(
+            f"cannot list Docker networks: {(listed.stderr or listed.stdout).strip()}"
+        )
+    ids = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    gateways: set[str] = set(_DOCKER_GATEWAYS)
+    if not ids:
+        return frozenset(gateways)
+    inspected = _run([docker, "network", "inspect", *ids])
+    if inspected.returncode:
+        raise NetworkPolicyError(
+            f"Docker network inspect failed: {(inspected.stderr or inspected.stdout).strip()}"
+        )
+    try:
+        rows = json.loads(inspected.stdout)
+    except json.JSONDecodeError as exc:
+        raise NetworkPolicyError("Docker network inspect returned malformed JSON") from exc
+    if not isinstance(rows, list):
+        raise NetworkPolicyError("Docker network inspect returned an unexpected shape")
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        ipam = row.get("IPAM")
+        configs = ipam.get("Config") if isinstance(ipam, Mapping) else None
+        for config in configs or []:
+            if not isinstance(config, Mapping):
+                continue
+            gateway = config.get("Gateway")
+            if not gateway:
+                continue
+            try:
+                gateways.add(str(ipaddress.ip_address(str(gateway).strip())))
+            except ValueError:
+                continue
+    return frozenset(gateways)
+
+
+def parse_remotes(
+    values: Sequence[str | Mapping[str, Any]],
+    *,
+    blocked_gateways: frozenset[str] = _DOCKER_GATEWAYS,
+) -> tuple[Target, ...]:
     targets: list[Target] = []
     seen: set[tuple[str, int, str]] = set()
     for value in values:
         target = _parse_target(value)
-        _validate_target(target)
+        _validate_target(target, blocked_gateways)
         key = (target.host.casefold().rstrip("."), target.port, target.protocol)
         if key in seen:
             raise NetworkPolicyError(f"duplicate authorized remote: {target.declared!r}")
@@ -81,7 +150,44 @@ def parse_remotes(values: Sequence[str | Mapping[str, Any]]) -> tuple[Target, ..
     return tuple(targets)
 
 
-def resolve_targets(targets: Sequence[Target]) -> tuple[ResolvedTarget, ...]:
+def rebuild_targets(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    blocked_gateways: frozenset[str] = _DOCKER_GATEWAYS,
+) -> tuple[Target, ...]:
+    """Reconstruct declared Targets from immutable stored records (RACE/INPUT).
+
+    Used by bootstrap so a child receives the challenge's targets exactly as they
+    were declared at preparation time, never a value re-read from a mutable
+    manifest after the race started.
+    """
+
+    targets: list[Target] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise NetworkPolicyError("declared target record is malformed")
+        try:
+            port = int(row["port"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NetworkPolicyError("declared target record has no valid port") from exc
+        target = Target(
+            declared=str(row.get("declared", "")),
+            host=str(row.get("host", "")),
+            port=port,
+            scheme=str(row.get("scheme", "tcp")),
+            organizer_declared=bool(row.get("organizer_declared")),
+            callback=bool(row.get("callback")),
+        )
+        _validate_target(target, blocked_gateways)
+        targets.append(target)
+    return tuple(targets)
+
+
+def resolve_targets(
+    targets: Sequence[Target],
+    *,
+    blocked_gateways: frozenset[str] = _DOCKER_GATEWAYS,
+) -> tuple[ResolvedTarget, ...]:
     result: list[ResolvedTarget] = []
     seen: set[tuple[str, int, str]] = set()
     for target in targets:
@@ -95,7 +201,11 @@ def resolve_targets(targets: Sequence[Target]) -> tuple[ResolvedTarget, ...]:
                 address = str(ipaddress.ip_address(record[4][0]))
             except (ValueError, IndexError, TypeError):
                 continue
-            _validate_address(address, organizer_declared=target.organizer_declared)
+            _validate_address(
+                address,
+                organizer_declared=target.organizer_declared,
+                blocked_gateways=blocked_gateways,
+            )
             key = (address, target.port, target.transport)
             if key not in seen:
                 seen.add(key)
@@ -177,7 +287,7 @@ def _parse_target(value: str | Mapping[str, Any]) -> Target:
     raise NetworkPolicyError(f"unsupported remote declaration: {raw_text!r}")
 
 
-def _validate_target(target: Target) -> None:
+def _validate_target(target: Target, blocked_gateways: frozenset[str]) -> None:
     if target.protocol not in PROTOCOLS and target.scheme != "nc":
         raise NetworkPolicyError(f"unsupported remote protocol: {target.protocol!r}")
     if not 1 <= target.port <= 65535:
@@ -191,14 +301,23 @@ def _validate_target(target: Target) -> None:
         if not _HOST.fullmatch(target.host):
             raise NetworkPolicyError(f"unsafe or malformed remote host: {target.host!r}")
         return
-    _validate_address(target.host, organizer_declared=target.organizer_declared)
+    _validate_address(
+        target.host,
+        organizer_declared=target.organizer_declared,
+        blocked_gateways=blocked_gateways,
+    )
 
 
-def _validate_address(value: str, *, organizer_declared: bool) -> None:
+def _validate_address(
+    value: str, *, organizer_declared: bool, blocked_gateways: frozenset[str] = _DOCKER_GATEWAYS
+) -> None:
     address = ipaddress.ip_address(value)
-    if str(address) in _METADATA_IPS:
+    canonical = str(address)
+    if canonical in _METADATA_IPS:
         raise NetworkPolicyError(f"cloud metadata endpoint is always forbidden: {value}")
-    if str(address) in _DOCKER_GATEWAYS:
+    # A real Docker gateway is forbidden even for organizer-declared private
+    # targets: reaching it means reaching a service on the host.
+    if canonical in blocked_gateways:
         raise NetworkPolicyError(f"Docker host gateway is always forbidden: {value}")
     if address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
         raise NetworkPolicyError(f"remote address is not permitted unicast: {value}")

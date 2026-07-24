@@ -36,6 +36,11 @@ def utc_now() -> str:
 def safe_under(root: Path, relative: Path) -> Path:
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         raise WorkspaceError(f"unsafe relative path: {relative}")
+    # A symlinked base (e.g. a swapped output/ directory) would let resolve()
+    # anchor the whole computation outside the repository, so reject it before
+    # resolving.
+    if root.is_symlink():
+        raise WorkspaceError(f"workspace base must not be a symlink: {root}")
     base = root.resolve()
     target = (base / relative).resolve(strict=False)
     try:

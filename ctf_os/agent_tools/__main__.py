@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -49,7 +51,12 @@ from ..race import (
 from ..race import (
     status as race_status,
 )
-from ..sandbox.network import parse_remotes, resolve_targets
+from ..sandbox.network import (
+    collect_docker_gateways,
+    parse_remotes,
+    rebuild_targets,
+    resolve_targets,
+)
 from ..sandbox.resources import sandbox_gc
 from ..sandbox.runtime import (
     SandboxError,
@@ -82,7 +89,7 @@ from ..service import (
     load_service,
     prepare_service,
 )
-from ..workspace import clear_active, create_run, resolve_run, utc_now
+from ..workspace import atomic_json, clear_active, create_run, resolve_run, utc_now
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,11 +136,6 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--lanes-file")
     bootstrap.add_argument("--docker", default="docker")
 
-    confirm = commands.add_parser("race-spawn-confirm", help="record the native thread identity returned by Root")
-    confirm.add_argument("--run-id")
-    confirm.add_argument("--lane", required=True)
-    confirm.add_argument("--native-session", required=True)
-
     endgame = commands.add_parser("race-endgame", help="prepare the single qualified post-minute-60 Sol max replacement")
     endgame.add_argument("--run-id")
     endgame.add_argument("--replaces-lane", required=True)
@@ -143,12 +145,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("race-status", help="return mechanical progress, duplicate, and stagnation signals")
     show.add_argument("--run-id")
-
-    stop = commands.add_parser("race-stop-confirm", help="confirm that Root interrupted one native child")
-    stop.add_argument("--run-id")
-    stop.add_argument("--lane", required=True)
-    stop.add_argument("--native-session", required=True)
-    stop.add_argument("--docker", default="docker")
 
     reconcile = commands.add_parser(
         "race-reconcile",
@@ -261,21 +257,10 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         return _race_prepare(repo, args)
     if args.command == "race-bootstrap":
         return _race_bootstrap(repo, args)
-    if args.command == "race-spawn-confirm":
-        run = resolve_run(repo, args.run_id)
-        return confirm_native_spawn(run, lane_id=args.lane, native_session=args.native_session)
     if args.command == "race-endgame":
         return _race_endgame(repo, args)
     if args.command == "race-status":
         return race_status(resolve_run(repo, args.run_id))
-    if args.command == "race-stop-confirm":
-        run = resolve_run(repo, args.run_id)
-        return _stop_and_cleanup_lane(
-            run,
-            lane_id=args.lane,
-            native_session=args.native_session,
-            docker=args.docker,
-        )
     if args.command == "race-reconcile":
         return _race_reconcile(repo, args)
     if args.command == "race-lane-cleanup":
@@ -412,6 +397,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 str(service["network"]) if service.get("status") == "READY" else None
             ),
             remote_execution=str(race.get("remote_execution", "agent")),
+            docker=args.docker,
         )
         artifact_inbox = register_artifact_inbox(run, "root")
         root_sandbox = _create_sandbox(SandboxSpec(
@@ -472,11 +458,17 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
-    manifest, challenge = _select(repo, args.contest, args.selector)
+    # Resolve the exact active run from the immutable active pointer first, then
+    # confirm the CLI selector points at that run's fixed challenge identity. The
+    # bootstrap payload is built only from RUN/RACE/INPUT state captured at
+    # preparation time, never from the mutable contest.md, so a post-preparation
+    # manifest edit (e.g. a swapped remote or category) can never reach a child.
     run = resolve_run(repo)
     race = load_race(run)
-    if race["challenge"]["id"] != challenge.id or race["contest"]["slug"] != manifest.slug:
-        raise ValueError("selector does not match the exact active race")
+    _require_active_race_selector(race, args.contest, args.selector)
+    contest_slug = str(race["contest"]["slug"])
+    challenge_id = str(race["challenge"]["id"])
+    category = str(race["challenge"]["category"])
     specifications = _lane_json(args)
     reserved = reserve_lanes(run, specifications)
     source, input_record = validate_prepared_input(run)
@@ -484,10 +476,13 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     root_service_endpoints = tuple(
         str(value) for value in race.get("service_endpoints", [])
     )
-    targets = _agent_targets(
-        challenge.remotes,
-        service_network=str(root_service_network) if root_service_network else None,
-        remote_execution=str(race.get("remote_execution", "agent")),
+    targets = (
+        ()
+        if (
+            root_service_network
+            or str(race.get("remote_execution", "agent")) == "human-relay"
+        )
+        else _resolve_stored_targets(race.get("declared_targets", []), docker=args.docker)
     )
     packets: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -504,7 +499,7 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 lane_service = prepare_service(
                     ServiceSpec(
                         run_id=run.name,
-                        challenge_id=challenge.id,
+                        challenge_id=challenge_id,
                         source=source,
                         run_root=run,
                         plan=input_record["service_plan"],
@@ -527,9 +522,9 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             )
             metadata = _create_sandbox(SandboxSpec(
                 run_id=run.name,
-                contest_slug=manifest.slug,
-                challenge_id=challenge.id,
-                category=challenge.category,
+                contest_slug=contest_slug,
+                challenge_id=challenge_id,
+                category=category,
                 lane_id=str(lane["lane_id"]),
                 source=source,
                 lane_root=run / "workers" / str(lane["lane_id"]),
@@ -550,6 +545,17 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             packets.append(attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata))
         except Exception as exc:  # noqa: BLE001
             cleanup_errors: list[str] = []
+            # A service that failed to start AND to fully roll back arrives as a
+            # ServiceCleanupError carrying a structured recovery record; persist it
+            # so the lane stays CLEANUP_FAILED and race-lane-cleanup can reclaim it.
+            if isinstance(exc, ServiceCleanupError):
+                cleanup_errors.extend(str(value) for value in exc.failures)
+                try:
+                    _persist_child_service_recovery(
+                        run, str(lane["lane_id"]), exc.service
+                    )
+                except Exception as recovery_exc:  # noqa: BLE001
+                    cleanup_errors.append(f"service recovery write: {recovery_exc}")
             if metadata is not None:
                 try:
                     cleanup(metadata, docker=args.docker)
@@ -614,6 +620,7 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
         remotes,
         service_network=str(service_network) if service_network else None,
         remote_execution=str(race.get("remote_execution", "agent")),
+        docker=args.docker,
     )
     lane_service: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
@@ -781,16 +788,35 @@ def _session_read(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
     race = load_race(run)
     lane = next(row for row in race["lanes"] if row["lane_id"] == metadata["lane_id"])
     detector = StreamingDetector(str(race.get("flag_pattern") or ""))
+    # Seed the detector with the previous read's durable tail so a flag split
+    # across two receipts (e.g. "CTF{sp" then "lit}") is still detected.
+    prior_tail = str(receipt.get("session_prior_tail") or "")
+    if prior_tail:
+        detector.buffer = prior_tail
     candidate = detector.feed(str(receipt["observed_output"]))
     winner = None
     if candidate:
-        winner = record_candidate(
-            run,
-            lane_id=str(metadata["lane_id"]),
-            attack_family=str(lane["attack_family"]),
-            candidate=candidate,
-            receipt=receipt,
-        )
+        current_output = str(receipt["observed_output"])
+        if candidate in current_output:
+            winner = record_candidate(
+                run,
+                lane_id=str(metadata["lane_id"]),
+                attack_family=str(lane["attack_family"]),
+                candidate=candidate,
+                receipt=receipt,
+            )
+        else:
+            winner = record_candidate(
+                run,
+                lane_id=str(metadata["lane_id"]),
+                attack_family=str(lane["attack_family"]),
+                candidate=candidate,
+                receipt=receipt,
+                boundary={
+                    "receipt_id": receipt.get("session_prior_receipt_id"),
+                    "tail": prior_tail,
+                },
+            )
     warnings: list[str] = []
     try:
         note_command_receipt(run, receipt)
@@ -1033,6 +1059,10 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     race = load_race(run)
     if race["status"] not in {"WON", "TIMED_OUT", "HANDOFF", "STOPPED"}:
         raise ValueError("race cleanup requires a terminal race state")
+    # Every native child that was ever spawned — winner or not — must carry a
+    # native_stopped_at stop proof and be in a cleanup-terminal lane state before
+    # controller cleanup may touch it. The lane status name alone (including a
+    # child that found the flag) is never sufficient.
     unresolved_native = [
         {
             "lane_id": str(lane.get("lane_id")),
@@ -1044,11 +1074,8 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
         and lane.get("lane_id") != "root"
         and lane.get("native_session")
         and not (
-            lane.get("status") in {"STOPPED", "WON"}
-            or (
-                lane.get("status") == "CLEANUP_FAILED"
-                and lane.get("native_stopped_at")
-            )
+            lane.get("native_stopped_at")
+            and lane.get("status") in {"STOPPED", "CLEANUP_FAILED"}
         )
     ]
     pending_cancel_targets = cancel_targets(race)
@@ -1208,10 +1235,11 @@ def _agent_targets(
     *,
     service_network: str | None,
     remote_execution: str,
+    docker: str,
 ):
     if service_network or remote_execution == "human-relay":
         return ()
-    return resolve_targets(parse_remotes(remotes))
+    return _resolve_declared_targets(remotes, docker=docker)
 
 
 def _selection_args(parser: argparse.ArgumentParser) -> None:
@@ -1252,6 +1280,69 @@ def _optional_remainder(values: Sequence[str]) -> list[str] | None:
     if result[:1] == ["--"]:
         result = result[1:]
     return result or None
+
+
+def _resolve_declared_targets(remotes: Sequence[Any], *, docker: str):
+    """Resolve declared remotes against the live Docker gateway set (fail closed)."""
+
+    if not remotes:
+        return ()
+    blocked = collect_docker_gateways(docker=docker)
+    return resolve_targets(
+        parse_remotes(remotes, blocked_gateways=blocked), blocked_gateways=blocked
+    )
+
+
+def _resolve_stored_targets(declared_targets: Sequence[Any], *, docker: str):
+    """Resolve immutable stored target records against the live Docker gateways."""
+
+    if not declared_targets:
+        return ()
+    blocked = collect_docker_gateways(docker=docker)
+    return resolve_targets(
+        rebuild_targets(declared_targets, blocked_gateways=blocked),
+        blocked_gateways=blocked,
+    )
+
+
+def _persist_child_service_recovery(
+    run: Path, lane_id: str, recovery: Mapping[str, Any]
+) -> None:
+    """Write a child lane's CLEANUP_FAILED service recovery record for later retry."""
+
+    expected = (run / "service" / "instances" / lane_id / "service.json").resolve()
+    if Path(str(recovery.get("metadata_path", ""))).resolve() != expected:
+        raise ValueError("service recovery record does not belong to this lane")
+    atomic_json(expected, dict(recovery))
+
+
+def _require_active_race_selector(
+    race: Mapping[str, Any], contest_selector: str | None, challenge_selector: str
+) -> None:
+    """Confirm the CLI selector names the active run without reading the manifest."""
+
+    contest = race.get("contest", {})
+    if contest_selector:
+        key = unicodedata.normalize("NFKC", contest_selector).strip().casefold()
+        if key not in {
+            str(contest.get("name", "")).casefold(),
+            str(contest.get("slug", "")).casefold(),
+        }:
+            raise ValueError("selector contest does not match the exact active race")
+    challenge = race.get("challenge", {})
+    raw = unicodedata.normalize("NFKC", challenge_selector).strip()
+    number = re.fullmatch(r"0*([1-9][0-9]*)\s*(?:번(?:\s*문제)?)?", raw)
+    if number:
+        matched = str(challenge.get("number")) == number.group(1)
+    else:
+        folded = raw.casefold()
+        matched = folded in {
+            str(challenge.get("key", "")).casefold(),
+            str(challenge.get("id", "")).casefold(),
+            str(challenge.get("name", "")).casefold(),
+        }
+    if not matched:
+        raise ValueError("selector does not match the exact active race")
 
 
 def _resource_profile(input_record: Mapping[str, Any]) -> str:

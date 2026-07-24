@@ -10,18 +10,29 @@ if (( ${#PROFILES[@]} == 0 )); then PROFILES=("${ALL_PROFILES[@]}"); fi
   echo "Unsupported host OS: sandbox images require Ubuntu or Kali Linux x86_64." >&2
   exit 65
 }
-if [[ ! -r /etc/os-release ]]; then
-  echo "Unsupported Linux distribution: cannot read /etc/os-release (Ubuntu or Kali Linux x86_64 required)." >&2
-  exit 65
+if [[ -r /etc/os-release ]]; then
+  source /etc/os-release
+else
+  echo "WARNING: cannot read /etc/os-release; continuing (sandbox images build inside a pinned debian:12 container, so the host distro rarely matters)." >&2
 fi
-source /etc/os-release
-case "${ID:-}" in
-  ubuntu|kali) ;;
-  *) echo "Unsupported Linux distribution: sandbox images require Ubuntu or Kali Linux x86_64." >&2; exit 65 ;;
+: "${ID:=unknown}"
+# The whole toolchain is built inside the pinned debian:12-slim base, so the host
+# distribution is almost never relevant. Accept the Debian/Ubuntu/Kali family
+# outright and only warn (never abort) for anything else.
+case "${ID}" in
+  ubuntu|kali|debian) ;;
+  *)
+    if [[ " ${ID_LIKE:-} " == *debian* || " ${ID_LIKE:-} " == *ubuntu* ]]; then
+      :
+    else
+      echo "WARNING: untested host distribution '${ID}'; sandbox images build inside a pinned debian:12 container, so this is usually fine." >&2
+    fi
+    ;;
 esac
+# Architecture, unlike distro, is load-bearing: the images are linux/amd64 only.
 case "$(uname -m)" in
   x86_64|amd64) ;;
-  *) echo "Unsupported host architecture: sandbox images require Ubuntu or Kali Linux x86_64." >&2; exit 65 ;;
+  *) echo "Unsupported host architecture: sandbox images are linux/amd64 only (found $(uname -m))." >&2; exit 65 ;;
 esac
 HOST_DISTRIBUTION="${ID^^}"
 if [[ "$(uname -r)" == *[Mm]icrosoft* || -n "${WSL_INTEROP:-}" ]]; then
@@ -98,14 +109,17 @@ if [[ -z "$daemon" || "$docker_os" != "linux" || ! "$docker_arch" =~ ^(x86_64|am
   exit 69
 fi
 
+# Building images never invokes Compose; only the runtime (doctor + challenge
+# service startup) needs it. So a missing/old plugin is a warning here, not a
+# hard stop — a minimal Docker Engine can still build every image.
 if ! compose="$(docker compose version --short 2>&1)"; then
-  echo "Docker Compose v2 plugin is unavailable: $compose" >&2
-  exit 69
-fi
-compose_major="${compose#v}"; compose_major="${compose_major%%.*}"
-if [[ "$compose_major" != "2" ]]; then
-  echo "Docker Compose v2 plugin is required (found: ${compose:-unknown})." >&2
-  exit 69
+  echo "WARNING: Docker Compose v2 plugin not detected ($compose). Not needed to build images, but 'doctor' and challenge-service startup require Compose v2 (>=2.24) at contest time." >&2
+  compose="absent"
+else
+  compose_major="${compose#v}"; compose_major="${compose_major%%.*}"
+  if [[ "$compose_major" != "2" ]]; then
+    echo "WARNING: Docker Compose v2 recommended (found: ${compose:-unknown}); not needed to build images but required by 'doctor' at contest time." >&2
+  fi
 fi
 docker build --help >/dev/null 2>&1 || { echo "docker build is unavailable for the current daemon/CLI." >&2; exit 69; }
 docker run --help >/dev/null 2>&1 || { echo "docker run is unavailable for the current daemon/CLI." >&2; exit 69; }

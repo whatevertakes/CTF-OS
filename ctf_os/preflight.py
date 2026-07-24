@@ -237,9 +237,10 @@ def detect_service(input_root: Path, category: str) -> dict[str, Any]:
                 "review_reasons": ["Dockerfile has no declared service port and remains input-only"],
             }
         bases, base_reasons = _dockerfile_bases(text)
+        reasons = base_reasons + _dockerfile_hazards(text)
         return {
             "kind": "dockerfile",
-            "safe": not base_reasons,
+            "safe": not reasons,
             "source": relative.as_posix(),
             "context": relative.parent.as_posix() or ".",
             "base_images": bases,
@@ -248,7 +249,7 @@ def detect_service(input_root: Path, category: str) -> dict[str, Any]:
                 "ports": ports,
                 "endpoints": _endpoints("challenge", ports, category),
             }],
-            "review_reasons": base_reasons,
+            "review_reasons": reasons,
         }
     return {"kind": "none", "safe": True, "services": [], "review_reasons": []}
 
@@ -296,6 +297,9 @@ def _compose_plan(input_root: Path, path: Path, category: str) -> dict[str, Any]
             "credential_spec", "device_cgroup_rules", "extends", "label_file",
             "gpus", "group_add", "cgroup_parent", "sysctls", "ulimits",
             "oom_score_adj", "isolation", "volume_driver",
+            # Compose lifecycle hooks run extra commands (optionally privileged or
+            # as another user) around the service and must never be honored.
+            "post_start", "pre_stop",
         ):
             if raw.get(key):
                 reasons.append(f"service {name} requests unsafe {key}")
@@ -408,6 +412,41 @@ def _dockerfile_ports(text: str) -> list[int]:
     return sorted(result)
 
 
+def _dockerfile_hazards(text: str) -> list[str]:
+    """Reject Dockerfile instructions that reach outside the isolated build.
+
+    Only FROM was previously analyzed, so a remote ADD, an external COPY --from
+    image, or a dynamic fetch instruction could silently pull from an undeclared
+    URL or registry during the live Solve build.
+    """
+
+    reasons: list[str] = []
+    stages: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        from_match = re.match(r"^FROM\s+.+?(?:\s+AS\s+(\S+))?\s*$", line, re.IGNORECASE)
+        if from_match and from_match.group(1):
+            stages.add(from_match.group(1).casefold())
+        upper = line.upper()
+        if upper.startswith("ADD "):
+            tokens = [token for token in line.split()[1:] if not token.startswith("--")]
+            sources = tokens[:-1] if len(tokens) > 1 else tokens
+            for source in sources:
+                if re.match(r"(?i)^(?:https?|git|ftp)://", source):
+                    reasons.append("Dockerfile ADD fetches a remote URL")
+                if "$" in source:
+                    reasons.append("Dockerfile ADD uses a dynamic source")
+        if upper.startswith("COPY "):
+            from_ref = re.search(r"(?i)(?:^|\s)--from=(\S+)", line)
+            if from_ref:
+                ref = from_ref.group(1).casefold()
+                if ref not in stages and not ref.isdigit():
+                    reasons.append("Dockerfile COPY --from references an external image")
+    return sorted(set(reasons))
+
+
 def _dockerfile_bases(text: str) -> tuple[list[str], list[str]]:
     images: list[str] = []
     stages: set[str] = set()
@@ -440,10 +479,15 @@ def _compose_build(
         dockerfile_value = str(value.get("dockerfile", "Dockerfile"))
         for key in (
             "ssh", "secrets", "additional_contexts", "entitlements",
-            "dockerfile_inline",
+            "dockerfile_inline", "privileged", "extra_hosts", "cache_to",
+            "ulimits", "shm_size", "isolation", "tags",
         ):
             if value.get(key):
                 reasons.append(f"build requests {key}")
+        # A build network other than the enforced "none" would let the image
+        # build reach the host or the internet during the live Solve.
+        if value.get("network") not in (None, "none"):
+            reasons.append("build requests a non-isolated network")
     else:
         return [], ["build must be a local string or mapping"]
     if not _compose_reference_is_scoped(input_root, compose_root, context_value, file=False):
@@ -461,7 +505,7 @@ def _compose_build(
     except PreflightError as exc:
         return [], reasons + [str(exc)]
     bases, base_reasons = _dockerfile_bases(text)
-    return bases, reasons + base_reasons
+    return bases, reasons + base_reasons + _dockerfile_hazards(text)
 
 
 def _read_service_descriptor(path: Path, *, errors: str = "strict") -> str:

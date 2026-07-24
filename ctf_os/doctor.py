@@ -11,6 +11,7 @@ from typing import Any
 
 from .categories import CATEGORIES
 from .images import smoke_images
+from .sandbox.gpu import HOST_GPU_QUERY, NVIDIA_DRIVER_CAPABILITIES
 
 PROFILES = CATEGORIES
 IMAGES = tuple(f"ctf-os-sandbox:{profile}" for profile in PROFILES)
@@ -171,15 +172,9 @@ def _gpu_checks(
             "detail": detail[-8_000:],
         })
 
-    host = _run(
-        runner,
-        [
-            "nvidia-smi",
-            "--query-gpu=index,name,driver_version",
-            "--format=csv,noheader,nounits",
-        ],
-        timeout=20,
-    )
+    # Shared with the live runtime's admission probe so diagnostics and execution
+    # can never disagree about the host GPU.
+    host = _run(runner, list(HOST_GPU_QUERY), timeout=20)
     host_detail = (host.stdout or host.stderr).strip()
     no_gpu = (
         host.returncode == 127
@@ -292,7 +287,7 @@ def _gpu_image_probe(
         "--env",
         "XDG_DATA_HOME=/work/.local/share",
         "--env",
-        "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        f"NVIDIA_DRIVER_CAPABILITIES={NVIDIA_DRIVER_CAPABILITIES}",
         "--entrypoint",
         command[0],
         f"ctf-os-sandbox:{profile}",

@@ -176,12 +176,10 @@ def test_native_stop_confirmation_cleans_private_sandbox_before_replacement(
         return {"container": metadata["name"], "removed": True, "already_absent": False}
 
     monkeypatch.setattr(cli, "cleanup", fake_cleanup)
-    result = cli.dispatch(
-        argparse.Namespace(
-            command="race-stop-confirm", run_id=run.name, lane=lane["lane_id"],
-            native_session="thread-stop", docker="docker",
-        ),
-        repo,
+    # Native interrupt results are applied only through the reconcile path's
+    # internal stop+cleanup routine (no legacy race-stop-confirm subcommand).
+    result = cli._stop_and_cleanup_lane(
+        run, lane_id=lane["lane_id"], native_session="thread-stop", docker="docker",
     )
     assert result["lane"]["status"] == "STOPPED"
     assert result["sandbox_cleanup"]["removed"] is True
@@ -247,12 +245,15 @@ def test_cleanup_failure_keeps_slot_until_retry_succeeds(
         }
 
     monkeypatch.setattr(cli, "cleanup", flaky_cleanup)
-    stop_args = argparse.Namespace(
-        command="race-stop-confirm", run_id=run.name, lane=old["lane_id"],
-        native_session="thread-cleanup-retry", docker="docker",
-    )
+
+    def _stop():
+        return cli._stop_and_cleanup_lane(
+            run, lane_id=old["lane_id"],
+            native_session="thread-cleanup-retry", docker="docker",
+        )
+
     with pytest.raises(RuntimeError, match="docker rm failed"):
-        cli.dispatch(stop_args, repo)
+        _stop()
     failed = next(
         row for row in load_race(run)["lanes"]
         if row["lane_id"] == old["lane_id"]
@@ -262,7 +263,7 @@ def test_cleanup_failure_keeps_slot_until_retry_succeeds(
     with pytest.raises(RaceError, match="concurrency four"):
         reserve_lanes(run, [_spec("replacement-blocked")])
 
-    retried = cli.dispatch(stop_args, repo)
+    retried = _stop()
     assert retried["lane"]["status"] == "STOPPED"
     assert retried["lane"]["cleanup_attempts"] == 2
     assert attempts == 2

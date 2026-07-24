@@ -64,7 +64,16 @@ def test_first_target_observed_candidate_wins_atomically_and_returns_sibling_can
     assert first["first"] is True
     assert first["display"] == "CTF{first}"
     assert first["manual_submission_required"] is True
-    assert first["cancel_targets"] == [{"lane_id": lanes[1]["lane_id"], "native_session": "thread-1"}]
+    # M4: the winning native child is still a live thread and must be interrupted
+    # alongside its siblings, so it appears in the returned cancel targets too.
+    assert first["cancel_targets"] == [
+        {"lane_id": lanes[0]["lane_id"], "native_session": "thread-0"},
+        {"lane_id": lanes[1]["lane_id"], "native_session": "thread-1"},
+    ]
+    winner_lane = next(
+        row for row in load_race(run)["lanes"] if row["lane_id"] == lanes[0]["lane_id"]
+    )
+    assert winner_lane["status"] == "CANCEL_REQUIRED"
     second_receipt = _receipt(run, challenge, lanes[1]["lane_id"], "CTF{second}", receipt_id="flag-two")
     second = record_candidate(
         run, lane_id=lanes[1]["lane_id"], attack_family=lanes[1]["attack_family"],

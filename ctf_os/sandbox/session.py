@@ -17,6 +17,13 @@ from .runtime import firewall_packets, user_exec_prefix
 
 SESSION_KINDS = frozenset({"shell", "remote", "debugger"})
 MAX_READ = 64 * 1024
+# A verified flag is at most this long, so carrying this many trailing bytes of
+# the previous durable read output is enough to detect a flag that straddles two
+# session-read receipts without re-emitting already-returned output.
+MAX_FLAG_TAIL = 1024
+# The in-container monitor refreshes the heartbeat every 2s while the session
+# process is alive; 30s of silence means the process (and its monitor) is gone.
+SESSION_HEARTBEAT_STALE_SECONDS = 30
 _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
 
 _TOOLS: dict[str, tuple[str, ...]] = {
@@ -391,11 +398,21 @@ def open_session(
     container_dir = f"/work/.ctf-sessions/{session_id}"
     observed_identity = target_identity or f"challenge:{metadata['challenge_id']}"
     packets_before = firewall_packets(metadata, observed_identity, docker=docker)
+    # A bounded monitor refreshes "<epoch> <pid> <starttime>" into a lane-private
+    # heartbeat file while the session process is alive, and drops an "exit"
+    # marker when it dies. The controller trusts only a fresh heartbeat whose pid
+    # matches, so a session that exited (or whose PID was reused) can never keep
+    # suppressing stagnation forever.
     shell = (
         "set -eu; d=$1; shift; ulimit -f 131072; "
         "mkdir -p \"$d\"; mkfifo \"$d/in\"; : >\"$d/out\"; "
         "(tail -f /dev/null >\"$d/in\") & echo $! >\"$d/keeper\"; "
-        "setsid \"$@\" <\"$d/in\" >>\"$d/out\" 2>&1 & echo $! >\"$d/pid\""
+        "setsid \"$@\" <\"$d/in\" >>\"$d/out\" 2>&1 & p=$!; echo \"$p\" >\"$d/pid\"; "
+        "st=$(awk 'NR==1{print $22}' \"/proc/$p/stat\" 2>/dev/null || echo 0); "
+        "echo \"$st\" >\"$d/starttime\"; "
+        "( while kill -0 \"$p\" 2>/dev/null; do "
+        "echo \"$(date +%s) $p $st\" >\"$d/heartbeat\"; sleep 2; done; "
+        "echo dead >\"$d/exit\" ) & echo $! >\"$d/monitor\""
     )
     result = _run(
         runner,
@@ -419,6 +436,12 @@ def open_session(
         "target_identity": observed_identity,
         "target_packets_before": packets_before,
         "container_dir": container_dir,
+        # Host-side view of the lane-private heartbeat/exit markers written by the
+        # in-container monitor above (relative to the lane root's /work mount).
+        "heartbeat_relpath": f"work/.ctf-sessions/{session_id}/heartbeat",
+        "exit_relpath": f"work/.ctf-sessions/{session_id}/exit",
+        "pid": None,
+        "pid_start_time": None,
         "cursor": 0,
         "status": "RUNNING",
         "opened_at": _now(),
@@ -466,6 +489,10 @@ def read(
     if limit < 1 or limit > MAX_READ:
         raise SessionError("session read limit must be between 1 and 65536 bytes")
     state = _load_state(metadata, session_id)
+    # The bounded tail of the previous durable read lets the caller detect a flag
+    # that straddles this read's boundary, provably backed by that prior receipt.
+    prior_tail = str(state.get("detector_tail", "") or "")
+    prior_tail_receipt_id = state.get("detector_tail_receipt_id")
     started_at = _now()
     script = (
         "import pathlib,sys; p=pathlib.Path(sys.argv[1]); o=int(sys.argv[2]); n=int(sys.argv[3]); "
@@ -499,10 +526,24 @@ def read(
             and int(packets_after) > int(state["target_packets_before"])
         )
     )
+    liveness = session_liveness(
+        Path(str(metadata["lane_root"])), state, now_epoch=datetime.now(UTC).timestamp()
+    )
+    receipt_id = uuid.uuid4().hex
     state["cursor"] = cursor_before + chunk_bytes
     state["last_read_at"] = _now()
+    # Carry this read's trailing bytes forward so the next read can detect a flag
+    # that begins here and completes there; the receipt id ties the tail to this
+    # durable output for tamper-evident boundary verification.
+    state["detector_tail"] = output[-MAX_FLAG_TAIL:]
+    state["detector_tail_receipt_id"] = receipt_id
+    # Draining a dead session's buffered output stays valid, but once the process
+    # has exited we reflect STOPPED so it never reads as infinitely RUNNING.
+    if liveness.get("reason") == "exited":
+        state["status"] = "STOPPED"
+        state["stopped_at"] = _now()
+        state["stopped_reason"] = "process-exited"
     atomic_json(_state_path(Path(str(metadata["lane_root"])), session_id), state)
-    receipt_id = uuid.uuid4().hex
     logs = Path(str(metadata["lane_root"])) / "logs"
     output_path = logs / f"{receipt_id}.session.txt"
     atomic_text(output_path, output)
@@ -523,6 +564,9 @@ def read(
         "started_at": started_at,
         "finished_at": _now(),
         "session_id": session_id,
+        "session_live": bool(liveness["live"]),
+        "session_prior_tail": prior_tail,
+        "session_prior_receipt_id": prior_tail_receipt_id,
         "output_truncated": total_bytes > int(state["cursor"]),
         "output_artifact": str(output_path.relative_to(Path(str(metadata["lane_root"])))),
     }
@@ -538,7 +582,9 @@ def close_session(
     docker: str = "docker",
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
-    state = _load_state(metadata, session_id)
+    # Idempotent: a session that already reached STOPPED can be closed again to
+    # retry resource cleanup without erroring.
+    state = _load_state(metadata, session_id, require_running=False)
     script = (
         "d=$1; for f in pid keeper; do p=$(cat \"$d/$f\" 2>/dev/null || true); "
         "[ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null || true; done; "
@@ -560,16 +606,26 @@ def close_session(
 
 
 def list_sessions(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
-    root = Path(str(metadata["lane_root"])) / "sessions"
+    lane_root = Path(str(metadata["lane_root"]))
+    root = lane_root / "sessions"
     if not root.exists():
         return []
     if root.is_symlink() or not root.is_dir():
         raise SessionError("session state directory is unsafe")
+    now_epoch = datetime.now(UTC).timestamp()
     rows = []
     for path in sorted(root.glob("*.json")):
         if path.is_symlink():
             raise SessionError("session state contains a symlink")
-        rows.append(json.loads(path.read_text(encoding="utf-8")))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            liveness = session_liveness(lane_root, value, now_epoch=now_epoch)
+            value["live"] = bool(liveness["live"])
+            # A RUNNING record whose process has exited is reflected as STOPPED so
+            # it never reads as an infinitely live session.
+            if value.get("status") == "RUNNING" and liveness.get("reason") == "exited":
+                _mark_session_stopped(metadata, value)
+        rows.append(value)
     return rows
 
 
@@ -602,7 +658,60 @@ def tool_version(
     return {"tool": name, "available": result.returncode == 0, "output": (result.stdout + result.stderr)[-4096:]}
 
 
-def _load_state(metadata: Mapping[str, Any], session_id: str) -> dict[str, Any]:
+def session_liveness(
+    lane_root: Path, state: Mapping[str, Any], *, now_epoch: float
+) -> dict[str, Any]:
+    """Return the real liveness of one persistent session from its heartbeat.
+
+    A session is live only when a fresh, well-formed heartbeat exists whose PID
+    matches any recorded identity. A missing/stale heartbeat, an exit marker, a
+    malformed record, or a PID mismatch all mean the session is not live.
+    """
+
+    session_id = str(state.get("session_id", ""))
+    if not _SESSION_ID.fullmatch(session_id):
+        return {"live": False, "reason": "invalid-session-id"}
+    if str(state.get("status")) != "RUNNING":
+        return {"live": False, "reason": "not-running"}
+    base = (Path(lane_root).resolve() / "work" / ".ctf-sessions" / session_id)
+    exit_marker = base / "exit"
+    heartbeat = base / "heartbeat"
+    if exit_marker.is_symlink():
+        return {"live": False, "reason": "unsafe-exit-marker"}
+    if exit_marker.is_file():
+        return {"live": False, "reason": "exited"}
+    if heartbeat.is_symlink() or not heartbeat.is_file():
+        return {"live": False, "reason": "no-heartbeat"}
+    try:
+        parts = heartbeat.read_text(encoding="utf-8", errors="replace").strip().split()
+    except OSError:
+        return {"live": False, "reason": "unreadable-heartbeat"}
+    if len(parts) < 3:
+        return {"live": False, "reason": "malformed-heartbeat"}
+    try:
+        epoch = float(parts[0])
+        pid = int(parts[1])
+    except ValueError:
+        return {"live": False, "reason": "malformed-heartbeat"}
+    start_time = parts[2]
+    if pid <= 0:
+        return {"live": False, "reason": "missing-pid"}
+    expected_pid = state.get("pid")
+    if expected_pid is not None and int(expected_pid) != pid:
+        return {"live": False, "reason": "pid-mismatch"}
+    expected_start = state.get("pid_start_time")
+    if expected_start is not None and str(expected_start) != start_time:
+        return {"live": False, "reason": "pid-reused"}
+    if now_epoch - epoch > SESSION_HEARTBEAT_STALE_SECONDS:
+        return {"live": False, "reason": "stale-heartbeat", "heartbeat_at": epoch}
+    return {
+        "live": True, "pid": pid, "pid_start_time": start_time, "heartbeat_at": epoch,
+    }
+
+
+def _load_state(
+    metadata: Mapping[str, Any], session_id: str, *, require_running: bool = True
+) -> dict[str, Any]:
     _validate_session_id(session_id)
     path = _state_path(Path(str(metadata["lane_root"])), session_id)
     if path.is_symlink() or not path.is_file():
@@ -612,9 +721,22 @@ def _load_state(metadata: Mapping[str, Any], session_id: str) -> dict[str, Any]:
         raise SessionError("persistent session schema is unsupported")
     if value.get("run_id") != metadata.get("run_id") or value.get("lane_id") != metadata.get("lane_id"):
         raise SessionError("persistent session identity mismatch")
-    if value.get("status") != "RUNNING":
+    if require_running and value.get("status") != "RUNNING":
         raise SessionError("persistent session is not running")
     return value
+
+
+def _mark_session_stopped(metadata: Mapping[str, Any], state: dict[str, Any]) -> None:
+    """Atomically reflect that a session process has exited."""
+
+    if state.get("status") != "RUNNING":
+        return
+    state["status"] = "STOPPED"
+    state["stopped_at"] = _now()
+    state["stopped_reason"] = "process-exited"
+    atomic_json(
+        _state_path(Path(str(metadata["lane_root"])), str(state["session_id"])), state
+    )
 
 
 def _state_path(lane_root: Path, session_id: str) -> Path:

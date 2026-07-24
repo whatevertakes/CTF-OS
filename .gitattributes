@@ -1,0 +1,16 @@
+# Normalize line endings to LF on checkout everywhere. A CRLF checkout (e.g. a
+# Windows clone with core.autocrlf=true) would corrupt the sandbox shell scripts
+# and entrypoint inside the Linux build container ("bad interpreter"), and would
+# also shift the sandbox build-identity hash. Keep everything LF.
+* text=auto eol=lf
+
+# Be explicit for executable text that runs inside the container.
+*.sh text eol=lf
+*.py text eol=lf
+sandbox/entrypoint.sh text eol=lf
+sandbox/bin/* text eol=lf
+
+# Real binaries must never be touched by EOL normalization.
+*.whl binary
+*.tar.gz binary
+*.png binary
