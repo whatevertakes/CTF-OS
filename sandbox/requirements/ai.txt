@@ -5,7 +5,7 @@ onnx==1.18.0
 onnxruntime-gpu==1.22.0
 transformers==4.53.2
 tokenizers==0.21.2
-sentencepiece==0.2.0
+sentencepiece==0.2.1
 safetensors==0.5.3
 datasets==4.0.0
 joblib==1.5.1
