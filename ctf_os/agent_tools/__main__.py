@@ -111,6 +111,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="per-lane",
         help="use a private local challenge-service instance per lane by default",
     )
+    prepare.add_argument(
+        "--remote-execution",
+        choices=("agent", "human-relay"),
+        default="agent",
+        help=(
+            "let agents access declared organizer targets, or require a participant "
+            "to execute every organizer-remote command"
+        ),
+    )
     prepare.add_argument("--dry-run", action="store_true", help="prepare fresh state but do not start service/sandbox")
 
     bootstrap = commands.add_parser("race-bootstrap", help="prepare all requested private native-worker lanes")
@@ -373,6 +382,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             "explicit-cli" if requested_root_profile else "policy-default"
         ),
         service_isolation=getattr(args, "service_isolation", "per-lane"),
+        remote_execution=getattr(args, "remote_execution", "agent"),
     )
     if args.dry_run:
         mark_prepare_failed(run, "dry-run requested; no service or sandbox was started")
@@ -396,7 +406,13 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             service_spec, actor=ServiceActor(lane_id="root", role="root"), docker=args.docker
         )
         set_service_context(run, service)
-        targets = () if service.get("status") == "READY" else resolve_targets(parse_remotes(challenge.remotes))
+        targets = _agent_targets(
+            challenge.remotes,
+            service_network=(
+                str(service["network"]) if service.get("status") == "READY" else None
+            ),
+            remote_execution=str(race.get("remote_execution", "agent")),
+        )
         artifact_inbox = register_artifact_inbox(run, "root")
         root_sandbox = _create_sandbox(SandboxSpec(
             run_id=run.name,
@@ -414,6 +430,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             artifact_inbox=artifact_inbox,
             resource_profile=_resource_profile(input_record),
             race_lane_count=0,
+            remote_execution=str(race.get("remote_execution", "agent")),
         ), docker=args.docker)
         if service.get("status") == "READY":
             root_sandbox["service_probe"] = probe_service_connectivity(root_sandbox, docker=args.docker)
@@ -467,10 +484,10 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     root_service_endpoints = tuple(
         str(value) for value in race.get("service_endpoints", [])
     )
-    targets = (
-        ()
-        if root_service_network
-        else resolve_targets(parse_remotes(challenge.remotes))
+    targets = _agent_targets(
+        challenge.remotes,
+        service_network=str(root_service_network) if root_service_network else None,
+        remote_execution=str(race.get("remote_execution", "agent")),
     )
     packets: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -524,6 +541,7 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 artifact_inbox=artifact_inbox,
                 resource_profile=_resource_profile(input_record),
                 race_lane_count=1 + len(packets),
+                remote_execution=str(race.get("remote_execution", "agent")),
             ), docker=args.docker)
             if service_network:
                 metadata["service_probe"] = probe_service_connectivity(
@@ -592,7 +610,11 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     service_network = race.get("service_network")
     service_endpoints = tuple(str(value) for value in race.get("service_endpoints", []))
     remotes = race["challenge"].get("remotes", [])
-    targets = () if service_network else resolve_targets(parse_remotes(remotes))
+    targets = _agent_targets(
+        remotes,
+        service_network=str(service_network) if service_network else None,
+        remote_execution=str(race.get("remote_execution", "agent")),
+    )
     lane_service: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     try:
@@ -638,6 +660,7 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 row["status"] not in {"STOPPED", "WON"}
                 for row in load_race(run)["lanes"] if row["lane_id"] != lane["lane_id"]
             ),
+            remote_execution=str(race.get("remote_execution", "agent")),
         ), docker=args.docker)
         if service_network:
             metadata["service_probe"] = probe_service_connectivity(
@@ -1158,16 +1181,37 @@ def _prepare_result(
         "root_model_profile": root["model_profile"],
         "root_model_profile_source": root.get("model_profile_source"),
         "service_isolation": race.get("service_isolation", "shared"),
+        "remote_execution": race.get("remote_execution", "agent"),
         "service_instances": race.get("service_instances", {}),
         "lanes": [{"lane_id": row["lane_id"], "status": row["status"], "attack_family": row["attack_family"]} for row in race["lanes"]],
         "attack_ready": race["attack_ready"],
         "dry_run": dry_run,
         "next_root_action": (
-            {"exec_command_prefix": sandbox["exec_command_prefix"], "instruction": "append the highest-probability attack argv and execute now"}
+            {
+                "exec_command_prefix": sandbox["exec_command_prefix"],
+                "instruction": (
+                    "append the highest-probability local attack argv and execute now; "
+                    "for an organizer remote attempt, emit HUMAN_REMOTE_ACTION with the "
+                    "exact participant-run command and analyze the returned HUMAN_REMOTE_RESULT"
+                    if race.get("remote_execution", "agent") == "human-relay"
+                    else "append the highest-probability attack argv and execute now"
+                ),
+            }
             if sandbox else
             {"blocked": True, "recovery_command": image.get("recovery_command"), "reason": race.get("prepare_blocker")}
         ),
     }
+
+
+def _agent_targets(
+    remotes: Sequence[str | Mapping[str, Any]],
+    *,
+    service_network: str | None,
+    remote_execution: str,
+):
+    if service_network or remote_execution == "human-relay":
+        return ()
+    return resolve_targets(parse_remotes(remotes))
 
 
 def _selection_args(parser: argparse.ArgumentParser) -> None:

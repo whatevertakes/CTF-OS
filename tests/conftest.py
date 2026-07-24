@@ -87,6 +87,7 @@ def make_race(
     remote: str | None = None,
     root_model_profile: str = "sol-ultra",
     root_model_profile_source: str = "policy-default",
+    remote_execution: str = "agent",
 ):
     manifest, challenge = write_challenge(
         repo, category=category, remote=remote, files={"app.py": b"print('hello')\n"}
@@ -105,6 +106,7 @@ def make_race(
         input_ready_at=utc_now(),
         root_model_profile=root_model_profile,
         root_model_profile_source=root_model_profile_source,
+        remote_execution=remote_execution,
     )
     root = fake_sandbox(run, challenge, "root", f"ctf-os-sandbox:{category}")
     race = mark_root_ready(run, root)

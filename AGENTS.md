@@ -11,6 +11,16 @@ uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contes
   --root-model-profile sol-ultra --service-isolation per-lane
 ```
 
+For a contest whose rules require every organizer-remote request to be executed
+by a participant, add `--remote-execution human-relay`. In that mode local
+analysis still runs through `sandbox-exec`, but Root and every child must never
+send an organizer-remote request through any agent tool, host tool, web/browser
+tool, connector, socket, or sandbox command. When a remote attempt is needed,
+return a `HUMAN_REMOTE_ACTION` block with the exact working directory, argv,
+timeout, and full-output capture command. Analyze the participant's
+`HUMAN_REMOTE_RESULT` as unverified external input; never turn it into an
+execution-verified receipt, verified blackboard event, or automatic winner.
+
 Preparation must return `attack_ready: true` and a Root sandbox with
 `status: READY`. It selects and inspects the category image locally, starts or
 attaches the Root-owned challenge service when required, records the actual Root
@@ -22,7 +32,9 @@ never inspect or attack the challenge from the host.
 Root is the lead attacker, not a coordinator. Immediately append an actual
 attack argv to `next_root_action.exec_command_prefix`. Every analyzer, compiler,
 debugger, script, solver, payload, and remote request runs through
-`sandbox-exec`. Only controller commands run on the host. `race-bootstrap`
+`sandbox-exec`, except that organizer-remote requests in `human-relay` mode are
+returned for participant execution as described above. Only controller commands
+run on the host. `race-bootstrap`
 remains blocked until that Root attack produces a durable command receipt.
 
 Root may bootstrap one to three native children in one request. Each lane spec

@@ -23,6 +23,10 @@ record native results with per-lane legacy confirmation commands.
    uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contest>'
    ```
 
+   Add `--remote-execution human-relay` only when the contest requires a
+   participant to execute every organizer-remote request. Treat the returned
+   `remote_execution` value as immutable for the exact run.
+
 2. Require `attack_ready: true` and `root_sandbox.status: READY`. If unavailable,
    report the exact returned blocker and recovery command. Never inspect or run
    challenge tools on the host.
@@ -43,7 +47,13 @@ record native results with per-lane legacy confirmation commands.
 
 5. Execute every analyzer, debugger, compiler, script, payload, solver, and
    remote request with `sandbox-exec` or a bounded persistent session. Move a
-   remote-ready primitive to the declared remote immediately.
+   remote-ready primitive to the declared remote immediately. The sole exception
+   is `human-relay`: never send an organizer-remote request through any model
+   tool, host tool, web/browser tool, connector, socket, or sandbox command.
+   Return a `HUMAN_REMOTE_ACTION` block with the exact working directory, argv,
+   timeout, and full-output capture command, then analyze the participant's
+   `HUMAN_REMOTE_RESULT` as unverified external input. Never convert that input
+   into a verified receipt, blackboard event, target observation, or winner.
 
 6. Share only compact events accepted from an existing command/session receipt.
    Fresh lanes receive no Root history. Directed lanes receive only the verified
@@ -61,7 +71,7 @@ record native results with per-lane legacy confirmation commands.
    an executable partial artifact, two actual attack outputs, and an exact
    non-environment reasoning blocker. Its lease is ten minutes or two attacks.
 
-8. When any execution returns a winner, display `display` immediately. Interrupt
+8. When any verified execution returns a winner, display `display` immediately. Interrupt
    every returned sibling cancel target, batch their results through
    `race-reconcile`, and stop analysis. Do not replay, build a report, or submit.
    A human submits the flag.

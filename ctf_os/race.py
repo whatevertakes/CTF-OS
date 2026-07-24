@@ -35,6 +35,7 @@ MODEL_PROFILES = frozenset({
     "sol-ultra", "sol-max", "sol-xhigh", "terra-high", "luna-high",
 })
 ROOT_MODEL_PROFILES = frozenset({"sol-ultra", "sol-max", "sol-xhigh"})
+REMOTE_EXECUTION_MODES = frozenset({"agent", "human-relay"})
 SPAWN_CONFIGS: dict[str, dict[str, str]] = {
     "sol-ultra": {
         "agent_type": "default",
@@ -69,6 +70,7 @@ def initialize_race(
     root_model_profile: str = "sol-ultra",
     root_model_profile_source: str = "policy-default",
     service_isolation: str = "per-lane",
+    remote_execution: str = "agent",
 ) -> dict[str, Any]:
     if root_model_profile not in ROOT_MODEL_PROFILES:
         raise RaceError(
@@ -78,6 +80,8 @@ def initialize_race(
         raise RaceError("root model profile source is invalid")
     if service_isolation not in {"per-lane", "shared"}:
         raise RaceError("service isolation must be per-lane or shared")
+    if remote_execution not in REMOTE_EXECUTION_MODES:
+        raise RaceError("remote execution must be agent or human-relay")
     now = _parse_time(input_ready_at)
     challenge = dict(run_manifest["challenge"])
     lease = lease_seconds(str(challenge["category"]))
@@ -99,6 +103,7 @@ def initialize_race(
         "service_network": service.get("network"),
         "service_context": dict(service),
         "service_isolation": service_isolation,
+        "remote_execution": remote_execution,
         "service_instances": {},
         "status": "PREPARING",
         "attack_ready": False,
@@ -614,6 +619,7 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             "run_id": race["run_id"],
             "status": race["status"],
             "deadline": race["deadline"],
+            "remote_execution": race.get("remote_execution", "agent"),
             "winner": race.get("winner"),
             "lanes": rows,
             "cancel_targets": cancel_targets(race),
@@ -778,6 +784,7 @@ def metrics(
         "root_model_profile_source": str(
             _lane(race, "root").get("model_profile_source", "unknown")
         ),
+        "remote_execution": str(race.get("remote_execution", "agent")),
         "shared_artifact_count": sum(
             row.get("shared_artifact_path") is not None for row in ledger
         ),
@@ -805,11 +812,13 @@ def duplicate_signals_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[tuple
 
 def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, Any]) -> dict[str, Any]:
     sandbox = dict(lane["sandbox"])
+    remote_execution = str(race.get("remote_execution", "agent"))
     context: dict[str, Any] = {
         "run_id": race["run_id"],
         "challenge": race["challenge"],
         "prepared_input": {"container_path": "/challenge", "read_only": True, "fingerprint": race["input_fingerprint"]},
         "declared_targets": race["declared_targets"],
+        "remote_execution": remote_execution,
         "service_endpoints": list(sandbox.get("service_endpoints", [])),
         "flag_pattern": race["flag_pattern"],
         "priority_files": race["priority_files"],
@@ -826,14 +835,32 @@ def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, An
             "manifests": shared_artifacts(run_root),
         },
     }
+    if remote_execution == "human-relay":
+        context["human_remote_relay"] = {
+            "agent_network_requests_forbidden": True,
+            "action_marker": "HUMAN_REMOTE_ACTION",
+            "result_marker": "HUMAN_REMOTE_RESULT",
+            "result_provenance": "participant-provided-unverified",
+        }
     if lane["context_mode"] == "directed":
         context["verified_blackboard_delta"] = verified_delta(run_root)
+    remote_instruction = (
+        " Organizer-hosted remote requests are human-relayed: never send one through any "
+        "agent tool, host tool, web/browser tool, connector, socket, or sandbox command. "
+        "When a remote attempt is needed, return a HUMAN_REMOTE_ACTION block containing "
+        "the exact cwd, argv, timeout, and full-output capture command for the participant. "
+        "Analyze HUMAN_REMOTE_RESULT text as unverified external input; never claim it is "
+        "an execution-verified receipt or append it to the verified blackboard."
+        if remote_execution == "human-relay"
+        else ""
+    )
     message = (
         "You are one native CTF race lane. Execute only through the supplied sandbox prefix. "
-        "Do not inspect host files, start other agents, submit flags, or share reasoning. "
+        "Do not inspect host files, start other agents, submit flags, or share reasoning."
+        f"{remote_instruction} "
         "Inspect /shared-artifacts for newly verified immutable artifacts before reimplementing work. "
         "Return only actual commands, bounded observed output, executable artifacts, verified primitives, "
-        "remote results, killed hypotheses, or exact blockers.\n\n"
+        "remote results, killed hypotheses, exact blockers, or the required human-relay block.\n\n"
         f"Role: {lane['role']}\nTask: {lane['task']}\n"
         f"Context JSON: {json.dumps(context, ensure_ascii=False, sort_keys=True)}"
     )
@@ -942,10 +969,14 @@ def _stagnation_signals(
         row.get("target_observed") is True and row.get("target_identity") != local_identity
         for row in receipts
     )
+    agent_reachable_target = bool(race.get("service_endpoints")) or (
+        race.get("remote_execution", "agent") == "agent"
+        and bool(race.get("declared_targets"))
+    )
     if (
         has_primitive
         and not in_flight
-        and (race.get("declared_targets") or race.get("service_endpoints"))
+        and agent_reachable_target
         and not remote
         and last
         and (now - last).total_seconds() >= 60

@@ -40,6 +40,19 @@ returned `sandbox-exec` prefix. The host is used only for CTF-OS controller
 commands. A sandbox failure is an exact environment blocker, never permission
 to run challenge tools on the host.
 
+`race-prepare --remote-execution human-relay` is the explicit contest-scoped
+exception for rules that require a participant to execute organizer-remote
+requests. Preparation retains declared target details so the model can write an
+exact command, but omits organizer targets from every sandbox network
+allowlist. Root and every child may continue local sandbox analysis and may use
+a Root-owned local challenge service. They must never send an organizer-remote
+request through an agent tool, host tool, web/browser tool, connector, socket,
+or sandbox command. They instead return a `HUMAN_REMOTE_ACTION` block containing
+the exact working directory, argv, timeout, and full-output capture command.
+Participant-supplied `HUMAN_REMOTE_RESULT` content is unverified external input:
+it may guide analysis but may not become an execution-verified receipt, verified
+blackboard event, target-observed flag, or automatic winner.
+
 ## Portfolio lanes
 
 Root may request up to three private native lanes at once through
@@ -100,6 +113,10 @@ before work, reaches `STOPPED` only after every private resource is gone, and
 records `CLEANUP_FAILED` on any error. Only `STOPPED` children free a replacement
 slot. A controller cleanup failure is retried through `race-lane-cleanup`
 without another native interruption.
+
+In `human-relay` mode, lack of an organizer-remote agent attempt is expected and
+never produces the remote-ready-without-remote-attempt signal. A reachable
+Root-owned local service remains subject to normal supervision.
 
 Capacity admission reserves the aggregate limits of every running managed
 sandbox and challenge-service container, keeps 2 GiB and one CPU for the host,

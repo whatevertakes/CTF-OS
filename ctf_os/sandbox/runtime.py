@@ -63,6 +63,7 @@ class SandboxSpec:
     artifact_inbox: Path | None = None
     resource_profile: str = "standard"
     race_lane_count: int = 0
+    remote_execution: str = "agent"
 
     @property
     def name(self) -> str:
@@ -79,6 +80,7 @@ class SandboxSpec:
             "org.ctf-os.challenge-id": self.challenge_id,
             "org.ctf-os.lane-id": self.lane_id,
             "org.ctf-os.category": self.category,
+            "org.ctf-os.remote-execution": self.remote_execution,
         }
 
 
@@ -206,6 +208,7 @@ def create(
         "target_identities": target_identities,
         "service_network": spec.service_network,
         "service_endpoints": list(spec.service_endpoints),
+        "remote_execution": spec.remote_execution,
         "artifact_inbox": (
             str(spec.artifact_inbox.resolve()) if spec.artifact_inbox is not None else None
         ),
@@ -636,6 +639,10 @@ def _validate_spec(spec: SandboxSpec) -> None:
         raise SandboxError("prepared challenge input must be read-only")
     if spec.targets and spec.service_network:
         raise SandboxError("a sandbox cannot join both a remote and challenge-service network")
+    if spec.remote_execution not in {"agent", "human-relay"}:
+        raise SandboxError("remote execution must be agent or human-relay")
+    if spec.remote_execution == "human-relay" and spec.targets:
+        raise SandboxError("human-relay sandboxes cannot authorize organizer remote targets")
     if bool(spec.service_network) != bool(spec.service_endpoints):
         raise SandboxError("service network and endpoints must be supplied together")
     if spec.service_network and not re.fullmatch(r"ctf-os-net-[a-z0-9_.-]{1,100}", spec.service_network):
