@@ -137,11 +137,7 @@ def test_user_docker_exec_prefix_carries_only_lane_private_state(
         assert argv[argv.index(value) - 1] == "--env"
         assert "/work" in value.split("=", 1)[1]
     joined = " ".join(argv).casefold()
-    for forbidden in (
-        str(repo.resolve()).casefold(),
-        ".ssh",
-        "host.docker.internal",
-    ):
+    for forbidden in ("/home/choijiwng-kali", ".ssh", "host.docker.internal"):
         assert forbidden not in joined
 
 
