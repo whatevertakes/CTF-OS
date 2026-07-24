@@ -322,6 +322,12 @@ def test_compose_override_resets_host_ports_and_networks(
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[1:3] == ["network", "inspect"]:
             return subprocess.CompletedProcess(argv, 1, "", "not found")
+        if "config" in argv and "--format" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps({"services": {"chall": {"image": "ctf-os-sandbox:base"}}}),
+                "",
+            )
         if "ps" in argv and "--status" in argv:
             return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
         return subprocess.CompletedProcess(argv, 0, "[]", "")
@@ -435,8 +441,21 @@ def test_service_metadata_failure_exposes_structured_cleanup_recovery(
                 json.dumps([{"Internal": True, "Labels": spec.labels}]),
                 "",
             )
+        if "config" in argv and "--format" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps({"services": {"chall": {"image": "ctf-os-sandbox:base"}}}),
+                "",
+            )
         if "down" in argv:
             return subprocess.CompletedProcess(argv, 1, "", "compose down failed")
+        if "ps" in argv and "--all" in argv:
+            # RM3 ownership enumeration before teardown.
+            return subprocess.CompletedProcess(argv, 0, "svc-container\n", "")
+        if argv[1:2] == ["inspect"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"Config": {"Labels": spec.labels}}]), ""
+            )
         if "ps" in argv and "--status" in argv:
             return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
         return subprocess.CompletedProcess(argv, 0, "[]", "")

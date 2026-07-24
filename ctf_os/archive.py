@@ -107,8 +107,14 @@ def _extract_zip(archive: Path, root: Path, limits: ArchiveLimits) -> list[str]:
 
 def _extract_tar(archive: Path, root: Path, limits: ArchiveLimits) -> list[str]:
     try:
+        compressed_size = archive.stat().st_size
+    except OSError as exc:
+        raise ArchiveError(f"cannot stat tar archive {archive.name}: {exc}") from exc
+    try:
         with tarfile.open(archive, mode="r:*") as handle:
-            return _extract_tar_members(handle, root, limits)
+            return _extract_tar_members(
+                handle, root, limits, compressed_size=compressed_size
+            )
     except (tarfile.TarError, OSError) as exc:
         raise ArchiveError(f"damaged tar archive {archive.name}: {exc}") from exc
 
@@ -117,6 +123,8 @@ def _extract_tar_members(
     handle: tarfile.TarFile,
     root: Path,
     limits: ArchiveLimits,
+    *,
+    compressed_size: int,
 ) -> list[str]:
     names: list[str] = []
     total = 0
@@ -124,6 +132,15 @@ def _extract_tar_members(
     members = handle.getmembers()
     if len(members) > limits.max_files:
         raise ArchiveError(f"tar has too many members: {len(members)} > {limits.max_files}")
+    # Compressed tars carry no per-member compressed size, so bound the whole
+    # archive's declared expansion ratio up front. Header sizes are then enforced
+    # per member by the streaming copy below, so a bomb cannot understate them.
+    declared_total = sum(int(member.size) for member in members if member.isfile())
+    if compressed_size > 0 and declared_total > compressed_size * limits.max_ratio:
+        raise ArchiveError(
+            f"tar compression ratio rejected: {declared_total}/{compressed_size} "
+            f"> {limits.max_ratio}"
+        )
     for member in members:
         target = _target(root, member.name)
         key = str(target).casefold()

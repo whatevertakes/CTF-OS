@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..workspace import atomic_json, state_lock, validate_identifier
+from .gpu import GpuError, admit_gpu, gpu_admitted, gpu_run_flags
 from .network import ResolvedTarget
 from .resources import ResourceError, admit, parse_size_bytes, resource_profile
 
@@ -63,6 +64,9 @@ class SandboxSpec:
     artifact_inbox: Path | None = None
     resource_profile: str = "standard"
     race_lane_count: int = 0
+    # auto: use a GPU only when category + host + Docker passthrough all verify,
+    # else CPU fallback. off: never. required: fail closed without a GPU.
+    gpu_policy: str = "auto"
 
     @property
     def name(self) -> str:
@@ -82,7 +86,12 @@ class SandboxSpec:
         }
 
 
-def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
+def build_run_argv(
+    spec: SandboxSpec,
+    *,
+    docker: str = "docker",
+    gpu: Mapping[str, Any] | None = None,
+) -> list[str]:
     _validate_spec(spec)
     profile = resource_profile(spec.resource_profile)
     targets = json.dumps([row.to_dict() for row in spec.targets], separators=(",", ":"))
@@ -135,6 +144,10 @@ def build_run_argv(spec: SandboxSpec, *, docker: str = "docker") -> list[str]:
                 f"{spec.category} sandbox rootless seccomp profile is missing or unsafe"
             )
         argv.extend(["--security-opt", f"seccomp={seccomp}"])
+    # A scoped GPU device request is added only after admission verified the host
+    # GPU and Docker passthrough; no other host device is ever mounted.
+    if gpu_admitted(gpu):
+        argv.extend(gpu_run_flags())
     if spec.service_network:
         argv.extend(["--network", spec.service_network, "--cap-add", "NET_ADMIN"])
     elif spec.targets:
@@ -165,8 +178,15 @@ def create(
             )
         except ResourceError as exc:
             raise SandboxError(str(exc)) from exc
+        try:
+            gpu_decision = admit_gpu(
+                spec.gpu_policy, spec.category,
+                image=spec.image, docker=docker, runner=runner,
+            )
+        except GpuError as exc:
+            raise SandboxError(str(exc)) from exc
         _prepare_lane_root(spec)
-        result = _run(runner, build_run_argv(spec, docker=docker), timeout=120)
+        result = _run(runner, build_run_argv(spec, docker=docker, gpu=gpu_decision), timeout=120)
         if result.returncode:
             raise SandboxError(f"sandbox create failed: {result.stderr.strip()}")
         inspected = _run(
@@ -221,6 +241,7 @@ def create(
         },
         "resource_profile": spec.resource_profile,
         "capacity_at_create": capacity,
+        "gpu": gpu_decision,
         "created_at": _now(),
         "exec_command_prefix": [
             "uv", "run", "python", "-m", "ctf_os.agent_tools", "sandbox-exec",
@@ -559,16 +580,19 @@ def firewall_packets(
 
     if target_identity == f"challenge:{metadata.get('challenge_id')}":
         return None
-    address: str | None = None
+    # One declared target may resolve to several IPs; every IP has its own accept
+    # rule, so gather all addresses for this declared identity and sum them.
+    addresses: set[str] = set()
     port: int | None = None
     for row in metadata.get("authorized_targets", []):
         if isinstance(row, Mapping) and row.get("declared") == target_identity:
-            address = str(row.get("ip") or "")
+            ip = str(row.get("ip") or "")
+            if ip:
+                addresses.add(ip)
             try:
                 port = int(row.get("port"))
             except (TypeError, ValueError):
                 return 0
-            break
     if port is None and target_identity in metadata.get("service_endpoints", []):
         parsed = urlsplit(target_identity if "://" in target_identity else f"tcp://{target_identity}")
         try:
@@ -593,7 +617,7 @@ def firewall_packets(
             counter = re.match(r"^\[([0-9]+):[0-9]+\]\s+", line)
             if not counter or f"--dport {port}" not in line:
                 continue
-            if address and f"-d {address}/" not in line:
+            if addresses and not any(f"-d {address}/" in line for address in addresses):
                 continue
             total += int(counter.group(1))
     return total
@@ -651,7 +675,14 @@ def _validate_spec(spec: SandboxSpec) -> None:
 
 
 def _target_identity(metadata: Mapping[str, Any], requested: str | None) -> str:
-    identities = [str(value) for value in metadata.get("target_identities", [])]
+    # One declared target that resolves to several IPs is stored once per IP, so
+    # deduplicate to logical declared identities before deciding whether the lane
+    # has a single unambiguous target.
+    identities: list[str] = []
+    for value in metadata.get("target_identities", []):
+        text = str(value)
+        if text not in identities:
+            identities.append(text)
     if requested is not None:
         if requested not in identities:
             raise SandboxError("target identity was not declared for this sandbox")

@@ -12,6 +12,7 @@ import regex as safe_regex
 
 from .blackboard import BlackboardError, append_verified_event
 from .race import load_race, record_winner
+from .sandbox.session import MAX_FLAG_TAIL
 
 
 class FlagError(ValueError):
@@ -81,6 +82,39 @@ def _is_placeholder(candidate: str) -> bool:
     return _PLACEHOLDERS.fullmatch(value.strip()) is not None
 
 
+def _verify_boundary_tail(
+    run_root: Path, lane_id: str, run_id: str, boundary: Mapping[str, Any]
+) -> str:
+    """Return the durable prior-read tail, proven to be a suffix of a real receipt.
+
+    The tail is never trusted from the caller: it must exactly match the end of a
+    durable prior session-read receipt for this run/lane, so a forged tail cannot
+    manufacture a flag that never actually appeared in session output.
+    """
+
+    prior_id = str(boundary.get("receipt_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", prior_id):
+        raise FlagError("boundary candidate has no valid prior receipt id")
+    claimed_tail = str(boundary.get("tail") or "")
+    if not claimed_tail or len(claimed_tail) > MAX_FLAG_TAIL:
+        raise FlagError("boundary candidate tail is empty or oversized")
+    durable = run_root / "workers" / lane_id / "logs" / f"{prior_id}.json"
+    if durable.is_symlink() or not durable.is_file():
+        raise FlagError("boundary candidate has no durable prior receipt")
+    try:
+        prior = json.loads(durable.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FlagError("boundary prior receipt is unreadable") from exc
+    if not isinstance(prior, dict):
+        raise FlagError("boundary prior receipt is invalid")
+    if prior.get("run_id") != run_id or prior.get("lane_id") != lane_id:
+        raise FlagError("boundary prior receipt does not belong to this exact run/lane")
+    prior_output = str(prior.get("observed_output", ""))
+    if not prior_output.endswith(claimed_tail):
+        raise FlagError("boundary tail is not a genuine suffix of durable prior output")
+    return claimed_tail
+
+
 def record_candidate(
     run_root: Path,
     *,
@@ -88,6 +122,7 @@ def record_candidate(
     attack_family: str,
     candidate: str,
     receipt: Mapping[str, Any],
+    boundary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     race = load_race(run_root)
     lane = next(
@@ -98,8 +133,17 @@ def record_candidate(
         raise FlagError("candidate attack_family does not match its exact lane")
     if not valid_candidate(candidate, str(race.get("flag_pattern") or "")):
         raise FlagError("candidate does not match the challenge flag pattern or is a placeholder")
-    if candidate not in str(receipt.get("observed_output", "")):
+    current_output = str(receipt.get("observed_output", ""))
+    # The verified evidence window is the current read plus, for a boundary
+    # candidate, the durable tail of the previous read.
+    prior_tail = ""
+    if boundary is not None:
+        prior_tail = _verify_boundary_tail(run_root, lane_id, str(race["run_id"]), boundary)
+    evidence = prior_tail + current_output
+    if candidate not in evidence:
         raise FlagError("candidate is not present in actual observed target output")
+    if boundary is not None and (candidate in current_output or candidate in prior_tail):
+        raise FlagError("boundary candidate must span two reads, not sit within one")
     if receipt.get("run_id") != race["run_id"] or receipt.get("lane_id") != lane_id:
         raise FlagError("candidate receipt does not belong to this exact run/lane")
     target = str(receipt.get("target_identity", ""))
@@ -128,7 +172,9 @@ def record_candidate(
     ):
         if durable_receipt.get(field) != receipt.get(field):
             raise FlagError(f"candidate receipt does not match durable execution: {field}")
-    if candidate not in str(durable_receipt.get("observed_output", "")):
+    # prior_tail was already verified to be a genuine suffix of the durable prior
+    # receipt, so the durable evidence window is that tail plus this durable read.
+    if candidate not in (prior_tail + str(durable_receipt.get("observed_output", ""))):
         raise FlagError("candidate is absent from durable observed output")
     result = record_winner(
         run_root,

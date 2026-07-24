@@ -16,6 +16,7 @@ from .blackboard import (
     shared_artifacts,
     verified_delta,
 )
+from .sandbox.session import session_liveness
 from .workspace import atomic_json, read_json, state_lock, utc_now
 
 RACE_SCHEMA_VERSION = 2
@@ -502,7 +503,7 @@ def record_winner(
                 "won": False,
                 "first": False,
                 "winner": dict(race["winner"]),
-                "cancel_targets": cancel_targets(race, excluding=str(race["winner"]["lane_id"])),
+                "cancel_targets": cancel_targets(race),
             }
         if race.get("status") != "ACTIVE":
             raise RaceError("a flag candidate cannot win a non-active race")
@@ -521,14 +522,24 @@ def record_winner(
         race["status"] = "WON"
         race["attack_ready"] = False
         race["timestamps"]["first_flag_candidate_at"] = timestamp
-        lane["status"] = "WON"
+        if lane_id == "root":
+            # Root is the lead attacker, not a native child; it is ended through
+            # timeout, handoff, or the exact-run cleanup path.
+            lane["status"] = "WON"
+        elif lane["status"] not in NON_EXECUTING_LANE_STATES:
+            # A winning native child is still a live native thread. The win is
+            # preserved in the race-level winner record above, but the child must
+            # still be interrupted and its private sandbox cleaned before any
+            # controller cleanup, exactly like its siblings.
+            lane["status"] = "CANCEL_REQUIRED"
         for sibling in race["lanes"]:
             if (
                 sibling["lane_id"] != lane_id
                 and sibling["status"] not in NON_EXECUTING_LANE_STATES
             ):
                 sibling["status"] = "CANCEL_REQUIRED"
-        targets = cancel_targets(race, excluding=lane_id)
+        # Every live native child, including the winner, is a cancel target.
+        targets = cancel_targets(race)
         _write(run_root, race)
         return {"won": True, "first": True, "winner": winner, "cancel_targets": targets}
 
@@ -553,7 +564,7 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             new_outputs = len({row.get("output_hash") for row in lane_receipts})
             high = sum(row.get("event_type") in HIGH_VALUE_TYPES for row in lane_events)
             running = _running_commands(run_root, str(lane["lane_id"]), current)
-            sessions = _running_sessions(run_root, str(lane["lane_id"]))
+            sessions = _running_sessions(run_root, str(lane["lane_id"]), current)
             lane["last_status_command_count"] = commands
             signals = _stagnation_signals(
                 race, lane, lane_events, lane_receipts, duplicates, current,
@@ -586,6 +597,10 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                     "duplicate-other-lane",
                     "remote-ready-without-remote-attempt",
                     "lease-expired-without-command",
+                    # A lane that ran once and then idled past its lease emits
+                    # this signal; without it the idle lane would hold its slot
+                    # until the 90-minute deadline.
+                    "no-new-output-hash",
                 } for signal in signals)
                 and lane["status"]
                 not in NON_EXECUTING_LANE_STATES | {"PREPARED", "CANCEL_REQUIRED"}
@@ -995,12 +1010,14 @@ def _running_commands(
     return [row for row in rows if row["heartbeat_stale"] is False]
 
 
-def _running_sessions(run_root: Path, lane_id: str) -> list[dict[str, Any]]:
-    root = run_root / "workers" / lane_id / "sessions"
+def _running_sessions(run_root: Path, lane_id: str, now: datetime) -> list[dict[str, Any]]:
+    lane_root = run_root / "workers" / lane_id
+    root = lane_root / "sessions"
     if not root.exists():
         return []
     if root.is_symlink() or not root.is_dir():
         raise RaceError("persistent session state directory is unsafe")
+    now_epoch = now.timestamp()
     rows: list[dict[str, Any]] = []
     for path in sorted(root.glob("*.json")):
         if path.is_symlink():
@@ -1010,18 +1027,26 @@ def _running_sessions(run_root: Path, lane_id: str) -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError) as exc:
             raise RaceError("persistent session state is unreadable") from exc
         if (
-            isinstance(value, dict)
-            and value.get("run_id") == run_root.name
-            and value.get("lane_id") == lane_id
-            and value.get("status") == "RUNNING"
+            not isinstance(value, dict)
+            or value.get("run_id") != run_root.name
+            or value.get("lane_id") != lane_id
+            or value.get("status") != "RUNNING"
         ):
-            rows.append({
-                "session_id": value.get("session_id"),
-                "kind": value.get("kind"),
-                "argv": value.get("argv"),
-                "opened_at": value.get("opened_at"),
-                "last_read_at": value.get("last_read_at"),
-            })
+            continue
+        # Only a session with a fresh, identity-matched heartbeat is really live
+        # and may suppress stagnation; a dead or stale one never counts.
+        liveness = session_liveness(lane_root, value, now_epoch=now_epoch)
+        if not liveness["live"]:
+            continue
+        rows.append({
+            "session_id": value.get("session_id"),
+            "kind": value.get("kind"),
+            "argv": value.get("argv"),
+            "opened_at": value.get("opened_at"),
+            "last_read_at": value.get("last_read_at"),
+            "heartbeat_at": liveness.get("heartbeat_at"),
+            "pid": liveness.get("pid"),
+        })
     return rows
 
 

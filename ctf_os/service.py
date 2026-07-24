@@ -198,8 +198,19 @@ def _prepare_service_locked(
             runtime = _start_compose(spec, docker=docker, runner=runner)
         else:
             raise ServiceError(f"unsupported service plan kind: {kind}")
-    except Exception:
-        _cleanup_failed_start(spec, kind=kind, docker=docker, runner=runner)
+    except Exception as exc:
+        rollback_failures = _cleanup_failed_start(spec, kind=kind, docker=docker, runner=runner)
+        if rollback_failures:
+            # The start failed AND its rollback left resources behind: surface a
+            # structured recovery so the controller keeps the lane CLEANUP_FAILED
+            # and race-cleanup / race-lane-cleanup can reclaim it later.
+            recovery = _recovery_metadata(spec, kind=kind, failures=rollback_failures)
+            raise ServiceCleanupError(
+                f"service start failed and cleanup was incomplete: {exc}; "
+                + "; ".join(rollback_failures),
+                service=recovery,
+                failures=rollback_failures,
+            ) from exc
         raise
     endpoints = [
         str(endpoint)
@@ -290,16 +301,26 @@ def cleanup_service(
     if runtime.get("compose_files"):
         service_root = _compose_service_root(runtime)
         env_file, controller_env = _prepare_compose_controller(service_root)
-        argv = [docker, "compose", "--env-file", str(env_file)]
-        for path in runtime["compose_files"]:
-            argv.extend(["--file", str(path)])
-        argv.extend([
-            "--project-name", str(runtime["project"]), "down", "--volumes",
-            "--remove-orphans", "--rmi", "local",
-        ])
-        result = _run(runner, argv, timeout=120, env=controller_env)
-        if result.returncode:
-            failures.append(result.stderr.strip() or "compose down failed")
+        # Verify every container in the project carries this exact run's labels
+        # before tearing it down, so a project-name collision can never delete a
+        # differently-owned stack.
+        ownership_error = _compose_project_owned(
+            runtime, metadata.get("labels", {}),
+            docker=docker, runner=runner, env_file=env_file, controller_env=controller_env,
+        )
+        if ownership_error:
+            failures.append(ownership_error)
+        else:
+            argv = [docker, "compose", "--env-file", str(env_file)]
+            for path in runtime["compose_files"]:
+                argv.extend(["--file", str(path)])
+            argv.extend([
+                "--project-name", str(runtime["project"]), "down", "--volumes",
+                "--remove-orphans", "--rmi", "local",
+            ])
+            result = _run(runner, argv, timeout=120, env=controller_env)
+            if result.returncode:
+                failures.append(result.stderr.strip() or "compose down failed")
     elif runtime.get("container"):
         name = str(runtime["container"])
         if _container_has_labels(name, metadata.get("labels", {}), docker=docker, runner=runner):
@@ -433,11 +454,15 @@ def _start_compose(
         "networks": {"ctf_os_race": {"external": True, "name": spec.network}},
     }
     atomic_text(override, yaml.dump(document, Dumper=_ComposeDumper, sort_keys=True))
-    argv = [
+    project_argv = [
         docker, "compose", "--env-file", str(env_file),
         "--file", str(source), "--file", str(override),
-        "--project-name", spec.project, "up", "--detach", "--build", "--pull", "never",
+        "--project-name", spec.project,
     ]
+    # Defense in depth: resolve source+override to the final config and fail
+    # closed if anything crosses a host/daemon boundary before starting it.
+    _verify_resolved_compose_config(project_argv, runner=runner, controller_env=controller_env)
+    argv = project_argv + ["up", "--detach", "--build", "--pull", "never"]
     started = _run(runner, argv, timeout=900, env=controller_env)
     if started.returncode:
         raise ServiceError(f"challenge compose start failed: {started.stderr.strip()}")
@@ -463,6 +488,102 @@ def _start_compose(
         "service_count": expected,
         "compose_env_file": str(env_file),
     }
+
+
+def _verify_resolved_compose_config(
+    project_argv: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    controller_env: Mapping[str, str],
+) -> None:
+    """Fail closed if the fully-resolved compose config crosses a host boundary."""
+
+    result = _run(
+        runner, list(project_argv) + ["config", "--format", "json"],
+        timeout=60, env=controller_env,
+    )
+    if result.returncode:
+        raise ServiceError(
+            "challenge compose config could not be resolved for verification: "
+            + (result.stderr or result.stdout).strip()[-2048:]
+        )
+    try:
+        config = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ServiceError("resolved compose config is not valid JSON") from exc
+    if not isinstance(config, Mapping):
+        raise ServiceError("resolved compose config has an unexpected shape")
+    reasons = _scan_resolved_config(config)
+    if reasons:
+        raise ServiceError(
+            "resolved compose config crosses a host/daemon boundary: "
+            + "; ".join(sorted(set(reasons)))
+        )
+
+
+def _scan_resolved_config(config: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    services = config.get("services")
+    if isinstance(services, Mapping):
+        for name, service in services.items():
+            if not isinstance(service, Mapping):
+                continue
+            if service.get("privileged") is True:
+                reasons.append(f"service {name} resolves to privileged")
+            for key in ("network_mode", "pid", "ipc", "uts"):
+                value = str(service.get(key) or "")
+                if value.startswith(("host", "container:")) or ":host" in value:
+                    reasons.append(f"service {name} resolves to host/shared {key}")
+            if service.get("userns_mode"):
+                reasons.append(f"service {name} sets userns_mode")
+            if service.get("cap_add"):
+                reasons.append(f"service {name} adds capabilities")
+            if service.get("devices"):
+                reasons.append(f"service {name} maps host devices")
+            if service.get("device_requests") or service.get("gpus"):
+                reasons.append(f"service {name} requests device passthrough")
+            for opt in service.get("security_opt") or []:
+                collapsed = str(opt).replace(" ", "").casefold()
+                if any(token in collapsed for token in (
+                    "seccomp=unconfined", "apparmor=unconfined",
+                    "no-new-privileges:false", "systempaths=unconfined",
+                )):
+                    reasons.append(f"service {name} relaxes security_opt")
+            hosts = service.get("extra_hosts")
+            host_entries = (
+                list(hosts.items()) if isinstance(hosts, Mapping)
+                else list(hosts) if isinstance(hosts, (list, tuple)) else []
+            )
+            if any("host-gateway" in str(entry) for entry in host_entries):
+                reasons.append(f"service {name} maps a host-gateway alias")
+            for volume in service.get("volumes") or []:
+                if isinstance(volume, Mapping):
+                    source = str(volume.get("source") or "")
+                    if volume.get("type") == "bind":
+                        reasons.append(f"service {name} bind-mounts host path {source}")
+                    if "docker.sock" in source:
+                        reasons.append(f"service {name} mounts the Docker socket")
+                else:
+                    text = str(volume)
+                    source = text.split(":", 1)[0]
+                    if source.startswith(("/", "~", ".")):
+                        reasons.append(f"service {name} bind-mounts a host path")
+                    if "docker.sock" in text:
+                        reasons.append(f"service {name} mounts the Docker socket")
+    networks = config.get("networks")
+    if isinstance(networks, Mapping):
+        for network_name, settings in networks.items():
+            # ctf_os_race is the controller-created internal race network.
+            if network_name == "ctf_os_race":
+                continue
+            if isinstance(settings, Mapping) and settings.get("external"):
+                reasons.append(f"network {network_name} is external")
+    volumes = config.get("volumes")
+    if isinstance(volumes, Mapping):
+        for volume_name, settings in volumes.items():
+            if isinstance(settings, Mapping) and (settings.get("external") or settings.get("driver_opts")):
+                reasons.append(f"volume {volume_name} is external or host-bound")
+    return reasons
 
 
 def _ensure_network(
@@ -524,6 +645,41 @@ def _service_running(
             and running > 0
         )
     return False
+
+
+def _compose_project_owned(
+    runtime: Mapping[str, Any],
+    expected_labels: object,
+    *,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    env_file: Path,
+    controller_env: Mapping[str, str],
+) -> str | None:
+    """Return an error string if the compose project is not exactly this run's.
+
+    Enumerates every container the project owns and requires each to carry the
+    full CTF-OS label set before any teardown runs. Returns None when cleanup is
+    safe (verified-owned or already gone).
+    """
+
+    expected = expected_labels if isinstance(expected_labels, Mapping) else {}
+    if not expected:
+        return "compose cleanup has no ownership labels to verify"
+    argv = [docker, "compose", "--env-file", str(env_file)]
+    for path in runtime["compose_files"]:
+        argv.extend(["--file", str(path)])
+    argv.extend(["--project-name", str(runtime["project"]), "ps", "--all", "--quiet"])
+    result = _run(runner, argv, timeout=30, env=controller_env)
+    if result.returncode:
+        return "cannot enumerate compose project containers before cleanup"
+    ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not ids:
+        return None
+    for container_id in ids:
+        if not _container_has_labels(container_id, expected, docker=docker, runner=runner):
+            return "refusing to remove compose project with unowned or mismatched containers"
+    return None
 
 
 def _container_has_labels(
@@ -597,7 +753,10 @@ def _cleanup_failed_start(
     kind: str,
     docker: str,
     runner: Callable[..., subprocess.CompletedProcess[str]],
-) -> None:
+) -> list[str]:
+    """Roll back a partial service start, returning every unrecovered failure."""
+
+    failures: list[str] = []
     if kind == "compose":
         source = spec.source / str(spec.plan.get("source", ""))
         override = spec.metadata_path.parent / "compose.race.yml"
@@ -605,7 +764,7 @@ def _cleanup_failed_start(
             env_file, controller_env = _prepare_compose_controller(
                 spec.metadata_path.parent
             )
-            _run(
+            result = _run(
                 runner,
                 [
                     docker, "compose", "--env-file", str(env_file),
@@ -616,14 +775,69 @@ def _cleanup_failed_start(
                 timeout=120,
                 env=controller_env,
             )
+            if result.returncode:
+                failures.append(result.stderr.strip() or "rollback compose down failed")
     elif kind == "dockerfile":
         if _container_has_labels(spec.container, spec.labels, docker=docker, runner=runner):
-            _run(runner, [docker, "rm", "--force", spec.container], timeout=60)
+            # Reclaim anonymous volumes (e.g. from a Dockerfile VOLUME) so a failed
+            # start never leaks storage.
+            result = _run(runner, [docker, "rm", "--force", "--volumes", spec.container], timeout=60)
+            if result.returncode and "No such" not in result.stderr:
+                failures.append(result.stderr.strip() or "rollback service container removal failed")
         # _start_dockerfile removes a newly built image on its own failure
         # paths.  An existing image is race-shared and must survive a private
         # lane instance failing to start.
     if _network_has_labels(spec.network, spec.labels, docker=docker, runner=runner):
-        _run(runner, [docker, "network", "rm", spec.network], timeout=30)
+        result = _run(runner, [docker, "network", "rm", spec.network], timeout=30)
+        if result.returncode and "not found" not in result.stderr.casefold():
+            failures.append(result.stderr.strip() or "rollback service network removal failed")
+    return failures
+
+
+def _recovery_metadata(
+    spec: ServiceSpec, *, kind: str, failures: Sequence[str]
+) -> dict[str, Any]:
+    """Structured CLEANUP_FAILED record that cleanup_service can later reclaim."""
+
+    if kind == "compose":
+        runtime: dict[str, Any] = {
+            "compose_files": [
+                str(spec.source / str(spec.plan.get("source", ""))),
+                str(spec.metadata_path.parent / "compose.race.yml"),
+            ],
+            "project": spec.project,
+            "service_count": max(
+                1,
+                len([row for row in spec.plan.get("services", []) if isinstance(row, Mapping)]),
+            ),
+            "compose_env_file": str(spec.metadata_path.parent / "compose.empty.env"),
+        }
+    else:
+        runtime = {
+            "container": spec.container,
+            "image": spec.image,
+            # An existing race-shared image is never owned by a failed private
+            # instance, so recovery must not try to remove it.
+            "owns_image": False,
+            "image_labels": spec.image_labels,
+            "compose_files": [],
+        }
+    return {
+        "schema_version": 1,
+        "status": "CLEANUP_FAILED",
+        "run_id": spec.run_id,
+        "challenge_id": spec.challenge_id,
+        "kind": kind,
+        "instance_id": spec.instance_id,
+        "isolation": "private-instance",
+        "network": spec.network,
+        "endpoints": [],
+        "lifecycle_owner": "root",
+        "labels": spec.labels,
+        "runtime": runtime,
+        "metadata_path": str(spec.metadata_path.resolve()),
+        "cleanup_failures": [str(value) for value in failures],
+    }
 
 
 def _validate_spec(spec: ServiceSpec) -> None:
