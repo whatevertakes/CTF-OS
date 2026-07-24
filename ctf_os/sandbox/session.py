@@ -12,7 +12,7 @@ import uuid
 
 from ..blackboard import output_hash
 from ..workspace import atomic_json, atomic_text
-from .runtime import firewall_packets
+from .runtime import firewall_packets, user_exec_prefix
 
 
 SESSION_KINDS = frozenset({"shell", "remote", "debugger"})
@@ -20,24 +20,75 @@ MAX_READ = 64 * 1024
 _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
 
 _TOOLS: dict[str, tuple[str, ...]] = {
-    "base": ("bash", "python3", "rg", "file", "strings", "xxd", "curl", "nc", "socat"),
-    "pwn": ("python3", "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools", "objdump", "readelf", "strace"),
-    "web": ("curl", "httpx", "nuclei", "semgrep", "sqlmap", "ffuf", "sstimap", "python3"),
-    "rev": ("gdb", "ctf-ghidra-headless", "capa", "r2", "objdump", "qemu-x86_64", "python3"),
-    "crypto": ("python3", "sage", "openssl", "z3", "ares"),
-    "forensic": ("file", "binwalk", "exiftool", "tshark", "vol", "foremost", "stegseek", "python3"),
-    "misc": ("python3", "ffmpeg", "sox", "zbarimg", "tesseract", "file", "ares"),
-    "osint": (
-        "whois", "dig", "curl", "tesseract", "exiftool", "sherlock", "maigret",
-        "holehe", "theHarvester", "python3",
+    "base": (
+        "bash", "python3", "rg", "file", "strings", "xxd", "curl", "wget",
+        "git", "jq", "nc", "socat", "objdump", "readelf", "nm", "nmap",
+        "gcc", "g++", "cmake", "clang", "ruby", "java",
     ),
-    "ai": ("python3", "onnxruntime", "safetensors", "pickletools"),
-    "cloud": ("terraform", "kubectl", "helm", "opa", "conftest", "checkov", "podman"),
+    "pwn": (
+        "gdb", "pwndbg", "checksec", "pwninit", "angrop", "seccomp-tools",
+        "gdb-multiarch", "ctf-ghidra-headless", "capa", "frida", "frida-ps",
+        "strace", "ltrace", "patchelf", "ROPgadget", "ropper", "one_gadget",
+        "musl-gcc", "cpio", "valgrind", "afl-fuzz", "afl-showmap",
+        "afl-cmin", "afl-tmin", "afl-clang-fast", "afl-clang-fast++",
+        "afl-qemu-trace", "boo", "atheris", "cargo", "rustc", "cargo-fuzz",
+        "qemu-x86_64", "qemu-i386", "qemu-aarch64",
+        "qemu-arm", "qemu-mips", "qemu-mipsel", "qemu-riscv64",
+        "qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-arm",
+        "qemu-system-riscv32", "qemu-system-riscv64", "qemu-img",
+    ),
+    "web": (
+        "httpx", "nuclei", "ctf-nuclei-scan", "semgrep", "sqlmap", "ffuf",
+        "sstimap", "dalfox", "schemathesis", "chromium", "chromedriver",
+        "node", "npm", "php", "sqlite3", "redis-cli", "psql", "mysql",
+    ),
+    "rev": (
+        "gdb", "gdb-multiarch", "ctf-ghidra-headless", "analyzeHeadless",
+        "capa", "r2", "jadx", "jadx-gui", "apktool", "frida", "frida-ps",
+        "upx", "wasm-objdump", "wasm2wat", "wasmtime", "javac",
+        "mono", "jazzer", "qemu-x86_64", "qemu-i386", "qemu-aarch64",
+        "qemu-arm", "qemu-mips", "qemu-mipsel", "qemu-riscv64",
+        "qemu-system-x86_64", "qemu-system-aarch64", "qemu-system-arm",
+        "qemu-system-riscv32", "qemu-system-riscv64", "qemu-img",
+    ),
+    "crypto": (
+        "sage", "openssl", "z3", "ares", "RsaCtfTool", "cado-nfs",
+        "hashcat", "gp", "gap", "maxima",
+    ),
+    "forensic": (
+        "binwalk", "exiftool", "tshark", "tcpdump", "vol", "mmls", "fls",
+        "icat", "foremost", "testdisk", "photorec", "dcfldd", "steghide",
+        "stegseek", "zsteg", "convert", "tesseract", "pngcheck", "ffmpeg",
+        "sox",
+    ),
+    "misc": (
+        "ffmpeg", "sox", "convert", "tesseract", "tshark", "binwalk",
+        "exiftool", "dot", "parallel", "podman", "zbarimg", "barcode",
+        "php", "lua", "perl", "node", "npm", "ares",
+    ),
+    "osint": (
+        "whois", "dig", "nslookup", "host", "traceroute", "chromium",
+        "convert", "tesseract", "exiftool", "ffmpeg", "yt-dlp", "git-lfs",
+        "pdftotext", "waybackurls", "sherlock", "maigret", "holehe",
+        "theHarvester",
+    ),
+    "ai": (
+        "onnxruntime", "safetensors", "pickletools", "protoc", "h5dump",
+        "ncdump", "dot", "jupyter", "modelscan", "fickling",
+    ),
+    "cloud": (
+        "aws", "az", "gcloud", "kubectl", "helm", "terraform", "tofu",
+        "podman", "skopeo", "oras", "cosign", "trivy", "syft", "grype",
+        "kustomize", "opa", "conftest", "checkov", "semgrep", "yq",
+    ),
 }
 _HELP = {
     "ctf-ghidra-headless": "ctf-ghidra-headless INPUT [TIMEOUT_SECONDS] exports bounded decompilation.",
-    "nuclei": "Use ctf-nuclei-scan with the bundled offline challenge templates.",
+    "analyzeHeadless": "Prefer ctf-ghidra-headless so projects remain bounded below /work and output goes to /artifacts.",
+    "nuclei": "Prefer ctf-nuclei-scan with the bundled offline challenge templates.",
+    "ctf-nuclei-scan": "Run ctf-nuclei-scan TARGET TEMPLATE [OUTPUT_NAME.jsonl] only against a declared HTTP(S) target.",
     "gdb": "Use gdb in a persistent debugger session for interactive breakpoints and memory inspection.",
+    "gdb-multiarch": "Use gdb-multiarch in a persistent debugger session for foreign-architecture binaries.",
     "pwndbg": "Run `pwndbg -q BINARY` in a persistent debugger session for enhanced GDB analysis.",
     "angrop": "Import angrop from Python to generate ROP chains for an angr project.",
     "vol": "Run Volatility 3 as `vol`; use `vol --help` to list framework options.",
@@ -52,8 +103,41 @@ _HELP = {
     "sherlock": "Run Sherlock only for public, challenge-scoped usernames and declared egress.",
     "maigret": "Run Maigret only for public, challenge-scoped usernames and declared egress.",
     "theHarvester": "Run theHarvester only against public challenge domains and declared egress.",
+    "afl-fuzz": "Run AFL++ as `afl-fuzz -i CORPUS -o FINDINGS -- TARGET`; keep corpora and findings below /work or /artifacts.",
+    "afl-showmap": "Use `afl-showmap -o MAP -- TARGET` for one bounded coverage-map probe.",
+    "afl-cmin": "Use `afl-cmin -i CORPUS -o MINIMIZED -- TARGET` to minimize an AFL++ corpus.",
+    "afl-tmin": "Use `afl-tmin -i TESTCASE -o MINIMIZED -- TARGET` to minimize one AFL++ testcase.",
+    "afl-qemu-trace": "Use through AFL++ QEMU mode (`afl-fuzz -Q` or `afl-showmap -Q`), not as a general system emulator.",
+    "boo": "Boofuzz installs the real `boo` CLI; import `boofuzz` in a Python harness for protocol fuzzing.",
+    "atheris": "Atheris is a Python library: write a TestOneInput callback, then run the harness with bounded libFuzzer flags such as `-runs=100`.",
+    "cargo-fuzz": "Run the installed binary as `cargo fuzz`; the pinned nightly toolchain and an offline libfuzzer-sys cache are preinstalled.",
+    "afl-clang-fast": "Compile a local target with AFL++ instrumentation before running afl-fuzz.",
+    "afl-clang-fast++": "Compile a local C++ target with AFL++ instrumentation before running afl-fuzz.",
+    "valgrind": "Use `valgrind --tool=memcheck --leak-check=full TARGET` for bounded dynamic memory analysis.",
+    "schemathesis": "Run `schemathesis run SCHEMA` against a declared API target; use `--max-examples` or `--max-time` to bound a probe.",
+    "jazzer": "Compile a Java fuzz target with `/opt/jazzer/jazzer_standalone.jar`, then run `jazzer --cp=CLASSPATH --target_class=CLASS -runs=N`.",
+    "chromium": "Use `/usr/bin/chromium --headless --no-sandbox` or Playwright's system Chromium integration inside the sandbox.",
+    "chromedriver": "Use `/usr/bin/chromedriver` with the matching Debian Chromium build.",
+    "qemu-aarch64": "Run AArch64 Linux user-mode binaries with the `/usr/aarch64-linux-gnu` sysroot when dynamically linked.",
+    "qemu-arm": "Run ARM Linux user-mode binaries with the `/usr/arm-linux-gnueabihf` sysroot when dynamically linked.",
+    "qemu-mipsel": "Run MIPSEL Linux user-mode binaries with the `/usr/mipsel-linux-gnu` sysroot when dynamically linked.",
+    "qemu-riscv64": "Run RISC-V 64 Linux user-mode binaries with the `/usr/riscv64-linux-gnu` sysroot when dynamically linked.",
+    "wasm-objdump": "Use WABT's `wasm-objdump` to inspect WebAssembly sections and disassembly.",
+    "wasm2wat": "Use WABT's `wasm2wat` to convert a WebAssembly module to text.",
+    "RsaCtfTool": "Run RsaCtfTool with challenge-provided RSA parameters or keys and keep outputs below /work or /artifacts.",
+    "cado-nfs": "Use cado-nfs only for a bounded factorization candidate after cheaper RSA attacks fail.",
+    "hashcat": "Use hashcat with a bounded mask or wordlist; GPU is used only when the sandbox received verified GPU access.",
+    "mmls": "Use mmls to enumerate disk-image partitions before fls or icat.",
+    "fls": "Use fls on an identified filesystem offset to enumerate deleted and live entries.",
+    "icat": "Use icat to extract one inode from a challenge disk image into /artifacts.",
+    "zsteg": "Use zsteg for bounded PNG/BMP steganography analysis.",
+    "waybackurls": "Run waybackurls only for a public challenge domain allowed by the race target policy.",
+    "modelscan": "Run modelscan before loading pickle, joblib, PyTorch, H5, or SavedModel artifacts.",
+    "fickling": "Use fickling to statically inspect or safely analyze pickle bytecode before any load.",
 }
 _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
+    "java": ("java", "--version"),
+    "javac": ("javac", "--version"),
     "nc": (
         "dpkg-query", "--show", "--showformat=${Version}\n", "netcat-openbsd",
     ),
@@ -72,18 +156,34 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
         "pwndbg", "--batch", "-q", "-ex",
         "pi import pwndbg; print(pwndbg.__version__)", "-ex", "quit",
     ),
+    "ctf-nuclei-scan": (
+        "sh", "-ec",
+        "command -v ctf-nuclei-scan >/dev/null; grep '^nuclei=' /opt/ctf-os/tool-versions.lock",
+    ),
     "httpx": (
         "python3", "-c",
         "from importlib.metadata import version; print(version('httpx'))",
     ),
     "semgrep": (
         "sh", "-ec",
-        "grep '^semgrep=' /opt/ctf-os/tool-versions.lock",
+        "command -v semgrep >/dev/null; grep '^semgrep=' /opt/ctf-os/tool-versions.lock",
     ),
     "ffuf": ("ffuf", "-V"),
     "ctf-ghidra-headless": (
         "sh", "-ec",
         "grep '^ghidra=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "analyzeHeadless": (
+        "sh", "-ec",
+        "command -v analyzeHeadless >/dev/null; grep '^ghidra=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "jadx-gui": (
+        "sh", "-ec",
+        "command -v jadx-gui >/dev/null; grep '^jadx=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "frida-ps": (
+        "sh", "-ec",
+        "command -v frida-ps >/dev/null; grep '^frida_tools=' /opt/ctf-os/tool-versions.lock",
     ),
     "openssl": ("openssl", "version"),
     "binwalk": (
@@ -126,6 +226,130 @@ _VERSION_COMMANDS: dict[str, tuple[str, ...]] = {
         "/opt/theharvester-venv/bin/python", "-c",
         "from importlib.metadata import version; print(version('theHarvester'))",
     ),
+    "afl-fuzz": (
+        "sh", "-ec",
+        "command -v afl-fuzz >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-showmap": (
+        "sh", "-ec",
+        "command -v afl-showmap >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-cmin": (
+        "sh", "-ec",
+        "command -v afl-cmin >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-tmin": (
+        "sh", "-ec",
+        "command -v afl-tmin >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-qemu-trace": (
+        "sh", "-ec",
+        "command -v afl-qemu-trace >/dev/null; grep '^qemuafl_commit=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-clang-fast": (
+        "sh", "-ec",
+        "command -v afl-clang-fast >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "afl-clang-fast++": (
+        "sh", "-ec",
+        "command -v afl-clang-fast++ >/dev/null; grep '^aflplusplus=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "boo": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('boofuzz'))",
+    ),
+    "ropper": (
+        "sh", "-ec",
+        "command -v ropper >/dev/null; python3 -c \"from importlib.metadata import version; print(version('ropper'))\"",
+    ),
+    "atheris": (
+        "python3", "-c",
+        "from importlib.metadata import version; print(version('atheris'))",
+    ),
+    "cargo-fuzz": ("cargo-fuzz", "--version"),
+    "RsaCtfTool": (
+        "sh", "-ec",
+        "command -v RsaCtfTool >/dev/null; grep '^RsaCtfTool=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "cado-nfs": (
+        "sh", "-ec",
+        "command -v cado-nfs >/dev/null; grep '^cado-nfs=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "gap": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "gap-core",
+    ),
+    "mmls": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "sleuthkit",
+    ),
+    "fls": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "sleuthkit",
+    ),
+    "icat": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "sleuthkit",
+    ),
+    "tcpdump": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "tcpdump",
+    ),
+    "testdisk": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "testdisk",
+    ),
+    "photorec": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "testdisk",
+    ),
+    "dcfldd": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "dcfldd",
+    ),
+    "steghide": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "steghide",
+    ),
+    "zsteg": (
+        "sh", "-ec",
+        "command -v zsteg >/dev/null; grep '^zsteg=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "convert": ("convert", "-version"),
+    "tesseract": ("tesseract", "--version"),
+    "pngcheck": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "pngcheck",
+    ),
+    "sox": ("sox", "--version"),
+    "dot": ("dot", "-V"),
+    "barcode": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "barcode",
+    ),
+    "php": ("php", "--version"),
+    "lua": ("lua", "-v"),
+    "perl": ("perl", "-v"),
+    "nslookup": ("dig", "-v"),
+    "host": ("dig", "-v"),
+    "chromium": ("chromium", "--version"),
+    "git-lfs": ("git-lfs", "--version"),
+    "pdftotext": ("pdftotext", "-v"),
+    "waybackurls": (
+        "sh", "-ec",
+        "command -v waybackurls >/dev/null; grep '^waybackurls=' /opt/ctf-os/tool-versions.lock",
+    ),
+    "protoc": ("protoc", "--version"),
+    "h5dump": ("h5dump", "-V"),
+    "ncdump": (
+        "dpkg-query", "--show", "--showformat=${Version}\n", "netcdf-bin",
+    ),
+    "jupyter": ("jupyter", "--version"),
+    "modelscan": ("modelscan", "--version"),
+    "fickling": ("fickling", "--version"),
+    "schemathesis": ("schemathesis", "--version"),
+    "az": ("az", "version"),
+    "gcloud": ("gcloud", "version"),
+    "aws": ("aws", "--version"),
+    "kubectl": ("kubectl", "version", "--client=true"),
+    "helm": ("helm", "version", "--short"),
+    "terraform": ("terraform", "version"),
+    "tofu": ("tofu", "version"),
+    "oras": ("oras", "version"),
+    "cosign": ("cosign", "version"),
+    "syft": ("syft", "version"),
+    "grype": ("grype", "version"),
+    "kustomize": ("kustomize", "version"),
+    "checkov": ("checkov", "--version"),
 }
 
 
@@ -178,8 +402,10 @@ def open_session(
     result = _run(
         runner,
         [
-            docker, "exec", "--detach", "--user", "1001:1001", "--workdir", "/work",
-            str(metadata["name"]), "sh", "-c", shell, "ctf-os-session", container_dir, *argv,
+            *user_exec_prefix(
+                metadata, docker=docker, detach=True, workdir="/work",
+            ),
+            "sh", "-c", shell, "ctf-os-session", container_dir, *argv,
         ],
         timeout=30,
     )
@@ -216,7 +442,7 @@ def send(
         raise SessionError("session send must contain 1..65536 bytes")
     state = _load_state(metadata, session_id)
     argv = [
-        docker, "exec", "--interactive", "--user", "1001:1001", str(metadata["name"]),
+        *user_exec_prefix(metadata, docker=docker, interactive=True),
         "sh", "-c", "cat >\"$1/in\"", "ctf-os-send", state["container_dir"],
     ]
     try:
@@ -248,7 +474,7 @@ def read(
         "b=p.read_bytes(); c=b[o:o+n]; sys.stdout.buffer.write(c); print(len(c),len(b),file=sys.stderr)"
     )
     argv = [
-        docker, "exec", "--user", "1001:1001", str(metadata["name"]),
+        *user_exec_prefix(metadata, docker=docker),
         "python3", "-c", script, f"{state['container_dir']}/out", str(state["cursor"]), str(limit),
     ]
     result = _run(runner, argv, timeout=_timeout(timeout))
@@ -322,7 +548,10 @@ def close_session(
     )
     result = _run(
         runner,
-        [docker, "exec", "--user", "1001:1001", str(metadata["name"]), "sh", "-c", script, "ctf-os-close", state["container_dir"]],
+        [
+            *user_exec_prefix(metadata, docker=docker),
+            "sh", "-c", script, "ctf-os-close", state["container_dir"],
+        ],
         timeout=_timeout(timeout),
     )
     if result.returncode == 0:
@@ -369,7 +598,7 @@ def tool_version(
     command = _VERSION_COMMANDS.get(name, (name, "--version"))
     result = _run(
         runner,
-        [docker, "exec", "--user", "1001:1001", str(metadata["name"]), *command],
+        [*user_exec_prefix(metadata, docker=docker), *command],
         timeout=20,
     )
     return {"tool": name, "available": result.returncode == 0, "output": (result.stdout + result.stderr)[-4096:]}

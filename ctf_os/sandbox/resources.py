@@ -1,4 +1,4 @@
-"""Small, stateless sandbox capacity admission."""
+"""Aggregate managed-container capacity admission for one race."""
 
 from __future__ import annotations
 
@@ -63,7 +63,10 @@ def admission_status(
             timeout=20, check=False,
         )
         listed = runner(
-            [docker, "ps", "--filter", "label=org.ctf-os.kind=sandbox", "--format", "{{json .}}"],
+            [
+                docker, "ps", "--filter", "label=org.ctf-os.managed=true",
+                "--format", "{{.ID}}",
+            ],
             capture_output=True, text=True, timeout=20, check=False,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
@@ -74,9 +77,16 @@ def admission_status(
         host = json.loads(info.stdout)
     except json.JSONDecodeError as exc:
         raise ResourceError("Docker returned malformed capacity data") from exc
-    active = [line for line in listed.stdout.splitlines() if line.strip()]
+    if not isinstance(host, dict):
+        raise ResourceError("Docker returned malformed capacity data")
+    active = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    usage = _managed_usage(active, docker=docker, runner=runner)
     return {
-        "active_sandboxes": len(active),
+        "active_sandboxes": usage["active_sandboxes"],
+        "active_services": usage["active_services"],
+        "active_managed_containers": usage["active_managed_containers"],
+        "reserved_memory_bytes": usage["memory_bytes"],
+        "reserved_cpus": usage["cpus"],
         "host_memory_bytes": int(host.get("MemTotal") or 0),
         "host_cpus": float(host.get("NCPU") or 0),
         "profiles": {name: profile.to_dict() for name, profile in RESOURCE_PROFILES.items()},
@@ -94,13 +104,141 @@ def admit(
         raise ResourceError("Root plus native children may not exceed concurrency four")
     profile = resource_profile(profile_name)
     status = admission_status(docker=docker, runner=runner)
-    if status["host_memory_bytes"] and parse_size_bytes(profile.memory) > max(
-        0, int(status["host_memory_bytes"]) - 2 * GIB
-    ):
-        raise ResourceError("sandbox memory request exceeds the reserved host budget")
-    if status["host_cpus"] and profile.cpus > max(0.5, float(status["host_cpus"]) - 1.0):
-        raise ResourceError("sandbox CPU request exceeds the reserved host budget")
-    return status | {"admitted_profile": profile.to_dict()}
+    if int(status["active_sandboxes"]) >= MAX_RACE_CONCURRENCY:
+        raise ResourceError(
+            "managed sandbox concurrency is already at the hard limit of four"
+        )
+    request_memory = parse_size_bytes(profile.memory)
+    projected_memory = int(status["reserved_memory_bytes"]) + request_memory
+    projected_cpus = float(status["reserved_cpus"]) + profile.cpus
+    memory_budget = max(0, int(status["host_memory_bytes"]) - 2 * GIB)
+    cpu_budget = max(0.5, float(status["host_cpus"]) - 1.0)
+    if status["host_memory_bytes"] and projected_memory > memory_budget:
+        raise ResourceError(
+            "aggregate managed-container memory request exceeds the reserved host budget "
+            f"({projected_memory} > {memory_budget} bytes)"
+        )
+    if status["host_cpus"] and projected_cpus > cpu_budget:
+        raise ResourceError(
+            "aggregate managed-container CPU request exceeds the reserved host budget "
+            f"({projected_cpus:g} > {cpu_budget:g} CPUs)"
+        )
+    return status | {
+        "admitted_profile": profile.to_dict(),
+        "projected_memory_bytes": projected_memory,
+        "projected_cpus": projected_cpus,
+        "memory_budget_bytes": memory_budget,
+        "cpu_budget": cpu_budget,
+    }
+
+
+def admit_fixed(
+    *,
+    memory: str,
+    cpus: float,
+    purpose: str,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Reserve capacity for a managed non-sandbox container such as a service."""
+
+    if cpus <= 0:
+        raise ResourceError("fixed CPU request must be positive")
+    request_memory = parse_size_bytes(memory)
+    status = admission_status(docker=docker, runner=runner)
+    memory_budget = max(0, int(status["host_memory_bytes"]) - 2 * GIB)
+    cpu_budget = max(0.5, float(status["host_cpus"]) - 1.0)
+    projected_memory = int(status["reserved_memory_bytes"]) + request_memory
+    projected_cpus = float(status["reserved_cpus"]) + cpus
+    if status["host_memory_bytes"] and projected_memory > memory_budget:
+        raise ResourceError(
+            f"aggregate {purpose} memory request exceeds the reserved host budget "
+            f"({projected_memory} > {memory_budget} bytes)"
+        )
+    if status["host_cpus"] and projected_cpus > cpu_budget:
+        raise ResourceError(
+            f"aggregate {purpose} CPU request exceeds the reserved host budget "
+            f"({projected_cpus:g} > {cpu_budget:g} CPUs)"
+        )
+    return status | {
+        "admitted_request": {
+            "purpose": purpose,
+            "memory": memory,
+            "memory_bytes": request_memory,
+            "cpus": cpus,
+        },
+        "projected_memory_bytes": projected_memory,
+        "projected_cpus": projected_cpus,
+        "memory_budget_bytes": memory_budget,
+        "cpu_budget": cpu_budget,
+    }
+
+
+def _managed_usage(
+    identifiers: list[str],
+    *,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    if not identifiers:
+        return {
+            "active_sandboxes": 0,
+            "active_services": 0,
+            "active_managed_containers": 0,
+            "memory_bytes": 0,
+            "cpus": 0.0,
+        }
+    try:
+        inspected = runner(
+            [docker, "inspect", *identifiers],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        raise ResourceError(f"Docker managed-resource inspection failed: {exc}") from exc
+    if inspected.returncode:
+        raise ResourceError(
+            inspected.stderr.strip() or "Docker managed-resource inspection failed"
+        )
+    try:
+        rows = json.loads(inspected.stdout)
+    except json.JSONDecodeError as exc:
+        raise ResourceError("Docker returned malformed managed-resource data") from exc
+    if not isinstance(rows, list):
+        raise ResourceError("Docker returned malformed managed-resource data")
+    sandboxes = 0
+    services = 0
+    memory = 0
+    nano_cpus = 0
+    counted = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ResourceError("Docker returned malformed managed-container data")
+        labels = row.get("Config", {}).get("Labels", {}) or {}
+        state = row.get("State", {}) or {}
+        if (
+            labels.get("org.ctf-os.managed") != "true"
+            or not bool(state.get("Running", True))
+        ):
+            continue
+        kind = labels.get("org.ctf-os.kind")
+        if kind not in {"sandbox", "service"}:
+            continue
+        host = row.get("HostConfig", {}) or {}
+        try:
+            memory += max(0, int(host.get("Memory") or 0))
+            nano_cpus += max(0, int(host.get("NanoCpus") or 0))
+        except (TypeError, ValueError) as exc:
+            raise ResourceError("Docker returned invalid managed resource limits") from exc
+        counted += 1
+        sandboxes += kind == "sandbox"
+        services += kind == "service"
+    return {
+        "active_sandboxes": sandboxes,
+        "active_services": services,
+        "active_managed_containers": counted,
+        "memory_bytes": memory,
+        "cpus": nano_cpus / 1_000_000_000,
+    }
 
 
 def sandbox_gc(

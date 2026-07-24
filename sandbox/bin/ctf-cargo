@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+# Cargo needs a writable home even though the sandbox root filesystem is
+# read-only. The only preloaded registry source is the pinned dependency set
+# needed by a freshly initialized cargo-fuzz harness.
+runtime_cargo_home="${CARGO_HOME:-/work/.cargo}"
+mkdir -p "$runtime_cargo_home"
+if [ ! -e "$runtime_cargo_home/config.toml" ]; then
+  umask 077
+  {
+    printf '%s\n' '[source.crates-io]'
+    printf '%s\n' 'replace-with = "ctf-os-vendored"'
+    printf '%s\n' '[source.ctf-os-vendored]'
+    printf '%s\n' 'directory = "/opt/cargo-fuzz-vendor"'
+    printf '%s\n' '[net]'
+    printf '%s\n' 'offline = true'
+  } >"$runtime_cargo_home/config.toml"
+fi
+
+export CARGO_HOME="$runtime_cargo_home"
+export CARGO_NET_OFFLINE=true
+exec /opt/rust-toolchain/bin/cargo "$@"

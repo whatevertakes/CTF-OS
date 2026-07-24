@@ -60,6 +60,15 @@ RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-binary-runtime-smo
 COPY sandbox/install/pwn-fuzzing.sh /opt/ctf-os/install/pwn-fuzzing.sh
 RUN chmod 0755 /opt/ctf-os/install/pwn-fuzzing.sh \
     && /opt/ctf-os/install/pwn-fuzzing.sh
+ENV PATH=/usr/local/bin:/opt/rust-toolchain/bin:${PATH}
+COPY sandbox/requirements/pwn-fuzzing.txt /opt/ctf-os/requirements/pwn-fuzzing.txt
+COPY sandbox/install/pwn-analysis-fuzzing.sh /opt/ctf-os/install/pwn-analysis-fuzzing.sh
+RUN chmod 0755 /opt/ctf-os/install/pwn-analysis-fuzzing.sh \
+    && /opt/ctf-os/install/pwn-analysis-fuzzing.sh
+COPY sandbox/install/pwn-language-fuzzing.sh /opt/ctf-os/install/pwn-language-fuzzing.sh
+COPY sandbox/bin/ctf-cargo /usr/local/bin/cargo
+RUN chmod 0755 /opt/ctf-os/install/pwn-language-fuzzing.sh /usr/local/bin/cargo \
+    && /opt/ctf-os/install/pwn-language-fuzzing.sh
 
 FROM pwn-tools AS profile-pwn
 COPY sandbox/smoke/pwn-fuzzing.sh /usr/local/bin/ctf-os-pwn-fuzzing-smoke
@@ -96,6 +105,11 @@ COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
 COPY sandbox/smoke/system-qemu.sh /usr/local/bin/ctf-os-system-qemu-smoke
 RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-*-smoke \
     && /opt/ctf-os/install/rev.sh
+COPY sandbox/install/rev-fuzzing.sh /opt/ctf-os/install/rev-fuzzing.sh
+COPY sandbox/smoke/rev-fuzzing.sh /usr/local/bin/ctf-os-rev-fuzzing-smoke
+RUN chmod 0755 /opt/ctf-os/install/rev-fuzzing.sh /usr/local/bin/ctf-os-rev-fuzzing-smoke \
+    && /opt/ctf-os/install/rev-fuzzing.sh \
+    && /usr/local/bin/ctf-os-rev-fuzzing-smoke
 
 FROM common AS profile-crypto
 COPY sandbox/requirements/crypto.txt /opt/ctf-os/requirements/crypto.txt

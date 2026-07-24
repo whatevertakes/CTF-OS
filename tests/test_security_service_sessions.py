@@ -11,7 +11,14 @@ import pytest
 from ctf_os.archive import ArchiveError, extract_archive
 from ctf_os.preflight import detect_service
 from ctf_os.sandbox.network import NetworkPolicyError, ResolvedTarget, Target, parse_remotes
-from ctf_os.sandbox.runtime import SandboxError, SandboxSpec, build_run_argv, cleanup
+from ctf_os.sandbox.runtime import (
+    USER_EXEC_ENV,
+    SandboxError,
+    SandboxSpec,
+    build_run_argv,
+    cleanup,
+    user_exec_prefix,
+)
 from ctf_os.sandbox.session import (
     SessionError, close_session, list_tools, open_session, read as session_read,
     tool_help, tool_version,
@@ -19,6 +26,29 @@ from ctf_os.sandbox.session import (
 from ctf_os.service import ServiceActor, ServiceError, ServiceSpec, prepare_service
 
 from conftest import fake_sandbox, make_race
+
+
+def _podman_sandbox_spec(tmp_path: Path, category: str) -> SandboxSpec:
+    root = tmp_path / category
+    source = root / "input"
+    source.mkdir(parents=True)
+    source.chmod(0o555)
+    lane_root = root / "workers" / "root"
+    for name in ("work", "evidence", "artifacts", "context"):
+        path = lane_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o755 if name == "context" else 0o777)
+    return SandboxSpec(
+        run_id=f"run-{category}",
+        contest_slug="demo",
+        challenge_id="challenge1",
+        category=category,
+        lane_id="root",
+        source=source,
+        lane_root=lane_root,
+        input_fingerprint="0" * 64,
+        image=f"ctf-os-sandbox:{category}",
+    )
 
 
 def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credentials(tmp_path: Path) -> None:
@@ -45,6 +75,49 @@ def test_sandbox_has_read_only_input_private_writable_paths_and_no_host_credenti
     assert "CTF_OS_ALLOWED_ENDPOINTS_JSON" in joined
     assert joined.count("--cap-add CHOWN") == 1
     assert joined.count("--cap-add DAC_READ_SEARCH") == 1
+
+
+@pytest.mark.parametrize(
+    ("category", "expects_rootless_seccomp"),
+    (("cloud", True), ("misc", True), ("web", False)),
+)
+def test_rootless_podman_seccomp_is_scoped_to_advertised_categories(
+    tmp_path: Path,
+    category: str,
+    expects_rootless_seccomp: bool,
+) -> None:
+    argv = build_run_argv(_podman_sandbox_spec(tmp_path, category))
+    seccomp = (
+        Path(__file__).resolve().parents[1] / "sandbox" / "seccomp-rootless.json"
+    )
+    security_opt = f"seccomp={seccomp}"
+    assert (security_opt in argv) is expects_rootless_seccomp
+
+
+def test_user_docker_exec_prefix_carries_only_lane_private_state(
+    repo: Path,
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo, category="cloud")
+    metadata = fake_sandbox(
+        run, challenge, "root", "ctf-os-sandbox:cloud",
+    )
+    argv = user_exec_prefix(
+        metadata,
+        interactive=True,
+        detach=True,
+        workdir="/work",
+    )
+    assert argv[:6] == [
+        "docker", "exec", "--interactive", "--detach", "--user", "1001:1001",
+    ]
+    assert "--workdir" in argv
+    for value in USER_EXEC_ENV:
+        assert argv.count(value) == 1
+        assert argv[argv.index(value) - 1] == "--env"
+        assert "/work" in value.split("=", 1)[1]
+    joined = " ".join(argv).casefold()
+    for forbidden in ("/home/choijiwng-kali", ".ssh", "host.docker.internal"):
+        assert forbidden not in joined
 
 
 def test_metadata_gateways_private_networks_and_undeclared_targets_are_rejected() -> None:
@@ -165,6 +238,14 @@ def test_compose_override_resets_host_ports_and_networks(tmp_path: Path) -> None
 
     def runner(argv, **kwargs):
         calls.append(list(argv))
+        if argv[1:2] == ["info"]:
+            return subprocess.CompletedProcess(
+                argv, 0,
+                json.dumps({"MemTotal": 32 * 1024**3, "NCPU": 16}),
+                "",
+            )
+        if argv[1:2] == ["ps"] and "--status" not in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[1:3] == ["network", "inspect"]:
             return subprocess.CompletedProcess(argv, 1, "", "not found")
         if "ps" in argv and "--status" in argv:
@@ -212,6 +293,7 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
     )
     assert state["status"] == "RUNNING"
     assert any("ulimit -f 131072" in value for value in calls[0])
+    assert all(value in calls[0] for value in USER_EXEC_ENV)
     receipt = session_read(metadata, session_id="dbg-main", runner=runner)
     assert receipt["observed_output"] == "gdb output\n"
     assert (run / "workers" / "root" / "logs" / f"{receipt['receipt_id']}.json").is_file()
@@ -413,6 +495,46 @@ def test_every_catalog_tool_has_a_working_version_probe(tmp_path: Path) -> None:
                 ["docker", "rm", "--force", name],
                 capture_output=True, text=True, timeout=30, check=False,
             )
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
+@pytest.mark.parametrize("category", ("cloud", "misc"))
+def test_rootless_podman_info_runs_in_hardened_catalog_sandbox(
+    tmp_path: Path,
+    category: str,
+) -> None:
+    spec = _podman_sandbox_spec(tmp_path, category)
+    run_argv = build_run_argv(spec)
+    started = subprocess.run(
+        run_argv,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    try:
+        result = subprocess.run(
+            [
+                *user_exec_prefix({"name": spec.name}, workdir="/work"),
+                "podman",
+                "info",
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        info = json.loads(result.stdout)
+        assert info["host"]["security"]["rootless"] is True
+    finally:
+        cleaned = cleanup({"name": spec.name, "labels": spec.labels})
+        assert cleaned["host_ownership_normalized"] is True
+        assert cleaned["removed"] is True
 
 
 def test_remote_session_requires_exact_declared_identity(repo: Path) -> None:

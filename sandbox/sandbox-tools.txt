@@ -8,6 +8,36 @@ Images: base, pwn, web, rev, crypto, forensic, misc, osint, ai, cloud.
 The exact profile additions are the executable install scripts in
 sandbox/install/. Missing required commands or imports fail the image build and
 the same capability families are independently checked by `doctor`.
+The model-facing command inventory is `ctf_os/sandbox/session.py::_TOOLS`.
+`list-tools`, `tool-help`, and `tool-version` expose that inventory inside an
+assigned sandbox. Tests require every solver-facing command asserted by the
+install scripts to appear in that inventory, carry non-empty help, and pass a
+live version probe in its category image. Debian dependency binaries that are
+not intended as solver tools remain outside the inventory.
+
+Controller discovery surface, in addition to the common base commands:
+
+- pwn: GDB/Pwndbg and gdb-multiarch; Ghidra headless, capa, Frida; ROP and
+  binary patching tools; musl and cross-architecture QEMU; Valgrind; AFL++
+  compiler, QEMU, corpus, and execution tools; boofuzz, Atheris, Rust,
+  cargo-fuzz, and system QEMU.
+- web: HTTP discovery and scanners; the constrained `ctf-nuclei-scan` wrapper;
+  SQLi, SSTI, XSS, Semgrep, Schemathesis, Chromium, and local web/database
+  runtimes.
+- rev: GDB multiarch, Ghidra, capa, Frida, radare2, JADX/Apktool, Java/Mono,
+  WebAssembly, Jazzer, and user/system QEMU.
+- crypto: Sage, Z3, OpenSSL, Ares, RsaCtfTool, CADO-NFS, PARI/GP, GAP, Maxima,
+  and Hashcat.
+- forensic: Volatility, Sleuth Kit, carving, packet tools, TestDisk/PhotoRec,
+  steganography, metadata, OCR, image, audio, and video tools.
+- misc: media/OCR, packet/file analysis, Graphviz, GNU Parallel, rootless
+  Podman, barcode/QR, common scripting runtimes, and Ares.
+- osint: DNS/routing, Chromium, metadata/OCR/media/PDF, yt-dlp, Wayback URLs,
+  Sherlock, Maigret, Holehe, and theHarvester.
+- ai: ONNX Runtime, Safetensors, pickletools, Protobuf/HDF5/NetCDF inspection,
+  Graphviz/Jupyter, ModelScan, and Fickling.
+- cloud: provider, Kubernetes, IaC, rootless container/registry, signature,
+  SBOM/vulnerability, policy, and configuration scanners.
 
 Pwn and Rev share an explicit foreign-binary runtime for dynamically linked
 i386, ARM hard-float, AArch64, MIPSEL, and RISC-V 64 ELF files. ARM-family,
@@ -25,9 +55,17 @@ the fixed offline rules at `/opt/capa-rules`. `ctf-ghidra-headless INPUT
 decompilation and log below `/artifacts`. Pwn adds AFL++ compiler instrumentation,
 ASan/UBSan builds, `afl-showmap`, bounded `afl-fuzz`, and a separately pinned
 `afl-qemu-trace`; this does not replace the system/cross-architecture QEMU layer.
+Pwn also provides Valgrind/Memcheck, boofuzz's real `boo` CLI and Python API,
+Atheris with its bundled libFuzzer, and cargo-fuzz on a date-pinned nightly Rust
+toolchain. The exact `libfuzzer-sys` graph needed by a new `cargo fuzz init`
+harness is vendored under `/opt/cargo-fuzz-vendor`, so its first bounded target
+can compile with sandbox networking disabled. Cargo writes only below
+`/work/.cargo`.
 Rev keeps PyOpenCL for CPU and native-Linux OpenCL analysis and provides CuPy
 with pinned CUDA 12 userspace libraries for NVIDIA GPU kernels, including on
 WSL2 where an NVIDIA OpenCL ICD may be unavailable.
+Rev provides the pinned Jazzer standalone launcher and jar under `/opt/jazzer`;
+its Temurin JDK 21 can compile and start a small JVM coverage-guided target.
 
 Web provides Debian Chromium and chromedriver, Playwright configured by probes
 to launch `/usr/bin/chromium` without a downloaded browser bundle, and pinned
@@ -38,6 +76,8 @@ one explicit HTTP(S) target and one pinned local template, disables update and
 Interactsh use, restricts execution to HTTP templates (never code/headless),
 and writes JSONL below `/artifacts`. Offline smokes use localhost only and keep
 Nuclei/Semgrep version checks disabled.
+Web also provides the pinned Schemathesis CLI for bounded OpenAPI and GraphQL
+property-based testing.
 
 AI provides ModelScan and Fickling before-load inspection for pickle/joblib and
 PyTorch serialization, plus ModelScan H5 and SavedModel support through pinned
@@ -68,3 +108,9 @@ CLIs receive no ambient host credentials and store temporary configuration only
 inside /work. AI model files are inspected inside the sandbox on CPU; models are
 not downloaded implicitly and unsafe pickle/joblib artifacts are never loaded
 on the host.
+
+Deliberately excluded from this image revision: syzkaller requires a dedicated
+kernel/VM workflow; Fuzzilli requires a large engine-specific V8 build; RESTler
+adds a .NET/service workflow; honggfuzz overlaps the existing native AFL++ and
+libFuzzer coverage; and LibAFL is a framework rather than a minimal ready-to-run
+CTF tool. No image installs any of those five tools.

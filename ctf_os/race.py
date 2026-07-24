@@ -8,11 +8,17 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 
-from .blackboard import HIGH_VALUE_TYPES, duplicate_signals, events, verified_delta
+from .blackboard import (
+    HIGH_VALUE_TYPES,
+    duplicate_signals,
+    events,
+    shared_artifacts,
+    verified_delta,
+)
 from .workspace import atomic_json, read_json, state_lock, utc_now
 
 
-RACE_SCHEMA_VERSION = 1
+RACE_SCHEMA_VERSION = 2
 MAX_CONCURRENCY = 4
 MAX_CHILDREN = 3
 RACE_SECONDS = 90 * 60
@@ -25,12 +31,20 @@ NON_EXECUTING_LANE_STATES = frozenset({
     "STOPPING", "CLEANUP_FAILED", "STOPPED", "WON",
 })
 TERMINAL_STATUSES = frozenset({"WON", "TIMED_OUT", "HANDOFF", "STOPPED"})
-MODEL_PROFILES = frozenset({"sol-xhigh", "terra-high", "luna-high"})
-AGENT_TYPES = {
-    "sol-xhigh": "ctf_sol_xhigh",
-    "terra-high": "ctf_terra_high",
-    "luna-high": "ctf_luna_high",
-    "sol-max": "ctf_sol_max",
+MODEL_PROFILES = frozenset({
+    "sol-ultra", "sol-max", "sol-xhigh", "terra-high", "luna-high",
+})
+ROOT_MODEL_PROFILES = frozenset({"sol-ultra", "sol-max", "sol-xhigh"})
+SPAWN_CONFIGS: dict[str, dict[str, str]] = {
+    "sol-ultra": {
+        "agent_type": "default",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "ultra",
+    },
+    "sol-xhigh": {"agent_type": "ctf_sol_xhigh"},
+    "terra-high": {"agent_type": "ctf_terra_high"},
+    "luna-high": {"agent_type": "ctf_luna_high"},
+    "sol-max": {"agent_type": "ctf_sol_max"},
 }
 TIMESTAMP_FIELDS = (
     "challenge_selected_at", "input_ready_at", "root_sandbox_ready_at",
@@ -52,7 +66,18 @@ def initialize_race(
     service: Mapping[str, Any],
     selected_at: str,
     input_ready_at: str,
+    root_model_profile: str = "sol-ultra",
+    root_model_profile_source: str = "policy-default",
+    service_isolation: str = "per-lane",
 ) -> dict[str, Any]:
+    if root_model_profile not in ROOT_MODEL_PROFILES:
+        raise RaceError(
+            "root model profile must be sol-ultra, sol-max, or sol-xhigh"
+        )
+    if root_model_profile_source not in {"explicit-cli", "policy-default"}:
+        raise RaceError("root model profile source is invalid")
+    if service_isolation not in {"per-lane", "shared"}:
+        raise RaceError("service isolation must be per-lane or shared")
     now = _parse_time(input_ready_at)
     challenge = dict(run_manifest["challenge"])
     lease = lease_seconds(str(challenge["category"]))
@@ -72,6 +97,8 @@ def initialize_race(
         "image_status": image.get("status"),
         "service_endpoints": list(service.get("endpoints", [])),
         "service_network": service.get("network"),
+        "service_isolation": service_isolation,
+        "service_instances": {},
         "status": "PREPARING",
         "attack_ready": False,
         "started_at": selected_at,
@@ -80,7 +107,8 @@ def initialize_race(
         "winner": None,
         "lanes": [{
             "lane_id": "root",
-            "model_profile": "sol-xhigh",
+            "model_profile": root_model_profile,
+            "model_profile_source": root_model_profile_source,
             "role": "lead-attacker",
             "task": "execute the highest-probability attack immediately",
             "context_mode": "root",
@@ -123,8 +151,48 @@ def set_service_context(run_root: Path, service: Mapping[str, Any]) -> dict[str,
         race["service_endpoints"] = list(service.get("endpoints", []))
         race["service_network"] = service.get("network")
         race["service_status"] = service.get("status")
+        if service.get("status") == "READY":
+            race["service_instances"]["root"] = {
+                "status": "READY",
+                "instance_id": service.get("instance_id", "root"),
+                "network": service.get("network"),
+                "endpoints": list(service.get("endpoints", [])),
+                "metadata_path": service.get("metadata_path"),
+            }
         _write(run_root, race)
         return race
+
+
+def set_lane_service_context(
+    run_root: Path,
+    *,
+    lane_id: str,
+    service: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach one Root-created private challenge-service instance to a lane."""
+
+    with state_lock(run_root):
+        race = load_race(run_root)
+        lane = _lane(race, lane_id)
+        if lane_id == "root":
+            raise RaceError("use set_service_context for Root")
+        if lane["status"] != "PREPARED" or lane.get("sandbox") is not None:
+            raise RaceError("lane service context is fixed before its sandbox starts")
+        if race.get("service_isolation") != "per-lane":
+            raise RaceError("private lane service requires per-lane isolation")
+        if service.get("status") != "READY":
+            raise RaceError("private lane service is not READY")
+        if service.get("instance_id") != lane_id:
+            raise RaceError("private service instance does not match its lane")
+        race["service_instances"][lane_id] = {
+            "status": "READY",
+            "instance_id": lane_id,
+            "network": service.get("network"),
+            "endpoints": list(service.get("endpoints", [])),
+            "metadata_path": service.get("metadata_path"),
+        }
+        _write(run_root, race)
+        return dict(race["service_instances"][lane_id])
 
 
 def mark_prepare_failed(run_root: Path, reason: str) -> dict[str, Any]:
@@ -285,19 +353,51 @@ def attach_lane_sandbox(
         return packet
 
 
-def mark_lane_prepare_failed(run_root: Path, *, lane_id: str, reason: str) -> dict[str, Any]:
+def mark_lane_prepare_failed(
+    run_root: Path,
+    *,
+    lane_id: str,
+    reason: str,
+    cleanup_failed: bool = False,
+) -> dict[str, Any]:
     with state_lock(run_root):
         race = load_race(run_root)
         lane = _lane(race, lane_id)
-        lane["status"] = "STOPPED"
+        lane["status"] = "CLEANUP_FAILED" if cleanup_failed else "STOPPED"
         lane["exact_blocker"] = reason[:4096]
-        lane["stopped_at"] = utc_now()
+        now = utc_now()
+        if cleanup_failed:
+            lane["cleanup_error"] = reason[:4096]
+            lane["cleanup_failed_at"] = now
+            lane["cleanup_attempts"] = int(lane.get("cleanup_attempts", 0)) + 1
+        else:
+            lane["stopped_at"] = now
+        instance = race.get("service_instances", {}).get(lane_id)
+        if isinstance(instance, dict):
+            instance["status"] = "CLEANUP_FAILED" if cleanup_failed else "STOPPED"
+            instance[
+                "cleanup_failed_at" if cleanup_failed else "stopped_at"
+            ] = now
+        _write(run_root, race)
+        return dict(lane)
+
+
+def begin_lane_cleanup_retry(run_root: Path, *, lane_id: str) -> dict[str, Any]:
+    """Retry controller cleanup for a lane whose native thread is already absent."""
+
+    with state_lock(run_root):
+        race = load_race(run_root)
+        lane = _lane(race, lane_id)
+        if lane_id == "root" or lane["status"] != "CLEANUP_FAILED":
+            raise RaceError("lane cleanup retry requires a child in CLEANUP_FAILED")
+        lane["status"] = "STOPPING"
+        lane["cleanup_attempts"] = int(lane.get("cleanup_attempts", 0)) + 1
         _write(run_root, race)
         return dict(lane)
 
 
 def confirm_native_spawn(run_root: Path, *, lane_id: str, native_session: str) -> dict[str, Any]:
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,255}", native_session):
+    if not _valid_native_session(native_session):
         raise RaceError("native session identity is invalid")
     with state_lock(run_root):
         race = load_race(run_root)
@@ -308,13 +408,23 @@ def confirm_native_spawn(run_root: Path, *, lane_id: str, native_session: str) -
             if row.get("lane_id") != lane_id
         ):
             raise RaceError("native session identity is already attached to another lane")
-        if lane["status"] != "PREPARED" or not isinstance(lane.get("sandbox"), Mapping):
+        attached = lane.get("native_session")
+        if attached is not None:
+            if attached != native_session:
+                raise RaceError("lane is already attached to a different native session")
+            return dict(lane)
+        if (
+            lane["status"] in {"STOPPING", "CLEANUP_FAILED", "STOPPED"}
+            or not isinstance(lane.get("sandbox"), Mapping)
+        ):
             raise RaceError("native spawn requires a prepared, READY private sandbox")
         if lane["sandbox"].get("status") != "READY":
             raise RaceError("native spawn requires a READY private sandbox")
         lane["native_session"] = native_session
-        lane["status"] = "RUNNING"
-        lane["spawned_at"] = utc_now()
+        if lane["status"] == "PREPARED":
+            lane["status"] = "RUNNING"
+        if lane.get("spawned_at") is None:
+            lane["spawned_at"] = utc_now()
         _write(run_root, race)
         return dict(lane)
 
@@ -440,26 +550,41 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             commands = len(lane_receipts)
             new_outputs = len({row.get("output_hash") for row in lane_receipts})
             high = sum(row.get("event_type") in HIGH_VALUE_TYPES for row in lane_events)
-            if commands <= int(lane.get("last_status_command_count", 0)):
-                lane["status_checks_without_command"] = int(lane.get("status_checks_without_command", 0)) + 1
-            else:
-                lane["status_checks_without_command"] = 0
+            running = _running_commands(run_root, str(lane["lane_id"]), current)
+            sessions = _running_sessions(run_root, str(lane["lane_id"]))
             lane["last_status_command_count"] = commands
             signals = _stagnation_signals(
-                race, lane, lane_events, lane_receipts, duplicates, current
+                race, lane, lane_events, lane_receipts, duplicates, current,
+                in_flight=bool(running or sessions),
             )
-            max_exhausted = lane.get("model_profile") == "sol-max" and (
-                commands >= int(lane.get("max_actual_attacks", 2))
-                or current >= _parse_time(str(lane.get("spawned_at") or lane["prepared_at"])) + timedelta(seconds=600)
+            max_exhausted = (
+                lane.get("lane_id") != "root"
+                and lane.get("model_profile") == "sol-max"
+                and (
+                    commands >= int(lane.get("max_actual_attacks", 2))
+                    or current
+                    >= _parse_time(
+                        str(lane.get("spawned_at") or lane["prepared_at"])
+                    )
+                    + timedelta(seconds=600)
+                )
             )
             if (
                 max_exhausted
+                and not (running or sessions)
                 and lane["status"] not in NON_EXECUTING_LANE_STATES | {"PREPARED"}
             ):
                 signals.append("sol-max-lease-exhausted")
                 lane["status"] = "CANCEL_REQUIRED"
             elif (
-                signals
+                not (running or sessions)
+                and any(signal in {
+                    "repeated-command-result",
+                    "artifact-hash-unchanged",
+                    "duplicate-other-lane",
+                    "remote-ready-without-remote-attempt",
+                    "lease-expired-without-command",
+                } for signal in signals)
                 and lane["status"]
                 not in NON_EXECUTING_LANE_STATES | {"PREPARED", "CANCEL_REQUIRED"}
             ):
@@ -474,10 +599,15 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 "high_value_event_count": high,
                 "duplicate_fingerprints": [row for row in duplicates if row["lane_id"] == lane["lane_id"]],
                 "stagnation_signals": signals,
+                "in_flight": bool(running or sessions),
+                "running_commands": running,
+                "running_sessions": sessions,
                 "last_verified_delta": _last_delta(lane_events),
                 "cancel_target": lane.get("native_session") if lane["status"] in {"STAGNANT", "CANCEL_REQUIRED"} else None,
             })
         _write(run_root, race)
+        native_actions = _native_actions(race)
+        controller_actions = _controller_actions(race)
         return {
             "run_id": race["run_id"],
             "status": race["status"],
@@ -486,6 +616,9 @@ def status(run_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             "lanes": rows,
             "cancel_targets": cancel_targets(race),
             "verified_delta": verified_delta(run_root),
+            "native_actions": native_actions,
+            "controller_actions": controller_actions,
+            "controller_reconcile_required": bool(native_actions or controller_actions),
             "metrics": metrics(
                 race,
                 ledger,
@@ -536,10 +669,18 @@ def finish_lane_cleanup(
             lane["cleanup_completed_at"] = now
             lane.pop("cleanup_error", None)
             lane.pop("cleanup_failed_at", None)
+            instance = race.get("service_instances", {}).get(lane_id)
+            if isinstance(instance, dict):
+                instance["status"] = "STOPPED"
+                instance["stopped_at"] = now
         else:
             lane["status"] = "CLEANUP_FAILED"
             lane["cleanup_error"] = error[:4096]
             lane["cleanup_failed_at"] = now
+            instance = race.get("service_instances", {}).get(lane_id)
+            if isinstance(instance, dict):
+                instance["status"] = "CLEANUP_FAILED"
+                instance["cleanup_failed_at"] = now
         _write(run_root, race)
         return dict(lane)
 
@@ -627,6 +768,17 @@ def metrics(
         },
         "duplicate_attack_ratio": round(len(duplicates) / max(1, len(command_receipts)), 6),
         "idle_lane_seconds": idle,
+        "model_portfolio": {
+            str(lane["lane_id"]): str(lane["model_profile"])
+            for lane in race["lanes"]
+        },
+        "root_model_profile": str(_lane(race, "root")["model_profile"]),
+        "root_model_profile_source": str(
+            _lane(race, "root").get("model_profile_source", "unknown")
+        ),
+        "shared_artifact_count": sum(
+            row.get("shared_artifact_path") is not None for row in ledger
+        ),
     }
 
 
@@ -656,7 +808,7 @@ def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, An
         "challenge": race["challenge"],
         "prepared_input": {"container_path": "/challenge", "read_only": True, "fingerprint": race["input_fingerprint"]},
         "declared_targets": race["declared_targets"],
-        "service_endpoints": race["service_endpoints"],
+        "service_endpoints": list(sandbox.get("service_endpoints", [])),
         "flag_pattern": race["flag_pattern"],
         "priority_files": race["priority_files"],
         "deadline": race["deadline"],
@@ -666,18 +818,33 @@ def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, An
             "metadata_path": sandbox["metadata_path"],
             "exec_command_prefix": sandbox["exec_command_prefix"],
         },
+        "shared_artifacts": {
+            "container_path": "/shared-artifacts",
+            "read_only": True,
+            "manifests": shared_artifacts(run_root),
+        },
     }
     if lane["context_mode"] == "directed":
         context["verified_blackboard_delta"] = verified_delta(run_root)
     message = (
         "You are one native CTF race lane. Execute only through the supplied sandbox prefix. "
         "Do not inspect host files, start other agents, submit flags, or share reasoning. "
+        "Inspect /shared-artifacts for newly verified immutable artifacts before reimplementing work. "
         "Return only actual commands, bounded observed output, executable artifacts, verified primitives, "
         "remote results, killed hypotheses, or exact blockers.\n\n"
         f"Role: {lane['role']}\nTask: {lane['task']}\n"
         f"Context JSON: {json.dumps(context, ensure_ascii=False, sort_keys=True)}"
     )
-    task_name = str(lane["lane_id"]).replace("-", "_")
+    task_name = _native_task_name(
+        str(lane["lane_id"]),
+        str(race["attempt_id"]),
+    )
+    spawn_args: dict[str, str] = {
+        "task_name": task_name,
+        "fork_turns": "none",
+        "message": message,
+    }
+    spawn_args.update(SPAWN_CONFIGS[str(lane["model_profile"])])
     return {
         "lane_id": lane["lane_id"],
         "model_profile": lane["model_profile"],
@@ -685,12 +852,7 @@ def _spawn_packet(run_root: Path, race: Mapping[str, Any], lane: Mapping[str, An
         "worker_paths": sandbox["paths"] | {"metadata_path": sandbox["metadata_path"]},
         "deadline": race["deadline"],
         "challenge_context": context,
-        "spawn_agent_args": {
-            "task_name": task_name,
-            "agent_type": AGENT_TYPES[str(lane["model_profile"])],
-            "fork_turns": "none",
-            "message": message,
-        },
+        "spawn_agent_args": spawn_args,
     }
 
 
@@ -700,7 +862,10 @@ def _normalize_specification(row: Mapping[str, Any]) -> dict[str, str]:
         raise RaceError(f"lane specification must contain exactly: {', '.join(sorted(required))}")
     values = {key: str(row[key]).strip() for key in required}
     if values["model_profile"] not in MODEL_PROFILES:
-        raise RaceError("bootstrap model_profile must be sol-xhigh, terra-high, or luna-high")
+        raise RaceError(
+            "bootstrap model_profile must be sol-ultra, sol-max, sol-xhigh, "
+            "terra-high, or luna-high"
+        )
     if values["context_mode"] not in {"fresh", "directed"}:
         raise RaceError("context_mode must be fresh or directed")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", values["attack_family"]):
@@ -711,6 +876,29 @@ def _normalize_specification(row: Mapping[str, Any]) -> dict[str, str]:
     return values
 
 
+def _valid_native_session(value: str) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= 256:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_.:/-]+", value):
+        return False
+    if "/" not in value:
+        return value[0].isalnum()
+    parts = value.split("/")
+    if value.startswith("/"):
+        parts = parts[1:]
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9_.:-]+", part) for part in parts)
+
+
+def _native_task_name(lane_id: str, attempt_id: str) -> str:
+    lane = re.sub(r"[^a-z0-9_]+", "_", lane_id.casefold()).strip("_")
+    attempt = re.sub(r"[^a-z0-9_]+", "_", attempt_id.casefold()).strip("_")
+    if not lane or not attempt:
+        raise RaceError("native task identity cannot be derived")
+    return f"{lane}_{attempt[:16]}"[:63]
+
+
 def _stagnation_signals(
     race: Mapping[str, Any],
     lane: Mapping[str, Any],
@@ -718,6 +906,8 @@ def _stagnation_signals(
     receipts: Sequence[Mapping[str, Any]],
     duplicates: Sequence[Mapping[str, Any]],
     now: datetime,
+    *,
+    in_flight: bool = False,
 ) -> list[str]:
     signals: list[str] = []
     lease = int(lane.get("lease_seconds", race["lease_seconds"]))
@@ -725,16 +915,20 @@ def _stagnation_signals(
         _optional_time(receipts[-1].get("finished_at"))
         if receipts else _optional_time(lane.get("prepared_at"))
     )
-    if last and (now - last).total_seconds() >= max(90, lease // 2):
-        signals.append("no-new-output-hash")
+    if (
+        not in_flight
+        and last
+        and (now - last).total_seconds() >= lease
+    ):
+        signals.append(
+            "lease-expired-without-command" if not receipts else "no-new-output-hash"
+        )
     fingerprints = [(
         row.get("argv_family"), row.get("target_identity"),
         row.get("exit_code"), row.get("output_hash"),
     ) for row in receipts]
     if len(fingerprints) != len(set(fingerprints)):
         signals.append("repeated-command-result")
-    if int(lane.get("status_checks_without_command", 0)) >= 2:
-        signals.append("no-command-across-status-checks")
     artifacts = [row.get("artifact_hash") for row in rows if row.get("artifact_hash")]
     if len(artifacts) >= 2 and artifacts[-1] == artifacts[-2]:
         signals.append("artifact-hash-unchanged")
@@ -748,6 +942,7 @@ def _stagnation_signals(
     )
     if (
         has_primitive
+        and not in_flight
         and (race.get("declared_targets") or race.get("service_endpoints"))
         and not remote
         and last
@@ -755,6 +950,123 @@ def _stagnation_signals(
     ):
         signals.append("remote-ready-without-remote-attempt")
     return signals
+
+
+def _running_commands(
+    run_root: Path,
+    lane_id: str,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    root = run_root / "workers" / lane_id / "logs" / "running"
+    if not root.exists():
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise RaceError("running command state directory is unsafe")
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json")):
+        if path.is_symlink():
+            raise RaceError("running command state is a symlink")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RaceError("running command state is unreadable") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("run_id") != run_root.name
+            or value.get("lane_id") != lane_id
+            or value.get("receipt_id") != path.stem
+            or value.get("status") != "RUNNING"
+        ):
+            raise RaceError("running command state identity mismatch")
+        heartbeat = _optional_time(value.get("heartbeat_at"))
+        stale = heartbeat is None or (now - heartbeat).total_seconds() > 30
+        rows.append({
+            "receipt_id": value.get("receipt_id"),
+            "argv": value.get("argv"),
+            "argv_family": value.get("argv_family"),
+            "started_at": value.get("started_at"),
+            "heartbeat_at": value.get("heartbeat_at"),
+            "last_output_at": value.get("last_output_at"),
+            "observed_bytes": value.get("observed_bytes"),
+            "heartbeat_stale": stale,
+        })
+    return [row for row in rows if row["heartbeat_stale"] is False]
+
+
+def _running_sessions(run_root: Path, lane_id: str) -> list[dict[str, Any]]:
+    root = run_root / "workers" / lane_id / "sessions"
+    if not root.exists():
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise RaceError("persistent session state directory is unsafe")
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.json")):
+        if path.is_symlink():
+            raise RaceError("persistent session state is a symlink")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RaceError("persistent session state is unreadable") from exc
+        if (
+            isinstance(value, dict)
+            and value.get("run_id") == run_root.name
+            and value.get("lane_id") == lane_id
+            and value.get("status") == "RUNNING"
+        ):
+            rows.append({
+                "session_id": value.get("session_id"),
+                "kind": value.get("kind"),
+                "argv": value.get("argv"),
+                "opened_at": value.get("opened_at"),
+                "last_read_at": value.get("last_read_at"),
+            })
+    return rows
+
+
+def _native_actions(race: Mapping[str, Any]) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for lane in race.get("lanes", []):
+        if not isinstance(lane, Mapping) or lane.get("lane_id") == "root":
+            continue
+        if (
+            lane.get("status") == "PREPARED"
+            and isinstance(lane.get("sandbox"), Mapping)
+            and lane["sandbox"].get("status") == "READY"
+            and isinstance(lane.get("spawn_agent_args"), Mapping)
+        ):
+            actions.append({
+                "action": "SPAWN",
+                "lane_id": lane["lane_id"],
+                "spawn_agent_args": dict(lane["spawn_agent_args"]),
+            })
+        elif (
+            lane.get("status") in {"STAGNANT", "CANCEL_REQUIRED"}
+            and lane.get("native_session")
+        ):
+            actions.append({
+                "action": "INTERRUPT",
+                "lane_id": lane["lane_id"],
+                "native_session": lane["native_session"],
+            })
+    return actions
+
+
+def _controller_actions(race: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "action": "RETRY_CLEANUP",
+            "lane_id": lane["lane_id"],
+            "exec_command": [
+                "uv", "run", "python", "-m", "ctf_os.agent_tools",
+                "race-lane-cleanup", "--run-id", race["run_id"],
+                "--lane", lane["lane_id"],
+            ],
+        }
+        for lane in race.get("lanes", [])
+        if isinstance(lane, Mapping)
+        and lane.get("lane_id") != "root"
+        and lane.get("status") == "CLEANUP_FAILED"
+    ]
 
 
 def _receipts(run_root: Path, lane_id: str) -> list[dict[str, Any]]:

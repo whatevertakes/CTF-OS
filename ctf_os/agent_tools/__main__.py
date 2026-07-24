@@ -7,13 +7,14 @@ or interrupts a native agent, or submits a flag.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
-from ..blackboard import append_verified_event
+from ..blackboard import append_verified_event, register_artifact_inbox
 from ..contest import discover_contests, initialize_contest, resolve_selector, select_contest
 from ..doctor import run_doctor
 from ..flag import StreamingDetector, record_candidate
@@ -22,6 +23,7 @@ from ..images import select_image, smoke_images
 from ..preflight import input_fingerprint, prepare_input, validate_prepared_input
 from ..race import (
     attach_lane_sandbox,
+    begin_lane_cleanup_retry,
     confirm_native_spawn,
     finish_lane_cleanup,
     initialize_race,
@@ -33,6 +35,7 @@ from ..race import (
     note_event,
     reserve_lanes,
     reserve_max_endgame,
+    set_lane_service_context,
     set_service_context,
     status as race_status,
     stop_confirmed,
@@ -41,7 +44,8 @@ from ..race import (
 from ..sandbox.network import parse_remotes, resolve_targets
 from ..sandbox.resources import sandbox_gc
 from ..sandbox.runtime import (
-    SandboxSpec, cleanup, create, execute, load_metadata, probe_service_connectivity,
+    SandboxError, SandboxSpec, cleanup, create, execute, load_metadata,
+    probe_service_connectivity,
 )
 from ..sandbox.session import (
     close_session,
@@ -72,6 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("race-prepare", help="select, materialize, and create the Root sandbox")
     _selection_args(prepare)
     prepare.add_argument("--docker", default="docker")
+    prepare.add_argument(
+        "--root-model-profile",
+        choices=("sol-ultra", "sol-max", "sol-xhigh"),
+        default=None,
+    )
+    prepare.add_argument(
+        "--service-isolation",
+        choices=("per-lane", "shared"),
+        default="per-lane",
+        help="use a private local challenge-service instance per lane by default",
+    )
     prepare.add_argument("--dry-run", action="store_true", help="prepare fresh state but do not start service/sandbox")
 
     bootstrap = commands.add_parser("race-bootstrap", help="prepare all requested private native-worker lanes")
@@ -101,6 +116,22 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--lane", required=True)
     stop.add_argument("--native-session", required=True)
     stop.add_argument("--docker", default="docker")
+
+    reconcile = commands.add_parser(
+        "race-reconcile",
+        help="batch-record native spawn/interrupt results and perform controller cleanup",
+    )
+    reconcile.add_argument("--run-id")
+    reconcile.add_argument("--events-json", required=True)
+    reconcile.add_argument("--docker", default="docker")
+
+    retry_cleanup = commands.add_parser(
+        "race-lane-cleanup",
+        help="retry a failed child sandbox/private-service cleanup",
+    )
+    retry_cleanup.add_argument("--run-id")
+    retry_cleanup.add_argument("--lane", required=True)
+    retry_cleanup.add_argument("--docker", default="docker")
 
     end = commands.add_parser("race-end", help="mark timeout, handoff, or explicit stop and return cancel targets")
     end.add_argument("--run-id")
@@ -180,8 +211,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
-    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
+    succeeded = _command_succeeded(args.command, result)
+    print(json.dumps(
+        {"ok": succeeded, "result": result},
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ))
+    return 0 if succeeded else 1
 
 
 def dispatch(args: argparse.Namespace, repo: Path) -> Any:
@@ -200,23 +237,23 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         return race_status(resolve_run(repo, args.run_id))
     if args.command == "race-stop-confirm":
         run = resolve_run(repo, args.run_id)
-        lane = stop_confirmed(run, lane_id=args.lane, native_session=args.native_session)
-        metadata_path = run / "workers" / str(args.lane) / "sandbox.json"
-        try:
-            if not metadata_path.is_file() or metadata_path.is_symlink():
-                raise ValueError(
-                    "stopped lane has no safe private sandbox metadata to clean"
-                )
-            cleanup_result = cleanup(load_metadata(metadata_path), docker=args.docker)
-        except Exception as exc:
-            finish_lane_cleanup(run, lane_id=args.lane, error=str(exc))
-            raise
-        lane = finish_lane_cleanup(run, lane_id=args.lane)
-        return {
-            "lane": lane,
-            "sandbox_cleanup": cleanup_result,
-            "artifacts_preserved": str(run / "workers" / str(args.lane) / "artifacts"),
-        }
+        return _stop_and_cleanup_lane(
+            run,
+            lane_id=args.lane,
+            native_session=args.native_session,
+            docker=args.docker,
+        )
+    if args.command == "race-reconcile":
+        return _race_reconcile(repo, args)
+    if args.command == "race-lane-cleanup":
+        run = resolve_run(repo, args.run_id)
+        begin_lane_cleanup_retry(run, lane_id=args.lane)
+        return _finish_controller_lane_cleanup(
+            run,
+            lane_id=args.lane,
+            docker=args.docker,
+            require_sandbox=False,
+        )
     if args.command == "race-end":
         return terminate(resolve_run(repo, args.run_id), reason=args.reason)
     if args.command == "race-handoff":
@@ -268,6 +305,17 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
     raise ValueError(f"unsupported command: {args.command}")
 
 
+def _command_succeeded(command: str, result: Any) -> bool:
+    if command == "doctor":
+        return isinstance(result, Mapping) and result.get("ok") is True
+    if command == "image-smoke":
+        return (
+            isinstance(result, Mapping)
+            and result.get("all_available") is True
+        )
+    return True
+
+
 def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     selected_at = utc_now()
     manifest, challenge = _select(repo, args.contest, args.selector)
@@ -287,6 +335,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     service: dict[str, Any] = {
         "status": "NOT_PREPARED", "network": None, "endpoints": [], "lifecycle_owner": "root",
     }
+    requested_root_profile = getattr(args, "root_model_profile", None)
     race = initialize_race(
         run,
         run_manifest=run_manifest,
@@ -295,6 +344,11 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
         service=service,
         selected_at=selected_at,
         input_ready_at=input_ready_at,
+        root_model_profile=requested_root_profile or "sol-ultra",
+        root_model_profile_source=(
+            "explicit-cli" if requested_root_profile else "policy-default"
+        ),
+        service_isolation=getattr(args, "service_isolation", "per-lane"),
     )
     if args.dry_run:
         mark_prepare_failed(run, "dry-run requested; no service or sandbox was started")
@@ -312,13 +366,15 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             source=run / "input",
             run_root=run,
             plan=input_record["service_plan"],
+            instance_id="root",
         )
         service = prepare_service(
             service_spec, actor=ServiceActor(lane_id="root", role="root"), docker=args.docker
         )
         set_service_context(run, service)
         targets = () if service.get("status") == "READY" else resolve_targets(parse_remotes(challenge.remotes))
-        root_sandbox = create(SandboxSpec(
+        artifact_inbox = register_artifact_inbox(run, "root")
+        root_sandbox = _create_sandbox(SandboxSpec(
             run_id=run.name,
             contest_slug=manifest.slug,
             challenge_id=challenge.id,
@@ -331,6 +387,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             targets=targets,
             service_network=str(service["network"]) if service.get("status") == "READY" else None,
             service_endpoints=tuple(str(value) for value in service.get("endpoints", [])),
+            artifact_inbox=artifact_inbox,
             resource_profile=_resource_profile(input_record),
             race_lane_count=0,
         ), docker=args.docker)
@@ -368,14 +425,52 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     specifications = _lane_json(args)
     reserved = reserve_lanes(run, specifications)
     source, input_record = validate_prepared_input(run)
-    service_network = race.get("service_network")
-    service_endpoints = tuple(str(value) for value in race.get("service_endpoints", []))
-    targets = () if service_network else resolve_targets(parse_remotes(challenge.remotes))
+    root_service_network = race.get("service_network")
+    root_service_endpoints = tuple(
+        str(value) for value in race.get("service_endpoints", [])
+    )
+    targets = (
+        ()
+        if root_service_network
+        else resolve_targets(parse_remotes(challenge.remotes))
+    )
     packets: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for lane in reserved:
+        lane_service: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None
         try:
-            metadata = create(SandboxSpec(
+            service_network = root_service_network
+            service_endpoints = root_service_endpoints
+            if (
+                root_service_network
+                and race.get("service_isolation") == "per-lane"
+            ):
+                lane_service = prepare_service(
+                    ServiceSpec(
+                        run_id=run.name,
+                        challenge_id=challenge.id,
+                        source=source,
+                        run_root=run,
+                        plan=input_record["service_plan"],
+                        instance_id=str(lane["lane_id"]),
+                    ),
+                    actor=ServiceActor(lane_id="root", role="root"),
+                    docker=args.docker,
+                )
+                set_lane_service_context(
+                    run,
+                    lane_id=str(lane["lane_id"]),
+                    service=lane_service,
+                )
+                service_network = lane_service["network"]
+                service_endpoints = tuple(
+                    str(value) for value in lane_service.get("endpoints", [])
+                )
+            artifact_inbox = register_artifact_inbox(
+                run, str(lane["lane_id"])
+            )
+            metadata = _create_sandbox(SandboxSpec(
                 run_id=run.name,
                 contest_slug=manifest.slug,
                 challenge_id=challenge.id,
@@ -388,19 +483,61 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 targets=targets,
                 service_network=str(service_network) if service_network else None,
                 service_endpoints=service_endpoints,
+                artifact_inbox=artifact_inbox,
                 resource_profile=_resource_profile(input_record),
                 race_lane_count=1 + len(packets),
             ), docker=args.docker)
+            if service_network:
+                metadata["service_probe"] = probe_service_connectivity(
+                    metadata, docker=args.docker
+                )
             packets.append(attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata))
         except Exception as exc:
-            mark_lane_prepare_failed(run, lane_id=str(lane["lane_id"]), reason=str(exc))
-            failures.append({"lane_id": str(lane["lane_id"]), "error": str(exc)})
+            cleanup_errors: list[str] = []
+            if metadata is not None:
+                try:
+                    cleanup(metadata, docker=args.docker)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"sandbox: {cleanup_exc}")
+            if lane_service is not None and lane_service.get("status") == "READY":
+                try:
+                    cleaned_service = cleanup_service(
+                        lane_service,
+                        actor=ServiceActor("root", "root"),
+                        docker=args.docker,
+                    )
+                    cleanup_errors.extend(
+                        str(value) for value in cleaned_service.get("failures", [])
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+            reason = str(exc)
+            if cleanup_errors:
+                reason += "; isolated service cleanup: " + "; ".join(cleanup_errors)
+            mark_lane_prepare_failed(
+                run,
+                lane_id=str(lane["lane_id"]),
+                reason=reason,
+                cleanup_failed=bool(cleanup_errors),
+            )
+            failures.append({"lane_id": str(lane["lane_id"]), "error": reason})
     return {
         "run_id": run.name,
         "packets": packets,
         "failures": failures,
         "native_spawn_performed": False,
-        "next_action": "Root passes each spawn_agent_args to native spawn_agent immediately while continuing its own attack.",
+        "native_actions": [
+            {
+                "action": "SPAWN",
+                "lane_id": packet["lane_id"],
+                "spawn_agent_args": packet["spawn_agent_args"],
+            }
+            for packet in packets
+        ],
+        "next_action": (
+            "Root executes only the returned native SPAWN actions, then records all "
+            "native thread ids in one race-reconcile call while continuing its attack."
+        ),
     }
 
 
@@ -418,8 +555,33 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     service_endpoints = tuple(str(value) for value in race.get("service_endpoints", []))
     remotes = race["challenge"].get("remotes", [])
     targets = () if service_network else resolve_targets(parse_remotes(remotes))
+    lane_service: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
     try:
-        metadata = create(SandboxSpec(
+        if service_network and race.get("service_isolation") == "per-lane":
+            lane_service = prepare_service(
+                ServiceSpec(
+                    run_id=run.name,
+                    challenge_id=str(race["challenge"]["id"]),
+                    source=source,
+                    run_root=run,
+                    plan=input_record["service_plan"],
+                    instance_id=str(lane["lane_id"]),
+                ),
+                actor=ServiceActor("root", "root"),
+                docker=args.docker,
+            )
+            set_lane_service_context(
+                run,
+                lane_id=str(lane["lane_id"]),
+                service=lane_service,
+            )
+            service_network = lane_service["network"]
+            service_endpoints = tuple(
+                str(value) for value in lane_service.get("endpoints", [])
+            )
+        artifact_inbox = register_artifact_inbox(run, str(lane["lane_id"]))
+        metadata = _create_sandbox(SandboxSpec(
             run_id=run.name,
             contest_slug=str(race["contest"]["slug"]),
             challenge_id=str(race["challenge"]["id"]),
@@ -432,15 +594,47 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             targets=targets,
             service_network=str(service_network) if service_network else None,
             service_endpoints=service_endpoints,
+            artifact_inbox=artifact_inbox,
             resource_profile=_resource_profile(input_record),
             race_lane_count=sum(
                 row["status"] not in {"STOPPED", "WON"}
                 for row in load_race(run)["lanes"] if row["lane_id"] != lane["lane_id"]
             ),
         ), docker=args.docker)
+        if service_network:
+            metadata["service_probe"] = probe_service_connectivity(
+                metadata, docker=args.docker
+            )
         packet = attach_lane_sandbox(run, lane_id=str(lane["lane_id"]), sandbox=metadata)
     except Exception as exc:
-        mark_lane_prepare_failed(run, lane_id=str(lane["lane_id"]), reason=str(exc))
+        cleanup_errors: list[str] = []
+        if metadata is not None:
+            try:
+                cleanup(metadata, docker=args.docker)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"sandbox: {cleanup_exc}")
+        if lane_service is not None and lane_service.get("status") == "READY":
+            try:
+                service_cleanup = cleanup_service(
+                    lane_service,
+                    actor=ServiceActor("root", "root"),
+                    docker=args.docker,
+                )
+                cleanup_errors.extend(
+                    f"service: {value}"
+                    for value in service_cleanup.get("failures", [])
+                )
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"service: {cleanup_exc}")
+        reason = str(exc)
+        if cleanup_errors:
+            reason += "; cleanup: " + "; ".join(cleanup_errors)
+        mark_lane_prepare_failed(
+            run,
+            lane_id=str(lane["lane_id"]),
+            reason=reason,
+            cleanup_failed=bool(cleanup_errors),
+        )
         raise
     return {
         "run_id": run.name,
@@ -486,7 +680,12 @@ def _sandbox_exec(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
         note_event(run, event)
     except Exception as exc:
         warnings.append(f"post-execution blackboard write failed: {exc}")
-    return {"receipt": receipt, "winner": winner, "warnings": warnings}
+    return {
+        "receipt": receipt,
+        "winner": winner,
+        "warnings": warnings,
+        "supervision": _supervision_snapshot(race_status(run)),
+    }
 
 
 def _blackboard_add(receipt_path: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -544,7 +743,12 @@ def _session_read(repo: Path, metadata_path: Path, args: argparse.Namespace) -> 
         note_event(run, event)
     except Exception as exc:
         warnings.append(f"post-execution blackboard write failed: {exc}")
-    return {"receipt": receipt, "winner": winner, "warnings": warnings}
+    return {
+        "receipt": receipt,
+        "winner": winner,
+        "warnings": warnings,
+        "supervision": _supervision_snapshot(race_status(run)),
+    }
 
 
 def _authorized_metadata(repo: Path, metadata_path: Path) -> dict[str, Any]:
@@ -583,6 +787,25 @@ def _authorized_metadata(repo: Path, metadata_path: Path) -> dict[str, Any]:
     return metadata
 
 
+def _supervision_snapshot(report: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": report["status"],
+        "deadline": report["deadline"],
+        "winner": report.get("winner"),
+        "native_actions": report.get("native_actions", []),
+        "controller_actions": report.get("controller_actions", []),
+        "lanes": [
+            {
+                "lane_id": row["lane_id"],
+                "status": row["status"],
+                "in_flight": row.get("in_flight", False),
+                "stagnation_signals": row.get("stagnation_signals", []),
+            }
+            for row in report.get("lanes", [])
+        ],
+    }
+
+
 def _race_handoff(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(repo, args.run_id)
     race = load_race(run)
@@ -605,6 +828,145 @@ def _race_handoff(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _race_reconcile(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Apply native-only boundary results in one controller transaction batch."""
+
+    run = resolve_run(repo, args.run_id)
+    raw = args.events_json
+    if len(raw.encode("utf-8")) > 64 * 1024:
+        raise ValueError("native reconciliation JSON is too large")
+    value = json.loads(raw)
+    if not isinstance(value, list) or not value:
+        raise ValueError("native reconciliation requires a non-empty event array")
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for index, row in enumerate(value):
+        if not isinstance(row, dict) or set(row) != {
+            "action", "lane_id", "native_session",
+        }:
+            raise ValueError(
+                "each native event must contain exactly action, lane_id, native_session"
+            )
+        action = str(row["action"])
+        lane_id = str(row["lane_id"])
+        native_session = str(row["native_session"])
+        try:
+            if action == "SPAWNED":
+                results.append({
+                    "action": action,
+                    "lane": confirm_native_spawn(
+                        run,
+                        lane_id=lane_id,
+                        native_session=native_session,
+                    ),
+                })
+            elif action == "INTERRUPTED":
+                results.append({
+                    "action": action,
+                    "cleanup": _stop_and_cleanup_lane(
+                        run,
+                        lane_id=lane_id,
+                        native_session=native_session,
+                        docker=args.docker,
+                    ),
+                })
+            else:
+                raise ValueError("native event action must be SPAWNED or INTERRUPTED")
+        except Exception as exc:
+            failures.append({
+                "index": str(index),
+                "lane_id": lane_id,
+                "action": action,
+                "error": str(exc),
+            })
+    report = race_status(run)
+    return {
+        "run_id": run.name,
+        "results": results,
+        "failures": failures,
+        "status": report,
+        "native_actions": report["native_actions"],
+    }
+
+
+def _stop_and_cleanup_lane(
+    run: Path,
+    *,
+    lane_id: str,
+    native_session: str,
+    docker: str,
+) -> dict[str, Any]:
+    stop_confirmed(
+        run,
+        lane_id=lane_id,
+        native_session=native_session,
+    )
+    return _finish_controller_lane_cleanup(
+        run,
+        lane_id=lane_id,
+        docker=docker,
+        require_sandbox=True,
+    )
+
+
+def _finish_controller_lane_cleanup(
+    run: Path,
+    *,
+    lane_id: str,
+    docker: str,
+    require_sandbox: bool,
+) -> dict[str, Any]:
+    failures: list[tuple[str, str]] = []
+    cleanup_result: dict[str, Any] | None = None
+    service_result: dict[str, Any] | None = None
+    metadata_path = run / "workers" / lane_id / "sandbox.json"
+    if metadata_path.exists() or require_sandbox:
+        try:
+            if not metadata_path.is_file() or metadata_path.is_symlink():
+                raise ValueError("stopped lane has no safe private sandbox metadata to clean")
+            cleanup_result = cleanup(load_metadata(metadata_path), docker=docker)
+        except Exception as exc:
+            failures.append(("sandbox", str(exc)))
+    service_path = (
+        run / "service" / "instances" / lane_id / "service.json"
+    )
+    if service_path.exists():
+        try:
+            if service_path.is_symlink() or not service_path.is_file():
+                raise ValueError("private service metadata is unsafe")
+            service_result = cleanup_service(
+                load_service(service_path),
+                actor=ServiceActor("root", "root"),
+                docker=docker,
+            )
+            failures.extend(
+                ("service", str(value))
+                for value in service_result.get("failures", [])
+            )
+        except Exception as exc:
+            failures.append(("service", str(exc)))
+    if failures:
+        error = (
+            failures[0][1]
+            if len(failures) == 1
+            else "; ".join(f"{scope}: {message}" for scope, message in failures)
+        )
+        finish_lane_cleanup(
+            run,
+            lane_id=lane_id,
+            error=error,
+        )
+        raise RuntimeError(error)
+    lane = finish_lane_cleanup(run, lane_id=lane_id)
+    return {
+        "lane": lane,
+        "sandbox_cleanup": cleanup_result,
+        "service_cleanup": service_result,
+        "artifacts_preserved": str(run / "workers" / lane_id / "artifacts"),
+        "shared_artifacts_preserved": str(run / "exchange" / "store"),
+    }
+
+
 def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(repo, args.run_id)
     race = load_race(run)
@@ -620,9 +982,24 @@ def _race_cleanup(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             cleaned.append(cleanup(load_metadata(metadata_path), docker=args.docker))
         except Exception as exc:
             failures.append({"scope": str(lane["lane_id"]), "error": str(exc)})
-    service_path = run / "service" / "service.json"
-    if service_path.exists():
+    service_root = run / "service"
+    service_paths = (
+        sorted(
+            (
+                path for path in service_root.rglob("service.json")
+                if path != service_root / "service.json"
+            ),
+            key=lambda path: path.as_posix(),
+        )
+        if service_root.exists() else []
+    )
+    root_service_path = service_root / "service.json"
+    if root_service_path.exists():
+        service_paths.append(root_service_path)
+    for service_path in service_paths:
         try:
+            if service_path.is_symlink() or not service_path.is_file():
+                raise ValueError("service metadata path is unsafe")
             service_cleanup = cleanup_service(
                 load_service(service_path), actor=ServiceActor("root", "root"), docker=args.docker
             )
@@ -682,6 +1059,10 @@ def _prepare_result(
         "flag_pattern": race["flag_pattern"],
         "priority_files": race["priority_files"],
         "deadline": race["deadline"],
+        "root_model_profile": root["model_profile"],
+        "root_model_profile_source": root.get("model_profile_source"),
+        "service_isolation": race.get("service_isolation", "shared"),
+        "service_instances": race.get("service_instances", {}),
         "lanes": [{"lane_id": row["lane_id"], "status": row["status"], "attack_family": row["attack_family"]} for row in race["lanes"]],
         "attack_ready": race["attack_ready"],
         "dry_run": dry_run,
@@ -740,6 +1121,35 @@ def _resource_profile(input_record: Mapping[str, Any]) -> str:
     if total > 256 * 1024**2:
         return "heavy"
     return "standard"
+
+
+def _create_sandbox(spec: SandboxSpec, *, docker: str) -> dict[str, Any]:
+    """Admit the strongest feasible profile without oversubscribing the host."""
+
+    order = {
+        "large-forensic": ("large-forensic", "heavy", "standard", "light"),
+        "heavy": ("heavy", "standard", "light"),
+        "standard": ("standard", "light"),
+        "light": ("light",),
+    }[spec.resource_profile]
+    failures: list[str] = []
+    for profile in order:
+        candidate = replace(spec, resource_profile=profile)
+        try:
+            metadata = create(candidate, docker=docker)
+            if profile != spec.resource_profile:
+                metadata["resource_degraded_from"] = spec.resource_profile
+                metadata["resource_degraded_reason"] = failures[-1]
+            return metadata
+        except SandboxError as exc:
+            message = str(exc)
+            if "aggregate managed-container" not in message and "reserved host budget" not in message:
+                raise
+            failures.append(message)
+    raise SandboxError(
+        "no sandbox resource profile fits the aggregate host budget: "
+        + "; ".join(failures)
+    )
 
 
 def _attack_timeout(metadata: Mapping[str, Any], requested: int) -> int:

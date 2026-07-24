@@ -89,6 +89,69 @@ def test_native_lane_is_not_running_until_root_confirms_real_thread(repo: Path) 
     assert confirmed["native_session"] == "thread-123"
 
 
+def test_native_spawn_confirmation_accepts_canonical_path_after_fast_receipt(
+    repo: Path,
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
+    lane = reserve_lanes(run, [_spec("fast-first-command")])[0]
+    from ctf_os.race import attach_lane_sandbox
+    attach_lane_sandbox(
+        run,
+        lane_id=lane["lane_id"],
+        sandbox=fake_sandbox(run, challenge, lane["lane_id"]),
+    )
+    note_command_receipt(
+        run,
+        _receipt(
+            run,
+            challenge,
+            lane["lane_id"],
+            "fast child completed",
+            receipt_id="fast-child-first",
+        ),
+    )
+    assert load_race(run)["lanes"][1]["status"] == "EXECUTING"
+
+    confirmed = confirm_native_spawn(
+        run,
+        lane_id=lane["lane_id"],
+        native_session="/root/lane_1",
+    )
+    assert confirmed["native_session"] == "/root/lane_1"
+    assert confirmed["status"] == "EXECUTING"
+    assert confirm_native_spawn(
+        run,
+        lane_id=lane["lane_id"],
+        native_session="/root/lane_1",
+    ) == confirmed
+
+
+@pytest.mark.parametrize(
+    "native_session",
+    ("/root//lane_1", "/root/../lane_1", "/root/./lane_1", "/root/lane_1/"),
+)
+def test_native_spawn_confirmation_rejects_unsafe_canonical_paths(
+    repo: Path,
+    native_session: str,
+) -> None:
+    _manifest, challenge, run, _race = make_race(repo)
+    _record_root_attack(run, challenge)
+    lane = reserve_lanes(run, [_spec("unsafe-session-path")])[0]
+    from ctf_os.race import attach_lane_sandbox
+    attach_lane_sandbox(
+        run,
+        lane_id=lane["lane_id"],
+        sandbox=fake_sandbox(run, challenge, lane["lane_id"]),
+    )
+    with pytest.raises(RaceError, match="native session identity"):
+        confirm_native_spawn(
+            run,
+            lane_id=lane["lane_id"],
+            native_session=native_session,
+        )
+
+
 def test_native_stop_confirmation_cleans_private_sandbox_before_replacement(
     repo: Path, monkeypatch
 ) -> None:
@@ -118,6 +181,29 @@ def test_native_stop_confirmation_cleans_private_sandbox_before_replacement(
     assert result["lane"]["status"] == "STOPPED"
     assert result["sandbox_cleanup"]["removed"] is True
     assert cleaned == [lane["lane_id"]]
+
+
+def test_native_task_name_is_unique_to_the_attempt(repo: Path, monkeypatch) -> None:
+    _manifest, challenge, run, race = make_race(repo)
+    _record_root_attack(run, challenge)
+
+    def fake_create(spec, docker="docker"):
+        return fake_sandbox(run, challenge, spec.lane_id, spec.image)
+
+    monkeypatch.setattr(cli, "create", fake_create)
+    result = cli._race_bootstrap(
+        repo,
+        argparse.Namespace(
+            selector="1",
+            contest="Demo CTF",
+            lanes_json=json.dumps([_spec("attempt-scoped-task")]),
+            lanes_file=None,
+            docker="docker",
+        ),
+    )
+    task_name = result["packets"][0]["spawn_agent_args"]["task_name"]
+    normalized_attempt = race["attempt_id"].replace("-", "_").casefold()[:16]
+    assert task_name == f"lane_1_{normalized_attempt}"
 
 
 def test_cleanup_failure_keeps_slot_until_retry_succeeds(
