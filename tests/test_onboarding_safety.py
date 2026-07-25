@@ -182,7 +182,7 @@ def test_onboarding_contract_is_visible_in_every_operator_surface() -> None:
     build = Path("sandbox/build-images.sh").read_text(encoding="utf-8")
 
     assert "--remote-execution human-relay" in readme
-    assert "doctor --profiles base web pwn" in readme
+    assert "--profiles web pwn rev crypto osint misc ai" in readme
     assert "해석되지 않는 주최측 주소도" in readme
     assert "--remote-execution '<agent|human-relay>'" in agents
     assert "--remote-execution '<agent|human-relay>'" in solve_skill

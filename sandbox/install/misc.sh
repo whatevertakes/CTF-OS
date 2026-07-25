@@ -6,8 +6,10 @@ apt_install \
   ffmpeg sox imagemagick tesseract-ocr tshark binwalk libimage-exiftool-perl \
   graphviz parallel podman uidmap slirp4netns fuse-overlayfs zbar-tools libzbar0 barcode \
   php-cli lua5.4 perl nodejs npm libgl1 libglib2.0-0
-pip_install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1
-pip_install -r /opt/ctf-os/requirements/misc.txt
+pip_install_locked /opt/ctf-os/requirements-lock/misc.txt
+pip_install_locked \
+  /opt/ctf-os/requirements-lock/torch-cpu.txt \
+  --index-url https://download.pytorch.org/whl/cpu
 
 # The sandbox keeps no-new-privileges, so setuid newuidmap cannot be used.
 # A single-ID rootless mapping is sufficient for local OCI inspection and

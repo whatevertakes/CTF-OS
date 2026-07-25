@@ -36,6 +36,20 @@ DELETED_COMMANDS = (
     # the single race-reconcile batch.
     "race-spawn-confirm", "race-stop-confirm",
 )
+_ALL_IMAGE_PROFILES = (
+    "base", "pwn", "web", "rev", "crypto",
+    "forensic", "misc", "osint", "ai", "cloud",
+)
+
+
+def _live_image_profiles() -> tuple[str, ...]:
+    requested = tuple(os.environ.get("CTF_OS_LIVE_PROFILES", "").split())
+    if not requested:
+        return _ALL_IMAGE_PROFILES
+    unknown = set(requested).difference(_ALL_IMAGE_PROFILES)
+    if unknown:
+        raise ValueError(f"unknown CTF_OS_LIVE_PROFILES: {sorted(unknown)}")
+    return requested
 
 
 def test_deleted_modules_and_cli_commands_are_absent() -> None:
@@ -279,6 +293,67 @@ def test_sandbox_build_is_credential_isolated_lock_bound_and_atomic() -> None:
     assert "selected_profile_count" in build
 
 
+def test_sandbox_python_and_apt_inputs_are_reproducibly_locked() -> None:
+    sandbox = Path("sandbox")
+    dockerfile = (sandbox / "Dockerfile.sandbox").read_text(encoding="utf-8")
+    library = (sandbox / "install" / "lib.sh").read_text(encoding="utf-8")
+    generator = (sandbox / "lock-python-requirements.sh").read_text(
+        encoding="utf-8"
+    )
+    apt_lock = (sandbox / "apt-snapshot.lock").read_text(encoding="utf-8")
+    apt_setup = (sandbox / "install" / "apt-snapshot.sh").read_text(
+        encoding="utf-8"
+    )
+    python_verifier = (sandbox / "install" / "verify-python.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "debian=20260623T000000Z" in apt_lock
+    assert "debian_security=20260623T000000Z" in apt_lock
+    assert "snapshot.debian.org/archive/debian/${debian}/" in apt_setup
+    assert "assert_apt_snapshot" in library
+    assert "/opt/ctf-os/install/apt-snapshot.sh" in dockerfile
+
+    expected_locks = {
+        "common", "ai", "ai-security", "binary-analysis", "cloud", "crypto",
+        "cuda-nvrtc", "forensic", "misc", "osint", "pwn", "pwn-fuzzing",
+        "rev", "torch-cpu", "torch-cu126", "web",
+    }
+    lock_root = sandbox / "requirements-lock"
+    for name in expected_locks:
+        lock = lock_root / f"{name}.txt"
+        contents = lock.read_text(encoding="utf-8")
+        assert "--hash=sha256:" in contents, lock
+        assert f"requirements-lock/{name}.txt" in dockerfile
+    for name in (
+        "checkov", "holehe", "maigret", "rsactftool", "semgrep", "sherlock",
+        "theharvester",
+    ):
+        lock = lock_root / "isolated" / f"{name}.txt"
+        assert "--hash=sha256:" in lock.read_text(encoding="utf-8"), lock
+        assert f"requirements-lock/isolated/{name}.txt" in dockerfile
+    semgrep_input = (
+        sandbox / "requirements" / "isolated" / "semgrep.txt"
+    ).read_text(encoding="utf-8")
+    assert "setuptools==80.9.0" in semgrep_input
+
+    assert "--generate-hashes" in generator
+    assert 'PLATFORM="x86_64-manylinux_2_36"' in generator
+    assert "complete Python environment at that build" in generator
+    assert "compile_torch_lock cu126" in generator
+    assert '"$COMMON" "$BINARY" sandbox/requirements/pwn.txt' in generator
+    assert '"$COMMON" "$AI" sandbox/requirements/torch-cu126.txt' in generator
+    assert "--require-hashes" in library
+    assert '/opt/ctf-os/install/verify-python.sh "${CTF_OS_PROFILE}"' in dockerfile
+    assert "python3 -m pip check" in python_verifier
+    assert 'diff -u "$expected" "$sorted_actual"' in python_verifier
+    cloud_allowlist = sandbox / "pip-check-allowlists" / "cloud.txt"
+    assert cloud_allowlist.read_text(encoding="utf-8").count("\n") == 13
+    assert "/opt/ctf-os/resolved/apt.txt" in dockerfile
+    assert "/opt/ctf-os/resolved/python.txt" in dockerfile
+    assert "/opt/ctf-os/resolved/python-venvs.txt" in dockerfile
+
+
 def test_remote_installer_archives_are_digest_pinned() -> None:
     installers = (
         "sandbox/install/rev.sh",
@@ -293,6 +368,7 @@ def test_remote_installer_archives_are_digest_pinned() -> None:
         assert (
             "download_sha256" in source
             or "#sha256=${" in source
+            or "requirements-lock/isolated/" in source
         ), path
 
 
@@ -338,7 +414,7 @@ def test_temp_contest_race_prepare_dry_smoke(tmp_path: Path) -> None:
 @pytest.mark.live
 @pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
 def test_all_category_images_run_live_smoke() -> None:
-    for profile in ("base", "pwn", "web", "rev", "crypto", "forensic", "misc", "osint", "ai", "cloud"):
+    for profile in _live_image_profiles():
         result = subprocess.run(
             ["docker", "run", "--rm", "--network", "none", f"ctf-os-sandbox:{profile}", "true"],
             capture_output=True, text=True, timeout=60, check=False,

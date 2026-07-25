@@ -17,22 +17,33 @@
 - **디스크**: 프로필 하나당 수 GB. 열 개 전체 빌드는 40–60 GiB, 수 시간 소요. 빌드 스크립트는 선택 빌드에 최소 20 GiB(프로필당 6 GiB로 증가), 전체 10개 빌드에 60 GiB의 여유 공간을 사전 요구한다.
 - **GPU는 선택**: 없으면 자동으로 CPU로 동작한다(`ai`/`crypto`/`rev`의 GPU 경로만 비활성). 현재 고정된 CUDA 12.6 도구는 compute capability 9.0까지 허용하며, RTX 50 계열(sm_120)처럼 더 새로운 GPU는 커널 오류를 내기 전에 CPU로 자동 전환한다.
 
-클론 직후에는 전체 열 개보다 `base`와 실제 사용할 카테고리만 먼저
-빌드하는 흐름을 권장한다. 예를 들어 web·pwn 문제를 풀 머신은 다음과
-같이 준비하고, 같은 프로필 집합을 `doctor`에 넘긴다.
+이 팀 브랜치의 이번 대회 배포 대상은 `web`, `pwn`, `rev`, `crypto`,
+`osint`, `misc`, `ai` 일곱 카테고리다. 클론한 팀원은 아래처럼 정확히
+같은 프로필 집합을 빌드하고 `doctor`에 넘긴다. `base`는 각 이미지의
+공통 부모 레이어로 빌드 과정에서 자동 준비되므로 별도 태그가 필요 없다.
 
 ```bash
 uv sync --frozen
-sandbox/build-images.sh base web pwn
-uv run python -m ctf_os.agent_tools doctor --profiles base web pwn
-uv run pytest -q
+sandbox/build-images.sh web pwn rev crypto osint misc ai
+uv run python -m ctf_os.agent_tools doctor \
+  --profiles web pwn rev crypto osint misc ai
+uv run pytest -q -W error
 ```
 
 빌드가 성공하면 스크립트도 정확히 일치하는 `doctor --profiles ...` 후속
 명령을 출력한다. 선택한 이미지의 설치·스모크 단계는 이미지 빌드 중
 실행되고, `doctor`는 호스트·Docker·Compose·선택 이미지의 고정 해시와
-플랫폼, 가능한 경우 GPU 경로를 검사한다. 선택하지 않은 일곱 개 이미지가
-없다는 이유로 이 검사가 실패하지 않는다.
+플랫폼, 가능한 경우 GPU 경로를 검사한다. 선택하지 않은 이미지가 없다는
+이유로 이 검사가 실패하지 않는다.
+
+APT 저장소 시점은 `sandbox/apt-snapshot.lock`, Python 전이 의존성과
+배포 파일 해시는 `sandbox/requirements-lock/`에 고정된다. 직접 의존성을
+바꾼 뒤에는 아래 명령으로 Python 잠금을 함께 갱신하고 변경된 잠금 파일을
+커밋한다.
+
+```bash
+sandbox/lock-python-requirements.sh
+```
 
 대회 전체 카테고리를 미리 준비해야 하는 공유 머신에서만 전체 빌드와
 기본 `doctor`를 사용한다.

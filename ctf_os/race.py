@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1046,7 +1047,14 @@ def _running_commands(
     return [row for row in rows if row["heartbeat_stale"] is False]
 
 
-def _running_sessions(run_root: Path, lane_id: str, now: datetime) -> list[dict[str, Any]]:
+def _running_sessions(
+    run_root: Path,
+    lane_id: str,
+    now: datetime,
+    *,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[dict[str, Any]]:
     lane_root = run_root / "workers" / lane_id
     root = lane_root / "sessions"
     if not root.exists():
@@ -1071,7 +1079,13 @@ def _running_sessions(run_root: Path, lane_id: str, now: datetime) -> list[dict[
             continue
         # Only a session with a fresh, identity-matched heartbeat is really live
         # and may suppress stagnation; a dead or stale one never counts.
-        liveness = session_liveness(lane_root, value, now_epoch=now_epoch)
+        liveness = session_liveness(
+            lane_root,
+            value,
+            now_epoch=now_epoch,
+            docker=docker,
+            runner=runner,
+        )
         if not liveness["live"]:
             continue
         rows.append({

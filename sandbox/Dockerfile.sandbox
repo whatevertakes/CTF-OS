@@ -10,8 +10,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 COPY sandbox/requirements.txt /opt/ctf-os/requirements/common.txt
-COPY sandbox/install/lib.sh sandbox/install/common.sh /opt/ctf-os/install/
-RUN chmod 0755 /opt/ctf-os/install/*.sh && /opt/ctf-os/install/common.sh
+COPY sandbox/requirements-lock/common.txt /opt/ctf-os/requirements-lock/common.txt
+COPY sandbox/apt-snapshot.lock /opt/ctf-os/apt-snapshot.lock
+COPY sandbox/install/apt-snapshot.sh sandbox/install/lib.sh sandbox/install/common.sh /opt/ctf-os/install/
+RUN chmod 0755 /opt/ctf-os/install/*.sh \
+    && /opt/ctf-os/install/apt-snapshot.sh \
+    && /opt/ctf-os/install/common.sh
 
 RUN groupadd --gid 1001 ctf \
     && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash ctf \
@@ -23,7 +27,11 @@ WORKDIR /challenge
 FROM rust:1.85.1-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS ares-builder
 ARG ARES_COMMIT=f0df3efa0272bbc7c1b8fa14f06b6104fdd287d1
 ARG ARES_SHA256=c9c2d831eec10a032afb846d751ada575fc3c880fa790e4ae01a69a8375fa183
-RUN apt-get update \
+COPY sandbox/apt-snapshot.lock /opt/ctf-os/apt-snapshot.lock
+COPY sandbox/install/apt-snapshot.sh /opt/ctf-os/apt-snapshot.sh
+RUN chmod 0755 /opt/ctf-os/apt-snapshot.sh \
+    && /opt/ctf-os/apt-snapshot.sh \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && curl --fail --location --retry 3 --silent --show-error \
        "https://github.com/bee-san/Ares/archive/${ARES_COMMIT}.tar.gz" \
@@ -41,6 +49,7 @@ ENV JAVA_HOME=/opt/java \
     CAPA_RULES=/opt/capa-rules \
     PATH=/opt/java/bin:/opt/ghidra/support:/opt/ghidra:${PATH}
 COPY sandbox/requirements/binary-analysis.txt /opt/ctf-os/requirements/binary-analysis.txt
+COPY sandbox/requirements-lock/binary-analysis.txt /opt/ctf-os/requirements-lock/binary-analysis.txt
 COPY sandbox/install/binary-analysis.sh /opt/ctf-os/install/binary-analysis.sh
 COPY sandbox/bin/ctf-ghidra-headless /usr/local/bin/ctf-ghidra-headless
 COPY sandbox/bin/capa /usr/local/bin/capa
@@ -53,6 +62,7 @@ RUN chmod 0755 /opt/ctf-os/install/binary-analysis.sh \
 
 FROM binary-analysis AS pwn-tools
 COPY sandbox/requirements/pwn.txt /opt/ctf-os/requirements/pwn.txt
+COPY sandbox/requirements-lock/pwn.txt /opt/ctf-os/requirements-lock/pwn.txt
 COPY sandbox/install/binary-runtime.sh sandbox/install/pwn.sh /opt/ctf-os/install/
 COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
 RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-binary-runtime-smoke \
@@ -62,6 +72,7 @@ RUN chmod 0755 /opt/ctf-os/install/pwn-fuzzing.sh \
     && /opt/ctf-os/install/pwn-fuzzing.sh
 ENV PATH=/usr/local/bin:/opt/rust-toolchain/bin:${PATH}
 COPY sandbox/requirements/pwn-fuzzing.txt /opt/ctf-os/requirements/pwn-fuzzing.txt
+COPY sandbox/requirements-lock/pwn-fuzzing.txt /opt/ctf-os/requirements-lock/pwn-fuzzing.txt
 COPY sandbox/install/pwn-analysis-fuzzing.sh /opt/ctf-os/install/pwn-analysis-fuzzing.sh
 RUN chmod 0755 /opt/ctf-os/install/pwn-analysis-fuzzing.sh \
     && /opt/ctf-os/install/pwn-analysis-fuzzing.sh
@@ -83,6 +94,8 @@ ENV NUCLEI_TEMPLATES=/opt/nuclei-templates \
     DISABLE_NUCLEI_TEMPLATES_AWS_DOWNLOAD=true \
     DISABLE_NUCLEI_TEMPLATES_AZURE_DOWNLOAD=true
 COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
+COPY sandbox/requirements-lock/web.txt /opt/ctf-os/requirements-lock/web.txt
+COPY sandbox/requirements-lock/isolated/semgrep.txt /opt/ctf-os/requirements-lock/isolated/semgrep.txt
 COPY sandbox/install/web.sh sandbox/install/web-verify.sh /opt/ctf-os/install/
 COPY sandbox/smoke/web-runtime.py /usr/local/bin/ctf-os-web-runtime-smoke
 COPY sandbox/bin/ctf-nuclei-scan sandbox/bin/sstimap /usr/local/bin/
@@ -100,6 +113,7 @@ RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke /usr/local/bin/sstimap \
 
 FROM binary-analysis AS profile-rev
 COPY sandbox/requirements/rev.txt /opt/ctf-os/requirements/rev.txt
+COPY sandbox/requirements-lock/rev.txt /opt/ctf-os/requirements-lock/rev.txt
 COPY sandbox/install/binary-runtime.sh sandbox/install/rev.sh /opt/ctf-os/install/
 COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
 COPY sandbox/smoke/system-qemu.sh /usr/local/bin/ctf-os-system-qemu-smoke
@@ -113,6 +127,9 @@ RUN chmod 0755 /opt/ctf-os/install/rev-fuzzing.sh /usr/local/bin/ctf-os-rev-fuzz
 
 FROM common AS profile-crypto
 COPY sandbox/requirements/crypto.txt /opt/ctf-os/requirements/crypto.txt
+COPY sandbox/requirements-lock/crypto.txt /opt/ctf-os/requirements-lock/crypto.txt
+COPY sandbox/requirements-lock/cuda-nvrtc.txt /opt/ctf-os/requirements-lock/cuda-nvrtc.txt
+COPY sandbox/requirements-lock/isolated/rsactftool.txt /opt/ctf-os/requirements-lock/isolated/rsactftool.txt
 COPY sandbox/install/crypto.sh /opt/ctf-os/install/crypto.sh
 COPY --from=ares-builder /tmp/ares/target/release/ares /usr/local/bin/ares
 RUN /opt/ctf-os/install/crypto.sh
@@ -120,25 +137,36 @@ RUN sage -c 'assert 2^10 == 1024; assert GF(7)(3)^2 == 2'
 
 FROM common AS profile-forensic
 COPY sandbox/requirements/forensic.txt /opt/ctf-os/requirements/forensic.txt
+COPY sandbox/requirements-lock/forensic.txt /opt/ctf-os/requirements-lock/forensic.txt
 COPY sandbox/install/forensic.sh /opt/ctf-os/install/forensic.sh
 RUN /opt/ctf-os/install/forensic.sh
 
 FROM common AS profile-misc
 COPY sandbox/requirements/misc.txt /opt/ctf-os/requirements/misc.txt
+COPY sandbox/requirements-lock/misc.txt /opt/ctf-os/requirements-lock/misc.txt
+COPY sandbox/requirements-lock/torch-cpu.txt /opt/ctf-os/requirements-lock/torch-cpu.txt
 COPY sandbox/install/misc.sh /opt/ctf-os/install/misc.sh
 COPY --from=ares-builder /tmp/ares/target/release/ares /usr/local/bin/ares
 RUN /opt/ctf-os/install/misc.sh
 
 FROM common AS profile-osint
 COPY sandbox/requirements/osint.txt /opt/ctf-os/requirements/osint.txt
+COPY sandbox/requirements-lock/osint.txt /opt/ctf-os/requirements-lock/osint.txt
+COPY sandbox/requirements-lock/isolated/sherlock.txt /opt/ctf-os/requirements-lock/isolated/sherlock.txt
+COPY sandbox/requirements-lock/isolated/maigret.txt /opt/ctf-os/requirements-lock/isolated/maigret.txt
+COPY sandbox/requirements-lock/isolated/holehe.txt /opt/ctf-os/requirements-lock/isolated/holehe.txt
+COPY sandbox/requirements-lock/isolated/theharvester.txt /opt/ctf-os/requirements-lock/isolated/theharvester.txt
 COPY sandbox/install/osint.sh /opt/ctf-os/install/osint.sh
 RUN /opt/ctf-os/install/osint.sh
 
 FROM common AS ai-tools
 COPY sandbox/requirements/ai.txt /opt/ctf-os/requirements/ai.txt
+COPY sandbox/requirements-lock/ai.txt /opt/ctf-os/requirements-lock/ai.txt
+COPY sandbox/requirements-lock/torch-cu126.txt /opt/ctf-os/requirements-lock/torch-cu126.txt
 COPY sandbox/install/ai.sh /opt/ctf-os/install/ai.sh
 RUN /opt/ctf-os/install/ai.sh
 COPY sandbox/requirements/ai-security.txt /opt/ctf-os/requirements/ai-security.txt
+COPY sandbox/requirements-lock/ai-security.txt /opt/ctf-os/requirements-lock/ai-security.txt
 COPY sandbox/install/ai-security.sh /opt/ctf-os/install/ai-security.sh
 RUN chmod 0755 /opt/ctf-os/install/ai-security.sh \
     && /opt/ctf-os/install/ai-security.sh
@@ -152,6 +180,9 @@ RUN chmod 0755 /usr/local/bin/ctf-os-ai-serialization-smoke \
 
 FROM common AS profile-cloud
 COPY sandbox/requirements/cloud.txt /opt/ctf-os/requirements/cloud.txt
+COPY sandbox/requirements-lock/cloud.txt /opt/ctf-os/requirements-lock/cloud.txt
+COPY sandbox/requirements-lock/isolated/checkov.txt /opt/ctf-os/requirements-lock/isolated/checkov.txt
+COPY sandbox/requirements-lock/isolated/semgrep.txt /opt/ctf-os/requirements-lock/isolated/semgrep.txt
 COPY sandbox/install/cloud.sh /opt/ctf-os/install/cloud.sh
 RUN /opt/ctf-os/install/cloud.sh
 
@@ -162,8 +193,27 @@ ARG CTF_OS_BUILD_SHA256
 COPY sandbox/sandbox-tools.txt /tools.txt
 COPY sandbox/tool-versions.lock /opt/ctf-os/tool-versions.lock
 COPY sandbox/config/ares.toml /opt/ctf-os/ares-config.toml
+COPY sandbox/pip-check-allowlists /opt/ctf-os/pip-check-allowlists
+COPY sandbox/install/verify-python.sh /opt/ctf-os/install/verify-python.sh
 COPY sandbox/entrypoint.sh /usr/local/bin/ctf-os-entrypoint
-RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint
+RUN chmod 0755 /usr/local/bin/ctf-os-entrypoint /opt/ctf-os/install/verify-python.sh \
+    && /opt/ctf-os/install/verify-python.sh "${CTF_OS_PROFILE}" \
+    && mkdir -p /opt/ctf-os/resolved \
+    && LC_ALL=C dpkg-query --show --showformat='${Package}=${Version}\n' \
+       | LC_ALL=C sort > /opt/ctf-os/resolved/apt.txt \
+    && python3 -m pip freeze --all \
+       | LC_ALL=C sort > /opt/ctf-os/resolved/python.txt \
+    && : > /opt/ctf-os/resolved/python-venvs.txt \
+    && for config in $(find /opt -mindepth 2 -maxdepth 2 -name pyvenv.cfg \
+         -print | LC_ALL=C sort); do \
+         venv="${config%/pyvenv.cfg}"; \
+         "$venv/bin/python" -m pip check || exit 1; \
+         printf '[%s]\n' "$venv" >> /opt/ctf-os/resolved/python-venvs.txt; \
+         "$venv/bin/python" -m pip freeze --all \
+           | LC_ALL=C sort >> /opt/ctf-os/resolved/python-venvs.txt; \
+       done \
+    && cd /opt/ctf-os/resolved \
+    && sha256sum apt.txt python.txt python-venvs.txt > SHA256SUMS
 LABEL org.ctf-os.sandbox="true" \
       org.ctf-os.profile="${CTF_OS_PROFILE}" \
       org.ctf-os.build-policy="pre-contest-pinned" \

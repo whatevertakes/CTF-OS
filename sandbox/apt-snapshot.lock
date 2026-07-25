@@ -1,0 +1,3 @@
+# Debian archive timestamps used by every sandbox image build.
+debian=20260623T000000Z
+debian_security=20260623T000000Z

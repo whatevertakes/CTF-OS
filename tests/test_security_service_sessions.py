@@ -23,6 +23,7 @@ from ctf_os.sandbox.runtime import (
     USER_EXEC_ENV,
     SandboxError,
     SandboxSpec,
+    argv_family,
     build_run_argv,
     cleanup,
     execute,
@@ -47,6 +48,21 @@ from ctf_os.service import (
     cleanup_service,
     prepare_service,
 )
+
+_ALL_IMAGE_PROFILES = (
+    "base", "pwn", "web", "rev", "crypto",
+    "forensic", "misc", "osint", "ai", "cloud",
+)
+
+
+def _live_image_profiles() -> tuple[str, ...]:
+    requested = tuple(os.environ.get("CTF_OS_LIVE_PROFILES", "").split())
+    if not requested:
+        return _ALL_IMAGE_PROFILES
+    unknown = set(requested).difference(_ALL_IMAGE_PROFILES)
+    if unknown:
+        raise ValueError(f"unknown CTF_OS_LIVE_PROFILES: {sorted(unknown)}")
+    return requested
 
 
 def _podman_sandbox_spec(tmp_path: Path, category: str) -> SandboxSpec:
@@ -405,6 +421,22 @@ def test_flag_candidate_forces_a_term_ignoring_exec_to_finish_promptly(
     assert elapsed < 1.5
 
 
+def test_shell_argv_family_uses_inner_command_shape_not_payload_arguments() -> None:
+    first = argv_family(
+        ["bash", "-lc", "python3 /work/solve.py --mode one"]
+    )
+    second = argv_family(
+        ["bash", "-lc", "python3 /work/solve.py --mode two"]
+    )
+    different_tool = argv_family(
+        ["bash", "-lc", "node /work/solve.js --mode one"]
+    )
+
+    assert first == second
+    assert "one" not in first and "two" not in second
+    assert first != different_tool
+
+
 def test_service_metadata_failure_exposes_structured_cleanup_recovery(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -575,6 +607,8 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
 
     def runner(argv, **kwargs):
         calls.append(list(argv))
+        if "ctf-os-session-identity" in argv:
+            return subprocess.CompletedProcess(argv, 0, "4242 99\n", "")
         if "python3" in argv and "-c" in argv:
             return subprocess.CompletedProcess(argv, 0, "gdb output\n", " 11\n")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -583,6 +617,8 @@ def test_persistent_session_is_category_bounded_and_reads_receipted_output(repo:
         metadata, session_id="dbg-main", kind="debugger", command=["gdb", "-q", "/challenge/chall"], runner=runner
     )
     assert state["status"] == "RUNNING"
+    assert state["pid"] == 4242
+    assert state["pid_start_time"] == "99"
     assert any("ulimit -f 131072" in value for value in calls[0])
     assert all(value in calls[0] for value in USER_EXEC_ENV)
     receipt = session_read(metadata, session_id="dbg-main", runner=runner)
@@ -796,6 +832,8 @@ def test_failed_session_close_remains_retryable(repo: Path) -> None:
     metadata = fake_sandbox(run, challenge, "root", "ctf-os-sandbox:pwn")
 
     def open_runner(argv, **kwargs):
+        if "ctf-os-session-identity" in argv:
+            return subprocess.CompletedProcess(argv, 0, "4242 99\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     open_session(
@@ -822,10 +860,7 @@ def test_failed_session_close_remains_retryable(repo: Path) -> None:
 @pytest.mark.live
 @pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
 def test_every_catalog_tool_has_a_working_version_probe(tmp_path: Path) -> None:
-    for category in (
-        "base", "pwn", "web", "rev", "crypto",
-        "forensic", "misc", "osint", "ai", "cloud",
-    ):
+    for category in _live_image_profiles():
         suffix = abs(hash((str(tmp_path), category)))
         name = f"ctf-os-tool-catalog-{category}-{suffix:x}"[:63]
         started = subprocess.run(
@@ -857,6 +892,8 @@ def test_rootless_podman_info_runs_in_hardened_catalog_sandbox(
     tmp_path: Path,
     category: str,
 ) -> None:
+    if category not in _live_image_profiles():
+        pytest.skip("profile omitted from CTF_OS_LIVE_PROFILES")
     spec = _podman_sandbox_spec(tmp_path, category)
     run_argv = build_run_argv(spec)
     started = subprocess.run(

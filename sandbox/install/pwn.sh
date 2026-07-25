@@ -15,7 +15,7 @@ apt_install \
   qemu-system-x86 qemu-system-arm qemu-system-misc qemu-utils \
   binfmt-support cpio busybox-static squashfs-tools pahole dwarves seccomp libseccomp-dev nasm \
   musl-tools
-pip_install -r /opt/ctf-os/requirements/pwn.txt
+pip_install_locked /opt/ctf-os/requirements-lock/pwn.txt
 gem install one_gadget --version 1.10.0 --no-document
 gem install seccomp-tools --version "$SECCOMP_TOOLS_VERSION" --no-document
 

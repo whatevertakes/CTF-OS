@@ -10,18 +10,16 @@ NUCLEI_TEMPLATES_COMMIT=7d66fa06cc0a5ad85f7bf35f18cf8ee9218fa9a5
 NUCLEI_TEMPLATES_SHA256=bb519f9fe89bfc37ae4bf5590c82507536aa1fc7fa00268d15589a0314643aa7
 DALFOX_VERSION=3.1.2
 DALFOX_SHA256=ef48d30c183cead88eb89da10bdc1a7fa58a484d175319096075b470f3652fd4
-SEMGREP_VERSION=1.127.1
-SEMGREP_SHA256=068fbd6e35b684356d14e7bb759b40d31d43cd9bfe88e4d209e18f91fda7ff8b
 SSTIMAP_COMMIT=d4f09055b15967b0e2265f20eb348a7ec2f25a2c
 SSTIMAP_SHA256=6afd688be9faa6888279e1587c1f63bb580e52f086d1ebe994edde5e3c0b691d
 
 apt_install \
   nodejs npm php-cli php-curl php-sqlite3 sqlite3 redis-tools \
   postgresql-client default-mysql-client chromium chromium-driver golang-go
-pip_install -r /opt/ctf-os/requirements/web.txt
+pip_install_locked /opt/ctf-os/requirements-lock/web.txt
 python3 -m venv /opt/semgrep-venv
-/opt/semgrep-venv/bin/pip install --no-cache-dir \
-  "https://files.pythonhosted.org/packages/3b/82/0f834b8315d0ae75fe53e45e7ce6e411f01d0119b0feb22f5a681f46760c/semgrep-${SEMGREP_VERSION}-cp39.cp310.cp311.py39.py310.py311-none-musllinux_1_0_x86_64.manylinux2014_x86_64.whl#sha256=${SEMGREP_SHA256}"
+venv_install_locked \
+  /opt/semgrep-venv /opt/ctf-os/requirements-lock/isolated/semgrep.txt
 ln -s /opt/semgrep-venv/bin/semgrep /usr/local/bin/semgrep
 npm install --global corepack@0.33.0
 corepack enable

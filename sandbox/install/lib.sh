@@ -6,7 +6,22 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_DEFAULT_TIMEOUT=120
 export PIP_RETRIES=5
 
+assert_apt_snapshot() {
+  local lock=/opt/ctf-os/apt-snapshot.lock debian debian_security
+  [[ -f "$lock" && ! -L "$lock" ]] || {
+    echo "APT snapshot lock is missing or unsafe." >&2
+    exit 1
+  }
+  debian="$(sed -n 's/^debian=//p' "$lock")"
+  debian_security="$(sed -n 's/^debian_security=//p' "$lock")"
+  grep -Fq "snapshot.debian.org/archive/debian/${debian}/" \
+    /etc/apt/sources.list.d/debian.sources
+  grep -Fq "snapshot.debian.org/archive/debian-security/${debian_security}/" \
+    /etc/apt/sources.list.d/debian.sources
+}
+
 apt_install() {
+  assert_apt_snapshot
   apt-get update
   apt-get install -y --no-install-recommends "$@"
   rm -rf /var/lib/apt/lists/*
@@ -14,6 +29,28 @@ apt_install() {
 
 pip_install() {
   python3 -m pip install --break-system-packages --no-cache-dir "$@"
+}
+
+pip_install_locked() {
+  local lock="$1"
+  shift
+  [[ -f "$lock" && ! -L "$lock" ]] || {
+    echo "Python dependency lock is missing or unsafe: $lock" >&2
+    exit 1
+  }
+  python3 -m pip install \
+    --break-system-packages --no-cache-dir --require-hashes \
+    "$@" -r "$lock"
+}
+
+venv_install_locked() {
+  local venv="$1" lock="$2"
+  shift 2
+  [[ -x "$venv/bin/pip" && -f "$lock" && ! -L "$lock" ]] || {
+    echo "Python venv or dependency lock is missing: $venv $lock" >&2
+    exit 1
+  }
+  "$venv/bin/pip" install --no-cache-dir --require-hashes "$@" -r "$lock"
 }
 
 download() {

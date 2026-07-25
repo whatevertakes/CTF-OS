@@ -8,7 +8,7 @@ apt_install \
   sleuthkit foremost libimage-exiftool-perl binwalk tshark tcpdump testdisk dcfldd \
   xfsprogs e2fsprogs ntfs-3g steghide imagemagick tesseract-ocr pngcheck \
   ffmpeg sox libzbar0 zbar-tools libgl1 libglib2.0-0
-pip_install -r /opt/ctf-os/requirements/forensic.txt
+pip_install_locked /opt/ctf-os/requirements-lock/forensic.txt
 if ! command -v vol >/dev/null && command -v vol.py >/dev/null; then ln -s "$(command -v vol.py)" /usr/local/bin/vol; fi
 gem install zsteg --version 0.2.13 --no-document
 

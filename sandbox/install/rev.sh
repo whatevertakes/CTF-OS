@@ -19,7 +19,7 @@ apt_install \
   ovmf qemu-efi-aarch64 qemu-efi-arm seabios u-boot-qemu \
   build-essential meson ninja-build pkg-config libzip-dev liblz4-dev libssl-dev \
   ocl-icd-libopencl1
-pip_install -r /opt/ctf-os/requirements/rev.txt
+pip_install_locked /opt/ctf-os/requirements-lock/rev.txt
 register_python_library_dirs nvidia.cuda_nvrtc nvidia.cuda_runtime
 
 download_sha256 "https://github.com/radareorg/radare2/archive/refs/tags/${RADARE2_VERSION}.tar.gz" /tmp/radare2.tar.gz "$RADARE2_SHA256"

@@ -13,7 +13,13 @@ from typing import Any
 
 from ..blackboard import output_hash
 from ..workspace import atomic_json, atomic_text
-from .runtime import firewall_packets, target_observation, user_exec_prefix
+from .runtime import (
+    SandboxError,
+    controller_exec_prefix,
+    firewall_packets,
+    target_observation,
+    user_exec_prefix,
+)
 
 SESSION_KINDS = frozenset({"shell", "remote", "debugger"})
 MAX_READ = 64 * 1024
@@ -21,10 +27,25 @@ MAX_READ = 64 * 1024
 # the previous durable read output is enough to detect a flag that straddles two
 # session-read receipts without re-emitting already-returned output.
 MAX_FLAG_TAIL = 1024
-# The in-container monitor refreshes the heartbeat every 2s while the session
-# process is alive; 30s of silence means the process (and its monitor) is gone.
+# The root-owned in-container monitor refreshes the heartbeat every 2s while the
+# session process is alive; 30s of silence means the process or monitor is gone.
 SESSION_HEARTBEAT_STALE_SECONDS = 30
 _SESSION_ID = re.compile(r"[a-z0-9][a-z0-9_-]{1,47}\Z")
+_CONTROLLER_DIR = re.compile(r"/tmp/\.ctf-os-controller-[0-9a-f]{32}\Z")
+_CONTROLLER_CLEANUP_SCRIPT = (
+    "c=$1; w=$2; "
+    "kill_exact() { f=$1; group=$2; "
+    "read p st <\"$c/$f\" 2>/dev/null || return 0; "
+    "cur=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+    "print(s[s.rfind(\") \")+2:].split()[19])' \"$p\" 2>/dev/null || true); "
+    "[ \"$cur\" = \"$st\" ] || return 0; "
+    "if [ \"$group\" = yes ]; then kill -TERM \"-$p\" 2>/dev/null || true; "
+    "else kill -TERM \"$p\" 2>/dev/null || true; fi; }; "
+    "if [ -d \"$c\" ] && [ ! -L \"$c\" ]; then "
+    "kill_exact identity yes; kill_exact keeper no; kill_exact monitor no; fi; "
+    "rm -rf -- \"$c\"; "
+    "setpriv --reuid=1001 --regid=1001 --clear-groups rm -rf -- \"$w\""
+)
 
 _TOOLS: dict[str, tuple[str, ...]] = {
     "base": (
@@ -396,36 +417,104 @@ def open_session(
     if state_path.exists() or state_path.is_symlink():
         raise SessionError("persistent session id already exists")
     container_dir = f"/work/.ctf-sessions/{session_id}"
+    controller_dir = f"/tmp/.ctf-os-controller-{uuid.uuid4().hex}"
     observed_identity = target_identity or f"challenge:{metadata['challenge_id']}"
     packets_before = firewall_packets(metadata, observed_identity, docker=docker)
-    # A bounded monitor refreshes "<epoch> <pid> <starttime>" into a lane-private
-    # heartbeat file while the session process is alive, and drops an "exit"
-    # marker when it dies. The controller trusts only a fresh heartbeat whose pid
-    # matches, so a session that exited (or whose PID was reused) can never keep
-    # suppressing stagnation forever.
+    # The target process runs as uid 1001, but the monitor and identity files live
+    # in a unique root-owned tmpfs directory. A lane command can modify /work, so
+    # no liveness decision may trust a marker stored there.
     shell = (
-        "set -eu; d=$1; shift; ulimit -f 131072; "
-        "mkdir -p \"$d\"; mkfifo \"$d/in\"; : >\"$d/out\"; "
-        "(tail -f /dev/null >\"$d/in\") & echo $! >\"$d/keeper\"; "
-        "setsid \"$@\" <\"$d/in\" >>\"$d/out\" 2>&1 & p=$!; echo \"$p\" >\"$d/pid\"; "
-        "st=$(awk 'NR==1{print $22}' \"/proc/$p/stat\" 2>/dev/null || echo 0); "
-        "echo \"$st\" >\"$d/starttime\"; "
-        "( while kill -0 \"$p\" 2>/dev/null; do "
-        "echo \"$(date +%s) $p $st\" >\"$d/heartbeat\"; sleep 2; done; "
-        "echo dead >\"$d/exit\" ) & echo $! >\"$d/monitor\""
+        "set -eu; c=$1; w=$2; shift 2; ulimit -f 131072; umask 077; "
+        "[ ! -e \"$c\" ] && [ ! -L \"$c\" ]; mkdir -- \"$c\"; chmod 0700 \"$c\"; "
+        "r=/work/.ctf-sessions; [ ! -L \"$r\" ]; "
+        "install -d -m 0700 -o 1001 -g 1001 \"$r\"; "
+        "setpriv --reuid=1001 --regid=1001 --clear-groups "
+        "sh -c 'umask 077; [ ! -e \"$1\" ] && [ ! -L \"$1\" ]; "
+        "mkdir -- \"$1\"; mkfifo -m 0600 \"$1/in\"; : >\"$1/out\"' "
+        "ctf-os-session-work \"$w\"; "
+        "setpriv --reuid=1001 --regid=1001 --clear-groups "
+        "sh -c 'exec tail -f /dev/null >\"$1\"' ctf-os-session-keeper \"$w/in\" & k=$!; "
+        "kst=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+        "print(s[s.rfind(\") \")+2:].split()[19])' \"$k\"); "
+        "printf '%s %s\\n' \"$k\" \"$kst\" >\"$c/keeper\"; "
+        "python3 -I -c 'import os,sys; os.setgroups([]); os.setgid(1001); os.setuid(1001); "
+        "os.setsid(); w=sys.argv[1]; i=os.open(w+\"/in\",os.O_RDONLY); "
+        "o=os.open(w+\"/out\",os.O_WRONLY|os.O_APPEND); os.dup2(i,0); "
+        "os.dup2(o,1); os.dup2(o,2); os.execvp(sys.argv[2], sys.argv[2:])' "
+        "\"$w\" \"$@\" & p=$!; "
+        "pinfo=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+        "v=s[s.rfind(\") \")+2:].split(); print(v[0],v[19])' \"$p\"); "
+        "pst=${pinfo%% *}; st=${pinfo#* }; [ \"$pst\" != Z ]; "
+        "printf '%s %s\\n' \"$p\" \"$st\" >\"$c/identity\"; "
+        "printf '%s %s %s\\n' \"$(date +%s)\" \"$p\" \"$st\" >\"$c/heartbeat\"; "
+        "( while :; do "
+        "info=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+        "v=s[s.rfind(\") \")+2:].split(); print(v[0],v[19])' \"$p\" 2>/dev/null || true); "
+        "state=${info%% *}; cur=${info#* }; "
+        "[ -n \"$info\" ] && [ \"$state\" != Z ] && [ \"$cur\" = \"$st\" ] || break; "
+        "printf '%s %s %s\\n' \"$(date +%s)\" \"$p\" \"$st\" >\"$c/heartbeat.next\"; "
+        "mv -f \"$c/heartbeat.next\" \"$c/heartbeat\"; sleep 2; done; "
+        "printf 'dead\\n' >\"$c/exit\" ) & m=$!; "
+        "mst=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+        "print(s[s.rfind(\") \")+2:].split()[19])' \"$m\"); "
+        "printf '%s %s\\n' \"$m\" \"$mst\" >\"$c/monitor\""
     )
     result = _run(
         runner,
         [
-            *user_exec_prefix(
+            *controller_exec_prefix(
                 metadata, docker=docker, detach=True, workdir="/work",
             ),
-            "sh", "-c", shell, "ctf-os-session", container_dir, *argv,
+            "sh", "-c", shell, "ctf-os-session", controller_dir, container_dir, *argv,
         ],
         timeout=30,
     )
     if result.returncode:
         raise SessionError(f"persistent session start failed: {result.stderr.strip()}")
+    identity_result = _run(
+        runner,
+        [
+            *controller_exec_prefix(metadata, docker=docker),
+            "sh", "-c",
+            (
+                "i=0; while [ \"$i\" -lt 50 ]; do "
+                "[ -f \"$1/identity\" ] && { cat \"$1/identity\"; exit 0; }; "
+                "i=$((i+1)); sleep 0.1; done; exit 1"
+            ),
+            "ctf-os-session-identity", controller_dir,
+        ],
+        timeout=10,
+    )
+    try:
+        pid_text, start_time = identity_result.stdout.strip().split()
+        pid = int(pid_text)
+        if (
+            identity_result.returncode
+            or pid <= 0
+            or not start_time.isdigit()
+            or int(start_time) <= 0
+        ):
+            raise ValueError
+    except ValueError:
+        diagnostic = _session_start_diagnostic(
+            metadata,
+            controller_dir=controller_dir,
+            container_dir=container_dir,
+            docker=docker,
+            runner=runner,
+        )
+        _discard_started_session(
+            metadata,
+            controller_dir=controller_dir,
+            container_dir=container_dir,
+            docker=docker,
+            runner=runner,
+        )
+        detail = (identity_result.stderr + diagnostic).strip()
+        raise SessionError(
+            "persistent session did not publish a valid process identity"
+            + (f": {detail[-2048:]}" if detail else "")
+        )
     state = {
         "schema_version": 1,
         "session_id": session_id,
@@ -436,18 +525,26 @@ def open_session(
         "target_identity": observed_identity,
         "target_packets_before": packets_before,
         "container_dir": container_dir,
-        # Host-side view of the lane-private heartbeat/exit markers written by the
-        # in-container monitor above (relative to the lane root's /work mount).
-        "heartbeat_relpath": f"work/.ctf-sessions/{session_id}/heartbeat",
-        "exit_relpath": f"work/.ctf-sessions/{session_id}/exit",
-        "pid": None,
-        "pid_start_time": None,
+        "controller_dir": controller_dir,
+        "container_name": metadata["name"],
+        "pid": pid,
+        "pid_start_time": start_time,
         "cursor": 0,
         "status": "RUNNING",
         "opened_at": _now(),
     }
     state_path.parent.mkdir(mode=0o700, exist_ok=True)
-    atomic_json(state_path, state)
+    try:
+        atomic_json(state_path, state)
+    except Exception:
+        _discard_started_session(
+            metadata,
+            controller_dir=controller_dir,
+            container_dir=container_dir,
+            docker=docker,
+            runner=runner,
+        )
+        raise
     return state
 
 
@@ -530,7 +627,11 @@ def read(
         after_packets=packets_after,
     )
     liveness = session_liveness(
-        Path(str(metadata["lane_root"])), state, now_epoch=datetime.now(UTC).timestamp()
+        Path(str(metadata["lane_root"])),
+        state,
+        now_epoch=datetime.now(UTC).timestamp(),
+        docker=docker,
+        runner=runner,
     )
     receipt_id = uuid.uuid4().hex
     state["cursor"] = cursor_before + chunk_bytes
@@ -589,16 +690,27 @@ def close_session(
     # Idempotent: a session that already reached STOPPED can be closed again to
     # retry resource cleanup without erroring.
     state = _load_state(metadata, session_id, require_running=False)
-    script = (
-        "d=$1; for f in pid keeper; do p=$(cat \"$d/$f\" 2>/dev/null || true); "
-        "[ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null || true; done; "
-        "rm -rf -- \"$d\""
-    )
+    controller_dir = str(state.get("controller_dir", ""))
+    if _CONTROLLER_DIR.fullmatch(controller_dir):
+        script = _CONTROLLER_CLEANUP_SCRIPT
+        prefix = controller_exec_prefix(metadata, docker=docker)
+        arguments = [controller_dir, str(state["container_dir"])]
+    else:
+        # Backward-compatible cleanup for session records created by an older
+        # controller. Legacy records are never considered live because they have
+        # no root-owned identity, but their work files remain safely removable.
+        script = (
+            "d=$1; for f in pid keeper; do p=$(cat \"$d/$f\" 2>/dev/null || true); "
+            "[ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null || "
+            "kill -TERM \"$p\" 2>/dev/null || true; done; rm -rf -- \"$d\""
+        )
+        prefix = user_exec_prefix(metadata, docker=docker)
+        arguments = [str(state["container_dir"])]
     result = _run(
         runner,
         [
-            *user_exec_prefix(metadata, docker=docker),
-            "sh", "-c", script, "ctf-os-close", state["container_dir"],
+            *prefix,
+            "sh", "-c", script, "ctf-os-close", *arguments,
         ],
         timeout=_timeout(timeout),
     )
@@ -663,50 +775,90 @@ def tool_version(
 
 
 def session_liveness(
-    lane_root: Path, state: Mapping[str, Any], *, now_epoch: float
+    lane_root: Path,
+    state: Mapping[str, Any],
+    *,
+    now_epoch: float,
+    docker: str = "docker",
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
-    """Return the real liveness of one persistent session from its heartbeat.
+    """Return liveness from a controller-owned identity and process probe.
 
-    A session is live only when a fresh, well-formed heartbeat exists whose PID
-    matches any recorded identity. A missing/stale heartbeat, an exit marker, a
-    malformed record, or a PID mismatch all mean the session is not live.
+    The probe runs as the container controller and reads only a root-owned tmpfs
+    directory. It also rereads /proc/<pid>/stat on every call, so a writable
+    /work marker or a reused PID can never keep a dead session in flight.
     """
 
+    Path(lane_root).resolve()
     session_id = str(state.get("session_id", ""))
     if not _SESSION_ID.fullmatch(session_id):
         return {"live": False, "reason": "invalid-session-id"}
     if str(state.get("status")) != "RUNNING":
         return {"live": False, "reason": "not-running"}
-    base = (Path(lane_root).resolve() / "work" / ".ctf-sessions" / session_id)
-    exit_marker = base / "exit"
-    heartbeat = base / "heartbeat"
-    if exit_marker.is_symlink():
-        return {"live": False, "reason": "unsafe-exit-marker"}
-    if exit_marker.is_file():
-        return {"live": False, "reason": "exited"}
-    if heartbeat.is_symlink() or not heartbeat.is_file():
-        return {"live": False, "reason": "no-heartbeat"}
+    controller_dir = str(state.get("controller_dir", ""))
+    if not _CONTROLLER_DIR.fullmatch(controller_dir):
+        return {"live": False, "reason": "unowned-heartbeat"}
     try:
-        parts = heartbeat.read_text(encoding="utf-8", errors="replace").strip().split()
-    except OSError:
-        return {"live": False, "reason": "unreadable-heartbeat"}
-    if len(parts) < 3:
+        expected_pid = int(state["pid"])
+        expected_start = str(state["pid_start_time"])
+    except (KeyError, TypeError, ValueError):
+        return {"live": False, "reason": "unpinned-identity"}
+    if expected_pid <= 0 or not expected_start.isdigit() or int(expected_start) <= 0:
+        return {"live": False, "reason": "unpinned-identity"}
+    container_name = str(state.get("container_name", ""))
+    probe_metadata = {"name": container_name}
+    probe_script = (
+        "d=$1; ep=$2; es=$3; "
+        "[ -d \"$d\" ] && [ ! -L \"$d\" ] || { echo missing-controller-state; exit 0; }; "
+        "[ ! -e \"$d/exit\" ] || { echo exited; exit 0; }; "
+        "read epoch pid start <\"$d/heartbeat\" 2>/dev/null || { echo no-heartbeat; exit 0; }; "
+        "[ \"$pid\" = \"$ep\" ] || { echo pid-mismatch; exit 0; }; "
+        "[ \"$start\" = \"$es\" ] || { echo pid-reused; exit 0; }; "
+        "info=$(python3 -I -c 'import pathlib,sys; s=pathlib.Path(\"/proc/\"+sys.argv[1]+\"/stat\").read_text(); "
+        "v=s[s.rfind(\") \")+2:].split(); print(v[0],v[19])' \"$pid\" 2>/dev/null || true); "
+        "state=${info%% *}; cur=${info#* }; "
+        "[ -n \"$info\" ] && [ \"$state\" != Z ] || { echo exited; exit 0; }; "
+        "[ \"$cur\" = \"$start\" ] || { echo pid-reused; exit 0; }; "
+        "printf 'live %s %s %s\\n' \"$epoch\" \"$pid\" \"$start\""
+    )
+    try:
+        result = _run(
+            runner,
+            [
+                *controller_exec_prefix(probe_metadata, docker=docker),
+                "sh", "-c", probe_script, "ctf-os-session-live",
+                controller_dir, str(expected_pid), expected_start,
+            ],
+            timeout=10,
+        )
+    except (SandboxError, SessionError, ValueError):
+        return {"live": False, "reason": "probe-failed"}
+    if result.returncode:
+        return {"live": False, "reason": "probe-failed"}
+    parts = result.stdout.strip().split()
+    if not parts:
+        return {"live": False, "reason": "malformed-heartbeat"}
+    if parts[0] != "live":
+        reason = parts[0]
+        if reason in {
+            "exited", "missing-controller-state", "no-heartbeat",
+            "pid-mismatch", "pid-reused",
+        }:
+            return {"live": False, "reason": reason}
+        return {"live": False, "reason": "malformed-heartbeat"}
+    if len(parts) != 4:
         return {"live": False, "reason": "malformed-heartbeat"}
     try:
-        epoch = float(parts[0])
-        pid = int(parts[1])
+        epoch = float(parts[1])
+        pid = int(parts[2])
     except ValueError:
         return {"live": False, "reason": "malformed-heartbeat"}
-    start_time = parts[2]
-    if pid <= 0:
-        return {"live": False, "reason": "missing-pid"}
-    expected_pid = state.get("pid")
-    if expected_pid is not None and int(expected_pid) != pid:
+    start_time = parts[3]
+    if pid != expected_pid:
         return {"live": False, "reason": "pid-mismatch"}
-    expected_start = state.get("pid_start_time")
-    if expected_start is not None and str(expected_start) != start_time:
+    if start_time != expected_start:
         return {"live": False, "reason": "pid-reused"}
-    if now_epoch - epoch > SESSION_HEARTBEAT_STALE_SECONDS:
+    if epoch > now_epoch + 5 or now_epoch - epoch > SESSION_HEARTBEAT_STALE_SECONDS:
         return {"live": False, "reason": "stale-heartbeat", "heartbeat_at": epoch}
     return {
         "live": True, "pid": pid, "pid_start_time": start_time, "heartbeat_at": epoch,
@@ -728,6 +880,59 @@ def _load_state(
     if require_running and value.get("status") != "RUNNING":
         raise SessionError("persistent session is not running")
     return value
+
+
+def _discard_started_session(
+    metadata: Mapping[str, Any],
+    *,
+    controller_dir: str,
+    container_dir: str,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    """Best-effort cleanup when session startup cannot become durable."""
+
+    try:
+        _run(
+            runner,
+            [
+                *controller_exec_prefix(metadata, docker=docker),
+                "sh", "-c", _CONTROLLER_CLEANUP_SCRIPT,
+                "ctf-os-session-discard", controller_dir, container_dir,
+            ],
+            timeout=10,
+        )
+    except SessionError:
+        pass
+
+
+def _session_start_diagnostic(
+    metadata: Mapping[str, Any],
+    *,
+    controller_dir: str,
+    container_dir: str,
+    docker: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> str:
+    """Return bounded startup evidence before a failed detached exec is removed."""
+
+    try:
+        result = _run(
+            runner,
+            [
+                *controller_exec_prefix(metadata, docker=docker),
+                "sh", "-c",
+                (
+                    "printf 'controller: '; ls -la \"$1\" 2>&1 || true; "
+                    "printf 'session output: '; tail -c 1024 \"$2/out\" 2>&1 || true"
+                ),
+                "ctf-os-session-diagnostic", controller_dir, container_dir,
+            ],
+            timeout=10,
+        )
+    except SessionError as exc:
+        return str(exc)
+    return (result.stdout + result.stderr)[-2048:]
 
 
 def _mark_session_stopped(metadata: Mapping[str, Any], state: dict[str, Any]) -> None:

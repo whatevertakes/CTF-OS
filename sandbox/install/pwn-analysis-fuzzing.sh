@@ -5,7 +5,7 @@ source /opt/ctf-os/install/lib.sh
 VALGRIND_DEBIAN_VERSION=1:3.19.0-1
 
 apt_install "valgrind=${VALGRIND_DEBIAN_VERSION}"
-pip_install -r /opt/ctf-os/requirements/pwn-fuzzing.txt
+pip_install_locked /opt/ctf-os/requirements-lock/pwn-fuzzing.txt
 # The cached pwn layer imports angr/pyvex as root. Do not bake pyvex's
 # process-local /tmp parser cache into the final non-root runtime image.
 rm -f /tmp/pyvex_ffi_parser_cache.*

@@ -1,0 +1,13 @@
+awscli 2.9.19 has requirement awscrt<0.17.0,>=0.12.4, but you have awscrt 1.0.0.dev0.
+awscli 2.9.19 has requirement cryptography<38.0.5,>=3.3.2, but you have cryptography 45.0.6.
+awscli 2.9.19 has requirement distro<1.6.0,>=1.5.0, but you have distro 1.8.0.
+awscli 2.9.19 has requirement jmespath<1.1.0,>=0.7.1, but you have jmespath 1.1.0.
+awscli 2.9.19 has requirement prompt-toolkit<3.0.29,>=3.0.24, but you have prompt-toolkit 3.0.36.
+awscli 2.9.19 has requirement urllib3<1.27,>=1.25.4, but you have urllib3 2.7.0.
+azure-ai-ml 1.4.0 requires pydash, which is not installed.
+azure-cli 2.45.0 requires azure-storage-common, which is not installed.
+azure-monitor-opentelemetry-exporter 1.0.0b12 requires fixedint, which is not installed.
+azure-monitor-opentelemetry-exporter 1.0.0b12 requires opentelemetry-api, which is not installed.
+azure-monitor-opentelemetry-exporter 1.0.0b12 requires opentelemetry-sdk, which is not installed.
+fabric 2.6.0 requires pathlib2, which is not installed.
+pygobject 3.42.2 requires pycairo, which is not installed.

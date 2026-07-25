@@ -13,7 +13,7 @@ CAPA_RULES_COMMIT=aed45e2571ebf7d2330e3daddbb5c472cc54966e
 CAPA_RULES_SHA256=2a7eb0c558e2f4436003c9d8a35587e520b2d96c6ea2793d27189a195e74a66b
 
 apt_install libglib2.0-0 libstdc++6
-pip_install -r /opt/ctf-os/requirements/binary-analysis.txt
+pip_install_locked /opt/ctf-os/requirements-lock/binary-analysis.txt
 
 download_sha256 \
   "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_linux_hotspot_${TEMURIN_VERSION}.tar.gz" \

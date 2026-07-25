@@ -10,7 +10,7 @@ scipy==1.15.3
 Pillow==11.3.0
 networkx==3.5
 sympy==1.14.0
-z3-solver==4.15.3.0
+z3-solver==4.13.0.0
 pycryptodome==3.23.0
 cryptography==45.0.6
 capstone==5.0.3

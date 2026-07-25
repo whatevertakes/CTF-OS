@@ -22,7 +22,7 @@ jobs:
           enable-cache: true
       - run: uv sync --frozen
       - name: Full pytest suite
-        run: uv run pytest -q
+        run: uv run pytest -q -W error
       - name: Race integration contract
         run: uv run pytest -q tests/test_prepare_images.py tests/test_race_bootstrap.py tests/test_flag_fastpath.py
       - name: Compile Python sources and tests

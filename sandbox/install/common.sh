@@ -10,7 +10,7 @@ apt_install \
   python3 python3-dev python3-pip python3-venv ruby ruby-dev default-jre-headless \
   iptables tini locales gnupg libmagic1 libxml2 libxslt1.1
 
-python3 -m pip install --break-system-packages --no-cache-dir -r /opt/ctf-os/requirements/common.txt
+pip_install_locked /opt/ctf-os/requirements-lock/common.txt
 
 for command in python3 curl wget git jq rg file objdump strings readelf nm xxd nmap gcc g++ cmake clang ruby java; do
   require_command "$command"

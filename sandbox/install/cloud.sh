@@ -32,7 +32,7 @@ KUSTOMIZE_SHA256=ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d
 GCLOUD_KEY_SHA256=3ecc63922b7795eb23fdc449ff9396f9114cb3cf186d6f5b53ad4cc3ebfbb11f
 
 apt_install awscli azure-cli podman skopeo uidmap slirp4netns fuse-overlayfs
-pip_install -r /opt/ctf-os/requirements/cloud.txt
+pip_install_locked /opt/ctf-os/requirements-lock/cloud.txt
 # Keep Debian's AWS CLI isolated from the newer analysis boto3 stack. Without
 # -S, /usr/local packages shadow its distro-pinned botocore and urllib3.
 cat >/usr/local/bin/aws <<'EOF'
@@ -41,11 +41,22 @@ export PYTHONPATH=/usr/lib/python3/dist-packages
 exec /usr/bin/python3 -S /usr/bin/aws "$@"
 EOF
 chmod 0755 /usr/local/bin/aws
+# Azure CLI is a Debian Python application too. Keep it on the same isolated
+# distro path so newer analysis libraries under /usr/local cannot shadow its
+# pinned dependencies.
+cat >/usr/local/bin/az <<'EOF'
+#!/bin/sh
+export PYTHONPATH=/usr/lib/python3/dist-packages
+exec /usr/bin/python3 -S /usr/bin/az "$@"
+EOF
+chmod 0755 /usr/local/bin/az
 python3 -m venv /opt/checkov-venv
-/opt/checkov-venv/bin/pip install --no-cache-dir checkov==3.2.446
+venv_install_locked \
+  /opt/checkov-venv /opt/ctf-os/requirements-lock/isolated/checkov.txt
 ln -s /opt/checkov-venv/bin/checkov /usr/local/bin/checkov
 python3 -m venv /opt/semgrep-venv
-/opt/semgrep-venv/bin/pip install --no-cache-dir semgrep==1.127.1
+venv_install_locked \
+  /opt/semgrep-venv /opt/ctf-os/requirements-lock/isolated/semgrep.txt
 ln -s /opt/semgrep-venv/bin/semgrep /usr/local/bin/semgrep
 sed -i '/^ctf:/d' /etc/subuid
 sed -i '/^ctf:/d' /etc/subgid
@@ -84,3 +95,8 @@ rm -rf /var/lib/apt/lists/* /tmp/helm.tgz /tmp/linux-amd64 /tmp/*.zip /tmp/tofu 
 
 for command in aws az gcloud kubectl helm terraform tofu podman skopeo oras cosign trivy syft grype kustomize opa conftest checkov semgrep yq; do require_command "$command"; done
 for module in boto3 botocore google.cloud.storage google.auth azure.identity azure.storage.blob kubernetes yaml requests httpx jinja2; do require_import "$module"; done
+aws --version 2>&1 | grep -Fq 'aws-cli/2.9.19'
+az version | grep -Fq '"azure-cli": "2.45.0"'
+gcloud --version | grep -Fq 'Google Cloud SDK 532.0.0'
+semgrep --version | grep -Fxq '1.127.1'
+checkov --version | grep -Fxq '3.2.446'

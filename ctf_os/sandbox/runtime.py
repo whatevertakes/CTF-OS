@@ -7,6 +7,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import subprocess
 import time
 import uuid
@@ -431,10 +432,17 @@ def execute(
         return_code = process.wait(timeout=5)
     finally:
         selector.close()
-        for handle in handles.values():
-            handle.flush()
-            os.fsync(handle.fileno())
-            handle.close()
+        try:
+            for handle in handles.values():
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+        finally:
+            # Popen owns these pipe objects even after their descriptors have
+            # reached EOF. Close them explicitly so fast flag-triggered
+            # termination is warning-clean in long-lived controller processes.
+            process.stdout.close()
+            process.stderr.close()
     observed = capture.decode("utf-8", errors="replace")
     after_packets = firewall_packets(metadata, resolved_target, docker=docker)
     target_observed, observation_source = target_observation(
@@ -576,7 +584,29 @@ def probe_service_connectivity(
 
 
 def argv_family(command: Sequence[str]) -> str:
+    return _argv_family(command, depth=0)
+
+
+def _argv_family(command: Sequence[str], *, depth: int) -> str:
     executable = Path(command[0]).name.casefold()
+    if depth < 3 and executable in {"bash", "dash", "ksh", "sh", "zsh"}:
+        values = list(command[1:])
+        for index, value in enumerate(values[:-1]):
+            option = value.split("=", 1)[0]
+            short_flags = option[1:] if option.startswith("-") and not option.startswith("--") else ""
+            if option == "--command" or "c" in short_flags:
+                try:
+                    inner = shlex.split(values[index + 1], posix=True)
+                except ValueError:
+                    inner = []
+                while inner and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", inner[0]):
+                    inner.pop(0)
+                inner_family = (
+                    _argv_family(inner, depth=depth + 1)
+                    if inner and inner[0] not in {"&&", "||", ";", "|"}
+                    else "script"
+                )
+                return f"{executable}:{option}:{inner_family}"
     stable: list[str] = [executable]
     for value in command[1:4]:
         if value.startswith("-"):
@@ -766,6 +796,27 @@ def user_exec_prefix(
     if detach:
         argv.append("--detach")
     argv.extend(["--user", "1001:1001"])
+    if workdir is not None:
+        argv.extend(["--workdir", workdir])
+    for value in USER_EXEC_ENV:
+        argv.extend(["--env", value])
+    argv.append(_metadata_name(metadata))
+    return argv
+
+
+def controller_exec_prefix(
+    metadata: Mapping[str, Any],
+    *,
+    docker: str = "docker",
+    detach: bool = False,
+    workdir: str | None = None,
+) -> list[str]:
+    """Build a root controller exec prefix without exposing host credentials."""
+
+    argv = [docker, "exec"]
+    if detach:
+        argv.append("--detach")
+    argv.extend(["--user", "0:0"])
     if workdir is not None:
         argv.extend(["--workdir", workdir])
     for value in USER_EXEC_ENV:
