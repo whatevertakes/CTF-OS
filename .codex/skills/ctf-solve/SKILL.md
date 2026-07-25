@@ -20,12 +20,14 @@ record native results with per-lane legacy confirmation commands.
 1. Prepare exactly one challenge:
 
    ```bash
-   uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contest>'
+   uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contest>' \
+     --remote-execution '<agent|human-relay>'
    ```
 
-   Add `--remote-execution human-relay` only when the contest requires a
-   participant to execute every organizer-remote request. Treat the returned
-   `remote_execution` value as immutable for the exact run.
+   This mode is a required explicit safety choice. Use `human-relay` when the
+   contest requires a participant to execute every organizer-remote request;
+   use `agent` only when organizer rules allow agent-originated remote requests.
+   Treat the returned `remote_execution` value as immutable for the exact run.
 
 2. Require `attack_ready: true` and `root_sandbox.status: READY`. If unavailable,
    report the exact returned blocker and recovery command. Never inspect or run
@@ -37,10 +39,12 @@ record native results with per-lane legacy confirmation commands.
 
 4. When useful, call `race-bootstrap` once with one to three lane specs. Each has
    exactly `model_profile`, `role`, `task`, `context_mode`, and a distinct
-   `attack_family`. Use Sol Ultra or Sol max for independent high-reasoning lanes
-   when worth their cost, Sol xhigh for efficient independent attacks, Terra high
-   for a verified build direction, and Luna high only for bounded mechanical
-   work. Pass every returned `spawn_agent_args` unchanged to native
+   `attack_family`. Pass each object with a repeatable `--lane '<JSON_OBJECT>'`,
+   or use `--lanes-json`/`--lanes-file` for an array. Use Sol Ultra or Sol max
+   for independent high-reasoning lanes when worth their cost, Sol xhigh for
+   efficient independent attacks, Terra high for a verified build direction,
+   and Luna high only for bounded mechanical work. Pass every returned
+   `spawn_agent_args` unchanged to native
    `spawn_agent`; after all calls return, batch their native thread IDs as
    `SPAWNED` events through the reconciliation rule above. A child becomes
    RUNNING only after that reconciliation.

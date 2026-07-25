@@ -2,9 +2,15 @@
 set -eu
 
 # Cargo needs a writable home even though the sandbox root filesystem is
-# read-only. The only preloaded registry source is the pinned dependency set
-# needed by a freshly initialized cargo-fuzz harness.
-runtime_cargo_home="${CARGO_HOME:-/work/.cargo}"
+# read-only. Docker build-time smoke tests run as root, so they must not leave a
+# root-owned config under /work that the runtime ctf user cannot read.
+if [ -n "${CARGO_HOME:-}" ]; then
+  runtime_cargo_home="$CARGO_HOME"
+elif [ "$(id -u)" -eq 0 ]; then
+  runtime_cargo_home="/tmp/ctf-os-build-cargo"
+else
+  runtime_cargo_home="/work/home/.cargo"
+fi
 mkdir -p "$runtime_cargo_home"
 if [ ! -e "$runtime_cargo_home/config.toml" ]; then
   umask 077

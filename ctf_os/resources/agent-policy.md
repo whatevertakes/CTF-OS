@@ -40,9 +40,11 @@ returned `sandbox-exec` prefix. The host is used only for CTF-OS controller
 commands. A sandbox failure is an exact environment blocker, never permission
 to run challenge tools on the host.
 
-`race-prepare --remote-execution human-relay` is the explicit contest-scoped
-exception for rules that require a participant to execute organizer-remote
-requests. Preparation retains declared target details so the model can write an
+Every `race-prepare` CLI call requires an explicit `--remote-execution` safety
+choice. `human-relay` is the contest-scoped mode for rules that require a
+participant to execute organizer-remote requests; `agent` is selected only when
+organizer rules allow agent-originated remote requests. Human-relay preparation
+retains declared target details so the model can write an
 exact command, but omits organizer targets from every sandbox network
 allowlist. Root and every child may continue local sandbox analysis and may use
 a Root-owned local challenge service. They must never send an organizer-remote

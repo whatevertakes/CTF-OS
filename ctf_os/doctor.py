@@ -94,9 +94,11 @@ GPU_PROBES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 def run_doctor(
     repo: Path,
     *,
+    profiles: Sequence[str] = PROFILES,
     docker: str = "docker",
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
+    required_profiles = _required_profiles(profiles)
     checks: list[dict[str, Any]] = []
     checks.append({
         "name": "host-platform",
@@ -138,11 +140,14 @@ def run_doctor(
         "ok": compose.returncode == 0 and compose_version >= (2, 24),
         "detail": (compose.stdout or compose.stderr).strip(),
     })
-    images = smoke_images(docker=docker, runner=runner)
+    images = smoke_images(required_profiles, docker=docker, runner=runner)
     checks.append({
         "name": "category-images",
         "ok": images["all_available"],
-        "detail": images["profiles"],
+        "detail": {
+            "required_profiles": list(required_profiles),
+            "profiles": images["profiles"],
+        },
     })
     checks.extend(
         _gpu_checks(
@@ -156,9 +161,27 @@ def run_doctor(
         "ok": all(check["ok"] for check in checks),
         "checks": checks,
         "images": images,
-        "build_command": ["sandbox/build-images.sh"],
+        "required_profiles": list(required_profiles),
+        "build_command": ["sandbox/build-images.sh", *required_profiles],
+        "full_build_command": ["sandbox/build-images.sh"],
         "solve_builds_images": False,
     }
+
+
+def _required_profiles(profiles: Sequence[str]) -> tuple[str, ...]:
+    selected = tuple(profiles)
+    if not selected:
+        raise ValueError("doctor requires at least one image profile")
+    unknown = [profile for profile in selected if profile not in PROFILES]
+    if unknown:
+        raise ValueError(
+            "unknown doctor image profile(s): "
+            + ", ".join(unknown)
+            + f"; supported: {', '.join(PROFILES)}"
+        )
+    if len(set(selected)) != len(selected):
+        raise ValueError("doctor image profiles must not be duplicated")
+    return selected
 
 
 def _gpu_checks(
@@ -255,18 +278,24 @@ def _gpu_checks(
         for row in images.get("profiles", [])
         if isinstance(row, Mapping)
     }
-    if not present.get("base", False):
+    inspected = set(present)
+    passthrough_profile = (
+        "base"
+        if present.get("base", False)
+        else next((profile for profile in PROFILES if present.get(profile, False)), None)
+    )
+    if passthrough_profile is None:
         add(
             "gpu-docker-passthrough",
             False,
-            "ctf-os-sandbox:base is absent; cannot validate scoped GPU passthrough",
+            "no required category image is available; cannot validate scoped GPU passthrough",
         )
         for name, _profile, _command in GPU_PROBES:
             add(name, True, "GPU passthrough was not validated", skipped=True)
         return checks
 
     passthrough = _gpu_image_probe(
-        "base",
+        passthrough_profile,
         (
             "nvidia-smi",
             "--query-gpu=index,name",
@@ -280,7 +309,10 @@ def _gpu_checks(
     add(
         "gpu-docker-passthrough",
         passthrough_ok,
-        passthrough_detail or "container nvidia-smi failed",
+        (
+            f"ctf-os-sandbox:{passthrough_profile}: "
+            + (passthrough_detail or "container nvidia-smi failed")
+        ),
     )
     if not passthrough_ok:
         for name, _profile, _command in GPU_PROBES:
@@ -289,7 +321,12 @@ def _gpu_checks(
 
     for name, profile, command in GPU_PROBES:
         if not present.get(profile, False):
-            add(name, True, f"ctf-os-sandbox:{profile} is absent", skipped=True)
+            detail = (
+                f"ctf-os-sandbox:{profile} was not selected for this doctor run"
+                if profile not in inspected
+                else f"ctf-os-sandbox:{profile} is unavailable"
+            )
+            add(name, True, detail, skipped=True)
             continue
         result = _gpu_image_probe(
             profile,

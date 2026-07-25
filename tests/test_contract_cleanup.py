@@ -324,7 +324,8 @@ def test_temp_contest_race_prepare_dry_smoke(tmp_path: Path) -> None:
     result = subprocess.run(
         [
             "python", "-m", "ctf_os.agent_tools", "--repo", str(tmp_path),
-            "race-prepare", "1", "--contest", "Smoke", "--dry-run",
+            "race-prepare", "1", "--contest", "Smoke",
+            "--remote-execution", "agent", "--dry-run",
         ],
         capture_output=True, text=True, check=False,
     )
@@ -386,7 +387,10 @@ def test_live_temp_contest_prepare_exec_and_exact_cleanup(tmp_path: Path) -> Non
     (challenge / "input.txt").write_text("immutable\n", encoding="utf-8")
     base = ["python", "-m", "ctf_os.agent_tools", "--repo", str(tmp_path)]
     prepared = subprocess.run(
-        [*base, "race-prepare", "1", "--contest", "Live"],
+        [
+            *base, "race-prepare", "1", "--contest", "Live",
+            "--remote-execution", "agent",
+        ],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr
@@ -510,7 +514,10 @@ def test_live_root_owned_service_is_prepared_probed_and_fully_cleaned(tmp_path: 
     base = ["python", "-m", "ctf_os.agent_tools", "--repo", str(tmp_path)]
     run_id: str | None = None
     prepared = subprocess.run(
-        [*base, "race-prepare", "1", "--contest", "Live Service"],
+        [
+            *base, "race-prepare", "1", "--contest", "Live Service",
+            "--remote-execution", "agent",
+        ],
         capture_output=True, text=True, timeout=180, check=False,
     )
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr
@@ -617,7 +624,10 @@ def test_live_declared_target_firewall_allows_only_exact_ip_and_port(
         (challenge / "input.txt").write_text("firewall\n", encoding="utf-8")
 
         prepared = subprocess.run(
-            [*base, "race-prepare", "1", "--contest", "Live Remote"],
+            [
+                *base, "race-prepare", "1", "--contest", "Live Remote",
+                "--remote-execution", "agent",
+            ],
             capture_output=True, text=True, timeout=120, check=False,
         )
         assert prepared.returncode == 0, prepared.stdout + prepared.stderr

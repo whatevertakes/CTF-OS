@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import regex as safe_regex
+
 from .categories import canonical_category
 
 
@@ -26,6 +28,27 @@ class SelectionError(ValueError):
 
     def payload(self) -> dict[str, object]:
         return {"error": str(self), "candidates": list(self.candidates)}
+
+
+MAX_FLAG_PATTERN_LENGTH = 2048
+
+
+def compile_flag_pattern(pattern: str | None) -> safe_regex.Pattern[str]:
+    """Compile the mandatory bounded organizer flag pattern."""
+
+    if not pattern:
+        raise ContestError(
+            "contest.md requires a non-empty flag pattern before race-prepare; "
+            "for example: - flag_pattern: \\ACTF\\{[^}\\r\\n]+\\}\\Z"
+        )
+    if len(pattern) > MAX_FLAG_PATTERN_LENGTH:
+        raise ContestError(
+            f"contest.md flag pattern exceeds {MAX_FLAG_PATTERN_LENGTH} characters"
+        )
+    try:
+        return safe_regex.compile(pattern)
+    except safe_regex.error as exc:
+        raise ContestError(f"contest.md flag pattern is invalid: {exc}") from exc
 
 
 def safe_name(value: str, *, fallback: str = "item") -> str:
@@ -67,7 +90,8 @@ def initialize_contest(root: str | Path, contest: str, challenge_key: str) -> di
         _atomic_text(
             manifest,
             f"# 대회명: {contest_name}\n"
-            "<!-- 여기에 대회 플래그 패턴을 추가하세요. -->\n\n"
+            "- 플래그 패턴: \n"
+            "<!-- 필수: 예시 \\ACTF\\{[^}\\r\\n]+\\}\\Z; 비어 있으면 race-prepare가 차단됩니다. -->\n\n"
             f"{heading}\n- 설명: \n- 원격: \n",
         )
         manifest_created = True
@@ -80,6 +104,10 @@ def initialize_contest(root: str | Path, contest: str, challenge_key: str) -> di
         "manifest_path": str(manifest),
         "manifest_created": manifest_created,
         "challenge_added": challenge_added,
+        "flag_pattern_required": True,
+        "next_action": (
+            f"edit {manifest} and fill the required flag pattern before race-prepare"
+        ),
     }
 
 

@@ -21,6 +21,7 @@ from ..blackboard import (
     human_relay_blocks_promotion,
     register_artifact_inbox,
 )
+from ..categories import CATEGORIES
 from ..contest import (
     discover_contests,
     initialize_contest,
@@ -100,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m ctf_os.agent_tools",
         description="Verified asynchronous portfolio race controller for one authorized CTF challenge",
+        allow_abbrev=False,
     )
     parser.add_argument("--repo", default=".")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -125,10 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--remote-execution",
         choices=("agent", "human-relay"),
-        default="agent",
+        required=True,
         help=(
-            "let agents access declared organizer targets, or require a participant "
-            "to execute every organizer-remote command"
+            "required explicit safety choice: let agents access declared organizer "
+            "targets, or require a participant to execute every organizer-remote command"
         ),
     )
     prepare.add_argument("--dry-run", action="store_true", help="prepare fresh state but do not start service/sandbox")
@@ -138,6 +140,13 @@ def build_parser() -> argparse.ArgumentParser:
     group = bootstrap.add_mutually_exclusive_group(required=True)
     group.add_argument("--lanes-json")
     group.add_argument("--lanes-file")
+    group.add_argument(
+        "--lane",
+        dest="lanes",
+        action="append",
+        metavar="JSON_OBJECT",
+        help="one lane JSON object; repeat --lane to request up to three lanes",
+    )
     bootstrap.add_argument("--docker", default="docker")
 
     endgame = commands.add_parser("race-endgame", help="prepare the single qualified post-minute-60 Sol max replacement")
@@ -168,7 +177,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     end = commands.add_parser("race-end", help="mark timeout, handoff, or explicit stop and return cancel targets")
     end.add_argument("--run-id")
-    end.add_argument("--reason", required=True, choices=("TIMED_OUT", "HANDOFF", "STOPPED"))
+    end.add_argument(
+        "--reason",
+        required=True,
+        type=str.upper,
+        choices=("TIMED_OUT", "HANDOFF", "STOPPED"),
+    )
 
     handoff = commands.add_parser("race-handoff", help="terminate the exact race and save one manual HANDOFF.md")
     handoff.add_argument("--run-id")
@@ -230,8 +244,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", help="pre-contest host/image diagnostics; never part of race-prepare")
     doctor.add_argument("--docker", default="docker")
-    image_smoke = commands.add_parser("image-smoke", help="inspect all ten local category images")
+    doctor.add_argument(
+        "--profiles",
+        nargs="+",
+        choices=CATEGORIES,
+        default=list(CATEGORIES),
+        help="validate only the profiles built for this machine (default: all ten)",
+    )
+    image_smoke = commands.add_parser("image-smoke", help="inspect selected local category images")
     image_smoke.add_argument("--docker", default="docker")
+    image_smoke.add_argument(
+        "--profiles",
+        nargs="+",
+        choices=CATEGORIES,
+        default=list(CATEGORIES),
+    )
     return parser
 
 
@@ -321,9 +348,9 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         _attack_timeout(metadata, 20)
         return tool_version(metadata, args.name)
     if args.command == "doctor":
-        return run_doctor(repo, docker=args.docker)
+        return run_doctor(repo, profiles=args.profiles, docker=args.docker)
     if args.command == "image-smoke":
-        return smoke_images(docker=args.docker)
+        return smoke_images(args.profiles, docker=args.docker)
     raise ValueError(f"unsupported command: {args.command}")
 
 
@@ -339,6 +366,12 @@ def _command_succeeded(command: str, result: Any) -> bool:
 
 
 def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
+    remote_execution = getattr(args, "remote_execution", None)
+    if remote_execution not in {"agent", "human-relay"}:
+        raise ValueError(
+            "race-prepare requires an explicit --remote-execution "
+            "choice: agent or human-relay"
+        )
     selected_at = utc_now()
     manifest, challenge = _select(repo, args.contest, args.selector)
     fingerprint = input_fingerprint(manifest, challenge)
@@ -371,7 +404,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             "explicit-cli" if requested_root_profile else "policy-default"
         ),
         service_isolation=getattr(args, "service_isolation", "per-lane"),
-        remote_execution=getattr(args, "remote_execution", "agent"),
+        remote_execution=remote_execution,
     )
     if args.dry_run:
         mark_prepare_failed(run, "dry-run requested; no service or sandbox was started")
@@ -1284,6 +1317,14 @@ def _select(repo: Path, contest_selector: str | None, challenge_selector: str):
 
 
 def _lane_json(args: argparse.Namespace) -> list[Mapping[str, Any]]:
+    inline_lanes = getattr(args, "lanes", None)
+    if inline_lanes:
+        if sum(len(raw) for raw in inline_lanes) > 64 * 1024:
+            raise ValueError("inline lane JSON is too large")
+        values = [json.loads(raw) for raw in inline_lanes]
+        if any(not isinstance(row, dict) for row in values):
+            raise ValueError("each --lane value must be one JSON object")
+        return values
     if args.lanes_file:
         path = Path(args.lanes_file)
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:

@@ -15,6 +15,7 @@ from .blackboard import (
     append_verified_event,
     human_relay_blocks_promotion,
 )
+from .contest import ContestError, compile_flag_pattern
 from .race import load_race, record_winner
 from .sandbox.session import MAX_FLAG_TAIL
 
@@ -35,12 +36,10 @@ _PLACEHOLDERS = re.compile(
 
 class StreamingDetector:
     def __init__(self, pattern: str | None) -> None:
-        if not pattern or len(pattern) > 2048:
-            raise FlagError("a bounded challenge flag pattern is required")
         try:
-            self.pattern = safe_regex.compile(pattern)
-        except safe_regex.error as exc:
-            raise FlagError(f"challenge flag pattern is invalid: {exc}") from exc
+            self.pattern = compile_flag_pattern(pattern)
+        except ContestError as exc:
+            raise FlagError(str(exc)) from exc
         self.buffer = ""
         self.seen: set[str] = set()
 
@@ -65,7 +64,12 @@ class StreamingDetector:
 
 
 def valid_candidate(candidate: str, pattern: Any | str | None) -> bool:
-    if not candidate or len(candidate) > 1024 or _is_placeholder(candidate):
+    if (
+        not candidate
+        or not pattern
+        or len(candidate) > 1024
+        or _is_placeholder(candidate)
+    ):
         return False
     try:
         compiled = safe_regex.compile(pattern) if isinstance(pattern, str) else pattern

@@ -8,11 +8,14 @@ Prepare it once:
 
 ```bash
 uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contest>' \
-  --root-model-profile sol-ultra --service-isolation per-lane
+  --root-model-profile sol-ultra --service-isolation per-lane \
+  --remote-execution '<agent|human-relay>'
 ```
 
-For a contest whose rules require every organizer-remote request to be executed
-by a participant, add `--remote-execution human-relay`. In that mode local
+The execution mode is a required explicit safety choice. For a contest whose
+rules require every organizer-remote request to be executed by a participant,
+use `--remote-execution human-relay`; use `agent` only when organizer rules allow
+agent-originated remote requests. In human-relay mode local
 analysis still runs through `sandbox-exec`, but Root and every child must never
 send an organizer-remote request through any agent tool, host tool, web/browser
 tool, connector, socket, or sandbox command. When a remote attempt is needed,

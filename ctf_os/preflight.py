@@ -24,7 +24,7 @@ from .archive import (
     copy_tree_without_links,
     extract_archive,
 )
-from .contest import ChallengeSpec, ContestManifest
+from .contest import ChallengeSpec, ContestManifest, compile_flag_pattern
 from .sandbox.network import parse_remotes
 from .workspace import atomic_json
 
@@ -64,6 +64,9 @@ def challenge_sources(manifest: ContestManifest, challenge: ChallengeSpec) -> tu
 
 
 def input_fingerprint(manifest: ContestManifest, challenge: ChallengeSpec) -> str:
+    # A run without a usable pattern can never exercise the flag fast path.
+    # Reject it before create_run() allocates any durable race state.
+    compile_flag_pattern(challenge.flag_pattern)
     sources = challenge_sources(manifest, challenge)
     if not sources and not challenge.remotes:
         raise PreflightError("challenge has neither a matching input nor a declared target")

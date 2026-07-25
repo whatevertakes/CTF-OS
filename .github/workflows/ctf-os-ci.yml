@@ -3,7 +3,8 @@ name: CTF-OS
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - "**"
   workflow_dispatch:
 
 permissions:

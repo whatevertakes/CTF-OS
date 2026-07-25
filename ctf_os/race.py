@@ -16,6 +16,7 @@ from .blackboard import (
     shared_artifacts,
     verified_delta,
 )
+from .contest import ContestError, compile_flag_pattern
 from .sandbox.session import session_liveness
 from .workspace import atomic_json, read_json, state_lock, utc_now
 
@@ -85,6 +86,10 @@ def initialize_race(
         raise RaceError("remote execution must be agent or human-relay")
     now = _parse_time(input_ready_at)
     challenge = dict(run_manifest["challenge"])
+    try:
+        compile_flag_pattern(challenge.get("flag_pattern"))
+    except ContestError as exc:
+        raise RaceError(str(exc)) from exc
     lease = lease_seconds(str(challenge["category"]))
     state: dict[str, Any] = {
         "schema_version": RACE_SCHEMA_VERSION,

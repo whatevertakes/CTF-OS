@@ -222,6 +222,15 @@ def test_new_tool_versions_and_artifacts_are_pinned() -> None:
             assert len(line.rsplit("=", 1)[1]) == 64
 
 
+def test_cargo_wrapper_separates_build_root_state_from_runtime_home() -> None:
+    wrapper = Path("sandbox/bin/ctf-cargo").read_text(encoding="utf-8")
+
+    assert 'elif [ "$(id -u)" -eq 0 ]; then' in wrapper
+    assert 'runtime_cargo_home="/tmp/ctf-os-build-cargo"' in wrapper
+    assert 'runtime_cargo_home="/work/home/.cargo"' in wrapper
+    assert 'runtime_cargo_home="${CARGO_HOME:-/work/.cargo}"' not in wrapper
+
+
 @pytest.mark.live
 @pytest.mark.skipif(os.environ.get("CTF_OS_LIVE") != "1", reason="set CTF_OS_LIVE=1")
 @pytest.mark.parametrize(

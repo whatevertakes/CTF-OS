@@ -60,7 +60,7 @@ Atheris with its bundled libFuzzer, and cargo-fuzz on a date-pinned nightly Rust
 toolchain. The exact `libfuzzer-sys` graph needed by a new `cargo fuzz init`
 harness is vendored under `/opt/cargo-fuzz-vendor`, so its first bounded target
 can compile with sandbox networking disabled. Cargo writes only below
-`/work/.cargo`.
+the attempt-private `$HOME/.cargo` (`/work/home/.cargo` at runtime).
 Rev keeps PyOpenCL for CPU and native-Linux OpenCL analysis and provides CuPy
 with pinned CUDA 12 userspace libraries for NVIDIA GPU kernels, including on
 WSL2 where an NVIDIA OpenCL ICD may be unavailable.

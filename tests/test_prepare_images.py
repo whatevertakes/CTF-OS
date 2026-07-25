@@ -179,7 +179,13 @@ def test_race_prepare_orchestrates_real_root_create_without_manual_command(repo:
         return fake_sandbox(spec.lane_root.parents[1], challenge, spec.lane_id, spec.image)
 
     monkeypatch.setattr(cli, "create", fake_create)
-    args = argparse.Namespace(selector="web/Example", contest="Demo CTF", docker="docker", dry_run=False)
+    args = argparse.Namespace(
+        selector="web/Example",
+        contest="Demo CTF",
+        docker="docker",
+        dry_run=False,
+        remote_execution="agent",
+    )
     result = cli._race_prepare(repo, args)
     assert result["attack_ready"] is True
     assert result["root_sandbox"]["status"] == "READY"
@@ -195,7 +201,13 @@ def test_race_prepare_missing_images_is_explicitly_not_attack_ready(repo: Path, 
         "selected_image": None, "image_available": False, "reason": "no local image",
         "recovery_command": ["sandbox/build-images.sh", "web"],
     })
-    args = argparse.Namespace(selector="1", contest="Demo CTF", docker="docker", dry_run=False)
+    args = argparse.Namespace(
+        selector="1",
+        contest="Demo CTF",
+        docker="docker",
+        dry_run=False,
+        remote_execution="agent",
+    )
     result = cli._race_prepare(repo, args)
     assert result["attack_ready"] is False
     assert result["root_sandbox"]["status"] == "UNAVAILABLE"
@@ -249,6 +261,7 @@ def test_incomplete_service_cleanup_keeps_recoverable_run_ownership(
             contest="Demo CTF",
             docker="docker",
             dry_run=False,
+            remote_execution="agent",
         ),
     )
     run = resolve_run(repo, result["run_id"])

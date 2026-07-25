@@ -220,3 +220,4 @@ for profile in "${PROFILES[@]}"; do
     "ctf-os-sandbox-build:${generation}-${profile}" \
     "ctf-os-sandbox:${profile}"
 done
+echo "Next: uv run python -m ctf_os.agent_tools doctor --profiles ${PROFILES[*]}"
