@@ -1,6 +1,6 @@
 ---
 name: ctf-solve
-description: Race exactly one authorized CTF challenge to the first target-observed valid flag.
+description: Race one authorized CTF challenge in an exact, concurrently safe run to the first target-observed valid flag.
 ---
 
 # CTF Solve
@@ -28,6 +28,9 @@ record native results with per-lane legacy confirmation commands.
    contest requires a participant to execute every organizer-remote request;
    use `agent` only when organizer rules allow agent-originated remote requests.
    Treat the returned `remote_execution` value as immutable for the exact run.
+   Record the returned `run_id`. Different challenges may race concurrently,
+   but only one active attempt is allowed per challenge. Never operate another
+   run.
 
 2. Require `attack_ready: true` and `root_sandbox.status: READY`. If unavailable,
    report the exact returned blocker and recovery command. Never inspect or run
@@ -37,7 +40,7 @@ record native results with per-lane legacy confirmation commands.
    `next_root_action.exec_command_prefix`. Root attacks continuously and never
    pauses merely to prepare workers.
 
-4. When useful, call `race-bootstrap` once with one to three lane specs. Each has
+4. When useful, call `race-bootstrap --run-id <run-id>` once with one to three lane specs. Each has
    exactly `model_profile`, `role`, `task`, `context_mode`, and a distinct
    `attack_family`. Pass each object with a repeatable `--lane '<JSON_OBJECT>'`,
    or use `--lanes-json`/`--lanes-file` for an array. Use Sol Ultra or Sol max
@@ -63,7 +66,7 @@ record native results with per-lane legacy confirmation commands.
    Fresh lanes receive no Root history. Directed lanes receive only the verified
    delta produced by the race engine.
 
-7. Poll `race-status` while Root keeps attacking. Interrupt stagnant, duplicate,
+7. Poll `race-status --run-id <run-id>` while Root keeps attacking. Interrupt stagnant, duplicate,
    or remote-avoiding native lanes returned as native `INTERRUPT` actions. After
    all calls return, batch their exact native session IDs as `INTERRUPTED` events
    through the reconciliation rule above. Reconciliation cleans each stopped
@@ -82,7 +85,11 @@ record native results with per-lane legacy confirmation commands.
 
 9. At 90 minutes, terminate without extension, interrupt native cancel targets,
    batch their results through `race-reconcile`, preserve needed lane-private
-   artifacts, and run exact `race-cleanup`.
+   artifacts, and run `race-cleanup --run-id <run-id>`.
+
+All post-prepare controller operations use the returned exact `run_id`.
+Omission is invalid when multiple races are active. Per-run concurrency remains
+Root plus three; all active runs share aggregate managed-container admission.
 
 Maintain read-only input, declared-target-only egress, private writable paths,
 Root-only service lifecycle, no host credentials/socket, and no automatic flag

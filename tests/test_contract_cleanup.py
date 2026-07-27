@@ -10,7 +10,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import fake_sandbox, make_race
+from conftest import fake_sandbox, make_race, write_challenge
 from test_blackboard_race import _receipt, _spec
 
 import ctf_os.agent_tools.__main__ as cli
@@ -19,7 +19,14 @@ from ctf_os.contest import parse_contest, resolve_selector
 from ctf_os.handoff import save_handoff
 from ctf_os.preflight import input_fingerprint
 from ctf_os.race import load_race, terminate
-from ctf_os.workspace import WorkspaceError, create_run
+from ctf_os.workspace import (
+    WorkspaceError,
+    active_pointer,
+    active_registry,
+    clear_active,
+    create_run,
+    resolve_run,
+)
 
 DELETED_MODULES = (
     "ctf_os." + "in" + "take", "ctf_os." + "tri" + "age", "ctf_os." + "problems",
@@ -149,6 +156,80 @@ def test_terminal_race_still_owns_resources_until_exact_cleanup(repo: Path) -> N
             repo, manifest, challenge,
             input_fingerprint=input_fingerprint(manifest, challenge),
         )
+
+
+def test_different_challenges_can_own_parallel_exact_runs(repo: Path) -> None:
+    first_manifest, first_challenge, first_run, _race = make_race(repo)
+    second_manifest, second_challenge = write_challenge(
+        repo,
+        contest="Parallel CTF",
+        category="ai",
+        name="OOS",
+        files={"model.py": b"print('parallel')\n"},
+    )
+    second_run, _manifest = create_run(
+        repo,
+        second_manifest,
+        second_challenge,
+        input_fingerprint=input_fingerprint(second_manifest, second_challenge),
+    )
+
+    assert resolve_run(repo, first_run.name) == first_run
+    assert resolve_run(repo, second_run.name) == second_run
+    with pytest.raises(WorkspaceError, match="multiple active races"):
+        resolve_run(repo)
+
+    clear_active(repo, run_id=second_run.name)
+    assert resolve_run(repo) == first_run
+    assert resolve_run(repo, first_run.name) == first_run
+    with pytest.raises(WorkspaceError, match="not an active race"):
+        resolve_run(repo, second_run.name)
+
+    with pytest.raises(WorkspaceError, match="already has an active race"):
+        create_run(
+            repo,
+            first_manifest,
+            first_challenge,
+            input_fingerprint=input_fingerprint(first_manifest, first_challenge),
+        )
+
+
+def test_parallel_registry_preserves_legacy_active_pointer(repo: Path) -> None:
+    _manifest, _challenge, legacy_run, _race = make_race(repo)
+    registry_path = active_registry(repo)
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    legacy_entry = registry["runs"][legacy_run.name]
+    pointer_path = active_pointer(repo)
+    pointer_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "run_id": legacy_entry["run_id"],
+            "run_root": legacy_entry["run_root"],
+            "challenge_id": legacy_entry["challenge_id"],
+            "created_at": legacy_entry["created_at"],
+        }),
+        encoding="utf-8",
+    )
+    registry_path.unlink()
+    original_pointer = pointer_path.read_bytes()
+
+    manifest, challenge = write_challenge(
+        repo,
+        contest="Second CTF",
+        category="misc",
+        name="Parallel",
+        files={"solve.txt": b"parallel\n"},
+    )
+    second_run, _manifest = create_run(
+        repo,
+        manifest,
+        challenge,
+        input_fingerprint=input_fingerprint(manifest, challenge),
+    )
+
+    assert pointer_path.read_bytes() == original_pointer
+    assert resolve_run(repo, legacy_run.name) == legacy_run
+    assert resolve_run(repo, second_run.name) == second_run
 
 
 def test_user_supplied_sandbox_metadata_must_match_attached_race(

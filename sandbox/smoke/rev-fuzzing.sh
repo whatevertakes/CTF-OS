@@ -23,4 +23,13 @@ javac -cp /opt/jazzer/jazzer_standalone.jar "$smoke_root/FuzzTarget.java"
 )
 grep -F 'Instrumented FuzzTarget' "$smoke_root/jazzer.out"
 grep -F 'stat::number_of_executed_units:' "$smoke_root/jazzer.out"
+fuzzilli_help="$(fuzzilli --help 2>&1 || true)"
+grep -F -- '--profile' <<<"$fuzzilli_help"
+fuzzil_help="$(fuzzil-tool --help 2>&1 || true)"
+grep -Fq 'Usage' <<<"$fuzzil_help"
+fuzzilli --profile=jerryscript --jobs=1 --maxIterations=10 \
+  --storagePath="$smoke_root/fuzzilli-campaign" --overwrite \
+  /usr/local/bin/jerry-fuzzilli >"$smoke_root/fuzzilli.out" 2>&1
+test -d "$smoke_root/fuzzilli-campaign/corpus"
 echo CTF_OS_JAZZER_SMOKE_OK
+echo CTF_OS_FUZZILLI_SMOKE_OK

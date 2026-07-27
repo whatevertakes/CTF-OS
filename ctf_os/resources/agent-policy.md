@@ -3,10 +3,13 @@
 ## Objective and ownership
 
 Minimize time to the first format-valid flag observed in actual output from one
-authorized challenge or organizer-declared target. One fresh run owns the
-machine until a winner, the 90-minute deadline, an explicit stop, or a manual
-Claude handoff. Root Sol is always the lead attacker and the only authority for
-challenge-service and global cleanup lifecycle.
+authorized challenge or organizer-declared target. Each fresh run owns exactly
+one challenge until a winner, the 90-minute deadline, an explicit stop, or a
+manual Claude handoff. Different challenges may have concurrent active runs on
+the same machine; a challenge may have only one active attempt at a time. Root
+Sol is always the lead attacker and the only authority for its exact run's
+challenge-service and cleanup lifecycle. One run must never stop, reconcile,
+clean, authorize, or reuse another run's resources.
 
 Python selects and materializes input, inspects local images, creates private
 sandboxes, prepares lane-isolated local services, produces native worker packets, records
@@ -23,6 +26,12 @@ challenge, safely extracts only matching input into a fresh run, fingerprints
 it, makes it read-only, selects `ctf-os-sandbox:<category>`, runs `docker image
 inspect`, prepares a safe challenge service when present, initializes compact
 race state and blackboard, and creates the Root sandbox.
+
+Active runs are registered by immutable `run_id`. All post-prepare controller
+operations target that exact id; when multiple races are active, omitting
+`--run-id` is an ambiguity error. The legacy single-run pointer remains readable
+so an already-running race can coexist with newly registered runs without its
+state being rewritten. Cleanup removes only the selected run's registry entry.
 
 Preparation records Root's declared model profile and whether it came from an
 explicit CLI value or the Sol Ultra policy default. Benchmark comparisons use
@@ -62,7 +71,7 @@ visible for the participant's manual decision and submission.
 ## Portfolio lanes
 
 Root may request up to three private native lanes at once through
-`race-bootstrap`, but only after Root has completed an actual sandbox attack
+`race-bootstrap --run-id <run-id>`, but only after Root has completed an actual sandbox attack
 command with a durable receipt. If post-execution metric logging failed,
 bootstrap recovers `root_first_command_at` from that receipt. Every specification
 has exactly:
@@ -86,7 +95,9 @@ lane.
 - Luna high performs bounded extraction, transformation, batching, comparison,
   brute force, or decoding.
 
-Root plus children never exceeds concurrency four. A fresh lane receives only
+Root plus children never exceeds concurrency four per run. Concurrent runs share
+one aggregate managed-container capacity budget, and service/sandbox admission
+and creation are serialized by a repository-global resource lock. A fresh lane receives only
 the challenge, read-only input, declared targets, deadline, and its sandbox. A
 directed lane may also receive a bounded verified blackboard delta. Every
 execution-verified artifact is copied once into a content-addressed immutable

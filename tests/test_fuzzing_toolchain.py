@@ -43,13 +43,20 @@ INSTALL_REQUIRED_COMMANDS = {
         "qemu-aarch64", "qemu-arm", "qemu-mips", "qemu-mipsel",
         "qemu-riscv64", "qemu-system-x86_64", "qemu-system-aarch64",
         "cpio", "afl-fuzz", "afl-showmap", "afl-clang-fast",
-        "afl-clang-fast++", "afl-qemu-trace", "valgrind", "boo", "cargo",
-        "cargo-fuzz", "rustc",
+        "afl-clang-fast++", "afl-qemu-trace", "afl-qemu-trace-aarch64",
+        "afl-qemu-trace-arm", "afl-qemu-trace-mips",
+        "afl-qemu-trace-mipsel", "aflnet-fuzz", "stateafl-fuzz",
+        "valgrind", "radamsa", "honggfuzz", "hfuzz-clang", "go",
+        "syz-manager", "syz-prog2c", "syz-execprog", "libafl-fuzz", "boo", "cargo",
+        "cargo-fuzz", "rustc", "clang-19",
     },
     "web": {
         "node", "npm", "php", "sqlite3", "redis-cli", "psql", "mysql",
         "chromium", "chromedriver", "ffuf", "nuclei", "ctf-nuclei-scan",
         "dalfox", "semgrep", "sqlmap", "sstimap", "schemathesis",
+        "restler", "httpx-pd", "katana", "feroxbuster", "mitmproxy",
+        "mitmdump", "grpcurl", "arjun", "jwt-tool", "commix", "phpggc",
+        "ysoserial",
     },
     "rev": {
         "java", "javac", "analyzeHeadless", "ctf-ghidra-headless", "frida",
@@ -57,7 +64,8 @@ INSTALL_REQUIRED_COMMANDS = {
         "jadx-gui", "apktool", "wasm-objdump", "upx", "wasmtime", "mono",
         "qemu-aarch64", "qemu-arm", "qemu-mips", "qemu-mipsel",
         "qemu-riscv64", "qemu-system-x86_64", "qemu-system-aarch64",
-        "qemu-system-riscv64", "qemu-img", "jazzer",
+        "qemu-system-riscv64", "qemu-img", "jazzer", "fuzzilli",
+        "fuzzil-tool", "jerry-fuzzilli", "apktool2",
     },
     "crypto": {
         "sage", "RsaCtfTool", "cado-nfs", "gp", "gap", "maxima", "hashcat",
@@ -67,7 +75,8 @@ INSTALL_REQUIRED_COMMANDS = {
         "vol", "mmls", "fls", "icat", "foremost", "exiftool", "binwalk",
         "tshark", "tcpdump", "testdisk", "photorec", "dcfldd", "steghide",
         "stegseek", "zsteg", "convert", "tesseract", "pngcheck", "ffmpeg",
-        "sox",
+        "sox", "yara", "bulk_extractor", "sqlite3", "pdfinfo", "pdftotext",
+        "olevba", "oleid", "rtfobj",
     },
     "misc": {
         "ffmpeg", "sox", "convert", "tesseract", "tshark", "binwalk",
@@ -121,9 +130,13 @@ def test_every_catalog_entry_has_help_and_a_probe_command() -> None:
 
 def test_p1_and_p2_tools_are_exposed_only_in_their_selected_images() -> None:
     placements = {
-        "pwn": {"valgrind", "boo", "atheris", "cargo-fuzz"},
-        "web": {"schemathesis"},
-        "rev": {"jazzer"},
+        "pwn": {
+            "valgrind", "boo", "atheris", "cargo-fuzz", "syz-manager",
+            "syz-execprog",
+            "honggfuzz", "libafl-fuzz",
+        },
+        "web": {"schemathesis", "restler"},
+        "rev": {"jazzer", "fuzzilli", "jerry-fuzzilli"},
     }
     for category, expected in placements.items():
         assert expected <= set(list_tools(category)["tools"])
@@ -142,14 +155,13 @@ def test_catalog_has_no_duplicates_or_base_redeclarations() -> None:
         assert len(exposed) == len(set(exposed)), category
 
 
-def test_explicitly_excluded_fuzzers_are_not_advertised() -> None:
-    excluded = {"syzkaller", "Fuzzilli", "RESTler", "honggfuzz", "LibAFL"}
-    exposed = {
-        tool
-        for category in session._TOOLS
-        for tool in list_tools(category)["tools"]
-    }
-    assert not excluded.intersection(exposed)
+def test_full_fuzzing_portfolio_is_advertised_in_selected_images() -> None:
+    assert {
+        "syz-manager", "syz-execprog", "honggfuzz", "libafl-fuzz",
+    } <= set(list_tools("pwn")["tools"])
+    assert "fuzzilli" in list_tools("rev")["tools"]
+    assert "jerry-fuzzilli" in list_tools("rev")["tools"]
+    assert "restler" in list_tools("web")["tools"]
 
 
 @pytest.mark.parametrize(
@@ -215,6 +227,12 @@ def test_new_tool_versions_and_artifacts_are_pinned() -> None:
         "rust_nightly=2026-06-10",
         "cargo-fuzz=0.13.2",
         "libfuzzer-sys=0.4.13",
+        "syzkaller=492bab153dea5e0e414bd0bbf60c3871267255ed",
+        "honggfuzz=cf8b66a4d09f4d4d786d96e3c46d9141fb4e98e2",
+        "libafl=0.15.4",
+        "fuzzilli=357cc311e8513cb4ef68ea4f3efef5fd1c418abc",
+        "fuzzilli_jerryscript=38e05b456987a26dc782a72c4221e396c9e35a20",
+        "restler=6d984deedbc54aad957fa3da0c7e9e5df23a2aee",
     }
     assert required <= set(lock.splitlines())
     for line in lock.splitlines():
@@ -237,7 +255,7 @@ def test_cargo_wrapper_separates_build_root_state_from_runtime_home() -> None:
     ("profile", "command"),
     (
         ("pwn", "/usr/local/bin/ctf-os-pwn-fuzzing-smoke"),
-        ("web", "schemathesis"),
+        ("web", "/usr/local/bin/ctf-os-web-security-smoke"),
         ("rev", "/usr/local/bin/ctf-os-rev-fuzzing-smoke"),
     ),
 )
@@ -255,8 +273,6 @@ def test_new_fuzzers_run_in_hardened_category_containers(
     if profile in {"pwn", "rev"}:
         argv.extend(["--cap-add", "SYS_PTRACE", "--security-opt", "seccomp=unconfined"])
     argv.extend(["--entrypoint", command, f"ctf-os-sandbox:{profile}"])
-    if profile == "web":
-        argv.append("--version")
     result = subprocess.run(
         argv, capture_output=True, text=True, timeout=300, check=False
     )

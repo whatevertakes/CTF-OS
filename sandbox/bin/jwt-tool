@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+exec /opt/jwt-tool-venv/bin/python /opt/jwt-tool/jwt_tool.py "$@"

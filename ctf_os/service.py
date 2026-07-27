@@ -70,6 +70,7 @@ class ServiceSpec:
     run_root: Path
     plan: Mapping[str, Any]
     instance_id: str = "root"
+    resource_scope: Path | None = None
 
     @property
     def suffix(self) -> str:
@@ -145,7 +146,12 @@ def prepare_service(
             + "; ".join(str(value) for value in spec.plan.get("review_reasons", []))
         )
     _validate_spec(spec)
-    with state_lock(spec.run_root / "resources"):
+    resource_scope = (
+        spec.resource_scope.resolve()
+        if spec.resource_scope is not None
+        else spec.run_root / "resources"
+    )
+    with state_lock(resource_scope):
         return _prepare_service_locked(
             spec,
             kind=kind,
@@ -851,6 +857,8 @@ def _validate_spec(spec: ServiceSpec) -> None:
         raise ServiceError("service instance id is invalid")
     if spec.run_root.is_symlink():
         raise ServiceError("service run root must not be a symlink")
+    if spec.resource_scope is not None and spec.resource_scope.is_symlink():
+        raise ServiceError("shared resource scope must not be a symlink")
 
 
 def _require_local_images(

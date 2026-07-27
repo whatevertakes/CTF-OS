@@ -8,3 +8,4 @@ mechanize==0.4.10
 playwright==1.54.0
 sqlmap @ https://files.pythonhosted.org/packages/65/29/0938e45586f78c712c568160ba26a15d19b4dfeae2e9bafe2eefdd87ba74/sqlmap-1.10.7-py2.py3-none-any.whl#sha256=83ec02d4e373dd6656ae0b65f1362565dd8b09f998adac3a4bbf72fa7bc7f2ac
 schemathesis @ https://files.pythonhosted.org/packages/6b/13/a1beda991930ac23df8876cd5f80f1b12a841d1063f813239a50215c9b94/schemathesis-4.24.2-py3-none-any.whl#sha256=19a01b67955afc9e8ee8ed3bec0a35660f973ce6164b4f79c4a4c1571fca368b
+arjun==2.2.7

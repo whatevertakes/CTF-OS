@@ -1,0 +1,5 @@
+termcolor==3.3.0
+cprint==1.2.2
+pycryptodomex==3.23.0
+requests==2.34.2
+ratelimit==2.2.1

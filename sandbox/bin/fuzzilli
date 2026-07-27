@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export LD_LIBRARY_PATH="/usr/lib/swift/linux${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /opt/fuzzilli/bin/FuzzilliCli "$@"

@@ -21,6 +21,7 @@ from ctf_os.images import (
 from ctf_os.preflight import input_fingerprint, prepare_input, validate_prepared_input
 from ctf_os.race import load_race
 from ctf_os.sandbox.runtime import SandboxSpec, create
+from ctf_os.service import ServiceSpec
 from ctf_os.workspace import WorkspaceError, create_run, resolve_run
 
 
@@ -164,14 +165,22 @@ def test_runtime_create_uses_inspected_image_without_pull_and_returns_executable
 def test_race_prepare_orchestrates_real_root_create_without_manual_command(repo: Path, monkeypatch) -> None:
     _manifest, challenge = write_challenge(repo, files={"app.py": b"print(1)\n"})
     created: list[SandboxSpec] = []
+    service_specs: list[ServiceSpec] = []
 
     monkeypatch.setattr(cli, "select_image", lambda category, docker: {
         "status": "AVAILABLE", "recommended_image": "ctf-os-sandbox:web",
         "selected_image": "ctf-os-sandbox:web", "image_available": True,
     })
-    monkeypatch.setattr(cli, "prepare_service", lambda *a, **k: {
-        "status": "NOT_REQUIRED", "network": None, "endpoints": [], "lifecycle_owner": "root",
-    })
+    def fake_prepare_service(spec, **_kwargs):
+        service_specs.append(spec)
+        return {
+            "status": "NOT_REQUIRED",
+            "network": None,
+            "endpoints": [],
+            "lifecycle_owner": "root",
+        }
+
+    monkeypatch.setattr(cli, "prepare_service", fake_prepare_service)
 
     def fake_create(spec, docker="docker"):
         created.append(spec)
@@ -190,6 +199,8 @@ def test_race_prepare_orchestrates_real_root_create_without_manual_command(repo:
     assert result["attack_ready"] is True
     assert result["root_sandbox"]["status"] == "READY"
     assert len(created) == 1 and created[0].lane_id == "root"
+    assert created[0].resource_scope == repo / "output" / "resources"
+    assert service_specs[0].resource_scope == repo / "output" / "resources"
     assert "sandbox" + "-create" not in json.dumps(result)
     assert result["next_root_action"]["exec_command_prefix"][-1] == "--"
 

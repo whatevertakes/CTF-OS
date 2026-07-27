@@ -12,6 +12,13 @@ uv run python -m ctf_os.agent_tools race-prepare '<selector>' --contest '<contes
   --remote-execution '<agent|human-relay>'
 ```
 
+Different challenges may run concurrently. `race-prepare` returns an immutable
+`run_id`; use that exact value with `--run-id` on every later controller command,
+including `race-bootstrap`, status, reconcile, end, handoff, lane cleanup, and
+cleanup. Never inspect, interrupt, reconcile, or clean another active run.
+Only one active attempt per challenge is allowed. Concurrency remains Root plus
+three per run and all runs share aggregate managed-container admission.
+
 The execution mode is a required explicit safety choice. For a contest whose
 rules require every organizer-remote request to be executed by a participant,
 use `--remote-execution human-relay`; use `agent` only when organizer rules allow
@@ -61,7 +68,7 @@ children, send all results in one `race-reconcile` batch; it removes each privat
 sandbox and service while preserving private and shared artifacts. Cleanup keeps
 the lane in `STOPPING` or `CLEANUP_FAILED`; only `STOPPED` frees its replacement
 slot. Retry a controller cleanup failure with
-`race-lane-cleanup --lane <lane-id>` before replacement. Share only events
+`race-lane-cleanup --run-id <run-id> --lane <lane-id>` before replacement. Share only events
 accepted by the append-only blackboard after their command/session receipt
 exists. Verified artifacts are immutable and directly readable by every lane
 under `/shared-artifacts`.

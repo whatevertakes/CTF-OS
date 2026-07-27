@@ -94,13 +94,14 @@ from ..service import (
     load_service,
     prepare_service,
 )
+from ..tool_audit import run_tool_audit
 from ..workspace import atomic_json, clear_active, create_run, resolve_run, utc_now
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m ctf_os.agent_tools",
-        description="Verified asynchronous portfolio race controller for one authorized CTF challenge",
+        description="Verified asynchronous portfolio race controller for exact concurrent CTF runs",
         allow_abbrev=False,
     )
     parser.add_argument("--repo", default=".")
@@ -137,6 +138,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     bootstrap = commands.add_parser("race-bootstrap", help="prepare all requested private native-worker lanes")
     _selection_args(bootstrap)
+    bootstrap.add_argument(
+        "--run-id",
+        help="exact active run; required when more than one race is active",
+    )
     group = bootstrap.add_mutually_exclusive_group(required=True)
     group.add_argument("--lanes-json")
     group.add_argument("--lanes-file")
@@ -251,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(CATEGORIES),
         help="validate only the profiles built for this machine (default: all ten)",
     )
+    tool_audit = commands.add_parser(
+        "tool-audit",
+        help="validate immutable tool pins and optionally compare official upstream releases",
+    )
+    tool_audit.add_argument("--check-upstream", action="store_true")
     image_smoke = commands.add_parser("image-smoke", help="inspect selected local category images")
     image_smoke.add_argument("--docker", default="docker")
     image_smoke.add_argument(
@@ -349,13 +359,15 @@ def dispatch(args: argparse.Namespace, repo: Path) -> Any:
         return tool_version(metadata, args.name)
     if args.command == "doctor":
         return run_doctor(repo, profiles=args.profiles, docker=args.docker)
+    if args.command == "tool-audit":
+        return run_tool_audit(repo, check_upstream=args.check_upstream)
     if args.command == "image-smoke":
         return smoke_images(args.profiles, docker=args.docker)
     raise ValueError(f"unsupported command: {args.command}")
 
 
 def _command_succeeded(command: str, result: Any) -> bool:
-    if command == "doctor":
+    if command in {"doctor", "tool-audit"}:
         return isinstance(result, Mapping) and result.get("ok") is True
     if command == "image-smoke":
         return (
@@ -423,6 +435,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             run_root=run,
             plan=input_record["service_plan"],
             instance_id="root",
+            resource_scope=repo / "output" / "resources",
         )
         service = prepare_service(
             service_spec, actor=ServiceActor(lane_id="root", role="root"), docker=args.docker
@@ -453,6 +466,7 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
             artifact_inbox=artifact_inbox,
             resource_profile=_resource_profile(input_record),
             race_lane_count=0,
+            resource_scope=repo / "output" / "resources",
             remote_execution=str(race.get("remote_execution", "agent")),
         ), docker=args.docker)
         if service.get("status") == "READY":
@@ -495,12 +509,12 @@ def _race_prepare(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
-    # Resolve the exact active run from the immutable active pointer first, then
+    # Resolve the exact active run from the immutable active registry first, then
     # confirm the CLI selector points at that run's fixed challenge identity. The
     # bootstrap payload is built only from RUN/RACE/INPUT state captured at
     # preparation time, never from the mutable contest.md, so a post-preparation
     # manifest edit (e.g. a swapped remote or category) can never reach a child.
-    run = resolve_run(repo)
+    run = resolve_run(repo, getattr(args, "run_id", None))
     race = load_race(run)
     _require_active_race_selector(race, args.contest, args.selector)
     contest_slug = str(race["contest"]["slug"])
@@ -541,6 +555,7 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                         run_root=run,
                         plan=input_record["service_plan"],
                         instance_id=str(lane["lane_id"]),
+                        resource_scope=repo / "output" / "resources",
                     ),
                     actor=ServiceActor(lane_id="root", role="root"),
                     docker=args.docker,
@@ -573,6 +588,7 @@ def _race_bootstrap(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 artifact_inbox=artifact_inbox,
                 resource_profile=_resource_profile(input_record),
                 race_lane_count=1 + len(packets),
+                resource_scope=repo / "output" / "resources",
                 remote_execution=str(race.get("remote_execution", "agent")),
             ), docker=args.docker)
             if service_network:
@@ -669,8 +685,9 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                     challenge_id=str(race["challenge"]["id"]),
                     source=source,
                     run_root=run,
-                    plan=input_record["service_plan"],
-                    instance_id=str(lane["lane_id"]),
+                plan=input_record["service_plan"],
+                instance_id=str(lane["lane_id"]),
+                resource_scope=repo / "output" / "resources",
                 ),
                 actor=ServiceActor("root", "root"),
                 docker=args.docker,
@@ -704,6 +721,7 @@ def _race_endgame(repo: Path, args: argparse.Namespace) -> dict[str, Any]:
                 row["status"] not in {"STOPPED", "WON"}
                 for row in load_race(run)["lanes"] if row["lane_id"] != lane["lane_id"]
             ),
+            resource_scope=repo / "output" / "resources",
             remote_execution=str(race.get("remote_execution", "agent")),
         ), docker=args.docker)
         if service_network:

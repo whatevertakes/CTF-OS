@@ -13,7 +13,7 @@ sympy==1.14.0
 z3-solver==4.13.0.0
 pycryptodome==3.23.0
 cryptography==45.0.6
-capstone==5.0.3
-unicorn==2.1.4
+capstone==5.0.6
+unicorn==2.1.2
 cffi==1.17.1
-pycparser==2.22
+pycparser==3.0

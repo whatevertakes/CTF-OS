@@ -65,6 +65,7 @@ class SandboxSpec:
     artifact_inbox: Path | None = None
     resource_profile: str = "standard"
     race_lane_count: int = 0
+    resource_scope: Path | None = None
     remote_execution: str = "agent"
     # auto: use a GPU only when category + host + Docker passthrough all verify,
     # else CPU fallback. off: never. required: fail closed without a GPU.
@@ -170,7 +171,11 @@ def create(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     _validate_spec(spec)
-    resource_scope = spec.lane_root.resolve().parents[1] / "resources"
+    resource_scope = (
+        spec.resource_scope.resolve()
+        if spec.resource_scope is not None
+        else spec.lane_root.resolve().parents[1] / "resources"
+    )
     with state_lock(resource_scope):
         try:
             capacity = admit(

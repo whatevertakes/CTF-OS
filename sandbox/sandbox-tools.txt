@@ -54,18 +54,31 @@ the fixed offline rules at `/opt/capa-rules`. `ctf-ghidra-headless INPUT
 [TIMEOUT_SECONDS]` keeps its temporary project below `/work` and writes the
 decompilation and log below `/artifacts`. Pwn adds AFL++ compiler instrumentation,
 ASan/UBSan builds, `afl-showmap`, bounded `afl-fuzz`, and a separately pinned
-`afl-qemu-trace`; this does not replace the system/cross-architecture QEMU layer.
+Frida mode plus AFL-patched QEMU user-mode tracers for x86-64, AArch64, ARM,
+MIPS, and MIPSEL; these do not replace the system/cross-architecture QEMU layer.
 Pwn also provides Valgrind/Memcheck, boofuzz's real `boo` CLI and Python API,
 Atheris with its bundled libFuzzer, and cargo-fuzz on a date-pinned nightly Rust
 toolchain. The exact `libfuzzer-sys` graph needed by a new `cargo fuzz init`
 harness is vendored under `/opt/cargo-fuzz-vendor`, so its first bounded target
 can compile with sandbox networking disabled. Cargo writes only below
 the attempt-private `$HOME/.cargo` (`/work/home/.cargo` at runtime).
+Pwn additionally includes LLVM/Clang 19, Radamsa, honggfuzz and its compiler
+wrappers, isolated AFLNet and StateAFL command families, Go, a complete
+amd64 Linux syzkaller userspace tool build, and LibAFL's ready-to-run
+`libafl-fuzz`. The pinned LibAFL source and offline dependency vendor live under
+`/opt/libafl` and `/opt/libafl-vendor`. A full syzkaller campaign still needs a
+challenge-owned kernel image and an explicitly approved VM backend; no host KVM
+or device is mounted implicitly.
 Rev keeps PyOpenCL for CPU and native-Linux OpenCL analysis and provides CuPy
 with pinned CUDA 12 userspace libraries for NVIDIA GPU kernels, including on
 WSL2 where an NVIDIA OpenCL ICD may be unavailable.
 Rev provides the pinned Jazzer standalone launcher and jar under `/opt/jazzer`;
 its Temurin JDK 21 can compile and start a small JVM coverage-guided target.
+Rev also provides the pinned Swift-built Fuzzilli CLI and FuzzIL tool together
+with a pinned, patched, sanitizer-coverage JerryScript REPRL target exposed as
+`jerry-fuzzilli`. This makes an offline local Fuzzilli campaign immediately
+runnable; a challenge engine may still replace JerryScript when built with its
+matching Fuzzilli profile and coverage instrumentation.
 
 Web provides Debian Chromium and chromedriver, Playwright configured by probes
 to launch `/usr/bin/chromium` without a downloaded browser bundle, and pinned
@@ -77,7 +90,11 @@ Interactsh use, restricts execution to HTTP templates (never code/headless),
 and writes JSONL below `/artifacts`. Offline smokes use localhost only and keep
 Nuclei/Semgrep version checks disabled.
 Web also provides the pinned Schemathesis CLI for bounded OpenAPI and GraphQL
-property-based testing.
+property-based testing, RESTler's compiler/driver/engine, ProjectDiscovery
+httpx as `httpx-pd`, Katana, feroxbuster, mitmproxy/mitmdump, grpcurl, Arjun,
+jwt_tool, Commix, PHPGGC, and ysoserial. A small immutable SecLists selection is
+available under `/opt/wordlists/SecLists` without carrying the multi-gigabyte
+full repository.
 
 AI provides ModelScan and Fickling before-load inspection for pickle/joblib and
 PyTorch serialization, plus ModelScan H5 and SavedModel support through pinned
@@ -96,7 +113,8 @@ are reported NEEDS_REVIEW.
 Crypto's hashcat uses its CUDA backend when a verified NVIDIA GPU is passed
 through and retains PoCL as an explicit CPU fallback.
 Crypto and Misc provide the pinned Ares automatic decoder. Forensic provides
-StegSeek. OSINT provides isolated, pinned Sherlock, Maigret, Holehe, and
+StegSeek, YARA, bulk_extractor, SQLite/PDF utilities, and oletools CLIs. OSINT
+provides isolated, pinned Sherlock, Maigret, Holehe, and
 theHarvester environments so their dependency sets cannot downgrade the common
 runtime.
 Misc/cloud permit only the additional namespace, mount, and chroot syscalls
@@ -108,9 +126,3 @@ CLIs receive no ambient host credentials and store temporary configuration only
 inside /work. AI model files are inspected inside the sandbox on CPU; models are
 not downloaded implicitly and unsafe pickle/joblib artifacts are never loaded
 on the host.
-
-Deliberately excluded from this image revision: syzkaller requires a dedicated
-kernel/VM workflow; Fuzzilli requires a large engine-specific V8 build; RESTler
-adds a .NET/service workflow; honggfuzz overlaps the existing native AFL++ and
-libFuzzer coverage; and LibAFL is a framework rather than a minimal ready-to-run
-CTF tool. No image installs any of those five tools.

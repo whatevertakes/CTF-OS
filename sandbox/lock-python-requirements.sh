@@ -98,7 +98,7 @@ compile_torch_lock cpu sandbox/requirements-lock/torch-cpu.txt \
 compile_lock sandbox/requirements-lock/cloud.txt \
   "$COMMON" sandbox/requirements/cloud.txt
 
-for tool in checkov holehe maigret rsactftool semgrep sherlock theharvester; do
+for tool in checkov holehe jwt-tool maigret mitmproxy rsactftool semgrep sherlock theharvester; do
   compile_lock \
     "sandbox/requirements-lock/isolated/${tool}.txt" \
     "sandbox/requirements/isolated/${tool}.txt"

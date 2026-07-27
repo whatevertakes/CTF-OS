@@ -1,4 +1,4 @@
-angr==9.2.169
+angr==9.2.213
 keystone-engine==0.9.2
 pyelftools==0.32
 pefile==2024.8.26

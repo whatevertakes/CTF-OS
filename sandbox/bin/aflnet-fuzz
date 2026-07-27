@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export AFL_PATH=/opt/aflnet
+exec /opt/aflnet/afl-fuzz "$@"

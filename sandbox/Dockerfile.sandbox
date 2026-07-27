@@ -41,6 +41,19 @@ RUN chmod 0755 /opt/ctf-os/apt-snapshot.sh \
     && tar -xzf /tmp/ares.tar.gz -C /tmp/ares --strip-components=1 \
     && cargo build --manifest-path /tmp/ares/Cargo.toml --release --locked
 
+FROM swift:6.3.3-bookworm@sha256:508b05bbc3919a1d392e57f3ddd13aed2793566c8111d750feeff6ba7e468ffb AS fuzzilli-builder
+COPY sandbox/install/fuzzilli-builder.sh /usr/local/bin/fuzzilli-builder
+RUN chmod 0755 /usr/local/bin/fuzzilli-builder \
+    && /usr/local/bin/fuzzilli-builder
+COPY sandbox/install/fuzzilli-jerryscript-builder.sh /usr/local/bin/fuzzilli-jerryscript-builder
+RUN chmod 0755 /usr/local/bin/fuzzilli-jerryscript-builder \
+    && /usr/local/bin/fuzzilli-jerryscript-builder
+
+FROM mcr.microsoft.com/dotnet/sdk:8.0.414-bookworm-slim@sha256:10b82617ed77a869847f0dea7d4ddf528b694d68636fcd05bc87574b653f9bdd AS restler-builder
+COPY sandbox/install/restler-builder.sh /usr/local/bin/restler-builder
+RUN chmod 0755 /usr/local/bin/restler-builder \
+    && /usr/local/bin/restler-builder
+
 FROM common AS profile-base
 
 FROM common AS binary-analysis
@@ -70,6 +83,15 @@ RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-binary-runtime-smo
 COPY sandbox/install/pwn-fuzzing.sh /opt/ctf-os/install/pwn-fuzzing.sh
 RUN chmod 0755 /opt/ctf-os/install/pwn-fuzzing.sh \
     && /opt/ctf-os/install/pwn-fuzzing.sh
+COPY sandbox/install/pwn-network-fuzzing.sh /opt/ctf-os/install/pwn-network-fuzzing.sh
+RUN chmod 0755 /opt/ctf-os/install/pwn-network-fuzzing.sh \
+    && /opt/ctf-os/install/pwn-network-fuzzing.sh
+COPY sandbox/bin/aflnet-fuzz sandbox/bin/aflnet-clang-fast sandbox/bin/aflnet-replay \
+    sandbox/bin/stateafl-fuzz sandbox/bin/stateafl-clang-fast sandbox/bin/stateafl-replay \
+    /usr/local/bin/
+RUN chmod 0755 \
+    /usr/local/bin/aflnet-fuzz /usr/local/bin/aflnet-clang-fast /usr/local/bin/aflnet-replay \
+    /usr/local/bin/stateafl-fuzz /usr/local/bin/stateafl-clang-fast /usr/local/bin/stateafl-replay
 ENV PATH=/usr/local/bin:/opt/rust-toolchain/bin:${PATH}
 COPY sandbox/requirements/pwn-fuzzing.txt /opt/ctf-os/requirements/pwn-fuzzing.txt
 COPY sandbox/requirements-lock/pwn-fuzzing.txt /opt/ctf-os/requirements-lock/pwn-fuzzing.txt
@@ -80,6 +102,12 @@ COPY sandbox/install/pwn-language-fuzzing.sh /opt/ctf-os/install/pwn-language-fu
 COPY sandbox/bin/ctf-cargo /usr/local/bin/cargo
 RUN chmod 0755 /opt/ctf-os/install/pwn-language-fuzzing.sh /usr/local/bin/cargo \
     && /opt/ctf-os/install/pwn-language-fuzzing.sh
+COPY sandbox/install/pwn-advanced-fuzzing.sh /opt/ctf-os/install/pwn-advanced-fuzzing.sh
+RUN chmod 0755 /opt/ctf-os/install/pwn-advanced-fuzzing.sh \
+    && /opt/ctf-os/install/pwn-advanced-fuzzing.sh
+COPY sandbox/install/pwn-libafl.sh /opt/ctf-os/install/pwn-libafl.sh
+RUN chmod 0755 /opt/ctf-os/install/pwn-libafl.sh \
+    && /opt/ctf-os/install/pwn-libafl.sh
 
 FROM pwn-tools AS profile-pwn
 COPY sandbox/smoke/pwn-fuzzing.sh /usr/local/bin/ctf-os-pwn-fuzzing-smoke
@@ -96,32 +124,48 @@ ENV NUCLEI_TEMPLATES=/opt/nuclei-templates \
 COPY sandbox/requirements/web.txt /opt/ctf-os/requirements/web.txt
 COPY sandbox/requirements-lock/web.txt /opt/ctf-os/requirements-lock/web.txt
 COPY sandbox/requirements-lock/isolated/semgrep.txt /opt/ctf-os/requirements-lock/isolated/semgrep.txt
+COPY sandbox/requirements-lock/isolated/mitmproxy.txt /opt/ctf-os/requirements-lock/isolated/mitmproxy.txt
+COPY sandbox/requirements-lock/isolated/jwt-tool.txt /opt/ctf-os/requirements-lock/isolated/jwt-tool.txt
 COPY sandbox/install/web.sh sandbox/install/web-verify.sh /opt/ctf-os/install/
 COPY sandbox/smoke/web-runtime.py /usr/local/bin/ctf-os-web-runtime-smoke
-COPY sandbox/bin/ctf-nuclei-scan sandbox/bin/sstimap /usr/local/bin/
+COPY sandbox/bin/ctf-nuclei-scan sandbox/bin/sstimap sandbox/bin/jwt-tool \
+    sandbox/bin/commix sandbox/bin/ysoserial /usr/local/bin/
 COPY sandbox/rules/nuclei /opt/ctf-os/rules/nuclei
 COPY sandbox/rules/semgrep /opt/ctf-os/rules/semgrep
-RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke /usr/local/bin/ctf-nuclei-scan /usr/local/bin/sstimap \
+RUN chmod 0755 /usr/local/bin/ctf-os-web-runtime-smoke /usr/local/bin/ctf-nuclei-scan \
+        /usr/local/bin/sstimap /usr/local/bin/jwt-tool /usr/local/bin/commix \
+        /usr/local/bin/ysoserial \
     && /opt/ctf-os/install/web.sh
 RUN chmod 0755 /opt/ctf-os/install/web-verify.sh \
     && /opt/ctf-os/install/web-verify.sh
 
 FROM web-tools AS profile-web
+COPY --from=restler-builder /opt/restler /opt/restler
+COPY --from=restler-builder /usr/share/dotnet/dotnet /usr/share/dotnet/dotnet
+COPY --from=restler-builder /usr/share/dotnet/host /usr/share/dotnet/host
+COPY --from=restler-builder /usr/share/dotnet/shared/Microsoft.NETCore.App /usr/share/dotnet/shared/Microsoft.NETCore.App
+COPY sandbox/bin/restler /usr/local/bin/restler
 COPY sandbox/smoke/web-security.sh /usr/local/bin/ctf-os-web-security-smoke
-RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke /usr/local/bin/sstimap \
+RUN chmod 0755 /usr/local/bin/ctf-os-web-security-smoke /usr/local/bin/sstimap /usr/local/bin/restler \
     && /usr/local/bin/ctf-os-web-security-smoke
 
 FROM binary-analysis AS profile-rev
 COPY sandbox/requirements/rev.txt /opt/ctf-os/requirements/rev.txt
 COPY sandbox/requirements-lock/rev.txt /opt/ctf-os/requirements-lock/rev.txt
 COPY sandbox/install/binary-runtime.sh sandbox/install/rev.sh /opt/ctf-os/install/
+COPY sandbox/bin/apktool /usr/local/bin/apktool
 COPY sandbox/smoke/binary-runtime.sh /usr/local/bin/ctf-os-binary-runtime-smoke
 COPY sandbox/smoke/system-qemu.sh /usr/local/bin/ctf-os-system-qemu-smoke
-RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-*-smoke \
+RUN chmod 0755 /opt/ctf-os/install/*.sh /usr/local/bin/ctf-os-*-smoke /usr/local/bin/apktool \
     && /opt/ctf-os/install/rev.sh
 COPY sandbox/install/rev-fuzzing.sh /opt/ctf-os/install/rev-fuzzing.sh
 COPY sandbox/smoke/rev-fuzzing.sh /usr/local/bin/ctf-os-rev-fuzzing-smoke
+COPY --from=fuzzilli-builder /opt/fuzzilli /opt/fuzzilli
+COPY --from=fuzzilli-builder /usr/lib/swift/linux /usr/lib/swift/linux
+COPY sandbox/bin/fuzzilli sandbox/bin/fuzzil-tool /usr/local/bin/
 RUN chmod 0755 /opt/ctf-os/install/rev-fuzzing.sh /usr/local/bin/ctf-os-rev-fuzzing-smoke \
+        /usr/local/bin/fuzzilli /usr/local/bin/fuzzil-tool \
+    && ln -s /opt/fuzzilli/bin/jerry-fuzzilli /usr/local/bin/jerry-fuzzilli \
     && /opt/ctf-os/install/rev-fuzzing.sh \
     && /usr/local/bin/ctf-os-rev-fuzzing-smoke
 
