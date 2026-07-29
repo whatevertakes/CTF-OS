@@ -560,14 +560,17 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         source = _challenge_source(argv[0])
-        observed = produce_inventory(
+        produce_inventory(
             source,
             emit_document=_emit_stdout_document,
         )
     except (OSError, TimeoutError, ValueError) as error:
         print(f"rev inventory: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
-    return 0 if observed else 1
+    # A canonical ``status:error`` document is a successfully transported
+    # oracle observation.  Reserve non-zero exit statuses for failures that
+    # prevented any complete document from being published.
+    return 0
 
 
 if __name__ == "__main__":

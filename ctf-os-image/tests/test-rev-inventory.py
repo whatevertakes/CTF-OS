@@ -318,7 +318,7 @@ class RevInventoryProducerTests(unittest.TestCase):
                 ):
                     exit_code = inventory.main(["/challenge/sample.bin"])
 
-                self.assertEqual(exit_code, 0 if observed else 1)
+                self.assertEqual(exit_code, 0)
                 self.assertEqual(stdout.buffer.getvalue(), payload)
                 self.assertEqual(stdout.buffer.write_calls, 1)
 
