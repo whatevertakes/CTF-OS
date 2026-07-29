@@ -305,6 +305,17 @@ class ContractTests(unittest.TestCase):
 
         payload = valid_payload(Role.RECON)
         payload["schema_version"] = 2
+        payload["hypotheses"] = [
+            {
+                "id": "hyp-1",
+                "claim": "The marker controls the branch.",
+                "evidence": ["obs-1"],
+                "unknowns": ["Whether another byte also gates the branch."],
+                "experiment": "Change only the marker and rerun.",
+                "success_oracle": "The traced branch changes.",
+                "falsifier": "The same branch is taken for both markers.",
+            }
+        ]
         payload["actions"][0].update(
             {
                 "hypothesis_ids": ["H-existing"],
@@ -353,6 +364,13 @@ class ContractTests(unittest.TestCase):
             "uniqueItems",
             action_variants["command"]["properties"]["hypothesis_ids"],
         )
+        hypothesis_schema = v2_schema["properties"]["hypotheses"]["items"]
+        self.assertIn("claim", hypothesis_schema["required"])
+        self.assertIn("evidence", hypothesis_schema["required"])
+        self.assertIn("unknowns", hypothesis_schema["required"])
+        self.assertIn("experiment", hypothesis_schema["required"])
+        self.assertIn("success_oracle", hypothesis_schema["required"])
+        self.assertNotIn("statement", hypothesis_schema["properties"])
 
         payload["actions"][0]["network_target_generation"] = None
         payload["actions"][0]["expected_observation"] = ""
@@ -365,6 +383,48 @@ class ContractTests(unittest.TestCase):
         joined = "\n".join(result.errors)
         self.assertIn("provided together", joined)
         self.assertIn("requires text", joined)
+
+    def test_managed_v2_hypothesis_requires_complete_discriminators(
+        self,
+    ) -> None:
+        payload = valid_payload(Role.RECON)
+        payload["schema_version"] = 2
+        payload["hypotheses"] = [
+            {
+                "id": "hyp-1",
+                "claim": "The marker controls the branch.",
+                "evidence": ["obs-1"],
+                "unknowns": [],
+                "experiment": "",
+                "success_oracle": "",
+                "falsifier": "",
+            }
+        ]
+        payload["actions"][0].update(
+            {
+                "hypothesis_ids": [],
+                "expected_observation": "the branch is traced",
+                "keep_if": "the trace is present",
+                "drop_if": "the trace is absent",
+                "timeout_seconds": 30,
+                "resource_class": "light",
+                "network_target_id": None,
+                "network_target_generation": None,
+            }
+        )
+
+        result = validate_role_output(
+            payload,
+            Role.RECON,
+            contract_version=2,
+        )
+
+        self.assertFalse(result.valid)
+        joined = "\n".join(result.errors)
+        self.assertIn("$.hypotheses[0].unknowns", joined)
+        self.assertIn("$.hypotheses[0].experiment", joined)
+        self.assertIn("$.hypotheses[0].success_oracle", joined)
+        self.assertIn("$.hypotheses[0].falsifier", joined)
 
     def test_contract_rejects_extra_keys_wrong_decision_and_readonly_write(self) -> None:
         payload = valid_payload(Role.FALSIFIER)

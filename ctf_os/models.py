@@ -817,6 +817,61 @@ class Hypothesis:
         )
 
 
+def hypothesis_has_complete_discriminators(
+    hypothesis: Hypothesis,
+) -> bool:
+    """Return whether one active hypothesis is safe to route beyond discovery."""
+
+    unknowns = hypothesis.extra.get("unknowns")
+    experiment = hypothesis.extra.get(
+        "experiment",
+        hypothesis.extra.get("cheapest_experiment"),
+    )
+    success_oracle = hypothesis.extra.get("success_oracle")
+    has_evidence = bool(
+        hypothesis.evidence_fact_ids
+        or hypothesis.evidence_artifact_ids
+        or hypothesis.evidence_run_ids
+        or hypothesis.evidence_receipt_ids
+    )
+    return (
+        hypothesis.status in ACTIVE_HYPOTHESIS_STATUSES
+        and bool(hypothesis.statement.strip())
+        and has_evidence
+        and isinstance(unknowns, list)
+        and bool(unknowns)
+        and all(
+            isinstance(item, str) and bool(item.strip())
+            for item in unknowns
+        )
+        and isinstance(experiment, str)
+        and bool(experiment.strip())
+        and isinstance(success_oracle, str)
+        and bool(success_oracle.strip())
+        and bool(hypothesis.falsifier.description.strip())
+    )
+
+
+def distinct_complete_active_hypotheses(
+    hypotheses: Iterable[Hypothesis],
+) -> tuple[Hypothesis, ...]:
+    """Keep one complete active hypothesis per normalized claim."""
+
+    distinct: list[Hypothesis] = []
+    claims: set[str] = set()
+    for hypothesis in hypotheses:
+        if not hypothesis_has_complete_discriminators(hypothesis):
+            continue
+        normalized_claim = " ".join(
+            hypothesis.statement.split()
+        ).casefold()
+        if normalized_claim in claims:
+            continue
+        claims.add(normalized_claim)
+        distinct.append(hypothesis)
+    return tuple(distinct)
+
+
 @dataclass
 class Experiment:
     id: str
@@ -3526,6 +3581,7 @@ __all__ = [
     "ChallengeStatus",
     "ClosureBundle",
     "ClosureCompleteness",
+    "distinct_complete_active_hypotheses",
     "ExecutionReceipt",
     "Experiment",
     "ExperimentKind",
@@ -3538,6 +3594,7 @@ __all__ = [
     "GoalStatus",
     "Hypothesis",
     "HypothesisStatus",
+    "hypothesis_has_complete_discriminators",
     "ModelValidationError",
     "ManagedCycle",
     "ManagedWave",

@@ -143,6 +143,51 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn('"status":"supported"', pack.text)
         self.assertNotIn('"kind":"resolved_hypothesis"', pack.text)
 
+    def test_active_hypothesis_exposes_typed_frontier_fields(self) -> None:
+        state = self.state()
+        hypothesis = state.hypotheses[0]
+        hypothesis.evidence_fact_ids.append("F-1")
+        hypothesis.extra.update(
+            {
+                "unknowns": ["whether a second comparison exists"],
+                "experiment": "trace one changed input",
+                "success_oracle": "the comparison branch changes",
+            }
+        )
+        state.validate()
+
+        pack = build_context_pack(
+            state,
+            get_adapter("rev"),
+            state_path=Path("/state/state.json"),
+        )
+        records = [
+            strict_json_loads(line)
+            for line in pack.text.splitlines()
+            if line
+        ]
+        record = next(
+            item
+            for item in records
+            if item.get("kind") == "active_hypothesis"
+        )
+
+        self.assertEqual(record["claim"], "comparison is direct")
+        self.assertEqual(record["evidence"], ["F-1"])
+        self.assertEqual(
+            record["unknowns"],
+            ["whether a second comparison exists"],
+        )
+        self.assertEqual(
+            record["experiment"],
+            "trace one changed input",
+        )
+        self.assertEqual(
+            record["success_oracle"],
+            "the comparison branch changes",
+        )
+        self.assertEqual(record["falsifier"], "change input")
+
     def test_latest_checkpoint_is_mandatory_under_context_pressure(self) -> None:
         state = self.state()
         state.prompt = "operator pressure " * 2_000

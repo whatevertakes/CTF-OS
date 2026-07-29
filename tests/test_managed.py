@@ -72,10 +72,12 @@ class ProbeRoleExecutor:
         invalid_role: Role | None = None,
         source_reference_role: Role | None = None,
         network_target: tuple[str, int] | None = None,
+        captain_hypothesis_count: int = 3,
     ) -> None:
         self.invalid_role = invalid_role
         self.source_reference_role = source_reference_role
         self.network_target = network_target
+        self.captain_hypothesis_count = captain_hypothesis_count
         self.lock = threading.Lock()
         self.active = 0
         self.max_active = 0
@@ -103,6 +105,31 @@ class ProbeRoleExecutor:
             ]["enum"][0]
             if contract_version == 2:
                 payload["schema_version"] = 2
+                if role is Role.CAPTAIN:
+                    payload["hypotheses"] = [
+                        {
+                            "id": f"hyp-{index}",
+                            "claim": (
+                                f"independent managed hypothesis {index}"
+                            ),
+                            "evidence": ["obs-1"],
+                            "unknowns": [
+                                f"unknown discriminator {index}"
+                            ],
+                            "experiment": (
+                                f"run bounded discriminator {index}"
+                            ),
+                            "success_oracle": (
+                                f"observe distinct behavior {index}"
+                            ),
+                            "falsifier": (
+                                f"behavior {index} remains unchanged"
+                            ),
+                        }
+                        for index in range(
+                            1, self.captain_hypothesis_count + 1
+                        )
+                    ]
                 for action in payload["actions"]:
                     action.update(
                         {
@@ -332,6 +359,15 @@ class ManagedV2Tests(unittest.TestCase):
             all(receipt.stdout_artifact_id for receipt in state.receipts)
         )
         self.assertEqual(len(state.checkpoints), 1)
+        self.assertEqual(len(state.hypotheses), 3)
+        self.assertTrue(
+            all(
+                hypothesis.extra["unknowns"]
+                and hypothesis.extra["experiment"]
+                and hypothesis.extra["success_oracle"]
+                for hypothesis in state.hypotheses
+            )
+        )
         self.assertFalse(
             any(
                 "KCTF{tool_flag}" in fact.statement
@@ -357,6 +393,33 @@ class ManagedV2Tests(unittest.TestCase):
                 for item in wave_experiments
             )
         )
+
+    def test_attack_route_with_insufficient_frontier_creates_repair_checkpoint(
+        self,
+    ):
+        executor = ProbeRoleExecutor(captain_hypothesis_count=2)
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+        self.assertIsNotNone(state.active_managed_session_id)
+        self.assertEqual(len(state.waves), 0)
+        self.assertEqual(len(state.hypotheses), 2)
+        self.assertEqual(len(state.checkpoints), 1)
+        self.assertIn(
+            "only 2 distinct complete active hypotheses",
+            state.checkpoints[-1].note,
+        )
+        captain = next(
+            run for run in state.runs if run.role == Role.CAPTAIN.value
+        )
+        self.assertEqual(captain.status, RunStatus.COMPLETED)
+        self.assertIn("rejected_decisions", captain.extra)
 
     def test_invalid_role_preserves_provisional_output_without_semantic_merge(
         self,

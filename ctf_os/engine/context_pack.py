@@ -43,6 +43,29 @@ def _bounded(value: object, maximum: int = 2048) -> str:
     return text[: maximum - 1] + "…"
 
 
+def _bounded_string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        _bounded(item)
+        for item in value
+        if isinstance(item, str) and item.strip()
+    ]
+
+
+def _hypothesis_evidence_refs(hypothesis: Any) -> list[str]:
+    return list(
+        dict.fromkeys(
+            (
+                *hypothesis.evidence_fact_ids,
+                *hypothesis.evidence_artifact_ids,
+                *hypothesis.evidence_run_ids,
+                *hypothesis.evidence_receipt_ids,
+            )
+        )
+    )
+
+
 def _record(
     kind: str,
     *,
@@ -347,6 +370,20 @@ def build_context_pack(
                     id=item.id,
                     status=item.status.value,
                     statement=_bounded(item.statement),
+                    claim=_bounded(item.statement),
+                    evidence=_hypothesis_evidence_refs(item),
+                    unknowns=_bounded_string_list(
+                        item.extra.get("unknowns")
+                    ),
+                    experiment=_bounded(
+                        item.extra.get(
+                            "experiment",
+                            item.extra.get("cheapest_experiment", ""),
+                        )
+                    ),
+                    success_oracle=_bounded(
+                        item.extra.get("success_oracle", "")
+                    ),
                     falsifier=_bounded(item.falsifier.description),
                     evidence_fact_ids=item.evidence_fact_ids,
                     evidence_receipt_ids=item.evidence_receipt_ids,
@@ -472,6 +509,20 @@ def build_context_pack(
                     id=item.id,
                     status=item.status.value,
                     statement=_bounded(item.statement),
+                    claim=_bounded(item.statement),
+                    evidence=_hypothesis_evidence_refs(item),
+                    unknowns=_bounded_string_list(
+                        item.extra.get("unknowns")
+                    ),
+                    experiment=_bounded(
+                        item.extra.get(
+                            "experiment",
+                            item.extra.get("cheapest_experiment", ""),
+                        )
+                    ),
+                    success_oracle=_bounded(
+                        item.extra.get("success_oracle", "")
+                    ),
                     falsifier=_bounded(item.falsifier.description),
                     evidence_fact_ids=item.evidence_fact_ids,
                     evidence_receipt_ids=item.evidence_receipt_ids,

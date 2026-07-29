@@ -338,6 +338,67 @@ def role_output_schema(
             "required": action_required,
             "properties": action_properties,
         }
+    if contract_version == 2:
+        hypothesis_items_schema: dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "id",
+                "claim",
+                "evidence",
+                "unknowns",
+                "experiment",
+                "success_oracle",
+                "falsifier",
+            ],
+            "properties": {
+                "id": {"type": "string"},
+                "claim": {"type": "string", "minLength": 1},
+                "evidence": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "unknowns": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "experiment": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "success_oracle": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "falsifier": {"type": "string", "minLength": 1},
+            },
+        }
+    else:
+        hypothesis_items_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "id",
+                "statement",
+                "observation_refs",
+                "falsifier",
+                "keep_if",
+                "drop_if",
+            ],
+            "properties": {
+                "id": {"type": "string"},
+                "statement": {"type": "string"},
+                "observation_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "falsifier": {"type": "string"},
+                "keep_if": {"type": "string"},
+                "drop_if": {"type": "string"},
+            },
+        }
     return {
         "title": f"CTF-OS {role.value} result",
         "type": "object",
@@ -383,29 +444,7 @@ def role_output_schema(
             },
             "hypotheses": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": [
-                        "id",
-                        "statement",
-                        "observation_refs",
-                        "falsifier",
-                        "keep_if",
-                        "drop_if",
-                    ],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "statement": {"type": "string"},
-                        "observation_refs": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "falsifier": {"type": "string"},
-                        "keep_if": {"type": "string"},
-                        "drop_if": {"type": "string"},
-                    },
-                },
+                "items": hypothesis_items_schema,
             },
             "hypothesis_updates": {
                 "type": "array",
@@ -692,14 +731,26 @@ def validate_role_output(
     if not isinstance(hypotheses, list):
         errors.append("$.hypotheses: expected array")
     else:
-        keys = {
-            "id",
-            "statement",
-            "observation_refs",
-            "falsifier",
-            "keep_if",
-            "drop_if",
-        }
+        keys = (
+            {
+                "id",
+                "claim",
+                "evidence",
+                "unknowns",
+                "experiment",
+                "success_oracle",
+                "falsifier",
+            }
+            if contract_version == 2
+            else {
+                "id",
+                "statement",
+                "observation_refs",
+                "falsifier",
+                "keep_if",
+                "drop_if",
+            }
+        )
         for index, item in enumerate(hypotheses):
             path = f"$.hypotheses[{index}]"
             if not isinstance(item, Mapping):
@@ -713,12 +764,45 @@ def validate_role_output(
                 errors.append(f"{path}.id: duplicate id {item_id!r}")
             else:
                 hypothesis_ids.add(item_id)
-            for field in ("statement", "falsifier", "keep_if", "drop_if"):
-                if not isinstance(item.get(field), str):
-                    errors.append(f"{path}.{field}: expected string")
-            refs = item.get("observation_refs")
-            if not _is_string_list(refs):
-                errors.append(f"{path}.observation_refs: expected string array")
+            if contract_version == 2:
+                for field in (
+                    "claim",
+                    "experiment",
+                    "success_oracle",
+                    "falsifier",
+                ):
+                    field_value = item.get(field)
+                    if (
+                        not isinstance(field_value, str)
+                        or not field_value.strip()
+                    ):
+                        errors.append(
+                            f"{path}.{field}: expected non-empty string"
+                        )
+                for field in ("evidence", "unknowns"):
+                    values = item.get(field)
+                    if (
+                        not _is_string_list(values)
+                        or not values
+                        or any(not value.strip() for value in values)
+                    ):
+                        errors.append(
+                            f"{path}.{field}: expected non-empty string array"
+                        )
+            else:
+                for field in (
+                    "statement",
+                    "falsifier",
+                    "keep_if",
+                    "drop_if",
+                ):
+                    if not isinstance(item.get(field), str):
+                        errors.append(f"{path}.{field}: expected string")
+                refs = item.get("observation_refs")
+                if not _is_string_list(refs):
+                    errors.append(
+                        f"{path}.observation_refs: expected string array"
+                    )
             # A proposal may reference observations already present in state,
             # which this state-independent validator cannot resolve.
 

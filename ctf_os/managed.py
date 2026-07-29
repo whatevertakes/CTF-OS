@@ -33,6 +33,7 @@ from ctf_os.models import (
     ChallengeState,
     ChallengeStatus,
     Checkpoint,
+    distinct_complete_active_hypotheses,
     Experiment,
     ExperimentKind,
     ExperimentStatus,
@@ -576,6 +577,35 @@ class ManagedOrchestrator:
                 f"Captain did not select a runnable stage: {next_stage}"
             )
         return wave
+
+    @staticmethod
+    def _frontier_routing_issue(
+        state: ChallengeState,
+        captain_output: Mapping[str, object] | None,
+    ) -> str | None:
+        decision = (
+            captain_output.get("decision")
+            if isinstance(captain_output, Mapping)
+            else None
+        )
+        next_stage = (
+            str(decision.get("next_stage"))
+            if isinstance(decision, Mapping)
+            else None
+        )
+        if next_stage not in {"attack", "proof"}:
+            return None
+        complete = distinct_complete_active_hypotheses(
+            state.hypotheses
+        )
+        if len(complete) >= 3:
+            return None
+        return (
+            f"Captain selected {next_stage} with only {len(complete)} "
+            "distinct complete active hypotheses; at least 3 are required "
+            "with evidence, non-empty unknowns, experiment, "
+            "success_oracle, and falsifier"
+        )
 
     @staticmethod
     def _select_actions(
@@ -1369,6 +1399,18 @@ class ManagedOrchestrator:
                     status=SessionStatus.PAUSED,
                     reason=f"Captain selected {latest.status.value}",
                     challenge_target=target,
+                )
+            frontier_issue = self._frontier_routing_issue(
+                latest,
+                captain.output,
+            )
+            if frontier_issue is not None:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason=frontier_issue,
+                    note=note,
                 )
             wave_name = self._wave_name(captain.output)
             _state, wave, role_runs = self._reserve_wave(

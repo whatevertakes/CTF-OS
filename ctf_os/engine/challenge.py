@@ -92,6 +92,7 @@ from ctf_os.models import (
     ChallengeIdentity,
     ChallengeState,
     ChallengeStatus,
+    distinct_complete_active_hypotheses,
     Experiment,
     ExperimentKind,
     ExperimentStatus,
@@ -2718,7 +2719,12 @@ class ChallengeEngine:
                     "canonical or locally proposed hypotheses, provide "
                     "expected_observation/keep_if/drop_if, and use the "
                     "selected target id and generation for remote work. "
-                    "Use an empty hypothesis_ids array for a probe."
+                    "Use an empty hypothesis_ids array for a probe. For each "
+                    "hypothesis proposal, provide a distinct claim, exact "
+                    "evidence references, non-empty unknowns, the cheapest "
+                    "experiment, success_oracle, and falsifier. "
+                    "Captain must maintain at least three complete active "
+                    "hypotheses before routing to attack or proof."
                     if managed_workspace
                     else ""
                 ),
@@ -3556,6 +3562,13 @@ class ChallengeEngine:
 
         def apply(state: ChallengeState) -> None:
             base_fact_ids = {fact.id for fact in base_state.facts}
+            base_artifact_ids = {
+                artifact.id for artifact in base_state.artifacts
+            }
+            base_run_ids = {run.id for run in base_state.runs}
+            base_receipt_ids = {
+                receipt.id for receipt in base_state.receipts
+            }
             for result, output, artifacts, normalization_error in normalized:
                 if result.completed and result.validation.valid:
                     self._require_before_hard_deadline(
@@ -3786,7 +3799,13 @@ class ChallengeEngine:
                         hypothesis_id = _record_id("H", run_id, local)
                         local_hypothesis_ids.append(hypothesis_id)
                         local_hypothesis_map[local] = hypothesis_id
-                        refs = hypothesis.get("observation_refs", [])
+                        v2_proposal = "claim" in hypothesis
+                        refs = hypothesis.get(
+                            "evidence"
+                            if v2_proposal
+                            else "observation_refs",
+                            [],
+                        )
                         resolved_fact_ids = [
                             local_fact_ids[item]
                             if item in local_fact_ids
@@ -3798,11 +3817,63 @@ class ChallengeEngine:
                                 or item in base_fact_ids
                             )
                         ]
+                        resolved_artifact_ids = [
+                            item
+                            for item in refs
+                            if (
+                                isinstance(item, str)
+                                and item in base_artifact_ids
+                            )
+                        ]
+                        resolved_run_ids = [
+                            item
+                            for item in refs
+                            if (
+                                isinstance(item, str)
+                                and item in base_run_ids
+                            )
+                        ]
+                        resolved_receipt_ids = [
+                            item
+                            for item in refs
+                            if (
+                                isinstance(item, str)
+                                and item in base_receipt_ids
+                            )
+                        ]
+                        hypothesis_extra = (
+                            {
+                                "unknowns": list(
+                                    hypothesis.get("unknowns", [])
+                                ),
+                                "experiment": str(
+                                    hypothesis.get("experiment", "")
+                                ),
+                                "success_oracle": str(
+                                    hypothesis.get("success_oracle", "")
+                                ),
+                                "managed_contract_version": 2,
+                            }
+                            if v2_proposal
+                            else {
+                                "keep_if": str(
+                                    hypothesis.get("keep_if", "")
+                                ),
+                                "drop_if": str(
+                                    hypothesis.get("drop_if", "")
+                                ),
+                            }
+                        )
                         state.hypotheses.append(
                             Hypothesis(
                                 id=hypothesis_id,
                                 statement=str(
-                                    hypothesis.get("statement", "")
+                                    hypothesis.get(
+                                        "claim"
+                                        if v2_proposal
+                                        else "statement",
+                                        "",
+                                    )
                                 ),
                                 falsifier=Falsifier(
                                     str(hypothesis.get("falsifier", ""))
@@ -3811,15 +3882,17 @@ class ChallengeEngine:
                                 evidence_fact_ids=list(
                                     dict.fromkeys(resolved_fact_ids)
                                 ),
+                                evidence_artifact_ids=list(
+                                    dict.fromkeys(resolved_artifact_ids)
+                                ),
+                                evidence_run_ids=list(
+                                    dict.fromkeys(resolved_run_ids)
+                                ),
+                                evidence_receipt_ids=list(
+                                    dict.fromkeys(resolved_receipt_ids)
+                                ),
                                 source_run_id=run_id,
-                                extra={
-                                    "keep_if": str(
-                                        hypothesis.get("keep_if", "")
-                                    ),
-                                    "drop_if": str(
-                                        hypothesis.get("drop_if", "")
-                                    ),
-                                },
+                                extra=hypothesis_extra,
                             )
                         )
 
@@ -4337,7 +4410,39 @@ class ChallengeEngine:
                             "at": utc_now(),
                         }
                     )
-                self._apply_decision(state, semantic_output.get("decision"))
+                decision = semantic_output.get("decision")
+                next_stage = (
+                    str(decision.get("next_stage"))
+                    if isinstance(decision, Mapping)
+                    else None
+                )
+                managed_frontier_required = (
+                    run_record.origin is RunOrigin.MANAGED_MODEL
+                    and result.invocation.role is Role.CAPTAIN
+                    and next_stage in {"attack", "proof"}
+                )
+                if (
+                    managed_frontier_required
+                    and len(
+                        distinct_complete_active_hypotheses(
+                            state.hypotheses
+                        )
+                    )
+                    < 3
+                ):
+                    reject_model_item(
+                        "rejected_decisions",
+                        "next_stage",
+                        next_stage,
+                        (
+                            "managed attack/proof routing requires at least "
+                            "three distinct active hypotheses with evidence, "
+                            "unknowns, experiment, success_oracle, "
+                            "and falsifier"
+                        ),
+                    )
+                else:
+                    self._apply_decision(state, decision)
 
         new_artifacts = tuple(
             artifact
