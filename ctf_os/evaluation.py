@@ -141,9 +141,33 @@ class EvaluationReport:
                     "metadata evaluation_case_id/evaluation_attempt; "
                     "otherwise challenge identity is attempt 1"
                 ),
+                "pass^2/3": (
+                    "accepted in at least two of complete canonical attempts "
+                    "1, 2, and 3"
+                ),
                 "clean_reproduction": (
                     "successful/total attempts from bounded, hash-validated "
                     "proof result artifacts"
+                ),
+                "first_valid_result": (
+                    "earliest hash-validated passed proof or manual accepted "
+                    "outcome per state"
+                ),
+                "human_interventions": (
+                    "explicit state.metadata.human_intervention_count only"
+                ),
+                "live_hidden": (
+                    "attempt-1 states explicitly labeled live, blind, or "
+                    "hidden in metadata evaluation_split; differing or "
+                    "missing fixed wall budgets make the result partial"
+                ),
+                "category_floor": (
+                    "lowest canonical solve@1 rate among eligible categories; "
+                    "fixed-budget or trial gaps make the result partial"
+                ),
+                "thin_scaffold_uplift": (
+                    "within explicit evaluation_model and fixed-wall-budget "
+                    "cohorts labeled by metadata evaluation_system"
                 ),
                 "time_origin": "challenge state created_at",
             },
@@ -569,6 +593,48 @@ def _trial_key(
     return (f"{state.contest_id}/{raw_case.strip()}", raw_attempt)
 
 
+def _bounded_metadata_text(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+        or len(value.encode("utf-8")) > MAX_METADATA_ID_BYTES
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in value
+        )
+    ):
+        return None
+    return value.strip()
+
+
+def _unique_attempt_one_states(
+    records: Sequence[_LoadedState],
+) -> tuple[list[ChallengeState], int, int]:
+    states: dict[str, ChallengeState] = {}
+    duplicate_cases: set[str] = set()
+    invalid = 0
+    duplicates = 0
+    for record in records:
+        key = _trial_key(record.state)
+        if key is None:
+            invalid += 1
+            continue
+        case_id, attempt = key
+        if attempt != 1:
+            continue
+        if case_id in duplicate_cases:
+            duplicates += 1
+            continue
+        if case_id in states:
+            duplicates += 1
+            states.pop(case_id, None)
+            duplicate_cases.add(case_id)
+            continue
+        states[case_id] = record.state
+    return list(states.values()), invalid, duplicates
+
+
 def _fixed_wall_budget_seconds(
     state: ChallengeState,
 ) -> tuple[float | None, str | None]:
@@ -615,7 +681,10 @@ def _fixed_wall_budget_seconds(
 def _solve_metrics(
     records: Sequence[_LoadedState],
 ) -> tuple[dict[str, EvaluationMetric], int]:
-    trials: dict[str, dict[int, tuple[bool, float | None]]] = defaultdict(dict)
+    trials: dict[
+        str,
+        dict[int, tuple[bool, float | None, str, ChallengeState]],
+    ] = defaultdict(dict)
     duplicate_keys: set[tuple[str, int]] = set()
     invalid_trials = 0
     duplicate_trials = 0
@@ -636,7 +705,12 @@ def _solve_metrics(
             continue
         budget, budget_error = _fixed_wall_budget_seconds(record.state)
         budget_errors += budget_error is not None
-        trials[case_id][attempt] = (_accepted(record.state), budget)
+        trials[case_id][attempt] = (
+            _accepted(record.state),
+            budget,
+            record.state.category,
+            record.state,
+        )
 
     trial_values = [
         value
@@ -644,7 +718,11 @@ def _solve_metrics(
         for attempt, value in attempts.items()
         if attempt <= 3
     ]
-    budgets = [budget for _solved, budget in trial_values if budget is not None]
+    budgets = [
+        budget
+        for _solved, budget, _category, _state in trial_values
+        if budget is not None
+    ]
     missing_budgets = len(trial_values) - len(budgets)
     distinct_budgets = sorted(set(budgets))
     budget_reason = _combine_reasons(
@@ -731,6 +809,60 @@ def _solve_metrics(
             "no valid attempt-1 canonical state"
         )
 
+    by_category: dict[str, list[bool]] = defaultdict(list)
+    for attempts in trials.values():
+        if 1 not in attempts:
+            continue
+        solved, _budget, category, _state = attempts[1]
+        by_category[category].append(solved)
+    if by_category:
+        category_rates = {
+            category: {
+                "solved_cases": sum(values),
+                "eligible_cases": len(values),
+                "rate": _round(sum(values) / len(values)),
+            }
+            for category, values in sorted(by_category.items())
+        }
+        floor_rate = min(
+            float(value["rate"]) for value in category_rates.values()
+        )
+        floor_categories = [
+            category
+            for category, value in category_rates.items()
+            if value["rate"] == floor_rate
+        ]
+        breakdown_truncated = (
+            len(category_rates) > MAX_BREAKDOWN_ITEMS
+            or len(floor_categories) > MAX_BREAKDOWN_ITEMS
+        )
+        metrics["category_floor"] = _metric(
+            {
+                "floor_rate": floor_rate,
+                "floor_categories": floor_categories[:MAX_BREAKDOWN_ITEMS],
+                "eligible_categories": len(category_rates),
+                "eligible_cases": sum(
+                    len(values) for values in by_category.values()
+                ),
+                "by_category": dict(
+                    list(category_rates.items())[:MAX_BREAKDOWN_ITEMS]
+                ),
+            },
+            len(category_rates),
+            partial_reason=_combine_reasons(
+                trial_reason,
+                (
+                    "category breakdown exceeds the bounded output limit"
+                    if breakdown_truncated
+                    else None
+                ),
+            ),
+        )
+    else:
+        metrics["category_floor"] = _unavailable(
+            "no eligible category has a valid canonical attempt 1"
+        )
+
     complete_three = [
         values
         for values in trials.values()
@@ -744,6 +876,10 @@ def _solve_metrics(
         )
         consistent = sum(
             all(values[index][0] for index in (1, 2, 3))
+            for values in complete_three
+        )
+        two_of_three = sum(
+            sum(values[index][0] for index in (1, 2, 3)) >= 2
             for values in complete_three
         )
         incomplete_reason = (
@@ -770,6 +906,15 @@ def _solve_metrics(
             len(complete_three),
             partial_reason=combined,
         )
+        metrics["pass^2/3"] = _metric(
+            {
+                "two_of_three_cases": two_of_three,
+                "eligible_cases": len(complete_three),
+                "rate": _round(two_of_three / len(complete_three)),
+            },
+            len(complete_three),
+            partial_reason=combined,
+        )
     else:
         unavailable_reason = (
             "no evaluation case has canonical attempts 1, 2, and 3"
@@ -782,7 +927,371 @@ def _solve_metrics(
             unavailable_reason,
             evidence={"incomplete_cases": incomplete_three},
         )
+        metrics["pass^2/3"] = _unavailable(
+            unavailable_reason,
+            evidence={"incomplete_cases": incomplete_three},
+        )
     return metrics, invalid_trials + duplicate_trials
+
+
+def _live_hidden_performance_metric(
+    records: Sequence[_LoadedState],
+) -> EvaluationMetric:
+    attempt_one, invalid_trials, duplicate_trials = (
+        _unique_attempt_one_states(records)
+    )
+    by_split: dict[str, list[bool]] = defaultdict(list)
+    missing_split = 0
+    invalid_split = 0
+    other_split = 0
+    budgets: list[float] = []
+    missing_budget = 0
+    allowed = {"live", "blind", "hidden"}
+    for state in attempt_one:
+        raw_split = state.metadata.get("evaluation_split")
+        if raw_split is None:
+            missing_split += 1
+            continue
+        split = _bounded_metadata_text(raw_split)
+        if split is None:
+            invalid_split += 1
+            continue
+        normalized = split.casefold()
+        if normalized not in allowed:
+            other_split += 1
+            continue
+        by_split[normalized].append(_accepted(state))
+        budget, budget_error = _fixed_wall_budget_seconds(state)
+        if budget is None or budget_error is not None:
+            missing_budget += 1
+        else:
+            budgets.append(budget)
+
+    eligible = sum(len(values) for values in by_split.values())
+    if not eligible:
+        return _unavailable(
+            (
+                "no valid canonical attempt 1 has an explicit "
+                "evaluation_split of live, blind, or hidden"
+            ),
+            evidence={
+                "attempt_one_states": len(attempt_one),
+                "missing_split": missing_split,
+                "invalid_split": invalid_split,
+                "other_split": other_split,
+                "invalid_trials": invalid_trials,
+                "duplicate_trials": duplicate_trials,
+                "missing_budget": missing_budget,
+            },
+        )
+    solved = sum(sum(values) for values in by_split.values())
+    breakdown = {
+        split: {
+            "solved_cases": sum(values),
+            "eligible_cases": len(values),
+            "rate": _round(sum(values) / len(values)),
+        }
+        for split, values in sorted(by_split.items())
+    }
+    reason = _combine_reasons(
+        (
+            f"{missing_split} attempt-1 state(s) lack evaluation_split"
+            if missing_split
+            else None
+        ),
+        (
+            f"{invalid_split} attempt-1 state(s) have invalid "
+            "evaluation_split metadata"
+            if invalid_split
+            else None
+        ),
+        (
+            f"{invalid_trials} state(s) lack valid trial metadata or "
+            "canonical attempt activity"
+            if invalid_trials
+            else None
+        ),
+        (
+            f"{duplicate_trials} duplicate attempt-1 record(s) excluded"
+            if duplicate_trials
+            else None
+        ),
+        (
+            f"{missing_budget} eligible state(s) lack a trustworthy fixed "
+            "wall budget"
+            if missing_budget
+            else None
+        ),
+        (
+            "eligible live/blind/hidden wall budgets differ across "
+            f"{len(set(budgets))} values"
+            if len(set(budgets)) > 1
+            else None
+        ),
+    )
+    return _metric(
+        {
+            "solved_cases": solved,
+            "eligible_cases": eligible,
+            "rate": _round(solved / eligible),
+            "by_split": breakdown,
+            "other_split_states": other_split,
+            "distinct_budget_seconds": sorted(set(budgets))[
+                :MAX_BREAKDOWN_ITEMS
+            ],
+        },
+        eligible,
+        partial_reason=reason,
+    )
+
+
+def _thin_scaffold_uplift_metric(
+    records: Sequence[_LoadedState],
+) -> EvaluationMetric:
+    systems = {"thin_scaffold", "ctf_os"}
+    observations: dict[
+        tuple[str, str],
+        tuple[str, float, bool],
+    ] = {}
+    duplicate_keys: set[tuple[str, str]] = set()
+    missing_system = 0
+    invalid_system = 0
+    other_system = 0
+    missing_model = 0
+    missing_budget = 0
+    invalid_trials = 0
+    duplicate_trials = 0
+    for record in records:
+        state = record.state
+        trial_key = _trial_key(state)
+        if trial_key is None:
+            invalid_trials += 1
+            continue
+        case_id, attempt = trial_key
+        if attempt != 1:
+            continue
+        raw_system = state.metadata.get("evaluation_system")
+        if raw_system is None:
+            missing_system += 1
+            continue
+        system_text = _bounded_metadata_text(raw_system)
+        if system_text is None:
+            invalid_system += 1
+            continue
+        system = system_text.casefold()
+        if system not in systems:
+            other_system += 1
+            continue
+        model = _bounded_metadata_text(
+            state.metadata.get("evaluation_model")
+        )
+        if model is None:
+            missing_model += 1
+            continue
+        budget, budget_error = _fixed_wall_budget_seconds(state)
+        if budget is None or budget_error is not None:
+            missing_budget += 1
+            continue
+        key = (case_id, system)
+        if key in duplicate_keys:
+            duplicate_trials += 1
+            continue
+        if key in observations:
+            duplicate_trials += 1
+            observations.pop(key, None)
+            duplicate_keys.add(key)
+            continue
+        observations[key] = (model, budget, _accepted(state))
+
+    cohorts: dict[
+        tuple[str, float],
+        dict[str, dict[str, bool]],
+    ] = defaultdict(lambda: defaultdict(dict))
+    for (case_id, system), (model, budget, accepted) in observations.items():
+        cohorts[(model, budget)][case_id][system] = accepted
+
+    comparable: list[dict[str, object]] = []
+    weighted_uplift = 0.0
+    total_weight = 0
+    excluded_unpaired = 0
+    for (model, budget), cases in sorted(cohorts.items()):
+        paired = [
+            values
+            for values in cases.values()
+            if set(values) == systems
+        ]
+        unpaired = len(cases) - len(paired)
+        excluded_unpaired += unpaired
+        if not paired:
+            continue
+        baseline = [
+            values["thin_scaffold"] for values in paired
+        ]
+        treatment = [values["ctf_os"] for values in paired]
+        baseline_rate = sum(baseline) / len(baseline)
+        treatment_rate = sum(treatment) / len(treatment)
+        uplift = treatment_rate - baseline_rate
+        weight = len(paired)
+        weighted_uplift += uplift * weight
+        total_weight += weight
+        comparable.append(
+            {
+                "model": model,
+                "budget_seconds": budget,
+                "thin_scaffold": {
+                    "solved_cases": sum(baseline),
+                    "eligible_cases": len(baseline),
+                    "rate": _round(baseline_rate),
+                },
+                "ctf_os": {
+                    "solved_cases": sum(treatment),
+                    "eligible_cases": len(treatment),
+                    "rate": _round(treatment_rate),
+                },
+                "rate_delta": _round(uplift),
+                "paired_cases": weight,
+                "excluded_unpaired_cases": unpaired,
+            }
+        )
+
+    if not comparable:
+        return _unavailable(
+            (
+                "no cohort contains both thin_scaffold and ctf_os attempt-1 "
+                "records with the same explicit evaluation_model and fixed "
+                "wall budget"
+            ),
+            evidence={
+                "candidate_records": len(observations),
+                "missing_system": missing_system,
+                "invalid_system": invalid_system,
+                "other_system": other_system,
+                "missing_model": missing_model,
+                "missing_budget": missing_budget,
+                "invalid_trials": invalid_trials,
+                "duplicate_trials": duplicate_trials,
+                "excluded_unpaired_cases": excluded_unpaired,
+            },
+        )
+
+    omitted = max(0, len(comparable) - MAX_BREAKDOWN_ITEMS)
+    reason = _combine_reasons(
+        (
+            f"{missing_system} attempt-1 state(s) lack evaluation_system"
+            if missing_system
+            else None
+        ),
+        (
+            f"{invalid_system} attempt-1 state(s) have invalid "
+            "evaluation_system metadata"
+            if invalid_system
+            else None
+        ),
+        (
+            f"{missing_model} selected state(s) lack a valid explicit "
+            "evaluation_model"
+            if missing_model
+            else None
+        ),
+        (
+            f"{missing_budget} selected state(s) lack a trustworthy fixed "
+            "wall budget"
+            if missing_budget
+            else None
+        ),
+        (
+            f"{invalid_trials} state(s) lack valid trial metadata or "
+            "canonical attempt activity"
+            if invalid_trials
+            else None
+        ),
+        (
+            f"{duplicate_trials} duplicate system trial(s) excluded"
+            if duplicate_trials
+            else None
+        ),
+        (
+            f"{excluded_unpaired} unpaired cohort case(s) excluded"
+            if excluded_unpaired
+            else None
+        ),
+        (
+            f"{omitted} comparable cohort(s) omitted from bounded breakdown"
+            if omitted
+            else None
+        ),
+    )
+    return _metric(
+        {
+            "rate_delta": _round(weighted_uplift / total_weight),
+            "comparable_cohorts": len(comparable),
+            "paired_cases": total_weight,
+            "excluded_unpaired_cases": excluded_unpaired,
+            "cohorts": comparable[:MAX_BREAKDOWN_ITEMS],
+        },
+        total_weight,
+        partial_reason=reason,
+        evidence={
+            "aggregation": "paired-case weighting within model/budget cohort"
+        },
+    )
+
+
+def _human_intervention_metric(
+    records: Sequence[_LoadedState],
+) -> EvaluationMetric:
+    total = 0
+    known = 0
+    missing = 0
+    invalid = 0
+    for record in records:
+        raw = record.state.metadata.get("human_intervention_count")
+        if raw is None:
+            missing += 1
+            continue
+        value = _nonnegative_integer(raw)
+        if value is None:
+            invalid += 1
+            continue
+        total += value
+        known += 1
+    if not known:
+        return _unavailable(
+            (
+                "no state has explicit nonnegative canonical metadata "
+                "human_intervention_count"
+            ),
+            evidence={
+                "missing_states": missing,
+                "invalid_states": invalid,
+            },
+        )
+    return _metric(
+        {
+            "count": total,
+            "states_with_count": known,
+            "missing_states": missing,
+            "invalid_states": invalid,
+        },
+        known,
+        partial_reason=_combine_reasons(
+            (
+                f"{missing} state(s) lack human_intervention_count metadata"
+                if missing
+                else None
+            ),
+            (
+                f"{invalid} state(s) have invalid "
+                "human_intervention_count metadata"
+                if invalid
+                else None
+            ),
+        ),
+        evidence={
+            "source": "state.metadata.human_intervention_count",
+            "submissions_counted": False,
+        },
+    )
 
 
 def _proof_path_candidate(path: str) -> str | None:
@@ -841,10 +1350,12 @@ def _parse_proof_result(
         or candidate != expected_candidate
         or not isinstance(policy_mode, str)
         or not policy_mode
+        or len(policy_mode.encode("utf-8")) > MAX_METADATA_ID_BYTES
         or successful is None
         or required is None
         or total is None
         or successful > total
+        or (passed and successful < required)
         or not isinstance(source_hash, str)
         or len(source_hash) != 64
         or any(character not in "0123456789abcdefABCDEF" for character in source_hash)
@@ -945,6 +1456,60 @@ def _proof_metrics(
             or "no valid proof result contains reproduction attempts"
         )
 
+    passed_evaluations = sum(
+        observation.passed for _record, observation in observations
+    )
+    proof_budgets: list[float] = []
+    missing_proof_budgets = 0
+    for record, _observation in observations:
+        budget, budget_error = _fixed_wall_budget_seconds(record.state)
+        if budget is None or budget_error is not None:
+            missing_proof_budgets += 1
+        else:
+            proof_budgets.append(budget)
+    proof_budget_values = sorted(set(proof_budgets))
+    proof_budget_reason = _combine_reasons(
+        (
+            f"{missing_proof_budgets} proof evaluation(s) lack a trustworthy "
+            "fixed wall budget"
+            if missing_proof_budgets
+            else None
+        ),
+        (
+            "proof evaluation wall budgets differ across "
+            f"{len(proof_budget_values)} values"
+            if len(proof_budget_values) > 1
+            else None
+        ),
+    )
+    if observations:
+        metrics["proof_pass_rate"] = _metric(
+            {
+                "passed_evaluations": passed_evaluations,
+                "proof_evaluations": len(observations),
+                "rate": _round(
+                    passed_evaluations / len(observations)
+                ),
+                "distinct_budget_seconds": proof_budget_values[
+                    :MAX_BREAKDOWN_ITEMS
+                ],
+                "missing_budget_evaluations": missing_proof_budgets,
+            },
+            len(observations),
+            partial_reason=_combine_reasons(
+                partial_reason,
+                proof_budget_reason,
+            ),
+        )
+    else:
+        metrics["proof_pass_rate"] = _unavailable(
+            _combine_reasons(
+                "no hash-validated proof evaluation is recorded",
+                partial_reason,
+            )
+            or "no hash-validated proof evaluation is recorded"
+        )
+
     proof_times: list[float] = []
     missing_proof_times = 0
     for record, observation in observations:
@@ -978,6 +1543,121 @@ def _proof_metrics(
                 time_reason,
             )
             or "no hash-validated passed proof has a usable timestamp"
+        )
+
+    proof_by_state: dict[str, list[_ProofObservation]] = defaultdict(list)
+    for record, observation in observations:
+        if observation.passed:
+            proof_by_state[record.state.identity.key].append(observation)
+    first_valid_times: list[float] = []
+    proof_first = 0
+    manual_first = 0
+    tied_first = 0
+    missing_valid_timestamps = 0
+    states_with_valid_outcome = 0
+    first_valid_budgets: list[float] = []
+    missing_first_valid_budgets = 0
+    for record in records:
+        state = record.state
+        timed_results: list[tuple[float, str]] = []
+        valid_outcomes = 0
+        for observation in proof_by_state.get(state.identity.key, []):
+            valid_outcomes += 1
+            elapsed = _elapsed_seconds(
+                state.created_at,
+                observation.completed_at,
+            )
+            if elapsed is None:
+                missing_valid_timestamps += 1
+            else:
+                timed_results.append((elapsed, "proof"))
+        for submission in state.submissions:
+            if submission.status is not SubmissionStatus.ACCEPTED:
+                continue
+            valid_outcomes += 1
+            elapsed = _elapsed_seconds(
+                state.created_at,
+                submission.submitted_at,
+            )
+            if elapsed is None:
+                missing_valid_timestamps += 1
+            else:
+                timed_results.append((elapsed, "manual"))
+        if valid_outcomes:
+            states_with_valid_outcome += 1
+            budget, budget_error = _fixed_wall_budget_seconds(state)
+            if budget is None or budget_error is not None:
+                missing_first_valid_budgets += 1
+            else:
+                first_valid_budgets.append(budget)
+        if not timed_results:
+            continue
+        first_elapsed = min(value for value, _source in timed_results)
+        first_sources = {
+            source
+            for value, source in timed_results
+            if value == first_elapsed
+        }
+        first_valid_times.append(first_elapsed)
+        if first_sources == {"proof"}:
+            proof_first += 1
+        elif first_sources == {"manual"}:
+            manual_first += 1
+        else:
+            tied_first += 1
+    first_valid_budget_values = sorted(set(first_valid_budgets))
+    first_valid_reason = _combine_reasons(
+        partial_reason,
+        (
+            f"{missing_valid_timestamps} valid result(s) lack a usable "
+            "canonical timestamp"
+            if missing_valid_timestamps
+            else None
+        ),
+        (
+            f"{missing_first_valid_budgets} state(s) with a valid outcome "
+            "lack a trustworthy fixed wall budget"
+            if missing_first_valid_budgets
+            else None
+        ),
+        (
+            "valid-result wall budgets differ across "
+            f"{len(first_valid_budget_values)} values"
+            if len(first_valid_budget_values) > 1
+            else None
+        ),
+    )
+    if first_valid_times:
+        metrics["median_time_to_first_valid_result"] = _metric(
+            {
+                **_time_summary(first_valid_times),
+                "states_with_valid_outcome": states_with_valid_outcome,
+                "proof_first_states": proof_first,
+                "manual_first_states": manual_first,
+                "tied_first_states": tied_first,
+                "distinct_budget_seconds": first_valid_budget_values[
+                    :MAX_BREAKDOWN_ITEMS
+                ],
+                "missing_budget_states": missing_first_valid_budgets,
+            },
+            len(first_valid_times),
+            partial_reason=first_valid_reason,
+            evidence={
+                "valid_sources": (
+                    "hash-validated passed proof or manual accepted outcome"
+                )
+            },
+        )
+    else:
+        metrics["median_time_to_first_valid_result"] = _unavailable(
+            _combine_reasons(
+                "no state has a valid result with a usable timestamp",
+                first_valid_reason,
+            )
+            or "no state has a valid result with a usable timestamp",
+            evidence={
+                "states_with_valid_outcome": states_with_valid_outcome
+            },
         )
 
     audited = 0
@@ -1354,12 +2034,19 @@ def _empty_metrics(reason: str) -> dict[str, EvaluationMetric]:
     names = (
         "solve@1",
         "solve@3",
+        "pass^2/3",
         "consistency",
+        "category_floor",
         "fixed_budget_comparability",
         "clean_reproduction_rate",
+        "proof_pass_rate",
         "false_proof_count",
         "time_to_first_primitive",
         "time_to_proof",
+        "median_time_to_first_valid_result",
+        "human_intervention_count",
+        "live_hidden_performance",
+        "thin_scaffold_uplift",
         "repeated_command_count",
         "stall_recovery_rate",
         "model_usage",
@@ -1470,6 +2157,15 @@ def evaluate_workspace(
     solve_metrics, _invalid_trials = _solve_metrics(loaded)
     metrics = dict(solve_metrics)
     metrics.update(_proof_metrics(loaded, diagnostics))
+    metrics["human_intervention_count"] = _human_intervention_metric(
+        loaded
+    )
+    metrics["live_hidden_performance"] = (
+        _live_hidden_performance_metric(loaded)
+    )
+    metrics["thin_scaffold_uplift"] = (
+        _thin_scaffold_uplift_metric(loaded)
+    )
     metrics["time_to_first_primitive"] = _first_primitive_metric(loaded)
     metrics["repeated_command_count"] = _repeated_command_metric(loaded)
     metrics["stall_recovery_rate"] = _stall_recovery_metric(loaded)
