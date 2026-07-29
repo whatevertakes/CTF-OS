@@ -1588,7 +1588,13 @@ class _OutputRead:
     oversized: bool
 
 
-def _read_output(path: Path, role: Role, limit_bytes: int) -> _OutputRead:
+def _read_output(
+    path: Path,
+    role: Role,
+    limit_bytes: int,
+    *,
+    contract_version: int = 1,
+) -> _OutputRead:
     try:
         before = path.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -1702,7 +1708,16 @@ def _read_output(path: Path, role: Role, limit_bytes: int) -> _OutputRead:
             output_bytes,
             False,
         )
-    return _OutputRead(validate_role_output(payload, role), payload, output_bytes, False)
+    return _OutputRead(
+        validate_role_output(
+            payload,
+            role,
+            contract_version=contract_version,
+        ),
+        payload,
+        output_bytes,
+        False,
+    )
 
 
 def _bounded_utf8(value: str, limit_bytes: int) -> tuple[bytes, int, bool]:
@@ -2069,7 +2084,13 @@ class BatchRunner:
         raw_directory = output_directory / "raw"
         raw_directory.mkdir(parents=True, exist_ok=True)
         schema_path = output_directory / "output-schema.json"
-        _atomic_json(schema_path, role_output_schema(invocation.role))
+        _atomic_json(
+            schema_path,
+            role_output_schema(
+                invocation.role,
+                contract_version=invocation.contract_version,
+            ),
+        )
 
         if self.flag_patterns is not None:
             detector = FlagDetector(
@@ -2397,7 +2418,10 @@ class BatchRunner:
                     )
                 )
             output_read = _read_output(
-                output_path, invocation.role, self.structured_output_limit_bytes
+                output_path,
+                invocation.role,
+                self.structured_output_limit_bytes,
+                contract_version=invocation.contract_version,
             )
             validation = output_read.validation
             raw_output = output_read.payload
@@ -2740,6 +2764,10 @@ class BatchWaveRunner:
         on_event: Callable[[CodexEvent], None] | None = None,
         on_flag: Callable[[FlagCandidate], None] | None = None,
         before_provider_start: Callable[[], None] | None = None,
+        before_invocation_provider_start: (
+            Callable[[BatchInvocation], None] | None
+        ) = None,
+        on_invocation_complete: Callable[[BatchResult], None] | None = None,
     ) -> tuple[BatchResult, ...]:
         cancel_event = threading.Event()
         dispatch_gate = _WaveDispatchGate()
@@ -2750,12 +2778,18 @@ class BatchWaveRunner:
         futures = []
 
         def dispatch(invocation: BatchInvocation) -> BatchResult | None:
+            def before_start() -> None:
+                if before_provider_start is not None:
+                    before_provider_start()
+                if before_invocation_provider_start is not None:
+                    before_invocation_provider_start(invocation)
+
             return dispatch_gate.run(
                 lambda: self.runner.run(
                     invocation,
                     on_event=on_event,
                     on_flag=on_flag,
-                    before_provider_start=before_provider_start,
+                    before_provider_start=before_start,
                     session_created_at=wave.created_at,
                     _cancel_event=cancel_event,
                 )
@@ -2793,6 +2827,12 @@ class BatchWaveRunner:
                         exc,
                         session_created_at=wave.created_at,
                     )
+                completed_result = results[index]
+                if (
+                    completed_result is not None
+                    and on_invocation_complete is not None
+                ):
+                    on_invocation_complete(completed_result)
         except BaseException as wave_error:
             def close_dispatch_gate() -> None:
                 if not dispatch_gate.closed:

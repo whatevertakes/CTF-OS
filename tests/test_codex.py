@@ -294,6 +294,66 @@ class ContractTests(unittest.TestCase):
             ["executed", "tool_inferred", "model_claimed", "external_doc", "operator"],
         )
 
+    def test_managed_v2_action_contract_is_explicit_and_v1_is_stable(
+        self,
+    ) -> None:
+        v1_schema = role_output_schema(Role.RECON)
+        self.assertNotIn(
+            "hypothesis_ids",
+            v1_schema["properties"]["actions"]["items"]["properties"],
+        )
+
+        payload = valid_payload(Role.RECON)
+        payload["schema_version"] = 2
+        payload["actions"][0].update(
+            {
+                "hypothesis_ids": ["H-existing"],
+                "expected_observation": "the branch changes",
+                "keep_if": "the changed branch is reproduced",
+                "drop_if": "the branch remains unchanged",
+                "timeout_seconds": 90,
+                "resource_class": "standard",
+                "network_target_id": "T-primary",
+                "network_target_generation": 3,
+            }
+        )
+        result = validate_role_output(
+            payload,
+            Role.RECON,
+            contract_version=2,
+        )
+        self.assertTrue(result.valid, result.errors)
+        v2_schema = role_output_schema(
+            Role.RECON,
+            contract_version=2,
+        )
+        self.assertEqual(
+            v2_schema["properties"]["schema_version"]["enum"],
+            [2],
+        )
+        self.assertIn(
+            "network_target_generation",
+            v2_schema["properties"]["actions"]["items"]["required"],
+        )
+        self.assertNotIn(
+            "uniqueItems",
+            v2_schema["properties"]["actions"]["items"]["properties"][
+                "hypothesis_ids"
+            ],
+        )
+
+        payload["actions"][0]["network_target_generation"] = None
+        payload["actions"][0]["expected_observation"] = ""
+        result = validate_role_output(
+            payload,
+            Role.RECON,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        joined = "\n".join(result.errors)
+        self.assertIn("provided together", joined)
+        self.assertIn("requires text", joined)
+
     def test_contract_rejects_extra_keys_wrong_decision_and_readonly_write(self) -> None:
         payload = valid_payload(Role.FALSIFIER)
         payload["extra"] = True

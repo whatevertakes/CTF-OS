@@ -426,9 +426,15 @@ class KnowledgeTests(unittest.TestCase):
             get_adapter("crypto"),
             state_path=self.engine.store.challenge_paths(self.identity).state,
         )
-        knowledge_section = pack.text.split(
-            "## Operator-ingested research with provenance", 1
-        )[1].split("## Category progress and failure contract", 1)[0]
+        context_records = [
+            json.loads(line)
+            for line in pack.text.splitlines()
+        ]
+        knowledge_section = "\n".join(
+            str(record["value"])
+            for record in context_records
+            if record.get("kind") == "knowledge_index"
+        )
         self.assertIn(marker, knowledge_section)
         self.assertNotIn("HEAD_ONLY_SHOULD_NOT_APPEAR", knowledge_section)
         offset_text = knowledge_section.split(

@@ -30,11 +30,59 @@ class SourceInventory:
     manifest_sha256: str
 
 
-def _file_hash(path: Path) -> str:
+def _file_hash(path: Path, expected: os.stat_result) -> str:
     digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as handle:
-        while chunk := handle.read(1024 * 1024):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise IngestError(f"cannot safely open {path}: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise IngestError(f"input is not a regular file: {path}")
+        expected_identity = (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_size,
+            expected.st_mtime_ns,
+            expected.st_ctime_ns,
+        )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if opened_identity != expected_identity:
+            raise IngestError(f"challenge input changed before hashing: {path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise IngestError(
+                    f"challenge input was truncated while hashing: {path}"
+                )
             digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise IngestError(
+                f"challenge input grew while hashing: {path}"
+            )
+        after = os.fstat(descriptor)
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if after_identity != opened_identity:
+            raise IngestError(f"challenge input changed while hashing: {path}")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -96,7 +144,7 @@ def inventory_challenge(
                 raise IngestError(
                     f"challenge input exceeds {max_files} regular files"
                 )
-            digest = _file_hash(candidate)
+            digest = _file_hash(candidate, metadata_before)
             metadata_after = candidate.lstat()
             before_identity = (
                 metadata_before.st_dev,
@@ -135,4 +183,3 @@ def inventory_challenge(
         total_bytes=total,
         manifest_sha256=hashlib.sha256(encoded).hexdigest(),
     )
-

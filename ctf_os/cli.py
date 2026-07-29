@@ -28,6 +28,23 @@ from ctf_os.engine.challenge import (
 from ctf_os.evaluation import EvaluationError, evaluate_workspace
 from ctf_os.images import image_status_is_usable, inspect_local_image
 from ctf_os.knowledge import KnowledgeError, KnowledgeStore
+from ctf_os.lifecycle import (
+    close_challenge,
+    create_checkpoint,
+    export_challenge,
+    pause_with_handoff,
+)
+from ctf_os.managed import (
+    ManagedError,
+    ManagedOrchestrator,
+    ManagedPreflightBlocked,
+)
+from ctf_os.migration import (
+    MigrationError,
+    apply_migration,
+    plan_migration,
+    rollback_migration,
+)
 from ctf_os.live_broker import (
     INSPECT_SECTIONS,
     LIVE_SCOPE_CAPABILITY_ENV,
@@ -45,8 +62,16 @@ from ctf_os.models import (
     Provenance,
 )
 from ctf_os.sandbox import NetworkTarget, SandboxError
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import StateStoreError
 from ctf_os.store.atomic import atomic_write_json, atomic_write_text
+from ctf_os.storage import (
+    StorageError,
+    quarantine_unreachable,
+    restore_quarantine,
+    storage_inventory,
+    storage_plan,
+)
 from ctf_os.terminal import terminal_safe
 
 
@@ -94,6 +119,55 @@ def _scope_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contest")
     parser.add_argument("--category")
     parser.add_argument("--challenge")
+
+
+def _flag_format_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--flag-prefix",
+        help="이 문제의 exact prefix-brace flag 형식",
+    )
+    parser.add_argument(
+        "--contest-flag-prefix",
+        help="첫 문제 생성 전에 고정할 대회 공통 prefix-brace 형식",
+    )
+    parser.add_argument(
+        "--flag-alphabet",
+        choices=("printable", "alnum_", "hex", "base64url"),
+    )
+    parser.add_argument("--flag-min-inner", type=int)
+    parser.add_argument("--flag-max-inner", type=int)
+
+
+def _flag_formats(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    challenge_prefix = getattr(args, "flag_prefix", None)
+    contest_prefix = getattr(args, "contest_flag_prefix", None)
+    alphabet = getattr(args, "flag_alphabet", None)
+    minimum = getattr(args, "flag_min_inner", None)
+    maximum = getattr(args, "flag_max_inner", None)
+    if (
+        challenge_prefix is None
+        and contest_prefix is None
+        and any(value is not None for value in (alphabet, minimum, maximum))
+    ):
+        raise CLIError(
+            "flag alphabet/bounds require --flag-prefix or "
+            "--contest-flag-prefix"
+        )
+
+    def record(prefix: str | None) -> dict[str, Any] | None:
+        if prefix is None:
+            return None
+        return {
+            "kind": "prefix_brace",
+            "prefix": prefix,
+            "alphabet": alphabet or "printable",
+            "min_inner": 1 if minimum is None else minimum,
+            "max_inner": 512 if maximum is None else maximum,
+        }
+
+    return record(challenge_prefix), record(contest_prefix)
 
 
 def _read_bounded_text(path: Path, *, maximum: int = 1024 * 1024) -> str:
@@ -517,6 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init_contest.add_argument("contest")
     init_contest.add_argument("--challenge", required=True)
+    _flag_format_options(init_contest)
 
     add = commands.add_parser(
         "add-challenge", help="사람이 파일을 넣을 문제 폴더와 상태 생성"
@@ -526,7 +601,11 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--prompt")
     add.add_argument("--prompt-file", type=Path)
     add.add_argument("--target", action="append", default=[])
-    add.add_argument("--budget-seconds", type=int)
+    add_budget = add.add_mutually_exclusive_group()
+    add_budget.add_argument("--budget-seconds", type=int)
+    add_budget.add_argument("--unbounded", action="store_true")
+    add.add_argument("--reason")
+    _flag_format_options(add)
 
     target = commands.add_parser(
         "add-target", help="문제별 허용 원격 endpoint 추가"
@@ -537,6 +616,41 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument(
         "--enforcement", choices=("declared", "proxy"), default="declared"
     )
+
+    typed_target = commands.add_parser(
+        "target", help="typed challenge target lifecycle"
+    )
+    typed_target_commands = typed_target.add_subparsers(
+        dest="target_command", required=True
+    )
+    target_list = typed_target_commands.add_parser("list")
+    _identity_values(target_list)
+    target_add = typed_target_commands.add_parser("add")
+    _identity_values(target_add)
+    target_add.add_argument("endpoint")
+    target_add.add_argument("--purpose", default="challenge remote")
+    target_add.add_argument("--docker-network", default="bridge")
+    target_add.add_argument(
+        "--enforcement", choices=("declared", "proxy"), default="declared"
+    )
+    target_add.add_argument("--expires-at")
+    target_select = typed_target_commands.add_parser("select")
+    _identity_values(target_select)
+    target_select.add_argument("target_id")
+    target_check = typed_target_commands.add_parser("check")
+    _identity_values(target_check)
+    target_check.add_argument("target_id")
+    target_replace = typed_target_commands.add_parser("replace")
+    _identity_values(target_replace)
+    target_replace.add_argument("target_id")
+    target_replace.add_argument("endpoint")
+    target_replace.add_argument("--reason", required=True)
+    target_replace.add_argument("--purpose", default="challenge remote")
+    target_replace.add_argument("--expires-at")
+    target_revoke = typed_target_commands.add_parser("revoke")
+    _identity_values(target_revoke)
+    target_revoke.add_argument("target_id")
+    target_revoke.add_argument("--reason", required=True)
 
     knowledge = commands.add_parser(
         "knowledge",
@@ -572,6 +686,26 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("prompt", nargs="?")
     solve.add_argument("--prompt-file", type=Path)
     solve.add_argument("--resume-thread")
+    solve.add_argument(
+        "--mode", choices=("managed", "assisted"), default="assisted"
+    )
+    solve.add_argument("--max-cycles", type=int, default=8)
+
+    preflight = commands.add_parser(
+        "preflight", help="managed solve prerequisites"
+    )
+    _identity_values(preflight)
+    preflight.add_argument("--json", action="store_true")
+
+    managed_cycle = commands.add_parser(
+        "managed-cycle", help="run one durable managed cycle"
+    )
+    _identity_values(managed_cycle)
+    managed_cycle.add_argument("--session-id")
+    note_group = managed_cycle.add_mutually_exclusive_group()
+    note_group.add_argument("--note")
+    note_group.add_argument("--note-file", type=Path)
+    managed_cycle.add_argument("--json", action="store_true")
 
     run = commands.add_parser(
         "run-challenge", help="결정적 Captain/3-role Batch 실행"
@@ -581,6 +715,29 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--prompt-file", type=Path)
     run.add_argument("--max-cycles", type=int, default=8)
     run.add_argument("--no-tools", action="store_true")
+    run.add_argument(
+        "--mode", choices=("managed", "legacy"), default="legacy"
+    )
+
+    session = commands.add_parser("session", help="managed session control")
+    session_commands = session.add_subparsers(
+        dest="session_command", required=True
+    )
+    session_cancel = session_commands.add_parser("cancel")
+    _identity_values(session_cancel)
+    session_cancel.add_argument("--reason", required=True)
+    session_cancel.add_argument(
+        "--target",
+        choices=("PAUSED", "NEEDS_HUMAN"),
+        required=True,
+    )
+
+    migrate = commands.add_parser("migrate", help="explicit state migration")
+    migrate.add_argument(
+        "migration_command",
+        choices=("check", "plan", "apply", "rollback"),
+    )
+    migrate.add_argument("--id", default="state-v2")
 
     status = commands.add_parser("status", help="읽기 전용 대회 board")
     status.add_argument("contest", nargs="?")
@@ -620,9 +777,15 @@ def build_parser() -> argparse.ArgumentParser:
     _identity_values(wave)
     wave.add_argument("wave", choices=("discovery", "attack", "proof"))
 
-    for name in ("pause", "resume"):
-        command_parser = commands.add_parser(name)
-        _identity_values(command_parser)
+    pause = commands.add_parser("pause")
+    _identity_values(pause)
+    pause.add_argument("--handoff", type=Path)
+    resume = commands.add_parser("resume")
+    _identity_values(resume)
+
+    checkpoint = commands.add_parser("checkpoint")
+    _identity_values(checkpoint)
+    checkpoint.add_argument("--note")
 
     budget = commands.add_parser(
         "budget-reset", help="사람의 명시적 문제 예산 초기화"
@@ -652,9 +815,32 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--response")
     submit.add_argument("--points", type=float)
     submit.add_argument("--allow-unproved", action="store_true")
+    submit.add_argument("--override-reason")
 
     export = commands.add_parser("export", help="상태/요약을 exports에 생성")
     _identity_values(export)
+    export.add_argument("--closure", action="store_true")
+    export.add_argument("--redacted", action="store_true")
+
+    close = commands.add_parser("close", help="record closure bundle")
+    _identity_values(close)
+    close.add_argument(
+        "--portability",
+        choices=("portable", "referential"),
+        default="referential",
+    )
+
+    storage = commands.add_parser(
+        "storage", help="artifact reachability and quarantine"
+    )
+    storage_commands = storage.add_subparsers(
+        dest="storage_command", required=True
+    )
+    for storage_name in ("inventory", "plan", "gc", "restore"):
+        storage_parser = storage_commands.add_parser(storage_name)
+        _identity_values(storage_parser)
+        if storage_name == "restore":
+            storage_parser.add_argument("quarantine_id")
 
     jobs = commands.add_parser("jobs", help="문제 container job 상태 조회")
     _identity_values(jobs)
@@ -969,23 +1155,59 @@ def main(
             _print_json(report.to_dict())
             return 0
 
+        if args.command == "migrate":
+            if args.migration_command in {"check", "plan"}:
+                report = plan_migration(
+                    workspace,
+                    migration_id=args.id,
+                )
+            elif args.migration_command == "apply":
+                report = apply_migration(
+                    workspace,
+                    migration_id=args.id,
+                )
+            elif args.migration_command == "rollback":
+                report = rollback_migration(
+                    workspace,
+                    migration_id=args.id,
+                )
+            else:
+                raise AssertionError(
+                    f"처리되지 않은 migrate 명령: "
+                    f"{args.migration_command}"
+                )
+            _print_json(report)
+            return 0
+
         engine = ChallengeEngine(workspace, config=config)
 
         if args.command == "init-contest":
             category, challenge = _parse_challenge_spec(args.challenge)
+            challenge_format, contest_format = _flag_formats(args)
             state = engine.add_challenge(
-                ChallengeIdentity(args.contest, category, challenge)
+                ChallengeIdentity(args.contest, category, challenge),
+                challenge_flag_format=challenge_format,
+                contest_flag_format=contest_format,
             )
             print(f"문제 폴더 준비 완료: {engine.challenge_input(state.identity)}")
             return 0
 
         if args.command == "add-challenge":
+            if args.unbounded and not (args.reason or "").strip():
+                raise CLIError("--unbounded에는 --reason이 필요합니다.")
+            if args.reason and not args.unbounded:
+                raise CLIError("--reason은 --unbounded와 함께 사용하세요.")
+            challenge_format, contest_format = _flag_formats(args)
             state = engine.add_challenge(
                 _identity(args),
                 description=args.description,
                 prompt=_prompt(args) or "",
                 targets=args.target,
                 budget_seconds=args.budget_seconds,
+                unbounded_reason=args.reason if args.unbounded else None,
+                challenge_flag_format=challenge_format,
+                contest_flag_format=contest_format,
+                state_schema_version=STATE_SCHEMA_VERSION,
             )
             print(f"문제 폴더: {engine.challenge_input(state.identity)}")
             print(f"상태: {state.status.value} rev={state.revision}")
@@ -1001,6 +1223,67 @@ def main(
             print(
                 f"허용 대상 추가: {NetworkTarget.parse(args.target).as_text()} "
                 f"(rev={state.revision})"
+            )
+            return 0
+
+        if args.command == "target":
+            identity = _identity(args)
+            if args.target_command == "list":
+                state = engine.store.load(identity)
+                _print_json(
+                    {
+                        "primary_target_id": state.primary_target_id,
+                        "configuration_epoch": state.configuration_epoch,
+                        "targets": [
+                            item.to_dict() for item in state.targets
+                        ],
+                    }
+                )
+                return 0
+            if args.target_command == "add":
+                state = engine.add_network_target(
+                    identity,
+                    args.endpoint,
+                    docker_network=args.docker_network,
+                    enforcement=args.enforcement,
+                    purpose=args.purpose,
+                    expires_at=args.expires_at,
+                )
+            elif args.target_command == "select":
+                state = engine.select_network_target(
+                    identity,
+                    args.target_id,
+                )
+            elif args.target_command == "check":
+                state = engine.check_network_target(
+                    identity,
+                    args.target_id,
+                )
+            elif args.target_command == "replace":
+                state = engine.replace_network_target(
+                    identity,
+                    args.target_id,
+                    args.endpoint,
+                    reason=args.reason,
+                    purpose=args.purpose,
+                    expires_at=args.expires_at,
+                )
+            elif args.target_command == "revoke":
+                state = engine.revoke_network_target(
+                    identity,
+                    args.target_id,
+                    reason=args.reason,
+                )
+            else:
+                raise AssertionError(
+                    f"처리되지 않은 target 명령: {args.target_command}"
+                )
+            _print_json(
+                {
+                    "primary_target_id": state.primary_target_id,
+                    "configuration_epoch": state.configuration_epoch,
+                    "targets": [item.to_dict() for item in state.targets],
+                }
             )
             return 0
 
@@ -1050,7 +1333,10 @@ def main(
             state = (
                 engine.store.load(identity)
                 if paths.state.exists()
-                else engine.add_challenge(identity)
+                else engine.add_challenge(
+                    identity,
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
             )
             effective_prompt = prompt if prompt else state.prompt
             if not effective_prompt.strip():
@@ -1058,6 +1344,24 @@ def main(
                     "문제풀이 프롬프트가 없습니다. PROMPT 또는 --prompt-file을 "
                     "지정하세요."
                 )
+            if args.mode == "managed":
+                if args.resume_thread is not None:
+                    raise CLIError(
+                        "--resume-thread is available only in assisted mode"
+                    )
+                if prompt is not None:
+                    engine.update_prompt(identity, prompt)
+                managed = ManagedOrchestrator(engine)
+                state = managed.run_cycles(
+                    identity,
+                    max_cycles=args.max_cycles,
+                )
+                print(
+                    f"Managed 종료: {identity.key} {state.status.value} "
+                    f"rev={state.revision}"
+                )
+                return 0
+
             def announce_live_session(_prepared: object) -> None:
                 print(
                     "Live 세션 생성 완료. 세 논리 역할은 유지되며 계정 "
@@ -1072,19 +1376,78 @@ def main(
                 on_prepared=announce_live_session,
             )
 
+        if args.command == "preflight":
+            report = ManagedOrchestrator(engine).preflight(_identity(args))
+            if args.json:
+                _print_json(report.to_dict())
+            else:
+                print(
+                    "managed preflight: "
+                    + ("ready" if report.ok else "blocked")
+                )
+                for issue in report.issues:
+                    print(f"- {terminal_safe(issue)}")
+            return 0 if report.ok else 2
+
+        if args.command == "managed-cycle":
+            note = (
+                _read_bounded_text(args.note_file)
+                if args.note_file is not None
+                else args.note
+            )
+            state = ManagedOrchestrator(engine).run_cycle(
+                _identity(args),
+                session_id=args.session_id,
+                note=note,
+            )
+            if args.json:
+                _print_json(state.to_dict())
+            else:
+                print(
+                    f"Managed cycle 완료: {state.identity.key} "
+                    f"{state.status.value} rev={state.revision}"
+                )
+            return 0
+
         if args.command == "run-challenge":
             identity = _identity(args)
             prompt = _prompt(args)
-            state = engine.run_challenge(
-                identity,
-                prompt=prompt if prompt else None,
-                max_cycles=args.max_cycles,
-                execute_registered_tools=not args.no_tools,
-            )
+            if args.mode == "managed":
+                if args.no_tools:
+                    raise CLIError(
+                        "--no-tools is available only in legacy mode"
+                    )
+                if prompt is not None:
+                    engine.update_prompt(identity, prompt)
+                state = ManagedOrchestrator(engine).run_cycles(
+                    identity,
+                    max_cycles=args.max_cycles,
+                )
+            else:
+                state = engine.run_challenge(
+                    identity,
+                    prompt=prompt if prompt else None,
+                    max_cycles=args.max_cycles,
+                    execute_registered_tools=not args.no_tools,
+                )
             print(
                 f"Batch 종료: {identity.key} {state.status.value} "
                 f"rev={state.revision}"
             )
+            return 0
+
+        if args.command == "session":
+            if args.session_command != "cancel":
+                raise AssertionError(
+                    f"처리되지 않은 session 명령: "
+                    f"{args.session_command}"
+                )
+            state = ManagedOrchestrator(engine).cancel_session(
+                _identity(args),
+                reason=args.reason,
+                target=ChallengeStatus(args.target),
+            )
+            print(f"session 취소: {state.status.value} rev={state.revision}")
             return 0
 
         if args.command == "status":
@@ -1158,10 +1521,28 @@ def main(
             return 0
 
         if args.command == "pause":
-            state = engine.pause(_identity(args))
+            identity = _identity(args)
+            state = (
+                pause_with_handoff(
+                    engine,
+                    identity,
+                    args.handoff,
+                )
+                if args.handoff is not None
+                else engine.pause(identity)
+            )
             print(
                 f"PAUSED (resume={state.resume_status.value if state.resume_status else '-'})"
             )
+            return 0
+
+        if args.command == "checkpoint":
+            _state, checkpoint = create_checkpoint(
+                engine,
+                _identity(args),
+                note=args.note,
+            )
+            _print_json(checkpoint.to_dict())
             return 0
 
         if args.command == "resume":
@@ -1209,6 +1590,7 @@ def main(
                 response=args.response,
                 points=args.points,
                 allow_unproved=args.allow_unproved,
+                override_reason=args.override_reason,
             )
             print(
                 f"사람 제출 결과 기록 완료: {args.outcome}; "
@@ -1218,15 +1600,45 @@ def main(
 
         if args.command == "export":
             identity = _identity(args)
-            state = engine.store.load(identity)
-            paths = engine.store.challenge_paths(identity)
-            engine.store.refresh_views(identity)
-            atomic_write_json(paths.exports / "state.json", state.to_dict())
-            atomic_write_text(
-                paths.exports / "summary.md",
-                paths.current_context.read_text(encoding="utf-8"),
+            destination = export_challenge(
+                engine,
+                identity,
+                include_closure=args.closure,
+                redacted=args.redacted,
             )
-            print(f"export 완료: {paths.exports}")
+            print(f"export 완료: {destination}")
+            return 0
+
+        if args.command == "close":
+            state = close_challenge(
+                engine,
+                _identity(args),
+                portability=args.portability,
+            )
+            assert state.closure is not None
+            _print_json(state.closure.to_dict())
+            return 0
+
+        if args.command == "storage":
+            identity = _identity(args)
+            if args.storage_command == "inventory":
+                report = storage_inventory(engine.store, identity)
+            elif args.storage_command == "plan":
+                report = storage_plan(engine.store, identity)
+            elif args.storage_command == "gc":
+                report = quarantine_unreachable(engine.store, identity)
+            elif args.storage_command == "restore":
+                report = restore_quarantine(
+                    engine.store,
+                    identity,
+                    args.quarantine_id,
+                )
+            else:
+                raise AssertionError(
+                    f"처리되지 않은 storage 명령: "
+                    f"{args.storage_command}"
+                )
+            _print_json(report)
             return 0
 
         if args.command == "jobs":
@@ -1396,6 +1808,12 @@ def main(
     except KeyboardInterrupt:
         print("\n중단됨", file=sys.stderr)
         return 130
+    except ManagedPreflightBlocked as error:
+        print(f"오류: {terminal_safe(error)}", file=sys.stderr)
+        return 2
+    except ManagedError as error:
+        print(f"오류: {terminal_safe(error)}", file=sys.stderr)
+        return 1
     except (
         CLIError,
         ConfigError,
@@ -1406,6 +1824,8 @@ def main(
         KnowledgeError,
         LiveBrokerError,
         SandboxError,
+        MigrationError,
+        StorageError,
         ValueError,
         OSError,
     ) as error:

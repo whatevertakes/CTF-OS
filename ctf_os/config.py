@@ -213,6 +213,13 @@ def _validate(config: EngineConfig) -> EngineConfig:
             raise ConfigError(f"[runtime] {error}") from error
     if not runtime.flag_patterns:
         raise ConfigError("[runtime] flag_patterns cannot be empty")
+    for index, pattern in enumerate(runtime.flag_patterns):
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise ConfigError(
+                f"[runtime] flag_patterns[{index}] is invalid: {error}"
+            ) from error
     for name in ("flag_scan_max_bytes", "work_tree_max_bytes"):
         value = getattr(runtime, name)
         if (

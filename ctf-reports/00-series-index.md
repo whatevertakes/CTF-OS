@@ -53,6 +53,8 @@ AI Agent는 CTF 상위권 경쟁에서 빼기 어려운 도구가 되었습니�
 ### 3부 — 실전 운용 기록
 
 - [13. 실전 기록 분석](13-field-record-analysis.md) — **첫 실전 기록 관측.** ACSC forensics 1문제와 Dreamhack 4문제의 정본 상태·run·세션 로그를 계수해, 설계된 계약이 운용에서 실제로 몇 퍼센트나 가동됐는지 기록합니다 (관측일 2026-07-29)
+- [14. 관리형 풀이 엔진 수술 전 근거 동결](14-managed-engine-evidence-freeze.md) — managed 전환 전에 A–D 관측 경로, `[측정]/[해석]/[가설]`, X-22~25 중단 조건과 표본 한계를 고정합니다
+- [15. NYU CTF Bench Pwn 부분 실측 중단 기록](15-nyu-pwn-current-baseline.md) — 개선된 working tree로 고정한 Pwn 10문제 중 실제 시작한 4문제의 부분 관측, 사전검증, 엔진 병목과 사용자 중단 상태를 보존합니다. 완성된 `0/10` baseline으로 해석하지 않습니다 (관측일 2026-07-30)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 

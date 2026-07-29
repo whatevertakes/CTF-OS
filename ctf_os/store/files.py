@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -23,14 +24,31 @@ from ctf_os.models import (
     ArtifactReference,
     Budget,
     CandidateStatus,
+    CandidateTier,
     ChallengeIdentity,
     ChallengeState,
     ChallengeStatus,
+    ClosureBundle,
+    ClosureCompleteness,
     FlagCandidate,
+    GoalStatus,
+    SessionStatus,
+    SubmissionOverride,
     SubmissionReference,
     SubmissionStatus,
     new_challenge_state,
     utc_now,
+)
+from ctf_os.schema import (
+    BOARD_VIEW_SCHEMA_VERSION,
+    CANDIDATE_INTENT_SCHEMA_VERSION,
+    CONTEST_MANIFEST_SCHEMA_VERSION,
+    EVENT_RECORD_SCHEMA_VERSION,
+    RUN_ENVELOPE_SCHEMA_VERSION,
+    SUBMISSION_INTENT_SCHEMA_VERSION,
+    SUBMISSION_LEDGER_RECORD_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    WORKER_RESULT_SCHEMA_VERSION,
 )
 from ctf_os.store.atomic import (
     append_json_line,
@@ -39,9 +57,10 @@ from ctf_os.store.atomic import (
     atomic_write_text,
     canonical_json_bytes,
     read_json,
+    strict_json_loads,
 )
 from ctf_os.store.locks import ChallengeLock, FileLock
-from ctf_os.store.upgrades import upgrade_state
+from ctf_os.store.upgrades import upgrade_state, validate_state_protocol_shape
 from ctf_os.store.views import (
     board_entry,
     render_board_markdown,
@@ -51,6 +70,10 @@ from ctf_os.store.views import (
 
 class StateStoreError(RuntimeError):
     """Base class for expected state-store errors."""
+
+
+class MigrationInProgress(StateStoreError):
+    """Canonical mutation is blocked by a schema migration marker."""
 
 
 class InvalidIdentity(StateStoreError, ValueError):
@@ -391,6 +414,38 @@ class StateStore:
         finally:
             os.close(descriptor)
 
+    def assert_mutations_allowed(self) -> None:
+        """Fail closed while an explicit workspace migration is transitional."""
+
+        marker_path = self.root / "migration.json"
+        try:
+            marker = read_json(marker_path)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            raise MigrationInProgress(
+                "workspace migration marker is unreadable; mutations are blocked"
+            ) from error
+        if not isinstance(marker, Mapping):
+            raise MigrationInProgress(
+                "workspace migration marker is invalid; mutations are blocked"
+            )
+        status = marker.get("status")
+        if status == "migrating":
+            raise MigrationInProgress(
+                "workspace state migration is in progress"
+            )
+        if status not in {
+            "applied",
+            "rolled_back",
+            "failed",
+            "failed_rolled_back",
+        }:
+            raise MigrationInProgress(
+                "workspace migration marker has an unknown status; "
+                "mutations are blocked"
+            )
+
     @staticmethod
     def _serialized_state(state: ChallengeState) -> bytes:
         payload = canonical_json_bytes(state.to_dict())
@@ -408,9 +463,10 @@ class StateStore:
         *,
         expected: ChallengeIdentity | None = None,
     ) -> ChallengeState:
-        raw = json.loads(payload.decode("utf-8"))
+        raw = strict_json_loads(payload)
         if not isinstance(raw, Mapping):
             raise CorruptStateError(f"state root must be an object: {path}")
+        validate_state_protocol_shape(raw)
         state = ChallengeState.from_dict(upgrade_state(raw))
         state.validate()
         if expected is not None and state.identity != expected:
@@ -513,6 +569,7 @@ class StateStore:
         *,
         metadata: Mapping[str, Any] | None = None,
     ) -> ContestPaths:
+        self.assert_mutations_allowed()
         paths = self.contest_paths(contest_id)
         paths.challenges.mkdir(parents=True, exist_ok=True)
         paths.runtime.mkdir(parents=True, exist_ok=True)
@@ -521,7 +578,7 @@ class StateStore:
             atomic_write_json(
                 paths.contest_json,
                 {
-                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "schema_version": CONTEST_MANIFEST_SCHEMA_VERSION,
                     "contest_id": contest_id,
                     "created_at": now,
                     "updated_at": now,
@@ -551,8 +608,10 @@ class StateStore:
         source_path: str | None = None,
         metadata: Mapping[str, Any] | None = None,
         budget: Budget | Mapping[str, Any] | None = None,
+        schema_version: int = CURRENT_SCHEMA_VERSION,
         exist_ok: bool = True,
     ) -> ChallengeState:
+        self.assert_mutations_allowed()
         identity = _identity(contest, category, challenge_id)
         self.initialize_contest(identity.contest_id)
         paths = self.challenge_paths(identity)
@@ -590,6 +649,7 @@ class StateStore:
                     source_path=source_path,
                     metadata=metadata,
                     budget=budget,
+                    schema_version=schema_version,
                 )
                 state.validate()
                 payload = self._serialized_state(state)
@@ -731,14 +791,15 @@ class StateStore:
         finally:
             os.close(descriptor)
         try:
-            raw = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raw = strict_json_loads(bytes(payload))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise CorruptStateError(
                 f"cannot read candidate intent journal: {error}"
             ) from error
         if (
             not isinstance(raw, Mapping)
-            or raw.get("schema_version") != 1
+            or raw.get("schema_version")
+            != CANDIDATE_INTENT_SCHEMA_VERSION
             or not isinstance(raw.get("intents"), list)
         ):
             raise CorruptStateError("invalid candidate intent journal")
@@ -770,6 +831,16 @@ class StateStore:
                 ) from error
             intent_id = raw_intent.get("id")
             observed_at = raw_intent.get("observed_at")
+            tier_value = raw_intent.get(
+                "tier", CandidateTier.GENERIC.value
+            )
+            format_epoch = raw_intent.get("format_epoch")
+            try:
+                tier = CandidateTier(str(tier_value))
+            except ValueError as error:
+                raise CorruptStateError(
+                    f"invalid candidate intent tier at index {index}"
+                ) from error
             expected_intent_id = "C-intent-" + hashlib.sha256(
                 value.encode("utf-8")
             ).hexdigest()
@@ -781,6 +852,14 @@ class StateStore:
                 or len(observed_at.encode("utf-8")) > 128
                 or intent_id in seen_ids
                 or value in seen_values
+                or (
+                    format_epoch is not None
+                    and (
+                        isinstance(format_epoch, bool)
+                        or not isinstance(format_epoch, int)
+                        or format_epoch < 0
+                    )
+                )
             ):
                 raise CorruptStateError(
                     f"invalid candidate intent fields at index {index}"
@@ -795,6 +874,8 @@ class StateStore:
                     "source": source,
                     "source_run_id": source_run_id,
                     "observed_at": observed_at,
+                    "tier": tier.value,
+                    "format_epoch": format_epoch,
                 }
             )
         if total_value_bytes > _CANDIDATE_INTENT_VALUE_BYTES_LIMIT:
@@ -809,7 +890,7 @@ class StateStore:
         intents: Sequence[Mapping[str, Any]],
     ) -> None:
         payload = {
-            "schema_version": 1,
+            "schema_version": CANDIDATE_INTENT_SCHEMA_VERSION,
             "intents": [dict(intent) for intent in intents],
         }
         if (
@@ -829,9 +910,12 @@ class StateStore:
         source: str,
         source_run_id: str | None = None,
         observed_at: str | None = None,
+        tier: CandidateTier = CandidateTier.GENERIC,
+        format_epoch: int | None = None,
     ) -> str:
         """Durably stage one bounded candidate before terminal notification."""
 
+        self.assert_mutations_allowed()
         identity = _identity(identity)
         value, source, source_run_id = self._validate_candidate_intent_text(
             value,
@@ -839,6 +923,18 @@ class StateStore:
             source_run_id,
         )
         actual_observed_at = observed_at or utc_now()
+        if not isinstance(tier, CandidateTier):
+            raise WorkerResultValidationError(
+                "candidate intent tier must be a CandidateTier"
+            )
+        if format_epoch is not None and (
+            isinstance(format_epoch, bool)
+            or not isinstance(format_epoch, int)
+            or format_epoch < 0
+        ):
+            raise WorkerResultValidationError(
+                "candidate intent format_epoch must be a non-negative integer"
+            )
         if (
             not isinstance(actual_observed_at, str)
             or not actual_observed_at
@@ -857,6 +953,8 @@ class StateStore:
             "source": source,
             "source_run_id": source_run_id,
             "observed_at": actual_observed_at,
+            "tier": tier.value,
+            "format_epoch": format_epoch,
         }
         paths = self.challenge_paths(identity)
         with self._candidate_intent_lock(paths) as intent_lock:
@@ -910,6 +1008,7 @@ class StateStore:
         cleared = frozenset(values)
         if not cleared:
             return
+        self.assert_mutations_allowed()
         paths = self.challenge_paths(identity)
         with self._candidate_intent_lock(paths) as intent_lock:
             intent_lock.acquire()
@@ -940,6 +1039,7 @@ class StateStore:
     ) -> ChallengeState:
         """Commit crash-left candidates at a session boundary without printing."""
 
+        self.assert_mutations_allowed()
         identity = _identity(identity)
         paths = self.challenge_paths(identity)
         with self._candidate_intent_lock(paths) as intent_lock:
@@ -992,6 +1092,19 @@ class StateStore:
                                 source_run_id=source_run_id,
                                 locator=str(intent["source"]),
                                 created_at=str(intent["observed_at"]),
+                                tier=CandidateTier(
+                                    str(
+                                        intent.get(
+                                            "tier",
+                                            CandidateTier.GENERIC.value,
+                                        )
+                                    )
+                                ),
+                                format_epoch=(
+                                    int(intent["format_epoch"])
+                                    if intent.get("format_epoch") is not None
+                                    else None
+                                ),
                                 extra={
                                     "recovered_from_candidate_intent": True,
                                     **(
@@ -1063,8 +1176,8 @@ class StateStore:
             if not raw_line.strip():
                 continue
             try:
-                record = json.loads(raw_line.decode("utf-8"))
-            except (UnicodeError, json.JSONDecodeError) as error:
+                record = strict_json_loads(raw_line)
+            except (UnicodeError, ValueError) as error:
                 raise CorruptStateError(
                     f"invalid recovery ledger line {index} in {path}: "
                     f"{error}"
@@ -1109,8 +1222,8 @@ class StateStore:
         self._ledger_records_by_id(records)
         if intent_payload:
             try:
-                raw_intents = json.loads(intent_payload.decode("utf-8"))
-            except (UnicodeError, json.JSONDecodeError) as error:
+                raw_intents = strict_json_loads(intent_payload)
+            except (UnicodeError, ValueError) as error:
                 raise CorruptStateError(
                     "cannot decode submission intent recovery snapshot: "
                     f"{error}"
@@ -1192,6 +1305,12 @@ class StateStore:
                 != record.get("proof_passed")
                 or submission.format_ok != record.get("format_ok")
                 or submission.points != record.get("points")
+                or (
+                    submission.override.to_dict()
+                    if submission.override is not None
+                    else None
+                )
+                != record.get("override")
             ):
                 raise CorruptStateError(
                     f"submission {submission_id!r} is missing from or "
@@ -1265,11 +1384,14 @@ class StateStore:
         expected_revision: int | None = None,
         validate_artifacts: bool = True,
     ) -> ChallengeState:
+        self.assert_mutations_allowed()
         state.validate()
         identity = _identity(state)
         paths = self.challenge_paths(identity)
         with ChallengeLock(paths.lock) as state_lock:
+            lock_started = time.monotonic()
             state_lock.acquire()
+            lock_wait_ms = (time.monotonic() - lock_started) * 1000
             current = self._read_state(paths.state, expected=identity)
             expected = (
                 state.revision
@@ -1284,6 +1406,7 @@ class StateStore:
                 current,
                 proposed,
                 validate_artifacts=validate_artifacts,
+                lock_wait_ms=lock_wait_ms,
             )
 
     save_state = save
@@ -1313,6 +1436,7 @@ class StateStore:
             category = None
         if mutator is None:
             raise TypeError("a state mutator is required")
+        self.assert_mutations_allowed()
         identity = _identity(
             contest,
             category if isinstance(category, str) else None,
@@ -1320,7 +1444,9 @@ class StateStore:
         )
         paths = self.challenge_paths(identity)
         with ChallengeLock(paths.lock) as state_lock:
+            lock_started = time.monotonic()
             state_lock.acquire()
+            lock_wait_ms = (time.monotonic() - lock_started) * 1000
             current = self._read_state(paths.state, expected=identity)
             if (
                 expected_revision is not None
@@ -1346,6 +1472,7 @@ class StateStore:
                 current,
                 proposed,
                 validate_artifacts=validate_artifacts,
+                lock_wait_ms=lock_wait_ms,
             )
 
     mutate = update
@@ -1357,19 +1484,41 @@ class StateStore:
         proposed: ChallengeState,
         *,
         validate_artifacts: bool,
+        lock_wait_ms: float = 0.0,
     ) -> ChallengeState:
+        commit_started = time.monotonic()
         if proposed.identity != current.identity:
             raise InvalidIdentity("state identity cannot change during commit")
         # Stop oversized in-memory collections before cloning/serializing them.
         proposed.validate()
         committed = ChallengeState.from_dict(proposed.to_dict())
-        committed.schema_version = CURRENT_SCHEMA_VERSION
+        # Ordinary writers preserve the source state protocol.  Only the
+        # explicit migration transaction may change it.
+        committed.schema_version = current.schema_version
         committed.revision = current.revision + 1
         committed.created_at = current.created_at
         committed.updated_at = utc_now()
         committed.validate()
+        serialization_started = time.monotonic()
         total_artifact_bytes = 0
+        current_artifacts = {
+            (
+                artifact.id,
+                artifact.path,
+                artifact.sha256,
+                artifact.size,
+            )
+            for artifact in current.artifacts
+        }
+        delta_artifact_count = 0
         for artifact in committed.artifacts:
+            if (
+                artifact.id,
+                artifact.path,
+                artifact.sha256,
+                artifact.size,
+            ) not in current_artifacts:
+                delta_artifact_count += 1
             if validate_artifacts:
                 artifact_path = validate_artifact(paths.root, artifact)
             else:
@@ -1393,6 +1542,9 @@ class StateStore:
                     f"{self.max_artifact_bytes}"
                 )
         committed_payload = self._serialized_state(committed)
+        serialization_ms = (
+            time.monotonic() - serialization_started
+        ) * 1000
 
         # Preserve the exact last readable canonical bytes before replacement.
         previous_payload = _read_bounded_regular(
@@ -1405,8 +1557,10 @@ class StateStore:
             paths.state,
             expected=current.identity,
         )
+        fsync_started = time.monotonic()
         atomic_write_bytes(paths.previous_state, previous_payload)
         atomic_write_bytes(paths.state, committed_payload)
+        fsync_ms = (time.monotonic() - fsync_started) * 1000
 
         self._append_event_best_effort(
             paths,
@@ -1418,7 +1572,33 @@ class StateStore:
             },
         )
         self._refresh_challenge_view_best_effort(committed, paths)
+        board_started = time.monotonic()
         self._refresh_board_best_effort(committed.contest_id)
+        board_ms = (time.monotonic() - board_started) * 1000
+        self._append_telemetry_best_effort(
+            {
+                "event": "state_commit",
+                "contest_id": committed.contest_id,
+                "category": committed.category,
+                "challenge_id": committed.challenge_id,
+                "revision": committed.revision,
+                "commit_ms": round(
+                    (time.monotonic() - commit_started) * 1000,
+                    3,
+                ),
+                "lock_wait_ms": round(lock_wait_ms, 3),
+                "serialization_ms": round(serialization_ms, 3),
+                "fsync_ms": round(fsync_ms, 3),
+                "board_scan_ms": round(board_ms, 3),
+                "artifact_hash_bytes": total_artifact_bytes,
+                "full_artifact_count": len(committed.artifacts),
+                "delta_shadow_artifact_count": delta_artifact_count,
+                "delta_shadow_mismatches": 0,
+                "board_shadow_match": self._board_projection_matches(
+                    committed
+                ),
+            }
+        )
         return committed
 
     def verify_artifacts(
@@ -1474,6 +1654,7 @@ class StateStore:
         request: Mapping[str, Any] | None = None,
         base_revision: int | None = None,
     ) -> RunPaths:
+        self.assert_mutations_allowed()
         if (
             isinstance(contest, (ChallengeIdentity, ChallengeState))
             and run_id is None
@@ -1509,7 +1690,7 @@ class StateStore:
         payload = dict(request or {})
         payload.update(
             {
-                "schema_version": CURRENT_SCHEMA_VERSION,
+                "schema_version": RUN_ENVELOPE_SCHEMA_VERSION,
                 "contest_id": identity.contest_id,
                 "category": identity.category,
                 "challenge_id": identity.challenge_id,
@@ -1529,6 +1710,7 @@ class StateStore:
         run_id: str | None = None,
         result: Mapping[str, Any] | None = None,
     ) -> Path:
+        self.assert_mutations_allowed()
         if isinstance(contest, (ChallengeIdentity, ChallengeState)):
             if isinstance(challenge_id, Mapping) and result is None:
                 result = challenge_id
@@ -1549,7 +1731,7 @@ class StateStore:
         if not paths.root.is_dir():
             raise StateNotFound(f"run does not exist: {identity.key}/{run_id}")
         payload = dict(result)
-        payload.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
+        payload.setdefault("schema_version", WORKER_RESULT_SCHEMA_VERSION)
         payload.setdefault("contest_id", identity.contest_id)
         payload.setdefault("category", identity.category)
         payload.setdefault("challenge_id", identity.challenge_id)
@@ -1565,6 +1747,7 @@ class StateStore:
         run_id: str | None = None,
         validation: Mapping[str, Any] | None = None,
     ) -> Path:
+        self.assert_mutations_allowed()
         if isinstance(contest, (ChallengeIdentity, ChallengeState)):
             if isinstance(challenge_id, Mapping) and validation is None:
                 validation = challenge_id
@@ -1599,6 +1782,7 @@ class StateStore:
         result: Mapping[str, Any] | None = None,
         *,
         persist_validation: bool = True,
+        expected_base_revision: int | None = None,
     ) -> list[ArtifactReference]:
         """Validate identity, base revision, and artifacts in a worker result."""
 
@@ -1639,7 +1823,15 @@ class StateStore:
                 raise WorkerResultValidationError(
                     "worker result has no base_revision"
                 )
-            self.assert_revision(identity, int(base_revision))
+            normalized_base_revision = int(base_revision)
+            if expected_base_revision is None:
+                self.assert_revision(identity, normalized_base_revision)
+            elif normalized_base_revision != expected_base_revision:
+                raise WorkerResultValidationError(
+                    "worker result base revision does not match its reserved "
+                    f"snapshot: {normalized_base_revision} != "
+                    f"{expected_base_revision}"
+                )
             records = result.get("artifacts", [])
             if records is None:
                 records = []
@@ -1669,7 +1861,7 @@ class StateStore:
                     run_id,
                     {
                         "ok": True,
-                        "base_revision": int(base_revision),
+                        "base_revision": normalized_base_revision,
                         "artifact_ids": [
                             artifact.id for artifact in artifacts
                         ],
@@ -1715,11 +1907,11 @@ class StateStore:
                 )
         if (
             "schema_version" in result
-            and int(result["schema_version"]) != CURRENT_SCHEMA_VERSION
+            and int(result["schema_version"]) != WORKER_RESULT_SCHEMA_VERSION
         ):
             raise WorkerResultValidationError(
                 f"worker result schema_version={result['schema_version']}, "
-                f"expected {CURRENT_SCHEMA_VERSION}"
+                f"expected {WORKER_RESULT_SCHEMA_VERSION}"
             )
 
     def refresh_views(
@@ -1781,7 +1973,7 @@ class StateStore:
             atomic_write_json(
                 contest.root / "board.json",
                 {
-                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "schema_version": BOARD_VIEW_SCHEMA_VERSION,
                     "contest_id": contest_id,
                     "updated_at": utc_now(),
                     "challenges": entries,
@@ -1828,12 +2020,56 @@ class StateStore:
         except Exception as error:  # noqa: BLE001 - derived view is best effort
             self.last_view_errors.append(str(error))
 
+    def _board_projection_matches(self, state: ChallengeState) -> bool:
+        """Compare the full board render with one challenge-local projection."""
+
+        try:
+            board = read_json(
+                self.contest_paths(state.contest_id).root / "board.json"
+            )
+            if not isinstance(board, Mapping):
+                return False
+            entries = board.get("challenges")
+            if not isinstance(entries, list):
+                return False
+            actual = next(
+                (
+                    entry
+                    for entry in entries
+                    if isinstance(entry, Mapping)
+                    and entry.get("category") == state.category
+                    and entry.get("challenge_id") == state.challenge_id
+                ),
+                None,
+            )
+            return actual == board_entry(state)
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _append_telemetry_best_effort(
+        self,
+        event: Mapping[str, Any],
+    ) -> None:
+        """Append bounded operational timings without prompts or output data."""
+
+        try:
+            append_json_line(
+                self.root / "runtime" / "telemetry.jsonl",
+                {
+                    "schema_version": 1,
+                    "at": utc_now(),
+                    **dict(event),
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - shadow data is best effort
+            self.last_view_errors.append(str(error))
+
     def _append_event_best_effort(
         self, paths: ChallengePaths, event: Mapping[str, Any]
     ) -> None:
         try:
             payload = {
-                "schema_version": CURRENT_SCHEMA_VERSION,
+                "schema_version": EVENT_RECORD_SCHEMA_VERSION,
                 "contest_id": paths.root.parents[2].name,
                 "category": paths.root.parent.name,
                 "challenge_id": paths.root.name,
@@ -1881,6 +2117,7 @@ class StateStore:
                 "proof_passed",
                 "format_ok",
                 "points",
+                "override",
                 "state_revision",
             )
         }
@@ -1909,7 +2146,7 @@ class StateStore:
                 "submission intent journal root must be an object"
             )
         if (
-            raw.get("schema_version") != CURRENT_SCHEMA_VERSION
+            raw.get("schema_version") != SUBMISSION_INTENT_SCHEMA_VERSION
             or raw.get("contest_id") != paths.root.name
             or not isinstance(raw.get("intents"), list)
         ):
@@ -1975,6 +2212,10 @@ class StateStore:
                         or not isinstance(record["points"], (int, float))
                     )
                 )
+                or (
+                    record.get("override") is not None
+                    and not isinstance(record.get("override"), Mapping)
+                )
                 or isinstance(record["state_revision"], bool)
                 or not isinstance(record["state_revision"], int)
                 or record["state_revision"] < 0
@@ -2008,7 +2249,7 @@ class StateStore:
         atomic_write_json(
             paths.submission_intents,
             {
-                "schema_version": CURRENT_SCHEMA_VERSION,
+                "schema_version": SUBMISSION_INTENT_SCHEMA_VERSION,
                 "contest_id": paths.root.name,
                 "intents": ordered,
             },
@@ -2037,9 +2278,8 @@ class StateStore:
                 has_trailing_fragment and index == len(pieces)
             )
             try:
-                line = raw_line.decode("utf-8")
-                record = json.loads(line)
-            except (UnicodeError, json.JSONDecodeError) as error:
+                record = strict_json_loads(raw_line)
+            except (UnicodeError, ValueError) as error:
                 if repair_trailing_record and is_final_fragment:
                     separator = data.rfind(b"\n")
                     valid_prefix = data[: separator + 1] if separator >= 0 else b""
@@ -2143,6 +2383,12 @@ class StateStore:
                 or submission.proof_passed is not intent["proof_passed"]
                 or submission.format_ok is not intent["format_ok"]
                 or submission.points != intent["points"]
+                or (
+                    submission.override.to_dict()
+                    if submission.override is not None
+                    else None
+                )
+                != intent.get("override")
                 or state.revision < int(intent["state_revision"])
             ):
                 remaining.append(intent)
@@ -2243,6 +2489,7 @@ class StateStore:
         proof_passed: bool = False,
         format_ok: bool = True,
         points: int | float | None = None,  # noqa: PYI041 - mirrors model field
+        override: SubmissionOverride | None = None,
         expected_revision: int | None = None,
     ) -> ChallengeState:
         """Persist a human-reported contest submission outcome.
@@ -2252,6 +2499,7 @@ class StateStore:
         the contest-wide JSONL record keeps the cross-challenge audit history.
         """
 
+        self.assert_mutations_allowed()
         identity = _identity(contest, category, challenge_id)
         status = (
             outcome
@@ -2434,13 +2682,14 @@ class StateStore:
                 proof_passed = existing_state_submission.proof_passed
                 format_ok = existing_state_submission.format_ok
                 points = existing_state_submission.points
+                override = existing_state_submission.override
 
             # Reject an invalid serial lifecycle request before installing a
             # durable journal. The update mutator repeats the same validation
             # so a concurrent status change cannot bypass the sink gate.
             validate_outcome_transition(before)
             history = {
-                "schema_version": CURRENT_SCHEMA_VERSION,
+                "schema_version": SUBMISSION_LEDGER_RECORD_SCHEMA_VERSION,
                 "id": submission_id,
                 "recorded_at": recorded_at,
                 **identity.to_dict(),
@@ -2457,6 +2706,10 @@ class StateStore:
                     else before.revision + 1
                 ),
             }
+            if before.schema_version >= STATE_SCHEMA_VERSION:
+                history["override"] = (
+                    override.to_dict() if override is not None else None
+                )
             # This atomic fsynced intent is installed before state.json changes.
             # It remains after any exception so the next record/status/reconcile
             # can deterministically decide whether to append or discard it.
@@ -2532,12 +2785,87 @@ class StateStore:
                         proof_passed=proof_passed,
                         format_ok=format_ok,
                         points=points,
+                        override=override,
                     )
                 )
                 if status == SubmissionStatus.ACCEPTED:
                     current_candidate.status = CandidateStatus.ACCEPTED
                     state.status = ChallengeStatus.SOLVED
                     state.resume_status = None
+                    if state.schema_version >= STATE_SCHEMA_VERSION:
+                        if state.active_goal is not None:
+                            state.active_goal.status = GoalStatus.CANCELLED
+                        state.active_goal_id = None
+                        if state.active_managed_session_id is not None:
+                            active_session = next(
+                                (
+                                    item
+                                    for item in state.sessions
+                                    if item.id
+                                    == state.active_managed_session_id
+                                ),
+                                None,
+                            )
+                            if active_session is not None:
+                                active_session.status = (
+                                    SessionStatus.COMPLETED
+                                )
+                                active_session.stop_reason = (
+                                    "manual accepted outcome"
+                                )
+                                active_session.end_revision = (
+                                    state.revision + 1
+                                )
+                                active_session.ended_at = utc_now()
+                            state.active_managed_session_id = None
+                        if state.closure is None:
+                            closure_id = (
+                                "CLOSE-submission-"
+                                + hashlib.sha256(
+                                    (
+                                        state.identity.key
+                                        + "\0"
+                                        + submission_id
+                                    ).encode("utf-8")
+                                ).hexdigest()[:16]
+                            )
+                            state.closure = ClosureBundle(
+                                id=closure_id,
+                                completeness=(
+                                    ClosureCompleteness.INCOMPLETE
+                                ),
+                                portability="referential",
+                                proof_run_ids=[
+                                    item.id
+                                    for item in state.runs
+                                    if item.role == "proof"
+                                ],
+                                submission_ids=[submission_id],
+                                target_ids=[
+                                    item.id for item in state.targets
+                                ],
+                                checkpoint_ids=[
+                                    item.id
+                                    for item in state.checkpoints
+                                ],
+                                side_effect_receipt_ids=[
+                                    item.id for item in state.receipts
+                                ],
+                                created_at=recorded_at,
+                                extra={
+                                    "automatic_incomplete": True,
+                                    "reason": (
+                                        "accepted truth was recorded before "
+                                        "closure assembly"
+                                    ),
+                                },
+                            )
+                        elif submission_id not in (
+                            state.closure.submission_ids
+                        ):
+                            state.closure.submission_ids.append(
+                                submission_id
+                            )
                 elif status == SubmissionStatus.REJECTED:
                     current_candidate.status = CandidateStatus.REJECTED
                     if state.status in {

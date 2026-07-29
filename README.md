@@ -132,6 +132,26 @@ ctfos add-challenge \
   --prompt-file ./prompts/example.txt
 ```
 
+새 문제는 state schema v2와 28,800초 wall budget으로 생성됩니다.
+`--budget-seconds N`으로 바꿀 수 있고, 무제한은
+`--unbounded --reason '운영자 사유'`를 함께 써야 합니다.
+
+정확한 flag prefix를 아는 경우 description에서 추측하게 두지 않고 안전한
+prefix-brace DSL로 고정합니다. 문제 형식이 대회 형식보다 우선하며 exact
+형식이 있으면 generic regex fallback을 사용하지 않습니다.
+
+```sh
+ctfos add-challenge 'Demo CTF' rev 'Example' \
+  --contest-flag-prefix KCTF \
+  --flag-prefix TASK \
+  --flag-alphabet alnum_ \
+  --flag-min-inner 4 --flag-max-inner 128
+```
+
+대회 형식은 첫 문제를 만들 때만 고정할 수 있고 이후 문제는 자동으로
+상속합니다. 이미 문제가 있는 대회에서는 문제별 `--flag-prefix`를
+사용합니다.
+
 생성되는 사람이 관리하는 입력 폴더는 다음과 같습니다.
 
 ```text
@@ -220,13 +240,15 @@ reset은 이미 발급된 Live/Batch/tool/proof의 `D`나 Live capability를
 ... --resume-thread THREAD_ID`로 새 deadline snapshot과 capability를
 발급받아 재개합니다.
 
-## Live 모드
+## Assisted Live 모드
 
-사람과 함께 푸는 기본 모드입니다.
+사람과 함께 푸는 초기 릴리스 기본 모드입니다. 명시적으로 쓰려면
+`--mode assisted`를 붙입니다.
 
 ```sh
 ctfos solve \
   'Demo CTF' web 'Example' \
+  --mode assisted \
   '문제 설명, URL 또는 nc 주소, 포트, 대회 규칙상 허용 범위'
 ```
 
@@ -369,13 +391,49 @@ ctfos solve 'Demo CTF' web 'Example' --resume-thread THREAD_ID
 CTF-OS는 thread ID를 자동 발견하거나 background에서 Live TUI를 다시
 붙이지 않습니다. 같은 문제의 동시 두 세션 대신 명시적 resume를 사용합니다.
 
-## Batch 모드
+## Managed 모드
+
+Managed는 사람이 선택한 한 문제에서
+`preflight → Captain → 정확히 3-role wave → deterministic action →
+Receipt → checkpoint`를 엔진이 소유합니다. 장애가 나면 assisted로
+fallback하지 않고 `PAUSED` 또는 `NEEDS_HUMAN`으로 멈춥니다.
+
+```sh
+ctfos preflight 'Demo CTF' web 'Example'
+ctfos managed-cycle 'Demo CTF' web 'Example' --note '첫 cycle'
+ctfos solve 'Demo CTF' web 'Example' --mode managed --max-cycles 8
+```
+
+provider 상한은 호출 시작만 대기시키며 예약된 논리 Run 세 개를 줄이지
+않습니다. Managed role contract v2는 command마다 열린 가설 ID,
+`expected_observation`, `keep_if`, `drop_if`, timeout/resource class와 원격
+target generation pin을 요구합니다. 이 계약 버전은 durable worker-result
+envelope 버전과 독립적으로 기록됩니다. production evaluation 정책은
+`observe`입니다. pending strategic
+evaluation은 다음 context의 최우선 evidence가 되지만 다음 cycle을 막는
+hard barrier는 X-22를 통과하기 전에는 활성화하지 않습니다. `solve`의
+기본값 역시 canary 승격 기준을 통과하기 전까지 assisted로 유지됩니다.
+
+진행 중 세션을 운영자가 끝내려면 이유와 목표 상태를 명시합니다.
+
+```sh
+ctfos session cancel 'Demo CTF' web 'Example' \
+  --reason '원격 인스턴스 교체 필요' --target NEEDS_HUMAN
+```
+
+사람이 accepted 결과를 기록하면 submission, active goal/session 종료와
+referential `incomplete` closure가 같은 state commit에 남습니다. 이후
+`ctfos close`는 이 자동 closure를 idempotent하게 완성하며, portable
+요청이 크기 한도를 넘으면 referential로 명시해 기록합니다.
+
+## Legacy Batch 모드
 
 재현 가능한 Captain → worker wave 반복에는 Batch를 사용합니다.
 
 ```sh
 ctfos run-challenge \
   'Demo CTF' web 'Example' \
+  --mode legacy \
   --max-cycles 8
 ```
 
@@ -429,6 +487,20 @@ ctfos wave 'Demo CTF' web 'Example' proof
 ctfos add-target \
   'Demo CTF' web 'Example' \
   'https://challenge.example:443'
+```
+
+state v2 managed remote 작업은 typed target을 추가한 뒤 사람이 primary를
+선택해야 합니다. replace/revoke/expiry는 configuration epoch를 올리고
+stale 결과를 의미 상태에 합치지 않습니다.
+
+```sh
+ctfos target add 'Demo CTF' web 'Example' \
+  'https://challenge.example:443' --purpose 'challenge API'
+ctfos target list 'Demo CTF' web 'Example'
+ctfos target select 'Demo CTF' web 'Example' TARGET_ID
+ctfos target check 'Demo CTF' web 'Example' TARGET_ID
+ctfos target revoke 'Demo CTF' web 'Example' TARGET_ID \
+  --reason 'challenge 종료'
 ```
 
 `--enforcement declared`가 등록 기본값이지만 실행 권한은 아닙니다. 이

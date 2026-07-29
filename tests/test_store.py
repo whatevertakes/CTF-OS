@@ -21,7 +21,10 @@ from ctf_os.models import (
     CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
+    ClosureCompleteness,
     FlagCandidate,
+    Goal,
+    GoalStatus,
     ModelValidationError,
     SubmissionStatus,
 )
@@ -967,6 +970,88 @@ class StateStoreTests(unittest.TestCase):
             CandidateStatus.ACCEPTED,
         )
         self.assertFalse(solved.submissions[0].proof_passed)
+
+    def test_v2_accepted_outcome_atomically_creates_incomplete_closure(
+        self,
+    ) -> None:
+        state = self.store.create_challenge(
+            self.identity,
+            schema_version=2,
+        )
+        state.status = ChallengeStatus.TRIAGING
+        state.goals.append(
+            Goal(
+                id="G-active",
+                description="finish the selected challenge",
+                status=GoalStatus.ACTIVE,
+            )
+        )
+        state.active_goal_id = "G-active"
+        state.candidates.append(
+            FlagCandidate(
+                id="C-v2-accepted",
+                value="flag{v2_atomic_closure}",
+                status=CandidateStatus.OBSERVED_CANDIDATE,
+            )
+        )
+        state = self.store.save(state)
+
+        contest_paths = self.store.contest_paths(
+            self.identity.contest_id
+        )
+        with (
+            mock.patch(
+                "ctf_os.store.files.append_json_line",
+                side_effect=OSError("synthetic ledger boundary crash"),
+            ),
+            self.assertRaisesRegex(OSError, "ledger boundary"),
+        ):
+            self.store.record_submission(
+                self.identity,
+                candidate_id="C-v2-accepted",
+                outcome=SubmissionStatus.ACCEPTED,
+                submission_id="SUB-v2-accepted",
+                proof_passed=True,
+                expected_revision=state.revision,
+            )
+
+        solved = self.store.load(self.identity)
+        self.assertIs(solved.status, ChallengeStatus.SOLVED)
+        self.assertIsNone(solved.active_goal_id)
+        self.assertIs(
+            solved.goals[0].status,
+            GoalStatus.CANCELLED,
+        )
+        self.assertIsNotNone(solved.closure)
+        self.assertIs(
+            solved.closure.completeness,
+            ClosureCompleteness.INCOMPLETE,
+        )
+        self.assertEqual(
+            solved.closure.submission_ids,
+            ["SUB-v2-accepted"],
+        )
+        self.assertTrue(
+            solved.closure.extra["automatic_incomplete"]
+        )
+        self.assertTrue(
+            json.loads(
+                contest_paths.submission_intents.read_text(
+                    encoding="utf-8"
+                )
+            )["intents"]
+        )
+        recovered = self.store.reconcile_submissions(
+            self.identity.contest_id
+        )
+        self.assertEqual(
+            recovered["ledger_appended"],
+            ["SUB-v2-accepted"],
+        )
+        self.assertEqual(
+            self.store.load(self.identity).closure.id,
+            solved.closure.id,
+        )
 
     def test_abandoned_challenge_cannot_be_solved_at_the_store_sink(
         self,

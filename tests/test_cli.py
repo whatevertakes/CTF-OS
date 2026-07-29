@@ -68,6 +68,54 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status, 0, errors)
         self.assertIn("28800", output)
 
+    def test_safe_contest_and_challenge_flag_formats_are_persisted(self) -> None:
+        status, _, errors = self.run_cli(
+            [
+                "add-challenge",
+                *self.identity,
+                "--prompt",
+                "solve",
+                "--contest-flag-prefix",
+                "KCTF",
+                "--flag-prefix",
+                "TASK",
+                "--flag-alphabet",
+                "alnum_",
+                "--flag-min-inner",
+                "4",
+                "--flag-max-inner",
+                "64",
+            ]
+        )
+        self.assertEqual(status, 0, errors)
+        store = StateStore(self.root)
+        first = store.load(ChallengeIdentity(*self.identity))
+        self.assertEqual(
+            first.metadata["challenge_flag_format"]["prefix"],
+            "TASK",
+        )
+        self.assertEqual(
+            first.metadata["contest_flag_format"]["prefix"],
+            "KCTF",
+        )
+
+        second_identity = (self.identity[0], "web", "문제 2")
+        status, _, errors = self.run_cli(
+            [
+                "add-challenge",
+                *second_identity,
+                "--prompt",
+                "solve second",
+            ]
+        )
+        self.assertEqual(status, 0, errors)
+        second = store.load(ChallengeIdentity(*second_identity))
+        self.assertNotIn("challenge_flag_format", second.metadata)
+        self.assertEqual(
+            second.metadata["contest_flag_format"]["prefix"],
+            "KCTF",
+        )
+
     def test_plain_status_escapes_model_control_characters(self) -> None:
         self.add()
         engine = ChallengeEngine(self.root)

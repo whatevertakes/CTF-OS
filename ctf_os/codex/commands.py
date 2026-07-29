@@ -102,6 +102,7 @@ class BatchInvocation:
     timeout_seconds: float | None = None
     deadline_epoch_seconds: float | None = None
     deadline_monotonic_seconds: float | None = None
+    contract_version: int = 1
 
     def __post_init__(self) -> None:
         if not self.run_id or "/" in self.run_id or "\\" in self.run_id:
@@ -141,6 +142,11 @@ class BatchInvocation:
             raise ValueError(
                 "deadline_monotonic_seconds must be positive and finite"
             )
+        if (
+            isinstance(self.contract_version, bool)
+            or self.contract_version not in {1, 2}
+        ):
+            raise ValueError("contract_version must be 1 or 2")
 
 
 @dataclass(frozen=True)

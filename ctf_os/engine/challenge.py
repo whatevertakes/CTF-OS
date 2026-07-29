@@ -19,6 +19,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -71,6 +72,7 @@ from ctf_os.governor import (
     attempted_recovery_actions,
     evaluate_stall,
 )
+from ctf_os.flag_formats import resolve_flag_format, validate_flag_format
 from ctf_os.live_broker import (
     LIVE_BROKER_DIRECTORY_ENV,
     LIVE_SCOPE_CAPABILITY_ENV,
@@ -82,12 +84,15 @@ from ctf_os.live_broker import (
 from ctf_os.models import (
     ArtifactReference,
     Budget,
+    BudgetMode,
     CandidateStatus,
     ChallengeIdentity,
     ChallengeState,
     ChallengeStatus,
     Experiment,
+    ExperimentKind,
     ExperimentStatus,
+    ExecutionReceipt,
     Fact,
     Falsifier,
     FlagCandidate,
@@ -98,10 +103,21 @@ from ctf_os.models import (
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
     ProgressMarker,
     Provenance,
+    ReceiptOutcome,
+    RunOrigin,
     RunReference,
     RunStatus,
+    SessionStatus,
     SourceFile,
+    SubmissionOverride,
+    TargetRecord,
+    TargetStatus,
     utc_now,
+)
+from ctf_os.schema import (
+    MANAGED_ROLE_RESULT_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    WORKER_RESULT_SCHEMA_VERSION,
 )
 from ctf_os.process import run_bounded_interactive
 from ctf_os.remote_limiter import (
@@ -141,7 +157,13 @@ from ctf_os.store import (
     WorkerResultValidationError,
     sha256_file,
 )
-from ctf_os.store.atomic import atomic_write_json, atomic_write_text
+from ctf_os.store.atomic import (
+    StrictJSONError,
+    atomic_write_json,
+    atomic_write_text,
+    read_json,
+)
+from ctf_os.store.locks import FileLock
 
 
 class EngineError(RuntimeError):
@@ -384,6 +406,51 @@ class ChallengeEngine:
             raise EngineError("challenge input escapes incoming/") from error
         return candidate
 
+    def _contest_flag_format(
+        self,
+        identity: ChallengeIdentity,
+        proposed: Mapping[str, Any] | None,
+    ) -> object | None:
+        """Read or set one immutable contest-wide flag-format default."""
+
+        if proposed is not None:
+            validate_flag_format(proposed)
+        paths = self.store.initialize_contest(identity.contest_id)
+        with FileLock(
+            paths.runtime / "flag-format.lock"
+        ) as format_lock:
+            format_lock.acquire()
+            manifest = read_json(paths.contest_json)
+            if not isinstance(manifest, dict):
+                raise EngineError("contest manifest must be an object")
+            metadata = manifest.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise EngineError("contest manifest metadata is corrupt")
+            existing = metadata.get("flag_format")
+            if existing is not None:
+                validate_flag_format(existing)
+            if proposed is None:
+                return copy.deepcopy(existing)
+            normalized = dict(proposed)
+            if existing is not None and existing != normalized:
+                raise EngineError(
+                    "contest flag format is immutable after it is set"
+                )
+            if existing is None:
+                existing_states = tuple(
+                    paths.challenges.glob("*/*/state.json")
+                )
+                if existing_states:
+                    raise EngineError(
+                        "set a contest flag format before creating its first "
+                        "challenge; use a challenge format for existing states"
+                    )
+                metadata["flag_format"] = normalized
+                manifest["metadata"] = metadata
+                manifest["updated_at"] = utc_now()
+                atomic_write_json(paths.contest_json, manifest)
+            return copy.deepcopy(normalized)
+
     def add_challenge(
         self,
         identity: ChallengeIdentity,
@@ -392,6 +459,10 @@ class ChallengeEngine:
         prompt: str = "",
         targets: Sequence[str] = (),
         budget_seconds: int | None = None,
+        unbounded_reason: str | None = None,
+        challenge_flag_format: Mapping[str, Any] | None = None,
+        contest_flag_format: Mapping[str, Any] | None = None,
+        state_schema_version: int = 1,
         _session_owned: bool = False,
     ) -> ChallengeState:
         """Create the human-owned input folder and durable engine state."""
@@ -414,6 +485,10 @@ class ChallengeEngine:
                         prompt=prompt,
                         targets=targets,
                         budget_seconds=budget_seconds,
+                        unbounded_reason=unbounded_reason,
+                        challenge_flag_format=challenge_flag_format,
+                        contest_flag_format=contest_flag_format,
+                        state_schema_version=state_schema_version,
                         _session_owned=True,
                     )
             except LockTimeout as error:
@@ -430,20 +505,43 @@ class ChallengeEngine:
             ) from error
         if not challenge_dir.is_dir():
             raise EngineError(f"challenge path is not a directory: {challenge_dir}")
+        if challenge_flag_format is not None:
+            validate_flag_format(challenge_flag_format)
+        inherited_contest_flag_format = self._contest_flag_format(
+            identity,
+            contest_flag_format,
+        )
         metadata: dict[str, Any] = {}
         if not state_was_present:
             metadata["adapter_name"] = adapter.name
             metadata["failure_labels"] = list(adapter.failure_labels())
+        if challenge_flag_format is not None:
+            metadata["challenge_flag_format"] = dict(
+                challenge_flag_format
+            )
+        if inherited_contest_flag_format is not None:
+            metadata["contest_flag_format"] = copy.deepcopy(
+                inherited_contest_flag_format
+            )
         if targets:
             # Parsing is deferred to the sandbox type so malformed targets fail
             # before any network-enabled container can be started.
             from ctf_os.sandbox import NetworkTarget
 
-            metadata["network_targets"] = [
+            parsed_targets = [
                 NetworkTarget.parse(target).as_text() for target in targets
             ]
-            metadata["docker_network"] = "bridge"
-            metadata["network_enforcement"] = "declared"
+            if state_schema_version < STATE_SCHEMA_VERSION:
+                metadata["network_targets"] = parsed_targets
+                metadata["docker_network"] = "bridge"
+                metadata["network_enforcement"] = "declared"
+        if (
+            not state_was_present
+            and state_schema_version >= STATE_SCHEMA_VERSION
+            and budget_seconds is None
+            and unbounded_reason is None
+        ):
+            budget_seconds = 8 * 60 * 60
         budget_deadline = (
             deadline_utc_after(budget_seconds)
             if budget_seconds is not None
@@ -453,9 +551,17 @@ class ChallengeEngine:
             Budget(
                 deadline_utc=budget_deadline,
                 allocated_seconds=budget_seconds,
+                mode=BudgetMode.BOUNDED,
             )
             if budget_seconds is not None
-            else None
+            else Budget(
+                mode=(
+                    BudgetMode.OPERATOR_UNBOUNDED
+                    if unbounded_reason is not None
+                    else BudgetMode.LEGACY_UNARMED
+                ),
+                unbounded_reason=unbounded_reason,
+            )
         )
         state = self.store.create_challenge(
             identity,
@@ -464,21 +570,83 @@ class ChallengeEngine:
             source_path=str(challenge_dir.relative_to(self.config.workspace_root)),
             metadata=metadata,
             budget=budget,
+            schema_version=state_schema_version,
         )
 
         def update_operator_fields(current: ChallengeState) -> None:
+            format_changed = False
             if description:
                 current.description = description
             if prompt:
                 current.prompt = prompt
+            for key, value in (
+                ("challenge_flag_format", challenge_flag_format),
+                (
+                    "contest_flag_format",
+                    inherited_contest_flag_format,
+                ),
+            ):
+                if (
+                    value is not None
+                    and current.metadata.get(key) != value
+                ):
+                    current.metadata[key] = copy.deepcopy(value)
+                    format_changed = True
+            if (
+                format_changed
+                and current.schema_version >= STATE_SCHEMA_VERSION
+            ):
+                current.configuration_epoch += 1
+                self._invalidate_active_managed_session(
+                    current,
+                    "flag format changed",
+                )
             if targets:
-                current.metadata.update(metadata)
+                if current.schema_version >= STATE_SCHEMA_VERSION:
+                    for endpoint in parsed_targets:
+                        if any(
+                            item.endpoint == endpoint
+                            and item.generation == 1
+                            for item in current.targets
+                        ):
+                            continue
+                        current.targets.append(
+                            TargetRecord(
+                                id=_record_id("T", endpoint, "1"),
+                                endpoint=endpoint,
+                                status=TargetStatus.ACTIVE,
+                                enforcement="declared",
+                                docker_network="bridge",
+                                purpose="challenge remote",
+                                generation=1,
+                                provenance="operator",
+                            )
+                        )
+                        current.configuration_epoch += 1
+                else:
+                    current.metadata.update(metadata)
             if budget_seconds is not None:
                 current.budget.deadline_utc = budget_deadline
                 current.budget.allocated_seconds = budget_seconds
                 current.budget.spent_seconds = 0
+                current.budget.mode = BudgetMode.BOUNDED
+                current.budget.unbounded_reason = None
+            elif unbounded_reason is not None:
+                current.budget.deadline_utc = None
+                current.budget.allocated_seconds = None
+                current.budget.spent_seconds = 0
+                current.budget.mode = BudgetMode.OPERATOR_UNBOUNDED
+                current.budget.unbounded_reason = unbounded_reason
 
-        if description or prompt or targets or budget_seconds is not None:
+        if (
+            description
+            or prompt
+            or targets
+            or budget_seconds is not None
+            or unbounded_reason is not None
+            or challenge_flag_format is not None
+            or inherited_contest_flag_format is not None
+        ):
             state = self.store.update(state.identity, update_operator_fields)
         state = self.refresh_ingest(state.identity)
         if not state_was_present:
@@ -536,6 +704,7 @@ class ChallengeEngine:
                             int(spec.timeout_s),
                         ),
                         resource_class=spec.resource_class,
+                        kind=ExperimentKind.PROBE,
                         status=ExperimentStatus.REGISTERED,
                         extra={
                             "adapter_seed": True,
@@ -556,6 +725,8 @@ class ChallengeEngine:
         *,
         docker_network: str = "bridge",
         enforcement: str = "declared",
+        purpose: str = "challenge remote",
+        expires_at: str | None = None,
     ) -> ChallengeState:
         parsed = NetworkTarget.parse(target)
         # Constructing the policy validates network/enforcement together.
@@ -566,6 +737,43 @@ class ChallengeEngine:
         )
 
         def apply(state: ChallengeState) -> None:
+            if state.schema_version >= STATE_SCHEMA_VERSION:
+                generation = 1 + max(
+                    (
+                        item.generation
+                        for item in state.targets
+                        if item.endpoint == parsed.as_text()
+                    ),
+                    default=0,
+                )
+                target_id = _record_id(
+                    "T",
+                    parsed.as_text(),
+                    str(generation),
+                )
+                if any(item.id == target_id for item in state.targets):
+                    return
+                if expires_at is not None:
+                    self._parse_target_timestamp(expires_at)
+                state.targets.append(
+                    TargetRecord(
+                        id=target_id,
+                        endpoint=parsed.as_text(),
+                        status=TargetStatus.ACTIVE,
+                        enforcement=enforcement,
+                        docker_network=docker_network,
+                        purpose=purpose,
+                        generation=generation,
+                        provenance="operator",
+                        expires_at=expires_at,
+                    )
+                )
+                state.configuration_epoch += 1
+                self._invalidate_active_managed_session(
+                    state,
+                    "target record added",
+                )
+                return
             targets = state.metadata.setdefault("network_targets", [])
             if not isinstance(targets, list):
                 raise EngineError("network_targets metadata is corrupt")
@@ -574,6 +782,214 @@ class ChallengeEngine:
                 targets.append(canonical)
             state.metadata["docker_network"] = docker_network
             state.metadata["network_enforcement"] = enforcement
+
+        return self.store.update(identity, apply)
+
+    @staticmethod
+    def _parse_target_timestamp(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise EngineError(
+                "target expiry must be an ISO-8601 timestamp"
+            ) from error
+        if parsed.tzinfo is None:
+            raise EngineError("target expiry must include a timezone")
+        return parsed.astimezone(UTC)
+
+    @classmethod
+    def _target_is_expired(cls, target: TargetRecord) -> bool:
+        return (
+            target.expires_at is not None
+            and cls._parse_target_timestamp(target.expires_at)
+            <= datetime.now(UTC)
+        )
+
+    @staticmethod
+    def _invalidate_active_managed_session(
+        state: ChallengeState,
+        reason: str,
+    ) -> None:
+        session_id = state.active_managed_session_id
+        if session_id is None:
+            return
+        session = next(
+            (item for item in state.sessions if item.id == session_id),
+            None,
+        )
+        if session is not None:
+            session.status = SessionStatus.PAUSED
+            session.stop_reason = reason
+            session.end_revision = state.revision + 1
+            session.ended_at = utc_now()
+        state.active_managed_session_id = None
+        if state.status not in {
+            ChallengeStatus.PAUSED,
+            ChallengeStatus.SOLVED,
+            ChallengeStatus.ABANDONED,
+        }:
+            state.resume_status = state.status
+            state.status = ChallengeStatus.PAUSED
+
+    def select_network_target(
+        self,
+        identity: ChallengeIdentity,
+        target_id: str,
+    ) -> ChallengeState:
+        """Select one active typed target for managed remote execution."""
+
+        def apply(state: ChallengeState) -> None:
+            if state.schema_version < STATE_SCHEMA_VERSION:
+                raise EngineError("typed target selection requires state v2")
+            target = next(
+                (item for item in state.targets if item.id == target_id),
+                None,
+            )
+            if target is None:
+                raise EngineError(f"unknown target: {target_id}")
+            if target.status is not TargetStatus.ACTIVE:
+                raise EngineError(f"target is not active: {target_id}")
+            if self._target_is_expired(target):
+                target.status = TargetStatus.EXPIRED
+                raise EngineError(f"target is expired: {target_id}")
+            if state.primary_target_id == target.id:
+                return
+            state.primary_target_id = target.id
+            state.configuration_epoch += 1
+            self._invalidate_active_managed_session(
+                state,
+                "primary target changed",
+            )
+
+        return self.store.update(identity, apply)
+
+    def revoke_network_target(
+        self,
+        identity: ChallengeIdentity,
+        target_id: str,
+        *,
+        reason: str,
+    ) -> ChallengeState:
+        if not reason.strip():
+            raise EngineError("target revoke reason is required")
+
+        def apply(state: ChallengeState) -> None:
+            target = next(
+                (item for item in state.targets if item.id == target_id),
+                None,
+            )
+            if target is None:
+                raise EngineError(f"unknown target: {target_id}")
+            if target.status is TargetStatus.REVOKED:
+                if target.revoke_reason != reason:
+                    raise EngineError(
+                        "target is already revoked with a different reason"
+                    )
+                return
+            target.status = TargetStatus.REVOKED
+            target.revoked_at = utc_now()
+            target.revoke_reason = reason
+            if state.primary_target_id == target.id:
+                state.primary_target_id = None
+            state.configuration_epoch += 1
+            self._invalidate_active_managed_session(
+                state,
+                "target revoked",
+            )
+
+        return self.store.update(identity, apply)
+
+    def replace_network_target(
+        self,
+        identity: ChallengeIdentity,
+        target_id: str,
+        endpoint: str,
+        *,
+        reason: str,
+        purpose: str = "challenge remote",
+        expires_at: str | None = None,
+    ) -> ChallengeState:
+        parsed = NetworkTarget.parse(endpoint)
+        if not reason.strip():
+            raise EngineError("target replacement reason is required")
+        if expires_at is not None:
+            self._parse_target_timestamp(expires_at)
+
+        def apply(state: ChallengeState) -> None:
+            old = next(
+                (item for item in state.targets if item.id == target_id),
+                None,
+            )
+            if old is None:
+                raise EngineError(f"unknown target: {target_id}")
+            if old.status is not TargetStatus.ACTIVE:
+                raise EngineError(f"target is not active: {target_id}")
+            old.status = TargetStatus.REVOKED
+            old.revoked_at = utc_now()
+            old.revoke_reason = reason
+            generation = 1 + max(
+                (
+                    item.generation
+                    for item in state.targets
+                    if item.endpoint == parsed.as_text()
+                ),
+                default=0,
+            )
+            replacement = TargetRecord(
+                id=_record_id("T", parsed.as_text(), str(generation)),
+                endpoint=parsed.as_text(),
+                status=TargetStatus.ACTIVE,
+                enforcement=old.enforcement,
+                docker_network=old.docker_network,
+                purpose=purpose,
+                generation=generation,
+                provenance="operator_replace",
+                expires_at=expires_at,
+                extra={"replaces": old.id},
+            )
+            state.targets.append(replacement)
+            if state.primary_target_id == old.id:
+                state.primary_target_id = None
+            state.configuration_epoch += 1
+            self._invalidate_active_managed_session(
+                state,
+                "target replaced; select the replacement explicitly",
+            )
+
+        return self.store.update(identity, apply)
+
+    def check_network_target(
+        self,
+        identity: ChallengeIdentity,
+        target_id: str,
+    ) -> ChallengeState:
+        """Record a local fail-closed lifecycle check without remote traffic."""
+
+        def apply(state: ChallengeState) -> None:
+            target = next(
+                (item for item in state.targets if item.id == target_id),
+                None,
+            )
+            if target is None:
+                raise EngineError(f"unknown target: {target_id}")
+            expired = self._target_is_expired(target)
+            if expired and target.status is TargetStatus.ACTIVE:
+                target.status = TargetStatus.EXPIRED
+                if state.primary_target_id == target.id:
+                    state.primary_target_id = None
+                state.configuration_epoch += 1
+                self._invalidate_active_managed_session(
+                    state,
+                    "target expired",
+                )
+            target.last_preflight = {
+                "checked_at": utc_now(),
+                "ok": (
+                    target.status is TargetStatus.ACTIVE and not expired
+                ),
+                "generation": target.generation,
+                "remote_request_performed": False,
+            }
 
         return self.store.update(identity, apply)
 
@@ -729,12 +1145,13 @@ class ChallengeEngine:
                 "model session"
             )
 
-    @staticmethod
     def _require_model_work_allowed(
+        self,
         state: ChallengeState,
         *,
         automated: bool = False,
     ) -> None:
+        self.store.assert_mutations_allowed()
         blocked = (
             _AUTOMATED_LOOP_STOP_STATUSES
             if automated
@@ -766,6 +1183,219 @@ class ChallengeEngine:
             )
         except EngineError as error:
             raise ModelCallLimitCancelled(str(error)) from error
+
+    def _mark_reserved_run_running(
+        self,
+        identity: ChallengeIdentity,
+        run_id: str,
+    ) -> None:
+        """Record provider start only after the limiter grants this invocation."""
+
+        state = self.store.load(identity)
+        run = next(
+            (item for item in state.runs if item.id == run_id),
+            None,
+        )
+        if run is None or run.origin is not RunOrigin.MANAGED_MODEL:
+            raise EngineError(f"managed run was not reserved: {run_id}")
+        if run.status is not RunStatus.CREATED:
+            raise EngineError(
+                f"managed run cannot start from {run.status.value}: {run_id}"
+            )
+        if (
+            run.configuration_epoch != state.configuration_epoch
+            or run.session_id != state.active_managed_session_id
+        ):
+            raise EngineError(f"managed run reservation is stale: {run_id}")
+        # Provider admission is durable but does not advance semantic state.
+        # This keeps the issued snapshot revision stable while still allowing
+        # recovery to distinguish never-started from provider-started calls.
+        atomic_write_json(
+            self.store.run_paths(identity, run_id=run_id).root
+            / "provider.json",
+            {
+                "status": "running",
+                "run_id": run_id,
+                "configuration_epoch": state.configuration_epoch,
+                "started_at": utc_now(),
+            },
+        )
+
+    @staticmethod
+    def _batch_result_run_status(result: BatchResult) -> RunStatus:
+        if result.completed and result.validation.valid:
+            return RunStatus.COMPLETED
+        if result.completed:
+            return RunStatus.INVALID
+        if result.attempts and result.attempts[-1].timed_out:
+            return RunStatus.TIMED_OUT
+        return RunStatus.FAILED
+
+    def _persist_reserved_run_terminal(
+        self,
+        identity: ChallengeIdentity,
+        result: BatchResult,
+    ) -> ChallengeState:
+        """Durably terminalize one managed result before its wave reduction."""
+
+        state = self.store.load(identity)
+        reserved = next(
+            (
+                run
+                for run in state.runs
+                if run.id == result.invocation.run_id
+            ),
+            None,
+        )
+        if reserved is None or reserved.origin is not RunOrigin.MANAGED_MODEL:
+            raise EngineError(
+                f"managed run was not reserved: {result.invocation.run_id}"
+            )
+        if reserved.status in {
+            RunStatus.COMPLETED,
+            RunStatus.INVALID,
+            RunStatus.FAILED,
+            RunStatus.TIMED_OUT,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }:
+            if reserved.extra.get("provisional_managed_terminal") is True:
+                return state
+            raise EngineError(
+                f"managed run is already terminal: {reserved.id}"
+            )
+
+        run_paths = self.store.run_paths(identity, run_id=reserved.id)
+        challenge_root = self.store.challenge_paths(identity).root
+        status = self._batch_result_run_status(result)
+        attempt_pointer: str | None = None
+        if result.attempts:
+            try:
+                attempt_pointer = result.attempts[-1].output_path.relative_to(
+                    challenge_root
+                ).as_posix()
+            except ValueError:
+                attempt_pointer = None
+        self.store.write_run_result(
+            identity,
+            reserved.id,
+            {
+                "base_revision": reserved.base_revision,
+                "status": status.value,
+                "provisional_managed_result": True,
+                "attempt_output_path": attempt_pointer,
+                "attempt_count": len(result.attempts),
+                "artifacts": [],
+                "flag_candidate_count": len(result.flag_candidates),
+                "failure_kinds": [
+                    failure.kind for failure in result.failures
+                ],
+            },
+        )
+        self.store.write_run_validation(
+            identity,
+            reserved.id,
+            {
+                "ok": (
+                    result.completed
+                    and result.validation.valid
+                ),
+                "base_revision": reserved.base_revision,
+                "errors": list(result.validation.errors),
+                "provisional_managed_result": True,
+            },
+        )
+
+        current = self.store.load(identity)
+
+        def apply(latest: ChallengeState) -> None:
+            run = next(
+                item for item in latest.runs if item.id == reserved.id
+            )
+            if run.status in {
+                RunStatus.COMPLETED,
+                RunStatus.INVALID,
+                RunStatus.FAILED,
+                RunStatus.TIMED_OUT,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            }:
+                if run.extra.get("provisional_managed_terminal") is True:
+                    return
+                raise EngineError(
+                    f"managed run is already terminal: {run.id}"
+                )
+            stale = (
+                run.configuration_epoch != latest.configuration_epoch
+                or run.session_id != latest.active_managed_session_id
+                or latest.status in _AUTOMATED_LOOP_STOP_STATUSES
+            )
+            run.status = RunStatus.INTERRUPTED if stale else status
+            run.request_path = run_paths.request.relative_to(
+                challenge_root
+            ).as_posix()
+            run.result_path = run_paths.result.relative_to(
+                challenge_root
+            ).as_posix()
+            run.validation_path = run_paths.validation.relative_to(
+                challenge_root
+            ).as_posix()
+            run.context_hash = self._request_context_hash(
+                run_paths.request
+            )
+            run.extra.update(
+                {
+                    "provider_wait_seconds": (
+                        result.timing.provider_wait_seconds
+                    ),
+                    "usage": {
+                        "input_tokens": result.usage.input_tokens,
+                        "cached_input_tokens": (
+                            result.usage.cached_input_tokens
+                        ),
+                        "output_tokens": result.usage.output_tokens,
+                        "reasoning_output_tokens": (
+                            result.usage.reasoning_output_tokens
+                        ),
+                    },
+                    "thread_id": result.thread_id,
+                    "contract_valid": result.validation.valid,
+                    "provisional_managed_terminal": True,
+                    "semantic_merge": False,
+                    "stale_managed_result": stale,
+                    "provider_completed_at": utc_now(),
+                }
+            )
+            if run.wave_id is not None:
+                wave = next(
+                    item
+                    for item in latest.waves
+                    if item.id == run.wave_id
+                )
+                statuses = {
+                    item.status
+                    for item in latest.runs
+                    if item.id in wave.role_run_ids.values()
+                }
+                terminal = {
+                    RunStatus.COMPLETED,
+                    RunStatus.INVALID,
+                    RunStatus.FAILED,
+                    RunStatus.TIMED_OUT,
+                    RunStatus.CANCELLED,
+                    RunStatus.INTERRUPTED,
+                }
+                wave.status = (
+                    "ready_to_reduce"
+                    if len(statuses) == 3 and statuses <= terminal
+                    else "running"
+                )
+
+        return self.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
 
     @staticmethod
     def _require_live_mutation_allowed(state: ChallengeState) -> None:
@@ -941,9 +1571,17 @@ class ChallengeEngine:
             state.budget.deadline_utc = deadline_utc_after(seconds)
             state.budget.allocated_seconds = seconds
             state.budget.spent_seconds = 0
+            state.budget.mode = BudgetMode.BOUNDED
+            state.budget.unbounded_reason = None
             state.budget.no_progress_since_seconds = None
             state.budget.refusals.clear()
             state.metadata["budget_reset_at"] = utc_now()
+            if state.schema_version >= STATE_SCHEMA_VERSION:
+                state.configuration_epoch += 1
+                self._invalidate_active_managed_session(
+                    state,
+                    "budget reset",
+                )
 
         return self.store.update(identity, apply)
 
@@ -1000,6 +1638,30 @@ class ChallengeEngine:
         return workspace
 
     def _network_policy(self, state: ChallengeState) -> NetworkPolicy:
+        if state.schema_version >= STATE_SCHEMA_VERSION:
+            if state.primary_target_id is None:
+                return NetworkPolicy.deny_all()
+            target = next(
+                (
+                    item
+                    for item in state.targets
+                    if item.id == state.primary_target_id
+                ),
+                None,
+            )
+            if (
+                target is None
+                or target.status is not TargetStatus.ACTIVE
+                or self._target_is_expired(target)
+            ):
+                raise EngineError(
+                    "selected target is unavailable, revoked, or expired"
+                )
+            return NetworkPolicy.allow(
+                (NetworkTarget.parse(target.endpoint),),
+                docker_network=target.docker_network,
+                enforcement=target.enforcement,
+            )
         targets = state.metadata.get("network_targets", [])
         if not targets:
             return NetworkPolicy.deny_all()
@@ -1017,8 +1679,57 @@ class ChallengeEngine:
             ),
         )
 
-    def sandbox(self, state: ChallengeState) -> ChallengeSandboxClient:
-        workspace = self._workspace(state)
+    def _require_experiment_target_current(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> None:
+        target_value = experiment.extra.get("network_target")
+        if target_value is None:
+            return
+        parsed = NetworkTarget.parse(str(target_value))
+        if state.schema_version < STATE_SCHEMA_VERSION:
+            self._network_policy(state).authorize(parsed)
+            return
+        target_id = experiment.extra.get("network_target_id")
+        generation = experiment.extra.get("network_target_generation")
+        epoch = experiment.extra.get("configuration_epoch")
+        if (
+            not isinstance(target_id, str)
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+        ):
+            raise EngineError(
+                "remote experiment lacks a typed target/generation pin"
+            )
+        target = next(
+            (item for item in state.targets if item.id == target_id),
+            None,
+        )
+        if (
+            epoch != state.configuration_epoch
+            or state.primary_target_id != target_id
+            or target is None
+            or target.status is not TargetStatus.ACTIVE
+            or target.generation != generation
+            or target.endpoint != parsed.as_text()
+            or self._target_is_expired(target)
+        ):
+            raise EngineError(
+                "remote experiment target, generation, or configuration "
+                "epoch is stale"
+            )
+        self._network_policy(state).authorize(parsed)
+
+    def sandbox(
+        self,
+        state: ChallengeState,
+        *,
+        workspace_override: Path | None = None,
+    ) -> ChallengeSandboxClient:
+        workspace = workspace_override or self._workspace(state)
         policy = self._network_policy(state)
         if self._sandbox_factory is not None:
             return self._sandbox_factory(state, workspace, policy)
@@ -1040,6 +1751,102 @@ class ChallengeEngine:
                 )
             ),
         )
+
+    def _managed_action_workspace(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> Path | None:
+        session_id = state.active_managed_session_id
+        if session_id is None:
+            return None
+        cycle = next(
+            (
+                item
+                for item in reversed(state.cycles)
+                if item.session_id == session_id
+                and experiment.id in item.selected_action_ids
+            ),
+            None,
+        )
+        if cycle is None:
+            raise EngineError(
+                "managed tool action is not bound to a durable cycle"
+            )
+        work = (
+            self.store.challenge_paths(state.identity).runtime
+            / "staging"
+            / session_id
+            / cycle.id
+            / experiment.id
+            / "work"
+        )
+        work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return work
+
+    def _quarantine_managed_action_stage(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+    ) -> Path | None:
+        """Move a failed managed action tree out of the runnable staging lane."""
+
+        cycle = next(
+            (
+                item
+                for item in reversed(state.cycles)
+                if experiment_id in item.selected_action_ids
+            ),
+            None,
+        )
+        if cycle is None:
+            return None
+        paths = self.store.challenge_paths(state.identity)
+        source = (
+            paths.runtime
+            / "staging"
+            / cycle.session_id
+            / cycle.id
+            / experiment_id
+        )
+        try:
+            source_metadata = source.lstat()
+        except FileNotFoundError:
+            return None
+        if source.is_symlink() or not source.is_dir():
+            raise EngineError(
+                "managed action stage is not a private directory"
+            )
+        destination_parent = (
+            paths.runtime
+            / "quarantine"
+            / "stages"
+            / cycle.session_id
+            / cycle.id
+        )
+        destination_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if source_metadata.st_dev != destination_parent.stat().st_dev:
+            raise EngineError(
+                "managed action quarantine must remain on one filesystem"
+            )
+        destination = (
+            destination_parent
+            / f"{experiment_id}-{uuid.uuid4().hex}"
+        )
+        os.replace(source, destination)
+        atomic_write_json(
+            destination / "quarantine.json",
+            {
+                "schema_version": 1,
+                "experiment_id": experiment_id,
+                "session_id": cycle.session_id,
+                "cycle_id": cycle.id,
+                "state_revision": state.revision,
+                "quarantined_at": utc_now(),
+                "automatic_restore": False,
+            },
+        )
+        return destination
 
     def _write_live_files(
         self, state: ChallengeState
@@ -1101,6 +1908,10 @@ class ChallengeEngine:
         self._require_solving_prompt(state)
         self._remaining_budget_seconds(state)
         client = self.sandbox(state)
+        flag_policy = resolve_flag_format(
+            state,
+            self.config.runtime.flag_patterns,
+        )
         initialization_request = tool_profile("light")
         lease = self.lease_broker.acquire(
             initialization_request,
@@ -1345,6 +2156,13 @@ class ChallengeEngine:
             return
         source = str(candidate.source)
         observed_at = utc_now()
+        state = self.store.load(identity)
+        policy = resolve_flag_format(
+            state,
+            self.config.runtime.flag_patterns,
+        )
+        if policy.source != "runtime" and not policy.matches(value):
+            return
         print_key = (
             identity.contest_id,
             identity.category,
@@ -1362,6 +2180,8 @@ class ChallengeEngine:
                 value=value,
                 source=source,
                 observed_at=observed_at,
+                tier=policy.tier_for(value),
+                format_epoch=policy.configuration_epoch,
             )
             print_flag_candidate(
                 DetectedFlag(value, source, observed_at)
@@ -1377,9 +2197,16 @@ class ChallengeEngine:
         instruction: str,
         deadline_monotonic_seconds: float,
         deadline_epoch_seconds: float,
+        run_id: str | None = None,
+        managed_workspace: bool = False,
     ) -> BatchInvocation:
         self._require_model_work_allowed(state)
-        run_id = _run_id(f"{prefix}-{role.value}")
+        run_id = run_id or _run_id(f"{prefix}-{role.value}")
+        contract_version = (
+            MANAGED_ROLE_RESULT_SCHEMA_VERSION
+            if managed_workspace
+            else 1
+        )
         reasoning_effort = ReasoningEffort(
             self.config.models.captain_effort
             if role is Role.CAPTAIN
@@ -1394,6 +2221,8 @@ class ChallengeEngine:
                 "model": self._model_for_role(role),
                 "reasoning_effort": reasoning_effort.value,
                 "state_revision": state.revision,
+                "configuration_epoch": state.configuration_epoch,
+                "contract_version": contract_version,
             },
             base_revision=state.revision,
         )
@@ -1403,7 +2232,9 @@ class ChallengeEngine:
             state_path=self.store.challenge_paths(state.identity).state,
             role=role.value,
         )
-        request_payload = json.loads(paths.request.read_text(encoding="utf-8"))
+        request_payload = read_json(paths.request)
+        if not isinstance(request_payload, dict):
+            raise EngineError("run request must be a JSON object")
         request_payload["context_sha256"] = context.sha256
         atomic_write_json(paths.request, request_payload)
         prompt = "\n\n".join(
@@ -1414,19 +2245,34 @@ class ChallengeEngine:
                     "Propose state changes only through the required JSON "
                     "contract. Do not edit state.json and do not submit flags."
                 ),
+                (
+                    "For each managed command action, name only open "
+                    "canonical or locally proposed hypotheses, provide "
+                    "expected_observation/keep_if/drop_if, and use the "
+                    "selected target id and generation for remote work. "
+                    "Use an empty hypothesis_ids array for a probe."
+                    if managed_workspace
+                    else ""
+                ),
             )
         )
+        if managed_workspace:
+            working_directory = paths.root / "workspace"
+            working_directory.mkdir(mode=0o700)
+        else:
+            working_directory = self._role_workspace(state, role)
         return BatchInvocation(
             run_id=run_id,
             role=role,
             prompt=prompt,
-            working_directory=self._role_workspace(state, role),
+            working_directory=working_directory,
             output_directory=paths.root,
             model_id=self._model_for_role(role),
             reasoning_effort=reasoning_effort,
             timeout_seconds=self.config.runtime.wave_deadline_s,
             deadline_epoch_seconds=deadline_epoch_seconds,
             deadline_monotonic_seconds=deadline_monotonic_seconds,
+            contract_version=contract_version,
         )
 
     def run_role(
@@ -1438,6 +2284,8 @@ class ChallengeEngine:
         prefix: str | None = None,
         _session_owned: bool = False,
         _automated: bool = False,
+        _reserved_run_id: str | None = None,
+        _managed_workspace: bool = False,
     ) -> BatchResult:
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -1455,6 +2303,8 @@ class ChallengeEngine:
                         prefix=prefix,
                         _session_owned=True,
                         _automated=_automated,
+                        _reserved_run_id=_reserved_run_id,
+                        _managed_workspace=_managed_workspace,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -1480,20 +2330,37 @@ class ChallengeEngine:
             instruction=instruction,
             deadline_monotonic_seconds=deadline_monotonic_seconds,
             deadline_epoch_seconds=deadline_epoch_seconds,
+            run_id=_reserved_run_id,
+            managed_workspace=_managed_workspace,
         )
+        def before_provider_start() -> None:
+            self._before_provider_start(
+                identity,
+                automated=_automated,
+            )
+            if _reserved_run_id is not None:
+                self._mark_reserved_run_running(
+                    identity,
+                    _reserved_run_id,
+                )
+
         result = self.batch_runner.run(
             invocation,
             on_flag=lambda candidate: self._print_codex_flag(
                 identity,
                 candidate,
             ),
-            before_provider_start=lambda: self._before_provider_start(
-                identity,
-                automated=_automated,
-            ),
+            before_provider_start=before_provider_start,
+        )
+        if _reserved_run_id is not None:
+            self._persist_reserved_run_terminal(identity, result)
+        commit_base = (
+            self.store.load(identity)
+            if _reserved_run_id is not None
+            else state
         )
         committed = self._commit_batch_results(
-            state,
+            commit_base,
             (result,),
             winner_statuses=(
                 _AUTOMATED_LOOP_STOP_STATUSES
@@ -1513,6 +2380,9 @@ class ChallengeEngine:
         *,
         _session_owned: bool = False,
         _automated: bool = False,
+        _reserved_run_ids: Mapping[Role, str] | None = None,
+        _semantic_barrier: bool = False,
+        _managed_workspace: bool = False,
     ) -> WaveOutcome:
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -1528,6 +2398,9 @@ class ChallengeEngine:
                         wave,
                         _session_owned=True,
                         _automated=_automated,
+                        _reserved_run_ids=_reserved_run_ids,
+                        _semantic_barrier=_semantic_barrier,
+                        _managed_workspace=_managed_workspace,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -1566,6 +2439,12 @@ class ChallengeEngine:
                     deadline_monotonic_seconds
                 ),
                 deadline_epoch_seconds=deadline_epoch_seconds,
+                run_id=(
+                    _reserved_run_ids.get(role)
+                    if _reserved_run_ids is not None
+                    else None
+                ),
+                managed_workspace=_managed_workspace,
             )
             for role in roles
         )
@@ -1581,15 +2460,41 @@ class ChallengeEngine:
                 identity,
                 automated=_automated,
             ),
+            before_invocation_provider_start=(
+                (
+                    lambda invocation: self._mark_reserved_run_running(
+                        identity,
+                        invocation.run_id,
+                    )
+                )
+                if _reserved_run_ids is not None
+                else None
+            ),
+            on_invocation_complete=(
+                (
+                    lambda result: self._persist_reserved_run_terminal(
+                        identity,
+                        result,
+                    )
+                )
+                if _reserved_run_ids is not None
+                else None
+            ),
+        )
+        commit_base = (
+            self.store.load(identity)
+            if _reserved_run_ids is not None
+            else state
         )
         committed = self._commit_batch_results(
-            state,
+            commit_base,
             results,
             winner_statuses=(
                 _AUTOMATED_LOOP_STOP_STATUSES
                 if _automated
                 else _MODEL_WORK_BLOCKED_STATUSES
             ),
+            semantic_barrier=_semantic_barrier,
         )
         results = self._effective_committed_batch_results(
             committed,
@@ -1660,9 +2565,50 @@ class ChallengeEngine:
             if result.completed and result.validation.valid
             else {}
         )
+        if (
+            output
+            and result.invocation.contract_version
+            != WORKER_RESULT_SCHEMA_VERSION
+        ):
+            # The model role contract and durable worker-result envelope are
+            # independent protocols.  Persist the former explicitly without
+            # pretending the v1 worker envelope itself was upgraded.
+            output["role_contract_version"] = (
+                result.invocation.contract_version
+            )
+            output["schema_version"] = WORKER_RESULT_SCHEMA_VERSION
         records = output.get("artifacts", [])
         normalized_artifacts: list[dict[str, Any]] = []
         paths = self.store.challenge_paths(state.identity)
+        reserved_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == result.invocation.run_id
+            ),
+            None,
+        )
+        managed_stage = (
+            reserved_run is not None
+            and reserved_run.origin is RunOrigin.MANAGED_MODEL
+        )
+        source_root = paths.root
+        if managed_stage:
+            expected_workspace = (
+                self.store.run_paths(
+                    state.identity,
+                    run_id=result.invocation.run_id,
+                ).root
+                / "workspace"
+            ).resolve(strict=True)
+            if (
+                result.invocation.working_directory.resolve(strict=True)
+                != expected_workspace
+            ):
+                raise WorkerResultValidationError(
+                    "managed model workspace does not match its run stage"
+                )
+            source_root = expected_workspace
         created_paths: list[Path] = []
 
         def cleanup_created(cause: BaseException) -> None:
@@ -1693,6 +2639,15 @@ class ChallengeEngine:
                 except WorkerResultValidationError as error:
                     cleanup_created(error)
                     raise
+                source_relative = relative
+                if managed_stage:
+                    posix = PurePosixPath(reported_locator)
+                    if posix.parts[:2] in {
+                        ("artifacts", "workspace"),
+                        ("proof", "workspace"),
+                    }:
+                        posix = PurePosixPath(*posix.parts[2:])
+                    source_relative = posix.as_posix()
                 artifact_id = _record_id(
                     "A", result.invocation.run_id, str(index)
                 )
@@ -1708,8 +2663,8 @@ class ChallengeEngine:
                 created_paths.append(snapshot_destination)
                 try:
                     snapshot = copy_bounded_regular(
-                        paths.root,
-                        relative,
+                        source_root,
+                        source_relative,
                         snapshot_destination,
                         maximum_bytes=min(
                             DEFAULT_SNAPSHOT_MAX_BYTES,
@@ -1752,6 +2707,16 @@ class ChallengeEngine:
             for candidate in result.flag_candidates
             if candidate_value_is_valid(candidate.value)
         }
+        flag_policy = resolve_flag_format(
+            state,
+            self.config.runtime.flag_patterns,
+        )
+        if flag_policy.source != "runtime":
+            accepted_values = {
+                value
+                for value in accepted_values
+                if flag_policy.matches(value)
+            }
         if isinstance(structured, list):
             for item in structured:
                 if (
@@ -1771,6 +2736,7 @@ class ChallengeEngine:
         for candidate in result.flag_candidates:
             if (
                 candidate_value_is_valid(candidate.value)
+                and candidate.value in accepted_values
                 and candidate.value not in seen_values
             ):
                 candidate_values.append(
@@ -1782,15 +2748,37 @@ class ChallengeEngine:
                 )
                 seen_values.add(candidate.value)
         output["flag_candidates"] = candidate_values
+        request_base_revision = state.revision
+        try:
+            request_payload = read_json(
+                self.store.run_paths(
+                    state.identity,
+                    run_id=result.invocation.run_id,
+                ).request
+            )
+            if not isinstance(request_payload, dict):
+                raise WorkerResultValidationError(
+                    "run request must be a JSON object"
+                )
+            request_base_revision = int(
+                request_payload.get("base_revision", state.revision)
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            request_base_revision = state.revision
         output.update(
             {
                 "contest_id": state.contest_id,
                 "category": state.category,
                 "challenge_id": state.challenge_id,
                 "run_id": result.invocation.run_id,
-                "base_revision": state.revision,
+                "base_revision": request_base_revision,
             }
         )
+        if managed_stage:
+            output["managed_terminal"] = {
+                "status": self._batch_result_run_status(result).value,
+                "provisional_semantic_merge": True,
+            }
         try:
             self.store.write_run_result(
                 state.identity,
@@ -1803,6 +2791,11 @@ class ChallengeEngine:
                 state.identity,
                 run_id=result.invocation.run_id,
                 result=output,
+                expected_base_revision=(
+                    reserved_run.base_revision
+                    if managed_stage and reserved_run is not None
+                    else None
+                ),
             )
         except Exception as error:
             cleanup_created(error)
@@ -1853,6 +2846,7 @@ class ChallengeEngine:
         winner_statuses: frozenset[ChallengeStatus] = (
             _MODEL_WORK_BLOCKED_STATUSES
         ),
+        semantic_barrier: bool = False,
         _pending_commit_handoff: list[ArtifactReference] | None = None,
     ) -> ChallengeState:
         if _pending_commit_handoff is None:
@@ -1862,6 +2856,7 @@ class ChallengeEngine:
                     base_state,
                     results,
                     winner_statuses=winner_statuses,
+                    semantic_barrier=semantic_barrier,
                     _pending_commit_handoff=pending_commit_handoff,
                 )
             except _HardDeadlineExpired as deadline_error:
@@ -1900,6 +2895,7 @@ class ChallengeEngine:
                     base_state,
                     expired_results,
                     winner_statuses=winner_statuses,
+                    semantic_barrier=semantic_barrier,
                 )
             except BaseException as commit_error:
                 try:
@@ -2015,6 +3011,37 @@ class ChallengeEngine:
                 cleanup_normalized(normalization_error)
                 raise
 
+        managed_reservations = [
+            run
+            for result, _output, _artifacts, _error in normalized
+            for run in base_state.runs
+            if run.id == result.invocation.run_id
+            and run.origin is RunOrigin.MANAGED_MODEL
+        ]
+        managed_reservations_current = all(
+            run.configuration_epoch == base_state.configuration_epoch
+            and run.session_id == base_state.active_managed_session_id
+            and base_state.status not in _AUTOMATED_LOOP_STOP_STATUSES
+            for run in managed_reservations
+        )
+        semantic_merge_allowed = (
+            managed_reservations_current
+            and (
+                not semantic_barrier
+                or all(
+                    result.completed
+                    and result.validation.valid
+                    and normalization_error is None
+                    for (
+                        result,
+                        _output,
+                        _artifacts,
+                        normalization_error,
+                    ) in normalized
+                )
+            )
+        )
+
         def apply(state: ChallengeState) -> None:
             base_fact_ids = {fact.id for fact in base_state.facts}
             for result, output, artifacts, normalization_error in normalized:
@@ -2039,66 +3066,137 @@ class ChallengeEngine:
                     and result.attempts[-1].timed_out
                     else RunStatus.FAILED
                 )
-                state.runs.append(
-                    RunReference(
-                        id=run_id,
-                        base_revision=base_state.revision,
-                        status=run_status,
-                        request_path=str(
-                            run_paths.request.relative_to(
-                                self.store.challenge_paths(state.identity).root
-                            )
-                        ),
-                        result_path=str(
-                            run_paths.result.relative_to(
-                                self.store.challenge_paths(state.identity).root
-                            )
-                        ),
-                        validation_path=str(
-                            run_paths.validation.relative_to(
-                                self.store.challenge_paths(state.identity).root
-                            )
-                        ),
-                        role=result.invocation.role.value,
-                        model=result.invocation.model_id,
-                        context_hash=self._request_context_hash(run_paths.request),
-                        extra={
-                            "provider_wait_seconds": (
-                                result.timing.provider_wait_seconds
-                            ),
-                            "usage": {
-                                "input_tokens": result.usage.input_tokens,
-                                "cached_input_tokens": (
-                                    result.usage.cached_input_tokens
-                                ),
-                                "output_tokens": result.usage.output_tokens,
-                                "reasoning_output_tokens": (
-                                    result.usage.reasoning_output_tokens
-                                ),
-                            },
-                            "thread_id": result.thread_id,
-                            "reasoning_effort": (
-                                result.invocation.reasoning_effort.value
-                                if result.invocation.reasoning_effort
-                                is not None
-                                else None
-                            ),
-                            "normalization_error": normalization_error,
-                            "contract_errors": list(
-                                result.validation.errors
-                            ),
-                            "failures": [
-                                {
-                                    "kind": failure.kind,
-                                    "message": failure.message,
-                                    "retryable": failure.retryable,
-                                }
-                                for failure in result.failures
-                            ],
-                        },
+                existing_run = next(
+                    (item for item in state.runs if item.id == run_id),
+                    None,
+                )
+                stale_managed_run = (
+                    existing_run is not None
+                    and existing_run.origin is RunOrigin.MANAGED_MODEL
+                    and (
+                        existing_run.configuration_epoch
+                        != state.configuration_epoch
+                        or existing_run.session_id
+                        != state.active_managed_session_id
+                        or state.status in _AUTOMATED_LOOP_STOP_STATUSES
                     )
                 )
-                run_record = state.runs[-1]
+                if stale_managed_run:
+                    run_status = RunStatus.INTERRUPTED
+                completed_run = RunReference(
+                    id=run_id,
+                    base_revision=base_state.revision,
+                    status=run_status,
+                    request_path=str(
+                        run_paths.request.relative_to(
+                            self.store.challenge_paths(state.identity).root
+                        )
+                    ),
+                    result_path=str(
+                        run_paths.result.relative_to(
+                            self.store.challenge_paths(state.identity).root
+                        )
+                    ),
+                    validation_path=str(
+                        run_paths.validation.relative_to(
+                            self.store.challenge_paths(state.identity).root
+                        )
+                    ),
+                    role=result.invocation.role.value,
+                    model=result.invocation.model_id,
+                    context_hash=self._request_context_hash(run_paths.request),
+                    extra={
+                        "provider_wait_seconds": (
+                            result.timing.provider_wait_seconds
+                        ),
+                        "usage": {
+                            "input_tokens": result.usage.input_tokens,
+                            "cached_input_tokens": (
+                                result.usage.cached_input_tokens
+                            ),
+                            "output_tokens": result.usage.output_tokens,
+                            "reasoning_output_tokens": (
+                                result.usage.reasoning_output_tokens
+                            ),
+                        },
+                        "thread_id": result.thread_id,
+                        "reasoning_effort": (
+                            result.invocation.reasoning_effort.value
+                            if result.invocation.reasoning_effort is not None
+                            else None
+                        ),
+                        "normalization_error": normalization_error,
+                        "contract_errors": list(result.validation.errors),
+                        "failures": [
+                            {
+                                "kind": failure.kind,
+                                "message": failure.message,
+                                "retryable": failure.retryable,
+                            }
+                            for failure in result.failures
+                        ],
+                        "provisional_wave_output": (
+                            not semantic_merge_allowed
+                        ),
+                        "stale_managed_result": stale_managed_run,
+                    },
+                )
+                if existing_run is None:
+                    state.runs.append(completed_run)
+                    run_record = completed_run
+                else:
+                    provisional_terminal = (
+                        existing_run.origin is RunOrigin.MANAGED_MODEL
+                        and existing_run.extra.get(
+                            "provisional_managed_terminal"
+                        )
+                        is True
+                    )
+                    if (
+                        existing_run.status
+                        not in {
+                            RunStatus.CREATED,
+                            RunStatus.RUNNING,
+                        }
+                        and not provisional_terminal
+                    ):
+                        raise EngineError(
+                            f"reserved run {run_id} is already terminal"
+                        )
+                    preserved = {
+                        "origin": existing_run.origin,
+                        "idempotency_key": existing_run.idempotency_key,
+                        "session_id": existing_run.session_id,
+                        "cycle_id": existing_run.cycle_id,
+                        "wave_id": existing_run.wave_id,
+                        "configuration_epoch": (
+                            existing_run.configuration_epoch
+                        ),
+                        "created_at": existing_run.created_at,
+                    }
+                    completed_run.origin = preserved["origin"]
+                    completed_run.base_revision = existing_run.base_revision
+                    completed_run.idempotency_key = preserved[
+                        "idempotency_key"
+                    ]
+                    completed_run.session_id = preserved["session_id"]
+                    completed_run.cycle_id = preserved["cycle_id"]
+                    completed_run.wave_id = preserved["wave_id"]
+                    completed_run.configuration_epoch = preserved[
+                        "configuration_epoch"
+                    ]
+                    completed_run.created_at = preserved["created_at"]
+                    completed_run.extra = {
+                        **existing_run.extra,
+                        **completed_run.extra,
+                        "provisional_managed_terminal": False,
+                        "semantic_merge": (
+                            semantic_merge_allowed
+                            and not stale_managed_run
+                        ),
+                    }
+                    state.runs[state.runs.index(existing_run)] = completed_run
+                    run_record = completed_run
 
                 def reject_model_item(
                     bucket_name: str,
@@ -2116,8 +3214,17 @@ class ChallengeEngine:
                         )
 
                 state.artifacts.extend(artifacts)
+                semantic_output = (
+                    output
+                    if semantic_merge_allowed
+                    else {
+                        "flag_candidates": output.get(
+                            "flag_candidates", []
+                        )
+                    }
+                )
                 local_fact_ids: dict[str, str] = {}
-                observations = output.get("observations", [])
+                observations = semantic_output.get("observations", [])
                 if isinstance(observations, list):
                     for index, observation in enumerate(observations, start=1):
                         if not isinstance(observation, Mapping):
@@ -2151,7 +3258,8 @@ class ChallengeEngine:
                         )
 
                 local_hypothesis_ids: list[str] = []
-                hypotheses = output.get("hypotheses", [])
+                local_hypothesis_map: dict[str, str] = {}
+                hypotheses = semantic_output.get("hypotheses", [])
                 if isinstance(hypotheses, list):
                     for index, hypothesis in enumerate(hypotheses, start=1):
                         if not isinstance(hypothesis, Mapping):
@@ -2159,6 +3267,7 @@ class ChallengeEngine:
                         local = str(hypothesis.get("id", index))
                         hypothesis_id = _record_id("H", run_id, local)
                         local_hypothesis_ids.append(hypothesis_id)
+                        local_hypothesis_map[local] = hypothesis_id
                         refs = hypothesis.get("observation_refs", [])
                         resolved_fact_ids = [
                             local_fact_ids[item]
@@ -2196,7 +3305,7 @@ class ChallengeEngine:
                             )
                         )
 
-                actions = output.get("actions", [])
+                actions = semantic_output.get("actions", [])
                 if isinstance(actions, list):
                     for index, action in enumerate(actions, start=1):
                         if (
@@ -2206,32 +3315,202 @@ class ChallengeEngine:
                         ):
                             continue
                         command = str(action["command"])
+                        managed_action = (
+                            result.invocation.contract_version
+                            == MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                        )
+                        if managed_action:
+                            requested_hypotheses = action.get(
+                                "hypothesis_ids", []
+                            )
+                            if not isinstance(
+                                requested_hypotheses, list
+                            ):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "hypothesis_ids is not an array",
+                                )
+                                continue
+                            open_hypotheses = {
+                                item.id
+                                for item in state.hypotheses
+                                if item.status
+                                is HypothesisStatus.OPEN
+                            }
+                            resolved_hypotheses = list(
+                                dict.fromkeys(
+                                    local_hypothesis_map.get(
+                                        str(item), str(item)
+                                    )
+                                    for item in requested_hypotheses
+                                )
+                            )
+                            unknown_hypotheses = sorted(
+                                set(resolved_hypotheses)
+                                - open_hypotheses
+                            )
+                            if unknown_hypotheses:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "unknown or non-open hypothesis ids: "
+                                    + ", ".join(unknown_hypotheses),
+                                )
+                                continue
+                            if (
+                                resolved_hypotheses
+                                and state.active_goal_id is None
+                            ):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "strategic action requires an active goal",
+                                )
+                                continue
+                            try:
+                                argv = tuple(shlex.split(command))
+                                if not argv:
+                                    raise ValueError("empty command")
+                                ensure_foreground_command(argv)
+                                requested_timeout = int(
+                                    action["timeout_seconds"]
+                                )
+                                resource_class = str(
+                                    action["resource_class"]
+                                )
+                                target_id = action.get(
+                                    "network_target_id"
+                                )
+                                target_generation = action.get(
+                                    "network_target_generation"
+                                )
+                                tool_profile(
+                                    resource_class,
+                                    network=target_id is not None,
+                                )
+                            except (
+                                BackgroundJobUnsupported,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as error:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    f"invalid managed command: {error}",
+                                )
+                                continue
+                            action_extra: dict[str, object] = {
+                                "configuration_epoch": (
+                                    state.configuration_epoch
+                                ),
+                                "managed_contract_version": (
+                                    MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                                ),
+                            }
+                            if target_id is not None:
+                                target = next(
+                                    (
+                                        item
+                                        for item in state.targets
+                                        if item.id == target_id
+                                    ),
+                                    None,
+                                )
+                                if (
+                                    target is None
+                                    or state.primary_target_id
+                                    != target.id
+                                    or target.status
+                                    is not TargetStatus.ACTIVE
+                                    or self._target_is_expired(target)
+                                    or target.generation
+                                    != target_generation
+                                    or target.enforcement != "proxy"
+                                ):
+                                    reject_model_item(
+                                        "rejected_actions",
+                                        "action",
+                                        index,
+                                        "target is not the selected active "
+                                        "proxy target at the requested "
+                                        "generation",
+                                    )
+                                    continue
+                                action_extra.update(
+                                    {
+                                        "network_target": (
+                                            target.endpoint
+                                        ),
+                                        "network_target_id": target.id,
+                                        "network_target_generation": (
+                                            target.generation
+                                        ),
+                                    }
+                                )
+                            hypothesis_ids = resolved_hypotheses
+                            expected_observation = str(
+                                action["expected_observation"]
+                            )
+                            keep_if = str(action["keep_if"])
+                            drop_if = str(action["drop_if"])
+                            timeout_seconds = (
+                                self._budget_command_timeout(
+                                    state,
+                                    requested_timeout,
+                                )
+                            )
+                        else:
+                            hypothesis_ids = list(
+                                local_hypothesis_ids
+                            )
+                            expected_observation = str(
+                                action.get("description", "")
+                            )
+                            keep_if = (
+                                "new executed evidence supports the active "
+                                "goal or named hypothesis"
+                            )
+                            drop_if = (
+                                "the command fails to discriminate or "
+                                "contradicts the named hypothesis"
+                            )
+                            timeout_seconds = (
+                                self.config.runtime.command_timeout_s
+                            )
+                            resource_class = _infer_resource_class(
+                                command
+                            )
+                            action_extra = {}
                         state.experiments.append(
                             Experiment(
                                 id=_record_id("E", run_id, str(index)),
-                                hypothesis_ids=list(local_hypothesis_ids),
+                                hypothesis_ids=hypothesis_ids,
                                 command=command,
-                                expected_observation=str(
-                                    action.get("description", "")
+                                expected_observation=(
+                                    expected_observation
                                 ),
-                                keep_if=(
-                                    "new executed evidence supports the active "
-                                    "goal or named hypothesis"
+                                keep_if=keep_if,
+                                drop_if=drop_if,
+                                timeout_seconds=timeout_seconds,
+                                resource_class=resource_class,
+                                kind=(
+                                    ExperimentKind.STRATEGIC
+                                    if hypothesis_ids
+                                    else ExperimentKind.PROBE
                                 ),
-                                drop_if=(
-                                    "the command fails to discriminate or "
-                                    "contradicts the named hypothesis"
-                                ),
-                                timeout_seconds=(
-                                    self.config.runtime.command_timeout_s
-                                ),
-                                resource_class=_infer_resource_class(command),
                                 status=ExperimentStatus.REGISTERED,
                                 source_run_id=run_id,
+                                extra=action_extra,
                             )
                         )
 
-                markers = output.get("progress_markers", [])
+                markers = semantic_output.get("progress_markers", [])
                 if isinstance(markers, list):
                     for index, marker in enumerate(markers, start=1):
                         if not isinstance(marker, Mapping):
@@ -2248,8 +3527,12 @@ class ChallengeEngine:
                             )
                         )
 
-                candidates = output.get("flag_candidates", [])
+                candidates = semantic_output.get("flag_candidates", [])
                 if isinstance(candidates, list):
+                    flag_policy = resolve_flag_format(
+                        state,
+                        self.config.runtime.flag_patterns,
+                    )
                     existing_values = {
                         candidate.value for candidate in state.candidates
                     }
@@ -2268,6 +3551,10 @@ class ChallengeEngine:
                                 status=CandidateStatus.OBSERVED_CANDIDATE,
                                 source_run_id=run_id,
                                 locator=str(candidate.get("evidence", "")),
+                                tier=flag_policy.tier_for(value),
+                                format_epoch=(
+                                    flag_policy.configuration_epoch
+                                ),
                                 extra={"source": candidate.get("source")},
                             )
                         )
@@ -2277,7 +3564,7 @@ class ChallengeEngine:
                     normalization_error is None
                     and result.validation.valid
                 ):
-                    hypothesis_updates = output.get(
+                    hypothesis_updates = semantic_output.get(
                         "hypothesis_updates", []
                     )
                     if isinstance(hypothesis_updates, list):
@@ -2405,7 +3692,7 @@ class ChallengeEngine:
                                     error,
                                 )
 
-                    evaluations = output.get("evaluations", [])
+                    evaluations = semantic_output.get("evaluations", [])
                     if isinstance(evaluations, list):
                         for evaluation in evaluations:
                             if not isinstance(evaluation, Mapping):
@@ -2467,7 +3754,7 @@ class ChallengeEngine:
                                     error,
                                 )
 
-                    goal_update = output.get("goal_update")
+                    goal_update = semantic_output.get("goal_update")
                     if (
                         result.invocation.role is Role.CAPTAIN
                         and isinstance(goal_update, Mapping)
@@ -2520,7 +3807,7 @@ class ChallengeEngine:
                                 error,
                             )
 
-                refusal = output.get("refusal")
+                refusal = semantic_output.get("refusal")
                 if isinstance(refusal, Mapping):
                     state.budget.refusals.append(
                         {
@@ -2532,7 +3819,7 @@ class ChallengeEngine:
                             "at": utc_now(),
                         }
                     )
-                self._apply_decision(state, output.get("decision"))
+                self._apply_decision(state, semantic_output.get("decision"))
 
         new_artifacts = tuple(
             artifact
@@ -2633,8 +3920,10 @@ class ChallengeEngine:
     @staticmethod
     def _request_context_hash(path: Path) -> str | None:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = read_json(path)
+        except (OSError, StrictJSONError):
+            return None
+        if not isinstance(payload, Mapping):
             return None
         value = payload.get("context_sha256")
         return str(value) if value is not None else None
@@ -2908,7 +4197,10 @@ class ChallengeEngine:
         ][:maximum]
         if not pending:
             return state
-        client = self.sandbox(state)
+        flag_policy = resolve_flag_format(
+            state,
+            self.config.runtime.flag_patterns,
+        )
         detected_flags: list[DetectedFlag] = []
         active_tool_run_id: str | None = None
 
@@ -2921,12 +4213,14 @@ class ChallengeEngine:
                 source=detected.source,
                 source_run_id=active_tool_run_id,
                 observed_at=detected.observed_at,
+                tier=flag_policy.tier_for(detected.value),
+                format_epoch=flag_policy.configuration_epoch,
             )
             detected_flags.append(detected)
             self._on_tool_flag(identity, detected)
 
         detector = FlagDetector(
-            self.config.runtime.flag_patterns,
+            flag_policy.patterns,
             callback=receive_tool_flag,
         )
         for experiment in pending:
@@ -2943,6 +4237,17 @@ class ChallengeEngine:
             )
             self._remaining_budget_seconds(latest_before_start)
             first_new_flag = len(detected_flags)
+            execution_workspace = (
+                self._managed_action_workspace(
+                    latest_before_start,
+                    experiment,
+                )
+                or self._workspace(latest_before_start)
+            )
+            client = self.sandbox(
+                latest_before_start,
+                workspace_override=execution_workspace,
+            )
 
             def mark_running(current: ChallengeState) -> None:
                 self._require_model_work_allowed(
@@ -2958,6 +4263,7 @@ class ChallengeEngine:
                     raise EngineError(
                         f"experiment is no longer registered: {item.id}"
                     )
+                self._require_experiment_target_current(current, item)
                 item.status = ExperimentStatus.RUNNING
 
             try:
@@ -3071,12 +4377,22 @@ class ChallengeEngine:
                             self.config.runtime.image_digest
                             or self.config.runtime.image
                         ),
+                        "network_target": experiment.extra.get(
+                            "network_target"
+                        ),
+                        "network_target_id": experiment.extra.get(
+                            "network_target_id"
+                        ),
+                        "network_target_generation": experiment.extra.get(
+                            "network_target_generation"
+                        ),
+                        "configuration_epoch": running.configuration_epoch,
                     },
                     base_revision=None,
                 )
-                run_request = json.loads(
-                    run_paths.request.read_text(encoding="utf-8")
-                )
+                run_request = read_json(run_paths.request)
+                if not isinstance(run_request, Mapping):
+                    raise EngineError("tool run request must be a JSON object")
                 run_base_revision = int(run_request["base_revision"])
             except BaseException as error:
                 failure_reason = f"could not create tool run: {error}"
@@ -3140,7 +4456,7 @@ class ChallengeEngine:
                 )
                 started = time.monotonic()
                 with FlagLogTailer(
-                    self._workspace(running),
+                    execution_workspace,
                     detector,
                     source_prefix=f"tool:{engine_run_id}",
                     max_bytes=self.config.runtime.flag_scan_max_bytes,
@@ -3309,6 +4625,7 @@ class ChallengeEngine:
                         client,
                         relative_locator,
                         snapshot_destination,
+                        workspace_root=execution_workspace,
                     )
                 except (EngineError, SandboxError) as error:
                     self._cleanup_uncommitted_artifacts(
@@ -3441,23 +4758,34 @@ class ChallengeEngine:
                     continue
             if not artifact_notification_failed:
                 try:
+                    result_payload: dict[str, Any] = {
+                        "status": result.status,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                        "duration_ms": result.duration_ms,
+                        "artifacts": [
+                            artifact.to_dict()
+                            for artifact in artifact_records
+                        ],
+                        "base_revision": run_base_revision,
+                    }
                     self.store.write_run_result(
                         identity,
                         None,
                         None,
                         engine_run_id,
+                        result_payload,
+                    )
+                    self.store.write_run_validation(
+                        identity,
+                        engine_run_id,
                         {
-                            "status": result.status,
-                            "exit_code": result.exit_code,
-                            "timed_out": result.timed_out,
-                            "duration_ms": result.duration_ms,
-                            "stdout_summary": result.stdout_summary,
-                            "stderr_summary": result.stderr_summary,
-                            "artifacts": [
-                                artifact.to_dict()
-                                for artifact in artifact_records
-                            ],
+                            "ok": True,
                             "base_revision": run_base_revision,
+                            "artifact_ids": [
+                                artifact.id for artifact in artifact_records
+                            ],
+                            "errors": [],
                         },
                     )
                 except Exception as error:
@@ -3516,6 +4844,7 @@ class ChallengeEngine:
                     continue
 
             result_fact_id = _record_id("F", engine_run_id, "result")
+            receipt_id = _record_id("RCPT", engine_run_id, "result")
 
             def finish(current: ChallengeState) -> None:
                 if result.exit_code == 0 and not result.timed_out:
@@ -3536,19 +4865,28 @@ class ChallengeEngine:
                     raise EngineError(
                         f"tool run is already committed: {engine_run_id}"
                     )
+                succeeded = result.exit_code == 0 and not result.timed_out
                 item.status = (
-                    ExperimentStatus.AWAITING_EVALUATION
-                    if result.exit_code == 0 and not result.timed_out
+                    ExperimentStatus.COMPLETED
+                    if (
+                        succeeded
+                        and current.schema_version >= STATE_SCHEMA_VERSION
+                        and item.kind is ExperimentKind.PROBE
+                    )
+                    else ExperimentStatus.AWAITING_EVALUATION
+                    if succeeded
                     else ExperimentStatus.FAILED
                 )
-                item.result = {
+                item_result: dict[str, Any] = {
                     "run_id": engine_run_id,
-                    "fact_id": result_fact_id,
                     "exit_code": result.exit_code,
                     "timed_out": result.timed_out,
-                    "stdout_summary": result.stdout_summary,
-                    "stderr_summary": result.stderr_summary,
                 }
+                if current.schema_version >= STATE_SCHEMA_VERSION:
+                    item_result["receipt_id"] = receipt_id
+                else:
+                    item_result["fact_id"] = result_fact_id
+                item.result = item_result
                 item.artifact_ids.extend(
                     artifact.id for artifact in artifact_records
                 )
@@ -3573,7 +4911,23 @@ class ChallengeEngine:
                                 self.store.challenge_paths(identity).root
                             )
                         ),
+                        validation_path=str(
+                            run_paths.validation.relative_to(
+                                self.store.challenge_paths(identity).root
+                            )
+                        ),
                         role="tool",
+                        origin=(
+                            RunOrigin.MANAGED_TOOL
+                            if current.active_managed_session_id is not None
+                            else RunOrigin.OPERATOR_TOOL
+                        ),
+                        session_id=current.active_managed_session_id,
+                        configuration_epoch=(
+                            current.configuration_epoch
+                            if current.schema_version >= STATE_SCHEMA_VERSION
+                            else None
+                        ),
                         created_at=utc_now(),
                         extra={
                             "experiment_id": item.id,
@@ -3582,21 +4936,68 @@ class ChallengeEngine:
                     )
                 )
                 current.artifacts.extend(artifact_records)
-                current.facts.append(
-                    Fact(
-                        id=result_fact_id,
-                        statement=(
-                            f"Experiment {item.id} exited "
-                            f"{result.exit_code}; stdout: "
-                            f"{result.stdout_summary[:1000]}"
+                if current.schema_version >= STATE_SCHEMA_VERSION:
+                    stderr_artifact = next(
+                        (
+                            artifact
+                            for artifact in artifact_records
+                            if artifact.extra.get("stream") == "stderr"
                         ),
-                        provenance=Provenance.EXECUTED,
-                        challenge_id=current.challenge_id,
-                        source_run_id=engine_run_id,
-                        artifact_id=stdout_artifact.id,
-                        locator=stdout_artifact.path,
+                        None,
                     )
-                )
+                    current.receipts.append(
+                        ExecutionReceipt(
+                            id=receipt_id,
+                            experiment_id=item.id,
+                            run_id=engine_run_id,
+                            outcome=(
+                                ReceiptOutcome.SUCCEEDED
+                                if succeeded
+                                else ReceiptOutcome.TIMED_OUT
+                                if result.timed_out
+                                else ReceiptOutcome.FAILED
+                            ),
+                            exit_code=result.exit_code,
+                            wall_seconds=elapsed,
+                            stdout_artifact_id=stdout_artifact.id,
+                            stderr_artifact_id=(
+                                stderr_artifact.id
+                                if stderr_artifact is not None
+                                else None
+                            ),
+                            stdout_bytes=result.stdout_bytes,
+                            stderr_bytes=result.stderr_bytes,
+                            stdout_lines=(
+                                result.stdout_summary.count("\n")
+                                + bool(result.stdout_summary)
+                            ),
+                            stderr_lines=(
+                                result.stderr_summary.count("\n")
+                                + bool(result.stderr_summary)
+                            ),
+                            preview=(
+                                f"exit={result.exit_code}; "
+                                f"stdout_bytes={result.stdout_bytes}; "
+                                f"stderr_bytes={result.stderr_bytes}"
+                            )[:160],
+                        )
+                    )
+                else:
+                    current.facts.append(
+                        Fact(
+                            id=result_fact_id,
+                            statement=(
+                                f"Experiment {item.id} exited "
+                                f"{result.exit_code}; output stored in "
+                                f"artifact {stdout_artifact.id}"
+                            ),
+                            provenance=Provenance.EXECUTED,
+                            challenge_id=current.challenge_id,
+                            source_run_id=engine_run_id,
+                            artifact_id=stdout_artifact.id,
+                            locator=stdout_artifact.path,
+                        )
+                    )
                 existing_candidate_values = {
                     candidate.value for candidate in current.candidates
                 }
@@ -3614,6 +5015,8 @@ class ChallengeEngine:
                             status=CandidateStatus.OBSERVED_CANDIDATE,
                             source_run_id=engine_run_id,
                             locator=detected.source,
+                            tier=flag_policy.tier,
+                            format_epoch=flag_policy.configuration_epoch,
                         )
                     )
                     existing_candidate_values.add(detected.value)
@@ -4254,6 +5657,57 @@ class ChallengeEngine:
                 + ", ".join(unknown_updates)
             )
         require_executed = status is not ExperimentStatus.FAILED
+        receipt = None
+        result_value = experiment.result
+        receipt_id = (
+            result_value.get("receipt_id")
+            if (
+                state.schema_version >= STATE_SCHEMA_VERSION
+                and isinstance(result_value, Mapping)
+            )
+            else None
+        )
+        if isinstance(receipt_id, str):
+            receipt = next(
+                (
+                    item
+                    for item in state.receipts
+                    if item.id == receipt_id
+                    and item.experiment_id == experiment.id
+                ),
+                None,
+            )
+            if receipt is None:
+                raise EngineError(
+                    "experiment receipt is missing from canonical state"
+                )
+            if (
+                status is not ExperimentStatus.FAILED
+                and receipt.outcome is not ReceiptOutcome.SUCCEEDED
+            ):
+                raise EngineError(
+                    "semantic evaluation requires a successful receipt"
+                )
+            evidence_artifact_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *evidence_artifact_ids,
+                        *(
+                            (receipt.stdout_artifact_id,)
+                            if receipt.stdout_artifact_id is not None
+                            else ()
+                        ),
+                        *(
+                            (receipt.stderr_artifact_id,)
+                            if receipt.stderr_artifact_id is not None
+                            else ()
+                        ),
+                    )
+                )
+            )
+            evidence_run_ids = tuple(
+                dict.fromkeys((*evidence_run_ids, receipt.run_id))
+            )
         (
             normalized_facts,
             normalized_artifacts,
@@ -4263,7 +5717,7 @@ class ChallengeEngine:
             fact_ids=evidence_fact_ids,
             artifact_ids=evidence_artifact_ids,
             run_ids=evidence_run_ids,
-            require_executed=require_executed,
+            require_executed=require_executed and receipt is None,
             allow_failed_runs=status is ExperimentStatus.FAILED,
         )
         if status is not ExperimentStatus.FAILED:
@@ -4281,7 +5735,11 @@ class ChallengeEngine:
             artifacts = {
                 artifact.id: artifact for artifact in state.artifacts
             }
-            same_run_chain = any(
+            same_run_chain = receipt is not None and (
+                receipt.run_id == target_run_id
+                and receipt.stdout_artifact_id in normalized_artifacts
+            )
+            same_run_chain = same_run_chain or any(
                 fact.provenance is Provenance.EXECUTED
                 and fact.source_run_id == target_run_id
                 and fact.artifact_id is not None
@@ -4302,6 +5760,12 @@ class ChallengeEngine:
         experiment.evaluated_at = utc_now()
         experiment.evidence_fact_ids = normalized_facts
         experiment.evidence_run_ids = normalized_runs
+        if receipt is not None:
+            experiment.evidence_receipt_ids = list(
+                dict.fromkeys(
+                    [*experiment.evidence_receipt_ids, receipt.id]
+                )
+            )
         experiment.artifact_ids = list(
             dict.fromkeys(
                 [*experiment.artifact_ids, *normalized_artifacts]
@@ -4338,6 +5802,18 @@ class ChallengeEngine:
                     ]
                 )
             )
+            if receipt is not None:
+                hypothesis.evidence_receipt_ids = list(
+                    dict.fromkeys(
+                        [*hypothesis.evidence_receipt_ids, receipt.id]
+                    )
+                )
+            for fact_id in normalized_facts:
+                fact = next(
+                    item for item in state.facts if item.id == fact_id
+                )
+                if hypothesis_id not in fact.supports:
+                    fact.supports.append(hypothesis_id)
         for hypothesis_id in refute_hypothesis_ids:
             hypothesis = hypotheses[hypothesis_id]
             hypothesis.status = HypothesisStatus.REFUTED
@@ -4366,6 +5842,18 @@ class ChallengeEngine:
                     ]
                 )
             )
+            if receipt is not None:
+                hypothesis.evidence_receipt_ids = list(
+                    dict.fromkeys(
+                        [*hypothesis.evidence_receipt_ids, receipt.id]
+                    )
+                )
+            for fact_id in normalized_facts:
+                fact = next(
+                    item for item in state.facts if item.id == fact_id
+                )
+                if hypothesis_id not in fact.contradicts:
+                    fact.contradicts.append(hypothesis_id)
 
     def evaluate_experiment(
         self,
@@ -4451,11 +5939,36 @@ class ChallengeEngine:
             needs_kvm=needs_kvm,
             network=network_target is not None,
         )
+        pinned_target_id: str | None = None
+        pinned_target_generation: int | None = None
+        pinned_configuration_epoch: int | None = None
         if network_target is not None:
             parsed = NetworkTarget.parse(network_target)
             state = self.store.load(identity)
             self._network_policy(state).authorize(parsed)
             canonical_target = parsed.as_text()
+            if state.schema_version >= STATE_SCHEMA_VERSION:
+                target_record = next(
+                    (
+                        item
+                        for item in state.targets
+                        if item.id == state.primary_target_id
+                    ),
+                    None,
+                )
+                if (
+                    target_record is None
+                    or target_record.status is not TargetStatus.ACTIVE
+                    or self._target_is_expired(target_record)
+                    or target_record.endpoint != canonical_target
+                ):
+                    raise EngineError(
+                        "remote experiment target is not the selected active "
+                        "typed target"
+                    )
+                pinned_target_id = target_record.id
+                pinned_target_generation = target_record.generation
+                pinned_configuration_epoch = state.configuration_epoch
         else:
             canonical_target = None
         experiment_id = _run_id("E-operator")
@@ -4471,6 +5984,32 @@ class ChallengeEngine:
                 raise EngineError(
                     "unknown hypothesis id(s): " + ", ".join(unknown)
                 )
+            if canonical_target is not None and (
+                state.schema_version >= STATE_SCHEMA_VERSION
+            ):
+                target_record = next(
+                    (
+                        item
+                        for item in state.targets
+                        if item.id == pinned_target_id
+                    ),
+                    None,
+                )
+                if (
+                    state.configuration_epoch
+                    != pinned_configuration_epoch
+                    or state.primary_target_id != pinned_target_id
+                    or target_record is None
+                    or target_record.status is not TargetStatus.ACTIVE
+                    or target_record.generation
+                    != pinned_target_generation
+                    or target_record.endpoint != canonical_target
+                    or self._target_is_expired(target_record)
+                ):
+                    raise EngineError(
+                        "target or configuration changed during remote "
+                        "experiment registration"
+                    )
             state.experiments.append(
                 Experiment(
                     id=experiment_id,
@@ -4484,10 +6023,24 @@ class ChallengeEngine:
                         configured_timeout,
                     ),
                     resource_class=resource_class,
+                    kind=(
+                        ExperimentKind.STRATEGIC
+                        if hypothesis_ids
+                        else ExperimentKind.PROBE
+                    ),
                     status=ExperimentStatus.REGISTERED,
                     extra={
                         **(
-                            {"network_target": canonical_target}
+                            {
+                                "network_target": canonical_target,
+                                "network_target_id": pinned_target_id,
+                                "network_target_generation": (
+                                    pinned_target_generation
+                                ),
+                                "configuration_epoch": (
+                                    pinned_configuration_epoch
+                                ),
+                            }
                             if canonical_target is not None
                             else {}
                         ),
@@ -4613,6 +6166,10 @@ class ChallengeEngine:
                 run.id == source_run_id for run in state.runs
             ):
                 raise EngineError(f"unknown source run: {source_run_id}")
+            policy = resolve_flag_format(
+                state,
+                self.config.runtime.flag_patterns,
+            )
             state.candidates.append(
                 FlagCandidate(
                     id=candidate_id,
@@ -4620,6 +6177,8 @@ class ChallengeEngine:
                     status=CandidateStatus.OBSERVED_CANDIDATE,
                     source_run_id=source_run_id,
                     locator=source,
+                    tier=policy.tier_for(value),
+                    format_epoch=policy.configuration_epoch,
                 )
             )
 
@@ -4737,6 +6296,8 @@ class ChallengeEngine:
         client: ChallengeSandboxClient,
         locator: str,
         destination: Path,
+        *,
+        workspace_root: Path | None = None,
     ) -> ImmutableFile:
         """Copy one model-writable file into canonical immutable evidence."""
 
@@ -4753,7 +6314,7 @@ class ChallengeEngine:
                     "sandbox returned an artifact from another challenge"
                 )
             return copy_bounded_regular(
-                self._workspace(state),
+                workspace_root or self._workspace(state),
                 reference.locator,
                 destination,
                 maximum_bytes=min(
@@ -5589,12 +7150,20 @@ class ChallengeEngine:
                         source=detected.source,
                         source_run_id=run_id,
                         observed_at=detected.observed_at,
+                        tier=proof_flag_policy.tier_for(detected.value),
+                        format_epoch=(
+                            proof_flag_policy.configuration_epoch
+                        ),
                     )
                     detected_proof_flags.append(detected)
                     self._on_tool_flag(identity, detected)
 
-                proof_detector = FlagDetector(
+                proof_flag_policy = resolve_flag_format(
+                    current,
                     self.config.runtime.flag_patterns,
+                )
+                proof_detector = FlagDetector(
+                    proof_flag_policy.patterns,
                     callback=receive_proof_flag,
                 )
                 proof_interruption: BaseException | None = None
@@ -5964,6 +7533,10 @@ class ChallengeEngine:
                                 ),
                                 source_run_id=run_reference.id,
                                 locator=detected.source,
+                                tier=proof_flag_policy.tier,
+                                format_epoch=(
+                                    proof_flag_policy.configuration_epoch
+                                ),
                             )
                         )
                         existing_values.add(detected.value)
@@ -6285,6 +7858,7 @@ class ChallengeEngine:
         response: str | None = None,
         points: int | float | None = None,
         allow_unproved: bool = False,
+        override_reason: str | None = None,
     ) -> ChallengeState:
         """Record the human's result; this function never contacts a CTF server."""
 
@@ -6321,6 +7895,28 @@ class ChallengeEngine:
                 "candidate has no passed proof; use an explicit operator "
                 "override only if you submitted it outside CTF-OS"
             )
+        effective_override_reason = (
+            (override_reason or "").strip()
+            or (
+                "operator explicitly used the legacy --allow-unproved "
+                "compatibility override"
+                if allow_unproved
+                else ""
+            )
+        )
+        override = (
+            SubmissionOverride(
+                kind="unproved_manual_outcome",
+                actor="operator",
+                reason=effective_override_reason,
+            )
+            if (
+                state.schema_version >= STATE_SCHEMA_VERSION
+                and normalized in {"accepted", "rejected"}
+                and not proof_passed
+            )
+            else None
+        )
         if normalized == "accepted":
             for record in self.store.load_contest_submissions(
                 identity.contest_id
@@ -6345,6 +7941,7 @@ class ChallengeEngine:
             response=response,
             proof_passed=proof_passed,
             points=points,
+            override=override,
             expected_revision=state.revision,
         )
 
@@ -6508,6 +8105,16 @@ class ChallengeEngine:
                     "base_revision": base_revision,
                 },
             )
+            self.store.write_run_validation(
+                identity,
+                run_id,
+                {
+                    "ok": False,
+                    "base_revision": base_revision,
+                    "errors": [str(reason)[:4096]],
+                    "error_type": "ToolExecutionFailure",
+                },
+            )
         except BaseException as error:
             write_error = error
 
@@ -6544,18 +8151,109 @@ class ChallengeEngine:
             if run_id is not None and not any(
                 run.id == run_id for run in state.runs
             ):
+                run_paths = self.store.run_paths(
+                    identity,
+                    run_id=run_id,
+                )
+                durable_run = (
+                    run_paths.request.is_file()
+                    and run_paths.result.is_file()
+                    and run_paths.validation.is_file()
+                )
+                root = self.store.challenge_paths(identity).root
+                cycle = next(
+                    (
+                        item
+                        for item in reversed(state.cycles)
+                        if experiment_id in item.selected_action_ids
+                    ),
+                    None,
+                )
                 state.runs.append(
                     RunReference(
                         id=run_id,
                         base_revision=state.revision,
                         status=RunStatus.FAILED,
+                        request_path=(
+                            run_paths.request.relative_to(root).as_posix()
+                            if durable_run
+                            else None
+                        ),
+                        result_path=(
+                            run_paths.result.relative_to(root).as_posix()
+                            if durable_run
+                            else None
+                        ),
+                        validation_path=(
+                            run_paths.validation.relative_to(root).as_posix()
+                            if durable_run
+                            else None
+                        ),
                         role="tool",
+                        origin=(
+                            RunOrigin.MANAGED_TOOL
+                            if (
+                                durable_run
+                                and state.active_managed_session_id is not None
+                            )
+                            else RunOrigin.OPERATOR_TOOL
+                            if durable_run
+                            else RunOrigin.COMPATIBILITY
+                        ),
+                        session_id=(
+                            state.active_managed_session_id
+                            if durable_run
+                            else None
+                        ),
+                        cycle_id=(
+                            cycle.id
+                            if durable_run and cycle is not None
+                            else None
+                        ),
+                        configuration_epoch=(
+                            state.configuration_epoch
+                            if (
+                                durable_run
+                                and state.schema_version
+                                >= STATE_SCHEMA_VERSION
+                            )
+                            else None
+                        ),
                         extra={"error": bounded_reason},
                     )
                 )
+                if (
+                    durable_run
+                    and state.schema_version >= STATE_SCHEMA_VERSION
+                    and not any(
+                        receipt.experiment_id == experiment_id
+                        or receipt.run_id == run_id
+                        for receipt in state.receipts
+                    )
+                ):
+                    receipt_id = _record_id(
+                        "RCPT",
+                        run_id,
+                        "failure",
+                    )
+                    state.receipts.append(
+                        ExecutionReceipt(
+                            id=receipt_id,
+                            experiment_id=experiment_id,
+                            run_id=run_id,
+                            outcome=ReceiptOutcome.FAILED,
+                            exit_code=None,
+                            wall_seconds=0.0,
+                            preview=(
+                                "tool failed; see durable run result and "
+                                "validation"
+                            ),
+                        )
+                    )
+                    experiment.result["receipt_id"] = receipt_id
 
         try:
-            return self.store.update(
+            state = self.store.update(
                 identity, apply, validate_artifacts=False
             )
         except ValueError:
@@ -6568,11 +8266,13 @@ class ChallengeEngine:
                 experiment.status = ExperimentStatus.FAILED
                 experiment.result = None
 
-            return self.store.update(
+            state = self.store.update(
                 identity,
                 apply_minimal,
                 validate_artifacts=False,
             )
+        self._quarantine_managed_action_stage(state, experiment_id)
+        return state
 
 
 __all__ = [

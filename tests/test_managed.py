@@ -1,0 +1,1250 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+import time
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest import mock
+
+import ctf_os.migration as migration_module
+from ctf_os.codex import (
+    BatchRunner,
+    FifoModelCallLimiter,
+    ProcessOutcome,
+    Role,
+)
+from ctf_os.config import load_config
+from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.lifecycle import close_challenge, create_checkpoint
+from ctf_os.managed import ManagedError, ManagedOrchestrator
+from ctf_os.migration import (
+    apply_migration,
+    plan_migration,
+    rollback_migration,
+)
+from ctf_os.models import (
+    ChallengeIdentity,
+    ChallengeStatus,
+    ExperimentStatus,
+    RunOrigin,
+    RunReference,
+    RunStatus,
+)
+from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.storage import (
+    quarantine_unreachable,
+    restore_quarantine,
+    storage_plan,
+)
+from ctf_os.store import MigrationInProgress
+from ctf_os.store.atomic import (
+    StrictJSONError,
+    atomic_write_json,
+    canonical_json_record,
+    read_json,
+    strict_json_loads,
+)
+from ctf_os.workspace_publish import (
+    publish_builder_file,
+    reconcile_workspace_publishes,
+)
+from tests.test_engine import (
+    FakeSandbox,
+    _output_path,
+    _payload,
+    _role_for,
+)
+
+
+IMAGE_DIGEST = "sha256:" + "b" * 64
+
+
+class ProbeRoleExecutor:
+    """Contract-valid fake model whose worker actions are independent probes."""
+
+    def __init__(
+        self,
+        *,
+        invalid_role: Role | None = None,
+        network_target: tuple[str, int] | None = None,
+    ) -> None:
+        self.invalid_role = invalid_role
+        self.network_target = network_target
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.roles: list[Role] = []
+
+    def run(self, command, *, cwd, timeout, on_stdout_line):
+        del cwd, timeout
+        role = _role_for(command)
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.roles.append(role)
+        try:
+            payload = _payload(role)
+            if role is not Role.CAPTAIN:
+                payload["hypotheses"] = []
+            schema_index = command.argv.index("--output-schema")
+            output_schema = json.loads(
+                Path(command.argv[schema_index + 1]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            contract_version = output_schema["properties"][
+                "schema_version"
+            ]["enum"][0]
+            if contract_version == 2:
+                payload["schema_version"] = 2
+                for action in payload["actions"]:
+                    action.update(
+                        {
+                            "hypothesis_ids": (
+                                ["hyp-1"]
+                                if role is Role.CAPTAIN
+                                else []
+                            ),
+                            "expected_observation": (
+                                "the bounded probe exits normally"
+                            ),
+                            "keep_if": "the observation is reproduced",
+                            "drop_if": "the observation is absent",
+                            "timeout_seconds": 30,
+                            "resource_class": "light",
+                            "network_target_id": (
+                                self.network_target[0]
+                                if self.network_target is not None
+                                else None
+                            ),
+                            "network_target_generation": (
+                                self.network_target[1]
+                                if self.network_target is not None
+                                else None
+                            ),
+                        }
+                    )
+            if role is self.invalid_role:
+                on_stdout_line(
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "text": "candidate KCTF{provisional_wave}",
+                        }
+                    )
+                    + "\n"
+                )
+                payload["artifacts"] = [
+                    {
+                        "path": "missing.bin",
+                        "sha256": None,
+                        "purpose": "force normalization failure",
+                    }
+                ]
+            time.sleep(0.01)
+            _output_path(command).write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            return ProcessOutcome(0, "", 0.01)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+class ToolConcurrency:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active = 0
+        self.maximum = 0
+
+    def enter(self) -> None:
+        with self.lock:
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+
+    def leave(self) -> None:
+        with self.lock:
+            self.active -= 1
+
+
+class SlowSandbox(FakeSandbox):
+    def __init__(self, work: Path, concurrency: ToolConcurrency) -> None:
+        super().__init__(work)
+        self.concurrency = concurrency
+
+    def run(self, spec):
+        self.concurrency.enter()
+        try:
+            time.sleep(0.15)
+            return super().run(spec)
+        finally:
+            self.concurrency.leave()
+
+
+class FailingSandbox(FakeSandbox):
+    def run(self, spec):
+        del spec
+        self.work.mkdir(parents=True, exist_ok=True)
+        (self.work / "failed-stage.txt").write_text(
+            "provisional",
+            encoding="utf-8",
+        )
+        raise RuntimeError("synthetic sandbox failure")
+
+
+class ManagedV2Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.identity = ChallengeIdentity("Managed CTF", "rev", "one")
+        incoming = (
+            self.root
+            / "incoming"
+            / self.identity.contest_id
+            / self.identity.category
+            / self.identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFmanaged")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def engine(
+        self,
+        executor: ProbeRoleExecutor,
+        *,
+        sandbox_factory=None,
+    ) -> ChallengeEngine:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=IMAGE_DIGEST,
+            ),
+            resources=replace(
+                config.resources,
+                provider_max_concurrent_calls=1,
+                max_standard_jobs=3,
+            ),
+        )
+        runner = BatchRunner(
+            process_executor=executor,
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        return ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=runner,
+            sandbox_factory=(
+                sandbox_factory
+                or (lambda state, work, policy: FakeSandbox(work))
+            ),
+        )
+
+    @staticmethod
+    def capability(_digest: str):
+        return {
+            "ok": True,
+            "schema_version": 2,
+            "capabilities": {
+                "convert": {},
+                "sqlite_readonly": {},
+                "z3": {},
+                "ortools": {},
+                "angr_python": {},
+            },
+        }
+
+    def add_v2(self, engine: ChallengeEngine):
+        return engine.add_challenge(
+            self.identity,
+            prompt="solve this one challenge",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+
+    def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
+        executor = ProbeRoleExecutor()
+        concurrency = ToolConcurrency()
+        engine = self.engine(
+            executor,
+            sandbox_factory=lambda state, work, policy: SlowSandbox(
+                work, concurrency
+            ),
+        )
+        self.add_v2(engine)
+        started = time.monotonic()
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(state.sessions), 1)
+        self.assertEqual(len(state.cycles), 1)
+        self.assertEqual(len(state.waves), 1)
+        wave = state.waves[0]
+        self.assertEqual(
+            set(wave.role_run_ids),
+            {"builder", "falsifier", "reproducer"},
+        )
+        self.assertEqual(len(set(wave.role_run_ids.values())), 3)
+        wave_runs = [
+            run for run in state.runs if run.id in wave.role_run_ids.values()
+        ]
+        self.assertEqual(
+            {run.status for run in wave_runs},
+            {RunStatus.COMPLETED},
+        )
+        self.assertEqual(executor.max_active, 1)
+        self.assertEqual(concurrency.maximum, 3)
+        self.assertLess(elapsed, 2.0)
+
+        tool_runs = [
+            run
+            for run in state.runs
+            if run.origin is RunOrigin.MANAGED_TOOL
+        ]
+        self.assertEqual(len(tool_runs), 3)
+        self.assertEqual(len(state.receipts), 3)
+        self.assertTrue(
+            all(receipt.stdout_artifact_id for receipt in state.receipts)
+        )
+        self.assertEqual(len(state.checkpoints), 1)
+        self.assertFalse(
+            any(
+                "KCTF{tool_flag}" in fact.statement
+                for fact in state.facts
+            )
+        )
+        paths = engine.store.challenge_paths(self.identity)
+        for run in wave_runs:
+            self.assertTrue(
+                (paths.runs / run.id / "provider.json").is_file()
+            )
+        wave_experiments = [
+            item
+            for item in state.experiments
+            if item.source_run_id in wave.role_run_ids.values()
+        ]
+        self.assertEqual(len(wave_experiments), 3)
+        self.assertTrue(
+            all(
+                item.timeout_seconds == 30
+                and item.resource_class == "light"
+                and item.extra["managed_contract_version"] == 2
+                for item in wave_experiments
+            )
+        )
+
+    def test_invalid_role_preserves_provisional_output_without_semantic_merge(
+        self,
+    ):
+        executor = ProbeRoleExecutor(invalid_role=Role.FALSIFIER)
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        with self.assertRaisesRegex(
+            ManagedError,
+            "analysis wave was invalid",
+        ):
+            orchestrator.run_cycle(self.identity)
+
+        state = engine.store.load(self.identity)
+        self.assertEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+        self.assertIsNone(state.active_managed_session_id)
+        wave = state.waves[0]
+        wave_run_ids = set(wave.role_run_ids.values())
+        self.assertEqual(
+            len([run for run in state.runs if run.id in wave_run_ids]),
+            3,
+        )
+        self.assertTrue(
+            all(
+                run.extra.get("provisional_wave_output") is True
+                for run in state.runs
+                if run.id in wave_run_ids
+            )
+        )
+        self.assertFalse(
+            any(
+                fact.source_run_id in wave_run_ids
+                for fact in state.facts
+            )
+        )
+        self.assertFalse(
+            any(
+                hypothesis.source_run_id in wave_run_ids
+                for hypothesis in state.hypotheses
+            )
+        )
+        self.assertFalse(
+            any(
+                experiment.source_run_id in wave_run_ids
+                for experiment in state.experiments
+            )
+        )
+        self.assertIn(
+            "KCTF{provisional_wave}",
+            {candidate.value for candidate in state.candidates},
+        )
+
+    def test_reconciler_recovers_two_terminal_and_one_durable_created_run(
+        self,
+    ):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        prepared_paths = {}
+
+        def persist_run(run_id: str, *, commit_state: bool) -> None:
+            snapshot = engine.store.load(self.identity)
+            run = next(item for item in snapshot.runs if item.id == run_id)
+            paths = prepared_paths.get(run_id)
+            if paths is None:
+                paths = engine.store.create_run(
+                    self.identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "model",
+                        "role": run.role,
+                        "configuration_epoch": run.configuration_epoch,
+                    },
+                    base_revision=run.base_revision,
+                )
+                prepared_paths[run_id] = paths
+                engine.store.write_run_result(
+                    self.identity,
+                    run_id,
+                    {
+                        "base_revision": run.base_revision,
+                        "status": RunStatus.COMPLETED.value,
+                        "provisional_managed_result": True,
+                        "artifacts": [],
+                    },
+                )
+                engine.store.write_run_validation(
+                    self.identity,
+                    run_id,
+                    {
+                        "ok": True,
+                        "base_revision": run.base_revision,
+                        "provisional_managed_result": True,
+                    },
+                )
+            if not commit_state:
+                return
+            challenge_root = engine.store.challenge_paths(
+                self.identity
+            ).root
+            current = engine.store.load(self.identity)
+
+            def apply(state):
+                target = next(
+                    item for item in state.runs if item.id == run_id
+                )
+                target.status = RunStatus.COMPLETED
+                target.request_path = paths.request.relative_to(
+                    challenge_root
+                ).as_posix()
+                target.result_path = paths.result.relative_to(
+                    challenge_root
+                ).as_posix()
+                target.validation_path = paths.validation.relative_to(
+                    challenge_root
+                ).as_posix()
+                target.extra["provisional_managed_terminal"] = True
+                target.extra["semantic_merge"] = False
+
+            engine.store.update(
+                self.identity,
+                apply,
+                expected_revision=current.revision,
+            )
+
+        assert cycle.captain_run_id is not None
+        persist_run(cycle.captain_run_id, commit_state=True)
+        _state, wave, role_runs = orchestrator._reserve_wave(
+            self.identity,
+            session_id,
+            cycle.id,
+            "discovery",
+        )
+        ordered_run_ids = list(role_runs.values())
+        for run_id in ordered_run_ids:
+            persist_run(run_id, commit_state=False)
+        persist_run(ordered_run_ids[0], commit_state=True)
+        persist_run(ordered_run_ids[1], commit_state=True)
+
+        recovered = orchestrator.reconcile(self.identity)
+        recovered_runs = {run.id: run for run in recovered.runs}
+        self.assertTrue(
+            all(
+                recovered_runs[run_id].status is RunStatus.COMPLETED
+                for run_id in ordered_run_ids
+            )
+        )
+        self.assertTrue(
+            recovered_runs[ordered_run_ids[2]].extra[
+                "recovered_from_durable_result"
+            ]
+        )
+        recovered_wave = next(
+            item for item in recovered.waves if item.id == wave.id
+        )
+        self.assertEqual(recovered_wave.status, "interrupted")
+        self.assertEqual(recovered.status, ChallengeStatus.PAUSED)
+        self.assertEqual(recovered.facts, [])
+
+    def test_failed_managed_tool_stages_are_quarantined(self):
+        engine = self.engine(
+            ProbeRoleExecutor(),
+            sandbox_factory=lambda state, work, policy: FailingSandbox(work),
+        )
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+        selected = set(state.cycles[0].selected_action_ids)
+        failed = {
+            item.id
+            for item in state.experiments
+            if item.id in selected
+            and item.status is ExperimentStatus.FAILED
+        }
+        self.assertEqual(failed, selected)
+        paths = engine.store.challenge_paths(self.identity)
+        manifests = list(
+            (paths.runtime / "quarantine" / "stages").rglob(
+                "quarantine.json"
+            )
+        )
+        self.assertEqual(len(manifests), len(selected))
+        self.assertTrue(
+            all(
+                read_json(path).get("automatic_restore") is False
+                for path in manifests
+            )
+        )
+        self.assertFalse(
+            any(
+                (
+                    paths.runtime
+                    / "staging"
+                    / state.sessions[0].id
+                    / state.cycles[0].id
+                    / experiment_id
+                ).exists()
+                for experiment_id in selected
+            )
+        )
+
+    def test_target_lifecycle_requires_explicit_primary_selection(self):
+        engine = self.engine(ProbeRoleExecutor())
+        state = self.add_v2(engine)
+        epoch = state.configuration_epoch
+        state = engine.add_network_target(
+            self.identity,
+            "example.test:31337",
+        )
+        self.assertIsNone(state.primary_target_id)
+        self.assertGreater(state.configuration_epoch, epoch)
+        target = state.targets[-1]
+        state = engine.select_network_target(self.identity, target.id)
+        self.assertEqual(state.primary_target_id, target.id)
+        state = engine.replace_network_target(
+            self.identity,
+            target.id,
+            "replacement.test:31337",
+            reason="challenge instance rotated",
+        )
+        self.assertIsNone(state.primary_target_id)
+        self.assertEqual(state.targets[0].status.value, "revoked")
+        replacement = state.targets[-1]
+        state = engine.select_network_target(
+            self.identity,
+            replacement.id,
+        )
+        state = engine.revoke_network_target(
+            self.identity,
+            replacement.id,
+            reason="operator ended remote access",
+        )
+        self.assertIsNone(state.primary_target_id)
+        with self.assertRaisesRegex(EngineError, "not active"):
+            engine.select_network_target(
+                self.identity,
+                replacement.id,
+            )
+
+    def test_remote_experiment_generation_pin_fails_closed_when_stale(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        endpoint = "https://challenge.example:443"
+        state = engine.add_network_target(
+            self.identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        engine.select_network_target(self.identity, target.id)
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('never runs')"),
+            expected_observation="remote response",
+            keep_if="response is useful",
+            drop_if="response is not useful",
+            network_target=endpoint,
+        )
+        engine.add_network_target(
+            self.identity,
+            "https://other.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        with self.assertRaisesRegex(EngineError, "stale"):
+            engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(experiment_id,),
+            )
+        state = engine.store.load(self.identity)
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertEqual(experiment.status, ExperimentStatus.REGISTERED)
+
+    def test_managed_model_remote_actions_resolve_only_selected_proxy_pin(
+        self,
+    ):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        endpoint = "https://managed.example:443"
+        state = engine.add_network_target(
+            self.identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        state = engine.select_network_target(
+            self.identity,
+            target.id,
+        )
+        executor.network_target = (target.id, target.generation)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        managed_remote = [
+            item
+            for item in state.experiments
+            if item.extra.get("managed_contract_version") == 2
+            and item.extra.get("network_target") is not None
+        ]
+        self.assertEqual(len(managed_remote), 4)
+        self.assertTrue(
+            all(
+                item.extra["network_target"] == endpoint
+                and item.extra["network_target_id"] == target.id
+                and item.extra["network_target_generation"]
+                == target.generation
+                and item.extra["configuration_epoch"]
+                == state.configuration_epoch
+                for item in managed_remote
+            )
+        )
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in managed_remote
+                    if item.status is ExperimentStatus.COMPLETED
+                ]
+            ),
+            3,
+        )
+
+    def test_managed_model_stale_target_generation_never_registers_action(
+        self,
+    ):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        state = engine.add_network_target(
+            self.identity,
+            "https://stale.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        engine.select_network_target(self.identity, target.id)
+        executor.network_target = (target.id, target.generation + 1)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        managed_experiments = [
+            item
+            for item in state.experiments
+            if item.extra.get("managed_contract_version") == 2
+        ]
+        self.assertEqual(managed_experiments, [])
+        managed_runs = [
+            item
+            for item in state.runs
+            if item.origin is RunOrigin.MANAGED_MODEL
+        ]
+        self.assertEqual(len(managed_runs), 4)
+        self.assertTrue(
+            all(
+                item.extra["rejected_actions"][0]["reason"].startswith(
+                    "target is not the selected active proxy target"
+                )
+                for item in managed_runs
+            )
+        )
+
+    def test_portable_closure_exists_only_after_bounded_copy(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        create_checkpoint(engine, self.identity, note="handoff")
+        state = close_challenge(
+            engine,
+            self.identity,
+            portability="portable",
+        )
+        self.assertEqual(state.closure.portability, "portable")
+        paths = engine.store.challenge_paths(self.identity)
+        package = paths.root / state.closure.extra["package_path"]
+        manifest = read_json(package / "manifest.json")
+        self.assertEqual(manifest["closure_id"], state.closure.id)
+        self.assertEqual(
+            manifest["source_manifest_sha256"],
+            state.metadata["source_manifest_sha256"],
+        )
+        self.assertTrue(list((package / "source").glob("*.bin")))
+
+        repeated = close_challenge(
+            engine,
+            self.identity,
+            portability="referential",
+        )
+        self.assertEqual(repeated.closure.id, state.closure.id)
+        self.assertEqual(repeated.closure.portability, "portable")
+
+        other = ChallengeIdentity("Managed CTF", "rev", "large")
+        other_incoming = (
+            self.root
+            / "incoming"
+            / other.contest_id
+            / other.category
+            / other.challenge_id
+        )
+        other_incoming.mkdir(parents=True)
+        (other_incoming / "large.bin").write_bytes(b"xx")
+        engine.add_challenge(
+            other,
+            prompt="close as referential",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        create_checkpoint(engine, other, note="handoff")
+        with mock.patch(
+            "ctf_os.lifecycle.MAX_PORTABLE_CLOSURE_BYTES",
+            1,
+        ):
+            state = close_challenge(
+                engine,
+                other,
+                portability="portable",
+            )
+        self.assertEqual(state.closure.portability, "referential")
+        self.assertTrue(state.closure.extra["portable_requested"])
+        self.assertIsNone(state.closure.extra["package_path"])
+
+    def test_close_upgrades_automatic_submission_closure(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        create_checkpoint(engine, self.identity, note="before submit")
+        state = engine.record_candidate(
+            self.identity,
+            "KCTF{manual_accept_then_close}",
+            print_immediately=False,
+        )
+        candidate_id = state.candidates[-1].id
+        state = engine.record_manual_submission(
+            self.identity,
+            candidate_id,
+            outcome="accepted",
+            allow_unproved=True,
+            override_reason="operator submitted outside CTF-OS",
+        )
+        automatic_id = state.closure.id
+        self.assertTrue(state.closure.extra["automatic_incomplete"])
+
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=OSError("synthetic closure upgrade fault"),
+            ),
+            self.assertRaisesRegex(OSError, "closure upgrade"),
+        ):
+            close_challenge(
+                engine,
+                self.identity,
+                portability="portable",
+            )
+        self.assertTrue(
+            engine.store.load(self.identity).closure.extra[
+                "automatic_incomplete"
+            ]
+        )
+
+        closed = close_challenge(
+            engine,
+            self.identity,
+            portability="portable",
+        )
+
+        self.assertEqual(closed.closure.id, automatic_id)
+        self.assertEqual(
+            closed.closure.completeness.value,
+            "complete",
+        )
+        self.assertNotIn(
+            "automatic_incomplete",
+            closed.closure.extra,
+        )
+        self.assertIsNotNone(
+            closed.closure.extra["package_path"],
+        )
+
+    def test_storage_quarantine_preserves_workspace_and_closure_reachability(
+        self,
+    ):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        create_checkpoint(engine, self.identity, note="storage")
+        state = close_challenge(
+            engine,
+            self.identity,
+            portability="portable",
+        )
+        paths = engine.store.challenge_paths(self.identity)
+        workspace_file = paths.artifacts / "workspace" / "operator.txt"
+        workspace_file.parent.mkdir(parents=True, exist_ok=True)
+        workspace_file.write_text("canonical", encoding="utf-8")
+        orphan = paths.artifacts / "snapshots" / "orphan.log"
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        orphan.write_text("orphan", encoding="utf-8")
+
+        plan = storage_plan(engine.store, self.identity)
+        candidates = {item["path"] for item in plan["candidates"]}
+        self.assertIn(
+            orphan.relative_to(paths.root).as_posix(),
+            candidates,
+        )
+        self.assertNotIn(
+            workspace_file.relative_to(paths.root).as_posix(),
+            candidates,
+        )
+        package_prefix = str(state.closure.extra["package_path"]) + "/"
+        self.assertFalse(
+            any(path.startswith(package_prefix) for path in candidates)
+        )
+
+        quarantined = quarantine_unreachable(
+            engine.store,
+            self.identity,
+        )
+        self.assertEqual(quarantined["status"], "quarantined")
+        self.assertFalse(orphan.exists())
+        restored = restore_quarantine(
+            engine.store,
+            self.identity,
+            quarantined["quarantine_id"],
+        )
+        self.assertIn(
+            orphan.relative_to(paths.root).as_posix(),
+            restored["restored"],
+        )
+        self.assertEqual(orphan.read_text(encoding="utf-8"), "orphan")
+
+    def test_ready_closure_intent_finishes_after_state_commit_fault(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        create_checkpoint(engine, self.identity, note="closure recovery")
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=OSError("synthetic closure commit fault"),
+            ),
+            self.assertRaisesRegex(OSError, "synthetic closure"),
+        ):
+            close_challenge(
+                engine,
+                self.identity,
+                portability="referential",
+            )
+        paths = engine.store.challenge_paths(self.identity)
+        self.assertEqual(
+            len(list((paths.runtime / "closure-intents").glob("*.json"))),
+            1,
+        )
+        self.assertIsNone(engine.store.load(self.identity).closure)
+
+        recovered = close_challenge(
+            engine,
+            self.identity,
+            portability="referential",
+        )
+        self.assertIsNotNone(recovered.closure)
+        self.assertEqual(
+            list((paths.runtime / "closure-intents").glob("*.json")),
+            [],
+        )
+
+
+class ProtocolAndMigrationTests(unittest.TestCase):
+    def test_strict_json_and_canonical_record_boundaries(self):
+        hostile = {
+            "value": "line1\n```\u202e<tag>",
+            "control": "\x1b[31m",
+        }
+        record = canonical_json_record(hostile)
+        self.assertNotIn("\n", record)
+        self.assertNotIn("`", record)
+        self.assertNotIn("<", record)
+        self.assertNotIn(">", record)
+        self.assertEqual(strict_json_loads(record), hostile)
+
+        rejected = (
+            b'{"a":1,"a":2}',
+            b'{"a":NaN}',
+            b'{"a":Infinity}',
+            b'{"a":1e9999}',
+            b'{"a":"\\ud800"}',
+            b'{"a":"\xff"}',
+        )
+        for payload in rejected:
+            with self.subTest(payload=payload), self.assertRaises(
+                StrictJSONError
+            ):
+                strict_json_loads(payload)
+
+    def _legacy_workspace(self):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        identity = ChallengeIdentity("Legacy", "rev", "migrate")
+        incoming = (
+            root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "input").write_bytes(b"legacy")
+        engine = ChallengeEngine(
+            root,
+            batch_runner=BatchRunner(
+                process_executor=ProbeRoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(identity, prompt="legacy solve")
+        return temporary, root, identity, engine
+
+    def test_explicit_migration_is_stable_and_exactly_rollbackable(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        paths = engine.store.challenge_paths(identity)
+        before = paths.state.read_bytes()
+        previous_before = (
+            paths.previous_state.read_bytes()
+            if paths.previous_state.exists()
+            else None
+        )
+        first = plan_migration(root)
+        self.assertFalse(first["zero_diff"])
+        applied = apply_migration(root)
+        self.assertEqual(applied["status"], "applied")
+        self.assertTrue(plan_migration(root)["zero_diff"])
+        self.assertEqual(
+            int(read_json(paths.state)["schema_version"]),
+            STATE_SCHEMA_VERSION,
+        )
+        rolled_back = rollback_migration(root)
+        self.assertEqual(rolled_back["status"], "rolled_back")
+        self.assertEqual(paths.state.read_bytes(), before)
+        if previous_before is None:
+            self.assertFalse(paths.previous_state.exists())
+        else:
+            self.assertEqual(
+                paths.previous_state.read_bytes(),
+                previous_before,
+            )
+
+    def test_interrupted_rollback_resumes_from_exact_v1_or_v2_bytes(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        paths = engine.store.challenge_paths(identity)
+        before = paths.state.read_bytes()
+        apply_migration(root)
+        real_write = migration_module.atomic_write_bytes
+        calls = 0
+
+        def interrupt_second_restore(path, payload, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("synthetic rollback interruption")
+            return real_write(path, payload, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                migration_module,
+                "atomic_write_bytes",
+                side_effect=interrupt_second_restore,
+            ),
+            self.assertRaisesRegex(OSError, "synthetic rollback"),
+        ):
+            rollback_migration(root)
+        marker = read_json(root / ".ctfos" / "migration.json")
+        self.assertEqual(marker["status"], "migrating")
+        self.assertEqual(marker["operation"], "rollback")
+
+        resumed = rollback_migration(root)
+        self.assertEqual(resumed["status"], "rolled_back")
+        self.assertEqual(paths.state.read_bytes(), before)
+        self.assertEqual(
+            read_json(root / ".ctfos" / "migration.json")["status"],
+            "rolled_back",
+        )
+
+    def test_migration_install_fault_restores_original_bytes(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        paths = engine.store.challenge_paths(identity)
+        before = paths.state.read_bytes()
+        real_write = migration_module.atomic_write_bytes
+        failed = False
+
+        def fail_state_install(path, payload, *args, **kwargs):
+            nonlocal failed
+            if (
+                Path(path) == paths.state
+                and b'"schema_version": 2' in payload
+                and not failed
+            ):
+                failed = True
+                raise OSError("synthetic state install fault")
+            return real_write(path, payload, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                migration_module,
+                "atomic_write_bytes",
+                side_effect=fail_state_install,
+            ),
+            self.assertRaisesRegex(OSError, "synthetic"),
+        ):
+            apply_migration(root, migration_id="fault")
+        self.assertEqual(paths.state.read_bytes(), before)
+        self.assertEqual(
+            read_json(root / ".ctfos" / "migration.json")["status"],
+            "failed_rolled_back",
+        )
+
+    def test_operational_v2_commit_forbids_downgrade(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        apply_migration(root)
+        engine.update_prompt(identity, "operational v2 commit")
+        with self.assertRaisesRegex(
+            migration_module.MigrationError,
+            "operational commit",
+        ):
+            rollback_migration(root)
+
+    def test_migration_marker_blocks_state_and_run_writes(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        atomic_write_json(
+            root / ".ctfos" / "migration.json",
+            {
+                "migration_id": "blocked",
+                "status": "migrating",
+                "active_schema": 1,
+            },
+        )
+        with self.assertRaises(MigrationInProgress):
+            engine.store.update(identity, lambda state: None)
+        with self.assertRaises(MigrationInProgress):
+            engine.store.create_run(identity, run_id="blocked")
+
+    def test_commit_telemetry_contains_only_operational_shadow_fields(self):
+        temporary, root, identity, engine = self._legacy_workspace()
+        self.addCleanup(temporary.cleanup)
+        secret = "KCTF{must_not_enter_telemetry}"
+        engine.update_prompt(identity, secret)
+        telemetry_path = (
+            root / ".ctfos" / "runtime" / "telemetry.jsonl"
+        )
+        payload = telemetry_path.read_text(encoding="utf-8")
+        self.assertNotIn(secret, payload)
+        records = [
+            strict_json_loads(line)
+            for line in payload.splitlines()
+            if line
+        ]
+        latest = records[-1]
+        self.assertEqual(latest["event"], "state_commit")
+        self.assertEqual(latest["delta_shadow_mismatches"], 0)
+        self.assertIn("artifact_hash_bytes", latest)
+        self.assertIn("lock_wait_ms", latest)
+        self.assertIn("board_shadow_match", latest)
+
+
+class WorkspacePublishTests(unittest.TestCase):
+    def test_builder_publish_recovers_after_filesystem_state_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = ChallengeIdentity("Publish", "rev", "one")
+            incoming = (
+                root
+                / "incoming"
+                / identity.contest_id
+                / identity.category
+                / identity.challenge_id
+            )
+            incoming.mkdir(parents=True)
+            (incoming / "input").write_bytes(b"x")
+            config = load_config(root)
+            config = replace(
+                config,
+                runtime=replace(
+                    config.runtime,
+                    image_digest=IMAGE_DIGEST,
+                ),
+            )
+            engine = ChallengeEngine(root, config=config)
+            engine.add_challenge(
+                identity,
+                prompt="publish",
+                state_schema_version=STATE_SCHEMA_VERSION,
+            )
+            run_id = "MR-builder-publish"
+            run_paths = engine.store.create_run(
+                identity,
+                run_id=run_id,
+                request={"kind": "model", "role": "builder"},
+            )
+            engine.store.write_run_result(
+                identity,
+                run_id,
+                {"status": "completed"},
+            )
+            engine.store.write_run_validation(
+                identity,
+                run_id,
+                {"ok": True},
+            )
+            run_paths.root.joinpath("workspace").mkdir()
+            run_paths.root.joinpath("workspace", "solve.py").write_text(
+                "print('complete')\n",
+                encoding="utf-8",
+            )
+            challenge_root = engine.store.challenge_paths(identity).root
+
+            def add_run(state):
+                state.runs.append(
+                    RunReference(
+                        id=run_id,
+                        base_revision=state.revision,
+                        status=RunStatus.COMPLETED,
+                        request_path=run_paths.request.relative_to(
+                            challenge_root
+                        ).as_posix(),
+                        result_path=run_paths.result.relative_to(
+                            challenge_root
+                        ).as_posix(),
+                        validation_path=run_paths.validation.relative_to(
+                            challenge_root
+                        ).as_posix(),
+                        role="builder",
+                        origin=RunOrigin.MANAGED_MODEL,
+                        configuration_epoch=state.configuration_epoch,
+                    )
+                )
+
+            engine.store.update(identity, add_run)
+            real_update = engine.store.update
+            with (
+                mock.patch.object(
+                    engine.store,
+                    "update",
+                    side_effect=OSError("synthetic commit fault"),
+                ),
+                self.assertRaisesRegex(OSError, "synthetic"),
+            ):
+                publish_builder_file(
+                    engine,
+                    identity,
+                    run_id=run_id,
+                    staged_path="solve.py",
+                    destination="solve.py",
+                    base_workspace_revision=0,
+                    base_sha256=None,
+                )
+
+            canonical = (
+                engine.store.challenge_paths(identity).artifacts
+                / "workspace"
+                / "solve.py"
+            )
+            self.assertEqual(
+                canonical.read_text(encoding="utf-8"),
+                "print('complete')\n",
+            )
+            reconciled = reconcile_workspace_publishes(engine, identity)
+            self.assertEqual(len(reconciled), 1)
+            state = engine.store.load(identity)
+            self.assertEqual(state.workspace_revision, 1)
+            self.assertEqual(len(state.workspace_publishes), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

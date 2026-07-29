@@ -2785,6 +2785,15 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(
             any(fact.provenance is Provenance.EXECUTED for fact in state.facts)
         )
+        executed_fact = next(
+            fact
+            for fact in state.facts
+            if fact.provenance is Provenance.EXECUTED
+        )
+        self.assertNotIn("KCTF{tool_flag}", executed_fact.statement)
+        self.assertIn(executed_fact.artifact_id, executed_fact.statement)
+        self.assertNotIn("stdout_summary", experiment.result)
+        self.assertNotIn("stderr_summary", experiment.result)
         self.assertEqual(state.candidates[0].value, "KCTF{tool_flag}")
         self.assertIn("미제출", terminal.getvalue())
 

@@ -13,7 +13,10 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from ctf_os.candidates import candidate_value_is_valid
+from ctf_os.schema import STATE_SCHEMA_VERSION
 
+# Compatibility alias for callers that still construct or inspect v1 state.
+# Unrelated protocols must import their own constant from ``ctf_os.schema``.
 CURRENT_SCHEMA_VERSION = 1
 MAX_REPEATED_FIELD_ITEMS = 16_384
 MAX_RECORDS_PER_COLLECTION = MAX_REPEATED_FIELD_ITEMS
@@ -90,6 +93,7 @@ class ExperimentStatus(StringEnum):
     INCONCLUSIVE = "inconclusive"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    COMPLETED = "completed"
 
 
 class GoalStatus(StringEnum):
@@ -127,6 +131,82 @@ class RunStatus(StringEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class FactKind(StringEnum):
+    OBSERVATION = "observation"
+    LEGACY = "legacy"
+
+
+class ExperimentKind(StringEnum):
+    PROBE = "probe"
+    STRATEGIC = "strategic"
+    LEGACY = "legacy"
+
+
+class ReceiptOutcome(StringEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class CandidateTier(StringEnum):
+    EXACT = "exact"
+    CONTEST = "contest"
+    GENERIC = "generic"
+    LEGACY_UNKNOWN = "legacy_unknown"
+
+
+class BudgetMode(StringEnum):
+    BOUNDED = "bounded"
+    OPERATOR_UNBOUNDED = "operator_unbounded"
+    LEGACY_UNARMED = "legacy_unarmed"
+
+
+class RunOrigin(StringEnum):
+    MANAGED_MODEL = "managed_model"
+    MANAGED_TOOL = "managed_tool"
+    ASSISTED_MODEL = "assisted_model"
+    OPERATOR_TOOL = "operator_tool"
+    PROOF = "proof"
+    COMPATIBILITY = "compatibility"
+
+
+class SessionMode(StringEnum):
+    MANAGED = "managed"
+    ASSISTED = "assisted"
+    MANUAL = "manual"
+
+
+class SessionStatus(StringEnum):
+    CREATED = "created"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PAUSED = "paused"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class WaveKind(StringEnum):
+    DISCOVERY = "discovery"
+    ATTACK = "attack"
+    PROOF = "proof"
+    EVALUATION = "evaluation"
+
+
+class TargetStatus(StringEnum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class ClosureCompleteness(StringEnum):
+    COMPLETE = "complete"
+    LEGACY_PARTIAL = "legacy_partial"
+    INCOMPLETE = "incomplete"
 
 
 def utc_now() -> str:
@@ -329,22 +409,40 @@ class RunReference:
     role: str | None = None
     model: str | None = None
     context_hash: str | None = None
+    origin: RunOrigin = RunOrigin.COMPATIBILITY
+    idempotency_key: str | None = None
+    session_id: str | None = None
+    cycle_id: str | None = None
+    wave_id: str | None = None
+    configuration_epoch: int | None = None
     created_at: str = field(default_factory=utc_now)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "base_revision": self.base_revision,
+            "status": _enum_value(self.status),
+            "request_path": self.request_path,
+            "result_path": self.result_path,
+            "validation_path": self.validation_path,
+            "role": self.role,
+            "model": self.model,
+            "context_hash": self.context_hash,
+            "created_at": self.created_at,
+        }
+        if v2:
+            canonical.update(
+                origin=_enum_value(self.origin),
+                idempotency_key=self.idempotency_key,
+                session_id=self.session_id,
+                cycle_id=self.cycle_id,
+                wave_id=self.wave_id,
+                configuration_epoch=self.configuration_epoch,
+            )
         return _with_extra(
             self.extra,
-            id=self.id,
-            base_revision=self.base_revision,
-            status=_enum_value(self.status),
-            request_path=self.request_path,
-            result_path=self.result_path,
-            validation_path=self.validation_path,
-            role=self.role,
-            model=self.model,
-            context_hash=self.context_hash,
-            created_at=self.created_at,
+            **canonical,
         )
 
     @classmethod
@@ -361,6 +459,12 @@ class RunReference:
             "role",
             "model",
             "context_hash",
+            "origin",
+            "idempotency_key",
+            "session_id",
+            "cycle_id",
+            "wave_id",
+            "configuration_epoch",
             "created_at",
         }
         return cls(
@@ -393,6 +497,34 @@ class RunReference:
                 if data.get("context_hash") is not None
                 else None
             ),
+            origin=RunOrigin(
+                str(data.get("origin", RunOrigin.COMPATIBILITY.value))
+            ),
+            idempotency_key=(
+                str(data["idempotency_key"])
+                if data.get("idempotency_key") is not None
+                else None
+            ),
+            session_id=(
+                str(data["session_id"])
+                if data.get("session_id") is not None
+                else None
+            ),
+            cycle_id=(
+                str(data["cycle_id"])
+                if data.get("cycle_id") is not None
+                else None
+            ),
+            wave_id=(
+                str(data["wave_id"])
+                if data.get("wave_id") is not None
+                else None
+            ),
+            configuration_epoch=(
+                int(data["configuration_epoch"])
+                if data.get("configuration_epoch") is not None
+                else None
+            ),
             created_at=str(data.get("created_at", utc_now())),
             extra=_extra(data, known),
         )
@@ -403,6 +535,7 @@ class Fact:
     id: str
     statement: str
     provenance: Provenance
+    kind: FactKind = FactKind.OBSERVATION
     challenge_id: str = ""
     source_run_id: str | None = None
     artifact_id: str | None = None
@@ -413,20 +546,30 @@ class Fact:
     contradicts: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self, *, default_challenge_id: str | None = None) -> dict[str, Any]:
+    def to_dict(
+        self,
+        *,
+        default_challenge_id: str | None = None,
+        v2: bool = False,
+    ) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "challenge_id": self.challenge_id or default_challenge_id or "",
+            "statement": self.statement,
+            "provenance": _enum_value(self.provenance),
+            "source_run_id": self.source_run_id,
+            "artifact_id": self.artifact_id,
+            "locator": self.locator,
+            "created_at": self.created_at,
+            "supersedes_id": self.supersedes_id,
+            "supports": list(self.supports),
+            "contradicts": list(self.contradicts),
+        }
+        if v2:
+            canonical["kind"] = _enum_value(self.kind)
         return _with_extra(
             self.extra,
-            id=self.id,
-            challenge_id=self.challenge_id or default_challenge_id or "",
-            statement=self.statement,
-            provenance=_enum_value(self.provenance),
-            source_run_id=self.source_run_id,
-            artifact_id=self.artifact_id,
-            locator=self.locator,
-            created_at=self.created_at,
-            supersedes_id=self.supersedes_id,
-            supports=list(self.supports),
-            contradicts=list(self.contradicts),
+            **canonical,
         )
 
     @classmethod
@@ -440,6 +583,7 @@ class Fact:
             "claim",
             "provenance",
             "confidence",
+            "kind",
             "source_run_id",
             "run_id",
             "artifact_id",
@@ -460,6 +604,7 @@ class Fact:
             challenge_id=str(data.get("challenge_id", default_challenge_id)),
             statement=str(data.get("statement", data.get("claim", ""))),
             provenance=Provenance.parse(str(provenance)),
+            kind=FactKind(str(data.get("kind", FactKind.OBSERVATION.value))),
             source_run_id=(
                 str(data.get("source_run_id", data.get("run_id")))
                 if data.get("source_run_id", data.get("run_id")) is not None
@@ -547,27 +692,35 @@ class Hypothesis:
     evidence_fact_ids: list[str] = field(default_factory=list)
     evidence_artifact_ids: list[str] = field(default_factory=list)
     evidence_run_ids: list[str] = field(default_factory=list)
+    evidence_receipt_ids: list[str] = field(default_factory=list)
     confidence: float | None = None
     refuted_by: str | None = None
     source_run_id: str | None = None
     created_at: str = field(default_factory=utc_now)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "statement": self.statement,
+            "paradigm": self.paradigm,
+            "falsifier": self.falsifier.to_dict(),
+            "status": _enum_value(self.status),
+            "evidence_fact_ids": list(self.evidence_fact_ids),
+            "evidence_artifact_ids": list(self.evidence_artifact_ids),
+            "evidence_run_ids": list(self.evidence_run_ids),
+            "confidence": self.confidence,
+            "refuted_by": self.refuted_by,
+            "source_run_id": self.source_run_id,
+            "created_at": self.created_at,
+        }
+        if v2:
+            canonical["evidence_receipt_ids"] = list(
+                self.evidence_receipt_ids
+            )
         return _with_extra(
             self.extra,
-            id=self.id,
-            statement=self.statement,
-            paradigm=self.paradigm,
-            falsifier=self.falsifier.to_dict(),
-            status=_enum_value(self.status),
-            evidence_fact_ids=list(self.evidence_fact_ids),
-            evidence_artifact_ids=list(self.evidence_artifact_ids),
-            evidence_run_ids=list(self.evidence_run_ids),
-            confidence=self.confidence,
-            refuted_by=self.refuted_by,
-            source_run_id=self.source_run_id,
-            created_at=self.created_at,
+            **canonical,
         )
 
     @classmethod
@@ -581,6 +734,7 @@ class Hypothesis:
             "evidence_fact_ids",
             "evidence_artifact_ids",
             "evidence_run_ids",
+            "evidence_receipt_ids",
             "evidence",
             "confidence",
             "refuted_by",
@@ -628,6 +782,13 @@ class Hypothesis:
                     "hypothesis evidence_run_ids",
                 )
             ],
+            evidence_receipt_ids=[
+                str(item)
+                for item in _repeated_items(
+                    data.get("evidence_receipt_ids", []),
+                    "hypothesis evidence_receipt_ids",
+                )
+            ],
             confidence=(
                 float(data["confidence"])
                 if data.get("confidence") is not None
@@ -658,37 +819,47 @@ class Experiment:
     drop_if: str
     timeout_seconds: int
     resource_class: str = "light"
+    kind: ExperimentKind = ExperimentKind.STRATEGIC
     status: ExperimentStatus = ExperimentStatus.REGISTERED
     result: Any = None
     source_run_id: str | None = None
     artifact_ids: list[str] = field(default_factory=list)
     evidence_fact_ids: list[str] = field(default_factory=list)
     evidence_run_ids: list[str] = field(default_factory=list)
+    evidence_receipt_ids: list[str] = field(default_factory=list)
     evaluation_reason: str | None = None
     evaluated_at: str | None = None
     created_at: str = field(default_factory=utc_now)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "hypothesis_ids": list(self.hypothesis_ids),
+            "command": self.command,
+            "expected_observation": self.expected_observation,
+            "keep_if": self.keep_if,
+            "drop_if": self.drop_if,
+            "timeout_seconds": self.timeout_seconds,
+            "resource_class": self.resource_class,
+            "status": _enum_value(self.status),
+            "result": self.result,
+            "source_run_id": self.source_run_id,
+            "artifact_ids": list(self.artifact_ids),
+            "evidence_fact_ids": list(self.evidence_fact_ids),
+            "evidence_run_ids": list(self.evidence_run_ids),
+            "evaluation_reason": self.evaluation_reason,
+            "evaluated_at": self.evaluated_at,
+            "created_at": self.created_at,
+        }
+        if v2:
+            canonical["kind"] = _enum_value(self.kind)
+            canonical["evidence_receipt_ids"] = list(
+                self.evidence_receipt_ids
+            )
         return _with_extra(
             self.extra,
-            id=self.id,
-            hypothesis_ids=list(self.hypothesis_ids),
-            command=self.command,
-            expected_observation=self.expected_observation,
-            keep_if=self.keep_if,
-            drop_if=self.drop_if,
-            timeout_seconds=self.timeout_seconds,
-            resource_class=self.resource_class,
-            status=_enum_value(self.status),
-            result=self.result,
-            source_run_id=self.source_run_id,
-            artifact_ids=list(self.artifact_ids),
-            evidence_fact_ids=list(self.evidence_fact_ids),
-            evidence_run_ids=list(self.evidence_run_ids),
-            evaluation_reason=self.evaluation_reason,
-            evaluated_at=self.evaluated_at,
-            created_at=self.created_at,
+            **canonical,
         )
 
     @classmethod
@@ -706,12 +877,14 @@ class Experiment:
             "timeout_seconds",
             "max_seconds",
             "resource_class",
+            "kind",
             "status",
             "result",
             "source_run_id",
             "artifact_ids",
             "evidence_fact_ids",
             "evidence_run_ids",
+            "evidence_receipt_ids",
             "evaluation_reason",
             "evaluated_at",
             "created_at",
@@ -740,6 +913,9 @@ class Experiment:
                 data.get("max_seconds", 0),
             ),
             resource_class=str(data.get("resource_class", "light")),
+            kind=ExperimentKind(
+                str(data.get("kind", ExperimentKind.STRATEGIC.value))
+            ),
             status=ExperimentStatus(
                 str(data.get("status", ExperimentStatus.REGISTERED.value))
             ),
@@ -768,6 +944,13 @@ class Experiment:
                 for item in _repeated_items(
                     data.get("evidence_run_ids", []),
                     "experiment evidence_run_ids",
+                )
+            ],
+            evidence_receipt_ids=[
+                str(item)
+                for item in _repeated_items(
+                    data.get("evidence_receipt_ids", []),
+                    "experiment evidence_receipt_ids",
                 )
             ],
             evaluation_reason=(
@@ -934,6 +1117,8 @@ class Budget:
     abort_rule: dict[str, Any] = field(default_factory=dict)
     refusals: list[dict[str, Any]] = field(default_factory=list)
     curve_profile: str | None = None
+    mode: BudgetMode = BudgetMode.LEGACY_UNARMED
+    unbounded_reason: str | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -942,17 +1127,25 @@ class Budget:
             return None
         return max(0, self.allocated_seconds - self.spent_seconds)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "deadline_utc": self.deadline_utc,
+            "allocated_seconds": self.allocated_seconds,
+            "spent_seconds": self.spent_seconds,
+            "no_progress_since_seconds": self.no_progress_since_seconds,
+            "model_tier": self.model_tier,
+            "abort_rule": dict(self.abort_rule),
+            "refusals": list(self.refusals),
+            "curve_profile": self.curve_profile,
+        }
+        if v2:
+            canonical.update(
+                mode=_enum_value(self.mode),
+                unbounded_reason=self.unbounded_reason,
+            )
         return _with_extra(
             self.extra,
-            deadline_utc=self.deadline_utc,
-            allocated_seconds=self.allocated_seconds,
-            spent_seconds=self.spent_seconds,
-            no_progress_since_seconds=self.no_progress_since_seconds,
-            model_tier=self.model_tier,
-            abort_rule=dict(self.abort_rule),
-            refusals=list(self.refusals),
-            curve_profile=self.curve_profile,
+            **canonical,
         )
 
     @classmethod
@@ -971,6 +1164,8 @@ class Budget:
             "refusals",
             "curve_profile",
             "progress_markers",
+            "mode",
+            "unbounded_reason",
         }
         return cls(
             deadline_utc=(
@@ -1020,6 +1215,14 @@ class Budget:
                 if data.get("curve_profile") is not None
                 else None
             ),
+            mode=BudgetMode(
+                str(data.get("mode", BudgetMode.LEGACY_UNARMED.value))
+            ),
+            unbounded_reason=(
+                str(data["unbounded_reason"])
+                if data.get("unbounded_reason") is not None
+                else None
+            ),
             extra=_extra(data, known),
         )
 
@@ -1034,19 +1237,29 @@ class FlagCandidate:
     locator: str | None = None
     created_at: str = field(default_factory=utc_now)
     proof_run_ids: list[str] = field(default_factory=list)
+    tier: CandidateTier = CandidateTier.GENERIC
+    format_epoch: int | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "value": self.value,
+            "status": _enum_value(self.status),
+            "source_run_id": self.source_run_id,
+            "artifact_id": self.artifact_id,
+            "locator": self.locator,
+            "created_at": self.created_at,
+            "proof_run_ids": list(self.proof_run_ids),
+        }
+        if v2:
+            canonical.update(
+                tier=_enum_value(self.tier),
+                format_epoch=self.format_epoch,
+            )
         return _with_extra(
             self.extra,
-            id=self.id,
-            value=self.value,
-            status=_enum_value(self.status),
-            source_run_id=self.source_run_id,
-            artifact_id=self.artifact_id,
-            locator=self.locator,
-            created_at=self.created_at,
-            proof_run_ids=list(self.proof_run_ids),
+            **canonical,
         )
 
     @classmethod
@@ -1061,6 +1274,8 @@ class FlagCandidate:
             "locator",
             "created_at",
             "proof_run_ids",
+            "tier",
+            "format_epoch",
         }
         return cls(
             id=str(data["id"]),
@@ -1095,6 +1310,14 @@ class FlagCandidate:
                     "candidate proof_run_ids",
                 )
             ],
+            tier=CandidateTier(
+                str(data.get("tier", CandidateTier.GENERIC.value))
+            ),
+            format_epoch=(
+                int(data["format_epoch"])
+                if data.get("format_epoch") is not None
+                else None
+            ),
             extra=_extra(data, known),
         )
 
@@ -1102,6 +1325,35 @@ class FlagCandidate:
 # A concise alias is convenient in engine code and preserves the terminology in
 # the implementation report.
 Candidate = FlagCandidate
+
+
+@dataclass
+class SubmissionOverride:
+    kind: str
+    actor: str
+    reason: str
+    timestamp: str = field(default_factory=utc_now)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            kind=self.kind,
+            actor=self.actor,
+            reason=self.reason,
+            timestamp=self.timestamp,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SubmissionOverride":
+        known = {"kind", "actor", "reason", "timestamp"}
+        return cls(
+            kind=str(data.get("kind", "")),
+            actor=str(data.get("actor", "")),
+            reason=str(data.get("reason", "")),
+            timestamp=str(data.get("timestamp", utc_now())),
+            extra=_extra(data, known),
+        )
 
 
 @dataclass
@@ -1115,20 +1367,28 @@ class SubmissionReference:
     proof_passed: bool = False
     format_ok: bool = False
     points: int | float | None = None
+    override: SubmissionOverride | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, v2: bool = False) -> dict[str, Any]:
+        canonical = {
+            "id": self.id,
+            "candidate_id": self.candidate_id,
+            "status": _enum_value(self.status),
+            "submitted_at": self.submitted_at,
+            "response": self.response,
+            "attempt": self.attempt,
+            "proof_passed": self.proof_passed,
+            "format_ok": self.format_ok,
+            "points": self.points,
+        }
+        if v2:
+            canonical["override"] = (
+                self.override.to_dict() if self.override is not None else None
+            )
         return _with_extra(
             self.extra,
-            id=self.id,
-            candidate_id=self.candidate_id,
-            status=_enum_value(self.status),
-            submitted_at=self.submitted_at,
-            response=self.response,
-            attempt=self.attempt,
-            proof_passed=self.proof_passed,
-            format_ok=self.format_ok,
-            points=self.points,
+            **canonical,
         )
 
     @classmethod
@@ -1144,6 +1404,7 @@ class SubmissionReference:
             "proof_passed",
             "format_ok",
             "points",
+            "override",
         }
         status = data.get("status")
         if status is None:
@@ -1173,11 +1434,677 @@ class SubmissionReference:
             proof_passed=bool(data.get("proof_passed", False)),
             format_ok=bool(data.get("format_ok", False)),
             points=data.get("points"),
+            override=(
+                SubmissionOverride.from_dict(data["override"])
+                if isinstance(data.get("override"), Mapping)
+                else None
+            ),
             extra=_extra(data, known),
         )
 
 
 Submission = SubmissionReference
+
+
+@dataclass
+class ExecutionReceipt:
+    id: str
+    experiment_id: str
+    run_id: str
+    outcome: ReceiptOutcome
+    exit_code: int | None = None
+    wall_seconds: float = 0.0
+    stdout_artifact_id: str | None = None
+    stderr_artifact_id: str | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    stdout_lines: int = 0
+    stderr_lines: int = 0
+    preview: str = ""
+    created_at: str = field(default_factory=utc_now)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            experiment_id=self.experiment_id,
+            run_id=self.run_id,
+            outcome=_enum_value(self.outcome),
+            exit_code=self.exit_code,
+            wall_seconds=self.wall_seconds,
+            stdout_artifact_id=self.stdout_artifact_id,
+            stderr_artifact_id=self.stderr_artifact_id,
+            stdout_bytes=self.stdout_bytes,
+            stderr_bytes=self.stderr_bytes,
+            stdout_lines=self.stdout_lines,
+            stderr_lines=self.stderr_lines,
+            preview=self.preview,
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionReceipt":
+        known = {
+            "id",
+            "experiment_id",
+            "run_id",
+            "outcome",
+            "exit_code",
+            "wall_seconds",
+            "stdout_artifact_id",
+            "stderr_artifact_id",
+            "stdout_bytes",
+            "stderr_bytes",
+            "stdout_lines",
+            "stderr_lines",
+            "preview",
+            "created_at",
+        }
+        return cls(
+            id=str(data.get("id", "")),
+            experiment_id=str(data.get("experiment_id", "")),
+            run_id=str(data.get("run_id", "")),
+            outcome=ReceiptOutcome(str(data.get("outcome", "failed"))),
+            exit_code=(
+                int(data["exit_code"])
+                if data.get("exit_code") is not None
+                else None
+            ),
+            wall_seconds=float(data.get("wall_seconds", 0.0)),
+            stdout_artifact_id=(
+                str(data["stdout_artifact_id"])
+                if data.get("stdout_artifact_id") is not None
+                else None
+            ),
+            stderr_artifact_id=(
+                str(data["stderr_artifact_id"])
+                if data.get("stderr_artifact_id") is not None
+                else None
+            ),
+            stdout_bytes=int(data.get("stdout_bytes", 0)),
+            stderr_bytes=int(data.get("stderr_bytes", 0)),
+            stdout_lines=int(data.get("stdout_lines", 0)),
+            stderr_lines=int(data.get("stderr_lines", 0)),
+            preview=str(data.get("preview", "")),
+            created_at=str(data.get("created_at", utc_now())),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class SolveSession:
+    id: str
+    mode: SessionMode
+    status: SessionStatus
+    configuration_epoch: int
+    start_revision: int
+    end_revision: int | None = None
+    budget_snapshot: dict[str, Any] = field(default_factory=dict)
+    run_ids: list[str] = field(default_factory=list)
+    wave_ids: list[str] = field(default_factory=list)
+    evaluation_policy: str = "observe"
+    stop_reason: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    started_at: str | None = None
+    ended_at: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            mode=_enum_value(self.mode),
+            status=_enum_value(self.status),
+            configuration_epoch=self.configuration_epoch,
+            start_revision=self.start_revision,
+            end_revision=self.end_revision,
+            budget_snapshot=dict(self.budget_snapshot),
+            run_ids=list(self.run_ids),
+            wave_ids=list(self.wave_ids),
+            evaluation_policy=self.evaluation_policy,
+            stop_reason=self.stop_reason,
+            created_at=self.created_at,
+            started_at=self.started_at,
+            ended_at=self.ended_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SolveSession":
+        known = {
+            "id",
+            "mode",
+            "status",
+            "configuration_epoch",
+            "start_revision",
+            "end_revision",
+            "budget_snapshot",
+            "run_ids",
+            "wave_ids",
+            "evaluation_policy",
+            "stop_reason",
+            "created_at",
+            "started_at",
+            "ended_at",
+        }
+        return cls(
+            id=str(data.get("id", "")),
+            mode=SessionMode(str(data.get("mode", SessionMode.MANUAL.value))),
+            status=SessionStatus(
+                str(data.get("status", SessionStatus.CREATED.value))
+            ),
+            configuration_epoch=int(data.get("configuration_epoch", 0)),
+            start_revision=int(data.get("start_revision", 0)),
+            end_revision=(
+                int(data["end_revision"])
+                if data.get("end_revision") is not None
+                else None
+            ),
+            budget_snapshot=dict(data.get("budget_snapshot", {})),
+            run_ids=[
+                str(item)
+                for item in _repeated_items(data.get("run_ids", []), "session run_ids")
+            ],
+            wave_ids=[
+                str(item)
+                for item in _repeated_items(data.get("wave_ids", []), "session wave_ids")
+            ],
+            evaluation_policy=str(data.get("evaluation_policy", "observe")),
+            stop_reason=(
+                str(data["stop_reason"])
+                if data.get("stop_reason") is not None
+                else None
+            ),
+            created_at=str(data.get("created_at", utc_now())),
+            started_at=(
+                str(data["started_at"])
+                if data.get("started_at") is not None
+                else None
+            ),
+            ended_at=(
+                str(data["ended_at"])
+                if data.get("ended_at") is not None
+                else None
+            ),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class ManagedCycle:
+    id: str
+    session_id: str
+    ordinal: int
+    phase: str
+    configuration_epoch: int
+    captain_run_id: str | None = None
+    wave_id: str | None = None
+    selected_action_ids: list[str] = field(default_factory=list)
+    checkpoint_id: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    completed_at: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            session_id=self.session_id,
+            ordinal=self.ordinal,
+            phase=self.phase,
+            configuration_epoch=self.configuration_epoch,
+            captain_run_id=self.captain_run_id,
+            wave_id=self.wave_id,
+            selected_action_ids=list(self.selected_action_ids),
+            checkpoint_id=self.checkpoint_id,
+            created_at=self.created_at,
+            completed_at=self.completed_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ManagedCycle":
+        known = {
+            "id",
+            "session_id",
+            "ordinal",
+            "phase",
+            "configuration_epoch",
+            "captain_run_id",
+            "wave_id",
+            "selected_action_ids",
+            "checkpoint_id",
+            "created_at",
+            "completed_at",
+        }
+        return cls(
+            id=str(data.get("id", "")),
+            session_id=str(data.get("session_id", "")),
+            ordinal=int(data.get("ordinal", 0)),
+            phase=str(data.get("phase", "created")),
+            configuration_epoch=int(data.get("configuration_epoch", 0)),
+            captain_run_id=(
+                str(data["captain_run_id"])
+                if data.get("captain_run_id") is not None
+                else None
+            ),
+            wave_id=(
+                str(data["wave_id"])
+                if data.get("wave_id") is not None
+                else None
+            ),
+            selected_action_ids=[
+                str(item)
+                for item in _repeated_items(
+                    data.get("selected_action_ids", []),
+                    "cycle selected_action_ids",
+                )
+            ],
+            checkpoint_id=(
+                str(data["checkpoint_id"])
+                if data.get("checkpoint_id") is not None
+                else None
+            ),
+            created_at=str(data.get("created_at", utc_now())),
+            completed_at=(
+                str(data["completed_at"])
+                if data.get("completed_at") is not None
+                else None
+            ),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class ManagedWave:
+    id: str
+    session_id: str
+    cycle_id: str
+    kind: WaveKind
+    role_run_ids: dict[str, str]
+    snapshot_revision: int
+    configuration_epoch: int
+    status: str = "created"
+    created_at: str = field(default_factory=utc_now)
+    reduced_at: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            session_id=self.session_id,
+            cycle_id=self.cycle_id,
+            kind=_enum_value(self.kind),
+            role_run_ids=dict(self.role_run_ids),
+            snapshot_revision=self.snapshot_revision,
+            configuration_epoch=self.configuration_epoch,
+            status=self.status,
+            created_at=self.created_at,
+            reduced_at=self.reduced_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ManagedWave":
+        known = {
+            "id",
+            "session_id",
+            "cycle_id",
+            "kind",
+            "role_run_ids",
+            "snapshot_revision",
+            "configuration_epoch",
+            "status",
+            "created_at",
+            "reduced_at",
+        }
+        roles = data.get("role_run_ids", {})
+        if not isinstance(roles, Mapping):
+            raise ModelValidationError("wave role_run_ids must be an object")
+        return cls(
+            id=str(data.get("id", "")),
+            session_id=str(data.get("session_id", "")),
+            cycle_id=str(data.get("cycle_id", "")),
+            kind=WaveKind(str(data.get("kind", WaveKind.DISCOVERY.value))),
+            role_run_ids={str(key): str(value) for key, value in roles.items()},
+            snapshot_revision=int(data.get("snapshot_revision", 0)),
+            configuration_epoch=int(data.get("configuration_epoch", 0)),
+            status=str(data.get("status", "created")),
+            created_at=str(data.get("created_at", utc_now())),
+            reduced_at=(
+                str(data["reduced_at"])
+                if data.get("reduced_at") is not None
+                else None
+            ),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class Checkpoint:
+    id: str
+    session_id: str | None
+    cycle_id: str | None
+    active_goal_id: str | None
+    open_hypothesis_ids: list[str] = field(default_factory=list)
+    observation_fact_ids: list[str] = field(default_factory=list)
+    next_actions: list[str] = field(default_factory=list)
+    do_not_repeat: list[str] = field(default_factory=list)
+    artifact_ids: list[str] = field(default_factory=list)
+    receipt_ids: list[str] = field(default_factory=list)
+    note: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            session_id=self.session_id,
+            cycle_id=self.cycle_id,
+            active_goal_id=self.active_goal_id,
+            open_hypothesis_ids=list(self.open_hypothesis_ids),
+            observation_fact_ids=list(self.observation_fact_ids),
+            next_actions=list(self.next_actions),
+            do_not_repeat=list(self.do_not_repeat),
+            artifact_ids=list(self.artifact_ids),
+            receipt_ids=list(self.receipt_ids),
+            note=self.note,
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Checkpoint":
+        known = {
+            "id",
+            "session_id",
+            "cycle_id",
+            "active_goal_id",
+            "open_hypothesis_ids",
+            "observation_fact_ids",
+            "next_actions",
+            "do_not_repeat",
+            "artifact_ids",
+            "receipt_ids",
+            "note",
+            "created_at",
+        }
+
+        def strings(name: str) -> list[str]:
+            return [
+                str(item)
+                for item in _repeated_items(data.get(name, []), f"checkpoint {name}")
+            ]
+
+        return cls(
+            id=str(data.get("id", "")),
+            session_id=(
+                str(data["session_id"])
+                if data.get("session_id") is not None
+                else None
+            ),
+            cycle_id=(
+                str(data["cycle_id"])
+                if data.get("cycle_id") is not None
+                else None
+            ),
+            active_goal_id=(
+                str(data["active_goal_id"])
+                if data.get("active_goal_id") is not None
+                else None
+            ),
+            open_hypothesis_ids=strings("open_hypothesis_ids"),
+            observation_fact_ids=strings("observation_fact_ids"),
+            next_actions=strings("next_actions"),
+            do_not_repeat=strings("do_not_repeat"),
+            artifact_ids=strings("artifact_ids"),
+            receipt_ids=strings("receipt_ids"),
+            note=str(data["note"]) if data.get("note") is not None else None,
+            created_at=str(data.get("created_at", utc_now())),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class TargetRecord:
+    id: str
+    endpoint: str
+    status: TargetStatus
+    enforcement: str
+    docker_network: str
+    purpose: str
+    generation: int
+    provenance: str
+    created_at: str = field(default_factory=utc_now)
+    expires_at: str | None = None
+    revoked_at: str | None = None
+    revoke_reason: str | None = None
+    last_preflight: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            endpoint=self.endpoint,
+            status=_enum_value(self.status),
+            enforcement=self.enforcement,
+            docker_network=self.docker_network,
+            purpose=self.purpose,
+            generation=self.generation,
+            provenance=self.provenance,
+            created_at=self.created_at,
+            expires_at=self.expires_at,
+            revoked_at=self.revoked_at,
+            revoke_reason=self.revoke_reason,
+            last_preflight=(
+                dict(self.last_preflight)
+                if self.last_preflight is not None
+                else None
+            ),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TargetRecord":
+        known = {
+            "id",
+            "endpoint",
+            "status",
+            "enforcement",
+            "docker_network",
+            "purpose",
+            "generation",
+            "provenance",
+            "created_at",
+            "expires_at",
+            "revoked_at",
+            "revoke_reason",
+            "last_preflight",
+        }
+        preflight = data.get("last_preflight")
+        return cls(
+            id=str(data.get("id", "")),
+            endpoint=str(data.get("endpoint", "")),
+            status=TargetStatus(
+                str(data.get("status", TargetStatus.ACTIVE.value))
+            ),
+            enforcement=str(data.get("enforcement", "declared")),
+            docker_network=str(data.get("docker_network", "bridge")),
+            purpose=str(data.get("purpose", "")),
+            generation=int(data.get("generation", 1)),
+            provenance=str(data.get("provenance", "operator")),
+            created_at=str(data.get("created_at", utc_now())),
+            expires_at=(
+                str(data["expires_at"])
+                if data.get("expires_at") is not None
+                else None
+            ),
+            revoked_at=(
+                str(data["revoked_at"])
+                if data.get("revoked_at") is not None
+                else None
+            ),
+            revoke_reason=(
+                str(data["revoke_reason"])
+                if data.get("revoke_reason") is not None
+                else None
+            ),
+            last_preflight=dict(preflight) if isinstance(preflight, Mapping) else None,
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class ClosureBundle:
+    id: str
+    completeness: ClosureCompleteness
+    portability: str
+    source_artifact_ids: list[str] = field(default_factory=list)
+    image_reference: str | None = None
+    solver_artifact_ids: list[str] = field(default_factory=list)
+    report_artifact_ids: list[str] = field(default_factory=list)
+    proof_run_ids: list[str] = field(default_factory=list)
+    submission_ids: list[str] = field(default_factory=list)
+    target_ids: list[str] = field(default_factory=list)
+    checkpoint_ids: list[str] = field(default_factory=list)
+    side_effect_receipt_ids: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=utc_now)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            completeness=_enum_value(self.completeness),
+            portability=self.portability,
+            source_artifact_ids=list(self.source_artifact_ids),
+            image_reference=self.image_reference,
+            solver_artifact_ids=list(self.solver_artifact_ids),
+            report_artifact_ids=list(self.report_artifact_ids),
+            proof_run_ids=list(self.proof_run_ids),
+            submission_ids=list(self.submission_ids),
+            target_ids=list(self.target_ids),
+            checkpoint_ids=list(self.checkpoint_ids),
+            side_effect_receipt_ids=list(self.side_effect_receipt_ids),
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ClosureBundle":
+        known = {
+            "id",
+            "completeness",
+            "portability",
+            "source_artifact_ids",
+            "image_reference",
+            "solver_artifact_ids",
+            "report_artifact_ids",
+            "proof_run_ids",
+            "submission_ids",
+            "target_ids",
+            "checkpoint_ids",
+            "side_effect_receipt_ids",
+            "created_at",
+        }
+
+        def strings(name: str) -> list[str]:
+            return [
+                str(item)
+                for item in _repeated_items(data.get(name, []), f"closure {name}")
+            ]
+
+        return cls(
+            id=str(data.get("id", "")),
+            completeness=ClosureCompleteness(
+                str(
+                    data.get(
+                        "completeness",
+                        ClosureCompleteness.INCOMPLETE.value,
+                    )
+                )
+            ),
+            portability=str(data.get("portability", "referential")),
+            source_artifact_ids=strings("source_artifact_ids"),
+            image_reference=(
+                str(data["image_reference"])
+                if data.get("image_reference") is not None
+                else None
+            ),
+            solver_artifact_ids=strings("solver_artifact_ids"),
+            report_artifact_ids=strings("report_artifact_ids"),
+            proof_run_ids=strings("proof_run_ids"),
+            submission_ids=strings("submission_ids"),
+            target_ids=strings("target_ids"),
+            checkpoint_ids=strings("checkpoint_ids"),
+            side_effect_receipt_ids=strings("side_effect_receipt_ids"),
+            created_at=str(data.get("created_at", utc_now())),
+            extra=_extra(data, known),
+        )
+
+
+@dataclass
+class WorkspacePublish:
+    id: str
+    run_id: str
+    staged_path: str
+    destination: str
+    sha256: str
+    base_sha256: str | None
+    base_workspace_revision: int
+    published_workspace_revision: int | None = None
+    status: str = "proposed"
+    created_at: str = field(default_factory=utc_now)
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _with_extra(
+            self.extra,
+            id=self.id,
+            run_id=self.run_id,
+            staged_path=self.staged_path,
+            destination=self.destination,
+            sha256=self.sha256,
+            base_sha256=self.base_sha256,
+            base_workspace_revision=self.base_workspace_revision,
+            published_workspace_revision=self.published_workspace_revision,
+            status=self.status,
+            created_at=self.created_at,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WorkspacePublish":
+        known = {
+            "id",
+            "run_id",
+            "staged_path",
+            "destination",
+            "sha256",
+            "base_sha256",
+            "base_workspace_revision",
+            "published_workspace_revision",
+            "status",
+            "created_at",
+        }
+        return cls(
+            id=str(data.get("id", "")),
+            run_id=str(data.get("run_id", "")),
+            staged_path=str(data.get("staged_path", "")),
+            destination=str(data.get("destination", "")),
+            sha256=str(data.get("sha256", "")),
+            base_sha256=(
+                str(data["base_sha256"])
+                if data.get("base_sha256") is not None
+                else None
+            ),
+            base_workspace_revision=int(data.get("base_workspace_revision", 0)),
+            published_workspace_revision=(
+                int(data["published_workspace_revision"])
+                if data.get("published_workspace_revision") is not None
+                else None
+            ),
+            status=str(data.get("status", "proposed")),
+            created_at=str(data.get("created_at", utc_now())),
+            extra=_extra(data, known),
+        )
 
 
 @dataclass
@@ -1207,6 +2134,18 @@ class ChallengeState:
     submissions: list[SubmissionReference] = field(default_factory=list)
     artifacts: list[ArtifactReference] = field(default_factory=list)
     runs: list[RunReference] = field(default_factory=list)
+    configuration_epoch: int = 0
+    workspace_revision: int = 0
+    receipts: list[ExecutionReceipt] = field(default_factory=list)
+    sessions: list[SolveSession] = field(default_factory=list)
+    cycles: list[ManagedCycle] = field(default_factory=list)
+    waves: list[ManagedWave] = field(default_factory=list)
+    checkpoints: list[Checkpoint] = field(default_factory=list)
+    targets: list[TargetRecord] = field(default_factory=list)
+    primary_target_id: str | None = None
+    closure: ClosureBundle | None = None
+    workspace_publishes: list[WorkspacePublish] = field(default_factory=list)
+    active_managed_session_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -1227,44 +2166,79 @@ class ChallengeState:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _with_extra(
-            self.extra,
-            schema_version=self.schema_version,
-            revision=self.revision,
-            updated_at=self.updated_at,
-            created_at=self.created_at,
-            contest_id=self.contest_id,
-            category=self.category,
-            challenge_id=self.challenge_id,
-            identity=self.identity.to_dict(),
-            status=_enum_value(self.status),
-            resume_status=(
+        v2 = self.schema_version >= STATE_SCHEMA_VERSION
+        canonical: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "revision": self.revision,
+            "updated_at": self.updated_at,
+            "created_at": self.created_at,
+            "contest_id": self.contest_id,
+            "category": self.category,
+            "challenge_id": self.challenge_id,
+            "identity": self.identity.to_dict(),
+            "status": _enum_value(self.status),
+            "resume_status": (
                 _enum_value(self.resume_status)
                 if self.resume_status is not None
                 else None
             ),
-            description=self.description,
-            prompt=self.prompt,
-            source_path=self.source_path,
-            source_inventory=[item.to_dict() for item in self.source_inventory],
-            metadata=dict(self.metadata),
-            active_goal_id=self.active_goal_id,
-            goals=[item.to_dict() for item in self.goals],
-            facts=[
-                item.to_dict(default_challenge_id=self.challenge_id)
+            "description": self.description,
+            "prompt": self.prompt,
+            "source_path": self.source_path,
+            "source_inventory": [
+                item.to_dict() for item in self.source_inventory
+            ],
+            "metadata": dict(self.metadata),
+            "active_goal_id": self.active_goal_id,
+            "goals": [item.to_dict() for item in self.goals],
+            "facts": [
+                item.to_dict(
+                    default_challenge_id=self.challenge_id,
+                    v2=v2,
+                )
                 for item in self.facts
             ],
-            hypotheses=[item.to_dict() for item in self.hypotheses],
-            experiments=[item.to_dict() for item in self.experiments],
-            progress_markers=[
+            "hypotheses": [
+                item.to_dict(v2=v2) for item in self.hypotheses
+            ],
+            "experiments": [
+                item.to_dict(v2=v2) for item in self.experiments
+            ],
+            "progress_markers": [
                 item.to_dict() for item in self.progress_markers
             ],
-            budget=self.budget.to_dict(),
-            candidates=[item.to_dict() for item in self.candidates],
-            submissions=[item.to_dict() for item in self.submissions],
-            artifacts=[item.to_dict() for item in self.artifacts],
-            runs=[item.to_dict() for item in self.runs],
-        )
+            "budget": self.budget.to_dict(v2=v2),
+            "candidates": [
+                item.to_dict(v2=v2) for item in self.candidates
+            ],
+            "submissions": [
+                item.to_dict(v2=v2) for item in self.submissions
+            ],
+            "artifacts": [item.to_dict() for item in self.artifacts],
+            "runs": [item.to_dict(v2=v2) for item in self.runs],
+        }
+        if v2:
+            canonical.update(
+                configuration_epoch=self.configuration_epoch,
+                workspace_revision=self.workspace_revision,
+                receipts=[item.to_dict() for item in self.receipts],
+                sessions=[item.to_dict() for item in self.sessions],
+                cycles=[item.to_dict() for item in self.cycles],
+                waves=[item.to_dict() for item in self.waves],
+                checkpoints=[item.to_dict() for item in self.checkpoints],
+                targets=[item.to_dict() for item in self.targets],
+                primary_target_id=self.primary_target_id,
+                closure=(
+                    self.closure.to_dict()
+                    if self.closure is not None
+                    else None
+                ),
+                workspace_publishes=[
+                    item.to_dict() for item in self.workspace_publishes
+                ],
+                active_managed_session_id=self.active_managed_session_id,
+            )
+        return _with_extra(self.extra, **canonical)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ChallengeState":
@@ -1316,6 +2290,18 @@ class ChallengeState:
             "submissions",
             "artifacts",
             "runs",
+            "configuration_epoch",
+            "workspace_revision",
+            "receipts",
+            "sessions",
+            "cycles",
+            "waves",
+            "checkpoints",
+            "targets",
+            "primary_target_id",
+            "closure",
+            "workspace_publishes",
+            "active_managed_session_id",
         }
 
         active_goal = data.get("active_goal_id", data.get("active_goal"))
@@ -1403,6 +2389,51 @@ class ChallengeState:
                 RunReference.from_dict(record)
                 for record in _records(data.get("runs", []))
             ],
+            configuration_epoch=int(data.get("configuration_epoch", 0)),
+            workspace_revision=int(data.get("workspace_revision", 0)),
+            receipts=[
+                ExecutionReceipt.from_dict(record)
+                for record in _records(data.get("receipts", []))
+            ],
+            sessions=[
+                SolveSession.from_dict(record)
+                for record in _records(data.get("sessions", []))
+            ],
+            cycles=[
+                ManagedCycle.from_dict(record)
+                for record in _records(data.get("cycles", []))
+            ],
+            waves=[
+                ManagedWave.from_dict(record)
+                for record in _records(data.get("waves", []))
+            ],
+            checkpoints=[
+                Checkpoint.from_dict(record)
+                for record in _records(data.get("checkpoints", []))
+            ],
+            targets=[
+                TargetRecord.from_dict(record)
+                for record in _records(data.get("targets", []))
+            ],
+            primary_target_id=(
+                str(data["primary_target_id"])
+                if data.get("primary_target_id") is not None
+                else None
+            ),
+            closure=(
+                ClosureBundle.from_dict(data["closure"])
+                if isinstance(data.get("closure"), Mapping)
+                else None
+            ),
+            workspace_publishes=[
+                WorkspacePublish.from_dict(record)
+                for record in _records(data.get("workspace_publishes", []))
+            ],
+            active_managed_session_id=(
+                str(data["active_managed_session_id"])
+                if data.get("active_managed_session_id") is not None
+                else None
+            ),
             extra=_extra(data, known),
         )
         return state
@@ -1422,6 +2453,13 @@ class ChallengeState:
             ("submissions", self.submissions),
             ("artifacts", self.artifacts),
             ("runs", self.runs),
+            ("receipts", self.receipts),
+            ("sessions", self.sessions),
+            ("cycles", self.cycles),
+            ("waves", self.waves),
+            ("checkpoints", self.checkpoints),
+            ("targets", self.targets),
+            ("workspace_publishes", self.workspace_publishes),
         ):
             if len(records) > MAX_RECORDS_PER_COLLECTION:
                 raise ModelValidationError(
@@ -1446,6 +2484,10 @@ class ChallengeState:
                 hypothesis.evidence_run_ids,
                 f"hypothesis {hypothesis.id} evidence_run_ids",
             )
+            _repeated_items(
+                hypothesis.evidence_receipt_ids,
+                f"hypothesis {hypothesis.id} evidence_receipt_ids",
+            )
         for experiment in self.experiments:
             _repeated_items(
                 experiment.hypothesis_ids,
@@ -1462,6 +2504,10 @@ class ChallengeState:
             _repeated_items(
                 experiment.evidence_run_ids,
                 f"experiment {experiment.id} evidence_run_ids",
+            )
+            _repeated_items(
+                experiment.evidence_receipt_ids,
+                f"experiment {experiment.id} evidence_receipt_ids",
             )
         for goal in self.goals:
             _repeated_items(goal.depends_on, f"goal {goal.id} depends_on")
@@ -1480,9 +2526,13 @@ class ChallengeState:
                 candidate.proof_run_ids,
                 f"candidate {candidate.id} proof_run_ids",
             )
-        if self.schema_version != CURRENT_SCHEMA_VERSION:
+        if self.schema_version not in {
+            CURRENT_SCHEMA_VERSION,
+            STATE_SCHEMA_VERSION,
+        }:
             errors.append(
-                f"schema_version must be {CURRENT_SCHEMA_VERSION}, "
+                "schema_version must be one of "
+                f"{CURRENT_SCHEMA_VERSION}, {STATE_SCHEMA_VERSION}; "
                 f"got {self.schema_version}"
             )
         if self.revision < 0:
@@ -1532,6 +2582,13 @@ class ChallengeState:
         markers = id_map("progress marker", self.progress_markers)
         candidates = id_map("candidate", self.candidates)
         id_map("submission", self.submissions)
+        receipts = id_map("receipt", self.receipts)
+        sessions = id_map("session", self.sessions)
+        cycles = id_map("cycle", self.cycles)
+        waves = id_map("wave", self.waves)
+        checkpoints = id_map("checkpoint", self.checkpoints)
+        targets = id_map("target", self.targets)
+        id_map("workspace publish", self.workspace_publishes)
         del markers  # uniqueness is the only marker-level map invariant
 
         for artifact in self.artifacts:
@@ -1624,6 +2681,12 @@ class ChallengeState:
                         f"hypothesis {hypothesis.id} references unknown run "
                         f"{run_id}"
                     )
+            for receipt_id in hypothesis.evidence_receipt_ids:
+                if receipt_id not in receipts:
+                    errors.append(
+                        f"hypothesis {hypothesis.id} references unknown "
+                        f"receipt {receipt_id}"
+                    )
             if hypothesis.source_run_id and hypothesis.source_run_id not in runs:
                 errors.append(
                     f"hypothesis {hypothesis.id} references unknown run "
@@ -1666,6 +2729,16 @@ class ChallengeState:
                     == facts[fact_id].source_run_id
                     for fact_id in hypothesis.evidence_fact_ids
                 )
+                has_executed_chain = has_executed_chain or any(
+                    receipt_id in receipts
+                    and receipts[receipt_id].outcome
+                    is ReceiptOutcome.SUCCEEDED
+                    and receipts[receipt_id].run_id in runs
+                    and runs[receipts[receipt_id].run_id].status
+                    is RunStatus.COMPLETED
+                    and receipts[receipt_id].stdout_artifact_id in artifacts
+                    for receipt_id in hypothesis.evidence_receipt_ids
+                )
                 if not has_executed_chain:
                     errors.append(
                         f"hypothesis {hypothesis.id} cannot be "
@@ -1697,6 +2770,12 @@ class ChallengeState:
                     errors.append(
                         f"experiment {experiment.id} references unknown run "
                         f"{run_id}"
+                    )
+            for receipt_id in experiment.evidence_receipt_ids:
+                if receipt_id not in receipts:
+                    errors.append(
+                        f"experiment {experiment.id} references unknown "
+                        f"receipt {receipt_id}"
                     )
             if (
                 not experiment.command
@@ -1761,6 +2840,15 @@ class ChallengeState:
                         facts[fact_id].artifact_id
                     ].source_run_id == result_run_id
                     for fact_id in experiment.evidence_fact_ids
+                )
+                has_executed_chain = has_executed_chain or any(
+                    receipt_id in receipts
+                    and receipts[receipt_id].experiment_id == experiment.id
+                    and receipts[receipt_id].run_id == result_run_id
+                    and receipts[receipt_id].outcome
+                    is ReceiptOutcome.SUCCEEDED
+                    and receipts[receipt_id].stdout_artifact_id in artifacts
+                    for receipt_id in experiment.evidence_receipt_ids
                 )
                 if not has_executed_chain:
                     errors.append(
@@ -1940,6 +3028,444 @@ class ChallengeState:
         ):
             errors.append("an accepted candidate requires a SOLVED challenge")
 
+        if self.schema_version >= STATE_SCHEMA_VERSION:
+            if self.configuration_epoch < 0:
+                errors.append("configuration_epoch cannot be negative")
+            if self.workspace_revision < 0:
+                errors.append("workspace_revision cannot be negative")
+
+            terminal_challenge = self.status in {
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+            }
+            if terminal_challenge and self.active_goal_id is not None:
+                errors.append("terminal challenge cannot retain an active goal")
+            if (
+                terminal_challenge
+                and self.active_managed_session_id is not None
+            ):
+                errors.append(
+                    "terminal challenge cannot retain an active managed session"
+                )
+
+            for fact in self.facts:
+                if (
+                    fact.kind is FactKind.OBSERVATION
+                    and fact.provenance is Provenance.EXECUTED
+                    and not (fact.locator or "").strip()
+                ):
+                    errors.append(
+                        f"executed observation fact {fact.id} requires a locator"
+                    )
+
+            for experiment in self.experiments:
+                if experiment.kind is ExperimentKind.PROBE:
+                    if experiment.hypothesis_ids:
+                        errors.append(
+                            f"probe experiment {experiment.id} cannot name "
+                            "hypotheses"
+                        )
+                    if experiment.status is ExperimentStatus.KEPT or (
+                        experiment.status is ExperimentStatus.DROPPED
+                    ):
+                        errors.append(
+                            f"probe experiment {experiment.id} completes "
+                            "without semantic keep/drop"
+                        )
+                elif experiment.kind is ExperimentKind.STRATEGIC:
+                    if not experiment.hypothesis_ids:
+                        errors.append(
+                            f"strategic experiment {experiment.id} requires "
+                            "at least one hypothesis"
+                        )
+                    if (
+                        self.active_goal_id is None
+                        and experiment.status
+                        in {
+                            ExperimentStatus.REGISTERED,
+                            ExperimentStatus.RUNNING,
+                        }
+                    ):
+                        errors.append(
+                            f"strategic experiment {experiment.id} requires "
+                            "an active goal"
+                        )
+
+            terminal_run_statuses = {
+                RunStatus.COMPLETED,
+                RunStatus.INVALID,
+                RunStatus.FAILED,
+                RunStatus.TIMED_OUT,
+                RunStatus.CANCELLED,
+                RunStatus.INTERRUPTED,
+            }
+            idempotency_keys: dict[str, str] = {}
+            for run in self.runs:
+                if run.configuration_epoch is not None and (
+                    run.configuration_epoch < 0
+                    or run.configuration_epoch > self.configuration_epoch
+                ):
+                    errors.append(
+                        f"run {run.id} has invalid configuration epoch"
+                    )
+                if run.idempotency_key:
+                    prior = idempotency_keys.get(run.idempotency_key)
+                    if prior is not None and prior != run.id:
+                        errors.append(
+                            "duplicate run idempotency key "
+                            f"{run.idempotency_key}: {prior}, {run.id}"
+                        )
+                    idempotency_keys[run.idempotency_key] = run.id
+                if (
+                    run.origin
+                    in {RunOrigin.MANAGED_MODEL, RunOrigin.MANAGED_TOOL}
+                    and run.status in terminal_run_statuses
+                    and (
+                        run.result_path is None
+                        or run.validation_path is None
+                    )
+                ):
+                    errors.append(
+                        f"terminal managed run {run.id} requires result and "
+                        "validation paths"
+                    )
+
+            expected_run_status = {
+                ReceiptOutcome.SUCCEEDED: RunStatus.COMPLETED,
+                ReceiptOutcome.FAILED: RunStatus.FAILED,
+                ReceiptOutcome.TIMED_OUT: RunStatus.TIMED_OUT,
+                ReceiptOutcome.CANCELLED: RunStatus.CANCELLED,
+                ReceiptOutcome.INTERRUPTED: RunStatus.INTERRUPTED,
+            }
+            seen_receipt_runs: set[str] = set()
+            seen_receipt_experiments: set[str] = set()
+            for receipt in self.receipts:
+                run = runs.get(receipt.run_id)
+                experiment = experiments.get(receipt.experiment_id)
+                if run is None or run.status not in terminal_run_statuses:
+                    errors.append(
+                        f"receipt {receipt.id} requires one terminal run"
+                    )
+                elif run.status is not expected_run_status[receipt.outcome]:
+                    errors.append(
+                        f"receipt {receipt.id} outcome does not match run "
+                        f"{run.id} status"
+                    )
+                if experiment is None:
+                    errors.append(
+                        f"receipt {receipt.id} references unknown experiment "
+                        f"{receipt.experiment_id}"
+                    )
+                if receipt.run_id in seen_receipt_runs:
+                    errors.append(
+                        f"run {receipt.run_id} has more than one receipt"
+                    )
+                if receipt.experiment_id in seen_receipt_experiments:
+                    errors.append(
+                        f"experiment {receipt.experiment_id} has more than "
+                        "one receipt"
+                    )
+                seen_receipt_runs.add(receipt.run_id)
+                seen_receipt_experiments.add(receipt.experiment_id)
+                for artifact_id in (
+                    receipt.stdout_artifact_id,
+                    receipt.stderr_artifact_id,
+                ):
+                    if artifact_id is not None and artifact_id not in artifacts:
+                        errors.append(
+                            f"receipt {receipt.id} references unknown artifact "
+                            f"{artifact_id}"
+                        )
+                if len(receipt.preview) > 160:
+                    errors.append(
+                        f"receipt {receipt.id} preview exceeds 160 characters"
+                    )
+                for label, value in (
+                    ("wall_seconds", receipt.wall_seconds),
+                    ("stdout_bytes", receipt.stdout_bytes),
+                    ("stderr_bytes", receipt.stderr_bytes),
+                    ("stdout_lines", receipt.stdout_lines),
+                    ("stderr_lines", receipt.stderr_lines),
+                ):
+                    if value < 0:
+                        errors.append(
+                            f"receipt {receipt.id} {label} cannot be negative"
+                        )
+
+            for session in self.sessions:
+                if session.configuration_epoch > self.configuration_epoch:
+                    errors.append(
+                        f"session {session.id} has a future configuration epoch"
+                    )
+                for run_id in session.run_ids:
+                    if run_id not in runs:
+                        errors.append(
+                            f"session {session.id} references unknown run "
+                            f"{run_id}"
+                        )
+                for wave_id in session.wave_ids:
+                    if wave_id not in waves:
+                        errors.append(
+                            f"session {session.id} references unknown wave "
+                            f"{wave_id}"
+                        )
+                if session.status in {
+                    SessionStatus.COMPLETED,
+                    SessionStatus.PAUSED,
+                    SessionStatus.FAILED,
+                    SessionStatus.INTERRUPTED,
+                } and session.end_revision is None:
+                    errors.append(
+                        f"terminal session {session.id} requires end_revision"
+                    )
+
+            if self.active_managed_session_id is not None:
+                active_session = sessions.get(self.active_managed_session_id)
+                if active_session is None:
+                    errors.append(
+                        "active_managed_session_id references unknown session "
+                        f"{self.active_managed_session_id}"
+                    )
+                elif (
+                    active_session.mode is not SessionMode.MANAGED
+                    or active_session.status
+                    not in {SessionStatus.CREATED, SessionStatus.RUNNING}
+                ):
+                    errors.append(
+                        f"active managed session {active_session.id} is not "
+                        "managed and nonterminal"
+                    )
+            active_managed = [
+                session.id
+                for session in self.sessions
+                if session.mode is SessionMode.MANAGED
+                and session.status
+                in {SessionStatus.CREATED, SessionStatus.RUNNING}
+            ]
+            if len(active_managed) > 1:
+                errors.append(
+                    "only one managed session may be active: "
+                    + ", ".join(active_managed)
+                )
+
+            expected_roles = {
+                WaveKind.DISCOVERY: {"recon", "specialist", "extractor"},
+                WaveKind.ATTACK: {"builder", "falsifier", "reproducer"},
+                WaveKind.PROOF: {
+                    "validator",
+                    "reproducer",
+                    "evidence_auditor",
+                },
+                WaveKind.EVALUATION: {
+                    "falsifier",
+                    "validator",
+                    "evidence_auditor",
+                },
+            }
+            for wave in self.waves:
+                if wave.session_id not in sessions:
+                    errors.append(
+                        f"wave {wave.id} references unknown session "
+                        f"{wave.session_id}"
+                    )
+                if wave.cycle_id not in cycles:
+                    errors.append(
+                        f"wave {wave.id} references unknown cycle "
+                        f"{wave.cycle_id}"
+                    )
+                if set(wave.role_run_ids) != expected_roles[wave.kind]:
+                    errors.append(
+                        f"wave {wave.id} must contain exactly the three "
+                        f"{wave.kind.value} roles"
+                    )
+                if len(set(wave.role_run_ids.values())) != 3:
+                    errors.append(
+                        f"wave {wave.id} must reference three distinct runs"
+                    )
+                for role, run_id in wave.role_run_ids.items():
+                    run = runs.get(run_id)
+                    if run is None:
+                        errors.append(
+                            f"wave {wave.id} role {role} references unknown "
+                            f"run {run_id}"
+                        )
+                    elif (
+                        run.role != role
+                        or run.wave_id != wave.id
+                        or run.session_id != wave.session_id
+                        or run.cycle_id != wave.cycle_id
+                    ):
+                        errors.append(
+                            f"wave {wave.id} role/run binding mismatch for "
+                            f"{role}"
+                        )
+
+            for cycle in self.cycles:
+                if cycle.session_id not in sessions:
+                    errors.append(
+                        f"cycle {cycle.id} references unknown session "
+                        f"{cycle.session_id}"
+                    )
+                if cycle.captain_run_id is not None:
+                    captain_run = runs.get(cycle.captain_run_id)
+                    if (
+                        captain_run is None
+                        or captain_run.role != "captain"
+                        or captain_run.session_id != cycle.session_id
+                        or captain_run.cycle_id != cycle.id
+                    ):
+                        errors.append(
+                            f"cycle {cycle.id} captain run binding is invalid"
+                        )
+                if cycle.wave_id is not None and cycle.wave_id not in waves:
+                    errors.append(
+                        f"cycle {cycle.id} references unknown wave "
+                        f"{cycle.wave_id}"
+                    )
+                if (
+                    cycle.checkpoint_id is not None
+                    and cycle.checkpoint_id not in checkpoints
+                ):
+                    errors.append(
+                        f"cycle {cycle.id} references unknown checkpoint "
+                        f"{cycle.checkpoint_id}"
+                    )
+
+            for checkpoint in self.checkpoints:
+                if (
+                    checkpoint.active_goal_id is not None
+                    and checkpoint.active_goal_id not in goals
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} references unknown goal "
+                        f"{checkpoint.active_goal_id}"
+                    )
+                for hypothesis_id in checkpoint.open_hypothesis_ids:
+                    if hypothesis_id not in hypotheses:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} references unknown "
+                            f"hypothesis {hypothesis_id}"
+                        )
+                for fact_id in checkpoint.observation_fact_ids:
+                    if fact_id not in facts:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} references unknown "
+                            f"fact {fact_id}"
+                        )
+                for artifact_id in checkpoint.artifact_ids:
+                    if artifact_id not in artifacts:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} references unknown "
+                            f"artifact {artifact_id}"
+                        )
+                for receipt_id in checkpoint.receipt_ids:
+                    if receipt_id not in receipts:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} references unknown "
+                            f"receipt {receipt_id}"
+                        )
+
+            if self.primary_target_id is not None:
+                primary = targets.get(self.primary_target_id)
+                if primary is None:
+                    errors.append(
+                        f"primary_target_id references unknown target "
+                        f"{self.primary_target_id}"
+                    )
+                elif primary.status is not TargetStatus.ACTIVE:
+                    errors.append(
+                        f"primary target {primary.id} is not active"
+                    )
+            target_endpoints: set[tuple[str, int]] = set()
+            for target in self.targets:
+                if not target.endpoint or target.generation < 1:
+                    errors.append(
+                        f"target {target.id} requires endpoint and positive "
+                        "generation"
+                    )
+                key = (target.endpoint, target.generation)
+                if key in target_endpoints:
+                    errors.append(
+                        f"duplicate target endpoint/generation: "
+                        f"{target.endpoint} generation {target.generation}"
+                    )
+                target_endpoints.add(key)
+                if (
+                    target.status is TargetStatus.REVOKED
+                    and (
+                        not target.revoked_at
+                        or not (target.revoke_reason or "").strip()
+                    )
+                ):
+                    errors.append(
+                        f"revoked target {target.id} requires timestamp and "
+                        "reason"
+                    )
+
+            for submission in self.submissions:
+                if (
+                    submission.status
+                    in {SubmissionStatus.ACCEPTED, SubmissionStatus.REJECTED}
+                    and not submission.proof_passed
+                    and submission.override is None
+                ):
+                    errors.append(
+                        f"unproved terminal submission {submission.id} "
+                        "requires an override"
+                    )
+                if submission.override is not None and (
+                    not submission.override.kind.strip()
+                    or not submission.override.actor.strip()
+                    or not submission.override.reason.strip()
+                ):
+                    errors.append(
+                        f"submission {submission.id} override requires kind, "
+                        "actor, and reason"
+                    )
+
+            if self.closure is not None:
+                if self.closure.portability not in {
+                    "portable",
+                    "referential",
+                }:
+                    errors.append(
+                        "closure portability must be portable or referential"
+                    )
+                for run_id in self.closure.proof_run_ids:
+                    if run_id not in runs:
+                        errors.append(
+                            f"closure references unknown proof run {run_id}"
+                        )
+                for target_id in self.closure.target_ids:
+                    if target_id not in targets:
+                        errors.append(
+                            f"closure references unknown target {target_id}"
+                        )
+                for checkpoint_id in self.closure.checkpoint_ids:
+                    if checkpoint_id not in checkpoints:
+                        errors.append(
+                            f"closure references unknown checkpoint "
+                            f"{checkpoint_id}"
+                        )
+
+            for publish in self.workspace_publishes:
+                if publish.run_id not in runs:
+                    errors.append(
+                        f"workspace publish {publish.id} references unknown "
+                        f"run {publish.run_id}"
+                    )
+                if (
+                    publish.base_workspace_revision < 0
+                    or (
+                        publish.published_workspace_revision is not None
+                        and publish.published_workspace_revision
+                        > self.workspace_revision
+                    )
+                ):
+                    errors.append(
+                        f"workspace publish {publish.id} has invalid revision"
+                    )
+
         if errors:
             raise ModelValidationError("; ".join(errors))
 
@@ -1952,6 +3478,7 @@ def new_challenge_state(
     source_path: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     budget: Budget | Mapping[str, Any] | None = None,
+    schema_version: int = CURRENT_SCHEMA_VERSION,
 ) -> ChallengeState:
     """Construct a validated revision-zero challenge state."""
 
@@ -1970,6 +3497,7 @@ def new_challenge_state(
         source_path=source_path,
         metadata=dict(metadata or {}),
         budget=parsed_budget,
+        schema_version=schema_version,
     )
     state.validate()
     return state
@@ -1978,15 +3506,23 @@ def new_challenge_state(
 __all__ = [
     "ArtifactReference",
     "Budget",
+    "BudgetMode",
     "CURRENT_SCHEMA_VERSION",
     "Candidate",
     "CandidateStatus",
+    "CandidateTier",
+    "Checkpoint",
     "ChallengeIdentity",
     "ChallengeState",
     "ChallengeStatus",
+    "ClosureBundle",
+    "ClosureCompleteness",
+    "ExecutionReceipt",
     "Experiment",
+    "ExperimentKind",
     "ExperimentStatus",
     "Fact",
+    "FactKind",
     "FlagCandidate",
     "Falsifier",
     "Goal",
@@ -1994,14 +3530,26 @@ __all__ = [
     "Hypothesis",
     "HypothesisStatus",
     "ModelValidationError",
+    "ManagedCycle",
+    "ManagedWave",
     "ProgressMarker",
     "Provenance",
+    "ReceiptOutcome",
     "RunReference",
+    "RunOrigin",
     "RunStatus",
+    "SessionMode",
+    "SessionStatus",
+    "SolveSession",
     "SourceFile",
     "Submission",
+    "SubmissionOverride",
     "SubmissionReference",
     "SubmissionStatus",
+    "TargetRecord",
+    "TargetStatus",
+    "WaveKind",
+    "WorkspacePublish",
     "new_challenge_state",
     "utc_now",
 ]

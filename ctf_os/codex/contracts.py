@@ -172,15 +172,25 @@ ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", 
 GOAL_ACTION_VALUES = ("create", "activate", "complete", "block", "park")
 HYPOTHESIS_STATUS_VALUES = ("open", "supported", "refuted", "confirmed")
 EVALUATION_STATUS_VALUES = ("kept", "dropped", "inconclusive", "failed")
+ACTION_RESOURCE_CLASS_VALUES = ("light", "standard", "heavy", "gpu")
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _REFERENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def role_output_schema(role: Role) -> dict[str, Any]:
+def role_output_schema(
+    role: Role,
+    *,
+    contract_version: int = 1,
+) -> dict[str, Any]:
     """Return the exact JSON Schema requested from a batch role."""
 
+    if (
+        isinstance(contract_version, bool)
+        or contract_version not in {1, 2}
+    ):
+        raise ValueError("contract_version must be 1 or 2")
     nullable_string = {"type": ["string", "null"]}
     action_kinds = (
         ACTION_KIND_VALUES
@@ -242,6 +252,60 @@ def role_output_schema(role: Role) -> dict[str, Any]:
         }
     else:
         goal_update_schema = {"type": "null"}
+    action_properties: dict[str, Any] = {
+        "kind": {"enum": list(action_kinds)},
+        "description": {"type": "string"},
+        "command": nullable_string,
+        "artifact_path": nullable_string,
+    }
+    action_required = [
+        "kind",
+        "description",
+        "command",
+        "artifact_path",
+    ]
+    if contract_version == 2:
+        action_properties.update(
+            {
+                "hypothesis_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "expected_observation": {"type": "string"},
+                "keep_if": {"type": "string"},
+                "drop_if": {"type": "string"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 28_800,
+                },
+                "resource_class": {
+                    "enum": list(ACTION_RESOURCE_CLASS_VALUES)
+                },
+                "network_target_id": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 1024,
+                    "pattern": r"^[^\u0000-\u0020\u007F]+$",
+                },
+                "network_target_generation": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                },
+            }
+        )
+        action_required.extend(
+            (
+                "hypothesis_ids",
+                "expected_observation",
+                "keep_if",
+                "drop_if",
+                "timeout_seconds",
+                "resource_class",
+                "network_target_id",
+                "network_target_generation",
+            )
+        )
     return {
         "title": f"CTF-OS {role.value} result",
         "type": "object",
@@ -264,7 +328,10 @@ def role_output_schema(role: Role) -> dict[str, Any]:
             "refusal",
         ],
         "properties": {
-            "schema_version": {"type": "integer", "enum": [1]},
+            "schema_version": {
+                "type": "integer",
+                "enum": [contract_version],
+            },
             "role": {"type": "string", "enum": [role.value]},
             "status": {"enum": list(STATUS_VALUES)},
             "summary": {"type": "string"},
@@ -401,13 +468,8 @@ def role_output_schema(role: Role) -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["kind", "description", "command", "artifact_path"],
-                    "properties": {
-                        "kind": {"enum": list(action_kinds)},
-                        "description": {"type": "string"},
-                        "command": nullable_string,
-                        "artifact_path": nullable_string,
-                    },
+                    "required": action_required,
+                    "properties": action_properties,
                 },
             },
             "artifacts": {
@@ -515,9 +577,19 @@ def _valid_relative_path(value: str) -> bool:
     )
 
 
-def validate_role_output(payload: str | bytes | Mapping[str, Any], role: Role) -> ContractValidation:
+def validate_role_output(
+    payload: str | bytes | Mapping[str, Any],
+    role: Role,
+    *,
+    contract_version: int = 1,
+) -> ContractValidation:
     """Strictly validate a role result without relying on a JSON Schema package."""
 
+    if (
+        isinstance(contract_version, bool)
+        or contract_version not in {1, 2}
+    ):
+        raise ValueError("contract_version must be 1 or 2")
     errors: list[str] = []
     if isinstance(payload, (str, bytes)):
         try:
@@ -548,8 +620,13 @@ def validate_role_output(payload: str | bytes | Mapping[str, Any], role: Role) -
         "refusal",
     }
     _exact_keys(value, top_keys, "$", errors)
-    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
-        errors.append("$.schema_version: expected 1")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != contract_version
+    ):
+        errors.append(
+            f"$.schema_version: expected {contract_version}"
+        )
     if value.get("role") != role.value:
         errors.append(f"$.role: expected {role.value!r}")
     if value.get("status") not in STATUS_VALUES:
@@ -741,7 +818,25 @@ def validate_role_output(payload: str | bytes | Mapping[str, Any], role: Role) -
     if not isinstance(actions, list):
         errors.append("$.actions: expected array")
     else:
-        keys = {"kind", "description", "command", "artifact_path"}
+        keys = {
+            "kind",
+            "description",
+            "command",
+            "artifact_path",
+        }
+        if contract_version == 2:
+            keys.update(
+                {
+                    "hypothesis_ids",
+                    "expected_observation",
+                    "keep_if",
+                    "drop_if",
+                    "timeout_seconds",
+                    "resource_class",
+                    "network_target_id",
+                    "network_target_generation",
+                }
+            )
         for index, item in enumerate(actions):
             path = f"$.actions[{index}]"
             if not isinstance(item, Mapping):
@@ -761,6 +856,100 @@ def validate_role_output(payload: str | bytes | Mapping[str, Any], role: Role) -
                 errors.append(f"{path}.artifact_path: expected safe relative path")
             if kind == "write_artifact" and not ROLE_SPECS[role].may_write_artifacts:
                 errors.append(f"{path}.kind: {role.value} is read-only")
+            if contract_version == 2:
+                action_hypothesis_ids = item.get("hypothesis_ids")
+                if not _is_string_list(action_hypothesis_ids):
+                    errors.append(
+                        f"{path}.hypothesis_ids: expected string array"
+                    )
+                elif (
+                    any(
+                        not _REFERENCE_ID_RE.fullmatch(item_id)
+                        for item_id in action_hypothesis_ids
+                    )
+                    or len(set(action_hypothesis_ids))
+                    != len(action_hypothesis_ids)
+                ):
+                    errors.append(
+                        f"{path}.hypothesis_ids: invalid or duplicate id"
+                    )
+                for field in (
+                    "expected_observation",
+                    "keep_if",
+                    "drop_if",
+                ):
+                    field_value = item.get(field)
+                    if not isinstance(field_value, str):
+                        errors.append(
+                            f"{path}.{field}: expected string"
+                        )
+                    elif kind == "command" and not field_value.strip():
+                        errors.append(
+                            f"{path}.{field}: command action requires text"
+                        )
+                timeout_seconds = item.get("timeout_seconds")
+                if (
+                    isinstance(timeout_seconds, bool)
+                    or not isinstance(timeout_seconds, int)
+                    or not 1 <= timeout_seconds <= 28_800
+                ):
+                    errors.append(
+                        f"{path}.timeout_seconds: expected integer "
+                        "from 1 to 28800"
+                    )
+                if (
+                    item.get("resource_class")
+                    not in ACTION_RESOURCE_CLASS_VALUES
+                ):
+                    errors.append(
+                        f"{path}.resource_class: invalid resource class"
+                    )
+                target_id = item.get("network_target_id")
+                target_generation = item.get(
+                    "network_target_generation"
+                )
+                if target_id is not None and (
+                    not isinstance(target_id, str)
+                    or not candidate_value_is_valid(target_id)
+                    or any(character.isspace() for character in target_id)
+                ):
+                    errors.append(
+                        f"{path}.network_target_id: invalid id or null"
+                    )
+                if target_generation is not None and (
+                    isinstance(target_generation, bool)
+                    or not isinstance(target_generation, int)
+                    or target_generation < 1
+                ):
+                    errors.append(
+                        f"{path}.network_target_generation: expected "
+                        "positive integer or null"
+                    )
+                if (target_id is None) != (
+                    target_generation is None
+                ):
+                    errors.append(
+                        f"{path}: target id and generation must be "
+                        "provided together"
+                    )
+                if kind == "command":
+                    if (
+                        not isinstance(item.get("command"), str)
+                        or not str(item["command"]).strip()
+                    ):
+                        errors.append(
+                            f"{path}.command: command action requires text"
+                        )
+                    if item.get("artifact_path") is not None:
+                        errors.append(
+                            f"{path}.artifact_path: command action "
+                            "requires null"
+                        )
+                elif target_id is not None:
+                    errors.append(
+                        f"{path}.network_target_id: only command actions "
+                        "may request a target"
+                    )
 
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, list):

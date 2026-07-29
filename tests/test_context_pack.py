@@ -13,10 +13,12 @@ from ctf_os.models import (
     Goal,
     GoalStatus,
     Hypothesis,
+    HypothesisStatus,
     Provenance,
     RunReference,
     RunStatus,
 )
+from ctf_os.store.atomic import strict_json_loads
 
 
 class ContextPackTests(unittest.TestCase):
@@ -110,6 +112,19 @@ class ContextPackTests(unittest.TestCase):
             pack.text.index("runtime reached"), pack.text.index("answer may")
         )
 
+    def test_pack_keeps_bounded_resolved_hypothesis_history(self) -> None:
+        state = self.state()
+        state.hypotheses[0].status = HypothesisStatus.CONFIRMED
+        state.hypotheses[0].evidence_fact_ids.append("F-1")
+        state.facts[0].supports.append("H-1")
+        pack = build_context_pack(
+            state,
+            get_adapter("rev"),
+            state_path=Path("/state/state.json"),
+        )
+        self.assertIn('"kind":"resolved_hypothesis"', pack.text)
+        self.assertIn("comparison is direct", pack.text)
+
     def test_long_operator_prompt_has_explicit_pointer_and_truncation(self) -> None:
         state = self.state()
         state.prompt = "A" * 16_000 + "TAIL_SENTINEL"
@@ -124,6 +139,22 @@ class ContextPackTests(unittest.TestCase):
         self.assertIn(str(state_path), pack.text)
         self.assertTrue(pack.truncated)
         self.assertEqual(pack.omitted["prompt_chars"], len("TAIL_SENTINEL"))
+
+    def test_small_pack_omits_hostile_operator_text_without_partial_json(
+        self,
+    ) -> None:
+        state = self.state()
+        state.prompt = ("line\n```\u202e<tag>\x1b" * 2_000)
+        pack = build_context_pack(
+            state,
+            get_adapter("rev"),
+            state_path=Path("/state/state.json"),
+            max_chars=4096,
+        )
+        self.assertLessEqual(len(pack.text), 4096)
+        self.assertIn("operator_context", pack.omitted)
+        for line in pack.text.splitlines():
+            strict_json_loads(line.encode("utf-8"))
 
 
 if __name__ == "__main__":

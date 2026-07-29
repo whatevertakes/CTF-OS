@@ -171,6 +171,33 @@ class TimeoutValidationTests(unittest.TestCase):
                     )
                     self.assertEqual(getattr(invocation, field), value)
 
+    def test_batch_invocation_contract_version_is_explicitly_bounded(
+        self,
+    ) -> None:
+        for version in (True, 0, 3, "2"):
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(ValueError, "contract_version"),
+            ):
+                BatchInvocation(
+                    "contract-validation",
+                    Role.RECON,
+                    "inspect the challenge",
+                    Path("/challenge"),
+                    Path("/runs/contract-validation"),
+                    contract_version=version,  # type: ignore[arg-type]
+                )
+        for version in (1, 2):
+            invocation = BatchInvocation(
+                "contract-validation",
+                Role.RECON,
+                "inspect the challenge",
+                Path("/challenge"),
+                Path("/runs/contract-validation"),
+                contract_version=version,
+            )
+            self.assertEqual(invocation.contract_version, version)
+
     def test_model_call_timeout_is_finite_nonnegative_or_none(
         self,
     ) -> None:

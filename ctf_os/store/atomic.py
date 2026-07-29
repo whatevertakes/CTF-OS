@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
 import os
 import secrets
 from pathlib import Path
@@ -11,6 +12,103 @@ from typing import Any, BinaryIO
 
 
 _TEMPORARY_NAME_ATTEMPTS = 16
+
+
+class StrictJSONError(ValueError):
+    """A JSON payload violated the canonical trust-boundary contract."""
+
+
+def _reject_json_constant(value: str) -> None:
+    raise StrictJSONError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise StrictJSONError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
+def _unique_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise StrictJSONError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _validate_json_strings(root: Any, *, max_depth: int = 512) -> None:
+    pending: list[tuple[Any, int]] = [(root, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > max_depth:
+            raise StrictJSONError(
+                f"JSON nesting exceeds {max_depth} levels"
+            )
+        if isinstance(value, str):
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+                raise StrictJSONError("lone UTF-16 surrogate is forbidden")
+        elif isinstance(value, list):
+            pending.extend((item, depth + 1) for item in value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                pending.append((key, depth + 1))
+                pending.append((item, depth + 1))
+
+
+def strict_json_loads(
+    payload: bytes | str,
+    *,
+    max_bytes: int | None = None,
+    max_depth: int = 512,
+) -> Any:
+    """Decode strict RFC JSON with duplicate and Unicode checks."""
+
+    try:
+        payload_size = (
+            len(payload)
+            if isinstance(payload, bytes)
+            else len(payload.encode("utf-8", errors="strict"))
+        )
+        if max_bytes is not None and payload_size > max_bytes:
+            raise StrictJSONError(
+                f"JSON exceeds {max_bytes} byte limit"
+            )
+        text = payload.decode("utf-8", errors="strict") if isinstance(
+            payload, bytes
+        ) else payload
+        value = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
+    except UnicodeDecodeError as error:
+        raise StrictJSONError("JSON must be valid UTF-8") from error
+    except RecursionError as error:
+        raise StrictJSONError("JSON nesting is too deep") from error
+    _validate_json_strings(value, max_depth=max_depth)
+    return value
+
+
+def canonical_json_record(value: Any) -> str:
+    """Render one injection-resistant physical JSON line."""
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    return (
+        encoded.replace("`", "\\u0060")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def _retry_close(stream: BinaryIO) -> BaseException | None:
@@ -244,8 +342,7 @@ def atomic_write_json(
 
 
 def read_json(path: Path) -> Any:
-    with Path(path).open("r", encoding="utf-8") as stream:
-        return json.load(stream)
+    return strict_json_loads(Path(path).read_bytes())
 
 
 def append_json_line(
@@ -259,13 +356,7 @@ def append_json_line(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-            allow_nan=False,
-        )
+        canonical_json_record(value)
         + "\n"
     ).encode("utf-8")
     descriptor = os.open(
@@ -291,6 +382,9 @@ __all__ = [
     "atomic_write_bytes",
     "atomic_write_json",
     "atomic_write_text",
+    "canonical_json_record",
     "canonical_json_bytes",
     "read_json",
+    "StrictJSONError",
+    "strict_json_loads",
 ]
