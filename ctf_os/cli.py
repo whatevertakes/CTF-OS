@@ -13,6 +13,10 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from ctf_os.benchmark import (
+    BlindLivePromotionEvidence,
+    evaluate_blind_live_promotion,
+)
 from ctf_os.config import (
     ConfigError,
     default_config_text,
@@ -64,7 +68,11 @@ from ctf_os.models import (
 from ctf_os.sandbox import NetworkTarget, SandboxError
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import StateStoreError
-from ctf_os.store.atomic import atomic_write_json, atomic_write_text
+from ctf_os.store.atomic import (
+    atomic_write_json,
+    atomic_write_text,
+    strict_json_loads,
+)
 from ctf_os.storage import (
     StorageError,
     quarantine_unreachable,
@@ -79,6 +87,67 @@ class CLIError(RuntimeError):
     def __init__(self, message: str, exit_code: int = 2) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+MAX_PROMOTION_EVIDENCE_BYTES = 16 * 1024 * 1024
+
+
+def _read_bounded_regular_bytes(
+    path: Path,
+    *,
+    maximum: int,
+    label: str,
+) -> bytes:
+    """Read one stable regular file without following its terminal symlink."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CLIError(f"{label} 파일을 안전하게 열 수 없습니다.") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CLIError(f"{label} 입력은 일반 파일이어야 합니다.")
+        if before.st_size > maximum:
+            raise CLIError(f"{label} 파일은 {maximum} bytes 이하여야 합니다.")
+
+        chunks = bytearray()
+        while len(chunks) <= maximum:
+            block = os.read(
+                descriptor,
+                min(1024 * 1024, maximum + 1 - len(chunks)),
+            )
+            if not block:
+                break
+            chunks.extend(block)
+        if len(chunks) > maximum:
+            raise CLIError(f"{label} 파일은 {maximum} bytes 이하여야 합니다.")
+
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or len(chunks) != after.st_size:
+            raise CLIError(f"{label} 파일이 읽는 동안 변경되었습니다.")
+        return bytes(chunks)
+    except OSError as error:
+        raise CLIError(f"{label} 파일을 안전하게 읽을 수 없습니다.") from error
+    finally:
+        os.close(descriptor)
 
 
 def _inspect_offset_argument(value: str) -> int:
@@ -753,6 +822,25 @@ def build_parser() -> argparse.ArgumentParser:
     evaluation.add_argument("--category")
     evaluation.add_argument("--challenge")
 
+    benchmark = commands.add_parser(
+        "benchmark",
+        help="operator-supplied benchmark evidence의 읽기 전용 gate 평가",
+    )
+    benchmark_commands = benchmark.add_subparsers(
+        dest="benchmark_command",
+        required=True,
+    )
+    promotion = benchmark_commands.add_parser(
+        "promotion",
+        help="blind/live promotion evidence를 fail-closed로 평가",
+    )
+    promotion.add_argument(
+        "--evidence",
+        type=Path,
+        required=True,
+        help="strict JSON promotion evidence 파일(자동 승격에는 사용하지 않음)",
+    )
+
     leases = commands.add_parser("leases", help="도구/model 대기 상태")
     leases.add_argument("--json", action="store_true")
 
@@ -1153,6 +1241,26 @@ def main(
                 challenge_id=args.challenge,
             )
             _print_json(report.to_dict())
+            return 0
+
+        if args.command == "benchmark":
+            if args.benchmark_command != "promotion":
+                raise AssertionError(
+                    "처리되지 않은 benchmark 명령: "
+                    f"{args.benchmark_command}"
+                )
+            payload = _read_bounded_regular_bytes(
+                args.evidence,
+                maximum=MAX_PROMOTION_EVIDENCE_BYTES,
+                label="promotion evidence",
+            )
+            evidence = BlindLivePromotionEvidence.from_dict(
+                strict_json_loads(
+                    payload,
+                    max_bytes=MAX_PROMOTION_EVIDENCE_BYTES,
+                )
+            )
+            _print_json(evaluate_blind_live_promotion(evidence))
             return 0
 
         if args.command == "migrate":
