@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Bounded, query-only SQLite reader for challenge data."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+from pathlib import Path
+from urllib.parse import quote
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="ctf-sqlite-readonly")
+    parser.add_argument("database", nargs="?")
+    parser.add_argument("query", nargs="?")
+    parser.add_argument("--max-rows", type=int, default=100)
+    parser.add_argument("--self-test", action="store_true")
+    return parser
+
+
+def main() -> int:
+    arguments = _parser().parse_args()
+    if arguments.self_test:
+        connection = sqlite3.connect(":memory:")
+        connection.execute("PRAGMA query_only=ON")
+        assert connection.execute("SELECT 1").fetchone() == (1,)
+        connection.close()
+        return 0
+    if not arguments.database or not arguments.query:
+        raise SystemExit("database and query are required")
+    if not 1 <= arguments.max_rows <= 1000:
+        raise SystemExit("--max-rows must be between 1 and 1000")
+    database = Path(arguments.database).resolve(strict=True)
+    if not database.is_file():
+        raise SystemExit("database must be a regular file")
+    uri = f"file:{quote(str(database))}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        cursor = connection.execute(arguments.query)
+        columns = [item[0] for item in cursor.description or ()]
+        rows = cursor.fetchmany(arguments.max_rows + 1)
+        truncated = len(rows) > arguments.max_rows
+        rows = rows[: arguments.max_rows]
+        print(
+            json.dumps(
+                {
+                    "columns": columns,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "truncated": truncated,
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+    finally:
+        connection.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

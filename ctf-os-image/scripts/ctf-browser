@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: ctf-browser URL [OPTIONS]\n' >&2
+}
+
+if (($# == 0)); then
+    usage
+    exit 2
+fi
+
+template=/opt/ctf-templates/web/browser.py
+if [[ ! -r "${template}" ]]; then
+    printf 'ctf-browser: template is unavailable: %s\n' "${template}" >&2
+    exit 127
+fi
+
+exec /opt/venvs/pw/bin/python "${template}" "$@"

@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "capabilities": [
+    {
+      "name": "convert",
+      "kind": "command",
+      "command": "/usr/bin/convert",
+      "arguments": ["-version"]
+    },
+    {
+      "name": "sqlite_readonly",
+      "kind": "command",
+      "command": "/usr/local/bin/ctf-sqlite-readonly",
+      "arguments": ["--self-test"]
+    },
+    {
+      "name": "z3",
+      "kind": "python_module",
+      "command": "/opt/venvs/main/bin/python",
+      "module": "z3"
+    },
+    {
+      "name": "ortools",
+      "kind": "python_module",
+      "command": "/opt/venvs/main/bin/python",
+      "module": "ortools"
+    },
+    {
+      "name": "angr_python",
+      "kind": "python_module",
+      "command": "/opt/venvs/angr/bin/python",
+      "module": "angr"
+    }
+  ]
+}

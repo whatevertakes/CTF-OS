@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Find bounded flag candidates in work files and job logs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import stat
+import sys
+from pathlib import Path
+from typing import Iterator
+
+SCHEMA_VERSION = 1
+DEFAULT_REGEX = r"[A-Za-z0-9_]{2,20}\{[^}\r\n]{1,200}\}"
+DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_FILES = 10000
+DEFAULT_MAX_RESULTS = 1000
+HARD_MAX_FILE_BYTES = 512 * 1024 * 1024
+HARD_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+HARD_MAX_FILES = 100000
+HARD_MAX_RESULTS = 10000
+DEFAULT_MAX_OUTPUT_CHARS = 1_000_000
+HARD_MAX_OUTPUT_CHARS = 16_000_000
+MAX_DIAGNOSTICS = 1000
+EXCLUDED_DIRS = {".git", "__pycache__", "node_modules"}
+
+
+class RegexTimeout(RuntimeError):
+    pass
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="ctf-flag",
+        description="Search files for bounded flag-like candidates without reading stdin.",
+    )
+    result.add_argument("paths", nargs="*", metavar="PATH", help="file or directory")
+    result.add_argument(
+        "--logs",
+        action="store_true",
+        help="also search $CTF_WORK_DIR/.ctf/{jobs,runs,logs}",
+    )
+    result.add_argument(
+        "--regex",
+        default=os.environ.get("FLAG_REGEX", DEFAULT_REGEX),
+        help="Python regular expression (default: $FLAG_REGEX or common flag syntax)",
+    )
+    result.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=DEFAULT_MAX_FILE_BYTES,
+        metavar="N",
+        help="skip files larger than N bytes (default: 64 MiB)",
+    )
+    result.add_argument(
+        "--max-total-bytes",
+        type=int,
+        default=DEFAULT_MAX_TOTAL_BYTES,
+        metavar="N",
+        help="stop before reading more than N bytes total (default: 512 MiB)",
+    )
+    result.add_argument(
+        "--max-files",
+        type=int,
+        default=DEFAULT_MAX_FILES,
+        metavar="N",
+        help="inspect at most N regular files (default: 10000)",
+    )
+    result.add_argument(
+        "--max-results",
+        type=int,
+        default=DEFAULT_MAX_RESULTS,
+        metavar="N",
+        help="stop after N candidates",
+    )
+    result.add_argument(
+        "--max-candidate-chars",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="retain at most N characters per candidate (default: 4096, max: 65536)",
+    )
+    result.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+        metavar="N",
+        help="retain at most N candidate characters total (default: 1000000)",
+    )
+    result.add_argument(
+        "--regex-timeout",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="per-file regex deadline (default: 2.0, max: 30)",
+    )
+    result.add_argument("--json", action="store_true", help="emit schema_version=1 JSON")
+    return result
+
+
+def append_bounded(
+    collection: list[object], value: object, dropped: dict[str, int], kind: str
+) -> None:
+    if len(collection) < MAX_DIAGNOSTICS:
+        collection.append(value)
+    else:
+        dropped[kind] = dropped.get(kind, 0) + 1
+
+
+def iter_files(
+    paths: list[Path], errors: list[object], dropped: dict[str, int]
+) -> Iterator[Path]:
+    seen: set[tuple[int, int]] = set()
+    for root in sorted(paths, key=lambda item: os.fsencode(str(item))):
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            append_bounded(errors, f"{root}: {exc}", dropped, "errors")
+            continue
+        if stat.S_ISLNK(root_stat.st_mode):
+            append_bounded(errors, f"{root}: symlink input skipped", dropped, "errors")
+            continue
+        if stat.S_ISREG(root_stat.st_mode):
+            identity = (root_stat.st_dev, root_stat.st_ino)
+            if identity not in seen:
+                seen.add(identity)
+                yield root
+            continue
+        if not stat.S_ISDIR(root_stat.st_mode):
+            append_bounded(
+                errors,
+                f"{root}: not a regular file or directory",
+                dropped,
+                "errors",
+            )
+            continue
+
+        def onerror(exc: OSError) -> None:
+            append_bounded(errors, str(exc), dropped, "errors")
+
+        for current, directories, filenames in os.walk(
+            root, topdown=True, followlinks=False, onerror=onerror
+        ):
+            directories[:] = sorted(
+                [
+                    name
+                    for name in directories
+                    if name not in EXCLUDED_DIRS
+                    and not Path(current, name).is_symlink()
+                ],
+                key=os.fsencode,
+            )
+            for filename in sorted(filenames, key=os.fsencode):
+                candidate = Path(current, filename)
+                try:
+                    candidate_stat = candidate.lstat()
+                except OSError as exc:
+                    append_bounded(
+                        errors, f"{candidate}: {exc}", dropped, "errors"
+                    )
+                    continue
+                if not stat.S_ISREG(candidate_stat.st_mode):
+                    continue
+                identity = (candidate_stat.st_dev, candidate_stat.st_ino)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                yield candidate
+
+
+def json_dump(value: object) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def terminal_safe(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if (
+            codepoint < 0x20
+            or 0x7F <= codepoint <= 0x9F
+            or not character.isprintable()
+        ):
+            if codepoint <= 0xFF:
+                escaped.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                escaped.append(f"\\u{codepoint:04x}")
+            else:
+                escaped.append(f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def read_regular_bounded(path: Path, limit: int) -> tuple[bytearray | None, int, bool]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError("not a regular file")
+        if file_stat.st_size > limit:
+            return None, file_stat.st_size, True
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(descriptor, min(1024 * 1024, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return data, file_stat.st_size, len(data) > limit
+    finally:
+        os.close(descriptor)
+
+
+def main(argv: list[str]) -> int:
+    cli = parser()
+    if not argv:
+        cli.print_usage(sys.stderr)
+        return 2
+    args = cli.parse_args(argv)
+    if not 1 <= args.max_file_bytes <= HARD_MAX_FILE_BYTES:
+        cli.error(
+            f"--max-file-bytes must be between 1 and {HARD_MAX_FILE_BYTES}"
+        )
+    if not 1 <= args.max_total_bytes <= HARD_MAX_TOTAL_BYTES:
+        cli.error(
+            f"--max-total-bytes must be between 1 and {HARD_MAX_TOTAL_BYTES}"
+        )
+    if not 1 <= args.max_files <= HARD_MAX_FILES:
+        cli.error(f"--max-files must be between 1 and {HARD_MAX_FILES}")
+    if not 1 <= args.max_results <= HARD_MAX_RESULTS:
+        cli.error(f"--max-results must be between 1 and {HARD_MAX_RESULTS}")
+    if not 1 <= args.max_candidate_chars <= 65536:
+        cli.error("--max-candidate-chars must be between 1 and 65536")
+    if not 1 <= args.max_output_chars <= HARD_MAX_OUTPUT_CHARS:
+        cli.error(
+            f"--max-output-chars must be between 1 and {HARD_MAX_OUTPUT_CHARS}"
+        )
+    if len(args.regex) > 4096:
+        cli.error("--regex is limited to 4096 characters")
+    if not 0.01 <= args.regex_timeout <= 30.0:
+        cli.error("--regex-timeout must be between 0.01 and 30 seconds")
+    try:
+        expression = re.compile(args.regex)
+    except re.error as exc:
+        cli.error(f"invalid --regex: {exc}")
+
+    paths = [Path(value) for value in args.paths]
+    if args.logs:
+        work_dir = Path(os.environ.get("CTF_WORK_DIR", "/work"))
+        # Job implementations have used both jobs/ and runs/.  Missing
+        # optional log roots are normal in a fresh work directory.
+        paths.extend(
+            path
+            for path in (
+                work_dir / ".ctf" / "jobs",
+                work_dir / ".ctf" / "runs",
+                work_dir / ".ctf" / "logs",
+            )
+            if path.exists()
+        )
+    if not paths and not args.logs:
+        cli.error("provide at least one PATH or use --logs")
+
+    results: list[dict[str, object]] = []
+    errors: list[object] = []
+    skipped: list[dict[str, object]] = []
+    diagnostics_dropped: dict[str, int] = {}
+    truncated = False
+    result_limit_reached = False
+    files_considered = 0
+    files_scanned = 0
+    bytes_scanned = 0
+    output_chars = 0
+    limit_reasons: list[str] = []
+
+    for path in iter_files(paths, errors, diagnostics_dropped):
+        if files_considered >= args.max_files:
+            truncated = True
+            limit_reasons.append("max_files")
+            break
+        files_considered += 1
+        if len(results) >= args.max_results:
+            truncated = True
+            result_limit_reached = True
+            limit_reasons.append("max_results")
+            break
+        try:
+            remaining_bytes = args.max_total_bytes - bytes_scanned
+            if remaining_bytes <= 0:
+                truncated = True
+                limit_reasons.append("max_total_bytes")
+                break
+            read_limit = min(args.max_file_bytes, remaining_bytes)
+            data, observed_size, exceeded = read_regular_bounded(path, read_limit)
+            if exceeded:
+                if observed_size > args.max_file_bytes or read_limit == args.max_file_bytes:
+                    reason = "file_size_limit"
+                else:
+                    reason = "max_total_bytes"
+                truncated = True
+                limit_reasons.append(reason)
+                if reason == "max_total_bytes":
+                    break
+                append_bounded(
+                    skipped,
+                    {"path": str(path), "reason": reason, "size": observed_size},
+                    diagnostics_dropped,
+                    "skipped",
+                )
+                continue
+        except OSError as exc:
+            append_bounded(errors, f"{path}: {exc}", diagnostics_dropped, "errors")
+            continue
+        assert data is not None
+        files_scanned += 1
+        bytes_scanned += len(data)
+
+        # Replacement characters delimit malformed byte sequences and prevent
+        # bytes on opposite sides of binary data from being joined into a flag.
+        text = data.decode("utf-8", errors="replace")
+        line_number = 1
+        line_cursor = 0
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def regex_alarm(_signum: int, _frame: object) -> None:
+            raise RegexTimeout()
+
+        signal.signal(signal.SIGALRM, regex_alarm)
+        signal.setitimer(signal.ITIMER_REAL, args.regex_timeout)
+        try:
+            for match in expression.finditer(text):
+                line_number += text.count("\n", line_cursor, match.start())
+                line_cursor = match.start()
+                raw_candidate = match.group(0)
+                retained_candidate = raw_candidate[: args.max_candidate_chars]
+                if output_chars + len(retained_candidate) > args.max_output_chars:
+                    truncated = True
+                    result_limit_reached = True
+                    limit_reasons.append("max_output_chars")
+                    break
+                candidate_truncated = len(raw_candidate) > len(retained_candidate)
+                if candidate_truncated:
+                    truncated = True
+                    limit_reasons.append("candidate_length")
+                output_chars += len(retained_candidate)
+                results.append(
+                    {
+                        "candidate": retained_candidate,
+                        "path": str(path),
+                        "line": line_number,
+                        "character_offset": match.start(),
+                        "truncated": candidate_truncated,
+                    }
+                )
+                if len(results) >= args.max_results:
+                    truncated = True
+                    result_limit_reached = True
+                    limit_reasons.append("max_results")
+                    break
+        except RegexTimeout:
+            truncated = True
+            limit_reasons.append("regex_timeout")
+            append_bounded(
+                skipped,
+                {"path": str(path), "reason": "regex_timeout"},
+                diagnostics_dropped,
+                "skipped",
+            )
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        if result_limit_reached:
+            break
+
+    if diagnostics_dropped:
+        truncated = True
+        limit_reasons.append("diagnostics_limit")
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "ctf-flag",
+        "regex": args.regex,
+        "count": len(results),
+        "candidates": results,
+        "truncated": truncated,
+        "result_limit_reached": result_limit_reached,
+        "limit_reasons": sorted(set(limit_reasons)),
+        "files_considered": files_considered,
+        "files_scanned": files_scanned,
+        "bytes_scanned": bytes_scanned,
+        "limits": {
+            "max_files": args.max_files,
+            "max_file_bytes": args.max_file_bytes,
+            "max_total_bytes": args.max_total_bytes,
+            "max_results": args.max_results,
+            "max_candidate_chars": args.max_candidate_chars,
+            "max_output_chars": args.max_output_chars,
+            "regex_timeout_seconds": args.regex_timeout,
+        },
+        "output_chars": output_chars,
+        "skipped": skipped,
+        "errors": errors,
+        "diagnostics_dropped": diagnostics_dropped,
+    }
+    if args.json:
+        json_dump(payload)
+    else:
+        for result in results:
+            suffix = " …[truncated]" if result["truncated"] else ""
+            print(
+                f"{terminal_safe(str(result['path']))}:{result['line']}:"
+                f"{result['character_offset']}\t"
+                f"{terminal_safe(str(result['candidate']))}{suffix}"
+            )
+        for error in errors:
+            print(f"ctf-flag: {terminal_safe(str(error))}", file=sys.stderr)
+        if truncated:
+            reasons = ",".join(sorted(set(limit_reasons))) or "bounded_output"
+            print(f"ctf-flag: scan truncated ({reasons})", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

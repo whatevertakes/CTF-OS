@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Query the deterministic CTF-OS tool manifest."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+DEFAULT_MANIFEST = "/tools/manifest.json"
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
+
+class ManifestError(RuntimeError):
+    pass
+
+
+def _usage_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ctf-tools",
+        description="List and search tools installed in the CTF-OS image.",
+    )
+    parser.add_argument(
+        "--manifest",
+        default=os.environ.get("CTF_TOOLS_MANIFEST", DEFAULT_MANIFEST),
+        help="manifest path (default: %(default)s)",
+    )
+    parser.add_argument("--json", action="store_true", help="emit schema_version=1 JSON")
+    parser.add_argument(
+        "--all", action="store_true", help="include catalogued but unavailable tools"
+    )
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument(
+        "--list",
+        nargs="?",
+        const="",
+        metavar="CATEGORY",
+        help="list tools, optionally restricted to CATEGORY",
+    )
+    operation.add_argument("--search", metavar="QUERY", help="search tool metadata")
+    operation.add_argument("--info", metavar="NAME", help="show one tool")
+    operation.add_argument(
+        "--render-md", action="store_true", help="render the manifest as Markdown"
+    )
+    return parser
+
+
+def _normalize_command_form(argv: list[str]) -> list[str]:
+    """Accept both `ctf-tools search x` and `ctf-tools --search x`."""
+    commands = {
+        "list": "--list",
+        "search": "--search",
+        "info": "--info",
+        "render-md": "--render-md",
+    }
+    normalized = list(argv)
+    options_with_values = {"--manifest"}
+    skip_next = False
+    for index, value in enumerate(normalized):
+        if skip_next:
+            skip_next = False
+            continue
+        if value in options_with_values:
+            skip_next = True
+            continue
+        if value.startswith("-"):
+            continue
+        if value in commands:
+            normalized[index] = commands[value]
+        break
+    return normalized
+
+
+def _load_manifest(path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    manifest_path = Path(path)
+    try:
+        resolved_path = manifest_path.resolve(strict=True)
+        before = resolved_path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ManifestError(f"manifest not found: {manifest_path}") from exc
+    except OSError as exc:
+        raise ManifestError(f"cannot read manifest {manifest_path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ManifestError(f"manifest must be a regular file: {manifest_path}")
+    if before.st_size > MAX_MANIFEST_BYTES:
+        raise ManifestError(
+            f"manifest exceeds {MAX_MANIFEST_BYTES} byte limit: {manifest_path}"
+        )
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ManifestError(
+                    f"manifest must be a regular file: {manifest_path}"
+                )
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ManifestError(f"manifest changed while opening: {manifest_path}")
+            if opened.st_size > MAX_MANIFEST_BYTES:
+                raise ManifestError(
+                    f"manifest exceeds {MAX_MANIFEST_BYTES} byte limit: "
+                    f"{manifest_path}"
+                )
+            chunks: list[bytes] = []
+            remaining = MAX_MANIFEST_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(descriptor)
+        encoded = b"".join(chunks)
+        if len(encoded) > MAX_MANIFEST_BYTES:
+            raise ManifestError(
+                f"manifest exceeds {MAX_MANIFEST_BYTES} byte limit: {manifest_path}"
+            )
+        raw = json.loads(encoded.decode("utf-8"))
+    except ManifestError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ManifestError(f"cannot read manifest {manifest_path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ManifestError("manifest root must be an object")
+    if raw.get("schema_version") != SCHEMA_VERSION:
+        raise ManifestError(
+            f"unsupported manifest schema_version: {raw.get('schema_version')!r}"
+        )
+    raw_tools = raw.get("tools")
+    if not isinstance(raw_tools, list):
+        raise ManifestError("manifest tools must be an array")
+
+    raw_failed = raw.get("failed")
+    if not isinstance(raw_failed, list) or not all(
+        isinstance(item, str) for item in raw_failed
+    ):
+        raise ManifestError("manifest failed must be an array of strings")
+
+    tools: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, item in enumerate(raw_tools):
+        if not isinstance(item, dict):
+            raise ManifestError(f"manifest tools[{index}] must be an object")
+        required = ("category", "name", "path", "available")
+        if any(field not in item for field in required):
+            raise ManifestError(
+                f"manifest tools[{index}] lacks category/name/path/available"
+            )
+        if not isinstance(item["available"], bool):
+            raise ManifestError(f"manifest tools[{index}].available must be boolean")
+        if not all(isinstance(item[field], str) for field in required[:-1]):
+            raise ManifestError(
+                f"manifest tools[{index}] category/name/path must be strings"
+            )
+        if not item["category"] or not item["name"]:
+            raise ManifestError(
+                f"manifest tools[{index}] category/name must not be empty"
+            )
+        key = (item["category"].casefold(), item["name"].casefold())
+        if key in seen:
+            raise ManifestError(
+                f"manifest tools[{index}] duplicates category/name: "
+                f"{item['category']}/{item['name']}"
+            )
+        seen.add(key)
+        if item["available"] and (
+            not item["path"] or not Path(item["path"]).is_absolute()
+        ):
+            raise ManifestError(
+                f"manifest tools[{index}] available tool requires an absolute path"
+            )
+        if not item["available"] and item["path"]:
+            raise ManifestError(
+                f"manifest tools[{index}] unavailable tool path must be empty"
+            )
+        description = item.get("description", "")
+        if not isinstance(description, str):
+            raise ManifestError(
+                f"manifest tools[{index}].description must be a string"
+            )
+        normalized = {
+            "category": item["category"],
+            "name": item["name"],
+            "path": item["path"],
+            "available": item["available"],
+            "description": description,
+            "aliases": _string_list(item.get("aliases", []), f"tools[{index}].aliases"),
+            "tags": _string_list(item.get("tags", []), f"tools[{index}].tags"),
+        }
+        tools.append(normalized)
+    tools.sort(key=lambda tool: (tool["category"].casefold(), tool["name"].casefold()))
+    return raw, tools
+
+
+def _string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ManifestError(f"manifest {field} must be an array of strings")
+    return list(value)
+
+
+def _visible(tools: list[dict[str, Any]], include_all: bool) -> list[dict[str, Any]]:
+    return list(tools) if include_all else [tool for tool in tools if tool["available"]]
+
+
+def _search(tools: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    needle = query.casefold()
+    return [
+        tool
+        for tool in tools
+        if needle
+        in " ".join(
+            [
+                tool["name"],
+                tool["category"],
+                tool["description"],
+                tool["path"],
+                *tool["aliases"],
+                *tool["tags"],
+            ]
+        ).casefold()
+    ]
+
+
+def _json_dump(payload: dict[str, Any]) -> None:
+    json.dump(payload, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def _plain_list(tools: list[dict[str, Any]]) -> None:
+    if not tools:
+        return
+    category_width = max(8, max(len(tool["category"]) for tool in tools))
+    name_width = max(4, max(len(tool["name"]) for tool in tools))
+    for tool in tools:
+        status = "" if tool["available"] else " [unavailable]"
+        print(
+            f"{tool['category']:<{category_width}}  "
+            f"{tool['name']:<{name_width}}  "
+            f"{tool['path'] or '-'}{status}"
+        )
+
+
+def _plain_info(tool: dict[str, Any]) -> None:
+    print(f"name: {tool['name']}")
+    print(f"category: {tool['category']}")
+    print(f"available: {'yes' if tool['available'] else 'no'}")
+    print(f"path: {tool['path'] or '-'}")
+    print(f"description: {tool['description'] or '-'}")
+    print(f"aliases: {', '.join(tool['aliases']) or '-'}")
+    print(f"tags: {', '.join(tool['tags']) or '-'}")
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def _render_markdown(tools: list[dict[str, Any]]) -> None:
+    print("# CTF-OS tool index")
+    print()
+    print("Manifest schema: `1`")
+    categories = sorted({tool["category"] for tool in tools}, key=str.casefold)
+    for category in categories:
+        category_tools = [tool for tool in tools if tool["category"] == category]
+        print()
+        print(f"## {_markdown_cell(category)}")
+        print()
+        print("| Tool | Path | Description |")
+        print("|---|---|---|")
+        for tool in category_tools:
+            unavailable = "" if tool["available"] else " *(unavailable)*"
+            print(
+                f"| `{_markdown_cell(tool['name'])}`{unavailable} "
+                f"| `{_markdown_cell(tool['path'] or '-')}` "
+                f"| {_markdown_cell(tool['description'])} |"
+            )
+
+
+def main(argv: list[str]) -> int:
+    parser = _usage_parser()
+    if not argv:
+        parser.print_usage(sys.stderr)
+        return 2
+    args = parser.parse_args(_normalize_command_form(argv))
+
+    try:
+        raw, all_tools = _load_manifest(args.manifest)
+    except ManifestError as exc:
+        if args.json:
+            _json_dump(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "ctf-tools",
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+        else:
+            print(f"ctf-tools: {exc}", file=sys.stderr)
+        return 1
+
+    tools = _visible(all_tools, args.all)
+    if args.render_md:
+        if args.json:
+            parser.error("--json and --render-md cannot be used together")
+        _render_markdown(tools)
+        return 0
+
+    if args.list is not None:
+        category = args.list
+        if category:
+            tools = [
+                tool for tool in tools if tool["category"].casefold() == category.casefold()
+            ]
+        if args.json:
+            _json_dump(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "list",
+                    "category": category or None,
+                    "count": len(tools),
+                    "failed": raw["failed"],
+                    "tools": tools,
+                }
+            )
+        else:
+            _plain_list(tools)
+        return 0
+
+    if args.search is not None:
+        tools = _search(tools, args.search)
+        if args.json:
+            _json_dump(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "search",
+                    "query": args.search,
+                    "count": len(tools),
+                    "failed": raw["failed"],
+                    "tools": tools,
+                }
+            )
+        else:
+            _plain_list(tools)
+        return 0
+
+    assert args.info is not None
+    needle = args.info.casefold()
+    matches = [
+        tool
+        for tool in tools
+        if tool["name"].casefold() == needle
+        or needle in (alias.casefold() for alias in tool["aliases"])
+    ]
+    if not matches:
+        if args.json:
+            _json_dump(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "command": "info",
+                    "name": args.info,
+                    "found": False,
+                    "failed": raw["failed"],
+                    "tool": None,
+                }
+            )
+        else:
+            print(f"ctf-tools: tool not found: {args.info}", file=sys.stderr)
+        return 1
+
+    tool = matches[0]
+    if args.json:
+        _json_dump(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "command": "info",
+                "name": args.info,
+                "found": True,
+                "failed": raw["failed"],
+                "tool": tool,
+            }
+        )
+    else:
+        _plain_info(tool)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

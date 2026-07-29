@@ -1,0 +1,1189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ctfwrap [OPTIONS] -- COMMAND [ARG...]
+
+Run a foreground command without stdin, save bounded output prefixes under
+/work/.ctf/runs, scan complete drained streams for configured flag candidates,
+and print bounded tails.
+
+Options:
+  --json                       Emit one schema_version=1 JSON result
+  --timeout SECONDS            Stop after SECONDS (default: 300; maximum:
+                               604800; 0 disables)
+  --summary-bytes BYTES        Tail bytes retained per stream (default: 4096)
+  --stdout-limit-bytes BYTES   Raw stdout prefix cap (default: 16777216)
+  --stderr-limit-bytes BYTES   Raw stderr prefix cap (default: 16777216)
+  -h, --help                   Show this help
+
+Environment:
+  CTF_WRAP_FLAG_PATTERNS_JSON  JSON array of flag regexes supplied by CTF-OS
+EOF
+}
+
+die() {
+    printf 'ctfwrap: %s\n' "$*" >&2
+    exit 2
+}
+
+run_process_action() {
+    local action="$1"
+    local command_sid="$2"
+    local command_start_ticks="$3"
+    local run_token="$4"
+    local signal_name="${5:-SIGTERM}"
+    python3 - "$action" "$command_sid" "$command_start_ticks" "$run_token" \
+        "$signal_name" <<'PY'
+import os
+import pathlib
+import signal
+import sys
+
+action = sys.argv[1]
+command_sid = int(sys.argv[2])
+command_start_ticks = int(sys.argv[3])
+run_token = f"CTF_WRAP_RUN_TOKEN={sys.argv[4]}".encode()
+signal_value = getattr(signal, sys.argv[5])
+
+def identity(pid):
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    return {
+        "state": fields[0],
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+def has_token(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb", buffering=0) as handle:
+            data = handle.read(2 * 1024 * 1024 + 1)
+        return run_token in data.split(b"\0")
+    except OSError:
+        return False
+
+targets = []
+for entry in pathlib.Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    pid = int(entry.name)
+    try:
+        process = identity(pid)
+    except (OSError, ValueError, IndexError):
+        continue
+    if process["state"] in {"Z", "X", "x"}:
+        continue
+    if process["start_ticks"] < command_start_ticks:
+        continue
+    if process["sid"] == command_sid or has_token(pid):
+        targets.append(pid)
+
+if action == "has":
+    raise SystemExit(0 if targets else 1)
+if action != "signal":
+    raise SystemExit(2)
+
+targets.sort(key=lambda pid: pid == command_sid)
+for pid in targets:
+    try:
+        os.kill(pid, signal_value)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise SystemExit(3)
+PY
+}
+
+json_mode=0
+timeout_seconds="${CTF_WRAP_TIMEOUT:-300}"
+summary_bytes="${CTF_SUMMARY_BYTES:-4096}"
+stdout_limit_bytes="${CTF_STDOUT_LIMIT_BYTES:-16777216}"
+stderr_limit_bytes="${CTF_STDERR_LIMIT_BYTES:-16777216}"
+
+if (($# == 0)); then
+    usage
+    exit 2
+fi
+
+while (($# > 0)); do
+    case "$1" in
+        --json)
+            json_mode=1
+            shift
+            ;;
+        --timeout)
+            (($# >= 2)) || die '--timeout requires a value'
+            timeout_seconds="$2"
+            shift 2
+            ;;
+        --summary-bytes)
+            (($# >= 2)) || die '--summary-bytes requires a value'
+            summary_bytes="$2"
+            shift 2
+            ;;
+        --stdout-limit-bytes)
+            (($# >= 2)) || die '--stdout-limit-bytes requires a value'
+            stdout_limit_bytes="$2"
+            shift 2
+            ;;
+        --stderr-limit-bytes)
+            (($# >= 2)) || die '--stderr-limit-bytes requires a value'
+            stderr_limit_bytes="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+(($# > 0)) || die 'COMMAND is required'
+[[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die '--timeout must be a non-negative integer'
+leading_zeros="${timeout_seconds%%[!0]*}"
+timeout_seconds="${timeout_seconds#"$leading_zeros"}"
+[[ -n "$timeout_seconds" ]] || timeout_seconds=0
+(( ${#timeout_seconds} <= 6 )) ||
+    die '--timeout must not exceed 604800 seconds'
+((10#$timeout_seconds <= 604800)) ||
+    die '--timeout must not exceed 604800 seconds'
+[[ "$summary_bytes" =~ ^[0-9]+$ ]] || die '--summary-bytes must be a non-negative integer'
+((summary_bytes <= 65536)) || die '--summary-bytes must not exceed 65536'
+for stream_limit_name in stdout_limit_bytes stderr_limit_bytes; do
+    stream_limit="${!stream_limit_name}"
+    [[ "$stream_limit" =~ ^[0-9]+$ ]] ||
+        die "--${stream_limit_name//_/-} must be a non-negative integer"
+    (( ${#stream_limit} <= 10 )) ||
+        die "--${stream_limit_name//_/-} must not exceed 1073741824 bytes"
+    stream_limit="$((10#$stream_limit))"
+    ((stream_limit <= 1073741824)) ||
+        die "--${stream_limit_name//_/-} must not exceed 1073741824 bytes"
+    printf -v "$stream_limit_name" '%s' "$stream_limit"
+done
+
+command_args=("$@")
+state_root="${CTF_STATE_ROOT:-/work/.ctf}"
+[[ "$state_root" == /* ]] || die 'CTF_STATE_ROOT must be an absolute path'
+[[ "$state_root" != *$'\n'* && "$state_root" != *$'\t'* ]] ||
+    die 'CTF_STATE_ROOT must not contain tabs or newlines'
+runs_root="${state_root%/}/runs"
+umask 077
+mkdir -p -- "$runs_root"
+
+allocation="$(python3 - "$runs_root" <<'PY'
+import fcntl
+import os
+import pathlib
+import secrets
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+lock_path = root / ".lock"
+counter_path = root / ".counter"
+flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
+flags |= getattr(os, "O_NOFOLLOW", 0)
+
+lock_before = None
+try:
+    lock_before = lock_path.stat(follow_symlinks=False)
+except FileNotFoundError:
+    pass
+if lock_before is not None and not stat.S_ISREG(lock_before.st_mode):
+    raise SystemExit("ctfwrap: run lock must be a regular file")
+try:
+    lock_fd = os.open(lock_path, flags, 0o600)
+except OSError as exc:
+    raise SystemExit(f"ctfwrap: cannot safely open run lock: {exc}") from exc
+try:
+    lock_opened = os.fstat(lock_fd)
+    if not stat.S_ISREG(lock_opened.st_mode):
+        raise SystemExit("ctfwrap: run lock must be a regular file")
+    if lock_before is not None and (
+        lock_opened.st_dev,
+        lock_opened.st_ino,
+    ) != (lock_before.st_dev, lock_before.st_ino):
+        raise SystemExit("ctfwrap: run lock changed while opening")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    counter = 0
+    try:
+        counter_before = counter_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(counter_before.st_mode) or counter_before.st_size > 64:
+            raise SystemExit("ctfwrap: run counter must be a small regular file")
+        read_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        read_flags |= getattr(os, "O_NOFOLLOW", 0)
+        counter_fd = os.open(counter_path, read_flags)
+        try:
+            counter_opened = os.fstat(counter_fd)
+            if not stat.S_ISREG(counter_opened.st_mode):
+                raise SystemExit("ctfwrap: run counter must be a regular file")
+            if (counter_opened.st_dev, counter_opened.st_ino) != (
+                counter_before.st_dev,
+                counter_before.st_ino,
+            ):
+                raise SystemExit("ctfwrap: run counter changed while opening")
+            value = os.read(counter_fd, 65).decode("ascii").strip()
+        finally:
+            os.close(counter_fd)
+        if not value.isdigit() or len(value) > 12:
+            raise SystemExit("ctfwrap: run counter is invalid")
+        counter = int(value)
+
+    while True:
+        counter += 1
+        run_id = f"run-{counter:08d}"
+        run_dir = root / run_id
+        try:
+            run_dir.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+
+    temporary = root / f".counter.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    temporary_fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.write(temporary_fd, f"{counter}\n".encode("ascii"))
+    finally:
+        os.close(temporary_fd)
+    os.replace(temporary, counter_path)
+finally:
+    os.close(lock_fd)
+
+print(f"{run_id}\t{run_dir}")
+PY
+)"
+IFS=$'\t' read -r run_id run_dir <<< "$allocation"
+[[ "$run_id" =~ ^run-[0-9]{8,}$ && "$run_dir" == "$runs_root/$run_id" ]] ||
+    die 'safe run allocation failed'
+
+stdout_path="$run_dir/stdout.log"
+stderr_path="$run_dir/stderr.log"
+meta_path="$run_dir/meta.json"
+result_path="$run_dir/result.json"
+capture_path="$run_dir/stream-capture.json"
+candidate_path="$run_dir/flag-candidates.jsonl"
+exit_marker="$run_dir/.command-exit"
+: > "$stdout_path"
+: > "$stderr_path"
+
+working_directory="$(pwd -P)"
+python3 - "$meta_path" "$run_id" "$working_directory" "$timeout_seconds" \
+    "$stdout_path" "$stderr_path" "$stdout_limit_bytes" \
+    "$stderr_limit_bytes" "$summary_bytes" "${command_args[@]}" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+(
+    path,
+    run_id,
+    cwd,
+    timeout,
+    stdout_path,
+    stderr_path,
+    stdout_limit,
+    stderr_limit,
+    summary_limit,
+    *command,
+) = sys.argv[1:]
+payload = {
+    "schema_version": 1,
+    "kind": "run",
+    "run_id": run_id,
+    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "cwd": cwd,
+    "command": command,
+    "timeout_seconds": int(timeout),
+    "stdout_path": stdout_path,
+    "stderr_path": stderr_path,
+    "flag_candidate_path": str(
+        pathlib.Path(stdout_path).with_name("flag-candidates.jsonl")
+    ),
+    "stdout_limit_bytes": int(stdout_limit),
+    "stderr_limit_bytes": int(stderr_limit),
+    "summary_bytes": int(summary_limit),
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+
+started_ns="$(date +%s%N)"
+identity_path="$run_dir/.command-identity"
+release_path="$run_dir/.command-release"
+timeout_marker="$run_dir/timeout.requested"
+run_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+identity_writer='
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+pid = int(sys.argv[2])
+text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+fields = text[text.rfind(")") + 2 :].split()
+value = f"{pid} {fields[19]} {fields[2]} {fields[3]} {fields[0]}\n"
+temporary = path.with_name(f"{path.name}.tmp.{pid}")
+temporary.write_text(value, encoding="utf-8")
+os.replace(temporary, path)
+'
+stream_drainer='
+import base64
+import codecs
+import json
+import os
+import pathlib
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import time
+
+(
+    stdout_path,
+    stderr_path,
+    capture_path,
+    candidate_path,
+    stdout_limit,
+    stderr_limit,
+    summary_limit,
+    *command,
+) = sys.argv[1:]
+
+pattern_text = os.environ.pop("CTF_WRAP_FLAG_PATTERNS_JSON", "[]")
+try:
+    pattern_text_bytes = len(pattern_text.encode("utf-8"))
+except UnicodeEncodeError as exc:
+    raise SystemExit("flag regex JSON must be valid UTF-8") from exc
+if pattern_text_bytes > 64 * 1024:
+    raise SystemExit("CTF_WRAP_FLAG_PATTERNS_JSON exceeds 65536 bytes")
+try:
+    pattern_values = json.loads(pattern_text)
+except json.JSONDecodeError as exc:
+    raise SystemExit(
+        f"CTF_WRAP_FLAG_PATTERNS_JSON is invalid JSON: {exc}"
+    ) from exc
+if (
+    not isinstance(pattern_values, list)
+    or len(pattern_values) > 64
+    or any(not isinstance(value, str) or not value for value in pattern_values)
+):
+    raise SystemExit(
+        "CTF_WRAP_FLAG_PATTERNS_JSON must contain up to 64 regex strings"
+    )
+try:
+    encoded_pattern_sizes = [
+        len(value.encode("utf-8")) for value in pattern_values
+    ]
+except UnicodeEncodeError as exc:
+    raise SystemExit("flag regexes must be valid UTF-8") from exc
+pattern_bytes = sum(encoded_pattern_sizes)
+if (
+    pattern_bytes > 64 * 1024
+    or any(size > 16 * 1024 for size in encoded_pattern_sizes)
+):
+    raise SystemExit("flag regexes exceed their bounded size")
+try:
+    flag_patterns = tuple(re.compile(value) for value in pattern_values)
+except re.error as exc:
+    raise SystemExit(f"invalid flag regex: {exc}") from exc
+
+limits = {
+    "stdout": int(stdout_limit),
+    "stderr": int(stderr_limit),
+}
+tail_limit = int(summary_limit)
+streams = {}
+candidate_descriptor = None
+
+CANDIDATE_COUNT_LIMIT = 1024
+CANDIDATE_CHARS_LIMIT = 256 * 1024
+CANDIDATE_FILE_LIMIT = 1024 * 1024
+CANDIDATE_MAX_CHARS = 1024
+CANDIDATE_MAX_BYTES = 4 * 1024
+SCAN_OVERLAP_CHARS = 4 * 1024
+
+def open_log(name, path):
+    flags = os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        os.close(descriptor)
+        raise OSError(f"{name} log is not a regular file")
+    streams[name] = {
+        "descriptor": descriptor,
+        "bytes": 0,
+        "stored_bytes": 0,
+        "tail": bytearray(),
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+        "complete": False,
+    }
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+
+def open_candidate_sidecar(path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        os.close(descriptor)
+        raise OSError("flag candidate sidecar is not a regular file")
+    return descriptor, opened
+
+class CandidateScanner:
+    def __init__(self, descriptor, opened):
+        self.descriptor = descriptor
+        self.device = opened.st_dev
+        self.inode = opened.st_ino
+        self.decoders = {
+            name: codecs.getincrementaldecoder("utf-8")(errors="replace")
+            for name in ("stdout", "stderr")
+        }
+        self.tails = {"stdout": "", "stderr": ""}
+        self.finished = set()
+        self.seen = set()
+        self.candidate_chars = 0
+        self.file_bytes = 0
+        self.suppressed_matches = 0
+
+    def feed(self, name, data, *, final=False):
+        if name in self.finished:
+            return
+        text = self.decoders[name].decode(data, final=final)
+        if final:
+            self.finished.add(name)
+        if not text or not flag_patterns:
+            return
+        combined = self.tails[name] + text
+        for pattern in flag_patterns:
+            for match in pattern.finditer(combined):
+                value = match.group(0)
+                encoded_value = value.encode("utf-8")
+                if value in self.seen:
+                    continue
+                if (
+                    not value
+                    or len(value) > CANDIDATE_MAX_CHARS
+                    or len(encoded_value) > CANDIDATE_MAX_BYTES
+                    or len(self.seen) >= CANDIDATE_COUNT_LIMIT
+                    or self.candidate_chars + len(value)
+                    > CANDIDATE_CHARS_LIMIT
+                ):
+                    self.suppressed_matches += 1
+                    continue
+                record = (
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "kind": "flag_candidate",
+                            "stream": name,
+                            "value": value,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                if self.file_bytes + len(record) > CANDIDATE_FILE_LIMIT:
+                    self.suppressed_matches += 1
+                    continue
+                write_all(self.descriptor, record)
+                self.file_bytes += len(record)
+                self.candidate_chars += len(value)
+                self.seen.add(value)
+        self.tails[name] = combined[-SCAN_OVERLAP_CHARS:]
+
+    def metadata(self):
+        return {
+            "path": candidate_path,
+            "pattern_count": len(flag_patterns),
+            "pattern_bytes": pattern_bytes,
+            "candidate_count": len(self.seen),
+            "candidate_chars": self.candidate_chars,
+            "file_bytes": self.file_bytes,
+            "candidate_count_limit": CANDIDATE_COUNT_LIMIT,
+            "candidate_chars_limit": CANDIDATE_CHARS_LIMIT,
+            "candidate_file_limit_bytes": CANDIDATE_FILE_LIMIT,
+            "candidate_max_chars": CANDIDATE_MAX_CHARS,
+            "candidate_max_bytes": CANDIDATE_MAX_BYTES,
+            "rolling_overlap_chars": SCAN_OVERLAP_CHARS,
+            "suppressed_matches": self.suppressed_matches,
+            "complete": all(
+                value["complete"] for value in streams.values()
+            ),
+            "device": self.device,
+            "inode": self.inode,
+        }
+
+scanner = None
+
+def consume(name, data):
+    value = streams[name]
+    value["bytes"] += len(data)
+    scanner.feed(name, data)
+    remaining = limits[name] - value["stored_bytes"]
+    if remaining > 0:
+        stored = data[:remaining]
+        write_all(value["descriptor"], stored)
+        value["stored_bytes"] += len(stored)
+    if tail_limit:
+        value["tail"].extend(data)
+        if len(value["tail"]) > tail_limit:
+            del value["tail"][:-tail_limit]
+
+def write_capture():
+    payload = {"schema_version": 1, "streams": {}}
+    for name, value in streams.items():
+        payload["streams"][name] = {
+            "bytes": value["bytes"],
+            "stored_bytes": value["stored_bytes"],
+            "limit_bytes": limits[name],
+            "truncated": value["bytes"] > value["stored_bytes"],
+            "tail_base64": base64.b64encode(value["tail"]).decode("ascii"),
+            "summary_truncated": value["bytes"] > len(value["tail"]),
+            "complete": value["complete"],
+            "device": value["device"],
+            "inode": value["inode"],
+        }
+    payload["flag_scan"] = scanner.metadata()
+    destination = pathlib.Path(capture_path)
+    temporary = destination.with_name(
+        f"{destination.name}.tmp.{os.getpid()}"
+    )
+    with open(temporary, "x", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, destination)
+
+try:
+    open_log("stdout", stdout_path)
+    open_log("stderr", stderr_path)
+    candidate_descriptor, candidate_metadata = open_candidate_sidecar(
+        candidate_path
+    )
+    scanner = CandidateScanner(candidate_descriptor, candidate_metadata)
+except OSError:
+    for value in streams.values():
+        os.close(value["descriptor"])
+    if candidate_descriptor is not None:
+        os.close(candidate_descriptor)
+    raise
+
+try:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
+except OSError as exc:
+    consume("stderr", f"ctfwrap: command launch failed: {exc}\n".encode())
+    for value in streams.values():
+        value["complete"] = True
+    for name in streams:
+        scanner.feed(name, b"", final=True)
+    write_capture()
+    for value in streams.values():
+        os.close(value["descriptor"])
+    os.close(candidate_descriptor)
+    raise SystemExit(127)
+
+selector = selectors.DefaultSelector()
+assert process.stdout is not None and process.stderr is not None
+for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+    os.set_blocking(pipe.fileno(), False)
+    selector.register(pipe, selectors.EVENT_READ, name)
+
+exit_drain_deadline = None
+while selector.get_map():
+    ready = selector.select(0.05)
+    for key, _ in ready:
+        try:
+            data = os.read(key.fileobj.fileno(), 64 * 1024)
+        except BlockingIOError:
+            continue
+        if data:
+            consume(key.data, data)
+        else:
+            streams[key.data]["complete"] = True
+            scanner.feed(key.data, b"", final=True)
+            selector.unregister(key.fileobj)
+            key.fileobj.close()
+    returncode = process.poll()
+    if returncode is not None:
+        if exit_drain_deadline is None:
+            exit_drain_deadline = time.monotonic() + 0.2
+        elif time.monotonic() >= exit_drain_deadline:
+            for key in list(selector.get_map().values()):
+                scanner.feed(key.data, b"", final=True)
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+            break
+
+returncode = process.wait()
+write_capture()
+for value in streams.values():
+    os.close(value["descriptor"])
+os.close(candidate_descriptor)
+if returncode < 0:
+    returncode = 128 + (-returncode)
+raise SystemExit(returncode)
+'
+
+setsid bash -c '
+    identity_path=$1
+    release_path=$2
+    marker=$3
+    identity_writer=$4
+    run_token=$5
+    stream_drainer=$6
+    stdout_path=$7
+    stderr_path=$8
+    capture_path=$9
+    candidate_path=${10}
+    stdout_limit=${11}
+    stderr_limit=${12}
+    summary_limit=${13}
+    shift 13
+    export CTF_WRAP_RUN_TOKEN="$run_token"
+    python3 -c "$identity_writer" "$identity_path" "$$"
+    while [[ ! -e "$release_path" ]]; do
+        sleep 0.01
+    done
+    set +e
+    python3 -c "$stream_drainer" "$stdout_path" "$stderr_path" \
+        "$capture_path" "$candidate_path" "$stdout_limit" "$stderr_limit" \
+        "$summary_limit" "$@"
+    rc=$?
+    printf "%s\n" "$rc" > "$marker"
+    exit "$rc"
+' ctfwrap-runner "$identity_path" "$release_path" "$exit_marker" \
+    "$identity_writer" "$run_token" "$stream_drainer" "$stdout_path" \
+    "$stderr_path" "$capture_path" "$candidate_path" \
+    "$stdout_limit_bytes" "$stderr_limit_bytes" "$summary_bytes" \
+    "${command_args[@]}" \
+    </dev/null >/dev/null 2>/dev/null &
+command_pid=$!
+
+command_start_ticks=""
+command_identity_ready=0
+for _ in {1..500}; do
+    identity_fields="$(python3 - "$identity_path" "$command_pid" <<'PY'
+import pathlib
+import sys
+
+try:
+    identity_path = pathlib.Path(sys.argv[1])
+    pid = int(sys.argv[2])
+    recorded = identity_path.read_text(encoding="utf-8").split()
+    if len(recorded) != 5 or int(recorded[0]) != pid:
+        raise ValueError
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    current = [str(pid), fields[19], fields[2], fields[3], fields[0]]
+    if recorded != current:
+        raise ValueError
+    print(*recorded[1:])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+PY
+)" || identity_fields=""
+    read -r command_start_ticks command_pgid command_sid command_state \
+        <<< "$identity_fields"
+    if [[ "$command_start_ticks" =~ ^[0-9]+$ &&
+          "$command_pgid" == "$command_pid" &&
+          "$command_sid" == "$command_pid" &&
+          "$command_state" != "Z" && "$command_state" != "X" &&
+          "$command_state" != "x" ]]; then
+        command_identity_ready=1
+        break
+    fi
+    if ! kill -0 "$command_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.01
+done
+
+timeout_watcher_pid=""
+cleanup_failed=0
+orchestration_error=""
+if ((command_identity_ready)); then
+    if ((timeout_seconds > 0)); then
+        python3 - "$timeout_seconds" "$timeout_marker" "$command_sid" \
+            "$command_start_ticks" "$run_token" <<'PY' &
+import os
+import pathlib
+import signal
+import sys
+import time
+
+timeout_seconds = int(sys.argv[1])
+timeout_marker = pathlib.Path(sys.argv[2])
+command_sid = int(sys.argv[3])
+command_start_ticks = int(sys.argv[4])
+run_token = f"CTF_WRAP_RUN_TOKEN={sys.argv[5]}".encode()
+
+def identity(pid):
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    return fields[0], int(fields[3]), int(fields[19])
+
+def has_token(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb", buffering=0) as handle:
+            data = handle.read(2 * 1024 * 1024 + 1)
+        return run_token in data.split(b"\0")
+    except OSError:
+        return False
+
+def signal_processes(signal_value):
+    targets = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            state, sid, start_ticks = identity(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+        if state in {"Z", "X", "x"} or start_ticks < command_start_ticks:
+            continue
+        if sid == command_sid or has_token(pid):
+            targets.append(pid)
+    targets.sort(key=lambda pid: pid == command_sid)
+    for pid in targets:
+        try:
+            os.kill(pid, signal_value)
+        except ProcessLookupError:
+            pass
+
+time.sleep(timeout_seconds)
+temporary = timeout_marker.with_name(
+    f"{timeout_marker.name}.tmp.{os.getpid()}"
+)
+temporary.write_text("timeout\n", encoding="ascii")
+os.replace(temporary, timeout_marker)
+signal_processes(signal.SIGTERM)
+time.sleep(5)
+signal_processes(signal.SIGKILL)
+PY
+        timeout_watcher_pid=$!
+    fi
+
+    release_tmp="$run_dir/.command-release.tmp.$$"
+    printf 'release\n' > "$release_tmp"
+    mv -f -- "$release_tmp" "$release_path"
+
+    set +e
+    wait "$command_pid"
+    wrapper_rc=$?
+    set -e
+    if [[ -n "$timeout_watcher_pid" ]]; then
+        kill "$timeout_watcher_pid" 2>/dev/null || true
+        wait "$timeout_watcher_pid" 2>/dev/null || true
+    fi
+
+    run_process_action "signal" "$command_sid" "$command_start_ticks" \
+        "$run_token" "SIGTERM" || true
+    for _ in {1..10}; do
+        if ! run_process_action "has" "$command_sid" "$command_start_ticks" \
+            "$run_token"; then
+            break
+        fi
+        sleep 0.02
+    done
+    for _ in {1..40}; do
+        if ! run_process_action "has" "$command_sid" "$command_start_ticks" \
+            "$run_token"; then
+            break
+        fi
+        run_process_action "signal" "$command_sid" "$command_start_ticks" \
+            "$run_token" "SIGKILL" || true
+        sleep 0.05
+    done
+    if run_process_action "has" "$command_sid" "$command_start_ticks" \
+        "$run_token"; then
+        cleanup_failed=1
+        orchestration_error="command descendants survived SIGKILL cleanup"
+    fi
+else
+    kill -TERM -- "-$command_pid" 2>/dev/null || true
+    wait "$command_pid" 2>/dev/null || true
+    wrapper_rc=125
+    orchestration_error="failed to establish command session identity"
+fi
+finished_ns="$(date +%s%N)"
+
+timed_out=0
+exit_code="$wrapper_rc"
+if [[ -f "$timeout_marker" ]]; then
+    timed_out=1
+    exit_code=124
+elif [[ -f "$exit_marker" ]]; then
+    IFS= read -r recorded_exit < "$exit_marker" || recorded_exit="$wrapper_rc"
+    if [[ "$recorded_exit" =~ ^[0-9]+$ ]] && ((recorded_exit <= 255)); then
+        exit_code="$recorded_exit"
+    fi
+fi
+if ((cleanup_failed)) && ((timed_out == 0)); then
+    exit_code=125
+fi
+rm -f -- "$exit_marker" "$identity_path" "$release_path" "$timeout_marker"
+
+python3 - "$result_path" "$meta_path" "$capture_path" "$run_id" \
+    "$exit_code" "$timed_out" "$timeout_seconds" "$started_ns" \
+    "$finished_ns" "$stdout_path" "$stderr_path" "$summary_bytes" \
+    "$stdout_limit_bytes" "$stderr_limit_bytes" "$orchestration_error" <<'PY'
+import base64
+import binascii
+import datetime
+import json
+import os
+import pathlib
+import stat
+import sys
+
+(
+    path,
+    meta_path,
+    capture_path,
+    run_id,
+    exit_code,
+    timed_out,
+    timeout_seconds,
+    started_ns,
+    finished_ns,
+    stdout_path,
+    stderr_path,
+    summary_bytes,
+    stdout_limit,
+    stderr_limit,
+    orchestration_error,
+) = sys.argv[1:]
+
+limit = int(summary_bytes)
+stream_limits = {
+    "stdout": int(stdout_limit),
+    "stderr": int(stderr_limit),
+}
+
+def timestamp(nanoseconds):
+    value = int(nanoseconds) / 1_000_000_000
+    return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).isoformat()
+
+def load_regular_json(filename, maximum_bytes):
+    source = pathlib.Path(filename)
+    try:
+        before = source.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None, "missing"
+    if not stat.S_ISREG(before.st_mode):
+        return None, "not_regular"
+    if before.st_size > maximum_bytes:
+        return None, "oversized"
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise OSError("file changed while opening")
+            data = os.read(descriptor, maximum_bytes + 1)
+        finally:
+            os.close(descriptor)
+        if len(data) > maximum_bytes:
+            return None, "oversized"
+        value = json.loads(data)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"unreadable: {exc}"
+    return value, None
+
+capture, capture_error = load_regular_json(capture_path, 1024 * 1024)
+capture_streams = (
+    capture.get("streams")
+    if isinstance(capture, dict) and capture.get("schema_version") == 1
+    else None
+)
+if not isinstance(capture_streams, dict):
+    capture_streams = {}
+    if capture_error is None:
+        capture_error = "invalid"
+
+def summarize(name, filename):
+    source = pathlib.Path(filename)
+    try:
+        before = source.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return {
+            "bytes": 0,
+            "stored_bytes": 0,
+            "summary": "",
+            "summary_truncated": False,
+            "truncated": None,
+            "truncation_known": False,
+            "error": "missing",
+        }
+    if not stat.S_ISREG(before.st_mode):
+        return {
+            "bytes": 0,
+            "stored_bytes": 0,
+            "summary": "",
+            "summary_truncated": False,
+            "truncated": None,
+            "truncation_known": False,
+            "error": "not_regular",
+        }
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise OSError("file changed while opening")
+            size = opened.st_size
+            if size > stream_limits[name]:
+                raise OSError(
+                    f"log exceeds {stream_limits[name]} byte raw limit"
+                )
+            identity = (opened.st_dev, opened.st_ino)
+            fallback = b""
+            if limit:
+                os.lseek(descriptor, max(0, size - limit), os.SEEK_SET)
+                fallback = os.read(descriptor, limit)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        return {
+            "bytes": 0,
+            "stored_bytes": 0,
+            "summary": "",
+            "summary_truncated": False,
+            "truncated": None,
+            "truncation_known": False,
+            "error": f"unreadable: {exc}",
+        }
+    captured = capture_streams.get(name)
+    if isinstance(captured, dict):
+        try:
+            captured_bytes = int(captured["bytes"])
+            stored_bytes = int(captured["stored_bytes"])
+            captured_limit = int(captured["limit_bytes"])
+            device = int(captured["device"])
+            inode = int(captured["inode"])
+            tail = base64.b64decode(captured["tail_base64"], validate=True)
+            capture_complete = captured["complete"]
+            if (
+                captured_bytes < 0
+                or stored_bytes < 0
+                or stored_bytes > captured_bytes
+                or stored_bytes != size
+                or captured_limit != stream_limits[name]
+                or stored_bytes > captured_limit
+                or identity != (device, inode)
+                or len(tail) > limit
+                or bool(captured["truncated"])
+                != (captured_bytes > stored_bytes)
+                or bool(captured["summary_truncated"])
+                != (captured_bytes > len(tail))
+                or not isinstance(capture_complete, bool)
+            ):
+                raise ValueError("capture fields are inconsistent")
+        except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+            return {
+                "bytes": 0,
+                "stored_bytes": 0,
+                "summary": "",
+                "summary_truncated": False,
+                "truncated": None,
+                "truncation_known": False,
+                "error": f"invalid_capture: {exc}",
+            }
+        return {
+            "bytes": captured_bytes,
+            "stored_bytes": stored_bytes,
+            "summary": tail.decode("utf-8", errors="replace"),
+            "summary_truncated": captured_bytes > len(tail),
+            "truncated": (
+                captured_bytes > stored_bytes
+                if capture_complete
+                else None
+            ),
+            "truncation_known": capture_complete,
+            "capture_complete": capture_complete,
+            "error": None,
+        }
+    return {
+        "bytes": size,
+        "stored_bytes": size,
+        "summary": fallback.decode("utf-8", errors="replace"),
+        "summary_truncated": size > len(fallback),
+        "truncated": None,
+        "truncation_known": False,
+        "capture_complete": False,
+        "error": None,
+    }
+
+stdout = summarize("stdout", stdout_path)
+stderr = summarize("stderr", stderr_path)
+was_timed_out = bool(int(timed_out))
+code = int(exit_code)
+status = "timed_out" if was_timed_out else ("completed" if code == 0 else "failed")
+payload = {
+    "schema_version": 1,
+    "kind": "run_result",
+    "run_id": run_id,
+    "status": status,
+    "exit_code": code,
+    "timed_out": was_timed_out,
+    "timeout_seconds": int(timeout_seconds),
+    "started_at": timestamp(started_ns),
+    "finished_at": timestamp(finished_ns),
+    "duration_ms": max(0, (int(finished_ns) - int(started_ns)) // 1_000_000),
+    "stdout_path": stdout_path,
+    "stderr_path": stderr_path,
+    "stdout_bytes": stdout["bytes"],
+    "stderr_bytes": stderr["bytes"],
+    "stdout_stored_bytes": stdout["stored_bytes"],
+    "stderr_stored_bytes": stderr["stored_bytes"],
+    "stdout_limit_bytes": stream_limits["stdout"],
+    "stderr_limit_bytes": stream_limits["stderr"],
+    "stdout_truncated": stdout["truncated"],
+    "stderr_truncated": stderr["truncated"],
+    "stdout_truncation_known": stdout["truncation_known"],
+    "stderr_truncation_known": stderr["truncation_known"],
+    "stdout_capture_complete": stdout.get("capture_complete", False),
+    "stderr_capture_complete": stderr.get("capture_complete", False),
+    "stdout_summary": stdout["summary"],
+    "stderr_summary": stderr["summary"],
+    "stdout_summary_truncated": stdout["summary_truncated"],
+    "stderr_summary_truncated": stderr["summary_truncated"],
+    "stdout_error": stdout["error"],
+    "stderr_error": stderr["error"],
+    "stream_capture_error": capture_error,
+    "orchestration_error": orchestration_error or None,
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+
+meta, meta_error = load_regular_json(meta_path, 1024 * 1024)
+if isinstance(meta, dict) and meta_error is None:
+    meta["finished_at"] = payload["finished_at"]
+    meta["status"] = status
+    meta["exit_code"] = code
+    meta["capture"] = {
+        name: {
+            "bytes": stream["bytes"],
+            "stored_bytes": stream["stored_bytes"],
+            "limit_bytes": stream_limits[name],
+            "truncated": stream["truncated"],
+            "truncation_known": stream["truncation_known"],
+            "capture_complete": stream.get("capture_complete", False),
+            "summary_truncated": stream["summary_truncated"],
+            "error": stream["error"],
+        }
+        for name, stream in (("stdout", stdout), ("stderr", stderr))
+    }
+    meta_tmp = f"{meta_path}.tmp.{os.getpid()}"
+    with open(meta_tmp, "x", encoding="utf-8") as handle:
+        json.dump(meta, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+    os.replace(meta_tmp, meta_path)
+PY
+
+if ((json_mode)); then
+    cat -- "$result_path"
+else
+    python3 - "$result_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+
+def terminal_safe(value):
+    output = []
+    for character in value:
+        if character in "\n\t" or character.isprintable():
+            output.append(character)
+        else:
+            output.append(character.encode("unicode_escape").decode("ascii"))
+    return "".join(output)
+
+print(
+    f"{result['run_id']}: {result['status']} "
+    f"(exit={result['exit_code']}, duration_ms={result['duration_ms']})"
+)
+for stream in ("stdout", "stderr"):
+    total = result[f"{stream}_bytes"]
+    stored = result[f"{stream}_stored_bytes"]
+    suffix = ""
+    if result[f"{stream}_truncation_known"] and result[f"{stream}_truncated"]:
+        suffix = "; raw prefix truncated"
+    elif not result[f"{stream}_capture_complete"]:
+        suffix = "; stream capture incomplete"
+    elif not result[f"{stream}_truncation_known"]:
+        suffix = "; raw truncation unknown"
+    print(
+        f"{stream}: {result[f'{stream}_path']} "
+        f"({stored} stored / {total} drained bytes{suffix})"
+    )
+for stream in ("stdout", "stderr"):
+    log_error = result[f"{stream}_error"]
+    if log_error:
+        print(f"{stream} log error: {log_error}")
+    summary = result[f"{stream}_summary"]
+    if not summary:
+        continue
+    marker = " [tail; truncated]" if result[f"{stream}_summary_truncated"] else ""
+    print(f"--- {stream}{marker} ---")
+    print(terminal_safe(summary), end="" if summary.endswith("\n") else "\n")
+PY
+fi
+
+exit "$exit_code"

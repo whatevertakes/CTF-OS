@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: ghidra-decompile [OPTIONS] BINARY
+
+Run Ghidra's headless analyzer and write noninteractive decompilation artifacts.
+
+Options:
+  -o, --output DIR       Artifact directory (default: /work/ghidra/<binary>)
+      --timeout SECONDS  Overall and per-file analysis timeout (default: 900)
+      --processor ID     Optional Ghidra language/processor ID
+      --json             Emit schema_version=1 summary JSON
+  -h, --help             Show this help
+
+Artifacts:
+  decompiled.c, analysis.log, script.log, headless.log, summary.json
+EOF
+}
+
+if (($# == 0)); then
+  usage
+  exit 2
+fi
+
+output_dir=''
+analysis_timeout=900
+processor=''
+json_output=0
+binary=''
+
+while (($#)); do
+  case "$1" in
+    -o|--output)
+      (($# >= 2)) || { printf 'ghidra-decompile: %s requires a value\n' "$1" >&2; exit 2; }
+      output_dir=$2
+      shift 2
+      ;;
+    --timeout)
+      (($# >= 2)) || { printf 'ghidra-decompile: --timeout requires a value\n' >&2; exit 2; }
+      analysis_timeout=$2
+      shift 2
+      ;;
+    --processor)
+      (($# >= 2)) || { printf 'ghidra-decompile: --processor requires a value\n' >&2; exit 2; }
+      processor=$2
+      shift 2
+      ;;
+    --json)
+      json_output=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      if (($# != 1)); then
+        printf 'ghidra-decompile: exactly one BINARY is required\n' >&2
+        exit 2
+      fi
+      binary=$1
+      shift
+      ;;
+    -*)
+      printf 'ghidra-decompile: unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "${binary}" ]]; then
+        printf 'ghidra-decompile: exactly one BINARY is required\n' >&2
+        exit 2
+      fi
+      binary=$1
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${binary}" ]]; then
+  printf 'ghidra-decompile: BINARY is required\n' >&2
+  exit 2
+fi
+if [[ ! "${analysis_timeout}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'ghidra-decompile: --timeout must be a positive integer\n' >&2
+  exit 2
+fi
+if [[ ! -f "${binary}" ]]; then
+  printf 'ghidra-decompile: not a regular file: %s\n' "${binary}" >&2
+  exit 1
+fi
+
+ghidra_dir=${GHIDRA_INSTALL_DIR:-/opt/ghidra}
+headless="${ghidra_dir}/support/analyzeHeadless"
+if [[ ! -x "${headless}" ]]; then
+  printf 'ghidra-decompile: analyzeHeadless not found: %s\n' "${headless}" >&2
+  exit 1
+fi
+
+binary=$(readlink -f -- "${binary}")
+input_sha256=$(sha256sum -- "${binary}" | awk '{ print $1 }')
+if [[ -z "${output_dir}" ]]; then
+  work_dir=${CTF_WORK_DIR:-/work}
+  if [[ "${work_dir}" != /* || "${work_dir}" == / || -L "${work_dir}" || ! -d "${work_dir}" ]]; then
+    printf 'ghidra-decompile: unsafe work directory for default output: %s\n' \
+      "${work_dir}" >&2
+    exit 1
+  fi
+  work_dir=${work_dir%/}
+  ghidra_root="${work_dir}/ghidra"
+  if [[ -L "${ghidra_root}" ]]; then
+    printf 'ghidra-decompile: refusing symlink default output root: %s\n' \
+      "${ghidra_root}" >&2
+    exit 1
+  elif [[ -e "${ghidra_root}" && ! -d "${ghidra_root}" ]]; then
+    printf 'ghidra-decompile: default output root is not a directory: %s\n' \
+      "${ghidra_root}" >&2
+    exit 1
+  fi
+  mkdir -p -- "${ghidra_root}"
+  if [[ -L "${ghidra_root}" || ! -d "${ghidra_root}" ]]; then
+    printf 'ghidra-decompile: unsafe default output root: %s\n' \
+      "${ghidra_root}" >&2
+    exit 1
+  fi
+  ghidra_root=$(readlink -f -- "${ghidra_root}")
+  safe_name=$(
+    printf '%s' "$(basename -- "${binary}")" | tr -c 'A-Za-z0-9._-' '_'
+  )
+  output_dir="${ghidra_root}/${safe_name}-${input_sha256:0:12}"
+fi
+
+while [[ "${output_dir}" != / && "${output_dir}" == */ ]]; do
+  output_dir=${output_dir%/}
+done
+if [[ -L "${output_dir}" ]]; then
+  printf 'ghidra-decompile: refusing symlink output directory: %s\n' \
+    "${output_dir}" >&2
+  exit 1
+elif [[ -e "${output_dir}" && ! -d "${output_dir}" ]]; then
+  printf 'ghidra-decompile: output path is not a directory: %s\n' \
+    "${output_dir}" >&2
+  exit 1
+fi
+mkdir -p -- "${output_dir}"
+if [[ -L "${output_dir}" || ! -d "${output_dir}" ]]; then
+  printf 'ghidra-decompile: unsafe output directory: %s\n' "${output_dir}" >&2
+  exit 1
+fi
+output_dir=$(readlink -f -- "${output_dir}")
+
+if ! command -v flock >/dev/null 2>&1; then
+  printf 'ghidra-decompile: flock is required for output isolation\n' >&2
+  exit 1
+fi
+exec 8<"${output_dir}"
+if ! flock -w 30 8; then
+  printf 'ghidra-decompile: output directory is busy: %s\n' "${output_dir}" >&2
+  exit 1
+fi
+
+decompiled_path="${output_dir}/decompiled.c"
+analysis_log="${output_dir}/analysis.log"
+script_log="${output_dir}/script.log"
+headless_log="${output_dir}/headless.log"
+summary_path="${output_dir}/summary.json"
+
+# Never open an existing output entry before checking its type without
+# following links. A previous regular artifact is allowed and will remain
+# visible until the replacement is complete.
+python3 - "${output_dir}" \
+  decompiled.c analysis.log script.log headless.log summary.json <<'PY'
+import os
+import stat
+import sys
+
+directory, *names = sys.argv[1:]
+flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(directory, flags)
+try:
+    for name in names:
+        try:
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(entry.st_mode):
+            raise SystemExit(
+                f"ghidra-decompile: refusing non-regular artifact: "
+                f"{directory}/{name}"
+            )
+finally:
+    os.close(descriptor)
+PY
+
+artifact_stage=$(mktemp -d "${output_dir}/.ghidra-stage.XXXXXX")
+chmod 0700 -- "${artifact_stage}"
+staged_decompiled="${artifact_stage}/decompiled.c"
+staged_analysis_log="${artifact_stage}/analysis.log"
+staged_script_log="${artifact_stage}/script.log"
+staged_headless_log="${artifact_stage}/headless.log"
+staged_summary="${artifact_stage}/summary.json"
+
+# Create every staging file with O_EXCL and O_NOFOLLOW. Ghidra and jq only
+# receive these private paths; final names are published with atomic replace.
+python3 - "${artifact_stage}" \
+  decompiled.c analysis.log script.log headless.log summary.json <<'PY'
+import os
+import stat
+import sys
+
+directory, *names = sys.argv[1:]
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+directory_fd = os.open(directory, directory_flags)
+try:
+    for name in names:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SystemExit(
+                    f"ghidra-decompile: staging artifact is not regular: {name}"
+                )
+        finally:
+            os.close(descriptor)
+finally:
+    os.close(directory_fd)
+PY
+
+project_root=$(mktemp -d "${TMPDIR:-/tmp}/ctf-ghidra-project.XXXXXX")
+script_root=$(mktemp -d "${TMPDIR:-/tmp}/ctf-ghidra-script.XXXXXX")
+
+cleanup() {
+  if [[ -n ${project_root:-} && ${project_root} == "${TMPDIR:-/tmp}/ctf-ghidra-project."* ]]; then
+    rm -rf -- "${project_root}"
+  fi
+  if [[ -n ${script_root:-} && ${script_root} == "${TMPDIR:-/tmp}/ctf-ghidra-script."* ]]; then
+    rm -rf -- "${script_root}"
+  fi
+  if [[ -n ${artifact_stage:-} && ${artifact_stage} == "${output_dir}/.ghidra-stage."* ]]; then
+    rm -rf -- "${artifact_stage}"
+  fi
+}
+trap cleanup EXIT
+
+cat >"${script_root}/CtfDecompile.java" <<'JAVA'
+// Decompile every discovered function into one deterministic text artifact.
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionIterator;
+
+public class CtfDecompile extends GhidraScript {
+    @Override
+    public void run() throws Exception {
+        String[] args = getScriptArgs();
+        if (args.length != 2) {
+            throw new IllegalArgumentException(
+                "CtfDecompile requires OUTPUT_FILE and FUNCTION_TIMEOUT"
+            );
+        }
+        File outputFile = new File(args[0]);
+        int functionTimeout = Integer.parseInt(args[1]);
+        DecompInterface decompiler = new DecompInterface();
+        decompiler.toggleCCode(true);
+        decompiler.toggleSyntaxTree(false);
+        decompiler.setSimplificationStyle("decompile");
+        if (!decompiler.openProgram(currentProgram)) {
+            throw new IllegalStateException("unable to open program in decompiler");
+        }
+
+        try (PrintWriter output = new PrintWriter(new BufferedWriter(
+                new OutputStreamWriter(
+                    new FileOutputStream(outputFile), StandardCharsets.UTF_8)))) {
+            output.println("/*");
+            output.println(" * Generated by CTF-OS ghidra-decompile.");
+            output.println(" * Program: " + currentProgram.getName());
+            output.println(" */");
+            output.println();
+
+            FunctionIterator functions =
+                currentProgram.getFunctionManager().getFunctions(true);
+            while (functions.hasNext() && !monitor.isCancelled()) {
+                Function function = functions.next();
+                output.println("/* " + function.getName() + " @ " +
+                    function.getEntryPoint() + " */");
+                DecompileResults result =
+                    decompiler.decompileFunction(function, functionTimeout, monitor);
+                if (result.decompileCompleted() &&
+                        result.getDecompiledFunction() != null) {
+                    output.println(result.getDecompiledFunction().getC());
+                }
+                else {
+                    String error = result.getErrorMessage();
+                    if (error == null || error.isEmpty()) {
+                        error = "unknown decompiler error";
+                    }
+                    output.println("/* DECOMPILATION FAILED: " +
+                        error.replace("*/", "* /") + " */");
+                }
+                output.println();
+            }
+        }
+        finally {
+            decompiler.dispose();
+        }
+    }
+}
+JAVA
+
+command=(
+  "${headless}"
+  "${project_root}"
+  ctf-project
+  -import "${binary}"
+  -overwrite
+  -analysisTimeoutPerFile "${analysis_timeout}"
+  -scriptPath "${script_root}"
+  -postScript CtfDecompile.java "${staged_decompiled}" "${analysis_timeout}"
+  -log "${staged_analysis_log}"
+  -scriptlog "${staged_script_log}"
+  -deleteProject
+)
+if [[ -n "${processor}" ]]; then
+  command+=( -processor "${processor}" )
+fi
+
+set +e
+timeout --signal=TERM --kill-after=10s "${analysis_timeout}s" \
+  "${command[@]}" </dev/null >"${staged_headless_log}" 2>&1
+exit_code=$?
+set -e
+
+status=failed
+if ((exit_code == 0)) && [[ -s "${staged_decompiled}" ]]; then
+  status=completed
+elif ((exit_code == 124 || exit_code == 137)); then
+  status=timed_out
+fi
+if [[ "${status}" == failed ]] && ((exit_code == 0)); then
+  exit_code=1
+fi
+
+jq -n \
+  --arg status "${status}" \
+  --arg input "${binary}" \
+  --arg input_sha256 "${input_sha256}" \
+  --arg output_dir "${output_dir}" \
+  --arg decompiled "${decompiled_path}" \
+  --arg analysis_log "${analysis_log}" \
+  --arg script_log "${script_log}" \
+  --arg headless_log "${headless_log}" \
+  --argjson exit_code "${exit_code}" \
+  '{
+    schema_version: 1,
+    command: "ghidra-decompile",
+    status: $status,
+    exit_code: $exit_code,
+    input: $input,
+    input_sha256: $input_sha256,
+    output_dir: $output_dir,
+    artifacts: {
+      decompiled: $decompiled,
+      analysis_log: $analysis_log,
+      script_log: $script_log,
+      headless_log: $headless_log
+    }
+  }' >"${staged_summary}"
+
+# Validate every staged source and current destination through non-following
+# directory descriptors, then atomically replace the five well-known names.
+python3 - "${artifact_stage}" "${output_dir}" \
+  decompiled.c analysis.log script.log headless.log summary.json <<'PY'
+import os
+import stat
+import sys
+
+source_directory, destination_directory, *names = sys.argv[1:]
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+source_fd = os.open(source_directory, directory_flags)
+destination_fd = os.open(destination_directory, directory_flags)
+opened: dict[str, tuple[int, int, int]] = {}
+try:
+    for name in names:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=source_fd)
+        source_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(source_stat.st_mode):
+            os.close(descriptor)
+            raise SystemExit(
+                f"ghidra-decompile: staging artifact is not regular: {name}"
+            )
+        os.fchmod(descriptor, 0o644)
+        opened[name] = (descriptor, source_stat.st_dev, source_stat.st_ino)
+
+        try:
+            destination_stat = os.stat(
+                name, dir_fd=destination_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise SystemExit(
+                f"ghidra-decompile: refusing non-regular artifact: "
+                f"{destination_directory}/{name}"
+            )
+
+    for name in names:
+        descriptor, expected_device, expected_inode = opened[name]
+        current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino)
+            != (expected_device, expected_inode)
+        ):
+            raise SystemExit(
+                f"ghidra-decompile: staging artifact changed before publish: {name}"
+            )
+        try:
+            destination_stat = os.stat(
+                name, dir_fd=destination_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise SystemExit(
+                    f"ghidra-decompile: refusing non-regular artifact: "
+                    f"{destination_directory}/{name}"
+                )
+        os.replace(
+            name,
+            name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+        )
+        os.close(descriptor)
+        del opened[name]
+finally:
+    for descriptor, _device, _inode in opened.values():
+        os.close(descriptor)
+    os.close(source_fd)
+    os.close(destination_fd)
+PY
+
+rmdir -- "${artifact_stage}"
+artifact_stage=''
+
+if ((json_output)); then
+  cat -- "${summary_path}"
+else
+  printf 'ghidra-decompile: %s (exit=%d)\n' "${status}" "${exit_code}"
+  printf 'artifacts: %s\n' "${output_dir}"
+fi
+
+flock -u 8
+exec 8>&-
+
+if [[ "${status}" != completed ]]; then
+  exit "${exit_code}"
+fi

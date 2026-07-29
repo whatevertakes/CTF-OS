@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ctf-log [OPTIONS] JOB_ID
+
+Read a bounded tail of a job's saved logs. This command never follows a file
+and never opens a pager.
+
+Options:
+  --json              Emit one schema_version=1 JSON document
+  --stream STREAM     stdout, stderr, or both (default: both)
+  --tail-bytes BYTES  Tail bytes per selected stream (default: 8192; max: 1048576)
+  -h, --help          Show this help
+EOF
+}
+
+die() {
+    printf 'ctf-log: %s\n' "$*" >&2
+    exit 2
+}
+
+if (($# == 0)); then
+    usage
+    exit 2
+fi
+
+json_mode=0
+stream="both"
+tail_bytes=8192
+job_id=""
+
+while (($# > 0)); do
+    case "$1" in
+        --json)
+            json_mode=1
+            shift
+            ;;
+        --stream)
+            (($# >= 2)) || die '--stream requires a value'
+            stream="$2"
+            shift 2
+            ;;
+        --tail-bytes)
+            (($# >= 2)) || die '--tail-bytes requires a value'
+            tail_bytes="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            [[ -z "$job_id" ]] || die 'only one JOB_ID may be specified'
+            job_id="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$job_id" ]] || die 'JOB_ID is required'
+[[ "$job_id" =~ ^job-[0-9]{8}$ ]] || die 'invalid JOB_ID'
+case "$stream" in
+    stdout|stderr|both) ;;
+    *) die '--stream must be stdout, stderr, or both' ;;
+esac
+[[ "$tail_bytes" =~ ^[0-9]+$ ]] || die '--tail-bytes must be a non-negative integer'
+((tail_bytes <= 1048576)) || die '--tail-bytes must not exceed 1048576'
+
+state_root="${CTF_STATE_ROOT:-/work/.ctf}"
+[[ "$state_root" == /* ]] || die 'CTF_STATE_ROOT must be an absolute path'
+jobs_root="${state_root%/}/jobs"
+job_dir="$jobs_root/$job_id"
+[[ -d "$job_dir" && ! -L "$job_dir" ]] || {
+    printf 'ctf-log: unknown job: %s\n' "$job_id" >&2
+    exit 3
+}
+
+python3 - "$job_dir" "$job_id" "$stream" "$tail_bytes" "$json_mode" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+job_dir_arg, job_id, requested_stream, tail_bytes, json_mode = sys.argv[1:]
+job_dir = pathlib.Path(job_dir_arg)
+limit = int(tail_bytes)
+
+def load_json(path):
+    try:
+        before = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+            return {}
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or opened.st_size > 1024 * 1024
+            ):
+                return {}
+            data = os.read(descriptor, 1024 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+        if len(data) > 1024 * 1024:
+            return {}
+        value = json.loads(data.decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeError, ValueError):
+        return {}
+
+def tail(path):
+    try:
+        before = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        size = 0
+        data = b""
+    else:
+        if not stat.S_ISREG(before.st_mode):
+            raise SystemExit(f"ctf-log: log must be a regular file: {path}")
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (before.st_dev, before.st_ino)
+                ):
+                    raise SystemExit(f"ctf-log: log changed while opening: {path}")
+                size = opened.st_size
+                if limit == 0:
+                    data = b""
+                else:
+                    os.lseek(descriptor, max(0, size - limit), os.SEEK_SET)
+                    data = os.read(descriptor, limit)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise SystemExit(f"ctf-log: cannot safely read log {path}: {exc}") from exc
+    return {
+        "path": str(path),
+        "bytes": size,
+        "tail": data.decode("utf-8", errors="replace"),
+        "tail_truncated": size > len(data),
+    }
+
+def terminal_safe(value):
+    output = []
+    for character in value:
+        if character in "\n\t" or character.isprintable():
+            output.append(character)
+        else:
+            output.append(character.encode("unicode_escape").decode("ascii"))
+    return "".join(output)
+
+status = load_json(job_dir / "status.json")
+streams = {}
+if requested_stream in {"stdout", "both"}:
+    streams["stdout"] = tail(job_dir / "stdout.log")
+if requested_stream in {"stderr", "both"}:
+    streams["stderr"] = tail(job_dir / "stderr.log")
+
+payload = {
+    "schema_version": 1,
+    "kind": "job_log",
+    "job_id": job_id,
+    "status": status.get("status", "unknown"),
+    "streams": streams,
+}
+if json_mode == "1":
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+else:
+    print(f"{job_id}: {payload['status']}")
+    for name, details in streams.items():
+        marker = " [tail; truncated]" if details["tail_truncated"] else ""
+        print(f"--- {name}{marker}: {details['path']} ({details['bytes']} bytes) ---")
+        value = terminal_safe(details["tail"])
+        if value:
+            print(value, end="" if value.endswith("\n") else "\n")
+PY

@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ctf-bg [OPTIONS] -- COMMAND [ARG...]
+
+Start a detached, stdin-free job. Complete stdout, stderr, metadata, and status
+are stored under /work/.ctf/jobs/JOB_ID.
+
+Options:
+  --json             Emit one schema_version=1 JSON launch result
+  --timeout SECONDS  Stop the job after SECONDS (default: 3600; 0 disables)
+  --name NAME        Attach a short display name to the job
+  -h, --help         Show this help
+EOF
+}
+
+die() {
+    printf 'ctf-bg: %s\n' "$*" >&2
+    exit 2
+}
+
+write_status() {
+    local path="$1"
+    local job_id="$2"
+    local status="$3"
+    local runner_pid="$4"
+    local pid_start_ticks="$5"
+    local started_at="$6"
+    local finished_at="$7"
+    local exit_code="$8"
+    local timed_out="$9"
+    local cancelled="${10}"
+    local command_pid="${11}"
+    local command_pid_start_ticks="${12}"
+    python3 - "$path" "$job_id" "$status" "$runner_pid" "$pid_start_ticks" \
+        "$started_at" "$finished_at" "$exit_code" "$timed_out" "$cancelled" \
+        "$command_pid" "$command_pid_start_ticks" <<'PY'
+import json
+import os
+import sys
+
+(
+    path,
+    job_id,
+    status,
+    runner_pid,
+    pid_start_ticks,
+    started_at,
+    finished_at,
+    exit_code,
+    timed_out,
+    cancelled,
+    command_pid,
+    command_pid_start_ticks,
+) = sys.argv[1:]
+payload = {
+    "schema_version": 1,
+    "job_id": job_id,
+    "status": status,
+    "runner_pid": int(runner_pid) if runner_pid else None,
+    "pgid": int(runner_pid) if runner_pid else None,
+    "pid_start_ticks": int(pid_start_ticks) if pid_start_ticks else None,
+    "started_at": started_at or None,
+    "finished_at": finished_at or None,
+    "exit_code": int(exit_code) if exit_code else None,
+    "timed_out": timed_out == "1",
+    "cancelled": cancelled == "1",
+    "command_pid": int(command_pid) if command_pid else None,
+    "command_pgid": int(command_pid) if command_pid else None,
+    "command_sid": int(command_pid) if command_pid else None,
+    "command_pid_start_ticks": (
+        int(command_pid_start_ticks) if command_pid_start_ticks else None
+    ),
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+signal_command_session() {
+    local command_pid="$1"
+    local command_pid_start_ticks="$2"
+    local signal_name="$3"
+    local allow_orphan="$4"
+    python3 - "$command_pid" "$command_pid_start_ticks" "$signal_name" \
+        "$allow_orphan" <<'PY'
+import os
+import pathlib
+import signal
+import sys
+
+leader_pid = int(sys.argv[1])
+leader_start_ticks = int(sys.argv[2])
+signal_value = getattr(signal, sys.argv[3])
+allow_orphan = sys.argv[4] == "1"
+
+def identity(pid):
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    return {
+        "state": fields[0],
+        "pgrp": int(fields[2]),
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+leader_matches = False
+try:
+    leader = identity(leader_pid)
+    leader_matches = (
+        leader["state"] not in {"Z", "X", "x"}
+        and leader["start_ticks"] == leader_start_ticks
+        and leader["pgrp"] == leader_pid
+        and leader["sid"] == leader_pid
+    )
+except (OSError, ValueError, IndexError):
+    pass
+
+if not leader_matches and not allow_orphan:
+    raise SystemExit(3)
+
+targets = []
+for entry in pathlib.Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    pid = int(entry.name)
+    try:
+        process = identity(pid)
+    except (OSError, ValueError, IndexError):
+        continue
+    if (
+        process["state"] not in {"Z", "X", "x"}
+        and
+        process["sid"] == leader_pid
+        and process["start_ticks"] >= leader_start_ticks
+    ):
+        targets.append(pid)
+
+# Signal the session leader last so it cannot exit before its children are sampled.
+targets.sort(key=lambda pid: pid == leader_pid)
+for pid in targets:
+    try:
+        os.kill(pid, signal_value)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise SystemExit(4)
+PY
+}
+
+state_root="${CTF_STATE_ROOT:-/work/.ctf}"
+[[ "$state_root" == /* ]] || die 'CTF_STATE_ROOT must be an absolute path'
+[[ "$state_root" != *$'\n'* && "$state_root" != *$'\t'* ]] ||
+    die 'CTF_STATE_ROOT must not contain tabs or newlines'
+jobs_root="${state_root%/}/jobs"
+
+if [[ "${1:-}" == "__ctf_internal_run_v1" ]]; then
+    (($# >= 5)) || exit 125
+    job_dir="$2"
+    job_id="$3"
+    timeout_seconds="$4"
+    shift 4
+    [[ "${1:-}" == "--" ]] || exit 125
+    shift
+    (($# > 0)) || exit 125
+    [[ "$job_id" =~ ^job-[0-9]{8}$ ]] || exit 125
+    [[ "$job_dir" == "$jobs_root/$job_id" ]] || exit 125
+    [[ -d "$job_dir" && ! -L "$job_dir" ]] || exit 125
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || exit 125
+
+    command_args=("$@")
+    runner_pid="$$"
+    pid_start_ticks="$(python3 - "$runner_pid" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+fields = text[text.rfind(")") + 2 :].split()
+print(fields[19])
+PY
+)"
+    started_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+    status_path="$job_dir/status.json"
+    stdout_path="$job_dir/stdout.log"
+    stderr_path="$job_dir/stderr.log"
+    exit_marker="$job_dir/.command-exit"
+    timeout_marker="$job_dir/timeout.requested"
+    identity_path="$job_dir/.command-identity"
+    release_path="$job_dir/.command-release"
+
+    if [[ -f "$job_dir/cancel.requested" ]]; then
+        write_status "$status_path" "$job_id" "cancelled" "$runner_pid" \
+            "$pid_start_ticks" "$started_at" "$started_at" "130" "0" "1" "" ""
+        exit 0
+    fi
+
+    write_status "$status_path" "$job_id" "starting" "$runner_pid" \
+        "$pid_start_ticks" "$started_at" "" "" "0" "0" "" ""
+
+    # The supervisor and command intentionally live in different sessions.
+    # ctf-kill can therefore terminate the complete command session without
+    # killing the supervisor before it persists the final status. The wrapper
+    # publishes its session identity and waits for release before user code can
+    # run, eliminating the fast-daemonize identity race.
+    identity_writer='
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+pid = int(sys.argv[2])
+text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+fields = text[text.rfind(")") + 2 :].split()
+value = f"{pid} {fields[19]} {fields[2]} {fields[3]} {fields[0]}\n"
+temporary = path.with_name(f"{path.name}.tmp.{pid}")
+temporary.write_text(value, encoding="utf-8")
+os.replace(temporary, path)
+'
+    setsid bash -c '
+        identity_path=$1
+        release_path=$2
+        marker=$3
+        identity_writer=$4
+        shift 4
+        python3 -c "$identity_writer" "$identity_path" "$$"
+        while [[ ! -e "$release_path" ]]; do
+            sleep 0.01
+        done
+        set +e
+        "$@"
+        rc=$?
+        printf "%s\n" "$rc" > "$marker"
+        exit "$rc"
+    ' ctf-bg-runner "$identity_path" "$release_path" "$exit_marker" \
+        "$identity_writer" "${command_args[@]}" \
+        </dev/null >"$stdout_path" 2>"$stderr_path" &
+    command_pid=$!
+
+    command_pid_start_ticks=""
+    command_identity_ready=0
+    for _ in {1..500}; do
+        identity_fields="$(python3 - "$identity_path" "$command_pid" <<'PY'
+import pathlib
+import sys
+
+try:
+    identity_path = pathlib.Path(sys.argv[1])
+    pid = int(sys.argv[2])
+    recorded = identity_path.read_text(encoding="utf-8").split()
+    if len(recorded) != 5 or int(recorded[0]) != pid:
+        raise ValueError
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    current = [str(pid), fields[19], fields[2], fields[3], fields[0]]
+    if recorded != current:
+        raise ValueError
+    print(*recorded[1:])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+PY
+)" || identity_fields=""
+        read -r command_pid_start_ticks command_pgid command_sid command_state \
+            <<< "$identity_fields"
+        if [[ "$command_pid_start_ticks" =~ ^[0-9]+$ &&
+              "$command_pgid" == "$command_pid" &&
+              "$command_sid" == "$command_pid" &&
+              "$command_state" != "Z" && "$command_state" != "X" &&
+              "$command_state" != "x" ]]; then
+            command_identity_ready=1
+            break
+        fi
+        if ! kill -0 "$command_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.01
+    done
+
+    if ((command_identity_ready == 0)); then
+        kill -TERM -- "-$command_pid" 2>/dev/null || true
+        set +e
+        wait "$command_pid"
+        wrapper_rc=$?
+        set -e
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+        final_status="failed"
+        exit_code="$wrapper_rc"
+        was_cancelled=0
+        if [[ -f "$job_dir/cancel.requested" ]]; then
+            final_status="cancelled"
+            exit_code=130
+            was_cancelled=1
+        elif [[ -f "$exit_marker" ]]; then
+            IFS= read -r recorded_exit < "$exit_marker" || recorded_exit="$wrapper_rc"
+            if [[ "$recorded_exit" =~ ^[0-9]+$ ]] && ((recorded_exit <= 255)); then
+                exit_code="$recorded_exit"
+            fi
+            if ((exit_code == 0)); then
+                final_status="completed"
+            fi
+        fi
+        rm -f -- "$exit_marker" "$identity_path" "$release_path"
+        write_status "$status_path" "$job_id" "$final_status" "$runner_pid" \
+            "$pid_start_ticks" "$started_at" "$finished_at" "$exit_code" \
+            "0" "$was_cancelled" "" ""
+        exit 0
+    fi
+
+    if [[ -f "$job_dir/cancel.requested" ]]; then
+        signal_command_session "$command_pid" "$command_pid_start_ticks" \
+            "SIGTERM" "0" || true
+        sleep 0.05
+        signal_command_session "$command_pid" "$command_pid_start_ticks" \
+            "SIGKILL" "1" || true
+        wait "$command_pid" 2>/dev/null || true
+        rm -f -- "$identity_path" "$release_path"
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+        write_status "$status_path" "$job_id" "cancelled" "$runner_pid" \
+            "$pid_start_ticks" "$started_at" "$finished_at" "130" "0" "1" \
+            "$command_pid" "$command_pid_start_ticks"
+        exit 0
+    fi
+
+    write_status "$status_path" "$job_id" "running" "$runner_pid" \
+        "$pid_start_ticks" "$started_at" "" "" "0" "0" "$command_pid" \
+        "$command_pid_start_ticks"
+
+    timeout_watcher_pid=""
+    if ((timeout_seconds > 0)); then
+        # Python sleeps in-process, so cancelling this watcher cannot orphan a
+        # child `sleep` in the supervisor session.
+        python3 - "$timeout_seconds" "$timeout_marker" "$command_pid" \
+            "$command_pid_start_ticks" <<'PY' &
+import os
+import pathlib
+import signal
+import sys
+import time
+
+timeout_seconds = int(sys.argv[1])
+timeout_marker = pathlib.Path(sys.argv[2])
+session_id = int(sys.argv[3])
+leader_start_ticks = int(sys.argv[4])
+
+def identity(pid):
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    return {
+        "state": fields[0],
+        "pgrp": int(fields[2]),
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+def signal_members(signal_value, allow_orphan):
+    leader_matches = False
+    try:
+        leader = identity(session_id)
+        leader_matches = (
+            leader["state"] not in {"Z", "X", "x"}
+            and leader["start_ticks"] == leader_start_ticks
+            and leader["pgrp"] == session_id
+            and leader["sid"] == session_id
+        )
+    except (OSError, ValueError, IndexError):
+        pass
+    if not leader_matches and not allow_orphan:
+        return
+
+    targets = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            process = identity(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+        if (
+            process["state"] not in {"Z", "X", "x"}
+            and process["sid"] == session_id
+            and process["start_ticks"] >= leader_start_ticks
+        ):
+            targets.append(pid)
+    targets.sort(key=lambda pid: pid == session_id)
+    for pid in targets:
+        try:
+            os.kill(pid, signal_value)
+        except ProcessLookupError:
+            pass
+
+time.sleep(timeout_seconds)
+temporary = timeout_marker.with_name(
+    f"{timeout_marker.name}.tmp.{os.getpid()}"
+)
+temporary.write_text("timeout\n", encoding="ascii")
+os.replace(temporary, timeout_marker)
+signal_members(signal.SIGTERM, False)
+time.sleep(5)
+signal_members(signal.SIGKILL, True)
+PY
+        timeout_watcher_pid=$!
+    fi
+    : > "$release_path"
+
+    set +e
+    wait "$command_pid"
+    wrapper_rc=$?
+    set -e
+    if [[ -n "$timeout_watcher_pid" ]]; then
+        kill "$timeout_watcher_pid" 2>/dev/null || true
+        wait "$timeout_watcher_pid" 2>/dev/null || true
+    fi
+
+    # A command that exits after daemonizing must not leak children. Clean any
+    # remaining members of the recorded command session before finalizing.
+    signal_command_session "$command_pid" "$command_pid_start_ticks" \
+        "SIGTERM" "1" || true
+    sleep 0.05
+    signal_command_session "$command_pid" "$command_pid_start_ticks" \
+        "SIGKILL" "1" || true
+
+    finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+    exit_code="$wrapper_rc"
+    final_status="failed"
+    was_timed_out=0
+    was_cancelled=0
+
+    if [[ -f "$job_dir/cancel.requested" ]]; then
+        final_status="cancelled"
+        exit_code=130
+        was_cancelled=1
+    elif [[ -f "$exit_marker" ]]; then
+        IFS= read -r recorded_exit < "$exit_marker" || recorded_exit="$wrapper_rc"
+        if [[ "$recorded_exit" =~ ^[0-9]+$ ]] && ((recorded_exit <= 255)); then
+            exit_code="$recorded_exit"
+        fi
+        if ((exit_code == 0)); then
+            final_status="completed"
+        fi
+    elif [[ -f "$timeout_marker" ]]; then
+        final_status="timed_out"
+        exit_code=124
+        was_timed_out=1
+    fi
+    rm -f -- "$exit_marker" "$timeout_marker" "$identity_path" "$release_path"
+    write_status "$status_path" "$job_id" "$final_status" "$runner_pid" \
+        "$pid_start_ticks" "$started_at" "$finished_at" "$exit_code" \
+        "$was_timed_out" "$was_cancelled" "$command_pid" \
+        "$command_pid_start_ticks"
+    exit 0
+fi
+
+json_mode=0
+timeout_seconds="${CTF_BG_TIMEOUT:-3600}"
+job_name=""
+
+if (($# == 0)); then
+    usage
+    exit 2
+fi
+
+while (($# > 0)); do
+    case "$1" in
+        --json)
+            json_mode=1
+            shift
+            ;;
+        --timeout)
+            (($# >= 2)) || die '--timeout requires a value'
+            timeout_seconds="$2"
+            shift 2
+            ;;
+        --name)
+            (($# >= 2)) || die '--name requires a value'
+            job_name="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+(($# > 0)) || die 'COMMAND is required'
+[[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die '--timeout must be a non-negative integer'
+((timeout_seconds <= 604800)) || die '--timeout must not exceed 604800 seconds'
+command_args=("$@")
+if [[ -z "$job_name" ]]; then
+    job_name="${command_args[0]##*/}"
+fi
+(( ${#job_name} <= 200 )) || die '--name must not exceed 200 characters'
+
+umask 077
+mkdir -p -- "$jobs_root"
+allocation="$(python3 - "$jobs_root" <<'PY'
+import fcntl
+import os
+import pathlib
+import secrets
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+lock_path = root / ".lock"
+counter_path = root / ".counter"
+flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NONBLOCK
+flags |= getattr(os, "O_NOFOLLOW", 0)
+
+lock_before = None
+try:
+    lock_before = lock_path.stat(follow_symlinks=False)
+except FileNotFoundError:
+    pass
+if lock_before is not None and not stat.S_ISREG(lock_before.st_mode):
+    raise SystemExit("ctf-bg: job lock must be a regular file")
+try:
+    lock_fd = os.open(lock_path, flags, 0o600)
+except OSError as exc:
+    raise SystemExit(f"ctf-bg: cannot safely open job lock: {exc}") from exc
+try:
+    lock_opened = os.fstat(lock_fd)
+    if not stat.S_ISREG(lock_opened.st_mode):
+        raise SystemExit("ctf-bg: job lock must be a regular file")
+    if lock_before is not None and (
+        lock_opened.st_dev,
+        lock_opened.st_ino,
+    ) != (lock_before.st_dev, lock_before.st_ino):
+        raise SystemExit("ctf-bg: job lock changed while opening")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    counter = 0
+    try:
+        counter_before = counter_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(counter_before.st_mode) or counter_before.st_size > 64:
+            raise SystemExit("ctf-bg: job counter must be a small regular file")
+        read_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        read_flags |= getattr(os, "O_NOFOLLOW", 0)
+        counter_fd = os.open(counter_path, read_flags)
+        try:
+            counter_opened = os.fstat(counter_fd)
+            if not stat.S_ISREG(counter_opened.st_mode):
+                raise SystemExit("ctf-bg: job counter must be a regular file")
+            if (counter_opened.st_dev, counter_opened.st_ino) != (
+                counter_before.st_dev,
+                counter_before.st_ino,
+            ):
+                raise SystemExit("ctf-bg: job counter changed while opening")
+            value = os.read(counter_fd, 65).decode("ascii").strip()
+        finally:
+            os.close(counter_fd)
+        if not value.isdigit() or len(value) > 12:
+            raise SystemExit("ctf-bg: job counter is invalid")
+        counter = int(value)
+
+    while True:
+        counter += 1
+        job_id = f"job-{counter:08d}"
+        job_dir = root / job_id
+        try:
+            job_dir.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+
+    temporary = root / f".counter.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    temporary_fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.write(temporary_fd, f"{counter}\n".encode("ascii"))
+    finally:
+        os.close(temporary_fd)
+    os.replace(temporary, counter_path)
+finally:
+    os.close(lock_fd)
+
+print(f"{job_id}\t{job_dir}")
+PY
+)"
+IFS=$'\t' read -r job_id job_dir <<< "$allocation"
+[[ "$job_id" =~ ^job-[0-9]{8,}$ && "$job_dir" == "$jobs_root/$job_id" ]] ||
+    die 'safe job allocation failed'
+
+stdout_path="$job_dir/stdout.log"
+stderr_path="$job_dir/stderr.log"
+meta_path="$job_dir/meta.json"
+status_path="$job_dir/status.json"
+runner_log="$job_dir/runner.log"
+: > "$stdout_path"
+: > "$stderr_path"
+: > "$runner_log"
+working_directory="$(pwd -P)"
+
+python3 - "$meta_path" "$job_id" "$job_name" "$working_directory" \
+    "$timeout_seconds" "$stdout_path" "$stderr_path" "${command_args[@]}" <<'PY'
+import datetime
+import json
+import os
+import sys
+
+(
+    path,
+    job_id,
+    name,
+    cwd,
+    timeout_seconds,
+    stdout_path,
+    stderr_path,
+    *command,
+) = sys.argv[1:]
+payload = {
+    "schema_version": 1,
+    "kind": "job",
+    "job_id": job_id,
+    "name": name,
+    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "cwd": cwd,
+    "command": command,
+    "timeout_seconds": int(timeout_seconds),
+    "stdout_path": stdout_path,
+    "stderr_path": stderr_path,
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+
+write_status "$status_path" "$job_id" "starting" "" "" "" "" "" "0" "0" "" ""
+self_path="$(readlink -f -- "$0")"
+setsid bash "$self_path" __ctf_internal_run_v1 "$job_dir" "$job_id" \
+    "$timeout_seconds" -- "${command_args[@]}" \
+    </dev/null >/dev/null 2>>"$runner_log" &
+launcher_pid=$!
+
+for _ in {1..50}; do
+    current_status="$(python3 - "$status_path" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("status", "unknown"))
+except (OSError, ValueError):
+    print("unknown")
+PY
+)"
+    if [[ "$current_status" != "starting" && "$current_status" != "unknown" ]]; then
+        break
+    fi
+    if ! kill -0 "$launcher_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.01
+done
+
+launch_failed=0
+if [[ "$current_status" == "starting" || "$current_status" == "unknown" ]]; then
+    # The runner can finish between the last status read and kill -0. Refresh
+    # once before declaring launch failure so a fast command is not overwritten.
+    current_status="$(python3 - "$status_path" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("status", "unknown"))
+except (OSError, ValueError):
+    print("unknown")
+PY
+)"
+fi
+if [[ "$current_status" == "starting" || "$current_status" == "unknown" ]]; then
+    if ! kill -0 "$launcher_pid" 2>/dev/null; then
+        finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+        write_status "$status_path" "$job_id" "failed" "$launcher_pid" "" \
+            "" "$finished_at" "125" "0" "0" "" ""
+        launch_failed=1
+    fi
+fi
+
+python3 - "$meta_path" "$status_path" "$launcher_pid" "$json_mode" <<'PY'
+import json
+import sys
+
+meta_path, status_path, launcher_pid, json_mode = sys.argv[1:]
+with open(meta_path, encoding="utf-8") as handle:
+    meta = json.load(handle)
+try:
+    with open(status_path, encoding="utf-8") as handle:
+        status = json.load(handle)
+except (OSError, ValueError):
+    status = {"status": "starting"}
+payload = {
+    "schema_version": 1,
+    "kind": "job_launch",
+    "job_id": meta["job_id"],
+    "name": meta["name"],
+    "status": status.get("status", "starting"),
+    "runner_pid": status.get("runner_pid") or int(launcher_pid),
+    "timeout_seconds": meta["timeout_seconds"],
+    "stdout_path": meta["stdout_path"],
+    "stderr_path": meta["stderr_path"],
+    "status_path": status_path,
+}
+if json_mode == "1":
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+else:
+    print(
+        f"{payload['job_id']}: {payload['status']} "
+        f"(pid={payload['runner_pid']}, timeout={payload['timeout_seconds']}s)"
+    )
+    print(f"stdout: {payload['stdout_path']}")
+    print(f"stderr: {payload['stderr_path']}")
+PY
+exit "$launch_failed"

@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Extract printable strings containing Korean characters."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+SCHEMA_VERSION = 1
+DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024
+DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_FILES = 1000
+HARD_MAX_FILE_BYTES = 512 * 1024 * 1024
+HARD_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+HARD_MAX_FILES = 10000
+HARD_MAX_RESULTS = 10000
+DEFAULT_MAX_OUTPUT_CHARS = 1_000_000
+HARD_MAX_OUTPUT_CHARS = 16_000_000
+MAX_DIAGNOSTICS = 1000
+EXCLUDED_DIRS = {".git", "__pycache__", "node_modules"}
+
+
+def is_korean(character: str) -> bool:
+    codepoint = ord(character)
+    return (
+        0x1100 <= codepoint <= 0x11FF
+        or 0x3130 <= codepoint <= 0x318F
+        or 0xA960 <= codepoint <= 0xA97F
+        or 0xAC00 <= codepoint <= 0xD7A3
+        or 0xD7B0 <= codepoint <= 0xD7FF
+        or 0xFFA0 <= codepoint <= 0xFFDC
+    )
+
+
+def is_string_character(character: str) -> bool:
+    return character == "\t" or (
+        character not in {"\x00", "\ufffd"} and character.isprintable()
+    )
+
+
+@dataclass(frozen=True)
+class Character:
+    value: str
+    offset: int
+
+
+def utf8_characters(data: bytes) -> Iterator[Character | None]:
+    index = 0
+    while index < len(data):
+        first = data[index]
+        if first < 0x80:
+            width = 1
+        elif 0xC2 <= first <= 0xDF:
+            width = 2
+        elif 0xE0 <= first <= 0xEF:
+            width = 3
+        elif 0xF0 <= first <= 0xF4:
+            width = 4
+        else:
+            yield None
+            index += 1
+            continue
+        chunk = data[index : index + width]
+        if len(chunk) != width:
+            yield None
+            break
+        try:
+            value = chunk.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            yield None
+            index += 1
+            continue
+        yield Character(value, index)
+        index += width
+
+
+def utf16_characters(
+    data: bytes, byteorder: str, alignment: int
+) -> Iterator[Character | None]:
+    index = alignment
+    encoding = "utf-16-le" if byteorder == "little" else "utf-16-be"
+    while index + 1 < len(data):
+        unit = int.from_bytes(data[index : index + 2], byteorder)
+        width = 2
+        if 0xD800 <= unit <= 0xDBFF and index + 3 < len(data):
+            second = int.from_bytes(data[index + 2 : index + 4], byteorder)
+            if 0xDC00 <= second <= 0xDFFF:
+                width = 4
+        chunk = data[index : index + width]
+        try:
+            value = chunk.decode(encoding, errors="strict")
+        except UnicodeDecodeError:
+            yield None
+            index += 2
+            continue
+        yield Character(value, index)
+        index += width
+
+
+def extract_runs(
+    characters: Iterator[Character | None], minimum: int, maximum: int
+) -> Iterator[tuple[int, str, bool]]:
+    before_capacity = max(0, min(maximum - 1, maximum // 2))
+    before_korean: deque[Character] = deque(maxlen=before_capacity)
+    output: list[Character] = []
+    run_length = 0
+    found_korean = False
+    run_truncated = False
+
+    def finish() -> tuple[int, str, bool] | None:
+        if not found_korean or run_length < minimum or not output:
+            return None
+        first = 0
+        last = len(output)
+        while first < last and output[first].value.isspace():
+            first += 1
+        while last > first and output[last - 1].value.isspace():
+            last -= 1
+        if first == last:
+            return None
+        text = "".join(character.value for character in output[first:last])
+        if not any(is_korean(char) for char in text):
+            return None
+        return output[first].offset, text, run_truncated
+
+    for character in characters:
+        if character is not None and is_string_character(character.value):
+            run_length += 1
+            if not found_korean:
+                if is_korean(character.value):
+                    found_korean = True
+                    output.extend(before_korean)
+                    output.append(character)
+                    before_korean.clear()
+                else:
+                    if before_korean.maxlen == 0 or (
+                        len(before_korean) == before_korean.maxlen
+                    ):
+                        run_truncated = True
+                    before_korean.append(character)
+            elif len(output) < maximum:
+                output.append(character)
+            else:
+                run_truncated = True
+            continue
+        result = finish()
+        if result is not None:
+            yield result
+        before_korean.clear()
+        output = []
+        run_length = 0
+        found_korean = False
+        run_truncated = False
+    result = finish()
+    if result is not None:
+        yield result
+
+
+def cli_parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="ktext",
+        description="Extract UTF-8/UTF-16 printable strings containing Hangul.",
+    )
+    result.add_argument("files", nargs="+", metavar="PATH")
+    result.add_argument(
+        "-n",
+        "--min-chars",
+        type=int,
+        default=2,
+        metavar="N",
+        help="minimum candidate length (default: 2)",
+    )
+    result.add_argument(
+        "--encoding",
+        choices=("auto", "utf-8", "utf-16le", "utf-16be"),
+        default="auto",
+    )
+    result.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=DEFAULT_MAX_FILE_BYTES,
+        metavar="N",
+        help="skip files larger than N bytes (default: 128 MiB)",
+    )
+    result.add_argument(
+        "--max-total-bytes",
+        type=int,
+        default=DEFAULT_MAX_TOTAL_BYTES,
+        metavar="N",
+        help="stop before reading more than N bytes total (default: 512 MiB)",
+    )
+    result.add_argument(
+        "--max-files",
+        type=int,
+        default=DEFAULT_MAX_FILES,
+        metavar="N",
+        help="inspect at most N regular files (default: 1000)",
+    )
+    result.add_argument(
+        "--max-results",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="stop after N strings (default: 1000)",
+    )
+    result.add_argument(
+        "--max-string-chars",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="retain at most N characters per string (default: 4096, max: 65536)",
+    )
+    result.add_argument(
+        "--max-output-chars",
+        type=int,
+        default=DEFAULT_MAX_OUTPUT_CHARS,
+        metavar="N",
+        help="retain at most N string characters total (default: 1000000)",
+    )
+    result.add_argument("--json", action="store_true", help="emit schema_version=1 JSON")
+    return result
+
+
+def append_bounded(
+    collection: list[object], value: object, dropped: dict[str, int], kind: str
+) -> None:
+    if len(collection) < MAX_DIAGNOSTICS:
+        collection.append(value)
+    else:
+        dropped[kind] = dropped.get(kind, 0) + 1
+
+
+def iter_files(
+    paths: list[Path], errors: list[object], dropped: dict[str, int]
+) -> Iterator[Path]:
+    seen: set[tuple[int, int]] = set()
+    for root in sorted(paths, key=lambda item: os.fsencode(str(item))):
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            append_bounded(errors, f"{root}: {exc}", dropped, "errors")
+            continue
+        if stat.S_ISLNK(root_stat.st_mode):
+            append_bounded(errors, f"{root}: symlink input skipped", dropped, "errors")
+            continue
+        if stat.S_ISREG(root_stat.st_mode):
+            identity = (root_stat.st_dev, root_stat.st_ino)
+            if identity not in seen:
+                seen.add(identity)
+                yield root
+            continue
+        if not stat.S_ISDIR(root_stat.st_mode):
+            append_bounded(
+                errors,
+                f"{root}: not a regular file or directory",
+                dropped,
+                "errors",
+            )
+            continue
+
+        def onerror(exc: OSError) -> None:
+            append_bounded(errors, str(exc), dropped, "errors")
+
+        for current, directories, filenames in os.walk(
+            root, topdown=True, followlinks=False, onerror=onerror
+        ):
+            directories[:] = sorted(
+                [
+                    name
+                    for name in directories
+                    if name not in EXCLUDED_DIRS
+                    and not Path(current, name).is_symlink()
+                ],
+                key=os.fsencode,
+            )
+            for filename in sorted(filenames, key=os.fsencode):
+                candidate = Path(current, filename)
+                try:
+                    candidate_stat = candidate.lstat()
+                except OSError as exc:
+                    append_bounded(
+                        errors, f"{candidate}: {exc}", dropped, "errors"
+                    )
+                    continue
+                if not stat.S_ISREG(candidate_stat.st_mode):
+                    continue
+                identity = (candidate_stat.st_dev, candidate_stat.st_ino)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                yield candidate
+
+
+def read_regular_bounded(path: Path, limit: int) -> tuple[bytearray | None, int, bool]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError("not a regular file")
+        if file_stat.st_size > limit:
+            return None, file_stat.st_size, True
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = os.read(descriptor, min(1024 * 1024, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return data, file_stat.st_size, len(data) > limit
+    finally:
+        os.close(descriptor)
+
+
+def terminal_safe(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if (
+            codepoint < 0x20
+            or 0x7F <= codepoint <= 0x9F
+            or not character.isprintable()
+        ):
+            if codepoint <= 0xFF:
+                escaped.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                escaped.append(f"\\u{codepoint:04x}")
+            else:
+                escaped.append(f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def main(argv: list[str]) -> int:
+    parser = cli_parser()
+    if not argv:
+        parser.print_usage(sys.stderr)
+        return 2
+    args = parser.parse_args(argv)
+    if args.min_chars <= 0:
+        parser.error("--min-chars must be > 0")
+    if not 1 <= args.max_file_bytes <= HARD_MAX_FILE_BYTES:
+        parser.error(
+            f"--max-file-bytes must be between 1 and {HARD_MAX_FILE_BYTES}"
+        )
+    if not 1 <= args.max_total_bytes <= HARD_MAX_TOTAL_BYTES:
+        parser.error(
+            f"--max-total-bytes must be between 1 and {HARD_MAX_TOTAL_BYTES}"
+        )
+    if not 1 <= args.max_files <= HARD_MAX_FILES:
+        parser.error(f"--max-files must be between 1 and {HARD_MAX_FILES}")
+    if not 1 <= args.max_results <= HARD_MAX_RESULTS:
+        parser.error(f"--max-results must be between 1 and {HARD_MAX_RESULTS}")
+    if not 1 <= args.max_string_chars <= 65536:
+        parser.error("--max-string-chars must be between 1 and 65536")
+    if not 1 <= args.max_output_chars <= HARD_MAX_OUTPUT_CHARS:
+        parser.error(
+            f"--max-output-chars must be between 1 and {HARD_MAX_OUTPUT_CHARS}"
+        )
+    if args.max_output_chars < args.max_string_chars:
+        parser.error("--max-output-chars must be >= --max-string-chars")
+
+    records: list[dict[str, object]] = []
+    errors: list[object] = []
+    skipped: list[object] = []
+    diagnostics_dropped: dict[str, int] = {}
+    truncated = False
+    result_limit_reached = False
+    files_considered = 0
+    files_scanned = 0
+    bytes_scanned = 0
+    output_chars = 0
+    limit_reasons: list[str] = []
+
+    for path in iter_files(
+        [Path(filename) for filename in args.files],
+        errors,
+        diagnostics_dropped,
+    ):
+        if files_considered >= args.max_files:
+            truncated = True
+            limit_reasons.append("max_files")
+            break
+        files_considered += 1
+        try:
+            remaining_bytes = args.max_total_bytes - bytes_scanned
+            if remaining_bytes <= 0:
+                truncated = True
+                limit_reasons.append("max_total_bytes")
+                break
+            read_limit = min(args.max_file_bytes, remaining_bytes)
+            data, observed_size, exceeded = read_regular_bounded(path, read_limit)
+            if exceeded:
+                if observed_size > args.max_file_bytes or read_limit == args.max_file_bytes:
+                    reason = "file_size_limit"
+                else:
+                    reason = "max_total_bytes"
+                truncated = True
+                limit_reasons.append(reason)
+                if reason == "max_total_bytes":
+                    break
+                append_bounded(
+                    skipped,
+                    {
+                        "path": str(path),
+                        "reason": reason,
+                        "size": observed_size,
+                    },
+                    diagnostics_dropped,
+                    "skipped",
+                )
+                continue
+        except OSError as exc:
+            append_bounded(errors, f"{path}: {exc}", diagnostics_dropped, "errors")
+            continue
+        assert data is not None
+        files_scanned += 1
+        bytes_scanned += len(data)
+
+        scanners: list[tuple[str, Iterator[Character | None]]] = []
+        if args.encoding in ("auto", "utf-8"):
+            scanners.append(("utf-8", utf8_characters(data)))
+        if args.encoding in ("auto", "utf-16le"):
+            scanners.append(("utf-16le", utf16_characters(data, "little", 0)))
+            scanners.append(("utf-16le", utf16_characters(data, "little", 1)))
+        if args.encoding in ("auto", "utf-16be"):
+            scanners.append(("utf-16be", utf16_characters(data, "big", 0)))
+            scanners.append(("utf-16be", utf16_characters(data, "big", 1)))
+
+        seen: set[tuple[str, int, str]] = set()
+        for encoding, scanner in scanners:
+            for offset, text, string_truncated in extract_runs(
+                scanner, args.min_chars, args.max_string_chars
+            ):
+                identity = (encoding, offset, text)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if output_chars + len(text) > args.max_output_chars:
+                    truncated = True
+                    result_limit_reached = True
+                    limit_reasons.append("max_output_chars")
+                    break
+                records.append(
+                    {
+                        "file": str(path),
+                        "encoding": encoding,
+                        "offset": offset,
+                        "text": text,
+                        "truncated": string_truncated,
+                    }
+                )
+                output_chars += len(text)
+                if string_truncated:
+                    truncated = True
+                    limit_reasons.append("string_length")
+                if len(records) >= args.max_results:
+                    truncated = True
+                    result_limit_reached = True
+                    limit_reasons.append("max_results")
+                    break
+            if result_limit_reached:
+                break
+        if result_limit_reached:
+            break
+
+    if diagnostics_dropped:
+        truncated = True
+        limit_reasons.append("diagnostics_limit")
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "ktext",
+        "count": len(records),
+        "strings": records,
+        "truncated": truncated,
+        "result_limit_reached": result_limit_reached,
+        "limit_reasons": sorted(set(limit_reasons)),
+        "files_considered": files_considered,
+        "files_scanned": files_scanned,
+        "bytes_scanned": bytes_scanned,
+        "limits": {
+            "max_files": args.max_files,
+            "max_file_bytes": args.max_file_bytes,
+            "max_total_bytes": args.max_total_bytes,
+            "max_results": args.max_results,
+            "max_string_chars": args.max_string_chars,
+            "max_output_chars": args.max_output_chars,
+        },
+        "output_chars": output_chars,
+        "skipped": skipped,
+        "errors": errors,
+        "diagnostics_dropped": diagnostics_dropped,
+    }
+    if args.json:
+        json.dump(
+            payload,
+            sys.stdout,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        sys.stdout.write("\n")
+    else:
+        multiple = len(args.files) > 1 or any(
+            Path(filename).is_dir() for filename in args.files
+        )
+        for record in records:
+            prefix = (
+                f"{terminal_safe(str(record['file']))}:" if multiple else ""
+            )
+            print(
+                f"{prefix}{record['offset']} [{record['encoding']}] "
+                f"{terminal_safe(str(record['text']))}"
+                f"{' …[truncated]' if record['truncated'] else ''}"
+            )
+        for error in errors:
+            print(f"ktext: {terminal_safe(str(error))}", file=sys.stderr)
+        if truncated:
+            reasons = ",".join(sorted(set(limit_reasons))) or "bounded_output"
+            print(f"ktext: scan truncated ({reasons})", file=sys.stderr)
+    return 0 if not errors else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

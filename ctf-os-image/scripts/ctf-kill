@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ctf-kill [OPTIONS] JOB_ID
+
+Cancel the recorded command session. PID birth times are verified before any
+signal is sent, then SIGTERM is followed by SIGKILL if the grace period expires.
+
+Options:
+  --json           Emit one schema_version=1 JSON result
+  --grace SECONDS  SIGTERM grace period (default: 3; maximum: 30)
+  -h, --help       Show this help
+EOF
+}
+
+die() {
+    printf 'ctf-kill: %s\n' "$*" >&2
+    exit 2
+}
+
+if (($# == 0)); then
+    usage
+    exit 2
+fi
+
+json_mode=0
+grace_seconds=3
+job_id=""
+
+while (($# > 0)); do
+    case "$1" in
+        --json)
+            json_mode=1
+            shift
+            ;;
+        --grace)
+            (($# >= 2)) || die '--grace requires a value'
+            grace_seconds="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            [[ -z "$job_id" ]] || die 'only one JOB_ID may be specified'
+            job_id="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$job_id" ]] || die 'JOB_ID is required'
+[[ "$job_id" =~ ^job-[0-9]{8}$ ]] || die 'invalid JOB_ID'
+[[ "$grace_seconds" =~ ^[0-9]+$ ]] || die '--grace must be a non-negative integer'
+((grace_seconds <= 30)) || die '--grace must not exceed 30 seconds'
+
+state_root="${CTF_STATE_ROOT:-/work/.ctf}"
+[[ "$state_root" == /* ]] || die 'CTF_STATE_ROOT must be an absolute path'
+jobs_root="${state_root%/}/jobs"
+job_dir="$jobs_root/$job_id"
+status_path="$job_dir/status.json"
+[[ -d "$job_dir" && ! -L "$job_dir" ]] || {
+    printf 'ctf-kill: unknown job: %s\n' "$job_id" >&2
+    exit 3
+}
+
+umask 077
+python3 - "$job_dir/cancel.requested" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    current = path.stat(follow_symlinks=False)
+except FileNotFoundError:
+    pass
+else:
+    if not stat.S_ISREG(current.st_mode):
+        raise SystemExit(f"ctf-kill: cancel marker must be a regular file: {path}")
+temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+descriptor = os.open(
+    temporary,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+    0o600,
+)
+os.close(descriptor)
+os.replace(temporary, path)
+PY
+
+read_status() {
+    python3 - "$status_path" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+valid = False
+try:
+    before = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+        raise ValueError
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size > 1024 * 1024
+        ):
+            raise ValueError
+        data = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > 1024 * 1024:
+        raise ValueError
+    status = json.loads(data.decode("utf-8"))
+    if not isinstance(status, dict):
+        raise ValueError
+    valid = True
+except (OSError, UnicodeError, ValueError):
+    status = {}
+if not valid:
+    status["status"] = "invalid"
+for key in (
+    "status",
+    "runner_pid",
+    "pgid",
+    "pid_start_ticks",
+    "command_pid",
+    "command_pgid",
+    "command_sid",
+    "command_pid_start_ticks",
+):
+    value = status.get(key)
+    print("" if value is None else value)
+PY
+}
+
+process_matches() {
+    local pid="$1"
+    local expected_ticks="$2"
+    python3 - "$pid" "$expected_ticks" <<'PY'
+import pathlib
+import sys
+
+try:
+    pid = int(sys.argv[1])
+    expected = int(sys.argv[2])
+    if pid <= 1:
+        raise ValueError
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    matches = fields[0] not in {"Z", "X", "x"} and int(fields[19]) == expected
+    raise SystemExit(0 if matches else 1)
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+PY
+}
+
+session_leader_matches() {
+    local pid="$1"
+    local expected_ticks="$2"
+    python3 - "$pid" "$expected_ticks" <<'PY'
+import pathlib
+import sys
+
+try:
+    pid = int(sys.argv[1])
+    expected = int(sys.argv[2])
+    if pid <= 1:
+        raise ValueError
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    matches = (
+        fields[0] not in {"Z", "X", "x"}
+        and
+        int(fields[19]) == expected
+        and int(fields[2]) == pid
+        and int(fields[3]) == pid
+    )
+    raise SystemExit(0 if matches else 1)
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+PY
+}
+
+signal_session_members() {
+    local session_id="$1"
+    local leader_start_ticks="$2"
+    local signal_name="$3"
+    local allow_orphan="$4"
+    python3 - "$session_id" "$leader_start_ticks" "$signal_name" \
+        "$allow_orphan" <<'PY'
+import os
+import pathlib
+import signal
+import sys
+
+session_id = int(sys.argv[1])
+leader_start_ticks = int(sys.argv[2])
+signal_value = getattr(signal, sys.argv[3])
+allow_orphan = sys.argv[4] == "1"
+
+def identity(pid):
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    fields = text[text.rfind(")") + 2 :].split()
+    return {
+        "state": fields[0],
+        "pgrp": int(fields[2]),
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+leader_matches = False
+try:
+    leader = identity(session_id)
+    leader_matches = (
+        leader["state"] not in {"Z", "X", "x"}
+        and leader["start_ticks"] == leader_start_ticks
+        and leader["pgrp"] == session_id
+        and leader["sid"] == session_id
+    )
+except (OSError, ValueError, IndexError):
+    pass
+if not leader_matches and not allow_orphan:
+    raise SystemExit(3)
+
+targets = []
+for entry in pathlib.Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    pid = int(entry.name)
+    try:
+        process = identity(pid)
+    except (OSError, ValueError, IndexError):
+        continue
+    if (
+        process["state"] not in {"Z", "X", "x"}
+        and
+        process["sid"] == session_id
+        and process["start_ticks"] >= leader_start_ticks
+    ):
+        targets.append(pid)
+
+targets.sort(key=lambda pid: pid == session_id)
+for pid in targets:
+    try:
+        os.kill(pid, signal_value)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        raise SystemExit(4)
+PY
+}
+
+session_has_members() {
+    local session_id="$1"
+    local leader_start_ticks="$2"
+    python3 - "$session_id" "$leader_start_ticks" <<'PY'
+import pathlib
+import sys
+
+session_id = int(sys.argv[1])
+leader_start_ticks = int(sys.argv[2])
+for entry in pathlib.Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    try:
+        text = (entry / "stat").read_text()
+        fields = text[text.rfind(")") + 2 :].split()
+        if (
+            fields[0] not in {"Z", "X", "x"}
+            and int(fields[3]) == session_id
+            and int(fields[19]) >= leader_start_ticks
+        ):
+            raise SystemExit(0)
+    except (OSError, ValueError, IndexError):
+        pass
+raise SystemExit(1)
+PY
+}
+
+emit_result() {
+    local action="$1"
+    python3 - "$status_path" "$job_id" "$action" "$json_mode" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+status_path, job_id, action, json_mode = sys.argv[1:]
+path = pathlib.Path(status_path)
+try:
+    before = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+        raise ValueError
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size > 1024 * 1024
+        ):
+            raise ValueError
+        data = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > 1024 * 1024:
+        raise ValueError
+    status = json.loads(data.decode("utf-8"))
+    if not isinstance(status, dict):
+        raise ValueError
+except (OSError, UnicodeError, ValueError):
+    status = {}
+payload = {
+    "schema_version": 1,
+    "kind": "job_cancel",
+    "job_id": job_id,
+    "action": action,
+    "status": status.get("status", "unknown"),
+    "exit_code": status.get("exit_code"),
+    "runner_pid": status.get("runner_pid"),
+    "command_pid": status.get("command_pid"),
+    "command_sid": status.get("command_sid"),
+    "finished_at": status.get("finished_at"),
+}
+if json_mode == "1":
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+else:
+    print(f"{job_id}: {payload['status']} ({action})")
+PY
+}
+
+write_final_status() {
+    local final_status="$1"
+    local exit_code="$2"
+    python3 - "$status_path" "$final_status" "$exit_code" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path, final_status, exit_code = sys.argv[1:]
+status_path = pathlib.Path(path)
+try:
+    before = status_path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+        raise ValueError
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(status_path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size > 1024 * 1024
+        ):
+            raise ValueError
+        data = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > 1024 * 1024:
+        raise ValueError
+    status = json.loads(data.decode("utf-8"))
+    if not isinstance(status, dict):
+        raise ValueError
+except (OSError, UnicodeError, ValueError):
+    status = {"schema_version": 1}
+status.update(
+    {
+        "schema_version": 1,
+        "status": final_status,
+        "exit_code": int(exit_code) if exit_code else None,
+        "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "timed_out": False,
+        "cancelled": final_status == "cancelled",
+    }
+)
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(status, handle, ensure_ascii=False, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+terminal_status() {
+    case "$1" in
+        completed|failed|timed_out|cancelled|lost) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+settled_status() {
+    case "$1" in
+        completed|failed|timed_out|cancelled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+status=""
+runner_pid=""
+pgid=""
+pid_start_ticks=""
+command_pid=""
+command_pgid=""
+command_sid=""
+command_pid_start_ticks=""
+for _ in {1..60}; do
+    mapfile -t status_fields < <(read_status)
+    status="${status_fields[0]:-unknown}"
+    runner_pid="${status_fields[1]:-}"
+    pgid="${status_fields[2]:-}"
+    pid_start_ticks="${status_fields[3]:-}"
+    command_pid="${status_fields[4]:-}"
+    command_pgid="${status_fields[5]:-}"
+    command_sid="${status_fields[6]:-}"
+    command_pid_start_ticks="${status_fields[7]:-}"
+    if [[ "$status" == "invalid" ]] ||
+       terminal_status "$status" ||
+       [[ -n "$runner_pid" && -n "$pid_start_ticks" &&
+          -n "$command_pid" && -n "$command_pid_start_ticks" ]]; then
+        break
+    fi
+    if [[ "$runner_pid" =~ ^[0-9]+$ && "$pid_start_ticks" =~ ^[0-9]+$ ]] &&
+       ! process_matches "$runner_pid" "$pid_start_ticks"; then
+        break
+    fi
+    sleep 0.05
+done
+
+if settled_status "$status"; then
+    emit_result "already_terminal"
+    exit 0
+fi
+
+# New jobs record a distinct command session. Verify all duplicated identity
+# fields before using it, then signal every member of that session.
+has_command_identity=0
+if [[ "$command_pid" =~ ^[0-9]+$ &&
+      "$command_pgid" == "$command_pid" &&
+      "$command_sid" == "$command_pid" &&
+      "$command_pid_start_ticks" =~ ^[0-9]+$ ]]; then
+    has_command_identity=1
+fi
+
+runner_identity_valid=0
+runner_alive=0
+if [[ "$runner_pid" =~ ^[0-9]+$ && "$pgid" == "$runner_pid" &&
+      "$pid_start_ticks" =~ ^[0-9]+$ ]]; then
+    runner_identity_valid=1
+    if process_matches "$runner_pid" "$pid_start_ticks"; then
+        runner_alive=1
+    fi
+fi
+
+if ((runner_alive == 0)); then
+    mapfile -t status_fields < <(read_status)
+    status="${status_fields[0]:-unknown}"
+    if settled_status "$status"; then
+        emit_result "already_finished"
+        exit 0
+    fi
+    if ((has_command_identity == 0)); then
+        write_final_status "cancelled" "130"
+        if ((runner_identity_valid)); then
+            emit_result "process_already_gone"
+        else
+            emit_result "cancelled_before_start"
+        fi
+        exit 0
+    fi
+fi
+
+iterations=$((grace_seconds * 10))
+if ((has_command_identity)); then
+    if session_leader_matches "$command_pid" "$command_pid_start_ticks"; then
+        signal_session_members "$command_sid" "$command_pid_start_ticks" \
+            "SIGTERM" "0" || true
+    else
+        # A leaderless command session may outlive a failed supervisor.
+        # Recorded SID/start filtering prevents signaling an older process.
+        signal_session_members "$command_sid" "$command_pid_start_ticks" \
+            "SIGTERM" "1" || true
+    fi
+    for ((index = 0; index < iterations; index++)); do
+        if ! session_has_members "$command_sid" "$command_pid_start_ticks"; then
+            break
+        fi
+        sleep 0.1
+    done
+    if session_has_members "$command_sid" "$command_pid_start_ticks"; then
+        for _ in {1..40}; do
+            if ! session_has_members "$command_sid" "$command_pid_start_ticks"; then
+                break
+            fi
+            signal_session_members "$command_sid" "$command_pid_start_ticks" \
+                "SIGKILL" "1" || true
+            sleep 0.05
+        done
+    fi
+else
+    # Compatibility/recovery path for a job that never persisted a command
+    # identity: terminate the verified supervisor session, including any
+    # legacy timeout child process groups inside that session.
+    if ((runner_alive)); then
+        signal_session_members "$runner_pid" "$pid_start_ticks" \
+            "SIGTERM" "0" || true
+    fi
+fi
+
+# Let the supervisor reap the command leader and atomically persist cancelled.
+if ((runner_alive)); then
+    for _ in {1..40}; do
+        if ! process_matches "$runner_pid" "$pid_start_ticks"; then
+            break
+        fi
+        sleep 0.05
+    done
+    if process_matches "$runner_pid" "$pid_start_ticks"; then
+        signal_session_members "$runner_pid" "$pid_start_ticks" \
+            "SIGTERM" "0" || true
+        for _ in {1..20}; do
+            if ! process_matches "$runner_pid" "$pid_start_ticks"; then
+                break
+            fi
+            sleep 0.05
+        done
+    fi
+    if process_matches "$runner_pid" "$pid_start_ticks"; then
+        signal_session_members "$runner_pid" "$pid_start_ticks" \
+            "SIGKILL" "0" || true
+    fi
+fi
+
+mapfile -t status_fields < <(read_status)
+status="${status_fields[0]:-unknown}"
+if ! terminal_status "$status" ||
+   [[ "$status" == "failed" || "$status" == "lost" ]]; then
+    write_final_status "cancelled" "130"
+fi
+if ((runner_alive)); then
+    emit_result "cancel_requested"
+else
+    emit_result "orphaned_command_cancelled"
+fi

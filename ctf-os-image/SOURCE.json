@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "source_kind": "vendored_git_tree",
+  "original_gitlink_commit": "b3f90ce04064240cde3e3db6f2b6c5a35a69bba5",
+  "original_path": "ctf-os-image",
+  "remote": null,
+  "remote_verified": false,
+  "notes": [
+    "The root repository previously stored this tree as a mode 160000 gitlink.",
+    "No remote URL was configured in the checked-out nested repository, so no remote provenance is asserted.",
+    "The ordinary files in this directory are now the release source of truth."
+  ]
+}
