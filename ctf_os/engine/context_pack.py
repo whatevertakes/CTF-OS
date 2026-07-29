@@ -10,11 +10,12 @@ from typing import Any
 from ctf_os.adapters.base import CategoryAdapter
 from ctf_os.knowledge import MAX_CONTEXT_EXCERPT_CHARS, knowledge_context
 from ctf_os.models import (
+    ACTIVE_HYPOTHESIS_STATUSES,
     CandidateTier,
     ChallengeState,
+    Checkpoint,
     ExperimentKind,
     ExperimentStatus,
-    HypothesisStatus,
     Provenance,
     TargetStatus,
 )
@@ -65,6 +66,127 @@ def _candidate_groups(state: ChallengeState) -> tuple[list[Any], list[Any]]:
         if item.tier not in {CandidateTier.EXACT, CandidateTier.CONTEST}
     ]
     return high, generic
+
+
+def _checkpoint_context_record(
+    checkpoint: Checkpoint,
+    *,
+    state_path: Path,
+    maximum: int = 1280,
+) -> tuple[str, int]:
+    values = {
+        "id": checkpoint.id,
+        "active_goal_id": checkpoint.active_goal_id,
+        "active_hypothesis_ids": checkpoint.open_hypothesis_ids,
+        "frontier_statuses": sorted(
+            item.value for item in ACTIVE_HYPOTHESIS_STATUSES
+        ),
+        "observation_fact_ids": checkpoint.observation_fact_ids,
+        "next_actions": checkpoint.next_actions,
+        "do_not_repeat": checkpoint.do_not_repeat,
+        "artifact_ids": checkpoint.artifact_ids,
+        "receipt_ids": checkpoint.receipt_ids,
+        "note": _bounded(checkpoint.note or ""),
+    }
+    complete = _record("latest_checkpoint", trust="evidence", **values)
+    if len(complete) <= maximum:
+        return complete, 0
+
+    omitted = 0
+
+    def compact(
+        items: list[str],
+        *,
+        maximum_items: int,
+        maximum_chars: int,
+    ) -> list[str]:
+        nonlocal omitted
+        result: list[str] = []
+        for item in items[:maximum_items]:
+            bounded = _bounded(item, maximum_chars)
+            result.append(bounded)
+            if bounded != item:
+                omitted += 1
+        omitted += max(0, len(items) - maximum_items)
+        return result
+
+    note = checkpoint.note or ""
+    bounded_note = _bounded(note, 160)
+    if bounded_note != note:
+        omitted += 1
+    counts = {
+        "active_hypotheses": len(checkpoint.open_hypothesis_ids),
+        "observation_facts": len(checkpoint.observation_fact_ids),
+        "next_actions": len(checkpoint.next_actions),
+        "do_not_repeat": len(checkpoint.do_not_repeat),
+        "artifacts": len(checkpoint.artifact_ids),
+        "receipts": len(checkpoint.receipt_ids),
+    }
+    compact_values = {
+        "id": _bounded(checkpoint.id, 128),
+        "active_goal_id": (
+            _bounded(checkpoint.active_goal_id, 128)
+            if checkpoint.active_goal_id is not None
+            else None
+        ),
+        "active_hypothesis_ids": compact(
+            checkpoint.open_hypothesis_ids,
+            maximum_items=4,
+            maximum_chars=48,
+        ),
+        "frontier_statuses": values["frontier_statuses"],
+        "observation_fact_ids": compact(
+            checkpoint.observation_fact_ids,
+            maximum_items=1,
+            maximum_chars=48,
+        ),
+        "next_actions": compact(
+            checkpoint.next_actions,
+            maximum_items=1,
+            maximum_chars=80,
+        ),
+        "do_not_repeat": compact(
+            checkpoint.do_not_repeat,
+            maximum_items=1,
+            maximum_chars=80,
+        ),
+        "artifact_ids": compact(
+            checkpoint.artifact_ids,
+            maximum_items=1,
+            maximum_chars=48,
+        ),
+        "receipt_ids": compact(
+            checkpoint.receipt_ids,
+            maximum_items=1,
+            maximum_chars=48,
+        ),
+        "note": bounded_note,
+        "field_counts": counts,
+        "complete": False,
+        "canonical_pointer": _bounded(state_path, 256),
+    }
+    bounded = _record(
+        "latest_checkpoint",
+        trust="evidence",
+        **compact_values,
+    )
+    if len(bounded) <= maximum:
+        return bounded, max(1, omitted)
+
+    minimal = _record(
+        "latest_checkpoint",
+        trust="evidence",
+        id=compact_values["id"],
+        active_goal_id=compact_values["active_goal_id"],
+        active_hypothesis_ids=compact_values["active_hypothesis_ids"],
+        frontier_statuses=compact_values["frontier_statuses"],
+        next_actions=compact_values["next_actions"],
+        do_not_repeat=compact_values["do_not_repeat"],
+        field_counts=counts,
+        complete=False,
+        canonical_pointer=compact_values["canonical_pointer"],
+    )
+    return minimal, max(1, omitted)
 
 
 def build_context_pack(
@@ -182,15 +304,15 @@ def build_context_pack(
             )
         )
 
-    open_hypotheses = [
+    active_hypotheses = [
         item
         for item in state.hypotheses
-        if item.status is HypothesisStatus.OPEN
+        if item.status in ACTIVE_HYPOTHESIS_STATUSES
     ]
     resolved_hypotheses = [
         item
         for item in state.hypotheses
-        if item.status is not HypothesisStatus.OPEN
+        if item.status not in ACTIVE_HYPOTHESIS_STATUSES
     ]
     pending = [
         item
@@ -203,24 +325,33 @@ def build_context_pack(
         }
     ]
     latest_checkpoint = state.checkpoints[-1] if state.checkpoints else None
+    if latest_checkpoint is not None:
+        checkpoint_record, checkpoint_omitted = _checkpoint_context_record(
+            latest_checkpoint,
+            state_path=state_path,
+        )
+        mandatory.append(checkpoint_record)
+        if checkpoint_omitted:
+            early_omitted["latest_checkpoint_fields"] = checkpoint_omitted
     critical_groups = [
         _Group(
             "operator_context",
             tuple(operator_records),
         ),
         _Group(
-            "open_hypotheses",
+            "active_hypotheses",
             tuple(
                 _record(
-                    "open_hypothesis",
+                    "active_hypothesis",
                     trust="evidence",
                     id=item.id,
+                    status=item.status.value,
                     statement=_bounded(item.statement),
                     falsifier=_bounded(item.falsifier.description),
                     evidence_fact_ids=item.evidence_fact_ids,
                     evidence_receipt_ids=item.evidence_receipt_ids,
                 )
-                for item in open_hypotheses
+                for item in active_hypotheses
             ),
         ),
         _Group(
@@ -242,26 +373,6 @@ def build_context_pack(
                 )
                 for item in reversed(pending)
             ),
-        ),
-        _Group(
-            "checkpoints",
-            (
-                _record(
-                    "latest_checkpoint",
-                    trust="evidence",
-                    id=latest_checkpoint.id,
-                    active_goal_id=latest_checkpoint.active_goal_id,
-                    open_hypothesis_ids=latest_checkpoint.open_hypothesis_ids,
-                    observation_fact_ids=latest_checkpoint.observation_fact_ids,
-                    next_actions=latest_checkpoint.next_actions,
-                    do_not_repeat=latest_checkpoint.do_not_repeat,
-                    artifact_ids=latest_checkpoint.artifact_ids,
-                    receipt_ids=latest_checkpoint.receipt_ids,
-                    note=_bounded(latest_checkpoint.note or ""),
-                ),
-            )
-            if latest_checkpoint is not None
-            else (),
         ),
         _Group(
             "proof",
@@ -316,7 +427,7 @@ def build_context_pack(
             (
                 state.prompt,
                 active_goal.description if active_goal is not None else "",
-                *(item.statement for item in open_hypotheses),
+                *(item.statement for item in active_hypotheses),
             )
         ),
     )

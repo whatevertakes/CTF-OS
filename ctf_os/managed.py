@@ -27,6 +27,7 @@ from ctf_os.engine.challenge import (
     SessionAlreadyRunning,
 )
 from ctf_os.models import (
+    ACTIVE_HYPOTHESIS_STATUSES,
     BudgetMode,
     ChallengeIdentity,
     ChallengeState,
@@ -36,7 +37,6 @@ from ctf_os.models import (
     ExperimentKind,
     ExperimentStatus,
     FactKind,
-    HypothesisStatus,
     ManagedCycle,
     ManagedWave,
     RunOrigin,
@@ -431,6 +431,34 @@ class ManagedOrchestrator:
             item for item in committed.cycles if item.id == cycle_id
         )
 
+    def _rebase_created_run(
+        self,
+        identity: ChallengeIdentity,
+        session_id: str,
+        run_id: str,
+    ) -> ChallengeState:
+        """Move an undispatched reservation to the latest durable snapshot."""
+
+        current = self.engine.store.load(identity)
+
+        def apply(state: ChallengeState) -> None:
+            self._require_epoch(state, session_id)
+            run = next(
+                (item for item in state.runs if item.id == run_id),
+                None,
+            )
+            if run is None or run.status is not RunStatus.CREATED:
+                raise ManagedError(
+                    f"managed run is not an undispatched reservation: {run_id}"
+                )
+            run.base_revision = state.revision + 1
+
+        return self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+
     def _reserve_wave(
         self,
         identity: ChallengeIdentity,
@@ -554,10 +582,20 @@ class ManagedOrchestrator:
         state: ChallengeState,
         wave: ManagedWave,
     ) -> tuple[str, ...]:
+        cycle = next(
+            (
+                item
+                for item in state.cycles
+                if item.id == wave.cycle_id
+            ),
+            None,
+        )
         role_order = {
-            run_id: index
+            run_id: index + 1
             for index, run_id in enumerate(wave.role_run_ids.values())
         }
+        if cycle is not None:
+            role_order[cycle.captain_run_id] = 0
         candidates = [
             item
             for item in state.experiments
@@ -567,7 +605,7 @@ class ManagedOrchestrator:
         open_hypotheses = {
             item.id
             for item in state.hypotheses
-            if item.status is HypothesisStatus.OPEN
+            if item.status in ACTIVE_HYPOTHESIS_STATUSES
         }
         strategic = [
             item
@@ -588,7 +626,6 @@ class ManagedOrchestrator:
                     item.id,
                 )
             )
-            return (strategic[0].id,)
         probes = [
             item
             for item in candidates
@@ -601,7 +638,30 @@ class ManagedOrchestrator:
                 item.id,
             )
         )
-        return tuple(item.id for item in probes[:3])
+        selected: list[str] = []
+        approaches: set[tuple[str, str]] = set()
+        for item in (*strategic, *probes):
+            approach = (item.source_run_id or "", item.command)
+            if approach in approaches:
+                continue
+            selected.append(item.id)
+            approaches.add(approach)
+            if len(selected) == 3:
+                break
+        return tuple(selected)
+
+    @staticmethod
+    def _initial_cartography_actions(
+        state: ChallengeState,
+        *,
+        maximum: int = 3,
+    ) -> tuple[str, ...]:
+        return tuple(
+            item.id
+            for item in state.experiments
+            if item.status is ExperimentStatus.REGISTERED
+            and item.extra.get("adapter_seed") is True
+        )[:maximum]
 
     def _mark_action_selection(
         self,
@@ -609,15 +669,27 @@ class ManagedOrchestrator:
         session_id: str,
         cycle_id: str,
         selected: Sequence[str],
+        *,
+        append: bool = False,
     ) -> ChallengeState:
         current = self.engine.store.load(identity)
 
         def apply(state: ChallengeState) -> None:
             self._require_epoch(state, session_id)
             cycle = next(item for item in state.cycles if item.id == cycle_id)
-            cycle.selected_action_ids = list(selected)
+            cycle.selected_action_ids = (
+                list(
+                    dict.fromkeys(
+                        (*cycle.selected_action_ids, *selected)
+                    )
+                )
+                if append
+                else list(selected)
+            )
             cycle.phase = (
-                "action_selected" if selected else "no_action_selected"
+                "action_selected"
+                if cycle.selected_action_ids
+                else "no_action_selected"
             )
 
         return self.engine.store.update(
@@ -737,7 +809,7 @@ class ManagedOrchestrator:
             open_hypothesis_ids=[
                 item.id
                 for item in current.hypotheses
-                if item.status is HypothesisStatus.OPEN
+                if item.status in ACTIVE_HYPOTHESIS_STATUSES
             ],
             observation_fact_ids=observation_ids,
             next_actions=next_actions,
@@ -814,7 +886,12 @@ class ManagedOrchestrator:
             experiment = experiments[experiment_id]
             role = run_roles.get(
                 experiment.source_run_id or "",
-                experiment.source_run_id or "unknown",
+                experiment.source_run_id
+                or (
+                    f"adapter:{experiment.id}"
+                    if experiment.extra.get("adapter_seed") is True
+                    else "unknown"
+                ),
             )
             lanes.setdefault(str(role), []).append(experiment_id)
 
@@ -1124,6 +1201,92 @@ class ManagedOrchestrator:
             expected_revision=current.revision,
         )
 
+    def _checkpoint_invalid_cycle(
+        self,
+        identity: ChallengeIdentity,
+        session_id: str,
+        cycle_id: str,
+        *,
+        reason: str,
+        note: str | None,
+    ) -> ChallengeState:
+        """Preserve a failed model attempt and let the next cycle repair it."""
+
+        current = self.engine.store.load(identity)
+        cycle_runs = [
+            run
+            for run in current.runs
+            if run.session_id == session_id and run.cycle_id == cycle_id
+        ]
+        diagnostics: list[dict[str, object]] = []
+        for run in cycle_runs:
+            if (
+                run.status is RunStatus.COMPLETED
+                and not run.extra.get("contract_errors")
+                and not run.extra.get("normalization_error")
+            ):
+                continue
+            diagnostics.append(
+                {
+                    "run_id": run.id,
+                    "role": run.role,
+                    "status": run.status.value,
+                    "contract_errors": run.extra.get("contract_errors", []),
+                    "normalization_error": run.extra.get(
+                        "normalization_error"
+                    ),
+                    "failures": run.extra.get("failures", []),
+                    "validation_path": run.validation_path,
+                }
+            )
+        diagnostic_text = json.dumps(
+            {
+                "managed_cycle_repair": reason,
+                "runs": diagnostics,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        checkpoint_note = "\n".join(
+            part
+            for part in (
+                note.strip() if note and note.strip() else None,
+                diagnostic_text[:4096],
+            )
+            if part
+        )
+        self._mark_action_selection(
+            identity,
+            session_id,
+            cycle_id,
+            (),
+        )
+        state = self._checkpoint(
+            identity,
+            session_id,
+            cycle_id,
+            note=checkpoint_note,
+        )
+        if state.status in _STOP_STATUSES:
+            target = (
+                state.status
+                if state.status
+                in {
+                    ChallengeStatus.PAUSED,
+                    ChallengeStatus.NEEDS_HUMAN,
+                }
+                else None
+            )
+            return self._finish_session(
+                identity,
+                session_id,
+                status=SessionStatus.PAUSED,
+                reason=reason,
+                challenge_target=target,
+            )
+        return state
+
     def _run_cycle_owned(
         self,
         identity: ChallengeIdentity,
@@ -1137,7 +1300,31 @@ class ManagedOrchestrator:
         self.require_preflight(identity, session_id=session_id)
         state, selected_session = self._reserve_session(identity, session_id)
         try:
-            state, cycle = self._reserve_cycle(identity, selected_session)
+            state, cycle = self._reserve_cycle(
+                identity,
+                selected_session,
+            )
+            cartography_actions = self._initial_cartography_actions(state)
+            if cartography_actions:
+                self._mark_action_selection(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    cartography_actions,
+                )
+                self.require_preflight(
+                    identity,
+                    session_id=selected_session,
+                )
+                self._execute_selected_actions(
+                    identity,
+                    cartography_actions,
+                )
+                self._rebase_created_run(
+                    identity,
+                    selected_session,
+                    cycle.captain_run_id,
+                )
             self.require_preflight(
                 identity,
                 session_id=selected_session,
@@ -1157,7 +1344,13 @@ class ManagedOrchestrator:
                 _managed_workspace=True,
             )
             if not captain.completed or not captain.validation.valid:
-                raise ManagedError("Captain result was not contract-valid")
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason="Captain result was not contract-valid",
+                    note=note,
+                )
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
             if latest.status in _STOP_STATUSES:
@@ -1211,8 +1404,15 @@ class ManagedOrchestrator:
                     for status in run_statuses.values()
                 )
             ):
-                raise ManagedError(
-                    "analysis wave was invalid; provisional results were preserved"
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason=(
+                        "analysis wave was invalid; provisional results were "
+                        "preserved"
+                    ),
+                    note=note,
                 )
             self._apply_builder_publishes(identity, outcome.results)
             latest = self.engine.store.load(identity)
@@ -1223,6 +1423,7 @@ class ManagedOrchestrator:
                 selected_session,
                 cycle.id,
                 selected,
+                append=True,
             )
             if selected:
                 self.require_preflight(

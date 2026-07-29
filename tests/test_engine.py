@@ -4,6 +4,7 @@ import hashlib
 import io
 import inspect
 import json
+import struct
 import sys
 import tempfile
 import threading
@@ -186,6 +187,40 @@ def _payload(role: Role, *, flag: str | None = None) -> dict[str, object]:
         "goal_update": None,
         "refusal": None,
     }
+
+
+def _elf64_image(
+    elf_type: int,
+    *,
+    program_types: tuple[int, ...] = (),
+) -> bytes:
+    identity = bytearray(16)
+    identity[:4] = b"\x7fELF"
+    identity[4] = 2
+    identity[5] = 1
+    identity[6] = 1
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        bytes(identity),
+        elf_type,
+        62,
+        1,
+        0,
+        64,
+        0,
+        0,
+        64,
+        56,
+        len(program_types),
+        0,
+        0,
+        0,
+    )
+    program_headers = b"".join(
+        struct.pack("<IIQQQQQQ", program_type, 0, 0, 0, 0, 0, 0, 0)
+        for program_type in program_types
+    )
+    return header + program_headers
 
 
 class RoleExecutor:
@@ -500,6 +535,80 @@ class EngineTests(unittest.TestCase):
             selected.status,
             ExperimentStatus.AWAITING_EVALUATION,
         )
+
+    def test_adapter_seed_prefers_elf_executable_over_libc_and_archive(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        for category in ("pwn", "rev"):
+            with self.subTest(category=category):
+                identity = ChallengeIdentity(
+                    "selector contest",
+                    category,
+                    "primary executable",
+                )
+                input_dir = engine.challenge_input(identity)
+                input_dir.mkdir(parents=True)
+                (input_dir / "00-bundle.zip").write_bytes(b"PK\x03\x04")
+                library = input_dir / "01-libc.so.6"
+                library.write_bytes(
+                    _elf64_image(3, program_types=(1,))
+                )
+                library.chmod(0o755)
+                challenge = input_dir / "zz-challenge"
+                challenge.write_bytes(
+                    _elf64_image(3, program_types=(3,))
+                )
+                # Selection is based on the ELF structure, not an executable
+                # mode bit that shared libraries commonly also carry.
+                challenge.chmod(0o644)
+
+                state = engine.add_challenge(identity, prompt="solve")
+
+                self.assertEqual(
+                    state.metadata["adapter_primary_source"],
+                    "zz-challenge",
+                )
+                seeded = [
+                    experiment
+                    for experiment in state.experiments
+                    if experiment.extra.get("adapter_seed")
+                ]
+                self.assertTrue(seeded)
+                self.assertTrue(
+                    all(
+                        "/challenge/zz-challenge" in experiment.command
+                        for experiment in seeded
+                    )
+                )
+
+    def test_crypto_adapter_seed_prefers_solver_source_deterministically(
+        self,
+    ) -> None:
+        identity = ChallengeIdentity(
+            "selector contest",
+            "crypto",
+            "primary source",
+        )
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "00-output.txt").write_text("ciphertext")
+        (input_dir / "zz-task.py").write_text("N = 17\n")
+
+        state = engine.add_challenge(identity, prompt="solve")
+
+        self.assertEqual(
+            state.metadata["adapter_primary_source"],
+            "zz-task.py",
+        )
+        seeded = [
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed")
+        ]
+        self.assertEqual(len(seeded), 1)
+        self.assertIn("/challenge/zz-task.py", seeded[0].command)
 
     def test_engine_budget_sets_deadline_and_clamps_tool_timeout(
         self,

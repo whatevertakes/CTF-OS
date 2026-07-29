@@ -8,6 +8,7 @@ from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.models import (
     ArtifactReference,
     ChallengeState,
+    Checkpoint,
     Fact,
     Falsifier,
     Goal,
@@ -124,6 +125,60 @@ class ContextPackTests(unittest.TestCase):
         )
         self.assertIn('"kind":"resolved_hypothesis"', pack.text)
         self.assertIn("comparison is direct", pack.text)
+
+    def test_supported_hypothesis_remains_on_active_frontier(self) -> None:
+        state = self.state()
+        state.hypotheses[0].status = HypothesisStatus.SUPPORTED
+        state.hypotheses[0].evidence_fact_ids.append("F-1")
+        state.facts[0].supports.append("H-1")
+        state.validate()
+
+        pack = build_context_pack(
+            state,
+            get_adapter("rev"),
+            state_path=Path("/state/state.json"),
+        )
+
+        self.assertIn('"kind":"active_hypothesis"', pack.text)
+        self.assertIn('"status":"supported"', pack.text)
+        self.assertNotIn('"kind":"resolved_hypothesis"', pack.text)
+
+    def test_latest_checkpoint_is_mandatory_under_context_pressure(self) -> None:
+        state = self.state()
+        state.prompt = "operator pressure " * 2_000
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-latest",
+                session_id=None,
+                cycle_id=None,
+                active_goal_id="G-1",
+                open_hypothesis_ids=["H-1"],
+                next_actions=[
+                    "run the cheapest discriminator",
+                    *(["x" * 2_000] * 20),
+                ],
+                do_not_repeat=[
+                    "avoid the stale brute-force path",
+                    *(["y" * 2_000] * 20),
+                ],
+                note="resume from this exact checkpoint",
+            )
+        )
+        state.validate()
+
+        pack = build_context_pack(
+            state,
+            get_adapter("rev"),
+            state_path=Path("/state/state.json"),
+            max_chars=4096,
+        )
+
+        self.assertLessEqual(len(pack.text), 4096)
+        self.assertIn('"kind":"latest_checkpoint"', pack.text)
+        self.assertIn('"active_hypothesis_ids":["H-1"]', pack.text)
+        self.assertIn("resume from this exact checkpoint", pack.text)
+        self.assertIn("operator_context", pack.omitted)
+        self.assertIn("latest_checkpoint_fields", pack.omitted)
 
     def test_long_operator_prompt_has_explicit_pointer_and_truncation(self) -> None:
         state = self.state()

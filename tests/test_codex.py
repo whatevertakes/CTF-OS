@@ -333,13 +333,25 @@ class ContractTests(unittest.TestCase):
         )
         self.assertIn(
             "network_target_generation",
-            v2_schema["properties"]["actions"]["items"]["required"],
+            v2_schema["properties"]["actions"]["items"]["anyOf"][0][
+                "required"
+            ],
+        )
+        action_variants = {
+            item["properties"]["kind"]["enum"][0]: item
+            for item in v2_schema["properties"]["actions"]["items"]["anyOf"]
+        }
+        self.assertEqual(
+            action_variants["command"]["properties"]["command"],
+            {"type": "string", "minLength": 1},
+        )
+        self.assertEqual(
+            action_variants["command"]["properties"]["artifact_path"],
+            {"type": "null"},
         )
         self.assertNotIn(
             "uniqueItems",
-            v2_schema["properties"]["actions"]["items"]["properties"][
-                "hypothesis_ids"
-            ],
+            action_variants["command"]["properties"]["hypothesis_ids"],
         )
 
         payload["actions"][0]["network_target_generation"] = None

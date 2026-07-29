@@ -306,6 +306,38 @@ def role_output_schema(
                 "network_target_generation",
             )
         )
+        action_variants: list[dict[str, Any]] = []
+        for action_kind in action_kinds:
+            variant_properties = dict(action_properties)
+            variant_properties["kind"] = {"enum": [action_kind]}
+            variant_properties["command"] = (
+                {"type": "string", "minLength": 1}
+                if action_kind == "command"
+                else {"type": "null"}
+            )
+            variant_properties["artifact_path"] = (
+                {"type": "string", "minLength": 1}
+                if action_kind == "write_artifact"
+                else {"type": "null"}
+            )
+            action_variants.append(
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": action_required,
+                    "properties": variant_properties,
+                }
+            )
+        action_items_schema: dict[str, Any] = {
+            "anyOf": action_variants,
+        }
+    else:
+        action_items_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": action_required,
+            "properties": action_properties,
+        }
     return {
         "title": f"CTF-OS {role.value} result",
         "type": "object",
@@ -465,12 +497,7 @@ def role_output_schema(
             },
             "actions": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": action_required,
-                    "properties": action_properties,
-                },
+                "items": action_items_schema,
             },
             "artifacts": {
                 "type": "array",

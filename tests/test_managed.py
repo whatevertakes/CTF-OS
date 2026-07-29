@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import threading
@@ -69,9 +70,11 @@ class ProbeRoleExecutor:
         self,
         *,
         invalid_role: Role | None = None,
+        source_reference_role: Role | None = None,
         network_target: tuple[str, int] | None = None,
     ) -> None:
         self.invalid_role = invalid_role
+        self.source_reference_role = source_reference_role
         self.network_target = network_target
         self.lock = threading.Lock()
         self.active = 0
@@ -142,6 +145,15 @@ class ProbeRoleExecutor:
                         "path": "missing.bin",
                         "sha256": None,
                         "purpose": "force normalization failure",
+                    }
+                ]
+            if role is self.source_reference_role:
+                content = b"\x7fELFmanaged"
+                payload["artifacts"] = [
+                    {
+                        "path": "challenge.bin",
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "purpose": "canonical source reference",
                     }
                 ]
             time.sleep(0.01)
@@ -312,8 +324,10 @@ class ManagedV2Tests(unittest.TestCase):
             for run in state.runs
             if run.origin is RunOrigin.MANAGED_TOOL
         ]
-        self.assertEqual(len(tool_runs), 3)
-        self.assertEqual(len(state.receipts), 3)
+        # Three deterministic cartography seeds run before the model wave,
+        # then three independently sourced model actions are executed.
+        self.assertEqual(len(tool_runs), 6)
+        self.assertEqual(len(state.receipts), 6)
         self.assertTrue(
             all(receipt.stdout_artifact_id for receipt in state.receipts)
         )
@@ -354,16 +368,21 @@ class ManagedV2Tests(unittest.TestCase):
             engine,
             capability_probe=self.capability,
         )
-        with self.assertRaisesRegex(
-            ManagedError,
-            "analysis wave was invalid",
-        ):
-            orchestrator.run_cycle(self.identity)
+        state = orchestrator.run_cycle(self.identity)
 
-        state = engine.store.load(self.identity)
-        self.assertEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
-        self.assertIsNone(state.active_managed_session_id)
+        self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+        self.assertIsNotNone(state.active_managed_session_id)
+        self.assertEqual(len(state.checkpoints), 1)
+        self.assertIn(
+            "analysis wave was invalid",
+            state.checkpoints[-1].note,
+        )
+        self.assertIn(
+            "cannot snapshot reported artifact",
+            state.checkpoints[-1].note,
+        )
         wave = state.waves[0]
+        self.assertEqual(wave.status, "invalid")
         wave_run_ids = set(wave.role_run_ids.values())
         self.assertEqual(
             len([run for run in state.runs if run.id in wave_run_ids]),
@@ -397,6 +416,45 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertIn(
             "KCTF{provisional_wave}",
             {candidate.value for candidate in state.candidates},
+        )
+
+    def test_managed_source_artifact_reference_does_not_invalidate_wave(
+        self,
+    ):
+        executor = ProbeRoleExecutor(source_reference_role=Role.FALSIFIER)
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        falsifier = next(
+            run
+            for run in state.runs
+            if run.role == Role.FALSIFIER.value
+        )
+        self.assertEqual(falsifier.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            falsifier.extra["source_references"],
+            [
+                {
+                    "path": "challenge.bin",
+                    "sha256": hashlib.sha256(
+                        b"\x7fELFmanaged"
+                    ).hexdigest(),
+                    "size": len(b"\x7fELFmanaged"),
+                    "purpose": "canonical source reference",
+                    "kind": "immutable_challenge_input",
+                }
+            ],
+        )
+        self.assertFalse(
+            any(
+                artifact.source_run_id == falsifier.id
+                for artifact in state.artifacts
+            )
         )
 
     def test_reconciler_recovers_two_terminal_and_one_durable_created_run(
@@ -682,11 +740,25 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
         self.assertEqual(
+            {
+                item.status for item in managed_remote
+            },
+            {
+                ExperimentStatus.AWAITING_EVALUATION,
+                ExperimentStatus.COMPLETED,
+                ExperimentStatus.REGISTERED,
+            },
+        )
+        self.assertEqual(
             len(
                 [
                     item
                     for item in managed_remote
-                    if item.status is ExperimentStatus.COMPLETED
+                    if item.status
+                    in {
+                        ExperimentStatus.AWAITING_EVALUATION,
+                        ExperimentStatus.COMPLETED,
+                    }
                 ]
             ),
             3,

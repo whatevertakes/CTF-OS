@@ -84,6 +84,14 @@ class HypothesisStatus(StringEnum):
     CONFIRMED = "confirmed"
 
 
+ACTIVE_HYPOTHESIS_STATUSES = frozenset(
+    {
+        HypothesisStatus.OPEN,
+        HypothesisStatus.SUPPORTED,
+    }
+)
+
+
 class ExperimentStatus(StringEnum):
     REGISTERED = "registered"
     RUNNING = "running"
@@ -3504,6 +3512,7 @@ def new_challenge_state(
 
 
 __all__ = [
+    "ACTIVE_HYPOTHESIS_STATUSES",
     "ArtifactReference",
     "Budget",
     "BudgetMode",

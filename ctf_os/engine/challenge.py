@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shlex
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -52,6 +54,7 @@ from ctf_os.codex.limiter import ModelCallLimitCancelled
 from ctf_os.config import EngineConfig, load_config
 from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceLimits, tool_profile
+from ctf_os.engine.context_archive import archive_context_pack
 from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.engine.flags import (
     FLAG_PATTERNS_ENV,
@@ -146,6 +149,7 @@ from ctf_os.sandbox.files import (
     SafeFileError,
     copy_bounded_regular,
     ensure_private_directory,
+    normalize_locator,
 )
 from ctf_os.stages.ingest import inventory_challenge
 from ctf_os.store import (
@@ -236,6 +240,446 @@ _AUTOMATED_LOOP_STOP_STATUSES = frozenset(
         *_MODEL_WORK_BLOCKED_STATUSES,
     }
 )
+
+_PRIMARY_ARCHIVE_SUFFIXES = (
+    ".7z",
+    ".apk",
+    ".bz2",
+    ".deb",
+    ".gz",
+    ".jar",
+    ".rar",
+    ".rpm",
+    ".tar",
+    ".tgz",
+    ".txz",
+    ".xz",
+    ".zip",
+)
+_PRIMARY_DOCUMENT_SUFFIXES = (
+    ".md",
+    ".pdf",
+    ".rst",
+)
+_PRIMARY_SOURCE_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cpp",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".php",
+    ".pl",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sage",
+    ".sh",
+    ".ts",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PrimarySourceProbe:
+    """A bounded, non-executing classification of one immutable input."""
+
+    source: SourceFile
+    inspected: bool = False
+    format: str = "unknown"
+    executable_mode: bool = False
+    elf_executable: bool = False
+    elf_shared_object: bool = False
+
+
+def _elf_has_interpreter(
+    descriptor: int,
+    size: int,
+    header: bytes,
+) -> bool:
+    """Return whether a bounded, structurally valid ELF has ``PT_INTERP``."""
+
+    if len(header) < 58 or header[4] not in {1, 2} or header[5] not in {1, 2}:
+        return False
+    byte_order = "<" if header[5] == 1 else ">"
+    if header[4] == 1:
+        if len(header) < 46:
+            return False
+        program_offset = struct.unpack_from(f"{byte_order}I", header, 28)[0]
+        entry_size = struct.unpack_from(f"{byte_order}H", header, 42)[0]
+        entry_count = struct.unpack_from(f"{byte_order}H", header, 44)[0]
+    else:
+        program_offset = struct.unpack_from(f"{byte_order}Q", header, 32)[0]
+        entry_size = struct.unpack_from(f"{byte_order}H", header, 54)[0]
+        entry_count = struct.unpack_from(f"{byte_order}H", header, 56)[0]
+    table_size = entry_size * entry_count
+    if (
+        entry_size < 4
+        or entry_count == 0
+        or entry_count > 4096
+        or table_size > 1024 * 1024
+        or program_offset > size
+        or table_size > size - program_offset
+    ):
+        return False
+    table = os.pread(descriptor, table_size, program_offset)
+    if len(table) != table_size:
+        return False
+    return any(
+        struct.unpack_from(f"{byte_order}I", table, index * entry_size)[0] == 3
+        for index in range(entry_count)
+    )
+
+
+def _classify_primary_source(
+    source_root: Path,
+    source: SourceFile,
+) -> _PrimarySourceProbe:
+    """Safely inspect input bytes without following links or running them."""
+
+    try:
+        normalized = normalize_locator(source.path)
+    except SafeFileError:
+        return _PrimarySourceProbe(source)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor: int | None = None
+    file_descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(source_root, directory_flags)
+        parts = normalized.split("/")
+        for component in parts[:-1]:
+            next_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        file_descriptor = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        before = os.fstat(file_descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != source.size:
+            return _PrimarySourceProbe(source)
+        header = os.pread(file_descriptor, min(before.st_size, 64), 0)
+        detected_format = "unknown"
+        elf_executable = False
+        elf_shared_object = False
+        if header.startswith(b"\x7fELF") and len(header) >= 18:
+            detected_format = "elf"
+            byte_order = (
+                "<" if header[5:6] == b"\x01" else ">"
+                if header[5:6] == b"\x02"
+                else None
+            )
+            if byte_order is not None:
+                elf_type = struct.unpack_from(f"{byte_order}H", header, 16)[0]
+                has_interpreter = (
+                    elf_type == 3
+                    and _elf_has_interpreter(
+                        file_descriptor,
+                        before.st_size,
+                        header,
+                    )
+                )
+                elf_executable = elf_type == 2 or has_interpreter
+                elf_shared_object = elf_type == 3 and not has_interpreter
+        elif header.startswith(b"MZ") and len(header) >= 64:
+            pe_offset = struct.unpack_from("<I", header, 60)[0]
+            if pe_offset <= before.st_size - 24 and pe_offset <= 16 * 1024**2:
+                pe_header = os.pread(file_descriptor, 24, pe_offset)
+                if len(pe_header) == 24 and pe_header.startswith(b"PE\0\0"):
+                    characteristics = struct.unpack_from("<H", pe_header, 22)[0]
+                    detected_format = (
+                        "pe_executable"
+                        if characteristics & 0x0002
+                        and not characteristics & 0x2000
+                        else "pe_library"
+                    )
+        elif header[:4] in {
+            b"\x00asm",
+            b"dex\n",
+        }:
+            detected_format = (
+                "wasm" if header[:4] == b"\x00asm" else "dex"
+            )
+        elif header[:4] in {
+            b"\xca\xfe\xba\xbe",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+        }:
+            detected_format = "mach_o"
+        after = os.fstat(file_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            return _PrimarySourceProbe(source)
+        return _PrimarySourceProbe(
+            source=source,
+            inspected=True,
+            format=detected_format,
+            executable_mode=bool(before.st_mode & 0o111),
+            elf_executable=elf_executable,
+            elf_shared_object=elf_shared_object,
+        )
+    except (OSError, OverflowError, struct.error, ValueError):
+        return _PrimarySourceProbe(source)
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+
+
+def _source_role_flags(path: str) -> tuple[bool, bool, bool, bool]:
+    lowered = path.casefold()
+    basename = PurePosixPath(lowered).name
+    is_archive = any(
+        lowered.endswith(suffix) for suffix in _PRIMARY_ARCHIVE_SUFFIXES
+    )
+    is_document = (
+        any(lowered.endswith(suffix) for suffix in _PRIMARY_DOCUMENT_SUFFIXES)
+        or basename
+        in {
+            "license",
+            "license.txt",
+            "readme",
+            "readme.txt",
+        }
+    )
+    is_library = bool(
+        re.match(r"^lib[^/]*\.so(?:\.|$)", basename)
+        or re.match(r"^ld(?:-|\.|64)", basename)
+        or basename.endswith((".a", ".dll", ".dylib", ".o"))
+    )
+    has_primary_hint = any(
+        token in re.split(r"[^a-z0-9]+", basename)
+        for token in (
+            "app",
+            "binary",
+            "chall",
+            "challenge",
+            "check",
+            "checker",
+            "main",
+            "oracle",
+            "server",
+            "service",
+            "task",
+            "vuln",
+        )
+    )
+    return is_archive, is_document, is_library, has_primary_hint
+
+
+def _primary_source_score(category: str, probe: _PrimarySourceProbe) -> int:
+    """Assign category-aware priority; path ordering remains the tie-breaker."""
+
+    source = probe.source
+    lowered = source.path.casefold()
+    suffix = PurePosixPath(lowered).suffix
+    basename = PurePosixPath(lowered).name
+    is_archive, is_document, is_library, has_primary_hint = (
+        _source_role_flags(lowered)
+    )
+    nonempty = 1 if source.size else 0
+    if category in {"pwn", "reversing"}:
+        if probe.elf_executable:
+            score = 10_000
+        elif probe.format == "pe_executable":
+            score = 9_500
+        elif probe.format in {"mach_o", "wasm", "dex"}:
+            score = 8_500 if category == "reversing" else 6_000
+        elif probe.elf_shared_object:
+            score = (
+                8_800
+                if probe.executable_mode and not is_library
+                else 4_000
+            )
+        elif probe.executable_mode and not is_library and not is_archive:
+            score = 6_500
+        elif suffix in _PRIMARY_SOURCE_SUFFIXES:
+            score = 5_000
+        elif is_archive:
+            score = 3_500
+        else:
+            score = 2_500
+        if is_library:
+            score -= 1_500
+        if is_document:
+            score -= 2_000
+    elif category == "crypto":
+        if suffix == ".sage":
+            score = 9_500
+        elif suffix == ".py":
+            score = 9_000
+        elif suffix == ".ipynb":
+            score = 8_500
+        elif suffix in _PRIMARY_SOURCE_SUFFIXES:
+            score = 7_500
+        elif suffix in {".json", ".pem", ".pub", ".txt"}:
+            score = 5_500
+        elif is_archive:
+            score = 4_500
+        else:
+            score = 4_000
+        if any(token in basename for token in ("solution", "solve", "writeup")):
+            score -= 3_000
+        if is_document:
+            score -= 2_000
+    elif category == "web":
+        if suffix in {".js", ".php", ".py", ".rb", ".ts"}:
+            score = 8_000
+        elif basename in {
+            "composer.json",
+            "go.mod",
+            "package.json",
+            "pom.xml",
+            "requirements.txt",
+        }:
+            score = 7_500
+        elif suffix in _PRIMARY_SOURCE_SUFFIXES:
+            score = 7_000
+        elif suffix in {".html", ".sql", ".vue"}:
+            score = 6_500
+        elif is_archive:
+            score = 4_500
+        else:
+            score = 4_000
+        if is_document:
+            score -= 2_000
+    elif category == "forensics":
+        if suffix in {
+            ".dd",
+            ".dmp",
+            ".e01",
+            ".evtx",
+            ".img",
+            ".log",
+            ".mbox",
+            ".mem",
+            ".pcap",
+            ".pcapng",
+            ".raw",
+            ".vmdk",
+        }:
+            score = 9_000
+        elif suffix in {
+            ".avi",
+            ".bmp",
+            ".eml",
+            ".gif",
+            ".jpeg",
+            ".jpg",
+            ".mp3",
+            ".mp4",
+            ".png",
+            ".wav",
+        }:
+            score = 8_000
+        elif is_archive:
+            score = 7_000
+        else:
+            score = 4_000
+        if is_document:
+            score -= 1_500
+    else:
+        if probe.format in {
+            "dex",
+            "elf",
+            "mach_o",
+            "pe_executable",
+            "wasm",
+        }:
+            score = 8_000
+        elif suffix in {
+            ".avi",
+            ".bmp",
+            ".gif",
+            ".jpeg",
+            ".jpg",
+            ".mp3",
+            ".mp4",
+            ".png",
+            ".wav",
+        }:
+            score = 7_500
+        elif is_archive:
+            score = 7_000
+        elif suffix in _PRIMARY_SOURCE_SUFFIXES:
+            score = 6_500
+        else:
+            score = 5_000
+        if is_document:
+            score -= 2_000
+    if has_primary_hint:
+        score += 250
+    return score + nonempty
+
+
+def _select_adapter_primary_source(
+    category: str,
+    source_root: Path,
+    sources: Sequence[SourceFile],
+) -> SourceFile | None:
+    """Choose one deterministic adapter seed without executing challenge input."""
+
+    normalized_category = category.strip().casefold()
+    if normalized_category in {"binary", "binary-exploitation"}:
+        normalized_category = "pwn"
+    elif normalized_category in {"re", "rev", "reverse"}:
+        normalized_category = "reversing"
+    elif normalized_category in {"cryptography"}:
+        normalized_category = "crypto"
+    elif normalized_category in {"dfir", "forensic"}:
+        normalized_category = "forensics"
+    elif normalized_category == "web-security":
+        normalized_category = "web"
+    probes = [
+        (
+            _classify_primary_source(source_root, source)
+            if normalized_category in {"pwn", "reversing"}
+            else _PrimarySourceProbe(source)
+        )
+        for source in sources
+    ]
+    if normalized_category in {"pwn", "reversing"}:
+        probes = [probe for probe in probes if probe.inspected]
+    if not probes:
+        return None
+    selected = min(
+        probes,
+        key=lambda probe: (
+            -_primary_source_score(normalized_category, probe),
+            probe.source.path.casefold(),
+            probe.source.path,
+        ),
+    )
+    return selected.source
 
 
 def _run_id(prefix: str) -> str:
@@ -674,11 +1118,20 @@ class ChallengeEngine:
             existing_ids = {
                 experiment.id for experiment in current.experiments
             }
+            primary_source = _select_adapter_primary_source(
+                current.category,
+                self.challenge_input(current.identity),
+                current.source_inventory,
+            )
             primary = (
-                f"/challenge/{current.source_inventory[0].path}"
-                if current.source_inventory
+                f"/challenge/{primary_source.path}"
+                if primary_source is not None
                 else "/challenge"
             )
+            if primary_source is not None:
+                current.metadata["adapter_primary_source"] = (
+                    primary_source.path
+                )
             for spec in adapter.initial_observations():
                 experiment_id = _record_id(
                     "E-adapter",
@@ -1345,6 +1798,9 @@ class ChallengeEngine:
             )
             run.extra.update(
                 {
+                    "context_path": self._request_context_path(
+                        run_paths.request
+                    ),
                     "provider_wait_seconds": (
                         result.timing.provider_wait_seconds
                     ),
@@ -2232,10 +2688,22 @@ class ChallengeEngine:
             state_path=self.store.challenge_paths(state.identity).state,
             role=role.value,
         )
+        challenge_paths = self.store.challenge_paths(state.identity)
+        archived_context = archive_context_pack(
+            challenge_paths.context_history,
+            run_id=run_id,
+            text=context.text,
+            expected_sha256=context.sha256,
+        )
+        context_path = archived_context.path.relative_to(
+            challenge_paths.root
+        ).as_posix()
         request_payload = read_json(paths.request)
         if not isinstance(request_payload, dict):
             raise EngineError("run request must be a JSON object")
         request_payload["context_sha256"] = context.sha256
+        request_payload["context_path"] = context_path
+        request_payload["context_size_bytes"] = archived_context.size_bytes
         atomic_write_json(paths.request, request_payload)
         prompt = "\n\n".join(
             (
@@ -2500,7 +2968,27 @@ class ChallengeEngine:
             committed,
             results,
         )
-        committed = self._record_stall_if_needed(committed)
+        result_run_ids = {
+            result.invocation.run_id for result in results
+        }
+        committed_statuses = {
+            run.id: run.status
+            for run in committed.runs
+            if run.id in result_run_ids
+        }
+        semantic_barrier_failed = _semantic_barrier and (
+            len(committed_statuses) != len(results)
+            or any(
+                status is not RunStatus.COMPLETED
+                for status in committed_statuses.values()
+            )
+        )
+        # One failed fixed-width wave is one repair opportunity, not three
+        # independent no-progress cycles merely because it retained three
+        # logical roles. The managed orchestrator checkpoints its diagnostics
+        # and exposes them to the next Captain.
+        if not semantic_barrier_failed:
+            committed = self._record_stall_if_needed(committed)
         candidates = tuple(
             dict.fromkeys(
                 candidate.value
@@ -2610,6 +3098,7 @@ class ChallengeEngine:
                 )
             source_root = expected_workspace
         created_paths: list[Path] = []
+        source_references: list[dict[str, Any]] = []
 
         def cleanup_created(cause: BaseException) -> None:
             errors: list[str] = []
@@ -2632,6 +3121,28 @@ class ChallengeEngine:
                 if not isinstance(item, Mapping):
                     continue
                 reported_locator = str(item.get("path", ""))
+                claimed = item.get("sha256")
+                if managed_stage and isinstance(claimed, str):
+                    source_reference = next(
+                        (
+                            source
+                            for source in state.source_inventory
+                            if source.path == reported_locator
+                            and source.sha256 == claimed.lower()
+                        ),
+                        None,
+                    )
+                    if source_reference is not None:
+                        source_references.append(
+                            {
+                                "path": source_reference.path,
+                                "sha256": source_reference.sha256,
+                                "size": source_reference.size,
+                                "purpose": str(item.get("purpose", "")),
+                                "kind": "immutable_challenge_input",
+                            }
+                        )
+                        continue
                 try:
                     relative = _relative_workspace_artifact(
                         reported_locator, result.invocation.role
@@ -2651,7 +3162,6 @@ class ChallengeEngine:
                 artifact_id = _record_id(
                     "A", result.invocation.run_id, str(index)
                 )
-                claimed = item.get("sha256")
                 snapshot_destination = (
                     paths.artifacts
                     / "snapshots"
@@ -2700,6 +3210,8 @@ class ChallengeEngine:
                     }
                 )
         output["artifacts"] = normalized_artifacts
+        if source_references:
+            output["source_references"] = source_references
         structured = output.get("flag_candidates", [])
         candidate_values: list[dict[str, str]] = []
         accepted_values = {
@@ -3106,6 +3618,9 @@ class ChallengeEngine:
                     model=result.invocation.model_id,
                     context_hash=self._request_context_hash(run_paths.request),
                     extra={
+                        "context_path": self._request_context_path(
+                            run_paths.request
+                        ),
                         "provider_wait_seconds": (
                             result.timing.provider_wait_seconds
                         ),
@@ -3126,6 +3641,9 @@ class ChallengeEngine:
                             else None
                         ),
                         "normalization_error": normalization_error,
+                        "source_references": output.get(
+                            "source_references", []
+                        ),
                         "contract_errors": list(result.validation.errors),
                         "failures": [
                             {
@@ -3926,6 +4444,17 @@ class ChallengeEngine:
         if not isinstance(payload, Mapping):
             return None
         value = payload.get("context_sha256")
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _request_context_path(path: Path) -> str | None:
+        try:
+            payload = read_json(path)
+        except (OSError, StrictJSONError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        value = payload.get("context_path")
         return str(value) if value is not None else None
 
     @staticmethod

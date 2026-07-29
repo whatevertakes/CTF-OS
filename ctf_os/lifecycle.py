@@ -11,13 +11,13 @@ from typing import Any
 
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
 from ctf_os.models import (
+    ACTIVE_HYPOTHESIS_STATUSES,
     ChallengeIdentity,
     Checkpoint,
     ClosureBundle,
     ClosureCompleteness,
     ExperimentStatus,
     FactKind,
-    HypothesisStatus,
     RunOrigin,
     utc_now,
 )
@@ -185,7 +185,7 @@ def create_checkpoint(
         open_hypothesis_ids=[
             item.id
             for item in current.hypotheses
-            if item.status is HypothesisStatus.OPEN
+            if item.status in ACTIVE_HYPOTHESIS_STATUSES
         ],
         observation_fact_ids=[
             item.id
