@@ -7,10 +7,14 @@ the runtime (or its virtual environment) is damaged during a contest.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from ctf_os.candidates import candidate_value_is_valid
@@ -28,6 +32,12 @@ MAX_RECEIPT_STREAM_EVIDENCE_TOTAL_BYTES = (
 )
 MAX_RECEIPT_SAMPLE_BYTES = 1024
 MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
+MAX_PROOF_RECIPE_INPUTS = 256
+MAX_PROOF_ATTEMPTS = 11
+MAX_PROOF_POLICY_STRING_BYTES = 256
+MAX_PROOF_POLICY_NOTES_BYTES = 64 * 1024
+MAX_PROOF_DESTINATION_BYTES = 4096
+MAX_MANAGED_PROOF_INPUT_BYTES = 64 * 1024 * 1024
 
 JSONValue = (
     None
@@ -157,6 +167,7 @@ class FactKind(StringEnum):
 class ExperimentKind(StringEnum):
     PROBE = "probe"
     STRATEGIC = "strategic"
+    PROOF = "proof"
     LEGACY = "legacy"
 
 
@@ -879,6 +890,438 @@ def distinct_complete_active_hypotheses(
     return tuple(distinct)
 
 
+_PROOF_RECIPE_INPUT_PURPOSES = frozenset(
+    {"reproducer", "fixture", "variant_generator", "verifier"}
+)
+
+
+def _canonical_record_sha256(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ProofRecipeInput:
+    """One immutable canonical artifact staged into a clean proof workspace."""
+
+    artifact_id: str
+    destination: str
+    purpose: str
+    sha256: str
+    size: int
+    source_run_id: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "destination": self.destination,
+            "purpose": self.purpose,
+            "sha256": self.sha256,
+            "size": self.size,
+            "source_run_id": self.source_run_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ProofRecipeInput":
+        expected = {
+            "artifact_id",
+            "destination",
+            "purpose",
+            "sha256",
+            "size",
+            "source_run_id",
+        }
+        if set(data) != expected:
+            raise ModelValidationError(
+                "proof recipe input has a non-canonical schema"
+            )
+        if (
+            not all(
+                isinstance(data.get(field), str)
+                for field in (
+                    "artifact_id",
+                    "destination",
+                    "purpose",
+                    "sha256",
+                )
+            )
+            or isinstance(data.get("size"), bool)
+            or not isinstance(data.get("size"), int)
+            or (
+                data.get("source_run_id") is not None
+                and not isinstance(data.get("source_run_id"), str)
+            )
+        ):
+            raise ModelValidationError(
+                "proof recipe input contains a non-canonical type"
+            )
+        return cls(
+            artifact_id=data["artifact_id"],
+            destination=data["destination"],
+            purpose=data["purpose"],
+            sha256=data["sha256"],
+            size=data["size"],
+            source_run_id=(
+                data["source_run_id"]
+                if data.get("source_run_id") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProofPolicySnapshot:
+    """Engine-owned category policy bound to a managed proof recipe."""
+
+    mode: str
+    oracle_protocol: str
+    clean_repetitions: int
+    remote_repetitions: int
+    trial_count: int
+    negative_control_repetitions: int
+    negative_control_timeout_seconds: int
+    minimum_success_rate: float | None
+    notes: str
+    policy_sha256: str
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "oracle_protocol": self.oracle_protocol,
+            "clean_repetitions": self.clean_repetitions,
+            "remote_repetitions": self.remote_repetitions,
+            "trial_count": self.trial_count,
+            "negative_control_repetitions": (
+                self.negative_control_repetitions
+            ),
+            "negative_control_timeout_seconds": (
+                self.negative_control_timeout_seconds
+            ),
+            "minimum_success_rate": self.minimum_success_rate,
+            "notes": self.notes,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._unsigned_dict(),
+            "policy_sha256": self.policy_sha256,
+        }
+
+    def computed_sha256(self) -> str:
+        return _canonical_record_sha256(self._unsigned_dict())
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        mode: str,
+        oracle_protocol: str,
+        clean_repetitions: int,
+        remote_repetitions: int,
+        trial_count: int,
+        negative_control_repetitions: int,
+        negative_control_timeout_seconds: int,
+        minimum_success_rate: float | None,
+        notes: str,
+    ) -> "ProofPolicySnapshot":
+        unsigned = {
+            "mode": mode,
+            "oracle_protocol": oracle_protocol,
+            "clean_repetitions": clean_repetitions,
+            "remote_repetitions": remote_repetitions,
+            "trial_count": trial_count,
+            "negative_control_repetitions": (
+                negative_control_repetitions
+            ),
+            "negative_control_timeout_seconds": (
+                negative_control_timeout_seconds
+            ),
+            "minimum_success_rate": minimum_success_rate,
+            "notes": notes,
+        }
+        return cls(
+            **unsigned,
+            policy_sha256=_canonical_record_sha256(unsigned),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ProofPolicySnapshot":
+        expected = {
+            "mode",
+            "oracle_protocol",
+            "clean_repetitions",
+            "remote_repetitions",
+            "trial_count",
+            "negative_control_repetitions",
+            "negative_control_timeout_seconds",
+            "minimum_success_rate",
+            "notes",
+            "policy_sha256",
+        }
+        if set(data) != expected:
+            raise ModelValidationError(
+                "proof policy snapshot has a non-canonical schema"
+            )
+        minimum = data.get("minimum_success_rate")
+        if (
+            not all(
+                isinstance(data.get(field), str)
+                for field in (
+                    "mode",
+                    "oracle_protocol",
+                    "notes",
+                    "policy_sha256",
+                )
+            )
+            or any(
+                isinstance(data.get(field), bool)
+                or not isinstance(data.get(field), int)
+                for field in (
+                    "clean_repetitions",
+                    "remote_repetitions",
+                    "trial_count",
+                    "negative_control_repetitions",
+                    "negative_control_timeout_seconds",
+                )
+            )
+            or (
+                minimum is not None
+                and (
+                    isinstance(minimum, bool)
+                    or not isinstance(minimum, (int, float))
+                    or not math.isfinite(float(minimum))
+                )
+            )
+        ):
+            raise ModelValidationError(
+                "proof policy snapshot contains a non-canonical type"
+            )
+        return cls(
+            mode=data["mode"],
+            oracle_protocol=data["oracle_protocol"],
+            clean_repetitions=data["clean_repetitions"],
+            remote_repetitions=data["remote_repetitions"],
+            trial_count=data["trial_count"],
+            negative_control_repetitions=data[
+                "negative_control_repetitions"
+            ],
+            negative_control_timeout_seconds=data[
+                "negative_control_timeout_seconds"
+            ],
+            minimum_success_rate=minimum,
+            notes=data["notes"],
+            policy_sha256=data["policy_sha256"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProofRecipe:
+    """Canonical candidate, inputs, target, and policy for one proof action."""
+
+    candidate_id: str
+    source_experiment_id: str
+    source_run_id: str
+    argv: tuple[str, ...]
+    inputs: tuple[ProofRecipeInput, ...]
+    network_target_id: str | None
+    network_target_generation: int | None
+    network_endpoint: str | None
+    configuration_epoch: int
+    source_manifest_sha256: str
+    source_request_sha256: str
+    image_reference: str
+    policy: ProofPolicySnapshot
+    recipe_sha256: str
+
+    def _unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "source_experiment_id": self.source_experiment_id,
+            "source_run_id": self.source_run_id,
+            "argv": list(self.argv),
+            "inputs": [item.to_dict() for item in self.inputs],
+            "network_target_id": self.network_target_id,
+            "network_target_generation": self.network_target_generation,
+            "network_endpoint": self.network_endpoint,
+            "configuration_epoch": self.configuration_epoch,
+            "source_manifest_sha256": self.source_manifest_sha256,
+            "source_request_sha256": self.source_request_sha256,
+            "image_reference": self.image_reference,
+            "policy": self.policy.to_dict(),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._unsigned_dict(),
+            "recipe_sha256": self.recipe_sha256,
+        }
+
+    def computed_sha256(self) -> str:
+        return _canonical_record_sha256(self._unsigned_dict())
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        candidate_id: str,
+        source_experiment_id: str,
+        source_run_id: str,
+        argv: Iterable[str],
+        inputs: Iterable[ProofRecipeInput],
+        network_target_id: str | None,
+        network_target_generation: int | None,
+        network_endpoint: str | None,
+        configuration_epoch: int,
+        source_manifest_sha256: str,
+        source_request_sha256: str,
+        image_reference: str,
+        policy: ProofPolicySnapshot,
+    ) -> "ProofRecipe":
+        provisional = cls(
+            candidate_id=candidate_id,
+            source_experiment_id=source_experiment_id,
+            source_run_id=source_run_id,
+            argv=tuple(argv),
+            inputs=tuple(inputs),
+            network_target_id=network_target_id,
+            network_target_generation=network_target_generation,
+            network_endpoint=network_endpoint,
+            configuration_epoch=configuration_epoch,
+            source_manifest_sha256=source_manifest_sha256,
+            source_request_sha256=source_request_sha256,
+            image_reference=image_reference,
+            policy=policy,
+            recipe_sha256="",
+        )
+        return cls(
+            candidate_id=provisional.candidate_id,
+            source_experiment_id=provisional.source_experiment_id,
+            source_run_id=provisional.source_run_id,
+            argv=provisional.argv,
+            inputs=provisional.inputs,
+            network_target_id=provisional.network_target_id,
+            network_target_generation=(
+                provisional.network_target_generation
+            ),
+            network_endpoint=provisional.network_endpoint,
+            configuration_epoch=provisional.configuration_epoch,
+            source_manifest_sha256=(
+                provisional.source_manifest_sha256
+            ),
+            source_request_sha256=(
+                provisional.source_request_sha256
+            ),
+            image_reference=provisional.image_reference,
+            policy=provisional.policy,
+            recipe_sha256=provisional.computed_sha256(),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ProofRecipe":
+        expected = {
+            "candidate_id",
+            "source_experiment_id",
+            "source_run_id",
+            "argv",
+            "inputs",
+            "network_target_id",
+            "network_target_generation",
+            "network_endpoint",
+            "configuration_epoch",
+            "source_manifest_sha256",
+            "source_request_sha256",
+            "image_reference",
+            "policy",
+            "recipe_sha256",
+        }
+        if set(data) != expected:
+            raise ModelValidationError(
+                "proof recipe has a non-canonical schema"
+            )
+        policy = data.get("policy")
+        inputs = data.get("inputs", [])
+        argv = data.get("argv", [])
+        if (
+            not all(
+                isinstance(data.get(field), str)
+                for field in (
+                    "candidate_id",
+                    "source_experiment_id",
+                    "source_run_id",
+                    "source_manifest_sha256",
+                    "source_request_sha256",
+                    "image_reference",
+                    "recipe_sha256",
+                )
+            )
+            or not isinstance(argv, list)
+            or any(not isinstance(item, str) for item in argv)
+            or not isinstance(inputs, list)
+            or any(not isinstance(item, Mapping) for item in inputs)
+            or not isinstance(policy, Mapping)
+            or isinstance(data.get("configuration_epoch"), bool)
+            or not isinstance(data.get("configuration_epoch"), int)
+            or (
+                data.get("network_target_id") is not None
+                and not isinstance(data.get("network_target_id"), str)
+            )
+            or (
+                data.get("network_target_generation") is not None
+                and (
+                    isinstance(
+                        data.get("network_target_generation"), bool
+                    )
+                    or not isinstance(
+                        data.get("network_target_generation"), int
+                    )
+                )
+            )
+            or (
+                data.get("network_endpoint") is not None
+                and not isinstance(data.get("network_endpoint"), str)
+            )
+        ):
+            raise ModelValidationError(
+                "proof recipe contains a non-canonical type"
+            )
+        return cls(
+            candidate_id=data["candidate_id"],
+            source_experiment_id=data["source_experiment_id"],
+            source_run_id=data["source_run_id"],
+            argv=tuple(argv),
+            inputs=tuple(
+                ProofRecipeInput.from_dict(item)
+                for item in inputs
+            ),
+            network_target_id=(
+                data["network_target_id"]
+                if data.get("network_target_id") is not None
+                else None
+            ),
+            network_target_generation=(
+                data["network_target_generation"]
+                if data.get("network_target_generation") is not None
+                else None
+            ),
+            network_endpoint=(
+                data["network_endpoint"]
+                if data.get("network_endpoint") is not None
+                else None
+            ),
+            configuration_epoch=data["configuration_epoch"],
+            source_manifest_sha256=data["source_manifest_sha256"],
+            source_request_sha256=data["source_request_sha256"],
+            image_reference=data["image_reference"],
+            policy=ProofPolicySnapshot.from_dict(policy),
+            recipe_sha256=data["recipe_sha256"],
+        )
+
+
 @dataclass
 class Experiment:
     id: str
@@ -899,6 +1342,7 @@ class Experiment:
     evidence_receipt_ids: list[str] = field(default_factory=list)
     evaluation_reason: str | None = None
     evaluated_at: str | None = None
+    proof_recipe: ProofRecipe | None = None
     created_at: str = field(default_factory=utc_now)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -927,6 +1371,11 @@ class Experiment:
             canonical["evidence_receipt_ids"] = list(
                 self.evidence_receipt_ids
             )
+            canonical["proof_recipe"] = (
+                self.proof_recipe.to_dict()
+                if self.proof_recipe is not None
+                else None
+            )
         return _with_extra(
             self.extra,
             **canonical,
@@ -934,6 +1383,14 @@ class Experiment:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Experiment":
+        raw_proof_recipe = data.get("proof_recipe")
+        if (
+            raw_proof_recipe is not None
+            and not isinstance(raw_proof_recipe, Mapping)
+        ):
+            raise ModelValidationError(
+                "experiment proof_recipe must be a canonical object or null"
+            )
         known = {
             "id",
             "hypothesis_ids",
@@ -957,6 +1414,7 @@ class Experiment:
             "evidence_receipt_ids",
             "evaluation_reason",
             "evaluated_at",
+            "proof_recipe",
             "created_at",
             "max_runs",
             "oracle",
@@ -1031,6 +1489,11 @@ class Experiment:
             evaluated_at=(
                 str(data["evaluated_at"])
                 if data.get("evaluated_at") is not None
+                else None
+            ),
+            proof_recipe=(
+                ProofRecipe.from_dict(data["proof_recipe"])
+                if isinstance(raw_proof_recipe, Mapping)
                 else None
             ),
             created_at=str(data.get("created_at", utc_now())),
@@ -2929,6 +3392,15 @@ class ChallengeState:
                 experiment.evidence_receipt_ids,
                 f"experiment {experiment.id} evidence_receipt_ids",
             )
+            if (
+                experiment.proof_recipe is not None
+                and len(experiment.proof_recipe.inputs)
+                > MAX_PROOF_RECIPE_INPUTS
+            ):
+                raise ModelValidationError(
+                    f"experiment {experiment.id} proof inputs exceed "
+                    f"{MAX_PROOF_RECIPE_INPUTS} items"
+                )
         for goal in self.goals:
             _repeated_items(goal.depends_on, f"goal {goal.id} depends_on")
             _repeated_items(
@@ -3448,6 +3920,17 @@ class ChallengeState:
         ):
             errors.append("an accepted candidate requires a SOLVED challenge")
 
+        if self.schema_version < STATE_SCHEMA_VERSION:
+            for experiment in self.experiments:
+                if (
+                    experiment.kind is ExperimentKind.PROOF
+                    or experiment.proof_recipe is not None
+                ):
+                    errors.append(
+                        f"managed proof experiment {experiment.id} requires "
+                        f"state schema v{STATE_SCHEMA_VERSION}"
+                    )
+
         if self.schema_version >= STATE_SCHEMA_VERSION:
             if self.configuration_epoch < 0:
                 errors.append("configuration_epoch cannot be negative")
@@ -3510,6 +3993,463 @@ class ChallengeState:
                             f"strategic experiment {experiment.id} requires "
                             "an active goal"
                         )
+                    if experiment.proof_recipe is not None:
+                        errors.append(
+                            f"strategic experiment {experiment.id} cannot "
+                            "contain a proof recipe"
+                        )
+                elif experiment.kind is ExperimentKind.PROOF:
+                    recipe = experiment.proof_recipe
+                    if recipe is None:
+                        errors.append(
+                            f"proof experiment {experiment.id} requires a "
+                            "typed proof recipe"
+                        )
+                        continue
+                    if experiment.hypothesis_ids:
+                        errors.append(
+                            f"proof experiment {experiment.id} cannot name "
+                            "hypotheses"
+                        )
+                    if recipe.candidate_id not in candidates:
+                        errors.append(
+                            f"proof experiment {experiment.id} references "
+                            f"unknown candidate {recipe.candidate_id}"
+                        )
+                    bound_candidate = candidates.get(recipe.candidate_id)
+                    source_experiment = experiments.get(
+                        recipe.source_experiment_id
+                    )
+                    source_run = runs.get(recipe.source_run_id)
+                    if (
+                        bound_candidate is None
+                        or bound_candidate.source_run_id
+                        != recipe.source_run_id
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} candidate "
+                            "does not match its source tool run"
+                        )
+                    if (
+                        source_run is None
+                        or source_run.status is not RunStatus.COMPLETED
+                        or source_run.origin is not RunOrigin.MANAGED_TOOL
+                        or source_run.extra.get("experiment_id")
+                        != recipe.source_experiment_id
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} requires a "
+                            "completed managed tool source run"
+                        )
+                    if (
+                        source_experiment is None
+                        or source_experiment.kind is ExperimentKind.PROOF
+                        or not isinstance(
+                            source_experiment.result, Mapping
+                        )
+                        or source_experiment.result.get("run_id")
+                        != recipe.source_run_id
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} source run "
+                            "is not linked by its source experiment"
+                        )
+                    else:
+                        try:
+                            source_argv = tuple(
+                                shlex.split(source_experiment.command)
+                            )
+                        except ValueError:
+                            source_argv = ()
+                        if source_argv != recipe.argv:
+                            errors.append(
+                                f"proof experiment {experiment.id} argv "
+                                "does not replay its source experiment"
+                            )
+                    if (
+                        bound_candidate is not None
+                        and any(
+                            bound_candidate.value in argument
+                            for argument in recipe.argv
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} argv embeds "
+                            "the candidate literal"
+                        )
+                    if (
+                        not recipe.argv
+                        or len(recipe.argv) > 4096
+                        or any(
+                            not isinstance(argument, str)
+                            or "\x00" in argument
+                            or len(argument.encode("utf-8"))
+                            > 1024 * 1024
+                            for argument in recipe.argv
+                        )
+                        or sum(
+                            len(argument.encode("utf-8"))
+                            for argument in recipe.argv
+                            if isinstance(argument, str)
+                        )
+                        > 1024 * 1024
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "canonical argv"
+                        )
+                    if (
+                        isinstance(recipe.configuration_epoch, bool)
+                        or not isinstance(recipe.configuration_epoch, int)
+                        or recipe.configuration_epoch < 0
+                        or recipe.configuration_epoch
+                        > self.configuration_epoch
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "configuration epoch"
+                        )
+                    if (
+                        len(recipe.source_manifest_sha256) != 64
+                        or recipe.source_manifest_sha256
+                        != recipe.source_manifest_sha256.lower()
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in (
+                                recipe.source_manifest_sha256.lower()
+                            )
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "source manifest sha256"
+                        )
+                    if (
+                        len(recipe.source_request_sha256) != 64
+                        or recipe.source_request_sha256
+                        != recipe.source_request_sha256.lower()
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in recipe.source_request_sha256
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "source request sha256"
+                        )
+                    if (
+                        not recipe.image_reference
+                        or "\x00" in recipe.image_reference
+                        or len(recipe.image_reference.encode("utf-8"))
+                        > 1024
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "image reference pin"
+                        )
+                    target_fields = (
+                        recipe.network_target_id,
+                        recipe.network_target_generation,
+                        recipe.network_endpoint,
+                    )
+                    if any(item is None for item in target_fields) and any(
+                        item is not None for item in target_fields
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} target id, "
+                            "generation, and endpoint must be bound together"
+                        )
+                    if (
+                        recipe.network_target_generation is not None
+                        and (
+                            isinstance(
+                                recipe.network_target_generation, bool
+                            )
+                            or not isinstance(
+                                recipe.network_target_generation, int
+                            )
+                            or recipe.network_target_generation < 1
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "target generation"
+                        )
+                    if recipe.network_target_id is not None:
+                        bound_target = targets.get(
+                            recipe.network_target_id
+                        )
+                        if (
+                            bound_target is None
+                            or bound_target.generation
+                            != recipe.network_target_generation
+                            or bound_target.endpoint
+                            != recipe.network_endpoint
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} target "
+                                "pin does not match a canonical target record"
+                            )
+                    policy = recipe.policy
+                    policy_counts = (
+                        policy.clean_repetitions,
+                        policy.remote_repetitions,
+                        policy.trial_count,
+                        policy.negative_control_repetitions,
+                    )
+                    if any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in policy_counts
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "policy repetition counts"
+                        )
+                    if (
+                        isinstance(
+                            policy.negative_control_timeout_seconds,
+                            bool,
+                        )
+                        or not isinstance(
+                            policy.negative_control_timeout_seconds,
+                            int,
+                        )
+                        or not 1
+                        <= policy.negative_control_timeout_seconds
+                        <= 30
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "negative-control timeout"
+                        )
+                    supported_policy_modes = {
+                        "deterministic",
+                        "success_distribution",
+                        "remote_independent",
+                        "sample_matrix",
+                        "hash_chain",
+                    }
+                    if (
+                        policy.mode not in supported_policy_modes
+                        or len(policy.mode.encode("utf-8"))
+                        > MAX_PROOF_POLICY_STRING_BYTES
+                        or not policy.oracle_protocol
+                        or len(policy.oracle_protocol.encode("utf-8"))
+                        > MAX_PROOF_POLICY_STRING_BYTES
+                        or len(policy.notes.encode("utf-8"))
+                        > MAX_PROOF_POLICY_NOTES_BYTES
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "policy strings"
+                        )
+                    effective_attempts = (
+                        policy.trial_count
+                        if policy.mode == "success_distribution"
+                        else policy.clean_repetitions
+                        + policy.remote_repetitions
+                    )
+                    minimum_rate = policy.minimum_success_rate
+                    if (
+                        minimum_rate is not None
+                        and (
+                            isinstance(minimum_rate, bool)
+                            or not isinstance(minimum_rate, (int, float))
+                            or not math.isfinite(float(minimum_rate))
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "minimum success rate"
+                        )
+                    if (
+                        policy.mode == "success_distribution"
+                        and (
+                            policy.trial_count < 1
+                            or minimum_rate is None
+                            or isinstance(minimum_rate, bool)
+                            or not isinstance(minimum_rate, (int, float))
+                            or not math.isfinite(float(minimum_rate))
+                            or not 0
+                            <= minimum_rate
+                            <= 1
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "success distribution policy"
+                        )
+                    if (
+                        policy.mode != "success_distribution"
+                        and (
+                            effective_attempts < 1
+                            or policy.trial_count != 0
+                            or minimum_rate is not None
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} has invalid "
+                            "non-distribution policy"
+                        )
+                    if (
+                        effective_attempts
+                        + policy.negative_control_repetitions
+                        > MAX_PROOF_ATTEMPTS
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} exceeds the "
+                            f"{MAX_PROOF_ATTEMPTS}-attempt proof limit"
+                        )
+                    if (
+                        policy.oracle_protocol
+                        != "remote_pwn_replay_negative_control_v1"
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} uses an "
+                            "unsupported oracle protocol"
+                        )
+                    if (
+                        policy.mode != "success_distribution"
+                        or policy.negative_control_repetitions != 1
+                        or recipe.network_endpoint is None
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} lacks the "
+                            "required remote negative-control policy"
+                        )
+                    if policy.policy_sha256 != policy.computed_sha256():
+                        errors.append(
+                            f"proof experiment {experiment.id} policy hash "
+                            "does not match its canonical snapshot"
+                        )
+                    if recipe.recipe_sha256 != recipe.computed_sha256():
+                        errors.append(
+                            f"proof experiment {experiment.id} recipe hash "
+                            "does not match its canonical payload"
+                        )
+                    artifact_ids: set[str] = set()
+                    destinations: set[str] = set()
+                    total_input_bytes = 0
+                    for proof_input in recipe.inputs:
+                        raw_segments = proof_input.destination.split("/")
+                        path = PurePosixPath(proof_input.destination)
+                        destination_valid = (
+                            bool(proof_input.destination)
+                            and proof_input.destination != "."
+                            and "\x00" not in proof_input.destination
+                            and "\\" not in proof_input.destination
+                            and len(
+                                proof_input.destination.encode("utf-8")
+                            )
+                            <= MAX_PROOF_DESTINATION_BYTES
+                            and all(
+                                segment not in {"", ".", ".."}
+                                and len(segment.encode("utf-8")) <= 255
+                                for segment in raw_segments
+                            )
+                            and not path.is_absolute()
+                            and ".." not in path.parts
+                        )
+                        if (
+                            not destination_valid
+                            or proof_input.destination in destinations
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} has "
+                                "unsafe or duplicate input destination "
+                                f"{proof_input.destination!r}"
+                            )
+                        destinations.add(proof_input.destination)
+                        if proof_input.artifact_id in artifact_ids:
+                            errors.append(
+                                f"proof experiment {experiment.id} has "
+                                "duplicate input artifact "
+                                f"{proof_input.artifact_id}"
+                            )
+                        artifact_ids.add(proof_input.artifact_id)
+                        if (
+                            proof_input.purpose
+                            not in _PROOF_RECIPE_INPUT_PURPOSES
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} has "
+                                f"invalid input purpose {proof_input.purpose}"
+                            )
+                        artifact = artifacts.get(
+                            proof_input.artifact_id
+                        )
+                        if (
+                            not isinstance(proof_input.size, bool)
+                            and isinstance(proof_input.size, int)
+                            and proof_input.size >= 0
+                        ):
+                            total_input_bytes += proof_input.size
+                        if artifact is None:
+                            errors.append(
+                                f"proof experiment {experiment.id} input "
+                                "references unknown artifact "
+                                f"{proof_input.artifact_id}"
+                            )
+                        elif (
+                            len(proof_input.sha256) != 64
+                            or any(
+                                character not in "0123456789abcdef"
+                                for character in proof_input.sha256
+                            )
+                            or proof_input.sha256
+                            != proof_input.sha256.lower()
+                            or artifact.sha256.lower()
+                            != proof_input.sha256
+                            or artifact.size != proof_input.size
+                            or isinstance(proof_input.size, bool)
+                            or not isinstance(proof_input.size, int)
+                            or proof_input.size < 0
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} input "
+                                f"{proof_input.artifact_id} hash/size mismatch"
+                            )
+                        if (
+                            not isinstance(proof_input.size, bool)
+                            and isinstance(proof_input.size, int)
+                            and proof_input.size
+                            > MAX_MANAGED_PROOF_INPUT_BYTES
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} input "
+                                f"{proof_input.artifact_id} exceeds the "
+                                "managed proof byte limit"
+                            )
+                        if (
+                            artifact is not None
+                            and artifact.source_run_id
+                            != proof_input.source_run_id
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} input "
+                                f"{proof_input.artifact_id} source run mismatch"
+                            )
+                        if (
+                            proof_input.artifact_id
+                            not in experiment.artifact_ids
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} input "
+                                f"{proof_input.artifact_id} is not linked "
+                                "through experiment artifact_ids"
+                            )
+                    if total_input_bytes > MAX_MANAGED_PROOF_INPUT_BYTES:
+                        errors.append(
+                            f"proof experiment {experiment.id} inputs exceed "
+                            "the aggregate managed proof byte limit"
+                        )
+                elif experiment.proof_recipe is not None:
+                    errors.append(
+                        f"{experiment.kind.value} experiment "
+                        f"{experiment.id} cannot contain a proof recipe"
+                    )
 
             terminal_run_statuses = {
                 RunStatus.COMPLETED,
@@ -3961,7 +4901,11 @@ __all__ = [
     "ModelValidationError",
     "ManagedCycle",
     "ManagedWave",
+    "MAX_MANAGED_PROOF_INPUT_BYTES",
     "ProgressMarker",
+    "ProofPolicySnapshot",
+    "ProofRecipe",
+    "ProofRecipeInput",
     "Provenance",
     "ReceiptOutcome",
     "RunReference",

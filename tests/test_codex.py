@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import http.server
 import json
 import multiprocessing
@@ -425,6 +426,74 @@ class ContractTests(unittest.TestCase):
         self.assertIn("$.hypotheses[0].experiment", joined)
         self.assertIn("$.hypotheses[0].success_oracle", joined)
         self.assertIn("$.hypotheses[0].falsifier", joined)
+
+    def test_managed_proof_action_is_minimal_and_reproducer_only(
+        self,
+    ) -> None:
+        payload = valid_payload(Role.REPRODUCER)
+        payload["schema_version"] = 2
+        payload["hypotheses"] = []
+        payload["actions"] = [
+            {
+                "kind": "prove_candidate",
+                "description": "Replay the canonical tool result.",
+                "candidate_id": "C-tool-1",
+                "inputs": [
+                    {
+                        "artifact_id": "A-solver",
+                        "purpose": "reproducer",
+                    }
+                ],
+            }
+        ]
+
+        result = validate_role_output(
+            payload,
+            Role.REPRODUCER,
+            contract_version=2,
+        )
+
+        self.assertTrue(result.valid, result.errors)
+        schema = role_output_schema(
+            Role.REPRODUCER,
+            contract_version=2,
+        )
+        variants = {
+            item["properties"]["kind"]["enum"][0]: item
+            for item in schema["properties"]["actions"]["items"]["anyOf"]
+        }
+        proof = variants["prove_candidate"]
+        self.assertEqual(
+            set(proof["properties"]),
+            {"kind", "description", "candidate_id", "inputs"},
+        )
+        self.assertEqual(
+            set(proof["properties"]["inputs"]["items"]["properties"]),
+            {"artifact_id", "purpose"},
+        )
+
+        wrong_role = copy.deepcopy(payload)
+        wrong_role["role"] = Role.VALIDATOR.value
+        result = validate_role_output(
+            wrong_role,
+            Role.VALIDATOR,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "restricted to the v2 reproducer",
+            "\n".join(result.errors),
+        )
+
+        payload["actions"][0]["repetitions"] = 1
+        payload["actions"][0]["oracle"] = "model-selected"
+        result = validate_role_output(
+            payload,
+            Role.REPRODUCER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("unexpected keys", "\n".join(result.errors))
 
     def test_contract_rejects_extra_keys_wrong_decision_and_readonly_write(self) -> None:
         payload = valid_payload(Role.FALSIFIER)

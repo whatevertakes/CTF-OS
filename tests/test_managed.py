@@ -20,7 +20,11 @@ from ctf_os.codex import (
     Role,
 )
 from ctf_os.config import load_config
-from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.engine.challenge import (
+    ChallengeEngine,
+    EngineError,
+    _proof_argv_contains_credential_material,
+)
 from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.lifecycle import close_challenge, create_checkpoint
 from ctf_os.managed import ManagedError, ManagedOrchestrator
@@ -30,13 +34,16 @@ from ctf_os.migration import (
     rollback_migration,
 )
 from ctf_os.models import (
+    CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
+    ExperimentKind,
     ExperimentStatus,
     ModelValidationError,
     RunOrigin,
     RunReference,
     RunStatus,
+    SessionStatus,
 )
 from ctf_os.sandbox import SandboxResult
 from ctf_os.schema import STATE_SCHEMA_VERSION
@@ -78,11 +85,19 @@ class ProbeRoleExecutor:
         source_reference_role: Role | None = None,
         network_target: tuple[str, int] | None = None,
         captain_hypothesis_count: int = 3,
+        captain_stage: str = "attack",
+        proof_candidate_id: str | None = None,
+        proof_artifact_id: str | None = None,
+        proof_extra_action: bool = False,
     ) -> None:
         self.invalid_role = invalid_role
         self.source_reference_role = source_reference_role
         self.network_target = network_target
         self.captain_hypothesis_count = captain_hypothesis_count
+        self.captain_stage = captain_stage
+        self.proof_candidate_id = proof_candidate_id
+        self.proof_artifact_id = proof_artifact_id
+        self.proof_extra_action = proof_extra_action
         self.lock = threading.Lock()
         self.active = 0
         self.max_active = 0
@@ -99,6 +114,11 @@ class ProbeRoleExecutor:
             self.prompts.append((role, command.stdin))
         try:
             payload = _payload(role)
+            if role is Role.CAPTAIN:
+                payload["decision"] = {
+                    "next_stage": self.captain_stage,
+                    "reason": "synthetic managed routing decision",
+                }
             if role is not Role.CAPTAIN:
                 payload["hypotheses"] = []
             schema_index = command.argv.index("--output-schema")
@@ -164,6 +184,48 @@ class ProbeRoleExecutor:
                             ),
                         }
                     )
+                if (
+                    role is Role.REPRODUCER
+                    and self.proof_candidate_id is not None
+                ):
+                    payload["actions"] = [
+                        {
+                            "kind": "prove_candidate",
+                            "description": (
+                                "replay the engine-bound tool result"
+                            ),
+                            "candidate_id": self.proof_candidate_id,
+                            "inputs": (
+                                [
+                                    {
+                                        "artifact_id": (
+                                            self.proof_artifact_id
+                                        ),
+                                        "purpose": "reproducer",
+                                    }
+                                ]
+                                if self.proof_artifact_id is not None
+                                else []
+                            ),
+                        }
+                    ]
+                    if self.proof_extra_action:
+                        payload["actions"].append(
+                            {
+                                "kind": "command",
+                                "description": "unexpected extra proof action",
+                                "command": "true",
+                                "artifact_path": None,
+                                "hypothesis_ids": [],
+                                "expected_observation": "true exits zero",
+                                "keep_if": "the command exits zero",
+                                "drop_if": "the command fails",
+                                "timeout_seconds": 1,
+                                "resource_class": "light",
+                                "network_target_id": None,
+                                "network_target_generation": None,
+                            }
+                        )
             if role is self.invalid_role:
                 on_stdout_line(
                     json.dumps(
@@ -229,6 +291,41 @@ class SlowSandbox(FakeSandbox):
             return super().run(spec)
         finally:
             self.concurrency.leave()
+
+
+class ReplaySandbox(FakeSandbox):
+    """Tool and clean proof both expose the same replay candidate."""
+
+    def run(self, spec):
+        result = super().run(spec)
+        stdout = self.work / "raw" / "stdout.log"
+        payload = "answer KCTF{proof_flag}\n"
+        stdout.write_text(payload, encoding="utf-8")
+        return replace(
+            result,
+            stdout_summary=payload.strip(),
+            stdout_bytes=stdout.stat().st_size,
+        )
+
+    def run_clean_proof(self, spec, **kwargs):
+        result = super().run_clean_proof(spec, **kwargs)
+        if spec.network_target is not None:
+            return result
+        stdout = self.work / result.stdout_path.removeprefix("/work/")
+        payload = "negative control: remote target disabled\n"
+        stdout.write_text(payload, encoding="utf-8")
+        return replace(
+            result,
+            stdout_summary=payload.strip(),
+            stdout_bytes=stdout.stat().st_size,
+        )
+
+
+class AlwaysReplaySandbox(ReplaySandbox):
+    """Unsafe replay double used to prove the negative control catches it."""
+
+    def run_clean_proof(self, spec, **kwargs):
+        return FakeSandbox.run_clean_proof(self, spec, **kwargs)
 
 
 class ReceiptCanarySandbox(FakeSandbox):
@@ -298,6 +395,41 @@ class FailingSandbox(FakeSandbox):
 
 
 class ManagedV2Tests(unittest.TestCase):
+    def test_managed_proof_credential_screen_is_executable_aware(self):
+        allowed = (
+            ("python3", "-u", "solver.py"),
+            ("python3", "-i", "solver.py"),
+            ("ssh", "-p", "2222", "challenge.example"),
+            ("curl", "-i", "https://challenge.example"),
+            (
+                "solver",
+                "--config",
+                "challenge.toml",
+                "--user",
+                "alice",
+                "--session",
+                "debug",
+            ),
+        )
+        blocked = (
+            ("curl", "-u", "alice:secret", "https://challenge.example"),
+            ("curl", "--cookie=session=secret", "https://challenge.example"),
+            ("ssh", "-i", "operator-key", "challenge.example"),
+            ("solver", "--access-code", "opaque"),
+            ("solver", "ACCESS_CODE=opaque"),
+            ("solver", "Authorization: Bearer opaque"),
+        )
+        for argv in allowed:
+            with self.subTest(argv=argv):
+                self.assertFalse(
+                    _proof_argv_contains_credential_material(argv)
+                )
+        for argv in blocked:
+            with self.subTest(argv=argv):
+                self.assertTrue(
+                    _proof_argv_contains_credential_material(argv)
+                )
+
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
@@ -370,6 +502,729 @@ class ManagedV2Tests(unittest.TestCase):
             prompt="solve this one challenge",
             state_schema_version=STATE_SCHEMA_VERSION,
         )
+
+    def execute_managed_source_fixture(
+        self,
+        orchestrator: ManagedOrchestrator,
+        engine: ChallengeEngine,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+    ):
+        _state, session_id = orchestrator._reserve_session(identity, None)
+        _state, cycle = orchestrator._reserve_cycle(identity, session_id)
+        orchestrator._mark_action_selection(
+            identity,
+            session_id,
+            cycle.id,
+            (experiment_id,),
+        )
+        engine.execute_registered_experiments(
+            identity,
+            maximum=1,
+            experiment_ids=(experiment_id,),
+            _session_owned=True,
+            _automated=True,
+        )
+        orchestrator._checkpoint(
+            identity,
+            session_id,
+            cycle.id,
+            note="managed source replay fixture",
+        )
+        return orchestrator._finish_session(
+            identity,
+            session_id,
+            status=SessionStatus.COMPLETED,
+            reason="managed source replay fixture completed",
+        )
+
+    def test_proof_wave_records_remote_replay_without_full_proof_or_submission(
+        self,
+    ):
+        identity = ChallengeIdentity("Managed CTF", "pwn", "proof")
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFmanaged-pwn")
+        executor = ProbeRoleExecutor(captain_stage="proof")
+        sandboxes: list[ReplaySandbox] = []
+        sandboxes_by_work: dict[Path, ReplaySandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            key = work.resolve()
+            sandbox = sandboxes_by_work.get(key)
+            if sandbox is None:
+                sandbox = ReplaySandbox(work)
+                sandboxes_by_work[key] = sandbox
+                sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state = engine.add_challenge(
+            identity,
+            prompt="prove one existing pwn candidate",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        endpoint = "https://pwn.example:443"
+        state = engine.add_network_target(
+            identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        state = engine.select_network_target(identity, target.id)
+        solver = engine._workspace(state) / "solver.py"
+        solver.write_text(
+            "print('derive candidate from immutable challenge input')\n",
+            encoding="utf-8",
+        )
+        _state, solver_artifact = engine.register_workspace_artifact(
+            identity,
+            "solver.py",
+        )
+        _state, source_experiment_id = engine.register_experiment(
+            identity,
+            command=("python3", "solver.py"),
+            expected_observation="the tool emits a candidate",
+            keep_if="the candidate is present in durable output",
+            drop_if="the candidate is absent",
+            network_target=endpoint,
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            identity,
+            source_experiment_id,
+        )
+        source_state = engine.store.load(identity)
+        self.assertIn(
+            "KCTF{proof_flag}",
+            [item.value for item in source_state.candidates],
+        )
+        candidate = next(
+            item
+            for item in source_state.candidates
+            if item.value == "KCTF{proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+        executor.proof_artifact_id = solver_artifact.id
+
+        with mock.patch.object(
+            engine,
+            "record_manual_submission",
+            wraps=engine.record_manual_submission,
+        ) as submission:
+            state = orchestrator.run_cycle(identity)
+
+        submission.assert_not_called()
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertEqual(state.submissions, [])
+        replayed_candidate = next(
+            item for item in state.candidates if item.id == candidate.id
+        )
+        self.assertEqual(
+            replayed_candidate.status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+        wave = state.waves[-1]
+        self.assertEqual(
+            set(wave.role_run_ids),
+            {"validator", "reproducer", "evidence_auditor"},
+        )
+        proof_cycle = next(
+            item for item in state.cycles if item.id == wave.cycle_id
+        )
+        proof_cycle_run_ids = {
+            proof_cycle.captain_run_id,
+            *wave.role_run_ids.values(),
+        }
+        self.assertFalse(
+            any(
+                item.status is ExperimentStatus.REGISTERED
+                and item.source_run_id in proof_cycle_run_ids
+                for item in state.experiments
+            ),
+            "proof-cycle non-proof actions must not pollute the frontier",
+        )
+        proof_experiments = [
+            item
+            for item in state.experiments
+            if item.kind is ExperimentKind.PROOF
+        ]
+        self.assertEqual(len(proof_experiments), 1)
+        proof_experiment = proof_experiments[0]
+        self.assertEqual(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        self.assertFalse(proof_experiment.result["passed"])
+        self.assertEqual(proof_experiment.result["total_attempts"], 10)
+        self.assertEqual(proof_experiment.result["successful_attempts"], 10)
+        self.assertEqual(
+            len(proof_experiment.result["negative_control_run_ids"]),
+            1,
+        )
+        self.assertIn(
+            "causal_oracle_unavailable",
+            "\n".join(proof_experiment.result["failures"]),
+        )
+        recipe = proof_experiment.proof_recipe
+        self.assertIsNotNone(recipe)
+        assert recipe is not None
+        self.assertEqual(recipe.argv, ("python3", "solver.py"))
+        self.assertEqual(recipe.inputs[0].artifact_id, solver_artifact.id)
+        self.assertEqual(recipe.inputs[0].destination, "solver.py")
+        self.assertEqual(recipe.image_reference, IMAGE_DIGEST)
+        self.assertEqual(recipe.network_target_id, target.id)
+        self.assertEqual(
+            recipe.network_target_generation,
+            target.generation,
+        )
+        self.assertEqual(recipe.network_endpoint, endpoint)
+        source_request = engine.store.run_paths(
+            identity,
+            run_id=recipe.source_run_id,
+        ).request
+        self.assertEqual(
+            recipe.source_request_sha256,
+            hashlib.sha256(source_request.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(recipe.policy.trial_count, 10)
+        self.assertEqual(recipe.policy.negative_control_repetitions, 1)
+        self.assertEqual(
+            recipe.policy.negative_control_timeout_seconds,
+            30,
+        )
+        self.assertEqual(
+            recipe.policy.oracle_protocol,
+            "remote_pwn_replay_negative_control_v1",
+        )
+        proof_runs = [
+            run for run in state.runs if run.origin is RunOrigin.PROOF
+        ]
+        self.assertEqual(len(proof_runs), 11)
+        self.assertEqual(len(proof_experiment.evidence_run_ids), 11)
+        unlinked = copy.deepcopy(state)
+        unlinked_proof = next(
+            item
+            for item in unlinked.experiments
+            if item.id == proof_experiment.id
+        )
+        unlinked_proof.artifact_ids.remove(solver_artifact.id)
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "is not linked through experiment artifact_ids",
+        ):
+            unlinked.validate()
+        self.assertTrue(
+            all(
+                run.session_id == wave.session_id
+                and run.cycle_id == wave.cycle_id
+                and run.wave_id == wave.id
+                and run.configuration_epoch == state.configuration_epoch
+                and run.extra["proof_experiment_id"]
+                == proof_experiment.id
+                and run.extra["recipe_sha256"]
+                == recipe.recipe_sha256
+                for run in proof_runs
+            )
+        )
+        self.assertEqual(
+            sum(
+                run.extra.get("negative_control") is True
+                for run in proof_runs
+            ),
+            1,
+        )
+        control_specs = [
+            spec
+            for spec in sandboxes[0].proof_specs
+            if spec.network_target is None
+        ]
+        self.assertEqual(len(control_specs), 1)
+        self.assertLessEqual(control_specs[0].timeout_seconds or 31, 30)
+        self.assertEqual(sandboxes[0].proof_calls, 11)
+        self.assertEqual(
+            sandboxes[0].proof_input_calls,
+            [(("solver.py", solver.read_bytes()),)] * 11,
+        )
+        self.assertIsNotNone(state.active_managed_session_id)
+        self.assertEqual(state.sessions[-1].status, SessionStatus.RUNNING)
+        tampered = copy.deepcopy(state)
+        source_experiment = next(
+            item
+            for item in tampered.experiments
+            if item.id == recipe.source_experiment_id
+        )
+        source_experiment.kind = ExperimentKind.PROOF
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "source run is not linked by its source experiment",
+        ):
+            tampered.validate()
+
+    def test_proof_wave_rejects_candidate_without_a_tool_source(self):
+        identity = ChallengeIdentity(
+            "Managed CTF", "pwn", "proof-no-source"
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFno-source")
+        executor = ProbeRoleExecutor(captain_stage="proof")
+        engine = self.engine(executor)
+        engine.add_challenge(
+            identity,
+            prompt="reject a model-only candidate",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        state = engine.record_candidate(
+            identity,
+            "KCTF{proof_flag}",
+            print_immediately=False,
+        )
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.value == "KCTF{proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(identity)
+
+        self.assertNotEqual(
+            state.status,
+            ChallengeStatus.READY_TO_SUBMIT,
+        )
+        self.assertEqual(state.submissions, [])
+        self.assertFalse(
+            any(
+                item.kind is ExperimentKind.PROOF
+                for item in state.experiments
+            )
+        )
+        self.assertIn(
+            "exactly one valid engine-bound replay recipe",
+            state.checkpoints[-1].note or "",
+        )
+        self.assertEqual(state.status, ChallengeStatus.TRIAGING)
+        self.assertIsNotNone(state.active_managed_session_id)
+        self.assertEqual(state.sessions[-1].status, SessionStatus.RUNNING)
+
+    def test_managed_proof_rejects_operator_tool_source(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="the operator tool emits a candidate",
+            keep_if="the candidate is present",
+            drop_if="the candidate is absent",
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(experiment_id,),
+        )
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.value == "KCTF{tool_flag}"
+        )
+
+        with self.assertRaisesRegex(
+            EngineError,
+            "operator tool candidates must use the explicit ctfos prove",
+        ):
+            engine._managed_proof_replay_source(state, candidate.id)
+
+    def test_proof_wave_rejects_reproducer_extra_action(self):
+        identity = ChallengeIdentity(
+            "Managed CTF",
+            "pwn",
+            "proof-extra-action",
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFextra-action")
+        executor = ProbeRoleExecutor(
+            captain_stage="proof",
+            proof_extra_action=True,
+        )
+        sandboxes_by_work: dict[Path, ReplaySandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            key = work.resolve()
+            if key not in sandboxes_by_work:
+                sandboxes_by_work[key] = ReplaySandbox(work)
+            return sandboxes_by_work[key]
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state = engine.add_challenge(
+            identity,
+            prompt="reject an extra proof-wave action",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        endpoint = "https://extra-action.example:443"
+        state = engine.add_network_target(
+            identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        engine.select_network_target(identity, state.targets[-1].id)
+        _state, source_experiment_id = engine.register_experiment(
+            identity,
+            command=("true",),
+            expected_observation="the remote tool emits a candidate",
+            keep_if="the candidate is present",
+            drop_if="the candidate is absent",
+            network_target=endpoint,
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            identity,
+            source_experiment_id,
+        )
+        source_state = engine.store.load(identity)
+        candidate = next(
+            item
+            for item in source_state.candidates
+            if item.value == "KCTF{proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+
+        state = orchestrator.run_cycle(identity)
+
+        self.assertFalse(
+            any(
+                item.kind is ExperimentKind.PROOF
+                for item in state.experiments
+            )
+        )
+        self.assertIn(
+            "exactly one valid engine-bound replay recipe",
+            state.checkpoints[-1].note or "",
+        )
+        proof_cycle = state.cycles[-1]
+        proof_run_ids = {
+            proof_cycle.captain_run_id,
+            *(
+                state.waves[-1].role_run_ids.values()
+                if proof_cycle.wave_id is not None
+                else ()
+            ),
+        }
+        self.assertFalse(
+            any(
+                item.status is ExperimentStatus.REGISTERED
+                and item.source_run_id in proof_run_ids
+                for item in state.experiments
+            )
+        )
+
+    def test_proof_wave_rejects_source_argv_with_candidate_literal(self):
+        identity = ChallengeIdentity(
+            "Managed CTF", "pwn", "proof-literal"
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFliteral")
+        executor = ProbeRoleExecutor(captain_stage="proof")
+        sandboxes: list[ReplaySandbox] = []
+        sandboxes_by_work: dict[Path, ReplaySandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            key = work.resolve()
+            sandbox = sandboxes_by_work.get(key)
+            if sandbox is None:
+                sandbox = ReplaySandbox(work)
+                sandboxes_by_work[key] = sandbox
+                sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        engine.add_challenge(
+            identity,
+            prompt="reject a hardcoded candidate replay",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        endpoint = "https://literal-pwn.example:443"
+        state = engine.add_network_target(
+            identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        engine.select_network_target(identity, state.targets[-1].id)
+        _state, source_experiment_id = engine.register_experiment(
+            identity,
+            command=(
+                "python3",
+                "-c",
+                "print('KCTF{proof_flag}')",
+            ),
+            expected_observation="the tool emits a candidate",
+            keep_if="the candidate is present",
+            drop_if="the candidate is absent",
+            network_target=endpoint,
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            identity,
+            source_experiment_id,
+        )
+        state = engine.store.load(identity)
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.value == "KCTF{proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+
+        state = orchestrator.run_cycle(identity)
+
+        self.assertNotEqual(
+            state.status,
+            ChallengeStatus.READY_TO_SUBMIT,
+        )
+        self.assertEqual(sandboxes[0].proof_calls, 0)
+        self.assertEqual(state.submissions, [])
+        self.assertFalse(
+            any(
+                item.kind is ExperimentKind.PROOF
+                for item in state.experiments
+            )
+        )
+        for credential_command in (
+            "python3 solver.py --token=credential-looking-value",
+            "curl -u alice:credential-looking-value https://pwn.example",
+            "curl -b credential-looking-value https://pwn.example",
+        ):
+            credential_state = copy.deepcopy(engine.store.load(identity))
+            credential_source = next(
+                item
+                for item in credential_state.experiments
+                if isinstance(item.result, dict)
+                and item.result.get("run_id") == candidate.source_run_id
+            )
+            credential_source.command = credential_command
+            with (
+                self.subTest(command=credential_command.split()[1]),
+                self.assertRaisesRegex(
+                    EngineError,
+                    "appears to contain credential material",
+                ),
+            ):
+                engine._managed_proof_replay_source(
+                    credential_state,
+                    candidate.id,
+                )
+
+    def test_remote_negative_control_blocks_encoded_candidate_replay(self):
+        identity = ChallengeIdentity(
+            "Managed CTF", "pwn", "proof-encoded"
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFencoded")
+        executor = ProbeRoleExecutor(captain_stage="proof")
+        sandboxes: list[AlwaysReplaySandbox] = []
+        sandboxes_by_work: dict[Path, AlwaysReplaySandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            key = work.resolve()
+            sandbox = sandboxes_by_work.get(key)
+            if sandbox is None:
+                sandbox = AlwaysReplaySandbox(work)
+                sandboxes_by_work[key] = sandbox
+                sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state = engine.add_challenge(
+            identity,
+            prompt="negative-control an encoded output replay",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        endpoint = "https://encoded-pwn.example:443"
+        state = engine.add_network_target(
+            identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        state = engine.select_network_target(identity, target.id)
+        solver = engine._workspace(state) / "solver.py"
+        encoded = b"S0NURntwcm9vZl9mbGFnfQ=="
+        solver.write_bytes(b"encoded = b'" + encoded + b"'\n")
+        self.assertNotIn(b"KCTF{proof_flag}", solver.read_bytes())
+        _state, solver_artifact = engine.register_workspace_artifact(
+            identity,
+            "solver.py",
+        )
+        _state, source_experiment_id = engine.register_experiment(
+            identity,
+            command=("python3", "solver.py"),
+            expected_observation="the tool emits a candidate",
+            keep_if="the candidate is present",
+            drop_if="the candidate is absent",
+            network_target=endpoint,
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            identity,
+            source_experiment_id,
+        )
+        source_state = engine.store.load(identity)
+        candidate = next(
+            item
+            for item in source_state.candidates
+            if item.value == "KCTF{proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+        executor.proof_artifact_id = solver_artifact.id
+
+        state = orchestrator.run_cycle(identity)
+
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertEqual(state.submissions, [])
+        proof_experiment = next(
+            item
+            for item in state.experiments
+            if item.kind is ExperimentKind.PROOF
+        )
+        self.assertEqual(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        self.assertFalse(proof_experiment.result["passed"])
+        self.assertIn(
+            "candidate reproduced without the remote target",
+            "\n".join(proof_experiment.result["failures"]),
+        )
+        proof_runs = [
+            run for run in state.runs if run.origin is RunOrigin.PROOF
+        ]
+        self.assertEqual(len(proof_runs), 11)
+        self.assertEqual(
+            sum(
+                run.extra.get("negative_control") is True
+                for run in proof_runs
+            ),
+            1,
+        )
+
+    def test_reconcile_finishes_terminal_session_after_completed_checkpoint(
+        self,
+    ):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        checkpointed = orchestrator._checkpoint(
+            self.identity,
+            session_id,
+            cycle.id,
+            note="durable terminal checkpoint",
+        )
+        self.assertIsNotNone(cycle.id)
+        self.assertIsNotNone(checkpointed.active_managed_session_id)
+
+        def mark_terminal(state):
+            state.status = ChallengeStatus.READY_TO_SUBMIT
+
+        terminal = engine.store.update(self.identity, mark_terminal)
+        self.assertEqual(
+            terminal.active_managed_session_id,
+            session_id,
+        )
+
+        recovered = orchestrator.reconcile(self.identity)
+
+        self.assertIsNone(recovered.active_managed_session_id)
+        session = next(
+            item for item in recovered.sessions if item.id == session_id
+        )
+        self.assertEqual(session.status, SessionStatus.COMPLETED)
+        self.assertIn("terminal challenge", session.stop_reason or "")
 
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()

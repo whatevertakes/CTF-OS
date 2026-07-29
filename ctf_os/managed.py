@@ -185,7 +185,14 @@ class ManagedOrchestrator:
             for item in state.experiments
             if (
                 item.status is ExperimentStatus.REGISTERED
-                and item.extra.get("network_target") is not None
+                and (
+                    item.extra.get("network_target") is not None
+                    or (
+                        item.kind is ExperimentKind.PROOF
+                        and item.proof_recipe is not None
+                        and item.proof_recipe.network_endpoint is not None
+                    )
+                )
             )
         ]
         remote_pending = bool(remote_experiments)
@@ -218,16 +225,36 @@ class ManagedOrchestrator:
             else:
                 for experiment in remote_experiments:
                     if (
-                        experiment.extra.get("network_target_id")
-                        != primary.id
-                        or experiment.extra.get(
+                        experiment.kind is ExperimentKind.PROOF
+                        and experiment.proof_recipe is not None
+                    ):
+                        recipe = experiment.proof_recipe
+                        target_id = recipe.network_target_id
+                        target_generation = (
+                            recipe.network_target_generation
+                        )
+                        configuration_epoch = (
+                            recipe.configuration_epoch
+                        )
+                        endpoint = recipe.network_endpoint
+                    else:
+                        target_id = experiment.extra.get(
+                            "network_target_id"
+                        )
+                        target_generation = experiment.extra.get(
                             "network_target_generation"
                         )
-                        != primary.generation
-                        or experiment.extra.get("configuration_epoch")
-                        != state.configuration_epoch
-                        or experiment.extra.get("network_target")
-                        != primary.endpoint
+                        configuration_epoch = experiment.extra.get(
+                            "configuration_epoch"
+                        )
+                        endpoint = experiment.extra.get(
+                            "network_target"
+                        )
+                    if (
+                        target_id != primary.id
+                        or target_generation != primary.generation
+                        or configuration_epoch != state.configuration_epoch
+                        or endpoint != primary.endpoint
                     ):
                         issues.append(
                             f"remote experiment {experiment.id} has a stale "
@@ -632,6 +659,24 @@ class ManagedOrchestrator:
             if item.status is ExperimentStatus.REGISTERED
             and item.source_run_id in role_order
         ]
+        if wave.kind is WaveKind.PROOF:
+            reproducer_run_id = wave.role_run_ids.get("reproducer")
+            proof_recipes = [
+                item
+                for item in candidates
+                if item.kind is ExperimentKind.PROOF
+                and item.proof_recipe is not None
+                and item.source_run_id == reproducer_run_id
+            ]
+            proof_recipes.sort(key=lambda item: item.id)
+            if len(proof_recipes) != 1 or len(candidates) != 1:
+                raise ManagedError(
+                    "proof wave must produce exactly one registered proof "
+                    "recipe and no other actions; observed "
+                    f"{len(proof_recipes)} recipe(s) and "
+                    f"{len(candidates)} total action(s)"
+                )
+            return (proof_recipes[0].id,)
         open_hypotheses = {
             item.id
             for item in state.hypotheses
@@ -910,6 +955,26 @@ class ManagedOrchestrator:
                 "selected managed experiments disappeared: "
                 + ", ".join(missing)
             )
+        proof_experiments = [
+            item
+            for item in experiments.values()
+            if item.kind is ExperimentKind.PROOF
+        ]
+        if proof_experiments:
+            if (
+                len(selected) != 1
+                or len(proof_experiments) != 1
+                or proof_experiments[0].proof_recipe is None
+            ):
+                raise ManagedError(
+                    "managed proof dispatch requires exactly one typed recipe"
+                )
+            self.engine.execute_proof_experiment(
+                identity,
+                proof_experiments[0].id,
+                _session_owned=True,
+            )
+            return self.engine.store.load(identity)
         run_roles = {item.id: item.role for item in state.runs}
         lanes: dict[str, list[str]] = {}
         for experiment_id in selected:
@@ -1175,6 +1240,30 @@ class ManagedOrchestrator:
             for cycle in state.cycles
             if cycle.completed_at is None
         }
+        active_session_id = state.active_managed_session_id
+        if (
+            active_session_id is not None
+            and state.status
+            in {
+                ChallengeStatus.READY_TO_SUBMIT,
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+            }
+            and not any(
+                cycle.session_id == active_session_id
+                and cycle.completed_at is None
+                for cycle in state.cycles
+            )
+        ):
+            return self._finish_session(
+                identity,
+                active_session_id,
+                status=SessionStatus.COMPLETED,
+                reason=(
+                    "managed recovery finalized a terminal challenge after "
+                    "its durable checkpoint"
+                ),
+            )
         if not unfinished_cycle_ids:
             return state
         current = self.engine.store.load(identity)
@@ -1459,7 +1548,19 @@ class ManagedOrchestrator:
             self._apply_builder_publishes(identity, outcome.results)
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
-            selected = self._select_actions(latest, wave)
+            try:
+                selected = self._select_actions(latest, wave)
+            except ManagedError:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason=(
+                        "proof wave did not produce exactly one valid "
+                        "engine-bound replay recipe"
+                    ),
+                    note=note,
+                )
             self._mark_action_selection(
                 identity,
                 selected_session,
@@ -1472,7 +1573,21 @@ class ManagedOrchestrator:
                     identity,
                     session_id=selected_session,
                 )
-                self._execute_selected_actions(identity, selected)
+                try:
+                    self._execute_selected_actions(identity, selected)
+                except EngineError:
+                    if wave.kind is not WaveKind.PROOF:
+                        raise
+                    return self._checkpoint_invalid_cycle(
+                        identity,
+                        selected_session,
+                        cycle.id,
+                        reason=(
+                            "managed proof recipe was stale, unsupported, "
+                            "or did not complete its replay"
+                        ),
+                        note=note,
+                    )
             state = self._checkpoint(
                 identity,
                 selected_session,

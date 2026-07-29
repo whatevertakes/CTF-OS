@@ -109,8 +109,12 @@ from ctf_os.models import (
     GoalStatus,
     Hypothesis,
     HypothesisStatus,
+    MAX_MANAGED_PROOF_INPUT_BYTES,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
     ProgressMarker,
+    ProofPolicySnapshot,
+    ProofRecipe,
+    ProofRecipeInput,
     Provenance,
     ReceiptOutcome,
     RunOrigin,
@@ -121,6 +125,7 @@ from ctf_os.models import (
     SubmissionOverride,
     TargetRecord,
     TargetStatus,
+    WaveKind,
     utc_now,
 )
 from ctf_os.schema import (
@@ -172,6 +177,7 @@ from ctf_os.store.atomic import (
     atomic_write_json,
     atomic_write_text,
     read_json,
+    strict_json_loads,
 )
 from ctf_os.store.locks import FileLock
 
@@ -742,6 +748,180 @@ def _relative_workspace_artifact(value: str, role: Role) -> str:
             f"{value!r}"
         )
     return (PurePosixPath(*prefix) / posix).as_posix()
+
+
+def _valid_proof_destination(value: str) -> bool:
+    raw_parts = value.split("/")
+    path = PurePosixPath(value)
+    return (
+        bool(value)
+        and value != "."
+        and "\x00" not in value
+        and "\\" not in value
+        and len(value.encode("utf-8")) <= 4096
+        and all(
+            part not in {"", ".", ".."}
+            and len(part.encode("utf-8")) <= 255
+            for part in raw_parts
+        )
+        and not path.is_absolute()
+        and ".." not in path.parts
+    )
+
+
+_PROOF_CREDENTIAL_OPTION_NAMES = frozenset(
+    {
+        "--api-key",
+        "--apikey",
+        "--auth-file",
+        "--auth-token",
+        "--authorization",
+        "--bearer",
+        "--cookie",
+        "--cookie-file",
+        "--credentials",
+        "--ftp-password",
+        "--http-password",
+        "--netrc",
+        "--netrc-file",
+        "--password",
+        "--password-stdin",
+        "--passwd",
+        "--private-key",
+        "--proxy-password",
+        "--secret",
+        "--session-id",
+        "--token",
+    }
+)
+_PROOF_CREDENTIAL_POSITIONAL_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "auth_token",
+        "authorization",
+        "cookie",
+        "password",
+        "passwd",
+        "secret",
+        "session",
+        "session_id",
+        "token",
+    }
+)
+_PROOF_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?:^|[^A-Za-z0-9_])"
+    r"(?:access[_-]?(?:code|key|token)|api[_-]?key|"
+    r"auth(?:orization)?|cookie|identity[_-]?file|password|passwd|"
+    r"private[_-]?key|secret|session[_-]?id|token)"
+    r"\s*[:=]\s*\S+"
+)
+_PROOF_CREDENTIAL_LONG_OPTION = re.compile(
+    r"(?i)^--(?:access[-_]?(?:code|key|token)|api[-_]?key|"
+    r"auth(?:orization)?|bearer|cookie(?:[-_]?file)?|credentials?|"
+    r"identity[-_]?file|netrc(?:[-_]?file)?|password(?:[-_]?stdin)?|"
+    r"passwd|private[-_]?key|proxy[-_]?password|secret|"
+    r"session[-_]?id|token)(?:=|$)"
+)
+_PROOF_CREDENTIAL_HEADER = re.compile(
+    r"(?i)\b(?:authorization|cookie|proxy-authorization)\s*:\s*\S+"
+)
+_PROOF_URL_USERINFO = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@"
+)
+_PROOF_JWT = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    r"(?![A-Za-z0-9_-])"
+)
+_PROOF_SECRET_PREFIX = re.compile(
+    r"(?i)(?:^|[^A-Za-z0-9])(?:ghp_|github_pat_|sk-)"
+    r"[A-Za-z0-9_-]{8,}"
+)
+
+
+def _proof_argv_contains_credential_material(
+    argv: Sequence[str],
+) -> bool:
+    """Conservatively reject replay commands that appear to carry secrets."""
+
+    executable = (
+        PurePosixPath(argv[0]).name.casefold() if argv else ""
+    )
+    curl_like = executable in {"curl", "curl.exe"}
+    ssh_like = executable in {
+        "scp",
+        "scp.exe",
+        "sftp",
+        "sftp.exe",
+        "ssh",
+        "ssh.exe",
+    }
+    for index, argument in enumerate(argv):
+        stripped = argument.strip()
+        lowered = stripped.casefold()
+        option_name = lowered.split("=", 1)[0]
+        if curl_like and (
+            option_name in {
+                "-b",
+                "-u",
+                "--cert",
+                "--cookie",
+                "--key",
+                "--user",
+            }
+            or stripped == "-E"
+            or (
+                len(lowered) > 2
+                and lowered[:2] in {"-b", "-u"}
+            )
+            or (len(stripped) > 2 and stripped.startswith("-E"))
+        ):
+            if "=" in stripped:
+                return bool(stripped.split("=", 1)[1].strip())
+            if (
+                len(lowered) > 2
+                and lowered[:2] in {"-b", "-u"}
+            ) or (len(stripped) > 2 and stripped.startswith("-E")):
+                return True
+            if index + 1 < len(argv):
+                return bool(argv[index + 1].strip())
+        if ssh_like and (
+            lowered == "-i"
+            or (len(lowered) > 2 and lowered.startswith("-i"))
+            or lowered.startswith("-oidentityfile=")
+        ):
+            if lowered != "-i":
+                return True
+            if index + 1 < len(argv):
+                return bool(argv[index + 1].strip())
+        if (
+            "-----begin " in lowered
+            and "private key-----" in lowered
+        ):
+            return True
+        if (
+            _PROOF_CREDENTIAL_ASSIGNMENT.search(stripped)
+            or _PROOF_CREDENTIAL_HEADER.search(stripped)
+            or _PROOF_URL_USERINFO.search(stripped)
+            or _PROOF_JWT.search(stripped)
+            or _PROOF_SECRET_PREFIX.search(stripped)
+            or re.search(r"\bAKIA[0-9A-Z]{16}\b", stripped)
+            or _PROOF_CREDENTIAL_LONG_OPTION.match(lowered)
+        ):
+            return True
+        if option_name in _PROOF_CREDENTIAL_OPTION_NAMES:
+            if "=" in stripped:
+                return bool(stripped.split("=", 1)[1])
+            if index + 1 < len(argv):
+                return bool(argv[index + 1].strip())
+        if (
+            lowered in _PROOF_CREDENTIAL_POSITIONAL_NAMES
+            and index + 1 < len(argv)
+            and argv[index + 1].strip()
+        ):
+            return True
+    return False
 
 
 def _infer_resource_class(command: str) -> str:
@@ -2139,6 +2319,479 @@ class ChallengeEngine:
             enforcement=str(
                 state.metadata.get("network_enforcement", "declared")
             ),
+        )
+
+    def _managed_proof_policy_snapshot(
+        self,
+        state: ChallengeState,
+        *,
+        remote: bool,
+    ) -> ProofPolicySnapshot:
+        """Mint the non-model proof policy supported by this vertical slice."""
+
+        adapter = get_adapter(state.category)
+        if adapter.name != "pwn" or not remote:
+            category_note = {
+                "pwn": (
+                    "Local Pwn managed proof remains fail-closed until a "
+                    "category impact or differential oracle is implemented"
+                ),
+                "crypto": (
+                    "Crypto managed proof remains fail-closed until the "
+                    "metamorphic-variant oracle runner is implemented"
+                ),
+                "rev": (
+                    "Rev managed proof remains fail-closed until the "
+                    "original-binary executable oracle runner is implemented"
+                ),
+                "web": (
+                    "Web managed proof remains fail-closed until the "
+                    "multi-user impact oracle runner is implemented"
+                ),
+                "forensics": (
+                    "Forensics managed proof remains fail-closed until the "
+                    "evidence hash-chain oracle runner is implemented"
+                ),
+                "misc": (
+                    "Misc managed proof remains fail-closed until the "
+                    "transform-DAG reverse oracle runner is implemented"
+                ),
+            }.get(
+                adapter.name,
+                (
+                    f"{adapter.name} managed proof remains fail-closed until "
+                    "its deterministic category oracle runner is implemented"
+                ),
+            )
+            raise EngineError(category_note)
+        policy = adapter.proof_policy(remote=remote)
+        return ProofPolicySnapshot.create(
+            mode=policy.mode,
+            oracle_protocol=(
+                "remote_pwn_replay_negative_control_v1"
+            ),
+            clean_repetitions=policy.clean_repetitions,
+            remote_repetitions=policy.remote_repetitions,
+            trial_count=policy.trial_count,
+            negative_control_repetitions=1,
+            negative_control_timeout_seconds=30,
+            minimum_success_rate=policy.minimum_success_rate,
+            notes=policy.notes,
+        )
+
+    def _canonical_artifact_contains_bytes(
+        self,
+        state: ChallengeState,
+        artifact: ArtifactReference,
+        needle: bytes,
+    ) -> bool:
+        """Scan an exact immutable artifact snapshot without trusting its path."""
+
+        if (
+            not needle
+            or artifact.size is None
+            or isinstance(artifact.size, bool)
+            or artifact.size < 0
+        ):
+            return False
+        paths = self.store.challenge_paths(state.identity)
+        paths.runtime.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".ctfos-proof-scan-",
+            dir=paths.runtime,
+        ) as temporary:
+            copied = copy_bounded_regular(
+                paths.root,
+                artifact.path,
+                Path(temporary) / "artifact.bin",
+                maximum_bytes=min(
+                    DEFAULT_SNAPSHOT_MAX_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.size,
+                mode=0o400,
+            )
+            overlap = b""
+            with copied.path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        return needle in overlap
+                    window = overlap + chunk
+                    if needle in window:
+                        return True
+                    overlap = window[-max(0, len(needle) - 1) :]
+
+    @staticmethod
+    def _managed_proof_replay_source(
+        state: ChallengeState,
+        candidate_id: str,
+    ) -> tuple[FlagCandidate, Experiment, RunReference, tuple[str, ...]]:
+        """Resolve a candidate to the exact completed tool command it came from."""
+
+        candidate = next(
+            (item for item in state.candidates if item.id == candidate_id),
+            None,
+        )
+        if candidate is None:
+            raise EngineError(f"unknown candidate: {candidate_id}")
+        if candidate.status in {
+            CandidateStatus.REJECTED,
+            CandidateStatus.ACCEPTED,
+        }:
+            raise EngineError(
+                "managed proof cannot replace a manual candidate outcome"
+            )
+        if not candidate.source_run_id:
+            raise EngineError(
+                "managed proof requires a candidate from a completed tool run"
+            )
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == candidate.source_run_id
+            ),
+            None,
+        )
+        if (
+            source_run is None
+            or source_run.status is not RunStatus.COMPLETED
+            or source_run.origin is not RunOrigin.MANAGED_TOOL
+        ):
+            raise EngineError(
+                "managed proof candidate source is not a completed "
+                "managed tool run; operator tool candidates must use the "
+                "explicit ctfos prove workflow"
+            )
+        source_experiments = [
+            item
+            for item in state.experiments
+            if isinstance(item.result, Mapping)
+            and item.result.get("run_id") == source_run.id
+            and item.kind is not ExperimentKind.PROOF
+        ]
+        if len(source_experiments) != 1:
+            raise EngineError(
+                "managed proof candidate source run must resolve to exactly "
+                "one canonical tool experiment"
+            )
+        source_experiment = source_experiments[0]
+        if source_run.extra.get("experiment_id") != source_experiment.id:
+            raise EngineError(
+                "managed proof source run does not link its tool experiment"
+            )
+        if source_experiment.status not in {
+            ExperimentStatus.COMPLETED,
+            ExperimentStatus.AWAITING_EVALUATION,
+            ExperimentStatus.KEPT,
+        }:
+            raise EngineError(
+                "managed proof source experiment is not successfully complete"
+            )
+        try:
+            argv = tuple(shlex.split(source_experiment.command))
+        except ValueError as error:
+            raise EngineError(
+                f"managed proof source command is invalid: {error}"
+            ) from error
+        if not argv:
+            raise EngineError("managed proof source command is empty")
+        if _proof_argv_contains_credential_material(argv):
+            raise EngineError(
+                "managed proof source argv appears to contain credential "
+                "material"
+            )
+        try:
+            ensure_foreground_command(argv)
+            CommandSpec.create(argv)
+        except (BackgroundJobUnsupported, ValueError) as error:
+            raise EngineError(
+                f"managed proof source command is unsafe: {error}"
+            ) from error
+        if any(candidate.value in argument for argument in argv):
+            raise EngineError(
+                "managed proof source argv embeds the candidate literal"
+            )
+        return candidate, source_experiment, source_run, argv
+
+    def _require_managed_proof_recipe_current(
+        self,
+        state: ChallengeState,
+        recipe: ProofRecipe,
+    ) -> tuple[FlagCandidate, Experiment, RunReference]:
+        """Fail closed if any engine-owned proof binding became stale."""
+
+        (
+            candidate,
+            source_experiment,
+            source_run,
+            replay_argv,
+        ) = self._managed_proof_replay_source(
+            state,
+            recipe.candidate_id,
+        )
+        self._require_managed_candidate_durable_output(
+            state,
+            candidate,
+            source_experiment,
+            source_run,
+        )
+        if (
+            source_experiment.id != recipe.source_experiment_id
+            or source_run.id != recipe.source_run_id
+            or replay_argv != recipe.argv
+        ):
+            raise EngineError(
+                "managed proof recipe no longer matches its source replay"
+            )
+        (
+            source_request_sha256,
+            image_reference,
+            request_target_endpoint,
+            request_target_id,
+            request_target_generation,
+        ) = (
+            self._managed_proof_source_environment(
+                state,
+                source_experiment,
+                source_run,
+                replay_argv,
+            )
+        )
+        if (
+            recipe.source_request_sha256 != source_request_sha256
+            or recipe.image_reference != image_reference
+            or recipe.network_endpoint != request_target_endpoint
+            or recipe.network_target_id != request_target_id
+            or recipe.network_target_generation
+            != request_target_generation
+        ):
+            raise EngineError(
+                "managed proof source request or image pin is stale"
+            )
+        manifest = state.metadata.get("source_manifest_sha256")
+        if (
+            manifest != recipe.source_manifest_sha256
+            or recipe.configuration_epoch != state.configuration_epoch
+        ):
+            raise EngineError(
+                "managed proof recipe source or configuration pin is stale"
+            )
+        target_fields = (
+            recipe.network_target_id,
+            recipe.network_target_generation,
+            recipe.network_endpoint,
+        )
+        remote = all(item is not None for item in target_fields)
+        if not remote and any(item is not None for item in target_fields):
+            raise EngineError("managed proof recipe has a partial target pin")
+        if remote:
+            target = next(
+                (
+                    item
+                    for item in state.targets
+                    if item.id == recipe.network_target_id
+                ),
+                None,
+            )
+            if (
+                target is None
+                or state.primary_target_id != target.id
+                or target.status is not TargetStatus.ACTIVE
+                or self._target_is_expired(target)
+                or target.generation
+                != recipe.network_target_generation
+                or target.endpoint != recipe.network_endpoint
+                or target.enforcement != "proxy"
+            ):
+                raise EngineError(
+                    "managed proof target, generation, or configuration "
+                    "pin is stale"
+                )
+            self._network_policy(state).authorize(
+                NetworkTarget.parse(target.endpoint)
+            )
+        current_policy = self._managed_proof_policy_snapshot(
+            state,
+            remote=remote,
+        )
+        if (
+            recipe.policy.policy_sha256
+            != current_policy.policy_sha256
+            or recipe.policy != current_policy
+            or recipe.recipe_sha256 != recipe.computed_sha256()
+        ):
+            raise EngineError(
+                "managed proof recipe policy or canonical hash is stale"
+            )
+        artifacts = {item.id: item for item in state.artifacts}
+        for proof_input in recipe.inputs:
+            artifact = artifacts.get(proof_input.artifact_id)
+            if (
+                artifact is None
+                or artifact.sha256.lower() != proof_input.sha256
+                or artifact.size != proof_input.size
+                or artifact.source_run_id != proof_input.source_run_id
+            ):
+                raise EngineError(
+                    "managed proof input artifact binding is stale: "
+                    f"{proof_input.artifact_id}"
+                )
+        return candidate, source_experiment, source_run
+
+    def _require_managed_candidate_durable_output(
+        self,
+        state: ChallengeState,
+        candidate: FlagCandidate,
+        source_experiment: Experiment,
+        source_run: RunReference,
+    ) -> None:
+        receipt_id = (
+            source_experiment.result.get("receipt_id")
+            if isinstance(source_experiment.result, Mapping)
+            else None
+        )
+        receipt = next(
+            (
+                item
+                for item in state.receipts
+                if item.id == receipt_id
+            ),
+            None,
+        )
+        if (
+            receipt is None
+            or receipt.run_id != source_run.id
+            or receipt.outcome is not ReceiptOutcome.SUCCEEDED
+            or receipt.stdout_artifact_id is None
+        ):
+            raise EngineError(
+                "managed proof candidate lacks a successful source receipt"
+            )
+        artifact_ids = {
+            receipt.stdout_artifact_id,
+            *(
+                (receipt.stderr_artifact_id,)
+                if receipt.stderr_artifact_id is not None
+                else ()
+            ),
+        }
+        source_artifacts = [
+            artifact
+            for artifact in state.artifacts
+            if artifact.id in artifact_ids
+            and artifact.source_run_id == source_run.id
+            and artifact.size is not None
+        ]
+        if len(source_artifacts) != len(artifact_ids):
+            raise EngineError(
+                "managed proof source receipt artifact chain is incomplete"
+            )
+        if not any(
+            self._canonical_artifact_contains_bytes(
+                state,
+                artifact,
+                candidate.value.encode("utf-8"),
+            )
+            for artifact in source_artifacts
+        ):
+            raise EngineError(
+                "managed proof candidate is absent from its source run's "
+                "durable output artifacts"
+            )
+
+    def _managed_proof_source_environment(
+        self,
+        state: ChallengeState,
+        source_experiment: Experiment,
+        source_run: RunReference,
+        argv: Sequence[str],
+    ) -> tuple[
+        str,
+        str,
+        str | None,
+        str | None,
+        int | None,
+    ]:
+        """Bind replay to the exact tool request and pinned runtime image."""
+
+        request_path = self.store.run_paths(
+            state.identity,
+            run_id=source_run.id,
+        ).request
+        expected_relative = request_path.relative_to(
+            self.store.challenge_paths(state.identity).root
+        ).as_posix()
+        if source_run.request_path != expected_relative:
+            raise EngineError(
+                "managed proof source run request path is not canonical"
+            )
+        challenge_paths = self.store.challenge_paths(state.identity)
+        challenge_paths.runtime.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".ctfos-proof-request-",
+                dir=challenge_paths.runtime,
+            ) as temporary:
+                snapshot = copy_bounded_regular(
+                    challenge_paths.root,
+                    expected_relative,
+                    Path(temporary) / "request.json",
+                    maximum_bytes=1024 * 1024,
+                    mode=0o400,
+                )
+                request = strict_json_loads(
+                    snapshot.path.read_bytes(),
+                    max_bytes=1024 * 1024,
+                )
+                request_sha256 = snapshot.sha256
+        except (
+            OSError,
+            SafeFileError,
+            StrictJSONError,
+            ValueError,
+        ) as error:
+            raise EngineError(
+                "managed proof source tool request is unavailable"
+            ) from error
+        pinned_image = self.config.runtime.image_digest
+        expected_target = source_experiment.extra.get("network_target")
+        expected_target_id = source_experiment.extra.get(
+            "network_target_id"
+        )
+        expected_target_generation = source_experiment.extra.get(
+            "network_target_generation"
+        )
+        if (
+            not isinstance(request, Mapping)
+            or request.get("kind") != "tool"
+            or request.get("run_id") != source_run.id
+            or request.get("experiment_id")
+            != source_run.extra.get("experiment_id")
+            or request.get("argv") != list(argv)
+            or request.get("configuration_epoch")
+            != state.configuration_epoch
+            or not isinstance(pinned_image, str)
+            or not pinned_image
+            or request.get("image_reference") != pinned_image
+            or request.get("image_digest") != pinned_image
+            or request.get("network_target") != expected_target
+            or request.get("network_target_id") != expected_target_id
+            or request.get("network_target_generation")
+            != expected_target_generation
+        ):
+            raise EngineError(
+                "managed proof source request does not match the current "
+                "pinned image, argv, or configuration"
+            )
+        return (
+            request_sha256,
+            pinned_image,
+            request.get("network_target"),
+            request.get("network_target_id"),
+            request.get("network_target_generation"),
         )
 
     def _require_experiment_target_current(
@@ -3567,6 +4220,10 @@ class ChallengeEngine:
 
         def apply(state: ChallengeState) -> None:
             base_fact_ids = {fact.id for fact in base_state.facts}
+            base_artifacts = {
+                artifact.id: artifact
+                for artifact in base_state.artifacts
+            }
             base_artifact_ids = {
                 artifact.id for artifact in base_state.artifacts
             }
@@ -3903,7 +4560,468 @@ class ChallengeEngine:
 
                 actions = semantic_output.get("actions", [])
                 if isinstance(actions, list):
+                    reservation = next(
+                        (
+                            item
+                            for item in base_state.runs
+                            if item.id == run_id
+                        ),
+                        None,
+                    )
+                    reservation_wave = next(
+                        (
+                            item
+                            for item in base_state.waves
+                            if reservation is not None
+                            and item.id == reservation.wave_id
+                        ),
+                        None,
+                    )
+                    decision = semantic_output.get("decision")
+                    captain_selected_proof = (
+                        result.invocation.role is Role.CAPTAIN
+                        and isinstance(decision, Mapping)
+                        and decision.get("next_stage") == "proof"
+                    )
+                    proof_action_context = (
+                        captain_selected_proof
+                        or (
+                            reservation_wave is not None
+                            and reservation_wave.kind is WaveKind.PROOF
+                        )
+                    )
+                    if proof_action_context:
+                        if result.invocation.role is Role.REPRODUCER:
+                            if (
+                                len(actions) != 1
+                                or not isinstance(actions[0], Mapping)
+                                or actions[0].get("kind")
+                                != "prove_candidate"
+                            ):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    0,
+                                    "a proof-wave Reproducer must emit exactly "
+                                    "one action and it must be prove_candidate",
+                                )
+                                actions = []
+                        else:
+                            for action_index, action in enumerate(
+                                actions,
+                                start=1,
+                            ):
+                                if (
+                                    isinstance(action, Mapping)
+                                    and action.get("kind") == "none"
+                                ):
+                                    continue
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    action_index,
+                                    "Captain, Validator, and Evidence Auditor "
+                                    "cannot register tool actions in a proof "
+                                    "cycle",
+                                )
+                            actions = []
+                    proof_action_count = sum(
+                        1
+                        for action in actions
+                        if isinstance(action, Mapping)
+                        and action.get("kind") == "prove_candidate"
+                    )
                     for index, action in enumerate(actions, start=1):
+                        if (
+                            isinstance(action, Mapping)
+                            and action.get("kind") == "prove_candidate"
+                        ):
+                            if proof_action_count != 1:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "a proof-wave Reproducer must propose "
+                                    "exactly one prove_candidate action",
+                                )
+                                continue
+                            if (
+                                result.invocation.contract_version
+                                != MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                                or result.invocation.role
+                                is not Role.REPRODUCER
+                            ):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "prove_candidate is restricted to the "
+                                    "managed v2 Reproducer",
+                                )
+                                continue
+                            if (
+                                reservation is None
+                                or reservation.origin
+                                is not RunOrigin.MANAGED_MODEL
+                                or reservation.role
+                                != Role.REPRODUCER.value
+                                or reservation_wave is None
+                                or reservation_wave.kind
+                                is not WaveKind.PROOF
+                            ):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "prove_candidate must originate from "
+                                    "the reserved Reproducer run of a proof "
+                                    "wave",
+                                )
+                                continue
+                            candidate_id = action.get("candidate_id")
+                            if not isinstance(candidate_id, str):
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    "candidate_id is invalid",
+                                )
+                                continue
+                            try:
+                                (
+                                    candidate,
+                                    source_experiment,
+                                    source_tool_run,
+                                    replay_argv,
+                                ) = self._managed_proof_replay_source(
+                                    base_state,
+                                    candidate_id,
+                                )
+                                self._require_managed_candidate_durable_output(
+                                    base_state,
+                                    candidate,
+                                    source_experiment,
+                                    source_tool_run,
+                                )
+                                input_values = action.get("inputs")
+                                if (
+                                    not isinstance(input_values, list)
+                                    or len(input_values) > 256
+                                ):
+                                    raise EngineError(
+                                        "proof inputs must be an array of at "
+                                        "most 256 canonical artifacts"
+                                    )
+                                proof_inputs: list[ProofRecipeInput] = []
+                                input_ids: set[str] = set()
+                                destinations: set[str] = set()
+                                total_input_bytes = 0
+                                candidate_bytes = candidate.value.encode(
+                                    "utf-8"
+                                )
+                                for input_value in input_values:
+                                    if not isinstance(
+                                        input_value, Mapping
+                                    ):
+                                        raise EngineError(
+                                            "proof input must be an object"
+                                        )
+                                    artifact_id = input_value.get(
+                                        "artifact_id"
+                                    )
+                                    purpose = input_value.get("purpose")
+                                    if (
+                                        not isinstance(artifact_id, str)
+                                        or artifact_id in input_ids
+                                    ):
+                                        raise EngineError(
+                                            "proof input artifact ids must "
+                                            "be valid and unique"
+                                        )
+                                    if purpose not in {
+                                        "reproducer",
+                                        "fixture",
+                                        "variant_generator",
+                                        "verifier",
+                                    }:
+                                        raise EngineError(
+                                            "proof input purpose is invalid"
+                                        )
+                                    artifact = base_artifacts.get(
+                                        artifact_id
+                                    )
+                                    if (
+                                        artifact is None
+                                        or artifact.size is None
+                                        or isinstance(artifact.size, bool)
+                                        or artifact.size < 0
+                                        or artifact.size
+                                        > MAX_MANAGED_PROOF_INPUT_BYTES
+                                        or len(artifact.sha256) != 64
+                                    ):
+                                        raise EngineError(
+                                            "proof input is not a bounded "
+                                            "canonical base artifact: "
+                                            f"{artifact_id}"
+                                        )
+                                    total_input_bytes += artifact.size
+                                    if total_input_bytes > min(
+                                        MAX_MANAGED_PROOF_INPUT_BYTES,
+                                        self.store.max_artifact_bytes,
+                                    ):
+                                        raise EngineError(
+                                            "proof input artifacts exceed "
+                                            "the aggregate byte limit"
+                                        )
+                                    source_locator = artifact.extra.get(
+                                        "source_locator"
+                                    )
+                                    if not isinstance(
+                                        source_locator, str
+                                    ):
+                                        raise EngineError(
+                                            "managed proof input artifact "
+                                            "lacks an engine-owned source "
+                                            f"destination: {artifact_id}"
+                                        )
+                                    destination = source_locator
+                                    if (
+                                        destination in destinations
+                                        or not _valid_proof_destination(
+                                            destination
+                                        )
+                                    ):
+                                        raise EngineError(
+                                            "engine-derived proof input "
+                                            "destinations must be safe and "
+                                            "unique"
+                                        )
+                                    if self._canonical_artifact_contains_bytes(
+                                        base_state,
+                                        artifact,
+                                        candidate_bytes,
+                                    ):
+                                        raise EngineError(
+                                            "proof input artifact embeds the "
+                                            "exact candidate bytes: "
+                                            f"{artifact_id}"
+                                        )
+                                    input_ids.add(artifact_id)
+                                    destinations.add(destination)
+                                    proof_inputs.append(
+                                        ProofRecipeInput(
+                                            artifact_id=artifact.id,
+                                            destination=destination,
+                                            purpose=str(purpose),
+                                            sha256=(
+                                                artifact.sha256.lower()
+                                            ),
+                                            size=artifact.size,
+                                            source_run_id=(
+                                                artifact.source_run_id
+                                            ),
+                                        )
+                                    )
+                                target_id = source_experiment.extra.get(
+                                    "network_target_id"
+                                )
+                                target_generation = (
+                                    source_experiment.extra.get(
+                                        "network_target_generation"
+                                    )
+                                )
+                                source_target_endpoint = (
+                                    source_experiment.extra.get(
+                                        "network_target"
+                                    )
+                                )
+                                target_endpoint: str | None = None
+                                if source_target_endpoint is not None:
+                                    if (
+                                        not isinstance(target_id, str)
+                                        or isinstance(
+                                            target_generation, bool
+                                        )
+                                        or not isinstance(
+                                            target_generation, int
+                                        )
+                                    ):
+                                        raise EngineError(
+                                            "remote source experiment lacks "
+                                            "a typed target/generation pin"
+                                        )
+                                    target = next(
+                                        (
+                                            item
+                                            for item in base_state.targets
+                                            if item.id == target_id
+                                        ),
+                                        None,
+                                    )
+                                    if (
+                                        target is None
+                                        or base_state.primary_target_id
+                                        != target.id
+                                        or target.status
+                                        is not TargetStatus.ACTIVE
+                                        or self._target_is_expired(target)
+                                        or target.generation
+                                        != target_generation
+                                        or target.endpoint
+                                        != source_target_endpoint
+                                        or target.enforcement != "proxy"
+                                        or source_experiment.extra.get(
+                                            "configuration_epoch"
+                                        )
+                                        != base_state.configuration_epoch
+                                    ):
+                                        raise EngineError(
+                                            "source replay target is not the "
+                                            "selected active proxy target at "
+                                            "its pinned generation"
+                                        )
+                                    target_endpoint = target.endpoint
+                                elif (
+                                    target_id is not None
+                                    or target_generation is not None
+                                ):
+                                    raise EngineError(
+                                        "local source experiment has a "
+                                        "partial target pin"
+                                    )
+                                manifest = base_state.metadata.get(
+                                    "source_manifest_sha256"
+                                )
+                                if (
+                                    not isinstance(manifest, str)
+                                    or len(manifest) != 64
+                                ):
+                                    raise EngineError(
+                                        "source manifest is unavailable"
+                                    )
+                                proof_policy = (
+                                    self._managed_proof_policy_snapshot(
+                                        base_state,
+                                        remote=target_id is not None,
+                                    )
+                                )
+                                (
+                                    source_request_sha256,
+                                    image_reference,
+                                    request_target_endpoint,
+                                    request_target_id,
+                                    request_target_generation,
+                                ) = self._managed_proof_source_environment(
+                                    base_state,
+                                    source_experiment,
+                                    source_tool_run,
+                                    replay_argv,
+                                )
+                                if (
+                                    request_target_endpoint
+                                    != target_endpoint
+                                    or request_target_id != target_id
+                                    or request_target_generation
+                                    != target_generation
+                                ):
+                                    raise EngineError(
+                                        "source request target does not "
+                                        "match its experiment pin"
+                                    )
+                                recipe = ProofRecipe.create(
+                                    candidate_id=candidate.id,
+                                    source_experiment_id=(
+                                        source_experiment.id
+                                    ),
+                                    source_run_id=source_tool_run.id,
+                                    argv=replay_argv,
+                                    inputs=proof_inputs,
+                                    network_target_id=(
+                                        str(target_id)
+                                        if target_id is not None
+                                        else None
+                                    ),
+                                    network_target_generation=(
+                                        target_generation
+                                        if target_id is not None
+                                        else None
+                                    ),
+                                    network_endpoint=target_endpoint,
+                                    configuration_epoch=(
+                                        base_state.configuration_epoch
+                                    ),
+                                    source_manifest_sha256=manifest,
+                                    source_request_sha256=(
+                                        source_request_sha256
+                                    ),
+                                    image_reference=image_reference,
+                                    policy=proof_policy,
+                                )
+                            except (
+                                BackgroundJobUnsupported,
+                                KeyError,
+                                SafeFileError,
+                                TypeError,
+                                ValueError,
+                                EngineError,
+                            ) as error:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    f"invalid managed proof: {error}",
+                                )
+                                continue
+                            state.experiments.append(
+                                Experiment(
+                                    id=_record_id(
+                                        "E", run_id, str(index)
+                                    ),
+                                    hypothesis_ids=[],
+                                    command=shlex.join(recipe.argv),
+                                    expected_observation=(
+                                        "engine-owned remote replay "
+                                        "reproduces the exact candidate"
+                                    ),
+                                    keep_if=(
+                                        "the engine ProofResult passes its "
+                                        "pinned replay policy"
+                                    ),
+                                    drop_if=(
+                                        "the engine ProofResult fails its "
+                                        "pinned replay policy"
+                                    ),
+                                    timeout_seconds=(
+                                        self._budget_command_timeout(
+                                            state,
+                                            self.config.runtime
+                                            .command_timeout_s,
+                                        )
+                                    ),
+                                    resource_class="standard",
+                                    kind=ExperimentKind.PROOF,
+                                    status=ExperimentStatus.REGISTERED,
+                                    source_run_id=run_id,
+                                    artifact_ids=[
+                                        item.artifact_id
+                                        for item in recipe.inputs
+                                    ],
+                                    proof_recipe=recipe,
+                                    extra={
+                                        "managed_contract_version": (
+                                            MANAGED_ROLE_RESULT_SCHEMA_VERSION
+                                        ),
+                                        "proof_recipe_version": 1,
+                                        "configuration_epoch": (
+                                            recipe.configuration_epoch
+                                        ),
+                                        "source_replay_binding": (
+                                            "completed_tool_exact_replay_v1"
+                                        ),
+                                    },
+                                )
+                            )
+                            continue
                         if (
                             not isinstance(action, Mapping)
                             or action.get("kind") != "command"
@@ -7197,10 +8315,32 @@ class ChallengeEngine:
         result_directory: Path,
         proof_evaluation_id: str,
         *,
+        input_destinations: Sequence[str] | None = None,
+        canonical_bindings: Sequence[
+            tuple[ArtifactReference, ProofRecipeInput]
+        ]
+        | None = None,
+        recipe_sha256: str | None = None,
         pending_handoff: list[_ProofInputPreparation] | None = None,
     ) -> _ProofInputPreparation:
-        if len(input_locators) > 256:
+        input_count = (
+            len(canonical_bindings)
+            if canonical_bindings is not None
+            else len(input_locators)
+        )
+        if input_count > 256:
             raise EngineError("proof cannot contain more than 256 inputs")
+        if canonical_bindings is not None and input_locators:
+            raise EngineError(
+                "canonical proof inputs cannot use mutable input locators"
+            )
+        if (
+            input_destinations is not None
+            and len(input_destinations) != input_count
+        ):
+            raise EngineError(
+                "proof input destinations must match the input locator count"
+            )
         workspace = self._workspace(state)
         input_directory = ensure_private_directory(
             result_directory / "inputs"
@@ -7213,33 +8353,94 @@ class ChallengeEngine:
         paths = self.store.challenge_paths(state.identity)
         entries: list[dict[str, Any]] = []
         prepared: list[ProofInput] = []
+        source_locators: set[str] = set()
         destinations: set[str] = set()
         total_bytes = 0
         created_paths: list[Path] = []
         manifest_path: Path | None = None
         try:
-            for index, locator in enumerate(input_locators):
+            for index in range(input_count):
                 filename = f"input-{index:04d}.bin"
                 snapshot_destination = input_directory / filename
                 # Track the exact destination before the copy starts so a
                 # normal interrupt cannot land between replacement and return.
                 created_paths.append(snapshot_destination)
-                snapshot = self._snapshot_workspace_file(
-                    state,
-                    client,
-                    locator,
-                    snapshot_destination,
-                )
-                if snapshot.source_locator in destinations:
+                canonical_artifact: ArtifactReference | None = None
+                canonical_input: ProofRecipeInput | None = None
+                if canonical_bindings is None:
+                    locator = input_locators[index]
+                    snapshot = self._snapshot_workspace_file(
+                        state,
+                        client,
+                        locator,
+                        snapshot_destination,
+                    )
+                else:
+                    canonical_artifact, canonical_input = (
+                        canonical_bindings[index]
+                    )
+                    if (
+                        canonical_artifact.id
+                        != canonical_input.artifact_id
+                        or canonical_artifact.sha256.lower()
+                        != canonical_input.sha256
+                        or canonical_artifact.size
+                        != canonical_input.size
+                        or canonical_artifact.source_run_id
+                        != canonical_input.source_run_id
+                    ):
+                        raise EngineError(
+                            "canonical proof input binding changed before "
+                            f"staging: {canonical_input.artifact_id}"
+                        )
+                    try:
+                        snapshot = copy_bounded_regular(
+                            paths.root,
+                            canonical_artifact.path,
+                            snapshot_destination,
+                            maximum_bytes=min(
+                                MAX_MANAGED_PROOF_INPUT_BYTES,
+                                self.store.max_artifact_bytes,
+                            ),
+                            expected_sha256=canonical_input.sha256,
+                            expected_size=canonical_input.size,
+                            mode=0o400,
+                        )
+                    except (OSError, SafeFileError, ValueError) as error:
+                        raise EngineError(
+                            "canonical proof input could not be staged: "
+                            f"{canonical_input.artifact_id}"
+                        ) from error
+                if snapshot.source_locator in source_locators:
                     raise EngineError(
                         "proof input locators must resolve to unique files"
                     )
-                destinations.add(snapshot.source_locator)
-                total_bytes += snapshot.size_bytes
-                if total_bytes > min(
-                    DEFAULT_SNAPSHOT_MAX_BYTES,
-                    self.store.max_artifact_bytes,
+                source_locators.add(snapshot.source_locator)
+                destination = (
+                    input_destinations[index]
+                    if input_destinations is not None
+                    else canonical_input.destination
+                    if canonical_input is not None
+                    else snapshot.source_locator
+                )
+                if (
+                    not _valid_proof_destination(destination)
+                    or destination in destinations
                 ):
+                    raise EngineError(
+                        "proof input destinations must be safe and unique"
+                    )
+                destinations.add(destination)
+                total_bytes += snapshot.size_bytes
+                aggregate_limit = min(
+                    (
+                        MAX_MANAGED_PROOF_INPUT_BYTES
+                        if canonical_bindings is not None
+                        else DEFAULT_SNAPSHOT_MAX_BYTES
+                    ),
+                    self.store.max_artifact_bytes,
+                )
+                if total_bytes > aggregate_limit:
                     raise EngineError(
                         "proof inputs exceed the configured artifact byte bound"
                     )
@@ -7248,7 +8449,11 @@ class ChallengeEngine:
                     filename,
                     staging_root / filename,
                     maximum_bytes=min(
-                        DEFAULT_SNAPSHOT_MAX_BYTES,
+                        (
+                            MAX_MANAGED_PROOF_INPUT_BYTES
+                            if canonical_bindings is not None
+                            else DEFAULT_SNAPSHOT_MAX_BYTES
+                        ),
                         self.store.max_artifact_bytes,
                     ),
                     expected_sha256=snapshot.sha256,
@@ -7258,20 +8463,34 @@ class ChallengeEngine:
                 canonical_path = snapshot.path.relative_to(
                     paths.root
                 ).as_posix()
-                entries.append(
-                    {
-                        "locator": snapshot.source_locator,
-                        "snapshot_path": canonical_path,
-                        "sha256": snapshot.sha256,
-                        "size_bytes": snapshot.size_bytes,
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "locator": snapshot.source_locator,
+                    "destination": destination,
+                    "snapshot_path": canonical_path,
+                    "sha256": snapshot.sha256,
+                    "size_bytes": snapshot.size_bytes,
+                }
+                if (
+                    canonical_artifact is not None
+                    and canonical_input is not None
+                ):
+                    entry.update(
+                        {
+                            "artifact_id": canonical_artifact.id,
+                            "source_run_id": (
+                                canonical_artifact.source_run_id
+                            ),
+                            "purpose": canonical_input.purpose,
+                            "recipe_sha256": recipe_sha256,
+                        }
+                    )
+                entries.append(entry)
                 prepared.append(
                     ProofInput(
                         source_locator=staged.path.relative_to(
                             workspace
                         ).as_posix(),
-                        destination_locator=snapshot.source_locator,
+                        destination_locator=destination,
                         sha256=snapshot.sha256,
                         size_bytes=snapshot.size_bytes,
                     )
@@ -7282,6 +8501,8 @@ class ChallengeEngine:
                 "inputs": entries,
                 "total_bytes": total_bytes,
             }
+            if recipe_sha256 is not None:
+                manifest["recipe_sha256"] = recipe_sha256
             manifest_path = result_directory / "input-manifest.json"
             atomic_write_json(manifest_path, manifest, mode=0o400)
             preparation = _ProofInputPreparation(
@@ -7514,6 +8735,222 @@ class ChallengeEngine:
 
         return self.store.update(identity, apply)
 
+    def execute_proof_experiment(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        *,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, ProofResult]:
+        """Execute exactly one engine-bound managed proof recipe."""
+
+        if not _session_owned:
+            lock_path = (
+                self.store.challenge_paths(identity).runtime
+                / "session.lock"
+            )
+            try:
+                with ChallengeLock(
+                    lock_path,
+                    timeout=0,
+                ) as session_lock:
+                    session_lock.acquire()
+                    self._recover_session_boundary(identity)
+                    return self.execute_proof_experiment(
+                        identity,
+                        experiment_id,
+                        _session_owned=True,
+                    )
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+
+        state = self.refresh_ingest(identity)
+        experiment = next(
+            (
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if (
+            experiment is None
+            or experiment.kind is not ExperimentKind.PROOF
+            or experiment.proof_recipe is None
+            or experiment.status is not ExperimentStatus.REGISTERED
+        ):
+            raise EngineError(
+                "managed proof experiment must be registered with a recipe"
+            )
+        recipe = experiment.proof_recipe
+        candidate, _source_experiment, _source_run = (
+            self._require_managed_proof_recipe_current(state, recipe)
+        )
+        proposal_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == experiment.source_run_id
+            ),
+            None,
+        )
+        proposal_wave = next(
+            (
+                item
+                for item in state.waves
+                if proposal_run is not None
+                and item.id == proposal_run.wave_id
+            ),
+            None,
+        )
+        if (
+            proposal_run is None
+            or proposal_run.origin is not RunOrigin.MANAGED_MODEL
+            or proposal_run.status is not RunStatus.COMPLETED
+            or proposal_run.role != Role.REPRODUCER.value
+            or proposal_wave is None
+            or proposal_wave.kind is not WaveKind.PROOF
+            or proposal_run.session_id
+            != state.active_managed_session_id
+            or proposal_run.configuration_epoch
+            != state.configuration_epoch
+        ):
+            raise EngineError(
+                "managed proof recipe is not owned by the active proof-wave "
+                "Reproducer"
+            )
+        artifacts = {item.id: item for item in state.artifacts}
+        total_input_bytes = 0
+        for proof_input in recipe.inputs:
+            artifact = artifacts[proof_input.artifact_id]
+            if proof_input.size > MAX_MANAGED_PROOF_INPUT_BYTES:
+                raise EngineError(
+                    "managed proof input exceeds the per-file byte limit"
+                )
+            total_input_bytes += proof_input.size
+            if total_input_bytes > min(
+                MAX_MANAGED_PROOF_INPUT_BYTES,
+                self.store.max_artifact_bytes,
+            ):
+                raise EngineError(
+                    "managed proof inputs exceed the aggregate byte limit"
+                )
+            if artifact.extra.get("source_locator") != (
+                proof_input.destination
+            ):
+                raise EngineError(
+                    "managed proof input destination no longer matches its "
+                    f"canonical artifact: {proof_input.artifact_id}"
+                )
+            if self._canonical_artifact_contains_bytes(
+                state,
+                artifact,
+                candidate.value.encode("utf-8"),
+            ):
+                raise EngineError(
+                    "managed proof input artifact embeds the exact candidate "
+                    f"bytes: {proof_input.artifact_id}"
+                )
+
+        def mark_running(current: ChallengeState) -> None:
+            current_experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            if current_experiment.status is not ExperimentStatus.REGISTERED:
+                raise EngineError(
+                    "managed proof experiment is no longer registered"
+                )
+            if (
+                current.active_managed_session_id
+                != proposal_run.session_id
+                or current.configuration_epoch
+                != recipe.configuration_epoch
+            ):
+                raise EngineError(
+                    "managed proof session or configuration pin is stale"
+                )
+            self._require_managed_proof_recipe_current(
+                current,
+                recipe,
+            )
+            current_experiment.status = ExperimentStatus.RUNNING
+
+        self.store.update(
+            identity,
+            mark_running,
+            expected_revision=state.revision,
+        )
+        managed_context: dict[str, object] = {
+            "session_id": proposal_run.session_id,
+            "cycle_id": proposal_run.cycle_id,
+            "wave_id": proposal_run.wave_id,
+        }
+        try:
+            return self.prove_candidate(
+                identity,
+                recipe.candidate_id,
+                recipe.argv,
+                input_locators=(),
+                network_target=recipe.network_endpoint,
+                repetitions=None,
+                _input_destinations=tuple(
+                    item.destination for item in recipe.inputs
+                ),
+                _canonical_inputs=recipe.inputs,
+                _session_owned=True,
+                _proof_experiment_id=experiment_id,
+                _managed_context=managed_context,
+            )
+        except BaseException as proof_error:
+            try:
+                latest = self.store.load(identity, recover=False)
+
+                def fail_proof(current: ChallengeState) -> None:
+                    current_experiment = next(
+                        item
+                        for item in current.experiments
+                        if item.id == experiment_id
+                    )
+                    if (
+                        current_experiment.status
+                        is ExperimentStatus.RUNNING
+                    ):
+                        current_experiment.status = (
+                            ExperimentStatus.FAILED
+                        )
+                        current_experiment.result = {
+                            "error": "managed_proof_execution_failed",
+                            "error_type": type(proof_error).__name__[
+                                :128
+                            ],
+                            "recipe_sha256": recipe.recipe_sha256,
+                            "policy_sha256": (
+                                recipe.policy.policy_sha256
+                            ),
+                        }
+                    if current.status is ChallengeStatus.PROVING:
+                        validate_transition(
+                            current.status,
+                            ChallengeStatus.ACTIVE,
+                        )
+                        current.status = ChallengeStatus.ACTIVE
+
+                self.store.update(
+                    identity,
+                    fail_proof,
+                    expected_revision=latest.revision,
+                )
+            except BaseException as recovery_error:
+                proof_error.add_note(
+                    "managed proof failure terminalization failed: "
+                    f"{recovery_error}"
+                )
+            raise
+
     def prove_candidate(
         self,
         identity: ChallengeIdentity,
@@ -7523,6 +8960,11 @@ class ChallengeEngine:
         input_locators: Sequence[str] = (),
         network_target: str | None = None,
         repetitions: int | None = None,
+        _input_destinations: Sequence[str] | None = None,
+        _canonical_inputs: Sequence[ProofRecipeInput] | None = None,
+        _session_owned: bool = False,
+        _proof_experiment_id: str | None = None,
+        _managed_context: Mapping[str, object] | None = None,
         _pending_attempt_handoff: list[ArtifactReference] | None = None,
     ) -> tuple[ChallengeState, ProofResult]:
         """Run a candidate in clean containers and apply the explicit proof gate."""
@@ -7537,6 +8979,11 @@ class ChallengeEngine:
                     input_locators=input_locators,
                     network_target=network_target,
                     repetitions=repetitions,
+                    _input_destinations=_input_destinations,
+                    _canonical_inputs=_canonical_inputs,
+                    _session_owned=_session_owned,
+                    _proof_experiment_id=_proof_experiment_id,
+                    _managed_context=_managed_context,
                     _pending_attempt_handoff=pending_attempt_handoff,
                 )
             except BaseException as proof_error:
@@ -7551,20 +8998,86 @@ class ChallengeEngine:
         if not command:
             raise EngineError("proof command cannot be empty")
         paths = self.store.challenge_paths(identity)
-        try:
-            session_lock = ChallengeLock(
-                paths.runtime / "session.lock", timeout=0
-            ).acquire()
-        except LockTimeout as error:
-            raise SessionAlreadyRunning(
-                f"another session already owns {identity.key}"
-            ) from error
+        session_lock: ChallengeLock | None = None
+        if not _session_owned:
+            try:
+                session_lock = ChallengeLock(
+                    paths.runtime / "session.lock", timeout=0
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
         proof_input_staging: tempfile.TemporaryDirectory[str] | None = None
         pending_proof_input_handoff: list[_ProofInputPreparation] = []
         try:
-            self._recover_session_boundary(identity)
+            if not _session_owned:
+                self._recover_session_boundary(identity)
             state = self.refresh_ingest(identity)
             self._remaining_budget_seconds(state)
+            managed_recipe: ProofRecipe | None = None
+            if _proof_experiment_id is not None:
+                managed_experiment = next(
+                    (
+                        item
+                        for item in state.experiments
+                        if item.id == _proof_experiment_id
+                    ),
+                    None,
+                )
+                if (
+                    managed_experiment is None
+                    or managed_experiment.kind is not ExperimentKind.PROOF
+                    or managed_experiment.proof_recipe is None
+                    or managed_experiment.status
+                    is not ExperimentStatus.RUNNING
+                ):
+                    raise EngineError(
+                        "managed proof experiment is not registered as running"
+                    )
+                managed_recipe = managed_experiment.proof_recipe
+                self._require_managed_proof_recipe_current(
+                    state,
+                    managed_recipe,
+                )
+                if candidate_id != managed_recipe.candidate_id:
+                    raise EngineError(
+                        "managed proof candidate does not match its recipe"
+                    )
+                if tuple(command) != managed_recipe.argv:
+                    raise EngineError(
+                        "managed proof command does not match its recipe"
+                    )
+                expected_destinations = tuple(
+                    item.destination for item in managed_recipe.inputs
+                )
+                if (
+                    _input_destinations is None
+                    or tuple(_input_destinations)
+                    != expected_destinations
+                ):
+                    raise EngineError(
+                        "managed proof input destinations do not match "
+                        "the recipe"
+                    )
+                if (
+                    _canonical_inputs is None
+                    or tuple(_canonical_inputs)
+                    != managed_recipe.inputs
+                ):
+                    raise EngineError(
+                        "managed proof canonical inputs do not match "
+                        "the recipe"
+                    )
+                if repetitions is not None:
+                    raise EngineError(
+                        "managed proof repetitions are engine-owned"
+                    )
+                if network_target != managed_recipe.network_endpoint:
+                    raise EngineError(
+                        "managed proof network target does not match "
+                        "the source replay"
+                    )
             candidate = next(
                 (
                     item
@@ -7692,6 +9205,19 @@ class ChallengeEngine:
             adapter_policy = get_adapter(state.category).proof_policy(
                 remote=target is not None
             )
+            if managed_recipe is not None:
+                expected_policy = self._managed_proof_policy_snapshot(
+                    state,
+                    remote=target is not None,
+                )
+                if (
+                    expected_policy != managed_recipe.policy
+                    or expected_policy.policy_sha256
+                    != managed_recipe.policy.policy_sha256
+                ):
+                    raise EngineError(
+                        "managed proof policy no longer matches its recipe"
+                    )
             required_runs = (
                 adapter_policy.trial_count
                 if adapter_policy.mode == "success_distribution"
@@ -7700,7 +9226,16 @@ class ChallengeEngine:
                     + adapter_policy.remote_repetitions
                 )
             )
-            run_count = repetitions if repetitions is not None else required_runs
+            negative_control_runs = (
+                managed_recipe.policy.negative_control_repetitions
+                if managed_recipe is not None
+                else 0
+            )
+            run_count = (
+                repetitions
+                if repetitions is not None
+                else required_runs + negative_control_runs
+            )
             if run_count < 1:
                 raise EngineError("proof repetitions must be positive")
             manifest = str(
@@ -7711,12 +9246,33 @@ class ChallengeEngine:
             result_directory = (
                 paths.proof / candidate_id / proof_evaluation_id
             )
+            canonical_artifacts = {
+                item.id: item for item in state.artifacts
+            }
+            canonical_bindings = (
+                tuple(
+                    (
+                        canonical_artifacts[item.artifact_id],
+                        item,
+                    )
+                    for item in managed_recipe.inputs
+                )
+                if managed_recipe is not None
+                else None
+            )
             input_preparation = self._prepare_proof_inputs(
                 state,
                 client,
                 input_locators,
                 result_directory,
                 proof_evaluation_id,
+                input_destinations=_input_destinations,
+                canonical_bindings=canonical_bindings,
+                recipe_sha256=(
+                    managed_recipe.recipe_sha256
+                    if managed_recipe is not None
+                    else None
+                ),
                 pending_handoff=pending_proof_input_handoff,
             )
             proof_input_staging = input_preparation.staging
@@ -7727,6 +9283,26 @@ class ChallengeEngine:
             input_manifest_locator = input_manifest_path.relative_to(
                 paths.root
             ).as_posix()
+            managed_metadata: dict[str, object] = {}
+            if managed_recipe is not None:
+                managed_metadata = {
+                    "proof_experiment_id": _proof_experiment_id,
+                    "recipe_sha256": managed_recipe.recipe_sha256,
+                    "policy_sha256": (
+                        managed_recipe.policy.policy_sha256
+                    ),
+                    "source_experiment_id": (
+                        managed_recipe.source_experiment_id
+                    ),
+                    "source_run_id": managed_recipe.source_run_id,
+                    "source_request_sha256": (
+                        managed_recipe.source_request_sha256
+                    ),
+                    "image_reference": managed_recipe.image_reference,
+                    "oracle_protocol": (
+                        managed_recipe.policy.oracle_protocol
+                    ),
+                }
             input_artifacts = tuple(
                 ArtifactReference(
                     id=_record_id(
@@ -7743,6 +9319,23 @@ class ChallengeEngine:
                     extra={
                         "kind": "proof_input",
                         "source_locator": str(entry["locator"]),
+                        **(
+                            {
+                                "destination": str(
+                                    entry["destination"]
+                                ),
+                                "canonical_artifact_id": entry.get(
+                                    "artifact_id"
+                                ),
+                                "canonical_source_run_id": entry.get(
+                                    "source_run_id"
+                                ),
+                                "purpose": entry.get("purpose"),
+                            }
+                            if managed_recipe is not None
+                            else {}
+                        ),
+                        **managed_metadata,
                     },
                 )
                 for index, entry in enumerate(
@@ -7759,7 +9352,10 @@ class ChallengeEngine:
                 path=input_manifest_locator,
                 sha256=input_manifest_sha256,
                 size=input_manifest_path.stat().st_size,
-                extra={"kind": "proof_input_manifest"},
+                extra={
+                    "kind": "proof_input_manifest",
+                    **managed_metadata,
+                },
             )
             proof_input_artifacts = (
                 *input_artifacts,
@@ -7798,13 +9394,26 @@ class ChallengeEngine:
             attempts: list[ProofAttempt] = []
             last_proof_deadline_monotonic: float | None = None
             for number in range(1, run_count + 1):
+                negative_control = number <= negative_control_runs
+                positive_number = number - negative_control_runs
                 local_phase = (
-                    adapter_policy.mode != "success_distribution"
-                    and number <= adapter_policy.clean_repetitions
+                    not negative_control
+                    and adapter_policy.mode != "success_distribution"
+                    and positive_number
+                    <= adapter_policy.clean_repetitions
                 )
-                attempt_target = None if local_phase else target
+                attempt_target = (
+                    None
+                    if negative_control or local_phase
+                    else target
+                )
                 current = self.store.load(identity)
                 require_current_proof(current)
+                if managed_recipe is not None:
+                    self._require_managed_proof_recipe_current(
+                        current,
+                        managed_recipe,
+                    )
                 self._remaining_budget_seconds(current)
                 run_id = _run_id(f"proof-{candidate_id}-{number}")
                 run_paths = self.store.create_run(
@@ -7814,6 +9423,11 @@ class ChallengeEngine:
                         "kind": "proof",
                         "candidate_id": candidate_id,
                         "attempt": number,
+                        "proof_phase": (
+                            "negative_control"
+                            if negative_control
+                            else "positive_replay"
+                        ),
                         "command": list(command),
                         "input_locators": [
                             item.destination_locator
@@ -7834,6 +9448,7 @@ class ChallengeEngine:
                             if attempt_target is not None
                             else None
                         ),
+                        **managed_metadata,
                     },
                     base_revision=current.revision,
                 )
@@ -7886,6 +9501,11 @@ class ChallengeEngine:
                 try:
                     latest_before_run = self.store.load(identity)
                     require_current_proof(latest_before_run)
+                    if managed_recipe is not None:
+                        self._require_managed_proof_recipe_current(
+                            latest_before_run,
+                            managed_recipe,
+                        )
                     if attempt_target is not None:
                         self._wait_for_remote_command_start(
                             latest_before_run,
@@ -7893,12 +9513,23 @@ class ChallengeEngine:
                         )
                         latest_before_run = self.store.load(identity)
                         require_current_proof(latest_before_run)
+                        if managed_recipe is not None:
+                            self._require_managed_proof_recipe_current(
+                                latest_before_run,
+                                managed_recipe,
+                            )
                     (
                         proof_timeout,
                         proof_deadline_monotonic,
                     ) = self._budget_command_limits(
                         latest_before_run,
-                        self.config.runtime.command_timeout_s,
+                        (
+                            managed_recipe.policy
+                            .negative_control_timeout_seconds
+                            if negative_control
+                            and managed_recipe is not None
+                            else self.config.runtime.command_timeout_s
+                        ),
                     )
                     last_proof_deadline_monotonic = (
                         proof_deadline_monotonic
@@ -8128,6 +9759,8 @@ class ChallengeEngine:
                                 for detected in detected_proof_flags
                             ],
                             "base_revision": current.revision,
+                            "negative_control": negative_control,
+                            **managed_metadata,
                         },
                     )
 
@@ -8181,10 +9814,42 @@ class ChallengeEngine:
                         run_paths.result.relative_to(paths.root)
                     ),
                     role="proof",
+                    origin=RunOrigin.PROOF,
+                    session_id=(
+                        str(_managed_context["session_id"])
+                        if _managed_context is not None
+                        and isinstance(
+                            _managed_context.get("session_id"), str
+                        )
+                        else None
+                    ),
+                    cycle_id=(
+                        str(_managed_context["cycle_id"])
+                        if _managed_context is not None
+                        and isinstance(
+                            _managed_context.get("cycle_id"), str
+                        )
+                        else None
+                    ),
+                    wave_id=(
+                        str(_managed_context["wave_id"])
+                        if _managed_context is not None
+                        and isinstance(
+                            _managed_context.get("wave_id"), str
+                        )
+                        else None
+                    ),
+                    configuration_epoch=(
+                        state.configuration_epoch
+                        if state.schema_version >= STATE_SCHEMA_VERSION
+                        else None
+                    ),
                     extra={
                         "candidate_id": candidate_id,
                         "clean_workspace": True,
                         "input_manifest_sha256": input_manifest_sha256,
+                        "negative_control": negative_control,
+                        **managed_metadata,
                     },
                 )
                 attempt_commit_deadline_error: list[str] = []
@@ -8338,9 +10003,53 @@ class ChallengeEngine:
                     )
                     for item in attempts
                 ]
+            control_attempts = attempts[:negative_control_runs]
+            positive_attempts = attempts[negative_control_runs:]
             proof_result = evaluate_proof(
-                candidate.value, manifest, attempts, adapter_policy
+                candidate.value,
+                manifest,
+                positive_attempts,
+                adapter_policy,
             )
+            if managed_recipe is not None:
+                control_failures: list[str] = []
+                if len(control_attempts) != negative_control_runs:
+                    control_failures.append(
+                        "negative control did not complete"
+                    )
+                for control in control_attempts:
+                    if control.timed_out:
+                        control_failures.append(
+                            f"{control.run_id}: negative control timed out"
+                        )
+                    if candidate.value in control.candidate_values:
+                        control_failures.append(
+                            f"{control.run_id}: candidate reproduced without "
+                            "the remote target"
+                        )
+                causal_failure = (
+                    "causal_oracle_unavailable: replay output is not bound "
+                    "to a trusted inbound transcript from the allowlisted "
+                    "target"
+                )
+                proof_result = replace(
+                    proof_result,
+                    # Network availability is not a causal impact oracle. A
+                    # solver can reconstruct the candidate locally and emit it
+                    # only when a connection succeeds. Preserve the replay
+                    # evidence, but never promote this managed protocol to a
+                    # full proof until a trusted target transcript is bound.
+                    passed=False,
+                    failures=tuple(
+                        dict.fromkeys(
+                            (
+                                *proof_result.failures,
+                                *control_failures,
+                                causal_failure,
+                            )
+                        )
+                    ),
+                )
 
             def fail_late_proof_result(
                 value: ProofResult,
@@ -8405,7 +10114,11 @@ class ChallengeEngine:
                         "network_target": (
                             target.as_text() if target is not None else None
                         ),
+                        "negative_control_run_ids": [
+                            attempt.run_id for attempt in control_attempts
+                        ],
                         "evaluated_at": utc_now(),
+                        **managed_metadata,
                     },
                 )
                 if proof_result.passed:
@@ -8428,12 +10141,43 @@ class ChallengeEngine:
                     path=str(result_path.relative_to(paths.root)),
                     sha256=sha256_file(result_path),
                     size=result_path.stat().st_size,
+                    extra={
+                        "kind": "proof_result",
+                        **managed_metadata,
+                    },
                 )
                 current = self.store.load(identity)
                 promotion_deadline_error: list[str] = []
 
                 def apply_result(latest: ChallengeState) -> None:
                     latest_candidate = require_current_proof(latest)
+                    managed_experiment: Experiment | None = None
+                    if _proof_experiment_id is not None:
+                        managed_experiment = next(
+                            (
+                                item
+                                for item in latest.experiments
+                                if item.id == _proof_experiment_id
+                            ),
+                            None,
+                        )
+                        if (
+                            managed_experiment is None
+                            or managed_experiment.status
+                            is not ExperimentStatus.RUNNING
+                            or managed_experiment.proof_recipe is None
+                            or managed_recipe is None
+                            or managed_experiment.proof_recipe.recipe_sha256
+                            != managed_recipe.recipe_sha256
+                        ):
+                            raise EngineError(
+                                "managed proof experiment changed before "
+                                "proof completion"
+                            )
+                        self._require_managed_proof_recipe_current(
+                            latest,
+                            managed_recipe,
+                        )
                     if (
                         latest.metadata.get("source_manifest_sha256")
                         != manifest
@@ -8456,8 +10200,56 @@ class ChallengeEngine:
                                 ChallengeStatus.ACTIVE,
                             )
                             latest.status = ChallengeStatus.ACTIVE
+                            if managed_experiment is not None:
+                                managed_experiment.status = (
+                                    ExperimentStatus.FAILED
+                                )
+                                managed_experiment.result = {
+                                    "passed": False,
+                                    "error": (
+                                        "proof completed after its hard "
+                                        "deadline"
+                                    ),
+                                    **managed_metadata,
+                                }
                             return
                     latest.artifacts.append(proof_artifact)
+                    if managed_experiment is not None:
+                        managed_experiment.status = (
+                            ExperimentStatus.COMPLETED
+                        )
+                        managed_experiment.result = {
+                            **proof_result.to_dict(),
+                            "proof_artifact_id": proof_artifact.id,
+                            "negative_control_run_ids": [
+                                attempt.run_id
+                                for attempt in control_attempts
+                            ],
+                            **managed_metadata,
+                        }
+                        managed_experiment.artifact_ids = list(
+                            dict.fromkeys(
+                                (
+                                    *managed_experiment.artifact_ids,
+                                    *(
+                                        item.id
+                                        for item in proof_input_artifacts
+                                    ),
+                                    proof_artifact.id,
+                                )
+                            )
+                        )
+                        managed_experiment.evidence_run_ids = list(
+                            dict.fromkeys(
+                                (
+                                    *managed_experiment.evidence_run_ids,
+                                    *(
+                                        attempt.run_id
+                                        for attempt in attempts
+                                    ),
+                                )
+                            )
+                        )
                     if proof_result.passed:
                         validate_transition(
                             latest.status,
@@ -8529,10 +10321,11 @@ class ChallengeEngine:
                     proof_input_staging.cleanup()
                 except BaseException as cleanup_error:
                     cleanup_errors.append(cleanup_error)
-            try:
-                session_lock.release()
-            except BaseException as release_error:
-                cleanup_errors.append(release_error)
+            if session_lock is not None:
+                try:
+                    session_lock.release()
+                except BaseException as release_error:
+                    cleanup_errors.append(release_error)
             if cleanup_errors:
                 if (
                     active_error is not None
@@ -8720,17 +10513,48 @@ class ChallengeEngine:
         recovered_at = utc_now()
 
         def apply(current: ChallengeState) -> None:
+            recovered_managed_proof = False
             for experiment in current.experiments:
                 if experiment.status is not ExperimentStatus.RUNNING:
                     continue
                 experiment.status = ExperimentStatus.FAILED
-                experiment.result = {
-                    "error": (
-                        "orphaned tool execution recovered after the "
-                        "previous session owner exited"
-                    )
-                }
+                if (
+                    experiment.kind is ExperimentKind.PROOF
+                    and experiment.proof_recipe is not None
+                ):
+                    recovered_managed_proof = True
+                    experiment.result = {
+                        "error": "orphaned_managed_proof_recovered",
+                        "recipe_sha256": (
+                            experiment.proof_recipe.recipe_sha256
+                        ),
+                        "policy_sha256": (
+                            experiment.proof_recipe.policy.policy_sha256
+                        ),
+                    }
+                else:
+                    experiment.result = {
+                        "error": (
+                            "orphaned tool execution recovered after the "
+                            "previous session owner exited"
+                        )
+                    }
                 experiment.extra["orphan_recovered_at"] = recovered_at
+            if (
+                recovered_managed_proof
+                and current.status is ChallengeStatus.PROVING
+            ):
+                validate_transition(
+                    current.status,
+                    ChallengeStatus.ACTIVE,
+                )
+                current.status = ChallengeStatus.ACTIVE
+            if (
+                recovered_managed_proof
+                and current.status is ChallengeStatus.PAUSED
+                and current.resume_status is ChallengeStatus.PROVING
+            ):
+                current.resume_status = ChallengeStatus.ACTIVE
 
         return self.store.update(
             identity,

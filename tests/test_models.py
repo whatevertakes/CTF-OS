@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import unittest
 from unittest import mock
 
@@ -10,6 +11,7 @@ from ctf_os.models import (
     ChallengeIdentity,
     ChallengeStatus,
     Experiment,
+    ExperimentKind,
     ExperimentStatus,
     Fact,
     Falsifier,
@@ -19,6 +21,9 @@ from ctf_os.models import (
     HypothesisStatus,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
     ModelValidationError,
+    ProofPolicySnapshot,
+    ProofRecipe,
+    ProofRecipeInput,
     Provenance,
     RunReference,
     RunStatus,
@@ -28,6 +33,91 @@ from ctf_os.store.upgrades import upgrade_state
 
 
 class ModelTests(unittest.TestCase):
+    def test_experiment_rejects_non_object_non_null_proof_recipe(self) -> None:
+        payload = Experiment(
+            id="E-probe",
+            hypothesis_ids=[],
+            command="true",
+            expected_observation="bounded output",
+            keep_if="the output appears",
+            drop_if="the output does not appear",
+            timeout_seconds=1,
+            kind=ExperimentKind.PROBE,
+        ).to_dict(v2=True)
+        for malformed in (True, 1, "recipe", [], [("candidate_id", "C-1")]):
+            malformed_payload = dict(payload)
+            malformed_payload["proof_recipe"] = malformed
+            with (
+                self.subTest(malformed=malformed),
+                self.assertRaisesRegex(
+                    ModelValidationError,
+                    "proof_recipe must be a canonical object or null",
+                ),
+            ):
+                Experiment.from_dict(malformed_payload)
+
+    def test_proof_recipe_rejects_nested_type_traps(self) -> None:
+        policy = ProofPolicySnapshot.create(
+            mode="success_distribution",
+            oracle_protocol="remote_pwn_replay_negative_control_v1",
+            clean_repetitions=0,
+            remote_repetitions=0,
+            trial_count=10,
+            negative_control_repetitions=1,
+            negative_control_timeout_seconds=30,
+            minimum_success_rate=0.7,
+            notes="remote pwn replay",
+        )
+        recipe = ProofRecipe.create(
+            candidate_id="C-1",
+            source_experiment_id="E-source",
+            source_run_id="R-source",
+            argv=("python3", "solver.py"),
+            inputs=(
+                ProofRecipeInput(
+                    artifact_id="A-solver",
+                    destination="solver.py",
+                    purpose="reproducer",
+                    sha256="a" * 64,
+                    size=12,
+                    source_run_id="R-builder",
+                ),
+            ),
+            network_target_id="T-1",
+            network_target_generation=1,
+            network_endpoint="https://pwn.example:443",
+            configuration_epoch=1,
+            source_manifest_sha256="b" * 64,
+            source_request_sha256="c" * 64,
+            image_reference="sha256:" + "d" * 64,
+            policy=policy,
+        )
+        mutations = (
+            ("candidate id bool", ("candidate_id",), True),
+            ("argv bool", ("argv", 0), True),
+            ("configuration bool", ("configuration_epoch",), True),
+            (
+                "target generation bool",
+                ("network_target_generation",),
+                True,
+            ),
+            ("policy notes bool", ("policy", "notes"), True),
+            ("policy repetition bool", ("policy", "trial_count"), True),
+            ("input artifact bool", ("inputs", 0, "artifact_id"), True),
+            ("input size bool", ("inputs", 0, "size"), True),
+        )
+        for label, path, value in mutations:
+            payload = copy.deepcopy(recipe.to_dict())
+            current = payload
+            for segment in path[:-1]:
+                current = current[segment]  # type: ignore[index]
+            current[path[-1]] = value  # type: ignore[index]
+            with (
+                self.subTest(label=label),
+                self.assertRaises(ModelValidationError),
+            ):
+                ProofRecipe.from_dict(payload)
+
     def test_experiment_timeout_requires_a_positive_integer(self) -> None:
         for timeout in (
             True,

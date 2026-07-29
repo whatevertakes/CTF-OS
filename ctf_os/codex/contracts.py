@@ -169,6 +169,13 @@ FLAG_SOURCE_VALUES = ("derived", "tool_output", "file_read", "external", "unknow
 STATUS_VALUES = ("ok", "blocked", "needs_human", "refused")
 NEXT_STAGE_VALUES = ("discover", "attack", "proof", "pause", "complete", "needs_human")
 ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", "none")
+MANAGED_PROOF_ACTION_KIND = "prove_candidate"
+PROOF_INPUT_PURPOSE_VALUES = (
+    "reproducer",
+    "fixture",
+    "variant_generator",
+    "verifier",
+)
 GOAL_ACTION_VALUES = ("create", "activate", "complete", "block", "park")
 HYPOTHESIS_STATUS_VALUES = ("open", "supported", "refuted", "confirmed")
 EVALUATION_STATUS_VALUES = ("kept", "dropped", "inconclusive", "failed")
@@ -197,6 +204,8 @@ def role_output_schema(
         if ROLE_SPECS[role].may_write_artifacts
         else tuple(value for value in ACTION_KIND_VALUES if value != "write_artifact")
     )
+    if contract_version == 2 and role is Role.REPRODUCER:
+        action_kinds = (*action_kinds, MANAGED_PROOF_ACTION_KIND)
     decision_schema: dict[str, Any]
     if role is Role.CAPTAIN:
         decision_schema = {
@@ -308,6 +317,59 @@ def role_output_schema(
         )
         action_variants: list[dict[str, Any]] = []
         for action_kind in action_kinds:
+            if action_kind == MANAGED_PROOF_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "candidate_id",
+                            "inputs",
+                        ],
+                        "properties": {
+                            "kind": {
+                                "enum": [MANAGED_PROOF_ACTION_KIND]
+                            },
+                            "description": {"type": "string"},
+                            "candidate_id": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^[A-Za-z0-9]"
+                                    r"[A-Za-z0-9_.:-]{0,255}$"
+                                ),
+                            },
+                            "inputs": {
+                                "type": "array",
+                                "maxItems": 256,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": [
+                                        "artifact_id",
+                                        "purpose",
+                                    ],
+                                    "properties": {
+                                        "artifact_id": {
+                                            "type": "string",
+                                            "pattern": (
+                                                r"^[A-Za-z0-9]"
+                                                r"[A-Za-z0-9_.:-]{0,255}$"
+                                            ),
+                                        },
+                                        "purpose": {
+                                            "enum": list(
+                                                PROOF_INPUT_PURPOSE_VALUES
+                                            )
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                )
+                continue
             variant_properties = dict(action_properties)
             variant_properties["kind"] = {"enum": [action_kind]}
             variant_properties["command"] = (
@@ -630,6 +692,7 @@ def _is_string_list(value: Any) -> bool:
 
 
 def _valid_relative_path(value: str) -> bool:
+    raw_parts = value.split("/")
     path = PurePosixPath(value)
     return (
         bool(value)
@@ -637,7 +700,11 @@ def _valid_relative_path(value: str) -> bool:
         and "\x00" not in value
         and "\\" not in value
         and len(value.encode("utf-8")) <= 4096
-        and all(len(part.encode("utf-8")) <= 255 for part in path.parts)
+        and all(
+            part not in {"", ".", ".."}
+            and len(part.encode("utf-8")) <= 255
+            for part in raw_parts
+        )
         and not path.is_absolute()
         and ".." not in path.parts
     )
@@ -953,8 +1020,78 @@ def validate_role_output(
             if not isinstance(item, Mapping):
                 errors.append(f"{path}: expected object")
                 continue
-            _exact_keys(item, keys, path, errors)
             kind = item.get("kind")
+            if kind == MANAGED_PROOF_ACTION_KIND:
+                proof_keys = {
+                    "kind",
+                    "description",
+                    "candidate_id",
+                    "inputs",
+                }
+                _exact_keys(item, proof_keys, path, errors)
+                if contract_version != 2 or role is not Role.REPRODUCER:
+                    errors.append(
+                        f"{path}.kind: prove_candidate is restricted to "
+                        "the v2 reproducer"
+                    )
+                if not isinstance(item.get("description"), str):
+                    errors.append(
+                        f"{path}.description: expected string"
+                    )
+                candidate_id = item.get("candidate_id")
+                if (
+                    not isinstance(candidate_id, str)
+                    or not _REFERENCE_ID_RE.fullmatch(candidate_id)
+                ):
+                    errors.append(f"{path}.candidate_id: invalid id")
+                proof_inputs = item.get("inputs")
+                input_artifact_ids: set[str] = set()
+                if (
+                    not isinstance(proof_inputs, list)
+                    or len(proof_inputs) > 256
+                ):
+                    errors.append(
+                        f"{path}.inputs: expected an array of at most 256 items"
+                    )
+                else:
+                    for input_index, proof_input in enumerate(proof_inputs):
+                        input_path = (
+                            f"{path}.inputs[{input_index}]"
+                        )
+                        if not isinstance(proof_input, Mapping):
+                            errors.append(
+                                f"{input_path}: expected object"
+                            )
+                            continue
+                        _exact_keys(
+                            proof_input,
+                            {"artifact_id", "purpose"},
+                            input_path,
+                            errors,
+                        )
+                        artifact_id = proof_input.get("artifact_id")
+                        if (
+                            not isinstance(artifact_id, str)
+                            or not _REFERENCE_ID_RE.fullmatch(artifact_id)
+                        ):
+                            errors.append(
+                                f"{input_path}.artifact_id: invalid id"
+                            )
+                        elif artifact_id in input_artifact_ids:
+                            errors.append(
+                                f"{input_path}.artifact_id: duplicate id"
+                            )
+                        else:
+                            input_artifact_ids.add(artifact_id)
+                        if (
+                            proof_input.get("purpose")
+                            not in PROOF_INPUT_PURPOSE_VALUES
+                        ):
+                            errors.append(
+                                f"{input_path}.purpose: invalid purpose"
+                            )
+                continue
+            _exact_keys(item, keys, path, errors)
             if kind not in ACTION_KIND_VALUES:
                 errors.append(f"{path}.kind: invalid kind")
             if not isinstance(item.get("description"), str):
@@ -1255,6 +1392,14 @@ def role_prompt(role: Role, user_prompt: str) -> str:
             write_rule,
             decision_rule,
             independence_rule,
+            (
+                "When the schema offers prove_candidate, bind only an "
+                "existing canonical candidate and existing canonical "
+                "artifacts. The engine owns proof repetitions and oracle "
+                "policy."
+                if role is Role.REPRODUCER
+                else ""
+            ),
             "Use only these provenance values: executed, tool_inferred, model_claimed, "
             "external_doc, operator.",
             "Every hypothesis must include falsifier, keep_if, and drop_if before execution.",
