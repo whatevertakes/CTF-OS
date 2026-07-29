@@ -436,6 +436,98 @@ class RevProofEvaluation:
         return _sha256(self.canonical_bytes())
 
 
+@dataclass(frozen=True, slots=True)
+class RevProofInputRecord:
+    """Payload-free input binding read from persisted proof evidence."""
+
+    ordinal: int
+    phase: str
+    mutation_id: str
+    input_sha256: str
+    input_size_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "input_sha256": self.input_sha256,
+            "input_size_bytes": self.input_size_bytes,
+            "mutation_id": self.mutation_id,
+            "ordinal": self.ordinal,
+            "phase": self.phase,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RevProofEvaluationRecord:
+    """Strict, immutable representation of persisted Rev proof evidence.
+
+    Unlike :class:`RevProofEvaluation`, this record never invents payloads for
+    the persisted plan.  ``verify_rev_proof_evaluation`` rebuilds the live
+    payload-bearing plan from the separately supplied accepted input.
+    """
+
+    candidate: str
+    source_manifest_sha256: str
+    accepted_input_sha256: str | None
+    accepted_input_size_bytes: int | None
+    plan: tuple[RevProofInputRecord, ...]
+    observations: tuple[RevProofObservation, ...]
+    failures: tuple[RevProofFailure, ...]
+    positive_successes: int
+    passed: bool
+    protocol: str = REV_STDIN_PROOF_PROTOCOL
+
+    @property
+    def failure_codes(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.code for item in self.failures))
+
+    @property
+    def verdict(self) -> str:
+        return "CONFIRMED" if self.passed else "INCONCLUSIVE"
+
+    @property
+    def transport_inconclusive(self) -> bool:
+        return bool(
+            {
+                "target_transport_exit_125",
+                "runner_transport_exit_125",
+                "ctfwrap_transport_exit_125",
+            }.intersection(self.failure_codes)
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "accepted_input_sha256": self.accepted_input_sha256,
+            "accepted_input_size_bytes": self.accepted_input_size_bytes,
+            "candidate": self.candidate,
+            "failure_codes": list(self.failure_codes),
+            "failures": [item.to_dict() for item in self.failures],
+            "observations": [
+                item.to_dict() for item in self.observations
+            ],
+            "passed": self.passed,
+            "plan": [item.to_dict() for item in self.plan],
+            "positive_successes": self.positive_successes,
+            "protocol": self.protocol,
+            "required_negative_attempts": 3,
+            "required_positive_attempts": 3,
+            "schema_version": 1,
+            "source_manifest_sha256": self.source_manifest_sha256,
+            "total_attempts": len(self.observations),
+            "transport_inconclusive": self.transport_inconclusive,
+            "verdict": self.verdict,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        payload = _canonical_json_bytes(self.to_dict())
+        if len(payload) > REV_STDIN_PROOF_MAX_EVIDENCE_BYTES:
+            raise ValueError("Rev proof evidence exceeds its byte limit")
+        return payload
+
+    @property
+    def evidence_sha256(self) -> str:
+        return _sha256(self.canonical_bytes())
+
+
 def _failure(
     code: str,
     *,
@@ -1283,3 +1375,865 @@ def evaluate_rev_stdin_proof(
         run_ids=tuple(item.run_id for item in normalized_observations),
     )
     return proof_result, evaluation
+
+
+_REV_PROOF_EVALUATION_KEYS = frozenset(
+    {
+        "accepted_input_sha256",
+        "accepted_input_size_bytes",
+        "candidate",
+        "failure_codes",
+        "failures",
+        "observations",
+        "passed",
+        "plan",
+        "positive_successes",
+        "protocol",
+        "required_negative_attempts",
+        "required_positive_attempts",
+        "schema_version",
+        "source_manifest_sha256",
+        "total_attempts",
+        "transport_inconclusive",
+        "verdict",
+    }
+)
+_REV_PROOF_INPUT_RECORD_KEYS = frozenset(
+    {
+        "input_sha256",
+        "input_size_bytes",
+        "mutation_id",
+        "ordinal",
+        "phase",
+    }
+)
+_REV_PROOF_OBSERVATION_KEYS = frozenset(
+    {
+        "clean_workspace",
+        "ctfwrap_exit_code",
+        "flag_scan_complete",
+        "flag_scan_error",
+        "flag_scanner_contract",
+        "flag_values",
+        "flag_values_overflow",
+        "input_sha256",
+        "input_size_bytes",
+        "mutation_id",
+        "orchestration_error",
+        "orchestration_status",
+        "phase",
+        "run_id",
+        "runner_exit_code",
+        "selected_candidate_direct_output",
+        "source_manifest_sha256",
+        "stderr",
+        "stdout",
+        "stream_capture_error",
+        "target_exit_code",
+        "timed_out",
+    }
+)
+_REV_PROOF_STREAM_KEYS = frozenset(
+    {
+        "artifact_id",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "capture_complete",
+        "capture_error",
+        "durable_artifact_complete",
+        "truncated",
+        "truncation_known",
+    }
+)
+_REV_PROOF_FAILURE_KEYS = frozenset(
+    {
+        "attempt_ordinal",
+        "code",
+        "run_id",
+        "stream",
+    }
+)
+_REV_PROOF_MUTATION_IDS = frozenset(
+    (
+        *REV_STDIN_PROOF_POSITIVE_MUTATION_IDS,
+        *REV_STDIN_PROOF_NONEMPTY_NEGATIVE_MUTATION_IDS,
+        *REV_STDIN_PROOF_EMPTY_NEGATIVE_MUTATION_IDS,
+    )
+)
+_REV_PROOF_PREFLIGHT_FAILURE_CODES = frozenset(
+    {
+        "accepted_input_contains_candidate",
+        "accepted_input_too_large",
+        "accepted_input_type_invalid",
+        "candidate_invalid",
+        "derived_input_contains_candidate",
+        "source_manifest_invalid",
+    }
+)
+_REV_PROOF_STREAM_FAILURE_CODES = frozenset(
+    {
+        "capture_error",
+        "capture_incomplete",
+        "capture_truncated",
+        "capture_truncation_unknown",
+        "durable_artifact_incomplete",
+        "durable_artifact_reused",
+    }
+)
+_REV_PROOF_MAX_FAILURES = (
+    _EXPECTED_ATTEMPT_COUNT * len(REV_STDIN_PROOF_FAILURE_CODES)
+)
+_REV_PROOF_EVIDENCE_ERROR = "invalid persisted Rev proof evidence"
+
+
+def _reject_persisted_evidence() -> None:
+    raise ValueError(_REV_PROOF_EVIDENCE_ERROR)
+
+
+def _exact_evidence_mapping(
+    value: object,
+    keys: frozenset[str],
+) -> dict[str, object]:
+    if type(value) is not dict or len(value) != len(keys):
+        _reject_persisted_evidence()
+    assert isinstance(value, dict)
+    for key in value:
+        if (
+            type(key) is not str
+            or len(key) > 64
+            or key not in keys
+        ):
+            _reject_persisted_evidence()
+    return value
+
+
+def _exact_evidence_list(
+    value: object,
+    *,
+    maximum_items: int,
+    exact_items: int | None = None,
+) -> list[object]:
+    if type(value) is not list:
+        _reject_persisted_evidence()
+    assert isinstance(value, list)
+    item_count = len(value)
+    if (
+        item_count > maximum_items
+        or (
+            exact_items is not None
+            and item_count != exact_items
+        )
+    ):
+        _reject_persisted_evidence()
+    return value
+
+
+def _exact_evidence_bool(value: object) -> bool:
+    if type(value) is not bool:
+        _reject_persisted_evidence()
+    assert isinstance(value, bool)
+    return value
+
+
+def _exact_evidence_int(
+    value: object,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        _reject_persisted_evidence()
+    assert isinstance(value, int)
+    return value
+
+
+def _exact_evidence_optional_int(
+    value: object,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int | None:
+    if value is None:
+        return None
+    return _exact_evidence_int(
+        value,
+        minimum=minimum,
+        maximum=maximum,
+    )
+
+
+def _exact_evidence_text(
+    value: object,
+    *,
+    maximum_chars: int,
+    maximum_bytes: int,
+    allow_empty: bool = False,
+    printable: bool = True,
+) -> str:
+    if (
+        type(value) is not str
+        or len(value) > maximum_chars
+        or (not value and not allow_empty)
+    ):
+        _reject_persisted_evidence()
+    assert isinstance(value, str)
+    if printable and not all(character.isprintable() for character in value):
+        _reject_persisted_evidence()
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        _reject_persisted_evidence()
+    if len(encoded) > maximum_bytes:
+        _reject_persisted_evidence()
+    return value
+
+
+def _exact_evidence_digest(
+    value: object,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    if allow_empty and type(value) is str and not value:
+        return ""
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or _SHA256.fullmatch(value) is None
+    ):
+        _reject_persisted_evidence()
+    assert isinstance(value, str)
+    return value
+
+
+def _exact_present_marker(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or value != "<present>":
+        _reject_persisted_evidence()
+    return value
+
+
+def _parse_rev_proof_stream_evidence(
+    value: object,
+) -> RevProofStreamEvidence:
+    mapping = _exact_evidence_mapping(value, _REV_PROOF_STREAM_KEYS)
+    artifact_id_value = mapping["artifact_id"]
+    artifact_id = (
+        None
+        if artifact_id_value is None
+        else _exact_evidence_text(
+            artifact_id_value,
+            maximum_chars=256,
+            maximum_bytes=256,
+        )
+    )
+    artifact_sha_value = mapping["artifact_sha256"]
+    artifact_sha256 = (
+        None
+        if artifact_sha_value is None
+        else _exact_evidence_digest(artifact_sha_value)
+    )
+    artifact_size_bytes = _exact_evidence_optional_int(
+        mapping["artifact_size_bytes"],
+        minimum=0,
+        maximum=REV_STDIN_PROOF_MAX_STREAM_BYTES,
+    )
+    truncated_value = mapping["truncated"]
+    if truncated_value is not None and type(truncated_value) is not bool:
+        _reject_persisted_evidence()
+    return RevProofStreamEvidence(
+        artifact_id=artifact_id,
+        artifact_sha256=artifact_sha256,
+        artifact_size_bytes=artifact_size_bytes,
+        capture_complete=_exact_evidence_bool(
+            mapping["capture_complete"]
+        ),
+        truncation_known=_exact_evidence_bool(
+            mapping["truncation_known"]
+        ),
+        truncated=truncated_value,
+        capture_error=_exact_present_marker(mapping["capture_error"]),
+        durable_artifact_complete=_exact_evidence_bool(
+            mapping["durable_artifact_complete"]
+        ),
+    )
+
+
+def _parse_rev_proof_observation(
+    value: object,
+) -> RevProofObservation:
+    mapping = _exact_evidence_mapping(
+        value,
+        _REV_PROOF_OBSERVATION_KEYS,
+    )
+    run_id = _exact_evidence_text(
+        mapping["run_id"],
+        maximum_chars=256,
+        maximum_bytes=256,
+        allow_empty=True,
+    )
+    phase = _exact_evidence_text(
+        mapping["phase"],
+        maximum_chars=16,
+        maximum_bytes=16,
+        allow_empty=True,
+    )
+    mutation_id = _exact_evidence_text(
+        mapping["mutation_id"],
+        maximum_chars=64,
+        maximum_bytes=64,
+        allow_empty=True,
+    )
+    orchestration_status = _exact_evidence_text(
+        mapping["orchestration_status"],
+        maximum_chars=64,
+        maximum_bytes=64,
+        allow_empty=True,
+    )
+    scanner_contract = _exact_evidence_text(
+        mapping["flag_scanner_contract"],
+        maximum_chars=64,
+        maximum_bytes=64,
+        allow_empty=True,
+    )
+    if scanner_contract not in {
+        "",
+        REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT,
+    }:
+        _reject_persisted_evidence()
+
+    flag_values_list = _exact_evidence_list(
+        mapping["flag_values"],
+        maximum_items=REV_STDIN_PROOF_MAX_FLAG_VALUES,
+    )
+    flag_values: list[str] = []
+    for flag_value in flag_values_list:
+        flag_values.append(
+            _exact_evidence_text(
+                flag_value,
+                maximum_chars=REV_STDIN_PROOF_MAX_CANDIDATE_CHARS,
+                maximum_bytes=REV_STDIN_PROOF_MAX_CANDIDATE_BYTES,
+            )
+        )
+    immutable_flag_values = tuple(flag_values)
+    if not _flag_values_are_valid(immutable_flag_values):
+        _reject_persisted_evidence()
+
+    return RevProofObservation(
+        run_id=run_id,
+        phase=phase,
+        mutation_id=mutation_id,
+        input_sha256=_exact_evidence_digest(
+            mapping["input_sha256"],
+            allow_empty=True,
+        ),
+        input_size_bytes=_exact_evidence_int(
+            mapping["input_size_bytes"],
+            minimum=-1,
+            maximum=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+        ),
+        source_manifest_sha256=_exact_evidence_digest(
+            mapping["source_manifest_sha256"],
+            allow_empty=True,
+        ),
+        clean_workspace=_exact_evidence_bool(
+            mapping["clean_workspace"]
+        ),
+        target_exit_code=_exact_evidence_optional_int(
+            mapping["target_exit_code"],
+            minimum=0,
+            maximum=255,
+        ),
+        runner_exit_code=_exact_evidence_optional_int(
+            mapping["runner_exit_code"],
+            minimum=0,
+            maximum=255,
+        ),
+        ctfwrap_exit_code=_exact_evidence_optional_int(
+            mapping["ctfwrap_exit_code"],
+            minimum=0,
+            maximum=255,
+        ),
+        timed_out=_exact_evidence_bool(mapping["timed_out"]),
+        orchestration_status=orchestration_status,
+        orchestration_error=_exact_present_marker(
+            mapping["orchestration_error"]
+        ),
+        stream_capture_error=_exact_present_marker(
+            mapping["stream_capture_error"]
+        ),
+        stdout=_parse_rev_proof_stream_evidence(mapping["stdout"]),
+        stderr=_parse_rev_proof_stream_evidence(mapping["stderr"]),
+        flag_scanner_contract=scanner_contract,
+        flag_scan_complete=_exact_evidence_bool(
+            mapping["flag_scan_complete"]
+        ),
+        flag_scan_error=_exact_present_marker(
+            mapping["flag_scan_error"]
+        ),
+        flag_values_overflow=_exact_evidence_bool(
+            mapping["flag_values_overflow"]
+        ),
+        flag_values=immutable_flag_values,
+        selected_candidate_direct_output=_exact_evidence_bool(
+            mapping["selected_candidate_direct_output"]
+        ),
+    )
+
+
+def _parse_rev_proof_input_record(
+    value: object,
+) -> RevProofInputRecord:
+    mapping = _exact_evidence_mapping(
+        value,
+        _REV_PROOF_INPUT_RECORD_KEYS,
+    )
+    phase = _exact_evidence_text(
+        mapping["phase"],
+        maximum_chars=16,
+        maximum_bytes=16,
+    )
+    if phase not in {_PHASE_POSITIVE, _PHASE_NEGATIVE}:
+        _reject_persisted_evidence()
+    mutation_id = _exact_evidence_text(
+        mapping["mutation_id"],
+        maximum_chars=64,
+        maximum_bytes=64,
+    )
+    if mutation_id not in _REV_PROOF_MUTATION_IDS:
+        _reject_persisted_evidence()
+    return RevProofInputRecord(
+        ordinal=_exact_evidence_int(
+            mapping["ordinal"],
+            minimum=1,
+            maximum=_EXPECTED_ATTEMPT_COUNT,
+        ),
+        phase=phase,
+        mutation_id=mutation_id,
+        input_sha256=_exact_evidence_digest(
+            mapping["input_sha256"]
+        ),
+        input_size_bytes=_exact_evidence_int(
+            mapping["input_size_bytes"],
+            minimum=0,
+            maximum=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+        ),
+    )
+
+
+def _parse_rev_proof_failure(value: object) -> RevProofFailure:
+    mapping = _exact_evidence_mapping(
+        value,
+        _REV_PROOF_FAILURE_KEYS,
+    )
+    code = _exact_evidence_text(
+        mapping["code"],
+        maximum_chars=64,
+        maximum_bytes=64,
+    )
+    if code not in REV_STDIN_PROOF_FAILURE_CODES:
+        _reject_persisted_evidence()
+    attempt_ordinal = _exact_evidence_optional_int(
+        mapping["attempt_ordinal"],
+        minimum=1,
+        maximum=_EXPECTED_ATTEMPT_COUNT,
+    )
+    run_id_value = mapping["run_id"]
+    run_id = (
+        None
+        if run_id_value is None
+        else _exact_evidence_text(
+            run_id_value,
+            maximum_chars=256,
+            maximum_bytes=256,
+        )
+    )
+    stream_value = mapping["stream"]
+    if stream_value is not None and (
+        type(stream_value) is not str
+        or stream_value not in {"stdout", "stderr"}
+    ):
+        _reject_persisted_evidence()
+    if (
+        attempt_ordinal is None
+        and (run_id is not None or stream_value is not None)
+    ):
+        _reject_persisted_evidence()
+    if (
+        stream_value is not None
+        and code not in _REV_PROOF_STREAM_FAILURE_CODES
+    ):
+        _reject_persisted_evidence()
+    return RevProofFailure(
+        code=code,
+        attempt_ordinal=attempt_ordinal,
+        run_id=run_id,
+        stream=stream_value,
+    )
+
+
+def _validate_rev_proof_record_plan(
+    record: RevProofEvaluationRecord,
+) -> None:
+    plan = record.plan
+    if len(plan) not in {0, _EXPECTED_ATTEMPT_COUNT}:
+        _reject_persisted_evidence()
+    if not plan:
+        if (
+            record.observations
+            or record.positive_successes != 0
+            or record.passed
+            or len(record.failures) != 1
+            or record.failures[0].code
+            not in _REV_PROOF_PREFLIGHT_FAILURE_CODES
+            or record.failures[0].attempt_ordinal is not None
+            or record.failures[0].run_id is not None
+            or record.failures[0].stream is not None
+        ):
+            _reject_persisted_evidence()
+        return
+
+    if (
+        not record.candidate
+        or not record.source_manifest_sha256
+        or record.accepted_input_sha256 is None
+        or record.accepted_input_size_bytes is None
+    ):
+        _reject_persisted_evidence()
+    accepted_size = record.accepted_input_size_bytes
+    accepted_sha256 = record.accepted_input_sha256
+    assert accepted_size is not None
+    assert accepted_sha256 is not None
+    negative_ids = (
+        REV_STDIN_PROOF_NONEMPTY_NEGATIVE_MUTATION_IDS
+        if accepted_size
+        else REV_STDIN_PROOF_EMPTY_NEGATIVE_MUTATION_IDS
+    )
+    expected_ids = (
+        *REV_STDIN_PROOF_POSITIVE_MUTATION_IDS,
+        *negative_ids,
+    )
+    expected_phases = (
+        *(_PHASE_POSITIVE for _ in range(3)),
+        *(_PHASE_NEGATIVE for _ in range(3)),
+    )
+    negative_sizes = (
+        (accepted_size, accepted_size, accepted_size - 1)
+        if accepted_size
+        else (1, 1, 1)
+    )
+    expected_sizes = (
+        accepted_size,
+        accepted_size,
+        accepted_size,
+        *negative_sizes,
+    )
+    for index, item in enumerate(plan, start=1):
+        if (
+            item.ordinal != index
+            or item.phase != expected_phases[index - 1]
+            or item.mutation_id != expected_ids[index - 1]
+            or item.input_size_bytes != expected_sizes[index - 1]
+        ):
+            _reject_persisted_evidence()
+        if index <= 3 and item.input_sha256 != accepted_sha256:
+            _reject_persisted_evidence()
+    if not accepted_size:
+        expected_empty_hashes = (
+            _sha256(b""),
+            _sha256(b""),
+            _sha256(b""),
+            _sha256(b"\x00"),
+            _sha256(b"\x0a"),
+            _sha256(b"\xff"),
+        )
+        if tuple(item.input_sha256 for item in plan) != (
+            expected_empty_hashes
+        ):
+            _reject_persisted_evidence()
+
+
+def _validate_rev_proof_record_uniqueness(
+    record: RevProofEvaluationRecord,
+) -> None:
+    failure_identities: set[tuple[object, ...]] = set()
+    for failure in record.failures:
+        identity = (
+            failure.code,
+            failure.attempt_ordinal,
+            failure.run_id,
+            failure.stream,
+        )
+        if identity in failure_identities:
+            _reject_persisted_evidence()
+        failure_identities.add(identity)
+    if not record.passed:
+        return
+
+    run_ids: set[str] = set()
+    artifact_ids: set[str] = set()
+    for observation in record.observations:
+        if observation.run_id in run_ids:
+            _reject_persisted_evidence()
+        run_ids.add(observation.run_id)
+        for stream in (observation.stdout, observation.stderr):
+            if stream.artifact_id is None:
+                continue
+            if stream.artifact_id in artifact_ids:
+                _reject_persisted_evidence()
+            artifact_ids.add(stream.artifact_id)
+
+
+def _validate_confirmed_rev_proof_record(
+    record: RevProofEvaluationRecord,
+) -> None:
+    if not record.passed:
+        return
+    if (
+        len(record.plan) != _EXPECTED_ATTEMPT_COUNT
+        or len(record.observations) != _EXPECTED_ATTEMPT_COUNT
+        or record.positive_successes != 3
+    ):
+        _reject_persisted_evidence()
+    for planned, observation in zip(
+        record.plan,
+        record.observations,
+        strict=True,
+    ):
+        if (
+            observation.phase != planned.phase
+            or observation.mutation_id != planned.mutation_id
+            or observation.input_sha256 != planned.input_sha256
+            or observation.input_size_bytes != planned.input_size_bytes
+            or observation.source_manifest_sha256
+            != record.source_manifest_sha256
+            or observation.clean_workspace is not True
+            or observation.timed_out is not False
+            or observation.orchestration_status != "completed"
+            or observation.orchestration_error is not None
+            or observation.stream_capture_error is not None
+            or observation.target_exit_code is None
+            or observation.target_exit_code == _TRANSPORT_INCONCLUSIVE_EXIT
+            or observation.runner_exit_code
+            != observation.target_exit_code
+            or observation.ctfwrap_exit_code
+            != observation.target_exit_code
+            or observation.flag_scanner_contract
+            != REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT
+            or observation.flag_scan_complete is not True
+            or observation.flag_scan_error is not None
+            or observation.flag_values_overflow is not False
+        ):
+            _reject_persisted_evidence()
+        for stream in (observation.stdout, observation.stderr):
+            if (
+                stream.capture_complete is not True
+                or stream.truncation_known is not True
+                or stream.truncated is not False
+                or stream.capture_error is not None
+                or stream.durable_artifact_complete is not True
+                or stream.artifact_id is None
+                or stream.artifact_sha256 is None
+                or stream.artifact_size_bytes is None
+            ):
+                _reject_persisted_evidence()
+        if planned.phase == _PHASE_POSITIVE:
+            if (
+                observation.selected_candidate_direct_output is not True
+                or record.candidate not in observation.flag_values
+            ):
+                _reject_persisted_evidence()
+        elif (
+            observation.selected_candidate_direct_output is not False
+            or observation.flag_values
+        ):
+            _reject_persisted_evidence()
+
+
+def parse_rev_proof_evaluation_evidence(
+    value: object,
+) -> RevProofEvaluationRecord:
+    """Parse one exact, bounded persisted v1 Rev proof evaluation mapping.
+
+    The parser accepts only JSON-shaped built-in types and never consumes
+    arbitrary iterables.  Semantic replay that requires the original accepted
+    input is deliberately left to :func:`verify_rev_proof_evaluation`.
+    """
+
+    mapping = _exact_evidence_mapping(
+        value,
+        _REV_PROOF_EVALUATION_KEYS,
+    )
+    protocol = _exact_evidence_text(
+        mapping["protocol"],
+        maximum_chars=64,
+        maximum_bytes=64,
+    )
+    if (
+        protocol != REV_STDIN_PROOF_PROTOCOL
+        or type(mapping["schema_version"]) is not int
+        or mapping["schema_version"] != 1
+        or type(mapping["required_positive_attempts"]) is not int
+        or mapping["required_positive_attempts"] != 3
+        or type(mapping["required_negative_attempts"]) is not int
+        or mapping["required_negative_attempts"] != 3
+    ):
+        _reject_persisted_evidence()
+
+    candidate = _exact_evidence_text(
+        mapping["candidate"],
+        maximum_chars=REV_STDIN_PROOF_MAX_CANDIDATE_CHARS,
+        maximum_bytes=REV_STDIN_PROOF_MAX_CANDIDATE_BYTES,
+        allow_empty=True,
+    )
+    accepted_sha_value = mapping["accepted_input_sha256"]
+    accepted_input_sha256 = (
+        None
+        if accepted_sha_value is None
+        else _exact_evidence_digest(accepted_sha_value)
+    )
+    accepted_input_size_bytes = _exact_evidence_optional_int(
+        mapping["accepted_input_size_bytes"],
+        minimum=0,
+        maximum=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+    )
+    if (accepted_input_sha256 is None) != (
+        accepted_input_size_bytes is None
+    ):
+        _reject_persisted_evidence()
+
+    plan_values = _exact_evidence_list(
+        mapping["plan"],
+        maximum_items=_EXPECTED_ATTEMPT_COUNT,
+    )
+    if len(plan_values) not in {0, _EXPECTED_ATTEMPT_COUNT}:
+        _reject_persisted_evidence()
+    plan = tuple(
+        _parse_rev_proof_input_record(item)
+        for item in plan_values
+    )
+    observation_values = _exact_evidence_list(
+        mapping["observations"],
+        maximum_items=_EXPECTED_ATTEMPT_COUNT,
+    )
+    observations = tuple(
+        _parse_rev_proof_observation(item)
+        for item in observation_values
+    )
+    failure_values = _exact_evidence_list(
+        mapping["failures"],
+        maximum_items=_REV_PROOF_MAX_FAILURES,
+    )
+    failures = tuple(
+        _parse_rev_proof_failure(item) for item in failure_values
+    )
+    failure_code_values = _exact_evidence_list(
+        mapping["failure_codes"],
+        maximum_items=len(REV_STDIN_PROOF_FAILURE_CODES),
+    )
+    parsed_failure_codes: list[str] = []
+    for code_value in failure_code_values:
+        code = _exact_evidence_text(
+            code_value,
+            maximum_chars=64,
+            maximum_bytes=64,
+        )
+        if (
+            code not in REV_STDIN_PROOF_FAILURE_CODES
+            or code in parsed_failure_codes
+        ):
+            _reject_persisted_evidence()
+        parsed_failure_codes.append(code)
+
+    record = RevProofEvaluationRecord(
+        candidate=candidate,
+        source_manifest_sha256=_exact_evidence_digest(
+            mapping["source_manifest_sha256"],
+            allow_empty=True,
+        ),
+        accepted_input_sha256=accepted_input_sha256,
+        accepted_input_size_bytes=accepted_input_size_bytes,
+        plan=plan,
+        observations=observations,
+        failures=failures,
+        positive_successes=_exact_evidence_int(
+            mapping["positive_successes"],
+            minimum=0,
+            maximum=3,
+        ),
+        passed=_exact_evidence_bool(mapping["passed"]),
+        protocol=protocol,
+    )
+
+    expected_positive_successes = (
+        3
+        - len(
+            {
+                failure.attempt_ordinal
+                for failure in record.failures
+                if failure.attempt_ordinal in {1, 2, 3}
+            }
+        )
+        if len(record.observations) == _EXPECTED_ATTEMPT_COUNT
+        else 0
+    )
+    if (
+        record.passed != (not record.failures)
+        or record.positive_successes != expected_positive_successes
+        or parsed_failure_codes != list(record.failure_codes)
+        or type(mapping["total_attempts"]) is not int
+        or mapping["total_attempts"] != len(record.observations)
+        or type(mapping["transport_inconclusive"]) is not bool
+        or mapping["transport_inconclusive"]
+        != record.transport_inconclusive
+        or type(mapping["verdict"]) is not str
+        or mapping["verdict"] != record.verdict
+    ):
+        _reject_persisted_evidence()
+
+    _validate_rev_proof_record_plan(record)
+    _validate_rev_proof_record_uniqueness(record)
+    _validate_confirmed_rev_proof_record(record)
+
+    try:
+        canonical = record.canonical_bytes()
+        supplied_canonical = _canonical_json_bytes(mapping)
+    except (TypeError, ValueError, UnicodeError):
+        _reject_persisted_evidence()
+    if (
+        len(supplied_canonical)
+        > REV_STDIN_PROOF_MAX_EVIDENCE_BYTES
+        or supplied_canonical != canonical
+    ):
+        _reject_persisted_evidence()
+    return record
+
+
+def verify_rev_proof_evaluation(
+    value: object,
+    *,
+    accepted_input: bytes,
+) -> RevProofEvaluationRecord:
+    """Replay and exact-compare one persisted Rev proof evaluation."""
+
+    record = parse_rev_proof_evaluation_evidence(value)
+    if (
+        type(accepted_input) is not bytes
+        or len(accepted_input)
+        > REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+    ):
+        _reject_persisted_evidence()
+    _, replayed = evaluate_rev_stdin_proof(
+        record.candidate,
+        accepted_input,
+        record.source_manifest_sha256,
+        record.observations,
+    )
+    try:
+        replayed_canonical = replayed.canonical_bytes()
+        recorded_canonical = record.canonical_bytes()
+    except (TypeError, ValueError, UnicodeError):
+        _reject_persisted_evidence()
+    if replayed_canonical != recorded_canonical:
+        _reject_persisted_evidence()
+    return record

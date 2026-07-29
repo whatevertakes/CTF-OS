@@ -14,9 +14,12 @@ from ctf_os.engine.rev_proof import (
     REV_STDIN_PROOF_POSITIVE_MUTATION_IDS,
     REV_STDIN_PROOF_PROTOCOL,
     RevProofObservation,
+    RevProofEvaluationRecord,
     RevProofStreamEvidence,
     build_rev_stdin_proof_plan,
     evaluate_rev_stdin_proof,
+    parse_rev_proof_evaluation_evidence,
+    verify_rev_proof_evaluation,
 )
 
 
@@ -786,6 +789,318 @@ class RevProofEvaluationTests(unittest.TestCase):
             len(evaluation.canonical_bytes()),
             REV_STDIN_PROOF_MAX_EVIDENCE_BYTES,
         )
+
+
+class RevProofPersistedEvidenceTests(unittest.TestCase):
+    def confirmed_mapping(self) -> dict[str, object]:
+        _, evaluation = evaluate_rev_stdin_proof(
+            CANDIDATE,
+            ACCEPTED_INPUT,
+            MANIFEST,
+            valid_observations(),
+        )
+        return json.loads(evaluation.canonical_bytes())
+
+    def test_exact_mapping_round_trips_and_replays_original_input(
+        self,
+    ) -> None:
+        mapping = self.confirmed_mapping()
+        record = parse_rev_proof_evaluation_evidence(mapping)
+
+        self.assertIsInstance(record, RevProofEvaluationRecord)
+        self.assertEqual(record.to_dict(), mapping)
+        self.assertEqual(
+            json.loads(record.canonical_bytes()),
+            mapping,
+        )
+        self.assertEqual(
+            verify_rev_proof_evaluation(
+                mapping,
+                accepted_input=ACCEPTED_INPUT,
+            ),
+            record,
+        )
+        self.assertNotIn(
+            ACCEPTED_INPUT.hex(),
+            record.canonical_bytes().decode("ascii"),
+        )
+
+    def test_replay_rejects_wrong_input_and_hash_only_plan_tampering(
+        self,
+    ) -> None:
+        mapping = self.confirmed_mapping()
+        with self.assertRaisesRegex(
+            ValueError,
+            "invalid persisted Rev proof evidence",
+        ):
+            verify_rev_proof_evaluation(
+                mapping,
+                accepted_input=ACCEPTED_INPUT + b"x",
+            )
+
+        tampered = json.loads(json.dumps(mapping))
+        tampered["plan"][3]["input_sha256"] = "0" * 64
+        tampered["observations"][3]["input_sha256"] = "0" * 64
+        parsed = parse_rev_proof_evaluation_evidence(tampered)
+        self.assertEqual(parsed.plan[3].input_sha256, "0" * 64)
+        with self.assertRaises(ValueError):
+            verify_rev_proof_evaluation(
+                tampered,
+                accepted_input=ACCEPTED_INPUT,
+            )
+
+    def test_derived_fields_and_fixed_plan_order_are_exact(self) -> None:
+        base = self.confirmed_mapping()
+        mutations = {
+            "failure-codes": lambda value: value.__setitem__(
+                "failure_codes",
+                ["timed_out"],
+            ),
+            "positive-successes": lambda value: value.__setitem__(
+                "positive_successes",
+                2,
+            ),
+            "total-attempts": lambda value: value.__setitem__(
+                "total_attempts",
+                5,
+            ),
+            "transport": lambda value: value.__setitem__(
+                "transport_inconclusive",
+                True,
+            ),
+            "verdict": lambda value: value.__setitem__(
+                "verdict",
+                "INCONCLUSIVE",
+            ),
+            "required-count": lambda value: value.__setitem__(
+                "required_positive_attempts",
+                2,
+            ),
+            "plan-order": lambda value: value["plan"].__setitem__(
+                slice(0, 2),
+                list(reversed(value["plan"][0:2])),
+            ),
+        }
+        for name, mutate in mutations.items():
+            mapping = json.loads(json.dumps(base))
+            mutate(mapping)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parse_rev_proof_evaluation_evidence(mapping)
+
+    def test_exact_builtin_types_keys_and_cardinality_are_required(
+        self,
+    ) -> None:
+        class EqualString(str):
+            def __eq__(self, _other):
+                return True
+
+            __hash__ = str.__hash__
+
+        class ExplodingIterable:
+            consumed = False
+
+            def __iter__(self):
+                self.consumed = True
+                raise AssertionError("must not consume")
+
+        class ExplodingList(list):
+            def __len__(self):
+                raise AssertionError("must not inspect subclass")
+
+            def __iter__(self):
+                raise AssertionError("must not consume subclass")
+
+        base = self.confirmed_mapping()
+        cases: list[tuple[str, object]] = []
+
+        extra = json.loads(json.dumps(base))
+        extra["extra"] = None
+        cases.append(("extra-key", extra))
+
+        missing = json.loads(json.dumps(base))
+        del missing["verdict"]
+        cases.append(("missing-key", missing))
+
+        tuple_plan = json.loads(json.dumps(base))
+        tuple_plan["plan"] = tuple(tuple_plan["plan"])
+        cases.append(("tuple-plan", tuple_plan))
+
+        subclass_list = json.loads(json.dumps(base))
+        explosive = ExplodingList(subclass_list["observations"])
+        subclass_list["observations"] = explosive
+        cases.append(("list-subclass", subclass_list))
+
+        subclass_text = json.loads(json.dumps(base))
+        subclass_text["candidate"] = EqualString(CANDIDATE)
+        cases.append(("str-subclass", subclass_text))
+
+        bool_integer = json.loads(json.dumps(base))
+        bool_integer["schema_version"] = True
+        cases.append(("bool-int", bool_integer))
+
+        oversized_list = json.loads(json.dumps(base))
+        oversized_list["observations"].append(
+            oversized_list["observations"][-1]
+        )
+        cases.append(("oversized-observations", oversized_list))
+
+        non_mapping = ExplodingIterable()
+        cases.append(("arbitrary-iterator", non_mapping))
+
+        for name, value in cases:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                parse_rev_proof_evaluation_evidence(value)
+        self.assertFalse(non_mapping.consumed)
+
+    def test_huge_values_are_rejected_without_entering_canonical_record(
+        self,
+    ) -> None:
+        marker = "PERSISTED-EVIDENCE-HUGE-" + (
+            "x" * (REV_STDIN_PROOF_MAX_EVIDENCE_BYTES + 1)
+        )
+        cases = []
+        huge_candidate = self.confirmed_mapping()
+        huge_candidate["candidate"] = marker
+        cases.append(huge_candidate)
+
+        huge_flag = self.confirmed_mapping()
+        huge_flag["observations"][0]["flag_values"] = [marker]
+        cases.append(huge_flag)
+
+        huge_integer = self.confirmed_mapping()
+        huge_integer["observations"][0]["input_size_bytes"] = 10**1000
+        cases.append(huge_integer)
+
+        for mapping in cases:
+            with self.assertRaises(ValueError) as caught:
+                parse_rev_proof_evaluation_evidence(mapping)
+            self.assertNotIn(marker, str(caught.exception))
+
+    def test_run_artifact_and_failure_identifiers_are_unique_and_known(
+        self,
+    ) -> None:
+        base = self.confirmed_mapping()
+        duplicate_run = json.loads(json.dumps(base))
+        duplicate_run["observations"][5]["run_id"] = (
+            duplicate_run["observations"][0]["run_id"]
+        )
+        duplicate_artifact = json.loads(json.dumps(base))
+        duplicate_artifact["observations"][5]["stderr"]["artifact_id"] = (
+            duplicate_artifact["observations"][0]["stdout"][
+                "artifact_id"
+            ]
+        )
+
+        _, failed_evaluation = evaluate_rev_stdin_proof(
+            CANDIDATE,
+            ACCEPTED_INPUT,
+            MANIFEST,
+            (
+                replace(
+                    valid_observations()[0],
+                    target_exit_code=125,
+                    runner_exit_code=125,
+                    ctfwrap_exit_code=125,
+                ),
+                *valid_observations()[1:],
+            ),
+        )
+        unknown_failure = json.loads(
+            failed_evaluation.canonical_bytes()
+        )
+        unknown_failure["failures"][0]["code"] = "unknown"
+        unknown_failure["failure_codes"][0] = "unknown"
+
+        for mapping in (
+            duplicate_run,
+            duplicate_artifact,
+            unknown_failure,
+        ):
+            with self.assertRaises(ValueError):
+                parse_rev_proof_evaluation_evidence(mapping)
+
+        failed_mapping = json.loads(
+            failed_evaluation.canonical_bytes()
+        )
+        failed_record = verify_rev_proof_evaluation(
+            failed_mapping,
+            accepted_input=ACCEPTED_INPUT,
+        )
+        self.assertFalse(failed_record.passed)
+        self.assertTrue(failed_record.transport_inconclusive)
+
+    def test_canonical_duplicate_run_and_artifact_failures_round_trip(
+        self,
+    ) -> None:
+        base = valid_observations()
+        duplicate_run_observations = list(base)
+        duplicate_run_observations[5] = replace(
+            duplicate_run_observations[5],
+            run_id=duplicate_run_observations[0].run_id,
+        )
+        duplicate_artifact_observations = list(base)
+        duplicate_artifact_observations[5] = replace(
+            duplicate_artifact_observations[5],
+            stderr=replace(
+                duplicate_artifact_observations[5].stderr,
+                artifact_id=(
+                    duplicate_artifact_observations[0]
+                    .stdout.artifact_id
+                ),
+            ),
+        )
+
+        for expected_code, observations in (
+            ("duplicate_run_id", duplicate_run_observations),
+            (
+                "durable_artifact_reused",
+                duplicate_artifact_observations,
+            ),
+        ):
+            with self.subTest(expected_code=expected_code):
+                _, evaluation = evaluate_rev_stdin_proof(
+                    CANDIDATE,
+                    ACCEPTED_INPUT,
+                    MANIFEST,
+                    observations,
+                )
+                mapping = json.loads(evaluation.canonical_bytes())
+                record = parse_rev_proof_evaluation_evidence(mapping)
+                self.assertIn(expected_code, record.failure_codes)
+                self.assertEqual(
+                    verify_rev_proof_evaluation(
+                        mapping,
+                        accepted_input=ACCEPTED_INPUT,
+                    ),
+                    record,
+                )
+
+    def test_noncanonical_nested_shape_and_observation_binding_fail(
+        self,
+    ) -> None:
+        base = self.confirmed_mapping()
+        extra_stream_key = json.loads(json.dumps(base))
+        extra_stream_key["observations"][0]["stdout"]["raw"] = "forbidden"
+
+        wrong_phase = json.loads(json.dumps(base))
+        wrong_phase["observations"][0]["phase"] = "other"
+
+        wrong_binding = json.loads(json.dumps(base))
+        wrong_binding["observations"][0]["input_sha256"] = "0" * 64
+
+        for name, mapping, parser_only in (
+            ("extra-stream-key", extra_stream_key, True),
+            ("phase-vocabulary", wrong_phase, True),
+            ("observation-binding", wrong_binding, False),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                if parser_only:
+                    parse_rev_proof_evaluation_evidence(mapping)
+                else:
+                    verify_rev_proof_evaluation(
+                        mapping,
+                        accepted_input=ACCEPTED_INPUT,
+                    )
 
 
 if __name__ == "__main__":
