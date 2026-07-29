@@ -13,11 +13,14 @@ from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     CandidateTier,
     ChallengeState,
-    Checkpoint,
-    ExperimentKind,
-    ExperimentStatus,
     Provenance,
     TargetStatus,
+)
+from ctf_os.engine.resume_capsule import (
+    MAX_RESUME_CAPSULE_BYTES,
+    MIN_RESUME_CAPSULE_BYTES,
+    ResumeCapsulePolicy,
+    render_resume_capsule,
 )
 from ctf_os.store.atomic import canonical_json_record
 
@@ -174,127 +177,6 @@ def _candidate_groups(state: ChallengeState) -> tuple[list[Any], list[Any]]:
     return high, generic
 
 
-def _checkpoint_context_record(
-    checkpoint: Checkpoint,
-    *,
-    state_path: Path,
-    maximum: int = 1280,
-) -> tuple[str, int]:
-    values = {
-        "id": checkpoint.id,
-        "active_goal_id": checkpoint.active_goal_id,
-        "active_hypothesis_ids": checkpoint.open_hypothesis_ids,
-        "frontier_statuses": sorted(
-            item.value for item in ACTIVE_HYPOTHESIS_STATUSES
-        ),
-        "observation_fact_ids": checkpoint.observation_fact_ids,
-        "next_actions": checkpoint.next_actions,
-        "do_not_repeat": checkpoint.do_not_repeat,
-        "artifact_ids": checkpoint.artifact_ids,
-        "receipt_ids": checkpoint.receipt_ids,
-        "note": _bounded(checkpoint.note or ""),
-    }
-    complete = _record("latest_checkpoint", trust="evidence", **values)
-    if len(complete) <= maximum:
-        return complete, 0
-
-    omitted = 0
-
-    def compact(
-        items: list[str],
-        *,
-        maximum_items: int,
-        maximum_chars: int,
-    ) -> list[str]:
-        nonlocal omitted
-        result: list[str] = []
-        for item in items[:maximum_items]:
-            bounded = _bounded(item, maximum_chars)
-            result.append(bounded)
-            if bounded != item:
-                omitted += 1
-        omitted += max(0, len(items) - maximum_items)
-        return result
-
-    note = checkpoint.note or ""
-    bounded_note = _bounded(note, 160)
-    if bounded_note != note:
-        omitted += 1
-    counts = {
-        "active_hypotheses": len(checkpoint.open_hypothesis_ids),
-        "observation_facts": len(checkpoint.observation_fact_ids),
-        "next_actions": len(checkpoint.next_actions),
-        "do_not_repeat": len(checkpoint.do_not_repeat),
-        "artifacts": len(checkpoint.artifact_ids),
-        "receipts": len(checkpoint.receipt_ids),
-    }
-    compact_values = {
-        "id": _bounded(checkpoint.id, 128),
-        "active_goal_id": (
-            _bounded(checkpoint.active_goal_id, 128)
-            if checkpoint.active_goal_id is not None
-            else None
-        ),
-        "active_hypothesis_ids": compact(
-            checkpoint.open_hypothesis_ids,
-            maximum_items=4,
-            maximum_chars=48,
-        ),
-        "frontier_statuses": values["frontier_statuses"],
-        "observation_fact_ids": compact(
-            checkpoint.observation_fact_ids,
-            maximum_items=1,
-            maximum_chars=48,
-        ),
-        "next_actions": compact(
-            checkpoint.next_actions,
-            maximum_items=1,
-            maximum_chars=80,
-        ),
-        "do_not_repeat": compact(
-            checkpoint.do_not_repeat,
-            maximum_items=1,
-            maximum_chars=80,
-        ),
-        "artifact_ids": compact(
-            checkpoint.artifact_ids,
-            maximum_items=1,
-            maximum_chars=48,
-        ),
-        "receipt_ids": compact(
-            checkpoint.receipt_ids,
-            maximum_items=1,
-            maximum_chars=48,
-        ),
-        "note": bounded_note,
-        "field_counts": counts,
-        "complete": False,
-        "canonical_pointer": _bounded(state_path, 256),
-    }
-    bounded = _record(
-        "latest_checkpoint",
-        trust="evidence",
-        **compact_values,
-    )
-    if len(bounded) <= maximum:
-        return bounded, max(1, omitted)
-
-    minimal = _record(
-        "latest_checkpoint",
-        trust="evidence",
-        id=compact_values["id"],
-        active_goal_id=compact_values["active_goal_id"],
-        active_hypothesis_ids=compact_values["active_hypothesis_ids"],
-        frontier_statuses=compact_values["frontier_statuses"],
-        next_actions=compact_values["next_actions"],
-        do_not_repeat=compact_values["do_not_repeat"],
-        field_counts=counts,
-        complete=False,
-        canonical_pointer=compact_values["canonical_pointer"],
-    )
-    return minimal, max(1, omitted)
-
-
 def build_context_pack(
     state: ChallengeState,
     adapter: CategoryAdapter,
@@ -420,30 +302,24 @@ def build_context_pack(
         for item in state.hypotheses
         if item.status not in ACTIVE_HYPOTHESIS_STATUSES
     ]
-    pending = [
-        item
-        for item in state.experiments
-        if item.kind is ExperimentKind.STRATEGIC
-        and item.status
-        in {
-            ExperimentStatus.AWAITING_EVALUATION,
-            ExperimentStatus.INCONCLUSIVE,
-        }
-    ]
-    latest_checkpoint = state.checkpoints[-1] if state.checkpoints else None
-    if latest_checkpoint is not None:
-        checkpoint_record, checkpoint_omitted = _checkpoint_context_record(
-            latest_checkpoint,
-            state_path=state_path,
-        )
-        mandatory.append(checkpoint_record)
-        if checkpoint_omitted:
-            early_omitted["latest_checkpoint_fields"] = checkpoint_omitted
+    capsule_budget = min(
+        MAX_RESUME_CAPSULE_BYTES,
+        max(MIN_RESUME_CAPSULE_BYTES, max_chars // 4),
+    )
+    capsule = render_resume_capsule(
+        state,
+        state_path=state_path,
+        policy=ResumeCapsulePolicy(max_bytes=capsule_budget),
+    )
+    mandatory.append(capsule.text)
+    for name, count in capsule.omitted_counts.items():
+        if count:
+            early_omitted[f"resume_{name}"] = count
     newest_receipts = list(reversed(state.receipts[-3:]))
     if newest_receipts:
-        # The newest executable evidence must survive even at the minimum
-        # context budget.  Keep it mandatory, and let the remaining two
-        # receipts compete in the critical tier ahead of operator text.
+        # Receipt summaries are engine-redacted, bounded samples backed by
+        # immutable artifacts.  Keep one so a freshly seeded tool wave can
+        # inform the very first Captain without exposing transport tails.
         mandatory.append(_receipt_context_record(newest_receipts[0]))
     critical_groups = [
         _Group(
@@ -485,26 +361,6 @@ def build_context_pack(
                     evidence_receipt_ids=item.evidence_receipt_ids,
                 )
                 for item in active_hypotheses
-            ),
-        ),
-        _Group(
-            "pending_evaluations",
-            tuple(
-                _record(
-                    "pending_strategic_evaluation",
-                    trust="evidence",
-                    id=item.id,
-                    hypothesis_ids=item.hypothesis_ids,
-                    expected=_bounded(item.expected_observation),
-                    keep_if=_bounded(item.keep_if),
-                    drop_if=_bounded(item.drop_if),
-                    receipt_id=(
-                        item.result.get("receipt_id")
-                        if isinstance(item.result, dict)
-                        else None
-                    ),
-                )
-                for item in reversed(pending)
             ),
         ),
         _Group(
@@ -683,29 +539,6 @@ def build_context_pack(
                         pointer=str(state_path),
                     ),
                 ]
-            ),
-        ),
-        _Group(
-            "receipts",
-            tuple(
-                _record(
-                    "execution_receipt",
-                    trust="evidence",
-                    id=item.id,
-                    experiment_id=item.experiment_id,
-                    run_id=item.run_id,
-                    outcome=item.outcome.value,
-                    exit_code=item.exit_code,
-                    wall_seconds=item.wall_seconds,
-                    stdout_artifact_id=item.stdout_artifact_id,
-                    stderr_artifact_id=item.stderr_artifact_id,
-                    stdout_bytes=item.stdout_bytes,
-                    stderr_bytes=item.stderr_bytes,
-                    stdout_lines=item.stdout_lines,
-                    stderr_lines=item.stderr_lines,
-                    preview=item.preview,
-                )
-                for item in reversed(state.receipts[:-3][-17:])
             ),
         ),
         _Group(
