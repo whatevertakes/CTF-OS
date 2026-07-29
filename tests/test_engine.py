@@ -6,6 +6,7 @@ import io
 import inspect
 import json
 import os
+import shlex
 import stat
 import struct
 import sys
@@ -19,6 +20,8 @@ from pathlib import Path
 from unittest import mock
 
 import ctf_os.engine.challenge as challenge_module
+import ctf_os.models as models_module
+import ctf_os.store.files as store_files
 from ctf_os.adapters import get_adapter
 from ctf_os.budget import deadline_epoch
 from ctf_os.codex import (
@@ -30,6 +33,17 @@ from ctf_os.codex import (
     Role,
 )
 from ctf_os.config import load_config
+from ctf_os.contracts.rev_inventory_v1 import (
+    REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V1_CONTRACT_ID,
+    REV_INVENTORY_V1_CONTRACT_VERSION,
+    REV_INVENTORY_V1_MAX_SOURCE_BYTES,
+    REV_INVENTORY_V1_SCHEMA_VERSION,
+    build_rev_inventory_v1_seed_extra,
+    build_rev_inventory_v1_source_binding,
+    build_rev_inventory_v1_source_snapshot,
+    rev_inventory_v1_seed_command,
+)
 from ctf_os.engine.challenge import (
     WAVE_ROLES,
     ChallengeEngine,
@@ -45,11 +59,13 @@ from ctf_os.engine.flags import (
     DetectedFlag,
     FlagDetector,
 )
-from ctf_os.engine.partial_oracle import (
-    REV_INVENTORY_CONTRACT_FINGERPRINT,
-    REV_INVENTORY_CONTRACT_ID,
-    REV_INVENTORY_CONTRACT_VERSION,
-    REV_INVENTORY_DOCUMENT_TRANSPORT,
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V2_CONTRACT_ID,
+    REV_INVENTORY_V2_CONTRACT_VERSION,
+    REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V2_MAX_BYTES,
+    REV_INVENTORY_V2_SCHEMA_VERSION,
 )
 from ctf_os.engine.receipt_summary import ReceiptSummaryError
 from ctf_os.governor import (
@@ -64,11 +80,13 @@ from ctf_os.models import (
     ChallengeState,
     ChallengeStatus,
     Experiment,
+    ExperimentKind,
     ExperimentStatus,
     Fact,
     GoalStatus,
     HypothesisStatus,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
+    ModelValidationError,
     Provenance,
     RunReference,
     RunStatus,
@@ -91,6 +109,48 @@ from ctf_os.store import (
 def _output_path(command: BuiltCommand) -> Path:
     index = command.argv.index("--output-last-message")
     return Path(command.argv[index + 1])
+
+
+def _rev_inventory_payload(
+    source: bytes,
+    *,
+    arch: str | None = "x86",
+    bits: int | None = 64,
+    bintype: str = "elf",
+    endian: str = "little",
+    havecode: bool = True,
+) -> bytes:
+    return (
+        json.dumps(
+            {
+                "binary": {
+                    "arch": arch,
+                    "bits": bits,
+                    "bintype": bintype,
+                    "endian": endian,
+                    "havecode": havecode,
+                },
+                "contract": {
+                    "fingerprint": (
+                        REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+                    ),
+                    "id": REV_INVENTORY_V2_CONTRACT_ID,
+                    "version": REV_INVENTORY_V2_CONTRACT_VERSION,
+                },
+                "schema_version": REV_INVENTORY_V2_SCHEMA_VERSION,
+                "source": {
+                    "sha256": hashlib.sha256(source).hexdigest(),
+                    "size_bytes": len(source),
+                },
+                "status": "ok",
+            },
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
 
 
 @contextmanager
@@ -449,6 +509,68 @@ class FakeSandbox:
         )
 
 
+class RevInventorySandbox(FakeSandbox):
+    def __init__(
+        self,
+        work: Path,
+        payload: bytes,
+        *,
+        complete_capture: bool = True,
+        status: str = "completed",
+        exit_code: int = 0,
+        timed_out: bool = False,
+        orchestration_error: str | None = None,
+        on_run=None,
+    ) -> None:
+        super().__init__(work)
+        self.payload = payload
+        self.complete_capture = complete_capture
+        self.status = status
+        self.exit_code = exit_code
+        self.timed_out = timed_out
+        self.orchestration_error = orchestration_error
+        self.on_run = on_run
+
+    def run(self, spec):
+        self.specs.append(spec)
+        raw = self.work / "raw"
+        raw.mkdir(exist_ok=True)
+        stdout = raw / "stdout.log"
+        stderr = raw / "stderr.log"
+        stdout.write_bytes(self.payload)
+        stderr.write_bytes(b"")
+        if self.on_run is not None:
+            self.on_run()
+        stdout_size = stdout.stat().st_size
+        return SandboxResult(
+            "rev-inventory-tool",
+            self.status,
+            self.exit_code,
+            self.timed_out,
+            5,
+            self.payload.decode("utf-8", errors="replace"),
+            "",
+            stdout_size,
+            0,
+            "/work/raw/stdout.log",
+            "/work/raw/stderr.log",
+            stdout_stored_bytes=stdout_size,
+            stderr_stored_bytes=0,
+            stdout_limit_bytes=16 * 1024 * 1024,
+            stderr_limit_bytes=16 * 1024 * 1024,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_truncation_known=True,
+            stderr_truncation_known=True,
+            stdout_capture_complete=self.complete_capture,
+            stderr_capture_complete=True,
+            stdout_error=None,
+            stderr_error=None,
+            stream_capture_error=None,
+            orchestration_error=self.orchestration_error,
+        )
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -471,6 +593,122 @@ class EngineTests(unittest.TestCase):
             self.root,
             batch_runner=runner,
             sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+
+    def engine_with_rev_inventory(
+        self,
+        payload: bytes,
+        *,
+        complete_capture: bool = True,
+        image_digest: str | None = "sha256:" + ("1" * 64),
+        status: str = "completed",
+        exit_code: int = 0,
+        timed_out: bool = False,
+        orchestration_error: str | None = None,
+        on_run=None,
+    ) -> ChallengeEngine:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=image_digest,
+            ),
+        )
+        runner = BatchRunner(
+            process_executor=RoleExecutor(),
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        return ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=runner,
+            sandbox_factory=lambda state, work, policy: RevInventorySandbox(
+                work,
+                payload,
+                complete_capture=complete_capture,
+                status=status,
+                exit_code=exit_code,
+                timed_out=timed_out,
+                orchestration_error=orchestration_error,
+                on_run=on_run,
+            ),
+        )
+
+    def install_legacy_v1_inventory(
+        self,
+        engine: ChallengeEngine,
+        *,
+        status: ExperimentStatus,
+        result: dict[str, object] | None = None,
+        source_size_bytes: int | None = None,
+    ) -> tuple[ChallengeState, str]:
+        """Replace only the active inventory seed with a frozen v1 seed."""
+
+        state = engine.store.load(self.identity)
+        primary = next(
+            source
+            for source in state.source_inventory
+            if source.path
+            == state.metadata.get("adapter_primary_source")
+        )
+        size = (
+            primary.size
+            if source_size_bytes is None
+            else source_size_bytes
+        )
+        binding = build_rev_inventory_v1_source_binding(
+            manifest_generation=(
+                len(
+                    state.metadata.get(
+                        "source_manifest_history",
+                        [],
+                    )
+                )
+                + 1
+            ),
+            manifest_sha256=state.metadata["source_manifest_sha256"],
+            path=primary.path,
+            source_sha256=primary.sha256,
+            source_size_bytes=size,
+        )
+        snapshot = build_rev_inventory_v1_source_snapshot(binding)
+        extra = build_rev_inventory_v1_seed_extra(binding, snapshot)
+        legacy_id = (
+            "E-adapter-reversing-"
+            + str(extra["adapter_spec_id"]).replace("@", "-")
+        )
+
+        def apply(current: ChallengeState) -> None:
+            current_primary = next(
+                source
+                for source in current.source_inventory
+                if source.path == primary.path
+            )
+            current_primary.size = size
+            inventory = next(
+                experiment
+                for experiment in current.experiments
+                if experiment.extra.get("adapter_spec_template_id")
+                == "inventory_observation"
+            )
+            inventory.id = legacy_id
+            inventory.command = rev_inventory_v1_seed_command(
+                primary.path
+            )
+            inventory.status = status
+            inventory.result = copy.deepcopy(result)
+            inventory.extra = copy.deepcopy(extra)
+
+        return (
+            engine.store.update(
+                self.identity,
+                apply,
+                validate_artifacts=False,
+            ),
+            legacy_id,
         )
 
     def test_add_ingests_human_folder_and_prepares_live_session(self) -> None:
@@ -628,13 +866,13 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(
             inventory_oracle,
             {
-                "oracle_id": REV_INVENTORY_CONTRACT_ID,
-                "oracle_version": REV_INVENTORY_CONTRACT_VERSION,
+                "oracle_id": REV_INVENTORY_V2_CONTRACT_ID,
+                "oracle_version": REV_INVENTORY_V2_CONTRACT_VERSION,
                 "contract_fingerprint": (
-                    REV_INVENTORY_CONTRACT_FINGERPRINT
+                    REV_INVENTORY_V2_CONTRACT_FINGERPRINT
                 ),
                 "document_transport": (
-                    REV_INVENTORY_DOCUMENT_TRANSPORT
+                    REV_INVENTORY_V2_DOCUMENT_TRANSPORT
                 ),
             },
         )
@@ -692,6 +930,183 @@ class EngineTests(unittest.TestCase):
             )
         )
 
+    def test_legacy_v1_registered_seed_is_cancelled_before_v2_sync(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        engine.add_challenge(self.identity, prompt="solve")
+        _legacy, legacy_id = self.install_legacy_v1_inventory(
+            engine,
+            status=ExperimentStatus.REGISTERED,
+        )
+
+        state = engine.refresh_ingest(self.identity)
+
+        legacy = next(
+            item for item in state.experiments if item.id == legacy_id
+        )
+        self.assertIs(legacy.status, ExperimentStatus.CANCELLED)
+        self.assertEqual(
+            legacy.extra["cancelled_reason"],
+            "legacy_contract_replaced",
+        )
+        current = [
+            item
+            for item in state.experiments
+            if item.status is ExperimentStatus.REGISTERED
+            and item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        ]
+        self.assertEqual(len(current), 1)
+        self.assertEqual(
+            current[0].extra["partial_oracle"]["oracle_version"],
+            REV_INVENTORY_V2_CONTRACT_VERSION,
+        )
+        self.assertNotIn("inventory_v2.py", legacy.command)
+
+    def test_legacy_v1_running_seed_fails_then_v2_is_registered(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        engine.add_challenge(self.identity, prompt="solve")
+        _legacy, legacy_id = self.install_legacy_v1_inventory(
+            engine,
+            status=ExperimentStatus.RUNNING,
+        )
+
+        state = engine._recover_session_boundary(self.identity)
+
+        legacy = next(
+            item for item in state.experiments if item.id == legacy_id
+        )
+        self.assertIs(legacy.status, ExperimentStatus.FAILED)
+        self.assertIn("orphaned tool execution", legacy.result["error"])
+        self.assertNotEqual(
+            legacy.extra.get("orphan_recovery"),
+            "retryable_without_canonical_outcome",
+        )
+        current = next(
+            item
+            for item in state.experiments
+            if item.status is ExperimentStatus.REGISTERED
+            and item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        self.assertEqual(
+            current.extra["partial_oracle"]["oracle_version"],
+            REV_INVENTORY_V2_CONTRACT_VERSION,
+        )
+
+    def test_legacy_v1_terminal_history_is_byte_stable_during_sync(
+        self,
+    ) -> None:
+        original_identity = self.identity
+        try:
+            for name, status, result in (
+                (
+                    "success",
+                    ExperimentStatus.COMPLETED,
+                    {"exit_code": 0, "timed_out": False},
+                ),
+                (
+                    "failed",
+                    ExperimentStatus.FAILED,
+                    {"exit_code": 7, "timed_out": False},
+                ),
+                (
+                    "timeout",
+                    ExperimentStatus.FAILED,
+                    {"exit_code": 124, "timed_out": True},
+                ),
+            ):
+                with self.subTest(name=name):
+                    identity = ChallengeIdentity(
+                        "legacy-v1-terminal",
+                        "rev",
+                        name,
+                    )
+                    self.identity = identity
+                    engine = self.engine_with_executor(RoleExecutor())
+                    input_dir = engine.challenge_input(identity)
+                    input_dir.mkdir(parents=True)
+                    (input_dir / "chall").write_bytes(_elf64_image(2))
+                    engine.add_challenge(identity, prompt="solve")
+                    state, legacy_id = (
+                        self.install_legacy_v1_inventory(
+                            engine,
+                            status=status,
+                            result=result,
+                        )
+                    )
+                    before = copy.deepcopy(
+                        next(
+                            item
+                            for item in state.experiments
+                            if item.id == legacy_id
+                        ).to_dict(v2=True)
+                    )
+
+                    synced = engine.refresh_ingest(identity)
+                    after = next(
+                        item
+                        for item in synced.experiments
+                        if item.id == legacy_id
+                    ).to_dict(v2=True)
+
+                    self.assertEqual(after, before)
+                    self.assertTrue(
+                        any(
+                            item.status
+                            is ExperimentStatus.REGISTERED
+                            and item.extra.get(
+                                "adapter_spec_template_id"
+                            )
+                            == "inventory_observation"
+                            and item.extra["partial_oracle"][
+                                "oracle_version"
+                            ]
+                            == REV_INVENTORY_V2_CONTRACT_VERSION
+                            for item in synced.experiments
+                        )
+                    )
+        finally:
+            self.identity = original_identity
+
+    def test_legacy_v1_oversize_seed_loads_but_never_runs(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        engine.add_challenge(self.identity, prompt="solve")
+        _legacy, legacy_id = self.install_legacy_v1_inventory(
+            engine,
+            status=ExperimentStatus.REGISTERED,
+            source_size_bytes=REV_INVENTORY_V1_MAX_SOURCE_BYTES + 1,
+        )
+
+        state = engine.refresh_ingest(self.identity)
+
+        legacy = next(
+            item for item in state.experiments if item.id == legacy_id
+        )
+        self.assertIs(legacy.status, ExperimentStatus.CANCELLED)
+        self.assertFalse(
+            any(
+                item.status is ExperimentStatus.REGISTERED
+                and item.extra.get("adapter_spec_template_id")
+                == "inventory_observation"
+                for item in state.experiments
+            )
+        )
+
     def test_rev_execute_all_synchronizes_input_added_after_empty_init(
         self,
     ) -> None:
@@ -735,52 +1150,65 @@ class EngineTests(unittest.TestCase):
             state,
             adapter,
         )
-        baseline_ids = {item[1] for item in baseline}
-
-        with mock.patch.object(
-            challenge_module,
-            "_REV_ADAPTER_SEED_CONTRACT_VERSION",
-            2,
+        specs = list(adapter.initial_observations())
+        inventory_index = next(
+            index
+            for index, spec in enumerate(specs)
+            if spec.id == "inventory_observation"
+        )
+        drifted_inventory_specs = list(specs)
+        drifted_inventory_specs[inventory_index] = replace(
+            specs[inventory_index],
+            purpose=f"{specs[inventory_index].purpose} drifted",
+        )
+        drifted_inventory_adapter = mock.Mock()
+        drifted_inventory_adapter.name = adapter.name
+        drifted_inventory_adapter.initial_observations.return_value = tuple(
+            drifted_inventory_specs
+        )
+        with self.assertRaisesRegex(
+            EngineError,
+            "drifted from the immutable v2 contract",
         ):
-            _primary, changed_contract = engine._rev_adapter_seed_plan(
+            engine._rev_adapter_seed_plan(
                 state,
-                adapter,
-            )
-        with mock.patch.object(
-            challenge_module,
-            "_REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION",
-            False,
-        ):
-            _primary, changed_execution = engine._rev_adapter_seed_plan(
-                state,
-                adapter,
-            )
-        with mock.patch.object(
-            challenge_module,
-            "_REV_SOURCE_SNAPSHOT_TREE_CONTRACT",
-            "exact-single-primary-v2",
-        ):
-            _primary, changed_snapshot_contract = (
-                engine._rev_adapter_seed_plan(
-                    state,
-                    adapter,
-                )
+                drifted_inventory_adapter,
             )
 
-        self.assertTrue(
-            baseline_ids.isdisjoint(
-                {item[1] for item in changed_contract}
-            )
+        assembly_index = next(
+            index
+            for index, spec in enumerate(specs)
+            if spec.id == "assembly_observation"
         )
-        self.assertTrue(
-            baseline_ids.isdisjoint(
-                {item[1] for item in changed_execution}
-            )
+        changed_specs = list(specs)
+        changed_specs[assembly_index] = replace(
+            specs[assembly_index],
+            timeout_s=specs[assembly_index].timeout_s + 1,
         )
-        self.assertTrue(
-            baseline_ids.isdisjoint(
-                {item[1] for item in changed_snapshot_contract}
-            )
+        changed_adapter = mock.Mock()
+        changed_adapter.name = adapter.name
+        changed_adapter.initial_observations.return_value = tuple(
+            changed_specs
+        )
+        _primary, changed = engine._rev_adapter_seed_plan(
+            state,
+            changed_adapter,
+        )
+        baseline_ids = {
+            item[0].id: item[1]
+            for item in baseline
+        }
+        changed_ids = {
+            item[0].id: item[1]
+            for item in changed
+        }
+        self.assertEqual(
+            baseline_ids["inventory_observation"],
+            changed_ids["inventory_observation"],
+        )
+        self.assertNotEqual(
+            baseline_ids["assembly_observation"],
+            changed_ids["assembly_observation"],
         )
         self.assertEqual(
             [item[3]["adapter_seed_order"] for item in baseline],
@@ -986,11 +1414,14 @@ class EngineTests(unittest.TestCase):
     def test_rev_seed_refresh_preserves_terminal_history_and_pins_run(
         self,
     ) -> None:
-        engine = self.engine_with_executor(RoleExecutor())
+        source_bytes = _elf64_image(2)
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
         input_dir = engine.challenge_input(self.identity)
         input_dir.mkdir(parents=True)
         original = input_dir / "chall"
-        original.write_bytes(_elf64_image(2))
+        original.write_bytes(source_bytes)
         state = engine.add_challenge(
             self.identity,
             prompt="solve",
@@ -1080,6 +1511,1657 @@ class EngineTests(unittest.TestCase):
                 ]
             ),
             3,
+        )
+
+    def test_rev_inventory_active_seed_rejects_single_field_tamper(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"active-seed-contract"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory_id = next(
+            item.id
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        canonical = state.to_dict()
+
+        for mutation in (
+            "source-path",
+            "source-hash",
+            "source-manifest",
+            "snapshot-hash",
+            "snapshot-locator",
+            "snapshot-binding",
+            "adapter-spec-id",
+            "adapter-spec-hash",
+            "command",
+            "resource-class",
+            "explicit-execution",
+            "timeout",
+            "incomplete-recovery-metadata",
+        ):
+            with self.subTest(mutation=mutation):
+                data = copy.deepcopy(canonical)
+                experiment = next(
+                    item
+                    for item in data["experiments"]
+                    if item["id"] == inventory_id
+                )
+                if mutation == "source-path":
+                    experiment["source_binding"]["path"] = "other"
+                elif mutation == "source-hash":
+                    experiment["source_binding"]["sha256"] = "0" * 64
+                elif mutation == "source-manifest":
+                    experiment["source_binding"][
+                        "manifest_sha256"
+                    ] = "0" * 64
+                elif mutation == "snapshot-hash":
+                    experiment["source_snapshot"]["sha256"] = "0" * 64
+                elif mutation == "snapshot-locator":
+                    experiment["source_snapshot"][
+                        "source_locator"
+                    ] = "other"
+                elif mutation == "snapshot-binding":
+                    experiment["source_snapshot"][
+                        "binding_sha256"
+                    ] = "0" * 64
+                elif mutation == "adapter-spec-id":
+                    experiment["adapter_spec_id"] = (
+                        "inventory_observation@" + ("0" * 64)
+                    )
+                elif mutation == "adapter-spec-hash":
+                    experiment["adapter_spec_sha256"] = "0" * 64
+                elif mutation == "command":
+                    experiment["command"] = "/bin/true"
+                elif mutation == "resource-class":
+                    experiment["resource_class"] = "heavy"
+                elif mutation == "explicit-execution":
+                    experiment["requires_explicit_execution"] = False
+                elif mutation == "timeout":
+                    experiment["timeout_seconds"] = 61
+                elif mutation == "incomplete-recovery-metadata":
+                    experiment["orphan_recovery"] = (
+                        "retryable_without_canonical_outcome"
+                    )
+
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "Rev inventory",
+                ):
+                    ChallengeState.from_dict(data).validate()
+
+    def test_refresh_ingest_repairs_registered_rev_seed_plan_fields(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"active-seed-repair"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        tampered = ChallengeState.from_dict(
+            copy.deepcopy(state.to_dict())
+        )
+        inventory = next(
+            item
+            for item in tampered.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        inventory.extra["orphan_recovered_at"] = (
+            "2026-07-30T00:00:00+00:00"
+        )
+        inventory.extra["orphan_recovery"] = (
+            "retryable_without_canonical_outcome"
+        )
+        inventory.command = "/bin/true"
+        inventory.resource_class = "heavy"
+        inventory.extra["adapter_spec_sha256"] = "0" * 64
+        inventory.extra["source_binding"]["sha256"] = "0" * 64
+        adapter = get_adapter(tampered.category)
+        primary, plan = engine._rev_adapter_seed_plan(
+            tampered,
+            adapter,
+        )
+        self.assertIsNotNone(primary)
+        self.assertTrue(
+            engine._rev_adapter_seed_plan_needs_sync(
+                tampered,
+                adapter,
+                primary,
+                plan,
+            )
+        )
+        update_calls = 0
+
+        def apply_in_memory(identity, mutator, **kwargs):
+            nonlocal update_calls
+            del kwargs
+            self.assertEqual(identity, self.identity)
+            update_calls += 1
+            mutator(tampered)
+            tampered.validate()
+            return tampered
+
+        with (
+            mock.patch.object(
+                engine.store,
+                "load",
+                return_value=tampered,
+            ),
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=apply_in_memory,
+            ),
+        ):
+            repaired = engine.refresh_ingest(self.identity)
+
+        expected = next(
+            item
+            for item in plan
+            if item[1] == inventory.id
+        )
+        repaired_inventory = next(
+            item
+            for item in repaired.experiments
+            if item.id == inventory.id
+        )
+        self.assertEqual(update_calls, 1)
+        self.assertEqual(
+            repaired_inventory.command,
+            shlex.join(expected[2]),
+        )
+        self.assertEqual(
+            repaired_inventory.resource_class,
+            expected[0].resource_class,
+        )
+        for key, value in expected[3].items():
+            self.assertEqual(repaired_inventory.extra[key], value)
+        self.assertEqual(
+            repaired_inventory.extra["orphan_recovery"],
+            "retryable_without_canonical_outcome",
+        )
+        self.assertEqual(
+            repaired_inventory.extra["orphan_recovered_at"],
+            "2026-07-30T00:00:00+00:00",
+        )
+
+    def test_rev_inventory_oracle_confirms_and_commits_atomically(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-confirmed"
+        payload = _rev_inventory_payload(source_bytes)
+        engine = self.engine_with_rev_inventory(payload)
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        before = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in before.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        stdout_copies: list[tuple[str | None, int | None]] = []
+        original_copy = challenge_module.copy_bounded_regular
+
+        def observing_copy(*args, **kwargs):
+            copied = original_copy(*args, **kwargs)
+            destination = Path(args[2])
+            if destination.name == "stdout.bin":
+                stdout_copies.append(
+                    (
+                        kwargs.get("expected_sha256"),
+                        kwargs.get("expected_size"),
+                    )
+                )
+            return copied
+
+        with (
+            mock.patch.object(
+                challenge_module,
+                "copy_bounded_regular",
+                side_effect=observing_copy,
+            ),
+            mock.patch.object(
+                challenge_module,
+                "inventory_challenge",
+                wraps=challenge_module.inventory_challenge,
+            ) as live_inventory,
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        completed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        fact = next(
+            item
+            for item in state.facts
+            if item.id == f"F-{run.id}-rev-inventory"
+        )
+        semantic = completed.result["partial_oracle"]
+
+        self.assertIs(completed.status, ExperimentStatus.COMPLETED)
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertEqual(receipt.outcome.value, "succeeded")
+        self.assertTrue(semantic["transport_succeeded"])
+        self.assertEqual(semantic["evaluation_status"], "evaluated")
+        self.assertEqual(semantic["result"]["verdict"], "CONFIRMED")
+        binding = semantic["execution_binding"]
+        self.assertEqual(binding["argv"], list(inventory.command.split()))
+        self.assertEqual(
+            binding["configuration_epoch"],
+            state.configuration_epoch,
+        )
+        self.assertEqual(
+            binding["experiment"]["adapter_spec_id"],
+            inventory.extra["adapter_spec_id"],
+        )
+        self.assertEqual(
+            binding["oracle"],
+            inventory.extra["partial_oracle"],
+        )
+        self.assertEqual(
+            binding["source_binding"],
+            inventory.extra["source_binding"],
+        )
+        self.assertEqual(
+            binding["source_snapshot"],
+            inventory.extra["source_snapshot"],
+        )
+        self.assertEqual(
+            binding["network"],
+            {
+                "target": None,
+                "target_generation": None,
+                "target_id": None,
+            },
+        )
+        self.assertEqual(
+            binding["image"]["reference"],
+            "sha256:" + ("1" * 64),
+        )
+        self.assertEqual(
+            binding["stdout_artifact"],
+            {
+                "id": receipt.stdout_artifact_id,
+                "path": fact.locator,
+                "sha256": next(
+                    artifact.sha256
+                    for artifact in state.artifacts
+                    if artifact.id == fact.artifact_id
+                ),
+                "size": next(
+                    artifact.size
+                    for artifact in state.artifacts
+                    if artifact.id == fact.artifact_id
+                ),
+            },
+        )
+        self.assertEqual(
+            binding["request"]["sha256"],
+            semantic["request_sha256"],
+        )
+        self.assertEqual(
+            completed.evidence_fact_ids,
+            [fact.id],
+        )
+        self.assertEqual(completed.evidence_run_ids, [run.id])
+        self.assertEqual(
+            completed.evidence_receipt_ids,
+            [receipt.id],
+        )
+        self.assertEqual(fact.source_run_id, run.id)
+        self.assertEqual(fact.artifact_id, receipt.stdout_artifact_id)
+        self.assertEqual(
+            run.extra["partial_oracle_result"],
+            semantic,
+        )
+        self.assertEqual(
+            receipt.extra["partial_oracle_result"],
+            semantic,
+        )
+        self.assertEqual(
+            fact.extra["partial_oracle_result"],
+            semantic,
+        )
+        root = engine.store.challenge_paths(self.identity).root
+        persisted_result = json.loads(
+            (root / run.result_path).read_text(encoding="utf-8")
+        )
+        persisted_validation = json.loads(
+            (root / run.validation_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted_result["partial_oracle"], semantic)
+        self.assertEqual(
+            persisted_validation["partial_oracle"],
+            semantic,
+        )
+        self.assertEqual(len(stdout_copies), 2)
+        # Public execution refreshes ingest once before the run; the oracle
+        # adds exactly one full inventory at commit, not one per phase.
+        self.assertEqual(live_inventory.call_count, 2)
+        self.assertTrue(
+            all(
+                sha256 == fact.extra["partial_oracle_result"][
+                    "result"
+                ]["source_sha256"]
+                or sha256
+                == next(
+                    artifact.sha256
+                    for artifact in state.artifacts
+                    if artifact.id == fact.artifact_id
+                )
+                for sha256, _size in stdout_copies
+            )
+        )
+        stdout_artifact = next(
+            artifact
+            for artifact in state.artifacts
+            if artifact.id == fact.artifact_id
+        )
+        self.assertEqual(
+            stdout_copies,
+            [
+                (stdout_artifact.sha256, stdout_artifact.size),
+                (stdout_artifact.sha256, stdout_artifact.size),
+            ],
+        )
+        self.assertEqual(state.candidates, [])
+        self.assertEqual(state.submissions, [])
+        self.assertEqual(state.status, before.status)
+
+    def test_rev_inventory_oracle_state_rejects_round_trip_tamper(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-state-tamper"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+        canonical = state.to_dict()
+        ChallengeState.from_dict(copy.deepcopy(canonical)).validate()
+
+        for mutation in (
+            "unknown-outcome-field",
+            "run-copy-diverges",
+            "stdout-pin-diverges",
+            "image-pin-removed",
+            "semantic-source-diverges",
+            "verdict-status-diverges",
+            "nested-evaluation-status",
+            "nested-verdict",
+            "nested-snapshot-mode",
+            "descriptor-removed",
+            "adapter-seed-disabled",
+            "run-experiment-id-diverges",
+            "resource-all-copies-diverge",
+            "semantic-contract-diverges",
+            "all-contract-markers-downgraded",
+        ):
+            with self.subTest(mutation=mutation):
+                data = copy.deepcopy(canonical)
+                experiment = next(
+                    item
+                    for item in data["experiments"]
+                    if item["id"] == inventory.id
+                )
+                run_id = experiment["result"]["run_id"]
+                run = next(
+                    item for item in data["runs"] if item["id"] == run_id
+                )
+                receipt = next(
+                    item
+                    for item in data["receipts"]
+                    if item["run_id"] == run_id
+                )
+                fact = next(
+                    item
+                    for item in data["facts"]
+                    if item["id"] == f"F-{run_id}-rev-inventory"
+                )
+                outcomes = (
+                    experiment["result"]["partial_oracle"],
+                    run["partial_oracle_result"],
+                    receipt["partial_oracle_result"],
+                    fact["partial_oracle_result"],
+                )
+
+                if mutation == "unknown-outcome-field":
+                    outcomes[0]["model_confidence"] = 1
+                elif mutation == "run-copy-diverges":
+                    outcomes[1]["rejection_code"] = "tampered"
+                elif mutation == "stdout-pin-diverges":
+                    for outcome in outcomes:
+                        outcome["execution_binding"][
+                            "stdout_artifact"
+                        ]["sha256"] = "0" * 64
+                elif mutation == "image-pin-removed":
+                    for outcome in outcomes:
+                        outcome["image_reference"] = None
+                        outcome["execution_binding"]["image"].update(
+                            {
+                                "digest": None,
+                                "reference": "ctf-os:core",
+                            }
+                        )
+                elif mutation == "semantic-source-diverges":
+                    for outcome in outcomes:
+                        outcome["result"]["source_sha256"] = "0" * 64
+                elif mutation == "verdict-status-diverges":
+                    experiment["status"] = "failed"
+                elif mutation == "nested-evaluation-status":
+                    outcomes[0]["evaluation_status"] = []
+                elif mutation == "nested-verdict":
+                    outcomes[0]["result"]["verdict"] = {}
+                elif mutation == "nested-snapshot-mode":
+                    outcomes[0]["execution_binding"][
+                        "source_snapshot_execution_binding"
+                    ]["mode"] = []
+                elif mutation == "descriptor-removed":
+                    experiment["partial_oracle"] = None
+                elif mutation == "adapter-seed-disabled":
+                    experiment["adapter_seed"] = False
+                elif mutation == "run-experiment-id-diverges":
+                    run["experiment_id"] = "E-unrelated"
+                elif mutation == "resource-all-copies-diverge":
+                    for outcome in outcomes:
+                        outcome["execution_binding"]["resource_request"][
+                            "cpu"
+                        ] = 2
+                elif mutation == "semantic-contract-diverges":
+                    for outcome in outcomes:
+                        outcome["result"]["verdict"] = "NOT_APPLICABLE"
+                elif mutation == "all-contract-markers-downgraded":
+                    legacy_oracle = {
+                        "contract_fingerprint": (
+                            REV_INVENTORY_V1_CONTRACT_FINGERPRINT
+                        ),
+                        "document_transport": (
+                            "atomic-work-file-plus-exact-stdout-once-v1"
+                        ),
+                        "oracle_id": REV_INVENTORY_V1_CONTRACT_ID,
+                        "oracle_version": (
+                            REV_INVENTORY_V1_CONTRACT_VERSION
+                        ),
+                    }
+                    experiment["partial_oracle"] = copy.deepcopy(
+                        legacy_oracle
+                    )
+                    for outcome in outcomes:
+                        outcome["execution_binding"]["oracle"] = (
+                            copy.deepcopy(legacy_oracle)
+                        )
+                        outcome["result"]["contract_fingerprint"] = (
+                            REV_INVENTORY_V1_CONTRACT_FINGERPRINT
+                        )
+                        outcome["result"]["oracle_version"] = (
+                            REV_INVENTORY_V1_CONTRACT_VERSION
+                        )
+
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "Rev inventory",
+                ):
+                    ChallengeState.from_dict(data).validate()
+
+    def test_rev_inventory_oracle_neutral_result_is_inconclusive_fact(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-neutral"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes, arch=None)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+
+        evaluated = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        self.assertIs(
+            evaluated.status,
+            ExperimentStatus.INCONCLUSIVE,
+        )
+        self.assertIn("INCONCLUSIVE", evaluated.evaluation_reason)
+        self.assertIsNotNone(evaluated.evaluated_at)
+        self.assertEqual(len(evaluated.evidence_fact_ids), 1)
+        fact = next(
+            item
+            for item in state.facts
+            if item.id == evaluated.evidence_fact_ids[0]
+        )
+        self.assertIn("incomplete_binary_profile", fact.statement)
+        self.assertEqual(state.candidates, [])
+        self.assertEqual(state.submissions, [])
+
+    def test_rev_inventory_oracle_errors_do_not_create_facts(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-errors"
+        valid = _rev_inventory_payload(source_bytes)
+        duplicate = valid.replace(
+            b'"status":"ok"}',
+            b'"status":"ok","status":"ok"}',
+        )
+        wrong_source = _rev_inventory_payload(
+            source_bytes + b"different"
+        )
+        legacy_document = json.loads(valid)
+        legacy_document["contract"] = {
+            "fingerprint": REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            "id": REV_INVENTORY_V1_CONTRACT_ID,
+            "version": REV_INVENTORY_V1_CONTRACT_VERSION,
+        }
+        legacy_document["schema_version"] = (
+            REV_INVENTORY_V1_SCHEMA_VERSION
+        )
+        legacy_payload = (
+            json.dumps(
+                legacy_document,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        cases = (
+            ("malformed", valid[:-2], "invalid_json"),
+            ("duplicate", duplicate, "duplicate_json_key"),
+            ("source-mismatch", wrong_source, "source_hash_mismatch"),
+            ("legacy-v1-image", legacy_payload, "invalid_schema"),
+            (
+                "noncanonical",
+                json.dumps(
+                    json.loads(valid),
+                    indent=2,
+                ).encode("ascii"),
+                "noncanonical_json",
+            ),
+        )
+        for name, payload, reason_code in cases:
+            with self.subTest(name=name):
+                identity = ChallengeIdentity(
+                    "rev oracle errors",
+                    "rev",
+                    name,
+                )
+                engine = self.engine_with_rev_inventory(payload)
+                input_dir = engine.challenge_input(identity)
+                input_dir.mkdir(parents=True)
+                (input_dir / "chall").write_bytes(source_bytes)
+                state = engine.add_challenge(
+                    identity,
+                    prompt="solve",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                inventory = next(
+                    item
+                    for item in state.experiments
+                    if item.extra.get("adapter_spec_template_id")
+                    == "inventory_observation"
+                )
+
+                state = engine.execute_registered_experiments(
+                    identity,
+                    experiment_ids=(inventory.id,),
+                )
+
+                failed = next(
+                    item
+                    for item in state.experiments
+                    if item.id == inventory.id
+                )
+                run = next(
+                    item
+                    for item in state.runs
+                    if item.extra.get("experiment_id") == inventory.id
+                )
+                receipt = next(
+                    item
+                    for item in state.receipts
+                    if item.run_id == run.id
+                )
+                semantic = failed.result["partial_oracle"]
+                self.assertIs(failed.status, ExperimentStatus.FAILED)
+                self.assertIs(run.status, RunStatus.COMPLETED)
+                self.assertEqual(receipt.outcome.value, "succeeded")
+                self.assertEqual(
+                    semantic["evaluation_status"],
+                    "evaluated",
+                )
+                self.assertEqual(
+                    semantic["result"]["verdict"],
+                    "ERROR",
+                )
+                self.assertEqual(
+                    semantic["result"]["reason_code"],
+                    reason_code,
+                )
+                self.assertEqual(
+                    failed.evaluation_reason,
+                    f"rev_inventory:evaluated:ERROR/{reason_code}",
+                )
+                self.assertIsNotNone(failed.evaluated_at)
+                self.assertEqual(failed.evidence_fact_ids, [])
+                self.assertFalse(
+                    any(fact.source_run_id == run.id for fact in state.facts)
+                )
+                self.assertEqual(state.candidates, [])
+                self.assertEqual(state.submissions, [])
+                rerun = engine.execute_registered_experiments(
+                    identity,
+                    experiment_ids=(inventory.id,),
+                )
+                self.assertEqual(len(rerun.runs), len(state.runs))
+                self.assertEqual(len(rerun.receipts), len(state.receipts))
+
+    def test_rev_inventory_oversized_complete_stdout_skips_byte_copy(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-oversized"
+        payload = b"x" * (REV_INVENTORY_V2_MAX_BYTES + 1)
+        engine = self.engine_with_rev_inventory(payload)
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        stdout_copy_count = 0
+        original_copy = challenge_module.copy_bounded_regular
+
+        def observing_copy(*args, **kwargs):
+            nonlocal stdout_copy_count
+            destination = Path(args[2])
+            if destination.name == "stdout.bin":
+                stdout_copy_count += 1
+            return original_copy(*args, **kwargs)
+
+        with mock.patch.object(
+            challenge_module,
+            "copy_bounded_regular",
+            side_effect=observing_copy,
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        outcome = failed.result["partial_oracle"]
+        self.assertEqual(stdout_copy_count, 0)
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertEqual(receipt.outcome.value, "succeeded")
+        self.assertEqual(outcome["evaluation_status"], "evaluated")
+        self.assertEqual(
+            outcome["result"]["reason_code"],
+            "artifact_too_large",
+        )
+        self.assertEqual(failed.evidence_fact_ids, [])
+        stdout_artifact = next(
+            item
+            for item in state.artifacts
+            if item.id == receipt.stdout_artifact_id
+        )
+        self.assertEqual(stdout_artifact.size, len(payload))
+
+    def test_rev_inventory_error_link_validation_scans_collections_once(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-linear-error"
+        malformed = _rev_inventory_payload(source_bytes)[:-2]
+        engine = self.engine_with_rev_inventory(malformed)
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+        state.experiments.extend(
+            Experiment(
+                id=f"E-linear-{index}",
+                hypothesis_ids=[],
+                command="true",
+                expected_observation="bounded output",
+                keep_if="output exists",
+                drop_if="output is absent",
+                timeout_seconds=1,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.REGISTERED,
+            )
+            for index in range(256)
+        )
+
+        class CountingList(list):
+            def __init__(self, values=()):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        raw_runs = list(state.runs)
+        raw_receipts = list(state.receipts)
+        raw_facts = list(state.facts)
+        state.runs = CountingList(raw_runs)
+        state.receipts = CountingList(raw_receipts)
+        state.facts = CountingList(raw_facts)
+
+        errors = models_module._rev_inventory_state_errors(
+            state,
+            runs={item.id: item for item in raw_runs},
+            receipts={item.id: item for item in raw_receipts},
+            artifacts={item.id: item for item in state.artifacts},
+            facts={item.id: item for item in raw_facts},
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(state.runs.iterations, 1)
+        self.assertEqual(state.receipts.iterations, 1)
+        self.assertEqual(state.facts.iterations, 1)
+
+    def test_rev_inventory_oracle_rejects_unpinned_or_incomplete_run(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-rejections"
+        payload = _rev_inventory_payload(source_bytes)
+        cases = (
+            ("unpinned-image", None, True, "request_binding_mismatch"),
+            (
+                "incomplete-stdout",
+                "sha256:" + ("2" * 64),
+                False,
+                "stdout_capture_incomplete",
+            ),
+        )
+        for name, digest, complete_capture, rejection in cases:
+            with self.subTest(name=name):
+                identity = ChallengeIdentity(
+                    "rev oracle rejections",
+                    "rev",
+                    name,
+                )
+                engine = self.engine_with_rev_inventory(
+                    payload,
+                    image_digest=digest,
+                    complete_capture=complete_capture,
+                )
+                input_dir = engine.challenge_input(identity)
+                input_dir.mkdir(parents=True)
+                (input_dir / "chall").write_bytes(source_bytes)
+                state = engine.add_challenge(
+                    identity,
+                    prompt="solve",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                inventory = next(
+                    item
+                    for item in state.experiments
+                    if item.extra.get("adapter_spec_template_id")
+                    == "inventory_observation"
+                )
+
+                state = engine.execute_registered_experiments(
+                    identity,
+                    experiment_ids=(inventory.id,),
+                )
+
+                failed = next(
+                    item
+                    for item in state.experiments
+                    if item.id == inventory.id
+                )
+                run = next(
+                    item
+                    for item in state.runs
+                    if item.extra.get("experiment_id") == inventory.id
+                )
+                receipt = next(
+                    item
+                    for item in state.receipts
+                    if item.run_id == run.id
+                )
+                semantic = failed.result["partial_oracle"]
+                self.assertIs(failed.status, ExperimentStatus.FAILED)
+                self.assertIs(run.status, RunStatus.COMPLETED)
+                self.assertEqual(receipt.outcome.value, "succeeded")
+                self.assertEqual(
+                    semantic["evaluation_status"],
+                    "rejected",
+                )
+                self.assertEqual(
+                    semantic["rejection_code"],
+                    rejection,
+                )
+                self.assertEqual(
+                    failed.evaluation_reason,
+                    f"rev_inventory:rejected:{rejection}",
+                )
+                self.assertIsNotNone(failed.evaluated_at)
+                self.assertEqual(failed.evidence_fact_ids, [])
+                resume_context = build_context_pack(
+                    state,
+                    get_adapter(state.category),
+                    state_path=(
+                        engine.store.challenge_paths(identity).state
+                    ),
+                )
+                self.assertIn(
+                    f'"evaluation_reason":"{failed.evaluation_reason}"',
+                    resume_context.text,
+                )
+
+    def test_rev_inventory_oracle_rejects_request_and_snapshot_tamper(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-binding-tamper"
+        payload = _rev_inventory_payload(source_bytes)
+        for mutation, expected_rejection in (
+            ("request", "request_binding_mismatch"),
+            (
+                "snapshot",
+                "source_snapshot_reverification_failed",
+            ),
+        ):
+            with self.subTest(mutation=mutation):
+                identity = ChallengeIdentity(
+                    "rev oracle tamper",
+                    "rev",
+                    mutation,
+                )
+                holder: dict[str, object] = {}
+
+                def tamper() -> None:
+                    engine = holder["engine"]
+                    assert isinstance(engine, ChallengeEngine)
+                    paths = engine.store.challenge_paths(identity)
+                    if mutation == "request":
+                        requests = list(paths.runs.glob("*/request.json"))
+                        self.assertEqual(len(requests), 1)
+                        request = json.loads(
+                            requests[0].read_text(encoding="utf-8")
+                        )
+                        request["argv"] = ["/bin/false"]
+                        requests[0].write_text(
+                            json.dumps(
+                                request,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            + "\n",
+                            encoding="ascii",
+                        )
+                    else:
+                        snapshot_file = holder["snapshot_file"]
+                        assert isinstance(snapshot_file, Path)
+                        original = snapshot_file.read_bytes()
+                        snapshot_file.chmod(0o700)
+                        snapshot_file.write_bytes(
+                            bytes([original[0] ^ 0xFF]) + original[1:]
+                        )
+                        snapshot_file.chmod(0o500)
+
+                engine = self.engine_with_rev_inventory(
+                    payload,
+                    on_run=tamper,
+                )
+                holder["engine"] = engine
+                input_dir = engine.challenge_input(identity)
+                input_dir.mkdir(parents=True)
+                (input_dir / "chall").write_bytes(source_bytes)
+                state = engine.add_challenge(
+                    identity,
+                    prompt="solve",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                inventory = next(
+                    item
+                    for item in state.experiments
+                    if item.extra.get("adapter_spec_template_id")
+                    == "inventory_observation"
+                )
+                holder["snapshot_file"] = (
+                    engine.store.challenge_paths(identity).root
+                    / inventory.extra["source_snapshot"]["challenge_dir"]
+                    / "chall"
+                )
+
+                state = engine.execute_registered_experiments(
+                    identity,
+                    experiment_ids=(inventory.id,),
+                )
+
+                failed = next(
+                    item
+                    for item in state.experiments
+                    if item.id == inventory.id
+                )
+                run = next(
+                    item
+                    for item in state.runs
+                    if item.extra.get("experiment_id") == inventory.id
+                )
+                receipt = next(
+                    item
+                    for item in state.receipts
+                    if item.run_id == run.id
+                )
+                semantic = failed.result["partial_oracle"]
+                self.assertIs(failed.status, ExperimentStatus.FAILED)
+                self.assertIs(run.status, RunStatus.COMPLETED)
+                self.assertEqual(receipt.outcome.value, "succeeded")
+                self.assertEqual(
+                    semantic["rejection_code"],
+                    expected_rejection,
+                )
+                self.assertEqual(
+                    failed.evaluation_reason,
+                    (
+                        "rev_inventory:rejected:"
+                        f"{expected_rejection}"
+                    ),
+                )
+                self.assertEqual(failed.evidence_fact_ids, [])
+                self.assertFalse(
+                    any(fact.source_run_id == run.id for fact in state.facts)
+                )
+
+    def test_rev_inventory_oracle_rejects_stdout_evidence_tamper(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-stdout-tamper"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        original_summary = challenge_module.summarize_stream_snapshot
+
+        def tampered_summary(*args, **kwargs):
+            evidence = original_summary(*args, **kwargs)
+            if kwargs.get("stream") == "stdout":
+                evidence["sha256"] = "0" * 64
+            return evidence
+
+        with mock.patch.object(
+            challenge_module,
+            "summarize_stream_snapshot",
+            side_effect=tampered_summary,
+        ):
+            with self.assertRaisesRegex(
+                Exception,
+                "stdout evidence SHA-256 does not match its artifact",
+            ):
+                engine.execute_registered_experiments(
+                    self.identity,
+                    experiment_ids=(inventory.id,),
+                )
+        state = engine.store.load(self.identity)
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertEqual(receipt.outcome.value, "failed")
+        self.assertIn("tool result commit failed", failed.result["error"])
+        self.assertEqual(failed.evidence_fact_ids, [])
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
+        )
+
+    def test_rev_inventory_oracle_rechecks_live_source_before_commit(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-live-source"
+        payload = _rev_inventory_payload(source_bytes)
+        engine = self.engine_with_rev_inventory(payload)
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        source = input_dir / "chall"
+        source.write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        original_evaluate = engine._evaluate_rev_inventory_run
+        calls = 0
+
+        def mutate_after_first_evaluation(*args, **kwargs):
+            nonlocal calls
+            outcome = original_evaluate(*args, **kwargs)
+            calls += 1
+            if calls == 1:
+                self.assertIsNotNone(outcome)
+                assert outcome is not None
+                self.assertEqual(outcome.evaluation_status, "evaluated")
+                source.write_bytes(source_bytes + b"changed")
+            return outcome
+
+        with mock.patch.object(
+            engine,
+            "_evaluate_rev_inventory_run",
+            side_effect=mutate_after_first_evaluation,
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        semantic = failed.result["partial_oracle"]
+        self.assertEqual(calls, 2)
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertEqual(receipt.outcome.value, "succeeded")
+        self.assertEqual(
+            semantic["rejection_code"],
+            "live_source_binding_mismatch",
+        )
+        self.assertEqual(
+            failed.evaluation_reason,
+            (
+                "rev_inventory:rejected:"
+                "live_source_binding_mismatch"
+            ),
+        )
+        self.assertIsNotNone(failed.evaluated_at)
+        self.assertEqual(failed.evidence_fact_ids, [])
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
+        )
+        root = engine.store.challenge_paths(self.identity).root
+        persisted_result = json.loads(
+            (root / run.result_path).read_text(encoding="utf-8")
+        )
+        persisted_validation = json.loads(
+            (root / run.validation_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted_result["partial_oracle"], semantic)
+        self.assertEqual(
+            persisted_validation["partial_oracle"],
+            semantic,
+        )
+
+    def test_rev_inventory_oracle_rechecks_full_live_manifest(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-live-manifest"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        secondary = input_dir / "notes.txt"
+        secondary.write_bytes(b"original secondary bytes")
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        original_evaluate = engine._evaluate_rev_inventory_run
+        calls = 0
+
+        def mutate_secondary_after_first(*args, **kwargs):
+            nonlocal calls
+            outcome = original_evaluate(*args, **kwargs)
+            calls += 1
+            if calls == 1:
+                self.assertIsNotNone(outcome)
+                assert outcome is not None
+                self.assertEqual(outcome.evaluation_status, "evaluated")
+                secondary.write_bytes(b"changed! secondary bytes")
+            return outcome
+
+        with mock.patch.object(
+            engine,
+            "_evaluate_rev_inventory_run",
+            side_effect=mutate_secondary_after_first,
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        semantic = failed.result["partial_oracle"]
+        self.assertEqual(calls, 2)
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertEqual(receipt.outcome.value, "succeeded")
+        self.assertEqual(
+            semantic["rejection_code"],
+            "live_source_manifest_mismatch",
+        )
+        self.assertEqual(
+            failed.evaluation_reason,
+            (
+                "rev_inventory:rejected:"
+                "live_source_manifest_mismatch"
+            ),
+        )
+        self.assertEqual(failed.evidence_fact_ids, [])
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
+        )
+
+    def test_rev_inventory_oracle_transport_matches_run_receipt(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-transport"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes),
+            status="failed",
+            orchestration_error="synthetic transport failure",
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        semantic = failed.result["partial_oracle"]
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertEqual(receipt.outcome.value, "failed")
+        self.assertFalse(semantic["transport_succeeded"])
+        self.assertEqual(
+            semantic["evaluation_status"],
+            "not_evaluated",
+        )
+        self.assertEqual(
+            failed.evaluation_reason,
+            "rev_inventory:not_evaluated:transport_failed",
+        )
+        self.assertIsNotNone(failed.evaluated_at)
+        self.assertEqual(failed.evidence_fact_ids, [])
+
+    def test_rev_inventory_oracle_timeout_matches_run_receipt(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-timeout"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes),
+            status="timed_out",
+            exit_code=124,
+            timed_out=True,
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        receipt = next(
+            item for item in state.receipts if item.run_id == run.id
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.TIMED_OUT)
+        self.assertEqual(receipt.outcome.value, "timed_out")
+        self.assertEqual(
+            failed.evaluation_reason,
+            "rev_inventory:not_evaluated:transport_failed",
+        )
+        self.assertEqual(failed.evidence_fact_ids, [])
+
+    def test_rev_inventory_oracle_deadline_after_commit_revalidation(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-deadline"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        original_gate = engine._require_before_hard_deadline
+        observed_operations: list[str] = []
+
+        def expire_after_revalidation(deadline, operation):
+            observed_operations.append(operation)
+            if operation == (
+                "Rev inventory commit revalidation completed"
+            ):
+                raise challenge_module._HardDeadlineExpired(
+                    "synthetic post-revalidation expiry"
+                )
+            return original_gate(deadline, operation)
+
+        with mock.patch.object(
+            engine,
+            "_require_before_hard_deadline",
+            side_effect=expire_after_revalidation,
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        self.assertIn(
+            "Rev inventory commit revalidation completed",
+            observed_operations,
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertEqual(failed.evidence_fact_ids, [])
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
+        )
+
+    def test_rev_inventory_oracle_deadline_guard_runs_after_artifact_validation(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-store-deadline"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        original_gate = engine._require_before_hard_deadline
+        real_validate_artifact = store_files.validate_artifact
+        operations: list[str] = []
+
+        def observe_validation(*args, **kwargs):
+            operations.append("artifact_validation")
+            return real_validate_artifact(*args, **kwargs)
+
+        def expire_at_canonical_commit(deadline, operation):
+            if operation == "Rev inventory canonical state commit":
+                operations.append("commit_guard")
+                raise challenge_module._HardDeadlineExpired(
+                    "synthetic post-artifact-validation expiry"
+                )
+            return original_gate(deadline, operation)
+
+        with (
+            mock.patch.object(
+                store_files,
+                "validate_artifact",
+                side_effect=observe_validation,
+            ),
+            mock.patch.object(
+                engine,
+                "_require_before_hard_deadline",
+                side_effect=expire_at_canonical_commit,
+            ),
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == inventory.id
+        )
+        self.assertIn("artifact_validation", operations)
+        self.assertEqual(operations[-1], "commit_guard")
+        self.assertLess(
+            operations.index("artifact_validation"),
+            operations.index("commit_guard"),
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertEqual(failed.evidence_fact_ids, [])
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
+        )
+
+    def test_rev_inventory_orphan_without_canonical_outcome_is_retried(
+        self,
+    ) -> None:
+        source_bytes = _elf64_image(2) + b"oracle-orphan-retry"
+        engine = self.engine_with_rev_inventory(
+            _rev_inventory_payload(source_bytes)
+        )
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(source_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        def simulate_crash_after_reservation(current):
+            orphan = next(
+                item
+                for item in current.experiments
+                if item.id == inventory.id
+            )
+            orphan.status = ExperimentStatus.RUNNING
+
+        crashed = engine.store.update(
+            self.identity,
+            simulate_crash_after_reservation,
+        )
+        self.assertEqual(crashed.runs, [])
+        self.assertEqual(crashed.receipts, [])
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+
+        recovered = next(
+            item for item in state.experiments if item.id == inventory.id
+        )
+        self.assertIs(recovered.status, ExperimentStatus.COMPLETED)
+        self.assertEqual(
+            recovered.extra["orphan_recovery"],
+            "retryable_without_canonical_outcome",
+        )
+        self.assertIn("orphan_recovered_at", recovered.extra)
+        self.assertEqual(len(recovered.evidence_run_ids), 1)
+        self.assertEqual(len(recovered.evidence_receipt_ids), 1)
+        self.assertEqual(len(recovered.evidence_fact_ids), 1)
+
+    def test_successful_tool_deadline_guard_runs_after_artifact_validation(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("/bin/true",),
+            expected_observation="exit zero",
+            keep_if="zero",
+            drop_if="nonzero",
+        )
+        original_gate = engine._require_before_hard_deadline
+        real_validate_artifact = store_files.validate_artifact
+        operations: list[str] = []
+
+        def observe_validation(*args, **kwargs):
+            operations.append("artifact_validation")
+            return real_validate_artifact(*args, **kwargs)
+
+        def expire_at_canonical_commit(deadline, operation):
+            if operation == "tool canonical state commit":
+                operations.append("commit_guard")
+                raise challenge_module._HardDeadlineExpired(
+                    "synthetic generic tool commit expiry"
+                )
+            return original_gate(deadline, operation)
+
+        with (
+            mock.patch.object(
+                store_files,
+                "validate_artifact",
+                side_effect=observe_validation,
+            ),
+            mock.patch.object(
+                engine,
+                "_require_before_hard_deadline",
+                side_effect=expire_at_canonical_commit,
+            ),
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(experiment_id,),
+            )
+
+        failed = next(
+            item for item in state.experiments if item.id == experiment_id
+        )
+        run = next(
+            item
+            for item in state.runs
+            if item.extra.get("experiment_id") == experiment_id
+        )
+        self.assertIn("artifact_validation", operations)
+        self.assertEqual(operations[-1], "commit_guard")
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertFalse(
+            any(fact.source_run_id == run.id for fact in state.facts)
         )
 
     def test_rev_seed_executes_from_verified_read_only_snapshot(
@@ -1172,10 +3254,10 @@ class EngineTests(unittest.TestCase):
                 )
             },
             {
-                "tree_contract": "exact-single-primary-v1",
+                "tree_contract": "exact-single-primary-v2",
                 "file_mode": 0o500,
                 "directory_mode": 0o500,
-                "publish": "staged-atomic-no-repair-v1",
+                "publish": "staged-atomic-no-repair-v2",
             },
         )
         request_path = (

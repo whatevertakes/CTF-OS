@@ -1351,7 +1351,7 @@ class ManagedV2Tests(unittest.TestCase):
                         argv[:2]
                         == (
                             "python3",
-                            "/opt/ctf-templates/rev/inventory.py",
+                            "/opt/ctf-templates/rev/inventory_v2.py",
                         )
                         for argv in pre_captain_argv
                     )

@@ -25,7 +25,7 @@ import safe_output  # noqa: E402
 
 module_spec = importlib.util.spec_from_file_location(
     "ctf_rev_inventory_under_test",
-    REV_TEMPLATES / "inventory.py",
+    REV_TEMPLATES / "inventory_v2.py",
 )
 assert module_spec is not None and module_spec.loader is not None
 inventory = importlib.util.module_from_spec(module_spec)
@@ -133,7 +133,10 @@ class RevInventoryProducerTests(unittest.TestCase):
             stat_path = Path(f"/proc/{descendant_pid}/stat")
             if not stat_path.exists():
                 return descendant_pid
-            fields = stat_path.read_text(encoding="ascii").split()
+            try:
+                fields = stat_path.read_text(encoding="ascii").split()
+            except (FileNotFoundError, ProcessLookupError):
+                return descendant_pid
             if fields[2] == "Z":
                 return descendant_pid
             time.sleep(0.01)
@@ -239,6 +242,95 @@ class RevInventoryProducerTests(unittest.TestCase):
             document["error"],
             {"code": "rabin2_invalid_schema"},
         )
+
+    def test_fingerprinted_rabin_normalization_corpus(self) -> None:
+        cases = (
+            (
+                {
+                    "arch": " X86 ",
+                    "bits": 64,
+                    "bintype": " Mach-O ",
+                    "endian": " LITTLE ",
+                    "havecode": True,
+                },
+                {
+                    "arch": "x86",
+                    "bits": 64,
+                    "bintype": "mach_o",
+                    "endian": "little",
+                    "havecode": True,
+                },
+            ),
+            (
+                {
+                    "arch": "",
+                    "bits": 0,
+                    "bintype": "mystery-format",
+                    "endian": "sideways",
+                    "havecode": False,
+                },
+                {
+                    "arch": None,
+                    "bits": None,
+                    "bintype": "unknown",
+                    "endian": "unknown",
+                    "havecode": False,
+                },
+            ),
+            (
+                {
+                    "arch": " ARM ",
+                    "bits": 32,
+                    "bintype": "Mach0",
+                    "endian": " Mixed ",
+                    "havecode": True,
+                },
+                {
+                    "arch": "arm",
+                    "bits": 32,
+                    "bintype": "mach_o",
+                    "endian": "mixed",
+                    "havecode": True,
+                },
+            ),
+        )
+        for values, expected in cases:
+            with self.subTest(values=values):
+                payload = json.dumps(
+                    {
+                        "info": {
+                            **values,
+                            "binsz": self.source.stat().st_size,
+                            "future_rabin_field": "allowed",
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertEqual(
+                    inventory._normalize_rabin2_info(
+                        payload,
+                        self.source.stat().st_size,
+                    ),
+                    expected,
+                )
+
+        invalid_info = {
+            "arch": "x86",
+            "binsz": self.source.stat().st_size + 1,
+            "bintype": "elf",
+            "bits": 64,
+            "endian": "little",
+            "havecode": True,
+        }
+        with self.assertRaises(inventory.InventoryError) as context:
+            inventory._normalize_rabin2_info(
+                json.dumps(
+                    {"info": invalid_info},
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                self.source.stat().st_size,
+            )
+        self.assertEqual(context.exception.code, "rabin2_invalid_schema")
 
     def test_rabin_root_must_contain_only_the_info_object(self) -> None:
         base = json.loads(self.rabin_payload())

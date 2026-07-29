@@ -8,15 +8,35 @@ import sys
 import unittest
 from pathlib import Path
 
+from ctf_os.contracts import resolve_rev_inventory_contract
+from ctf_os.contracts.rev_inventory_v1 import (
+    REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V1_CONTRACT_ID,
+    REV_INVENTORY_V1_CONTRACT_VERSION,
+    REV_INVENTORY_V1_SCHEMA_VERSION,
+    RevInventoryV1Verdict,
+    evaluate_rev_inventory_v1,
+)
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V2_CONTRACT_ID,
+    REV_INVENTORY_V2_CONTRACT_VERSION,
+    REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V2_MAX_BYTES,
+    REV_INVENTORY_V2_PRODUCER_ERROR_REASON_MAP,
+    REV_INVENTORY_V2_SCHEMA_VERSION,
+    RevInventoryV2ContractError,
+    RevInventoryV2Verdict,
+    evaluate_rev_inventory_v2,
+    rev_inventory_v2_canonical_json_bytes,
+    rev_inventory_v2_contract_descriptor,
+    validate_rev_inventory_v2_result_mapping,
+)
 from ctf_os.engine.partial_oracle import (
+    PartialOracleResult,
     PartialOracleVerdict,
-    REV_INVENTORY_CONTRACT_FINGERPRINT,
-    REV_INVENTORY_CONTRACT_ID,
-    REV_INVENTORY_CONTRACT_VERSION,
-    REV_INVENTORY_DOCUMENT_TRANSPORT,
-    REV_INVENTORY_MAX_BYTES,
-    REV_INVENTORY_SCHEMA_VERSION,
-    evaluate_rev_inventory,
+    RevBinaryProfile,
+    evaluate_rev_inventory as evaluate_rev_inventory_compat,
 )
 
 
@@ -24,8 +44,8 @@ SOURCE_BYTES = b"\x7fELFpartial-oracle-fixture"
 SOURCE_SHA256 = hashlib.sha256(SOURCE_BYTES).hexdigest()
 SOURCE_SIZE = len(SOURCE_BYTES)
 EXPECTED_CONTRACT_FINGERPRINT = (
-    "873e1bb39f81e5f0fb6f123ecc282efd2"
-    "e84bc23593e99dc4149ce1d46620b0c"
+    "1b61bb9fbd649abc1f0bbf7b77a2536"
+    "e40d6af683a89e612e42202920422a8cb"
 )
 
 
@@ -52,11 +72,11 @@ def valid_document() -> dict[str, object]:
             "havecode": True,
         },
         "contract": {
-            "fingerprint": REV_INVENTORY_CONTRACT_FINGERPRINT,
-            "id": REV_INVENTORY_CONTRACT_ID,
-            "version": REV_INVENTORY_CONTRACT_VERSION,
+            "fingerprint": REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+            "id": REV_INVENTORY_V2_CONTRACT_ID,
+            "version": REV_INVENTORY_V2_CONTRACT_VERSION,
         },
-        "schema_version": REV_INVENTORY_SCHEMA_VERSION,
+        "schema_version": REV_INVENTORY_V2_SCHEMA_VERSION,
         "source": {
             "sha256": SOURCE_SHA256,
             "size_bytes": SOURCE_SIZE,
@@ -66,7 +86,7 @@ def valid_document() -> dict[str, object]:
 
 
 def evaluate(document: dict[str, object]):
-    return evaluate_rev_inventory(
+    return evaluate_rev_inventory_v2(
         canonical_bytes(document),
         expected_source_sha256=SOURCE_SHA256,
         expected_source_size_bytes=SOURCE_SIZE,
@@ -74,12 +94,135 @@ def evaluate(document: dict[str, object]):
 
 
 class RevPartialOracleTests(unittest.TestCase):
+    def test_frozen_v1_public_facade_preserves_type_identity(self) -> None:
+        self.assertEqual(PartialOracleResult.__name__, "PartialOracleResult")
+        self.assertEqual(
+            PartialOracleResult.__module__,
+            "ctf_os.engine.partial_oracle",
+        )
+        self.assertEqual(RevBinaryProfile.__name__, "RevBinaryProfile")
+        self.assertEqual(
+            PartialOracleVerdict.__module__,
+            "ctf_os.engine.partial_oracle",
+        )
+        document = copy.deepcopy(valid_document())
+        document["contract"] = {
+            "fingerprint": REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            "id": REV_INVENTORY_V1_CONTRACT_ID,
+            "version": REV_INVENTORY_V1_CONTRACT_VERSION,
+        }
+        document["schema_version"] = REV_INVENTORY_V1_SCHEMA_VERSION
+        result = evaluate_rev_inventory_compat(
+            canonical_bytes(document),
+            expected_source_sha256=SOURCE_SHA256,
+            expected_source_size_bytes=SOURCE_SIZE,
+        )
+        self.assertIs(type(result), PartialOracleResult)
+        self.assertIs(type(result.profile), RevBinaryProfile)
+        self.assertIs(result.verdict, PartialOracleVerdict.CONFIRMED)
+        self.assertTrue(
+            repr(result).startswith("PartialOracleResult("),
+        )
+
+    def test_frozen_v1_golden_and_exact_registry_dispatch(self) -> None:
+        self.assertEqual(
+            REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            (
+                "873e1bb39f81e5f0fb6f123ecc282efd2"
+                "e84bc23593e99dc4149ce1d46620b0c"
+            ),
+        )
+        v1_document = copy.deepcopy(valid_document())
+        v1_document["contract"] = {
+            "fingerprint": REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            "id": REV_INVENTORY_V1_CONTRACT_ID,
+            "version": REV_INVENTORY_V1_CONTRACT_VERSION,
+        }
+        v1_document["schema_version"] = REV_INVENTORY_V1_SCHEMA_VERSION
+        v1_payload = canonical_bytes(v1_document)
+        v2_payload = canonical_bytes(valid_document())
+
+        v1_result = evaluate_rev_inventory_v1(
+            v1_payload,
+            expected_source_sha256=SOURCE_SHA256,
+            expected_source_size_bytes=SOURCE_SIZE,
+        )
+        self.assertIs(v1_result.verdict, RevInventoryV1Verdict.CONFIRMED)
+        self.assertEqual(
+            evaluate_rev_inventory_v2(
+                v1_payload,
+                expected_source_sha256=SOURCE_SHA256,
+                expected_source_size_bytes=SOURCE_SIZE,
+            ).reason_code,
+            "invalid_schema",
+        )
+        self.assertEqual(
+            evaluate_rev_inventory_v1(
+                v2_payload,
+                expected_source_sha256=SOURCE_SHA256,
+                expected_source_size_bytes=SOURCE_SIZE,
+            ).reason_code,
+            "invalid_schema",
+        )
+        self.assertIsNotNone(
+            resolve_rev_inventory_contract(
+                REV_INVENTORY_V1_CONTRACT_ID,
+                REV_INVENTORY_V1_CONTRACT_VERSION,
+                REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            )
+        )
+        self.assertIsNotNone(
+            resolve_rev_inventory_contract(
+                REV_INVENTORY_V2_CONTRACT_ID,
+                REV_INVENTORY_V2_CONTRACT_VERSION,
+                REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+            )
+        )
+        self.assertIsNone(
+            resolve_rev_inventory_contract(
+                REV_INVENTORY_V1_CONTRACT_ID,
+                REV_INVENTORY_V1_CONTRACT_VERSION,
+                REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+            )
+        )
+        self.assertIsNone(
+            resolve_rev_inventory_contract(
+                REV_INVENTORY_V2_CONTRACT_ID,
+                REV_INVENTORY_V2_CONTRACT_VERSION,
+                REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+            )
+        )
+
+    def test_frozen_v1_image_path_keeps_head_fingerprint(self) -> None:
+        repository = Path(__file__).resolve().parent.parent
+        template_dir = repository / "ctf-os-image" / "templates" / "rev"
+        module_name = "_ctfos_rev_inventory_v1_golden_test"
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            template_dir / "inventory.py",
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        sys.path.insert(0, str(template_dir))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.remove(str(template_dir))
+            sys.modules.pop(module_name, None)
+        self.assertEqual(
+            module.CONTRACT_FINGERPRINT,
+            REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+        )
+        self.assertEqual(module.CONTRACT_VERSION, 1)
+        self.assertEqual(module.OUTPUT_NAME, "inventory-v1.json")
+
     def test_valid_inventory_confirms_neutral_binary_profile(self) -> None:
         first = evaluate(valid_document())
         second = evaluate(valid_document())
 
         self.assertEqual(first, second)
-        self.assertEqual(first.verdict, PartialOracleVerdict.CONFIRMED)
+        self.assertEqual(first.verdict, RevInventoryV2Verdict.CONFIRMED)
         self.assertEqual(first.reason_code, "binary_profile_observed")
         self.assertEqual(first.source_sha256, SOURCE_SHA256)
         self.assertEqual(first.source_size_bytes, SOURCE_SIZE)
@@ -90,6 +233,27 @@ class RevPartialOracleTests(unittest.TestCase):
         self.assertEqual(first.profile.bintype, "elf")
         self.assertEqual(first.profile.endian, "little")
         self.assertTrue(first.profile.havecode)
+        self.assertEqual(
+            first.to_dict(),
+            {
+                "contract_fingerprint": (
+                    REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+                ),
+                "oracle_id": REV_INVENTORY_V2_CONTRACT_ID,
+                "oracle_version": REV_INVENTORY_V2_CONTRACT_VERSION,
+                "profile": {
+                    "arch": "x86",
+                    "bits": 64,
+                    "bintype": "elf",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "reason_code": "binary_profile_observed",
+                "source_sha256": SOURCE_SHA256,
+                "source_size_bytes": SOURCE_SIZE,
+                "verdict": "CONFIRMED",
+            },
+        )
 
     def test_producer_and_parser_contract_fingerprints_match(self) -> None:
         repository = Path(__file__).resolve().parent.parent
@@ -97,7 +261,7 @@ class RevPartialOracleTests(unittest.TestCase):
         module_name = "_ctfos_rev_inventory_contract_test"
         spec = importlib.util.spec_from_file_location(
             module_name,
-            template_dir / "inventory.py",
+            template_dir / "inventory_v2.py",
         )
         self.assertIsNotNone(spec)
         assert spec is not None and spec.loader is not None
@@ -112,21 +276,157 @@ class RevPartialOracleTests(unittest.TestCase):
 
         self.assertEqual(
             module.CONTRACT_FINGERPRINT,
-            REV_INVENTORY_CONTRACT_FINGERPRINT,
+            REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
         )
         self.assertEqual(
-            REV_INVENTORY_CONTRACT_FINGERPRINT,
+            REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
             EXPECTED_CONTRACT_FINGERPRINT,
         )
-        self.assertEqual(module.CONTRACT_ID, REV_INVENTORY_CONTRACT_ID)
+        self.assertEqual(module.CONTRACT_ID, REV_INVENTORY_V2_CONTRACT_ID)
         self.assertEqual(
             module.CONTRACT_VERSION,
-            REV_INVENTORY_CONTRACT_VERSION,
+            REV_INVENTORY_V2_CONTRACT_VERSION,
         )
         self.assertEqual(
             module.DOCUMENT_TRANSPORT,
-            REV_INVENTORY_DOCUMENT_TRANSPORT,
+            REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
         )
+        self.assertEqual(
+            module._CONTRACT_DESCRIPTOR,
+            rev_inventory_v2_contract_descriptor(),
+        )
+        self.assertEqual(
+            module._canonical_json_bytes(module._CONTRACT_DESCRIPTOR),
+            rev_inventory_v2_canonical_json_bytes(
+                rev_inventory_v2_contract_descriptor()
+            ),
+        )
+
+    def test_every_fingerprinted_semantic_rule_round_trips_validator(
+        self,
+    ) -> None:
+        cases = (
+            (
+                {
+                    "arch": None,
+                    "bits": None,
+                    "bintype": "unknown",
+                    "endian": "unknown",
+                    "havecode": False,
+                },
+                "NOT_APPLICABLE",
+                "no_executable_code",
+            ),
+            (
+                {
+                    "arch": "x86",
+                    "bits": 64,
+                    "bintype": "unknown",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "NOT_APPLICABLE",
+                "unsupported_binary_type",
+            ),
+            (
+                {
+                    "arch": None,
+                    "bits": 64,
+                    "bintype": "elf",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "INCONCLUSIVE",
+                "incomplete_binary_profile",
+            ),
+            (
+                {
+                    "arch": "mystery64",
+                    "bits": 64,
+                    "bintype": "elf",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "NOT_APPLICABLE",
+                "unsupported_architecture",
+            ),
+            (
+                {
+                    "arch": "x86",
+                    "bits": 8,
+                    "bintype": "elf",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "NOT_APPLICABLE",
+                "unsupported_architecture_bits",
+            ),
+            (
+                {
+                    "arch": "x86",
+                    "bits": 64,
+                    "bintype": "elf",
+                    "endian": "mixed",
+                    "havecode": True,
+                },
+                "INCONCLUSIVE",
+                "mixed_endian_profile",
+            ),
+            (
+                {
+                    "arch": "x86",
+                    "bits": 64,
+                    "bintype": "elf",
+                    "endian": "little",
+                    "havecode": True,
+                },
+                "CONFIRMED",
+                "binary_profile_observed",
+            ),
+        )
+        for profile, verdict, reason in cases:
+            with self.subTest(reason=reason):
+                document = valid_document()
+                document["binary"] = profile
+                result = evaluate(document)
+                self.assertEqual(result.verdict.value, verdict)
+                self.assertEqual(result.reason_code, reason)
+                self.assertEqual(
+                    validate_rev_inventory_v2_result_mapping(
+                        result.to_dict()
+                    ),
+                    result.to_dict(),
+                )
+
+        for producer_code, reason in (
+            REV_INVENTORY_V2_PRODUCER_ERROR_REASON_MAP.items()
+        ):
+            with self.subTest(producer_code=producer_code):
+                document = valid_document()
+                del document["binary"]
+                document["status"] = "error"
+                document["error"] = {"code": producer_code}
+                result = evaluate(document)
+                self.assertEqual(result.verdict.value, "ERROR")
+                self.assertEqual(result.reason_code, reason)
+                validate_rev_inventory_v2_result_mapping(
+                    result.to_dict()
+                )
+
+    def test_semantic_mapping_validator_rejects_nested_type_traps(
+        self,
+    ) -> None:
+        result = evaluate(valid_document()).to_dict()
+        for field in ("bintype", "endian"):
+            malformed = copy.deepcopy(result)
+            profile = malformed["profile"]
+            assert isinstance(profile, dict)
+            profile[field] = []
+            with (
+                self.subTest(field=field),
+                self.assertRaises(RevInventoryV2ContractError),
+            ):
+                validate_rev_inventory_v2_result_mapping(malformed)
 
     def test_duplicate_keys_are_rejected_at_every_object_level(self) -> None:
         payload = canonical_bytes(valid_document()).decode("ascii")
@@ -136,10 +436,10 @@ class RevPartialOracleTests(unittest.TestCase):
                 '"status":"ok","status":"ok"}',
             ),
             "contract": payload.replace(
-                f'"id":"{REV_INVENTORY_CONTRACT_ID}"',
+                f'"id":"{REV_INVENTORY_V2_CONTRACT_ID}"',
                 (
-                    f'"id":"{REV_INVENTORY_CONTRACT_ID}",'
-                    f'"id":"{REV_INVENTORY_CONTRACT_ID}"'
+                    f'"id":"{REV_INVENTORY_V2_CONTRACT_ID}",'
+                    f'"id":"{REV_INVENTORY_V2_CONTRACT_ID}"'
                 ),
             ),
             "source": payload.replace(
@@ -153,14 +453,14 @@ class RevPartialOracleTests(unittest.TestCase):
         }
         for name, mutated in mutations.items():
             with self.subTest(name=name):
-                result = evaluate_rev_inventory(
+                result = evaluate_rev_inventory_v2(
                     mutated.encode("ascii"),
                     expected_source_sha256=SOURCE_SHA256,
                     expected_source_size_bytes=SOURCE_SIZE,
                 )
                 self.assertEqual(
                     result.verdict,
-                    PartialOracleVerdict.ERROR,
+                    RevInventoryV2Verdict.ERROR,
                 )
                 self.assertEqual(result.reason_code, "duplicate_json_key")
 
@@ -186,7 +486,7 @@ class RevPartialOracleTests(unittest.TestCase):
                 result = evaluate(document)
                 self.assertEqual(
                     result.verdict,
-                    PartialOracleVerdict.ERROR,
+                    RevInventoryV2Verdict.ERROR,
                 )
                 self.assertEqual(result.reason_code, "invalid_schema")
 
@@ -196,7 +496,7 @@ class RevPartialOracleTests(unittest.TestCase):
         assert isinstance(source, dict)
         source["sha256"] = "0" * 64
         hash_result = evaluate(wrong_hash)
-        self.assertEqual(hash_result.verdict, PartialOracleVerdict.ERROR)
+        self.assertEqual(hash_result.verdict, RevInventoryV2Verdict.ERROR)
         self.assertEqual(hash_result.reason_code, "source_hash_mismatch")
 
         wrong_size = copy.deepcopy(valid_document())
@@ -204,7 +504,7 @@ class RevPartialOracleTests(unittest.TestCase):
         assert isinstance(source, dict)
         source["size_bytes"] = SOURCE_SIZE + 1
         size_result = evaluate(wrong_size)
-        self.assertEqual(size_result.verdict, PartialOracleVerdict.ERROR)
+        self.assertEqual(size_result.verdict, RevInventoryV2Verdict.ERROR)
         self.assertEqual(size_result.reason_code, "source_size_mismatch")
 
     def test_uppercase_digest_is_not_normalized(self) -> None:
@@ -215,7 +515,7 @@ class RevPartialOracleTests(unittest.TestCase):
 
         result = evaluate(document)
 
-        self.assertEqual(result.verdict, PartialOracleVerdict.ERROR)
+        self.assertEqual(result.verdict, RevInventoryV2Verdict.ERROR)
         self.assertEqual(result.reason_code, "invalid_schema")
 
     def test_truncated_oversized_and_noncanonical_payloads_fail_closed(
@@ -225,7 +525,7 @@ class RevPartialOracleTests(unittest.TestCase):
         cases = {
             "truncated": (valid[:-2], "invalid_json"),
             "oversized": (
-                b" " * (REV_INVENTORY_MAX_BYTES + 1),
+                b" " * (REV_INVENTORY_V2_MAX_BYTES + 1),
                 "artifact_too_large",
             ),
             "pretty": (
@@ -246,14 +546,14 @@ class RevPartialOracleTests(unittest.TestCase):
         }
         for name, (payload, reason) in cases.items():
             with self.subTest(name=name):
-                result = evaluate_rev_inventory(
+                result = evaluate_rev_inventory_v2(
                     payload,
                     expected_source_sha256=SOURCE_SHA256,
                     expected_source_size_bytes=SOURCE_SIZE,
                 )
                 self.assertEqual(
                     result.verdict,
-                    PartialOracleVerdict.ERROR,
+                    RevInventoryV2Verdict.ERROR,
                 )
                 self.assertEqual(result.reason_code, reason)
 
@@ -264,13 +564,13 @@ class RevPartialOracleTests(unittest.TestCase):
         self.assertEqual(len(current_source), SOURCE_SIZE)
         self.assertNotEqual(current_source, SOURCE_BYTES)
 
-        result = evaluate_rev_inventory(
+        result = evaluate_rev_inventory_v2(
             stale_payload,
             expected_source_sha256=hashlib.sha256(current_source).hexdigest(),
             expected_source_size_bytes=len(current_source),
         )
 
-        self.assertEqual(result.verdict, PartialOracleVerdict.ERROR)
+        self.assertEqual(result.verdict, RevInventoryV2Verdict.ERROR)
         self.assertEqual(result.reason_code, "source_hash_mismatch")
 
     def test_missing_and_unknown_fields_fail_closed(self) -> None:
@@ -289,7 +589,7 @@ class RevPartialOracleTests(unittest.TestCase):
                 result = evaluate(document)
                 self.assertEqual(
                     result.verdict,
-                    PartialOracleVerdict.ERROR,
+                    RevInventoryV2Verdict.ERROR,
                 )
                 self.assertEqual(result.reason_code, "invalid_schema")
 
@@ -310,7 +610,7 @@ class RevPartialOracleTests(unittest.TestCase):
 
         self.assertEqual(
             result.verdict,
-            PartialOracleVerdict.NOT_APPLICABLE,
+            RevInventoryV2Verdict.NOT_APPLICABLE,
         )
         self.assertEqual(result.reason_code, "no_executable_code")
 
@@ -324,7 +624,7 @@ class RevPartialOracleTests(unittest.TestCase):
 
         self.assertEqual(
             result.verdict,
-            PartialOracleVerdict.NOT_APPLICABLE,
+            RevInventoryV2Verdict.NOT_APPLICABLE,
         )
         self.assertEqual(result.reason_code, "unsupported_architecture")
 
@@ -338,7 +638,7 @@ class RevPartialOracleTests(unittest.TestCase):
 
         self.assertEqual(
             result.verdict,
-            PartialOracleVerdict.INCONCLUSIVE,
+            RevInventoryV2Verdict.INCONCLUSIVE,
         )
         self.assertEqual(result.reason_code, "incomplete_binary_profile")
 
@@ -350,7 +650,7 @@ class RevPartialOracleTests(unittest.TestCase):
 
         result = evaluate(document)
 
-        self.assertEqual(result.verdict, PartialOracleVerdict.ERROR)
+        self.assertEqual(result.verdict, RevInventoryV2Verdict.ERROR)
         self.assertEqual(result.reason_code, "producer_rabin2_timeout")
         self.assertEqual(result.source_sha256, SOURCE_SHA256)
         self.assertEqual(result.source_size_bytes, SOURCE_SIZE)
@@ -366,7 +666,7 @@ class RevPartialOracleTests(unittest.TestCase):
                 self.subTest(sha256=sha256, size=size),
                 self.assertRaises(ValueError),
             ):
-                evaluate_rev_inventory(
+                evaluate_rev_inventory_v2(
                     payload,
                     expected_source_sha256=sha256,
                     expected_source_size_bytes=size,

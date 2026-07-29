@@ -18,6 +18,41 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
 
 from ctf_os.candidates import candidate_value_is_valid
+from ctf_os.contracts import resolve_rev_inventory_contract
+from ctf_os.contracts.rev_inventory_v1 import (
+    REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V1_CONTRACT_ID,
+    REV_INVENTORY_V1_CONTRACT_VERSION,
+    REV_INVENTORY_V1_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V1_SEED_TEMPLATE_ID,
+    RevInventoryV1ContractError,
+    build_rev_inventory_v1_seed_extra,
+    build_rev_inventory_v1_source_binding,
+    build_rev_inventory_v1_source_snapshot,
+    rev_inventory_v1_oracle_descriptor,
+    rev_inventory_v1_seed_command,
+)
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_ADAPTER_SEED_CONTRACT_VERSION,
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V2_CONTRACT_ID,
+    REV_INVENTORY_V2_CONTRACT_VERSION,
+    REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V2_SEED_DROP_CONDITION,
+    REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
+    REV_INVENTORY_V2_SEED_KEEP_CONDITION,
+    REV_INVENTORY_V2_SEED_REQUIRES_EXPLICIT_EXECUTION,
+    REV_INVENTORY_V2_SEED_RESOURCE_CLASS,
+    REV_INVENTORY_V2_SEED_TEMPLATE_ID,
+    REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS,
+    RevInventoryV2ContractError,
+    build_rev_inventory_v2_seed_extra,
+    build_rev_inventory_v2_source_binding,
+    build_rev_inventory_v2_source_snapshot,
+    rev_inventory_v2_oracle_descriptor,
+    rev_inventory_v2_seed_command,
+    validate_rev_inventory_v2_result_mapping,
+)
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
 # Compatibility alias for callers that still construct or inspect v1 state.
@@ -2990,6 +3025,1329 @@ class WorkspacePublish:
         )
 
 
+_REV_INVENTORY_ORACLE_ID = REV_INVENTORY_V2_CONTRACT_ID
+_REV_INVENTORY_V2_CONTRACT_FINGERPRINT = (
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+)
+_REV_INVENTORY_V2_OUTCOME_KEYS = {
+    "evaluated_at",
+    "evaluation_status",
+    "execution_binding",
+    "image_reference",
+    "rejection_code",
+    "request_sha256",
+    "result",
+    "schema_version",
+    "source_binding",
+    "stdout_artifact_id",
+    "transport_succeeded",
+}
+_REV_INVENTORY_V2_EXECUTION_BINDING_KEYS = {
+    "argv",
+    "base_revision",
+    "configuration_epoch",
+    "experiment",
+    "image",
+    "network",
+    "oracle",
+    "request",
+    "resource_request",
+    "schema_version",
+    "source_binding",
+    "source_snapshot",
+    "source_snapshot_execution_binding",
+    "stdout_artifact",
+}
+
+
+def _rev_inventory_exact_mapping(
+    value: object,
+    keys: set[str],
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ModelValidationError(
+            f"{label} has missing or unknown fields"
+        )
+    return value
+
+
+def _rev_inventory_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _rev_inventory_image_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and _rev_inventory_sha256(value.removeprefix("sha256:"))
+    )
+
+
+def _validate_rev_inventory_v2_outcome_shape(
+    value: object,
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    outcome = _rev_inventory_exact_mapping(
+        value,
+        _REV_INVENTORY_V2_OUTCOME_KEYS,
+        label,
+    )
+    if outcome["schema_version"] != 2:
+        raise ModelValidationError(f"{label} has invalid schema_version")
+    if type(outcome["transport_succeeded"]) is not bool:
+        raise ModelValidationError(
+            f"{label} transport_succeeded must be boolean"
+        )
+    evaluation_status = outcome["evaluation_status"]
+    if (
+        not isinstance(evaluation_status, str)
+        or evaluation_status
+        not in {
+            "evaluated",
+            "not_evaluated",
+            "rejected",
+        }
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid evaluation_status"
+        )
+    if (
+        outcome["rejection_code"] is not None
+        and (
+            not isinstance(outcome["rejection_code"], str)
+            or not outcome["rejection_code"]
+            or len(outcome["rejection_code"]) > 128
+        )
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid rejection_code"
+        )
+    if (
+        outcome["request_sha256"] is not None
+        and not _rev_inventory_sha256(outcome["request_sha256"])
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid request_sha256"
+        )
+    for key in (
+        "image_reference",
+        "stdout_artifact_id",
+        "evaluated_at",
+    ):
+        if outcome[key] is not None and not isinstance(
+            outcome[key],
+            str,
+        ):
+            raise ModelValidationError(f"{label} has invalid {key}")
+
+    result_value = outcome["result"]
+    if result_value is None:
+        result = None
+    else:
+        try:
+            result = validate_rev_inventory_v2_result_mapping(
+                result_value
+            )
+        except RevInventoryV2ContractError as error:
+            raise ModelValidationError(
+                f"{label} has invalid semantic result: {error}"
+            ) from error
+
+    binding = _rev_inventory_exact_mapping(
+        outcome["execution_binding"],
+        _REV_INVENTORY_V2_EXECUTION_BINDING_KEYS,
+        f"{label} execution_binding",
+    )
+    if (
+        binding["schema_version"] != 2
+        or not isinstance(binding["argv"], list)
+        or not all(isinstance(item, str) for item in binding["argv"])
+        or isinstance(binding["base_revision"], bool)
+        or not isinstance(binding["base_revision"], int)
+        or binding["base_revision"] < 0
+        or isinstance(binding["configuration_epoch"], bool)
+        or not isinstance(binding["configuration_epoch"], int)
+        or binding["configuration_epoch"] < 0
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid execution binding scalars"
+        )
+    experiment_binding = _rev_inventory_exact_mapping(
+        binding["experiment"],
+        {
+            "adapter_name",
+            "adapter_seed",
+            "adapter_seed_contract_version",
+            "adapter_seed_order",
+            "adapter_spec_id",
+            "adapter_spec_sha256",
+            "adapter_spec_template_id",
+            "id",
+            "requires_explicit_execution",
+            "resource_class",
+        },
+        f"{label} experiment binding",
+    )
+    image_binding = _rev_inventory_exact_mapping(
+        binding["image"],
+        {"digest", "name", "reference"},
+        f"{label} image binding",
+    )
+    network_binding = _rev_inventory_exact_mapping(
+        binding["network"],
+        {"target", "target_generation", "target_id"},
+        f"{label} network binding",
+    )
+    request_binding = _rev_inventory_exact_mapping(
+        binding["request"],
+        {"path", "sha256"},
+        f"{label} request binding",
+    )
+    stdout_binding = _rev_inventory_exact_mapping(
+        binding["stdout_artifact"],
+        {"id", "path", "sha256", "size"},
+        f"{label} stdout binding",
+    )
+    if (
+        experiment_binding["adapter_name"] != "reversing"
+        or experiment_binding["adapter_seed"] is not True
+        or experiment_binding["adapter_seed_contract_version"]
+        != REV_INVENTORY_V2_ADAPTER_SEED_CONTRACT_VERSION
+        or isinstance(experiment_binding["adapter_seed_order"], bool)
+        or not isinstance(
+            experiment_binding["adapter_seed_order"],
+            int,
+        )
+        or experiment_binding["adapter_seed_order"] < 0
+        or experiment_binding["adapter_spec_template_id"]
+        != REV_INVENTORY_V2_SEED_TEMPLATE_ID
+        or not isinstance(experiment_binding["adapter_spec_id"], str)
+        or not _rev_inventory_sha256(
+            experiment_binding["adapter_spec_sha256"]
+        )
+        or not experiment_binding["adapter_spec_id"].endswith(
+            f"@{experiment_binding['adapter_spec_sha256']}"
+        )
+        or experiment_binding["requires_explicit_execution"]
+        is not REV_INVENTORY_V2_SEED_REQUIRES_EXPLICIT_EXECUTION
+        or not isinstance(experiment_binding["id"], str)
+        or experiment_binding["resource_class"]
+        != REV_INVENTORY_V2_SEED_RESOURCE_CLASS
+        or not isinstance(image_binding["name"], str)
+        or not isinstance(image_binding["reference"], str)
+        or any(value is not None for value in network_binding.values())
+        or not isinstance(request_binding["path"], str)
+        or request_binding["sha256"] != outcome["request_sha256"]
+        or (
+            request_binding["sha256"] is not None
+            and not _rev_inventory_sha256(request_binding["sha256"])
+        )
+        or not isinstance(binding["resource_request"], Mapping)
+        or not isinstance(stdout_binding["id"], str)
+        or not isinstance(stdout_binding["path"], str)
+        or not _rev_inventory_sha256(stdout_binding["sha256"])
+        or isinstance(stdout_binding["size"], bool)
+        or not isinstance(stdout_binding["size"], int)
+        or stdout_binding["size"] < 0
+        or outcome["stdout_artifact_id"] != stdout_binding["id"]
+        or outcome["source_binding"] != binding["source_binding"]
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid exact execution pins"
+        )
+    resource_request = binding["resource_request"]
+    if (
+        set(resource_request)
+        != {"cpu", "gpu", "kvm", "memory_mib", "network"}
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for value in resource_request.values()
+        )
+        or resource_request["network"] != 0
+        or dict(resource_request)
+        != {
+            "cpu": 1,
+            "gpu": 0,
+            "kvm": 0,
+            "memory_mib": 2048,
+            "network": 0,
+        }
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid resource request binding"
+        )
+    snapshot_execution = _rev_inventory_exact_mapping(
+        binding["source_snapshot_execution_binding"],
+        {"enforced", "mode", "scope_fingerprint", "snapshot_id"},
+        f"{label} source snapshot execution binding",
+    )
+    if (
+        type(snapshot_execution["enforced"]) is not bool
+        or not isinstance(snapshot_execution["mode"], str)
+        or snapshot_execution["mode"]
+        not in {
+                "production_read_only_snapshot_scope",
+                "trusted_injected_sandbox",
+            }
+        or not _rev_inventory_sha256(
+            snapshot_execution["scope_fingerprint"]
+        )
+        or not isinstance(snapshot_execution["snapshot_id"], str)
+        or snapshot_execution["enforced"]
+        is not (
+            snapshot_execution["mode"]
+            == "production_read_only_snapshot_scope"
+        )
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid source snapshot execution binding"
+        )
+    oracle = binding["oracle"]
+    if (
+        not isinstance(oracle, Mapping)
+        or set(oracle)
+        != {
+            "contract_fingerprint",
+            "document_transport",
+            "oracle_id",
+            "oracle_version",
+        }
+        or oracle.get("oracle_id") != _REV_INVENTORY_ORACLE_ID
+        or oracle.get("oracle_version")
+        != REV_INVENTORY_V2_CONTRACT_VERSION
+        or oracle.get("document_transport")
+        != REV_INVENTORY_V2_DOCUMENT_TRANSPORT
+        or oracle.get("contract_fingerprint")
+        != _REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid oracle binding"
+        )
+    if result is not None and (
+        result["oracle_id"] != oracle["oracle_id"]
+        or result["oracle_version"] != oracle["oracle_version"]
+        or result["contract_fingerprint"]
+        != oracle["contract_fingerprint"]
+    ):
+        raise ModelValidationError(
+            f"{label} semantic result/oracle binding mismatch"
+        )
+    source_binding = _rev_inventory_exact_mapping(
+        binding["source_binding"],
+        {
+            "manifest_generation",
+            "manifest_sha256",
+            "path",
+            "sha256",
+            "size_bytes",
+        },
+        f"{label} source binding",
+    )
+    try:
+        expected_source_binding = build_rev_inventory_v2_source_binding(
+            manifest_generation=source_binding["manifest_generation"],
+            manifest_sha256=source_binding["manifest_sha256"],
+            path=source_binding["path"],
+            source_sha256=source_binding["sha256"],
+            source_size_bytes=source_binding["size_bytes"],
+        )
+    except RevInventoryV2ContractError as error:
+        raise ModelValidationError(
+            f"{label} has invalid source binding"
+        ) from error
+    if dict(source_binding) != expected_source_binding:
+        raise ModelValidationError(
+            f"{label} has invalid source binding"
+        )
+    source_snapshot = _rev_inventory_exact_mapping(
+        binding["source_snapshot"],
+        {
+            "binding_sha256",
+            "challenge_dir",
+            "directory_mode",
+            "file_mode",
+            "id",
+            "mount_requirement",
+            "publish",
+            "sha256",
+            "size_bytes",
+            "source_locator",
+            "tree_contract",
+        },
+        f"{label} source snapshot",
+    )
+    try:
+        expected_source_snapshot = (
+            build_rev_inventory_v2_source_snapshot(
+                expected_source_binding
+            )
+        )
+    except RevInventoryV2ContractError as error:
+        raise ModelValidationError(
+            f"{label} has invalid source snapshot binding"
+        ) from error
+    if (
+        dict(source_snapshot) != expected_source_snapshot
+        or snapshot_execution["snapshot_id"]
+        != expected_source_snapshot["id"]
+    ):
+        raise ModelValidationError(
+            f"{label} has invalid source snapshot binding"
+        )
+    source_mismatch_error = result is not None and (
+        result["verdict"] == "ERROR"
+        and result["reason_code"]
+        in {"source_hash_mismatch", "source_size_mismatch"}
+    )
+    if result is not None and not source_mismatch_error and (
+        (
+            result["source_sha256"] is not None
+            and result["source_sha256"] != source_binding.get("sha256")
+        )
+        or (
+            result["source_size_bytes"] is not None
+            and result["source_size_bytes"]
+            != source_binding.get("size_bytes")
+        )
+        or (
+            result["verdict"]
+            in {"CONFIRMED", "INCONCLUSIVE", "NOT_APPLICABLE"}
+            and (
+                result["source_sha256"] != source_binding.get("sha256")
+                or result["source_size_bytes"]
+                != source_binding.get("size_bytes")
+            )
+        )
+    ):
+        raise ModelValidationError(
+            f"{label} semantic result/source binding mismatch"
+        )
+    if (
+        evaluation_status == "evaluated"
+        and (
+            outcome["transport_succeeded"] is not True
+            or outcome["rejection_code"] is not None
+            or result is None
+        )
+    ) or (
+        evaluation_status == "rejected"
+        and (
+            outcome["transport_succeeded"] is not True
+            or not isinstance(outcome["rejection_code"], str)
+            or result is not None
+        )
+    ) or (
+        evaluation_status == "not_evaluated"
+        and (
+            outcome["transport_succeeded"] is not False
+            or outcome["rejection_code"] != "transport_failed"
+            or result is not None
+        )
+    ):
+        raise ModelValidationError(
+            f"{label} transport/semantic axes are inconsistent"
+        )
+    if evaluation_status == "evaluated" and (
+        not _rev_inventory_image_digest(image_binding["digest"])
+        or image_binding["reference"] != image_binding["digest"]
+        or outcome["image_reference"] != image_binding["digest"]
+    ):
+        raise ModelValidationError(
+            f"{label} evaluated result lacks an exact image digest"
+        )
+    if (
+        not isinstance(outcome["evaluated_at"], str)
+        or not outcome["evaluated_at"]
+    ):
+        raise ModelValidationError(
+            f"{label} lacks an evaluation timestamp"
+        )
+    return outcome
+
+
+def _rev_inventory_v2_active_seed_errors(
+    state: "ChallengeState",
+    experiment: Experiment,
+    *,
+    descriptor: Mapping[str, Any],
+) -> list[str]:
+    """Validate the exact deterministic inventory seed before it can run."""
+
+    label = f"Rev inventory experiment {experiment.id}"
+    errors: list[str] = []
+    if dict(descriptor) != rev_inventory_v2_oracle_descriptor():
+        return [f"{label} has an invalid v2 oracle descriptor"]
+    manifest = state.metadata.get("source_manifest_sha256")
+    history = state.metadata.get("source_manifest_history", [])
+    primary_path = state.metadata.get("adapter_primary_source")
+    matching_sources = [
+        source
+        for source in state.source_inventory
+        if source.path == primary_path
+    ]
+    if (
+        not _rev_inventory_sha256(manifest)
+        or not isinstance(history, list)
+        or not isinstance(primary_path, str)
+        or not primary_path
+        or len(matching_sources) != 1
+    ):
+        return [f"{label} lacks its canonical active source metadata"]
+    primary = matching_sources[0]
+    if (
+        not _rev_inventory_sha256(primary.sha256)
+        or isinstance(primary.size, bool)
+        or not isinstance(primary.size, int)
+        or primary.size < 0
+    ):
+        return [f"{label} has an invalid active primary source"]
+
+    try:
+        source_binding = build_rev_inventory_v2_source_binding(
+            manifest_generation=len(history) + 1,
+            manifest_sha256=manifest,
+            path=primary.path,
+            source_sha256=primary.sha256,
+            source_size_bytes=primary.size,
+        )
+        source_snapshot = build_rev_inventory_v2_source_snapshot(
+            source_binding
+        )
+        expected_extra = build_rev_inventory_v2_seed_extra(
+            source_binding,
+            source_snapshot,
+        )
+        expected_command = rev_inventory_v2_seed_command(primary.path)
+    except RevInventoryV2ContractError:
+        return [f"{label} has an invalid active seed contract"]
+    allowed_extra = {
+        *expected_extra,
+        "orphan_recovered_at",
+        "orphan_recovery",
+    }
+    if (
+        state.metadata.get("adapter_name") != "reversing"
+        or state.metadata.get("adapter_seed_source_binding")
+        != source_binding
+        or experiment.kind is not ExperimentKind.PROBE
+        or experiment.hypothesis_ids
+        or experiment.command != expected_command
+        or experiment.expected_observation
+        != REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION
+        or experiment.keep_if != REV_INVENTORY_V2_SEED_KEEP_CONDITION
+        or experiment.drop_if != REV_INVENTORY_V2_SEED_DROP_CONDITION
+        or experiment.resource_class
+        != REV_INVENTORY_V2_SEED_RESOURCE_CLASS
+        or experiment.timeout_seconds < 1
+        or experiment.timeout_seconds
+        > REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS
+        or experiment.source_run_id is not None
+        or experiment.artifact_ids
+        or experiment.evidence_fact_ids
+        or experiment.evidence_run_ids
+        or experiment.evidence_receipt_ids
+        or experiment.evaluation_reason is not None
+        or experiment.evaluated_at is not None
+        or experiment.proof_recipe is not None
+        or set(experiment.extra) - allowed_extra
+        or any(
+            experiment.extra.get(key) != value
+            for key, value in expected_extra.items()
+        )
+    ):
+        errors.append(f"{label} active seed contract is inconsistent")
+    if (
+        "orphan_recovery" in experiment.extra
+        and experiment.extra.get("orphan_recovery")
+        != "retryable_without_canonical_outcome"
+    ):
+        errors.append(f"{label} has invalid orphan recovery metadata")
+    if (
+        "orphan_recovered_at" in experiment.extra
+        and (
+            not isinstance(
+                experiment.extra.get("orphan_recovered_at"),
+                str,
+            )
+            or not experiment.extra.get("orphan_recovered_at")
+            or len(experiment.extra["orphan_recovered_at"]) > 128
+        )
+    ):
+        errors.append(f"{label} has invalid orphan recovery timestamp")
+    if (
+        ("orphan_recovery" in experiment.extra)
+        != ("orphan_recovered_at" in experiment.extra)
+    ):
+        errors.append(f"{label} has incomplete orphan recovery metadata")
+    return errors
+
+
+def _rev_inventory_seed_id(adapter_spec_id: str) -> str:
+    normalized = adapter_spec_id.replace("@", "-")
+    return f"E-adapter-reversing-{normalized}"
+
+
+def _rev_inventory_seed_identity(
+    experiment: Experiment,
+    *,
+    version: int,
+) -> bool:
+    """Recognize a deterministic seed even if its mutable markers drift."""
+
+    source_binding = experiment.extra.get("source_binding")
+    source_snapshot = experiment.extra.get("source_snapshot")
+    if not isinstance(source_binding, Mapping) or not isinstance(
+        source_snapshot,
+        Mapping,
+    ):
+        return False
+    try:
+        if version == REV_INVENTORY_V1_CONTRACT_VERSION:
+            expected_binding = build_rev_inventory_v1_source_binding(
+                manifest_generation=source_binding.get(
+                    "manifest_generation"
+                ),
+                manifest_sha256=source_binding.get("manifest_sha256"),
+                path=source_binding.get("path"),
+                source_sha256=source_binding.get("sha256"),
+                source_size_bytes=source_binding.get("size_bytes"),
+            )
+            expected_snapshot = build_rev_inventory_v1_source_snapshot(
+                expected_binding
+            )
+            expected_extra = build_rev_inventory_v1_seed_extra(
+                expected_binding,
+                expected_snapshot,
+            )
+        elif version == REV_INVENTORY_V2_CONTRACT_VERSION:
+            expected_binding = build_rev_inventory_v2_source_binding(
+                manifest_generation=source_binding.get(
+                    "manifest_generation"
+                ),
+                manifest_sha256=source_binding.get("manifest_sha256"),
+                path=source_binding.get("path"),
+                source_sha256=source_binding.get("sha256"),
+                source_size_bytes=source_binding.get("size_bytes"),
+            )
+            expected_snapshot = build_rev_inventory_v2_source_snapshot(
+                expected_binding
+            )
+            expected_extra = build_rev_inventory_v2_seed_extra(
+                expected_binding,
+                expected_snapshot,
+            )
+        else:
+            return False
+    except (
+        RevInventoryV1ContractError,
+        RevInventoryV2ContractError,
+    ):
+        return False
+    return (
+        dict(source_binding) == expected_binding
+        and dict(source_snapshot) == expected_snapshot
+        and experiment.id
+        == _rev_inventory_seed_id(
+            str(expected_extra["adapter_spec_id"])
+        )
+    )
+
+
+def _rev_inventory_legacy_v1_seed_errors(
+    experiment: Experiment,
+    *,
+    descriptor: Mapping[str, Any],
+) -> list[str]:
+    """Validate only the immutable internal identity of historical v1."""
+
+    label = f"legacy Rev inventory experiment {experiment.id}"
+    if dict(descriptor) != rev_inventory_v1_oracle_descriptor():
+        return [f"{label} has an invalid v1 oracle descriptor"]
+    source_binding = experiment.extra.get("source_binding")
+    source_snapshot = experiment.extra.get("source_snapshot")
+    if not isinstance(source_binding, Mapping) or not isinstance(
+        source_snapshot,
+        Mapping,
+    ):
+        return [f"{label} lacks its historical source binding"]
+    try:
+        expected_binding = build_rev_inventory_v1_source_binding(
+            manifest_generation=source_binding.get(
+                "manifest_generation"
+            ),
+            manifest_sha256=source_binding.get("manifest_sha256"),
+            path=source_binding.get("path"),
+            source_sha256=source_binding.get("sha256"),
+            source_size_bytes=source_binding.get("size_bytes"),
+        )
+        expected_snapshot = build_rev_inventory_v1_source_snapshot(
+            expected_binding
+        )
+        expected_extra = build_rev_inventory_v1_seed_extra(
+            expected_binding,
+            expected_snapshot,
+        )
+        expected_command = rev_inventory_v1_seed_command(
+            str(expected_binding["path"])
+        )
+    except RevInventoryV1ContractError:
+        return [f"{label} has an invalid historical seed contract"]
+    allowed_extra = {
+        *expected_extra,
+        "cancelled_at",
+        "cancelled_reason",
+        "orphan_recovered_at",
+        "orphan_recovery",
+    }
+    errors: list[str] = []
+    if (
+        dict(source_binding) != expected_binding
+        or dict(source_snapshot) != expected_snapshot
+        or experiment.id
+        != _rev_inventory_seed_id(
+            str(expected_extra["adapter_spec_id"])
+        )
+        or experiment.kind is not ExperimentKind.PROBE
+        or experiment.hypothesis_ids
+        or experiment.command != expected_command
+        or set(experiment.extra) - allowed_extra
+        or any(
+            experiment.extra.get(key) != value
+            for key, value in expected_extra.items()
+        )
+    ):
+        errors.append(f"{label} internal identity is inconsistent")
+    return errors
+
+
+def _rev_inventory_contract_marker(
+    value: object,
+) -> tuple[str, int, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    oracle_id = value.get("oracle_id")
+    oracle_version = value.get("oracle_version")
+    fingerprint = value.get("contract_fingerprint")
+    if (
+        type(oracle_id) is str
+        and type(oracle_version) is int
+        and type(fingerprint) is str
+    ):
+        return oracle_id, oracle_version, fingerprint
+    result = value.get("result")
+    if isinstance(result, Mapping):
+        oracle_id = result.get("oracle_id")
+        oracle_version = result.get("oracle_version")
+        fingerprint = result.get("contract_fingerprint")
+        if (
+            type(oracle_id) is str
+            and type(oracle_version) is int
+            and type(fingerprint) is str
+        ):
+            return oracle_id, oracle_version, fingerprint
+    return None
+
+
+def _has_rev_inventory_v2_outcome_marker(value: object) -> bool:
+    marker = _rev_inventory_contract_marker(value)
+    if marker is None:
+        return False
+    contract = resolve_rev_inventory_contract(*marker)
+    return contract is not None and (
+        contract.oracle_version == REV_INVENTORY_V2_CONTRACT_VERSION
+    )
+
+
+def _has_rev_inventory_outcome_marker(value: object) -> bool:
+    """Compatibility name used by structural linearity tests."""
+
+    return _has_rev_inventory_v2_outcome_marker(value)
+
+
+def _has_rev_inventory_v1_outcome_marker(value: object) -> bool:
+    marker = _rev_inventory_contract_marker(value)
+    if marker is None:
+        return False
+    contract = resolve_rev_inventory_contract(*marker)
+    return contract is not None and (
+        contract.oracle_version == REV_INVENTORY_V1_CONTRACT_VERSION
+    )
+
+
+def _has_rev_inventory_oracle_id_marker(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("oracle_id") == _REV_INVENTORY_ORACLE_ID:
+        return True
+    result = value.get("result")
+    return (
+        isinstance(result, Mapping)
+        and result.get("oracle_id") == _REV_INVENTORY_ORACLE_ID
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RevInventoryLinkIndex:
+    linked_run_ids_by_experiment: Mapping[str, frozenset[str]]
+    marked_run_or_receipt_experiment_ids: frozenset[str]
+    marked_fact_ids: frozenset[str]
+    marked_fact_source_run_ids: frozenset[str]
+    oracle_copy_fact_source_run_ids: frozenset[str]
+    oracle_copy_experiment_ids: frozenset[str]
+
+
+def _rev_inventory_link_index(
+    state: "ChallengeState",
+) -> _RevInventoryLinkIndex:
+    """Index Rev outcome markers and links in one pass per collection."""
+
+    linked_run_ids: dict[str, set[str]] = {}
+    marked_run_or_receipt_experiment_ids: set[str] = set()
+    oracle_copy_experiment_ids: set[str] = set()
+
+    for run in state.runs:
+        outcome = run.extra.get("partial_oracle_result")
+        binding = (
+            outcome.get("execution_binding")
+            if isinstance(outcome, Mapping)
+            else None
+        )
+        experiment_binding = (
+            binding.get("experiment")
+            if isinstance(binding, Mapping)
+            else None
+        )
+        linked_experiment_ids = {
+            value
+            for value in (
+                run.extra.get("experiment_id"),
+                (
+                    experiment_binding.get("id")
+                    if isinstance(experiment_binding, Mapping)
+                    else None
+                ),
+            )
+            if isinstance(value, str)
+        }
+        for experiment_id in linked_experiment_ids:
+            linked_run_ids.setdefault(experiment_id, set()).add(run.id)
+            if _has_rev_inventory_outcome_marker(outcome):
+                marked_run_or_receipt_experiment_ids.add(
+                    experiment_id
+                )
+        direct_experiment_id = run.extra.get("experiment_id")
+        if (
+            isinstance(direct_experiment_id, str)
+            and outcome is not None
+        ):
+            oracle_copy_experiment_ids.add(direct_experiment_id)
+
+    for receipt in state.receipts:
+        experiment_id = receipt.experiment_id
+        linked_run_ids.setdefault(experiment_id, set()).add(
+            receipt.run_id
+        )
+        outcome = receipt.extra.get("partial_oracle_result")
+        if _has_rev_inventory_outcome_marker(outcome):
+            marked_run_or_receipt_experiment_ids.add(experiment_id)
+        if outcome is not None:
+            oracle_copy_experiment_ids.add(experiment_id)
+
+    marked_fact_ids: set[str] = set()
+    marked_fact_source_run_ids: set[str] = set()
+    oracle_copy_fact_source_run_ids: set[str] = set()
+    for fact in state.facts:
+        outcome = fact.extra.get("partial_oracle_result")
+        if outcome is not None and isinstance(fact.source_run_id, str):
+            oracle_copy_fact_source_run_ids.add(fact.source_run_id)
+        if not _has_rev_inventory_outcome_marker(outcome):
+            continue
+        marked_fact_ids.add(fact.id)
+        if isinstance(fact.source_run_id, str):
+            marked_fact_source_run_ids.add(fact.source_run_id)
+
+    return _RevInventoryLinkIndex(
+        linked_run_ids_by_experiment={
+            experiment_id: frozenset(run_ids)
+            for experiment_id, run_ids in linked_run_ids.items()
+        },
+        marked_run_or_receipt_experiment_ids=frozenset(
+            marked_run_or_receipt_experiment_ids
+        ),
+        marked_fact_ids=frozenset(marked_fact_ids),
+        marked_fact_source_run_ids=frozenset(
+            marked_fact_source_run_ids
+        ),
+        oracle_copy_fact_source_run_ids=frozenset(
+            oracle_copy_fact_source_run_ids
+        ),
+        oracle_copy_experiment_ids=frozenset(
+            oracle_copy_experiment_ids
+        ),
+    )
+
+
+def _rev_inventory_state_errors(
+    state: "ChallengeState",
+    *,
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+) -> list[str]:
+    errors: list[str] = []
+    link_index = _rev_inventory_link_index(state)
+
+    for experiment in state.experiments:
+        descriptor = experiment.extra.get("partial_oracle")
+        has_generic_adapter_identity = (
+            experiment.extra.get("adapter_seed") is True
+            and experiment.extra.get("adapter_name") == "reversing"
+            and experiment.extra.get("adapter_spec_template_id")
+            == REV_INVENTORY_V2_SEED_TEMPLATE_ID
+        )
+        has_v1_seed_identity = _rev_inventory_seed_identity(
+            experiment,
+            version=REV_INVENTORY_V1_CONTRACT_VERSION,
+        )
+        has_v2_seed_identity = _rev_inventory_seed_identity(
+            experiment,
+            version=REV_INVENTORY_V2_CONTRACT_VERSION,
+        )
+        descriptor_contract = (
+            resolve_rev_inventory_contract(
+                descriptor.get("oracle_id"),
+                descriptor.get("oracle_version"),
+                descriptor.get("contract_fingerprint"),
+            )
+            if isinstance(descriptor, Mapping)
+            else None
+        )
+        descriptor_is_v1 = descriptor_contract is not None and (
+            descriptor_contract.oracle_version
+            == REV_INVENTORY_V1_CONTRACT_VERSION
+        )
+        descriptor_is_v2 = descriptor_contract is not None and (
+            descriptor_contract.oracle_version
+            == REV_INVENTORY_V2_CONTRACT_VERSION
+        )
+        descriptor_marks_rev_inventory_id = (
+            isinstance(descriptor, Mapping)
+            and descriptor.get("oracle_id") == _REV_INVENTORY_ORACLE_ID
+        )
+        experiment_outcome = (
+            experiment.result.get("partial_oracle")
+            if isinstance(experiment.result, Mapping)
+            else None
+        )
+        linked_run_ids = link_index.linked_run_ids_by_experiment.get(
+            experiment.id,
+            frozenset(),
+        )
+        linked_outcome_marks_rev_inventory = (
+            _has_rev_inventory_outcome_marker(experiment_outcome)
+            or experiment.id
+            in link_index.marked_run_or_receipt_experiment_ids
+            or any(
+                fact_id in link_index.marked_fact_ids
+                for fact_id in experiment.evidence_fact_ids
+            )
+            or not linked_run_ids.isdisjoint(
+                link_index.marked_fact_source_run_ids
+            )
+        )
+        linked_has_oracle_copy = (
+            experiment.id in link_index.oracle_copy_experiment_ids
+            or not linked_run_ids.isdisjoint(
+                link_index.oracle_copy_fact_source_run_ids
+            )
+        )
+        is_legacy_v1 = (
+            (has_v1_seed_identity or descriptor_is_v1)
+            and not has_v2_seed_identity
+            and not descriptor_is_v2
+            and not linked_outcome_marks_rev_inventory
+        )
+        if is_legacy_v1:
+            label = f"legacy Rev inventory experiment {experiment.id}"
+            if isinstance(descriptor, Mapping):
+                errors.extend(
+                    _rev_inventory_legacy_v1_seed_errors(
+                        experiment,
+                        descriptor=descriptor,
+                    )
+                )
+            else:
+                errors.append(f"{label} lacks its v1 oracle descriptor")
+            if (
+                (
+                    isinstance(experiment.result, Mapping)
+                    and "partial_oracle" in experiment.result
+                )
+                or linked_has_oracle_copy
+            ):
+                errors.append(
+                    f"{label} cannot contain a typed oracle outcome or Fact"
+                )
+            continue
+        if not (
+            has_generic_adapter_identity
+            or has_v2_seed_identity
+            or descriptor_marks_rev_inventory_id
+            or linked_outcome_marks_rev_inventory
+        ):
+            continue
+        expected_descriptor = rev_inventory_v2_oracle_descriptor()
+        if not (has_v2_seed_identity or descriptor_is_v2):
+            errors.append(
+                f"Rev inventory experiment {experiment.id} has an "
+                "invalid v2 deterministic seed identity"
+            )
+        if descriptor != expected_descriptor:
+            errors.append(
+                f"Rev inventory experiment {experiment.id} has an "
+                "invalid oracle descriptor"
+            )
+        if experiment.status in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            if experiment.result is not None:
+                errors.append(
+                    f"Rev inventory experiment {experiment.id} has a "
+                    "premature result"
+                )
+            if isinstance(descriptor, Mapping):
+                errors.extend(
+                    _rev_inventory_v2_active_seed_errors(
+                        state,
+                        experiment,
+                        descriptor=descriptor,
+                    )
+                )
+            continue
+        label = f"Rev inventory experiment {experiment.id}"
+        if (
+            not isinstance(experiment.result, Mapping)
+            or "partial_oracle" not in experiment.result
+        ):
+            has_oracle_copy = (
+                experiment.id
+                in link_index.oracle_copy_experiment_ids
+            )
+            if (
+                experiment.status
+                not in {
+                    ExperimentStatus.CANCELLED,
+                    ExperimentStatus.FAILED,
+                }
+                or has_oracle_copy
+            ):
+                errors.append(
+                    f"{label} lacks its canonical oracle outcome"
+                )
+            continue
+        try:
+            experiment_result = _rev_inventory_exact_mapping(
+                experiment.result,
+                {
+                    "exit_code",
+                    "partial_oracle",
+                    "receipt_id",
+                    "run_id",
+                    "timed_out",
+                },
+                f"{label} result",
+            )
+            outcome = _validate_rev_inventory_v2_outcome_shape(
+                experiment_result["partial_oracle"],
+                label=f"{label} outcome",
+            )
+            run_id = experiment_result["run_id"]
+            receipt_id = experiment_result["receipt_id"]
+            if not isinstance(run_id, str) or not isinstance(
+                receipt_id,
+                str,
+            ):
+                raise ModelValidationError(
+                    f"{label} has invalid run/receipt ids"
+                )
+            run = runs.get(run_id)
+            receipt = receipts.get(receipt_id)
+            if (
+                run is None
+                or receipt is None
+                or receipt.run_id != run_id
+                or receipt.experiment_id != experiment.id
+            ):
+                raise ModelValidationError(
+                    f"{label} has an invalid run/receipt chain"
+                )
+            run_outcome = run.extra.get("partial_oracle_result")
+            receipt_outcome = receipt.extra.get(
+                "partial_oracle_result"
+            )
+            if run_outcome != outcome or receipt_outcome != outcome:
+                raise ModelValidationError(
+                    f"{label} outcome copies do not match"
+                )
+            binding = outcome["execution_binding"]
+            stdout_binding = binding["stdout_artifact"]
+            stdout_artifact = artifacts.get(stdout_binding["id"])
+            experiment_binding = binding["experiment"]
+            source_binding = binding["source_binding"]
+            source_snapshot = binding["source_snapshot"]
+            snapshot_execution = binding[
+                "source_snapshot_execution_binding"
+            ]
+            if (
+                run.extra.get("experiment_id") != experiment.id
+                or binding["experiment"]["id"] != experiment.id
+                or binding["experiment"]["resource_class"]
+                != experiment.resource_class
+                or any(
+                    experiment_binding.get(key)
+                    != experiment.extra.get(key)
+                    for key in (
+                        "adapter_name",
+                        "adapter_seed",
+                        "adapter_seed_contract_version",
+                        "adapter_seed_order",
+                        "adapter_spec_id",
+                        "adapter_spec_sha256",
+                        "adapter_spec_template_id",
+                        "requires_explicit_execution",
+                    )
+                )
+                or any(
+                    run.extra.get(key) != experiment.extra.get(key)
+                    for key in (
+                        "adapter_name",
+                        "adapter_seed",
+                        "adapter_seed_contract_version",
+                        "adapter_seed_order",
+                        "adapter_spec_id",
+                        "adapter_spec_sha256",
+                        "adapter_spec_template_id",
+                        "partial_oracle",
+                        "requires_explicit_execution",
+                        "source_binding",
+                        "source_snapshot",
+                    )
+                )
+                or binding["base_revision"] != run.base_revision
+                or binding["configuration_epoch"]
+                != run.configuration_epoch
+                or binding["request"]["path"] != run.request_path
+                or binding["source_binding"]
+                != experiment.extra.get("source_binding")
+                or binding["source_snapshot"]
+                != experiment.extra.get("source_snapshot")
+                or binding["oracle"] != descriptor
+                or binding["source_snapshot_execution_binding"]
+                != run.extra.get(
+                    "source_snapshot_execution_binding"
+                )
+                or not isinstance(source_binding, Mapping)
+                or set(source_binding)
+                != {
+                    "manifest_generation",
+                    "manifest_sha256",
+                    "path",
+                    "sha256",
+                    "size_bytes",
+                }
+                or not isinstance(source_snapshot, Mapping)
+                or set(source_snapshot)
+                != {
+                    "binding_sha256",
+                    "challenge_dir",
+                    "directory_mode",
+                    "file_mode",
+                    "id",
+                    "mount_requirement",
+                    "publish",
+                    "sha256",
+                    "size_bytes",
+                    "source_locator",
+                    "tree_contract",
+                }
+                or source_snapshot.get("id")
+                != snapshot_execution.get("snapshot_id")
+                or source_snapshot.get("source_locator")
+                != source_binding.get("path")
+                or source_snapshot.get("sha256")
+                != source_binding.get("sha256")
+                or source_snapshot.get("size_bytes")
+                != source_binding.get("size_bytes")
+                or not isinstance(experiment.command, str)
+                or binding["argv"] != shlex.split(experiment.command)
+                or stdout_artifact is None
+                or stdout_artifact.source_run_id != run.id
+                or stdout_artifact.path != stdout_binding["path"]
+                or stdout_artifact.sha256 != stdout_binding["sha256"]
+                or stdout_artifact.size != stdout_binding["size"]
+                or receipt.stdout_artifact_id != stdout_artifact.id
+                or outcome["stdout_artifact_id"] != stdout_artifact.id
+                or stdout_artifact.id not in experiment.artifact_ids
+            ):
+                raise ModelValidationError(
+                    f"{label} exact execution binding is inconsistent"
+                )
+            transport_succeeded = outcome["transport_succeeded"]
+            if (
+                type(experiment_result["timed_out"]) is not bool
+                or experiment_result["exit_code"] != receipt.exit_code
+                or (
+                    transport_succeeded
+                    and (
+                        experiment_result["exit_code"] != 0
+                        or experiment_result["timed_out"] is not False
+                    )
+                )
+            ):
+                raise ModelValidationError(
+                    f"{label} result/receipt transport mismatch"
+                )
+            if transport_succeeded:
+                if (
+                    run.status is not RunStatus.COMPLETED
+                    or receipt.outcome is not ReceiptOutcome.SUCCEEDED
+                ):
+                    raise ModelValidationError(
+                        f"{label} transport/run/receipt mismatch"
+                    )
+            else:
+                expected_run_status = (
+                    RunStatus.TIMED_OUT
+                    if experiment_result["timed_out"] is True
+                    else RunStatus.FAILED
+                )
+                expected_receipt_outcome = (
+                    ReceiptOutcome.TIMED_OUT
+                    if experiment_result["timed_out"] is True
+                    else ReceiptOutcome.FAILED
+                )
+                if (
+                    run.status is not expected_run_status
+                    or receipt.outcome is not expected_receipt_outcome
+                ):
+                    raise ModelValidationError(
+                        f"{label} failed transport status mismatch"
+                    )
+
+            semantic = outcome["result"]
+            verdict = (
+                semantic["verdict"]
+                if isinstance(semantic, Mapping)
+                else None
+            )
+            fact_required = verdict in {
+                "CONFIRMED",
+                "INCONCLUSIVE",
+                "NOT_APPLICABLE",
+            }
+            expected_status = (
+                ExperimentStatus.COMPLETED
+                if verdict == "CONFIRMED"
+                else ExperimentStatus.INCONCLUSIVE
+                if fact_required
+                else ExperimentStatus.FAILED
+            )
+            if experiment.status is not expected_status:
+                raise ModelValidationError(
+                    f"{label} verdict/status mismatch"
+                )
+            expected_fact_id = f"F-{run.id}-rev-inventory"
+            if fact_required:
+                if experiment.evidence_fact_ids != [expected_fact_id]:
+                    raise ModelValidationError(
+                        f"{label} lacks its deterministic Fact"
+                    )
+                fact = facts.get(expected_fact_id)
+                if (
+                    fact is None
+                    or fact.provenance is not Provenance.EXECUTED
+                    or fact.source_run_id != run.id
+                    or fact.artifact_id != stdout_artifact.id
+                    or fact.locator != stdout_artifact.path
+                    or fact.extra.get("partial_oracle_result")
+                    != outcome
+                    or fact.extra.get("receipt_id") != receipt.id
+                ):
+                    raise ModelValidationError(
+                        f"{label} has an invalid oracle Fact chain"
+                    )
+            elif (
+                experiment.evidence_fact_ids
+                or run.id
+                in link_index.oracle_copy_fact_source_run_ids
+            ):
+                raise ModelValidationError(
+                    f"{label} error/rejection cannot create a Fact"
+                )
+            if (
+                experiment.evidence_run_ids != [run.id]
+                or experiment.evidence_receipt_ids != [receipt.id]
+            ):
+                raise ModelValidationError(
+                    f"{label} evidence links are not exact"
+                )
+            if experiment.status in {
+                ExperimentStatus.FAILED,
+                ExperimentStatus.INCONCLUSIVE,
+            }:
+                semantic_reason = (
+                    (
+                        f"{semantic['verdict']}/"
+                        f"{semantic['reason_code']}"
+                    )
+                    if isinstance(semantic, Mapping)
+                    else (
+                        outcome["rejection_code"]
+                        or "no_semantic_result"
+                    )
+                )
+                expected_reason = (
+                    "rev_inventory:"
+                    f"{outcome['evaluation_status']}:"
+                    f"{semantic_reason}"
+                )[:512]
+                if (
+                    experiment.evaluation_reason != expected_reason
+                    or experiment.evaluated_at
+                    != outcome["evaluated_at"]
+                ):
+                    raise ModelValidationError(
+                        f"{label} has an invalid semantic "
+                        "reason/timestamp"
+                    )
+            elif (
+                experiment.evaluation_reason is not None
+                or experiment.evaluated_at is not None
+            ):
+                raise ModelValidationError(
+                    f"{label} confirmed result retains negative "
+                    "evaluation metadata"
+                )
+        except (
+            KeyError,
+            ModelValidationError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} is invalid: {error}")
+    return errors
+
+
 @dataclass
 class ChallengeState:
     contest_id: str
@@ -4832,6 +6190,16 @@ class ChallengeState:
                         f"workspace publish {publish.id} has invalid revision"
                     )
 
+        if self.schema_version >= STATE_SCHEMA_VERSION:
+            errors.extend(
+                _rev_inventory_state_errors(
+                    self,
+                    runs=runs,
+                    receipts=receipts,
+                    artifacts=artifacts,
+                    facts=facts,
+                )
+            )
         if errors:
             raise ModelValidationError("; ".join(errors))
 

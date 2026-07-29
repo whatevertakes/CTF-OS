@@ -53,6 +53,34 @@ from ctf_os.codex import (
 )
 from ctf_os.codex.limiter import ModelCallLimitCancelled
 from ctf_os.config import EngineConfig, load_config
+from ctf_os.contracts.rev_inventory_v1 import (
+    REV_INVENTORY_V1_ADAPTER_SEED_CONTRACT_VERSION,
+    rev_inventory_v1_oracle_descriptor,
+)
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_ADAPTER_SEED_CONTRACT_VERSION,
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V2_CONTRACT_ID,
+    REV_INVENTORY_V2_CONTRACT_VERSION,
+    REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+    REV_INVENTORY_V2_SEED_REQUIRES_EXPLICIT_EXECUTION,
+    REV_INVENTORY_V2_SEED_TEMPLATE_ID,
+    REV_INVENTORY_V2_SNAPSHOT_DIRECTORY_MODE,
+    REV_INVENTORY_V2_SNAPSHOT_FILE_MODE,
+    RevInventoryV2ContractError,
+    RevInventoryV2Result,
+    RevInventoryV2Verdict,
+    build_rev_inventory_v2_seed_extra,
+    build_rev_inventory_v2_seed_spec_descriptor,
+    build_rev_inventory_v2_source_binding,
+    build_rev_inventory_v2_source_snapshot,
+    evaluate_rev_inventory_v2,
+    evaluate_rev_inventory_v2_artifact_size,
+    rev_inventory_v2_oracle_descriptor,
+    rev_inventory_v2_seed_argv,
+    rev_inventory_v2_seed_spec_sha256,
+)
 from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceLimits, tool_profile
 from ctf_os.engine.context_archive import archive_context_pack
@@ -69,13 +97,6 @@ from ctf_os.engine.proof import (
     ProofResult,
     evaluate_proof,
     write_proof_result,
-)
-from ctf_os.engine.partial_oracle import (
-    REV_INVENTORY_CONTRACT_FINGERPRINT,
-    REV_INVENTORY_CONTRACT_ID,
-    REV_INVENTORY_CONTRACT_VERSION,
-    REV_INVENTORY_DOCUMENT_TRANSPORT,
-    REV_INVENTORY_MAX_SOURCE_BYTES,
 )
 from ctf_os.engine.receipt_summary import (
     ReceiptSummaryError,
@@ -138,6 +159,7 @@ from ctf_os.models import (
 )
 from ctf_os.schema import (
     MANAGED_ROLE_RESULT_SCHEMA_VERSION,
+    RUN_ENVELOPE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION,
     WORKER_RESULT_SCHEMA_VERSION,
 )
@@ -160,10 +182,12 @@ from ctf_os.sandbox import (
     NetworkTarget,
     ProofInput,
     SandboxError,
+    SandboxResult,
     ensure_foreground_command,
 )
 from ctf_os.sandbox.files import (
     DEFAULT_SNAPSHOT_MAX_BYTES,
+    DEFAULT_STREAM_CAPTURE_MAX_BYTES,
     ImmutableFile,
     SafeFileError,
     copy_bounded_regular,
@@ -177,6 +201,7 @@ from ctf_os.store import (
     ChallengeLock,
     LockTimeout,
     RevisionConflict,
+    RunPaths,
     StateStore,
     WorkerResultValidationError,
     sha256_file,
@@ -895,12 +920,67 @@ _ADAPTER_SEED_RUN_METADATA_KEYS = (
     "source_binding",
     "source_snapshot",
 )
-_REV_ADAPTER_SEED_CONTRACT_VERSION = 1
-_REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = True
-_REV_SOURCE_SNAPSHOT_TREE_CONTRACT = "exact-single-primary-v1"
-_REV_SOURCE_SNAPSHOT_FILE_MODE = 0o500
-_REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = 0o500
-_REV_SOURCE_SNAPSHOT_PUBLISH = "staged-atomic-no-repair-v1"
+_REV_ADAPTER_SEED_CONTRACT_VERSION = (
+    REV_INVENTORY_V2_ADAPTER_SEED_CONTRACT_VERSION
+)
+_REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = (
+    REV_INVENTORY_V2_SEED_REQUIRES_EXPLICIT_EXECUTION
+)
+_REV_SOURCE_SNAPSHOT_FILE_MODE = REV_INVENTORY_V2_SNAPSHOT_FILE_MODE
+_REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = (
+    REV_INVENTORY_V2_SNAPSHOT_DIRECTORY_MODE
+)
+_REV_INVENTORY_TEMPLATE_ID = REV_INVENTORY_V2_SEED_TEMPLATE_ID
+_REV_INVENTORY_STATE_RESULT_SCHEMA_VERSION = 2
+_REV_INVENTORY_REQUEST_MAX_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _RevInventoryOracleOutcome:
+    """Transport-independent, durable result of Rev inventory evaluation."""
+
+    transport_succeeded: bool
+    evaluation_status: str
+    rejection_code: str | None
+    result: RevInventoryV2Result | None
+    request_sha256: str | None
+    image_reference: str | None
+    stdout_artifact_id: str | None
+    source_binding: dict[str, Any] | None
+    execution_binding: dict[str, Any]
+    evaluated_at: str | None
+
+    def rejected(self, code: str) -> "_RevInventoryOracleOutcome":
+        return replace(
+            self,
+            evaluation_status="rejected",
+            rejection_code=code,
+            result=None,
+            evaluated_at=utc_now(),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": (
+                _REV_INVENTORY_STATE_RESULT_SCHEMA_VERSION
+            ),
+            "transport_succeeded": self.transport_succeeded,
+            "evaluation_status": self.evaluation_status,
+            "rejection_code": self.rejection_code,
+            "result": (
+                self.result.to_dict()
+                if self.result is not None
+                else None
+            ),
+            "request_sha256": self.request_sha256,
+            "image_reference": self.image_reference,
+            "stdout_artifact_id": self.stdout_artifact_id,
+            "source_binding": copy.deepcopy(self.source_binding),
+            "execution_binding": copy.deepcopy(
+                self.execution_binding
+            ),
+            "evaluated_at": self.evaluated_at,
+        }
 
 
 def _adapter_seed_run_metadata(
@@ -1631,45 +1711,28 @@ class ChallengeEngine:
             )
         manifest_generation = len(manifest_history) + 1
 
-        source_binding: dict[str, Any] = {
-            "manifest_generation": manifest_generation,
-            "manifest_sha256": manifest,
-            "path": primary_source.path,
-            "sha256": primary_source.sha256,
-            "size_bytes": primary_source.size,
-        }
-        snapshot_contract = {
-            "directory_mode": _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
-            "file_mode": _REV_SOURCE_SNAPSHOT_FILE_MODE,
-            "mount_requirement": "challenge_read_only",
-            "publish": _REV_SOURCE_SNAPSHOT_PUBLISH,
-            "tree_contract": _REV_SOURCE_SNAPSHOT_TREE_CONTRACT,
-        }
-        binding_sha256 = hashlib.sha256(
-            json.dumps(
-                {
-                    "source_binding": source_binding,
-                    "snapshot_contract": snapshot_contract,
-                },
-                allow_nan=False,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("ascii")
-        ).hexdigest()
-        source_snapshot = {
-            "binding_sha256": binding_sha256,
-            "challenge_dir": (
-                "runtime/source-snapshots/"
-                f"rev-primary-{binding_sha256}/challenge"
-            ),
-            **snapshot_contract,
-            "id": f"rev-primary-{binding_sha256}",
-            "sha256": primary_source.sha256,
-            "size_bytes": primary_source.size,
-            "source_locator": primary_source.path,
-        }
-        primary = f"/challenge/{primary_source.path}"
+        if primary_source.size > REV_INVENTORY_V2_MAX_SOURCE_BYTES:
+            # Historical v1 seed state did not bind its seed planner to the
+            # producer's 1 GiB parser limit.  Preserve that state, but produce
+            # no runnable v2 plan for an input outside the v2 contract.
+            return primary_source, ()
+
+        try:
+            source_binding = build_rev_inventory_v2_source_binding(
+                manifest_generation=manifest_generation,
+                manifest_sha256=manifest,
+                path=primary_source.path,
+                source_sha256=primary_source.sha256,
+                source_size_bytes=primary_source.size,
+            )
+            source_snapshot = build_rev_inventory_v2_source_snapshot(
+                source_binding
+            )
+        except RevInventoryV2ContractError as error:
+            raise EngineError(
+                "Rev adapter primary source cannot satisfy its immutable "
+                "seed contract"
+            ) from error
         plan: list[
             tuple[Any, str, tuple[str, ...], dict[str, Any]]
         ] = []
@@ -1679,81 +1742,118 @@ class ChallengeEngine:
             if str(spec.id) != "decompiler_observation"
         )
         for ordinal, spec in enumerate(managed_specs):
-            partial_oracle = (
-                {
-                    "oracle_id": REV_INVENTORY_CONTRACT_ID,
-                    "oracle_version": REV_INVENTORY_CONTRACT_VERSION,
-                    "contract_fingerprint": (
-                        REV_INVENTORY_CONTRACT_FINGERPRINT
-                    ),
-                    "document_transport": (
-                        REV_INVENTORY_DOCUMENT_TRANSPORT
-                    ),
-                }
-                if str(spec.id) == "inventory_observation"
-                else None
+            is_inventory = (
+                str(spec.id) == REV_INVENTORY_V2_SEED_TEMPLATE_ID
             )
-            spec_descriptor = {
-                "adapter": str(adapter.name),
-                "adapter_seed": True,
-                "adapter_seed_contract_version": (
-                    _REV_ADAPTER_SEED_CONTRACT_VERSION
-                ),
-                "adapter_seed_order": ordinal,
-                "command_template": list(spec.command_template),
-                "drop_condition": str(spec.drop_condition),
-                "expected_observation": str(spec.expected_observation),
-                "keep_condition": str(spec.keep_condition),
-                "oracle": partial_oracle,
-                "purpose": str(spec.purpose),
-                "requires_explicit_execution": (
-                    _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
-                ),
-                "requires_network": bool(spec.requires_network),
-                "resource_class": str(spec.resource_class),
-                "source_binding": source_binding,
-                "source_snapshot": source_snapshot,
-                "template_spec_id": str(spec.id),
-                "timeout_s": int(spec.timeout_s),
-            }
-            spec_sha256 = hashlib.sha256(
-                json.dumps(
-                    spec_descriptor,
-                    allow_nan=False,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("ascii")
-            ).hexdigest()
-            bound_spec_id = f"{spec.id}@{spec_sha256}"
+            if is_inventory:
+                try:
+                    spec_descriptor = (
+                        build_rev_inventory_v2_seed_spec_descriptor(
+                            source_binding,
+                            source_snapshot,
+                        )
+                    )
+                    spec_sha256 = rev_inventory_v2_seed_spec_sha256(
+                        source_binding,
+                        source_snapshot,
+                    )
+                    extra = build_rev_inventory_v2_seed_extra(
+                        source_binding,
+                        source_snapshot,
+                    )
+                    argv = rev_inventory_v2_seed_argv(
+                        primary_source.path
+                    )
+                except RevInventoryV2ContractError as error:
+                    raise EngineError(
+                        "Rev inventory seed contract could not be built"
+                    ) from error
+                adapter_descriptor = {
+                    "command_template": list(spec.command_template),
+                    "drop_condition": str(spec.drop_condition),
+                    "expected_observation": str(
+                        spec.expected_observation
+                    ),
+                    "keep_condition": str(spec.keep_condition),
+                    "purpose": str(spec.purpose),
+                    "requires_network": bool(spec.requires_network),
+                    "resource_class": str(spec.resource_class),
+                    "template_spec_id": str(spec.id),
+                    "timeout_s": int(spec.timeout_s),
+                }
+                if any(
+                    spec_descriptor[key] != value
+                    for key, value in adapter_descriptor.items()
+                ):
+                    raise EngineError(
+                        "reversing adapter inventory seed drifted from "
+                        "the immutable v2 contract"
+                    )
+                bound_spec_id = str(extra["adapter_spec_id"])
+            else:
+                partial_oracle = None
+                spec_descriptor = {
+                    "adapter": str(adapter.name),
+                    "adapter_seed": True,
+                    "adapter_seed_contract_version": (
+                        _REV_ADAPTER_SEED_CONTRACT_VERSION
+                    ),
+                    "adapter_seed_order": ordinal,
+                    "command_template": list(spec.command_template),
+                    "drop_condition": str(spec.drop_condition),
+                    "expected_observation": str(
+                        spec.expected_observation
+                    ),
+                    "keep_condition": str(spec.keep_condition),
+                    "oracle": partial_oracle,
+                    "purpose": str(spec.purpose),
+                    "requires_explicit_execution": (
+                        _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
+                    ),
+                    "requires_network": bool(spec.requires_network),
+                    "resource_class": str(spec.resource_class),
+                    "source_binding": source_binding,
+                    "source_snapshot": source_snapshot,
+                    "template_spec_id": str(spec.id),
+                    "timeout_s": int(spec.timeout_s),
+                }
+                spec_sha256 = hashlib.sha256(
+                    json.dumps(
+                        spec_descriptor,
+                        allow_nan=False,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                ).hexdigest()
+                bound_spec_id = f"{spec.id}@{spec_sha256}"
+                primary = f"/challenge/{primary_source.path}"
+                argv = tuple(
+                    argument.replace("{primary}", primary)
+                    for argument in spec.command_template
+                )
+                extra = {
+                    "adapter_name": str(adapter.name),
+                    "adapter_seed": True,
+                    "adapter_seed_contract_version": (
+                        _REV_ADAPTER_SEED_CONTRACT_VERSION
+                    ),
+                    "adapter_seed_order": ordinal,
+                    "adapter_spec_id": bound_spec_id,
+                    "adapter_spec_sha256": spec_sha256,
+                    "adapter_spec_template_id": str(spec.id),
+                    "purpose": spec.purpose,
+                    "requires_explicit_execution": (
+                        _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
+                    ),
+                    "source_binding": copy.deepcopy(source_binding),
+                    "source_snapshot": copy.deepcopy(source_snapshot),
+                }
             experiment_id = _record_id(
                 "E-adapter",
                 str(adapter.name),
                 bound_spec_id,
             )
-            argv = tuple(
-                argument.replace("{primary}", primary)
-                for argument in spec.command_template
-            )
-            extra: dict[str, Any] = {
-                "adapter_name": str(adapter.name),
-                "adapter_seed": True,
-                "adapter_seed_contract_version": (
-                    _REV_ADAPTER_SEED_CONTRACT_VERSION
-                ),
-                "adapter_seed_order": ordinal,
-                "adapter_spec_id": bound_spec_id,
-                "adapter_spec_sha256": spec_sha256,
-                "adapter_spec_template_id": str(spec.id),
-                "purpose": spec.purpose,
-                "requires_explicit_execution": (
-                    _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
-                ),
-                "source_binding": copy.deepcopy(source_binding),
-                "source_snapshot": copy.deepcopy(source_snapshot),
-            }
-            if partial_oracle is not None:
-                extra["partial_oracle"] = partial_oracle
             plan.append((spec, experiment_id, argv, extra))
         return primary_source, tuple(plan)
 
@@ -1766,6 +1866,48 @@ class ChallengeEngine:
             tuple[Any, str, tuple[str, ...], Mapping[str, Any]]
         ],
     ) -> bool:
+        def registered_seed_matches(
+            experiment: Experiment,
+            spec: Any,
+            experiment_id: str,
+            argv: Sequence[str],
+            extra: Mapping[str, Any],
+        ) -> bool:
+            allowed_extra = {
+                *extra,
+                "orphan_recovered_at",
+                "orphan_recovery",
+            }
+            return (
+                experiment.id == experiment_id
+                and experiment.status is ExperimentStatus.REGISTERED
+                and (
+                    state.schema_version < STATE_SCHEMA_VERSION
+                    or experiment.kind is ExperimentKind.PROBE
+                )
+                and not experiment.hypothesis_ids
+                and experiment.command == shlex.join(argv)
+                and experiment.expected_observation
+                == spec.expected_observation
+                and experiment.keep_if == spec.keep_condition
+                and experiment.drop_if == spec.drop_condition
+                and experiment.resource_class == spec.resource_class
+                and experiment.result is None
+                and experiment.source_run_id is None
+                and not experiment.artifact_ids
+                and not experiment.evidence_fact_ids
+                and not experiment.evidence_run_ids
+                and not experiment.evidence_receipt_ids
+                and experiment.evaluation_reason is None
+                and experiment.evaluated_at is None
+                and experiment.proof_recipe is None
+                and set(experiment.extra).issubset(allowed_extra)
+                and all(
+                    experiment.extra.get(key) == value
+                    for key, value in extra.items()
+                )
+            )
+
         desired_ids = {item[1] for item in plan}
         existing_ids = {item.id for item in state.experiments}
         if state.metadata.get("adapter_name") != str(adapter.name):
@@ -1780,19 +1922,39 @@ class ChallengeEngine:
             if "adapter_seed_source_binding" in state.metadata:
                 return True
         else:
-            expected_binding = plan[0][3]["source_binding"]
-            if (
-                state.metadata.get("adapter_primary_source")
-                != primary_source.path
-                or state.metadata.get("adapter_seed_source_binding")
-                != expected_binding
+            if state.metadata.get("adapter_primary_source") != (
+                primary_source.path
             ):
                 return True
+            if not plan:
+                if "adapter_seed_source_binding" in state.metadata:
+                    return True
+            else:
+                expected_binding = plan[0][3]["source_binding"]
+                if (
+                    state.metadata.get("adapter_seed_source_binding")
+                    != expected_binding
+                ):
+                    return True
         if any(
             item.extra.get("adapter_seed") is True
             and item.status is ExperimentStatus.REGISTERED
             and item.id not in desired_ids
             for item in state.experiments
+        ):
+            return True
+        by_id = {item.id: item for item in state.experiments}
+        if any(
+            item[1] in by_id
+            and by_id[item[1]].status is ExperimentStatus.REGISTERED
+            and not registered_seed_matches(
+                by_id[item[1]],
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+            )
+            for item in plan
         ):
             return True
         return any(item[1] not in existing_ids for item in plan)
@@ -1836,9 +1998,17 @@ class ChallengeEngine:
                 current.metadata["adapter_primary_source"] = (
                     current_primary.path
                 )
-                current.metadata["adapter_seed_source_binding"] = (
-                    copy.deepcopy(current_plan[0][3]["source_binding"])
-                )
+                if current_plan:
+                    current.metadata["adapter_seed_source_binding"] = (
+                        copy.deepcopy(
+                            current_plan[0][3]["source_binding"]
+                        )
+                    )
+                else:
+                    current.metadata.pop(
+                        "adapter_seed_source_binding",
+                        None,
+                    )
             for experiment in current.experiments:
                 if (
                     experiment.extra.get("adapter_seed") is True
@@ -1847,16 +2017,66 @@ class ChallengeEngine:
                 ):
                     experiment.status = ExperimentStatus.CANCELLED
                     experiment.extra["cancelled_at"] = utc_now()
-                    experiment.extra["cancelled_reason"] = (
-                        "source_binding_replaced"
-                        if current_primary is not None
-                        else "source_binding_unavailable"
+                    legacy_contract = (
+                        experiment.extra.get(
+                            "adapter_seed_contract_version"
+                        )
+                        == (
+                            REV_INVENTORY_V1_ADAPTER_SEED_CONTRACT_VERSION
+                        )
+                        or experiment.extra.get("partial_oracle")
+                        == rev_inventory_v1_oracle_descriptor()
                     )
-            existing_ids = {
-                experiment.id for experiment in current.experiments
+                    if legacy_contract:
+                        experiment.extra["cancelled_reason"] = (
+                            "legacy_contract_replaced"
+                        )
+                    else:
+                        experiment.extra["cancelled_reason"] = (
+                            "source_binding_replaced"
+                            if current_primary is not None
+                            else "source_binding_unavailable"
+                        )
+            existing_by_id = {
+                experiment.id: experiment
+                for experiment in current.experiments
             }
             for spec, experiment_id, argv, extra in current_plan:
-                if experiment_id in existing_ids:
+                existing = existing_by_id.get(experiment_id)
+                if existing is not None:
+                    if (
+                        existing.status is ExperimentStatus.REGISTERED
+                        and existing.result is None
+                        and existing.source_run_id is None
+                        and not existing.artifact_ids
+                        and not existing.evidence_fact_ids
+                        and not existing.evidence_run_ids
+                        and not existing.evidence_receipt_ids
+                    ):
+                        recovery_metadata = {
+                            key: copy.deepcopy(existing.extra[key])
+                            for key in (
+                                "orphan_recovered_at",
+                                "orphan_recovery",
+                            )
+                            if key in existing.extra
+                        }
+                        existing.hypothesis_ids = []
+                        existing.command = shlex.join(argv)
+                        existing.expected_observation = (
+                            spec.expected_observation
+                        )
+                        existing.keep_if = spec.keep_condition
+                        existing.drop_if = spec.drop_condition
+                        existing.resource_class = spec.resource_class
+                        existing.kind = ExperimentKind.PROBE
+                        existing.evaluation_reason = None
+                        existing.evaluated_at = None
+                        existing.proof_recipe = None
+                        existing.extra = {
+                            **copy.deepcopy(extra),
+                            **recovery_metadata,
+                        }
                     continue
                 current.experiments.append(
                     Experiment(
@@ -1876,7 +2096,7 @@ class ChallengeEngine:
                         extra=copy.deepcopy(extra),
                     )
                 )
-                existing_ids.add(experiment_id)
+                existing_by_id[experiment_id] = current.experiments[-1]
 
         return self.store.update(
             state.identity,
@@ -3435,87 +3655,42 @@ class ChallengeEngine:
             raise EngineError(
                 "Rev adapter experiment lacks an immutable source snapshot"
             )
-        source_locator = source_binding.get("path")
-        expected_sha256 = source_binding.get("sha256")
-        expected_size = source_binding.get("size_bytes")
-        snapshot_id = source_snapshot.get("id")
-        snapshot_relative = source_snapshot.get("challenge_dir")
-        snapshot_contract = {
-            "directory_mode": _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
-            "file_mode": _REV_SOURCE_SNAPSHOT_FILE_MODE,
-            "mount_requirement": "challenge_read_only",
-            "publish": _REV_SOURCE_SNAPSHOT_PUBLISH,
-            "tree_contract": _REV_SOURCE_SNAPSHOT_TREE_CONTRACT,
-        }
         try:
-            expected_binding_sha256 = hashlib.sha256(
-                json.dumps(
-                    {
-                        "source_binding": dict(source_binding),
-                        "snapshot_contract": snapshot_contract,
-                    },
-                    allow_nan=False,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("ascii")
-            ).hexdigest()
-        except (TypeError, ValueError) as error:
+            expected_source_binding = (
+                build_rev_inventory_v2_source_binding(
+                    manifest_generation=source_binding.get(
+                        "manifest_generation"
+                    ),
+                    manifest_sha256=source_binding.get(
+                        "manifest_sha256"
+                    ),
+                    path=source_binding.get("path"),
+                    source_sha256=source_binding.get("sha256"),
+                    source_size_bytes=source_binding.get("size_bytes"),
+                )
+            )
+            expected_source_snapshot = (
+                build_rev_inventory_v2_source_snapshot(
+                    expected_source_binding
+                )
+            )
+        except RevInventoryV2ContractError as error:
             raise EngineError(
                 "Rev adapter source snapshot metadata is invalid"
             ) from error
         if (
-            set(source_binding)
-            != {
-                "manifest_generation",
-                "manifest_sha256",
-                "path",
-                "sha256",
-                "size_bytes",
-            }
-            or set(source_snapshot)
-            != {
-                "binding_sha256",
-                "challenge_dir",
-                "directory_mode",
-                "file_mode",
-                "id",
-                "mount_requirement",
-                "publish",
-                "sha256",
-                "size_bytes",
-                "source_locator",
-                "tree_contract",
-            }
-            or not isinstance(source_locator, str)
-            or not isinstance(expected_sha256, str)
-            or isinstance(expected_size, bool)
-            or not isinstance(expected_size, int)
-            or not isinstance(snapshot_id, str)
-            or not re.fullmatch(
-                r"rev-primary-[0-9a-f]{64}",
-                snapshot_id,
-            )
-            or not isinstance(snapshot_relative, str)
-            or snapshot_relative
-            != f"runtime/source-snapshots/{snapshot_id}/challenge"
-            or source_snapshot.get("binding_sha256")
-            != expected_binding_sha256
-            or snapshot_id
-            != f"rev-primary-{expected_binding_sha256}"
-            or source_snapshot.get("source_locator") != source_locator
-            or source_snapshot.get("sha256") != expected_sha256
-            or source_snapshot.get("size_bytes") != expected_size
-            or any(
-                source_snapshot.get(key) != value
-                for key, value in snapshot_contract.items()
-            )
+            dict(source_binding) != expected_source_binding
+            or dict(source_snapshot) != expected_source_snapshot
         ):
             raise EngineError(
                 "Rev adapter source snapshot metadata is invalid"
             )
+        source_locator = expected_source_binding["path"]
+        expected_sha256 = expected_source_binding["sha256"]
+        expected_size = expected_source_binding["size_bytes"]
+        snapshot_id = expected_source_snapshot["id"]
         maximum_bytes = min(
-            REV_INVENTORY_MAX_SOURCE_BYTES,
+            REV_INVENTORY_V2_MAX_SOURCE_BYTES,
             self.store.max_artifact_bytes,
         )
         if expected_size < 0 or expected_size > maximum_bytes:
@@ -3653,6 +3828,502 @@ class ChallengeEngine:
                 "Rev adapter source snapshot lock is unavailable"
             ) from error
         return challenge_root, verified
+
+    @staticmethod
+    def _is_rev_inventory_oracle_experiment(
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> bool:
+        expected_oracle = rev_inventory_v2_oracle_descriptor()
+        return (
+            state.schema_version >= STATE_SCHEMA_VERSION
+            and experiment.extra.get("adapter_seed") is True
+            and experiment.extra.get("adapter_name") == "reversing"
+            and experiment.extra.get("adapter_spec_template_id")
+            == _REV_INVENTORY_TEMPLATE_ID
+            and experiment.extra.get("partial_oracle")
+            == expected_oracle
+        )
+
+    def _evaluate_rev_inventory_run(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+        *,
+        argv: Sequence[str],
+        engine_run_id: str,
+        run_paths: RunPaths,
+        run_base_revision: int,
+        issued_run_request: Mapping[str, object],
+        commit_revalidation: bool,
+        lease_id: str,
+        resource_request: Mapping[str, object],
+        seed_run_metadata: Mapping[str, object],
+        source_snapshot_execution_binding: Mapping[str, object] | None,
+        prepared_snapshot: tuple[Path, ImmutableFile] | None,
+        result: SandboxResult,
+        stdout_artifact: ArtifactReference,
+        stdout_evidence: Mapping[str, object] | None,
+    ) -> _RevInventoryOracleOutcome | None:
+        """Evaluate one exact, completely captured Rev inventory stdout."""
+
+        if not self._is_rev_inventory_oracle_experiment(
+            state,
+            experiment,
+        ):
+            return None
+        source_binding_value = experiment.extra.get("source_binding")
+        source_binding = (
+            copy.deepcopy(dict(source_binding_value))
+            if isinstance(source_binding_value, Mapping)
+            else None
+        )
+        challenge_paths = self.store.challenge_paths(state.identity)
+        try:
+            request_relative = run_paths.request.relative_to(
+                challenge_paths.root
+            ).as_posix()
+        except ValueError:
+            request_relative = None
+        execution_binding = {
+            "schema_version": 2,
+            "argv": list(argv),
+            "base_revision": run_base_revision,
+            "configuration_epoch": state.configuration_epoch,
+            "experiment": {
+                "adapter_name": experiment.extra.get("adapter_name"),
+                "adapter_seed": experiment.extra.get("adapter_seed"),
+                "adapter_seed_contract_version": experiment.extra.get(
+                    "adapter_seed_contract_version"
+                ),
+                "adapter_seed_order": experiment.extra.get(
+                    "adapter_seed_order"
+                ),
+                "adapter_spec_id": experiment.extra.get(
+                    "adapter_spec_id"
+                ),
+                "adapter_spec_sha256": experiment.extra.get(
+                    "adapter_spec_sha256"
+                ),
+                "adapter_spec_template_id": experiment.extra.get(
+                    "adapter_spec_template_id"
+                ),
+                "id": experiment.id,
+                "requires_explicit_execution": experiment.extra.get(
+                    "requires_explicit_execution"
+                ),
+                "resource_class": experiment.resource_class,
+            },
+            "image": {
+                "digest": self.config.runtime.image_digest,
+                "name": self.config.runtime.image,
+                "reference": (
+                    self.config.runtime.image_digest
+                    or self.config.runtime.image
+                ),
+            },
+            "network": {
+                "target": None,
+                "target_generation": None,
+                "target_id": None,
+            },
+            "oracle": copy.deepcopy(
+                experiment.extra.get("partial_oracle")
+            ),
+            "request": {
+                "path": request_relative,
+                "sha256": None,
+            },
+            "resource_request": copy.deepcopy(
+                dict(resource_request)
+            ),
+            "source_binding": copy.deepcopy(source_binding),
+            "source_snapshot": copy.deepcopy(
+                experiment.extra.get("source_snapshot")
+            ),
+            "source_snapshot_execution_binding": copy.deepcopy(
+                source_snapshot_execution_binding
+            ),
+            "stdout_artifact": {
+                "id": stdout_artifact.id,
+                "path": stdout_artifact.path,
+                "sha256": stdout_artifact.sha256,
+                "size": stdout_artifact.size,
+            },
+        }
+        transport_succeeded = (
+            result.status == "completed"
+            and result.exit_code == 0
+            and not result.timed_out
+            and result.orchestration_error is None
+        )
+        outcome = _RevInventoryOracleOutcome(
+            transport_succeeded=transport_succeeded,
+            evaluation_status=(
+                "pending" if transport_succeeded else "not_evaluated"
+            ),
+            rejection_code=(
+                None if transport_succeeded else "transport_failed"
+            ),
+            result=None,
+            request_sha256=None,
+            image_reference=None,
+            stdout_artifact_id=stdout_artifact.id,
+            source_binding=source_binding,
+            execution_binding=execution_binding,
+            evaluated_at=(None if transport_succeeded else utc_now()),
+        )
+        if not transport_succeeded:
+            return outcome
+
+        if prepared_snapshot is None:
+            return outcome.rejected("source_snapshot_missing")
+
+        try:
+            if request_relative is None:
+                raise SafeFileError("request path is outside challenge state")
+            with tempfile.TemporaryDirectory(
+                prefix=".ctfos-rev-oracle-request-",
+                dir=challenge_paths.runtime,
+            ) as temporary:
+                request_snapshot = copy_bounded_regular(
+                    challenge_paths.root,
+                    request_relative,
+                    Path(temporary) / "request.json",
+                    maximum_bytes=_REV_INVENTORY_REQUEST_MAX_BYTES,
+                    mode=0o400,
+                )
+                request_payload = request_snapshot.path.read_bytes()
+            request_sha256 = request_snapshot.sha256
+        except (OSError, SafeFileError, ValueError):
+            return outcome.rejected("request_snapshot_unavailable")
+        execution_binding = copy.deepcopy(outcome.execution_binding)
+        execution_binding["request"]["sha256"] = request_sha256
+        outcome = replace(
+            outcome,
+            request_sha256=request_sha256,
+            execution_binding=execution_binding,
+        )
+        try:
+            run_request = strict_json_loads(
+                request_payload,
+                max_bytes=_REV_INVENTORY_REQUEST_MAX_BYTES,
+            )
+        except (StrictJSONError, ValueError):
+            return outcome.rejected("request_invalid_json")
+        if not isinstance(run_request, Mapping):
+            return outcome.rejected("request_invalid_schema")
+
+        required_request_keys = {
+            "argv",
+            "base_revision",
+            "category",
+            "challenge_id",
+            "configuration_epoch",
+            "contest_id",
+            "created_at",
+            "experiment_id",
+            "image",
+            "image_digest",
+            "image_reference",
+            "kind",
+            "lease_id",
+            "network_target",
+            "network_target_generation",
+            "network_target_id",
+            "resource_class",
+            "resource_request",
+            "run_id",
+            "schema_version",
+            "source_snapshot_execution_binding",
+            *_ADAPTER_SEED_RUN_METADATA_KEYS,
+        }
+        pinned_image = self.config.runtime.image_digest
+        expected_scalars = {
+            "schema_version": RUN_ENVELOPE_SCHEMA_VERSION,
+            "contest_id": state.contest_id,
+            "category": state.category,
+            "challenge_id": state.challenge_id,
+            "run_id": engine_run_id,
+            "base_revision": run_base_revision,
+            "kind": "tool",
+            "experiment_id": experiment.id,
+            "resource_class": experiment.resource_class,
+            "lease_id": lease_id,
+            "image": self.config.runtime.image,
+            "image_digest": pinned_image,
+            "image_reference": pinned_image,
+            "network_target": None,
+            "network_target_id": None,
+            "network_target_generation": None,
+            "configuration_epoch": state.configuration_epoch,
+        }
+        if (
+            set(run_request) != required_request_keys
+            or dict(run_request) != dict(issued_run_request)
+            or not isinstance(run_request.get("created_at"), str)
+            or not run_request["created_at"]
+            or any(
+                run_request.get(key) != value
+                for key, value in expected_scalars.items()
+            )
+            or run_request.get("argv") != list(argv)
+            or run_request.get("resource_request")
+            != dict(resource_request)
+            or any(
+                run_request.get(key) != seed_run_metadata.get(key)
+                for key in _ADAPTER_SEED_RUN_METADATA_KEYS
+            )
+            or run_request.get("source_snapshot_execution_binding")
+            != source_snapshot_execution_binding
+            or not isinstance(pinned_image, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", pinned_image)
+            or resource_request.get("network") != 0
+        ):
+            return outcome.rejected("request_binding_mismatch")
+        outcome = replace(outcome, image_reference=pinned_image)
+
+        source_locator = (
+            source_binding.get("path")
+            if source_binding is not None
+            else None
+        )
+        expected_sha256 = (
+            source_binding.get("sha256")
+            if source_binding is not None
+            else None
+        )
+        expected_size = (
+            source_binding.get("size_bytes")
+            if source_binding is not None
+            else None
+        )
+        if (
+            not isinstance(source_locator, str)
+            or not isinstance(expected_sha256, str)
+            or isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+        ):
+            return outcome.rejected("seed_binding_invalid")
+        challenge_root, originally_verified = prepared_snapshot
+        maximum_source_bytes = min(
+            REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+            self.store.max_artifact_bytes,
+        )
+        if commit_revalidation:
+            try:
+                live_inventory = inventory_challenge(
+                    self.challenge_input(state.identity)
+                )
+            except (OSError, ValueError):
+                return outcome.rejected(
+                    "live_source_manifest_unavailable"
+                )
+            expected_manifest = (
+                source_binding.get("manifest_sha256")
+                if source_binding is not None
+                else None
+            )
+            live_bound_source = next(
+                (
+                    item
+                    for item in live_inventory.files
+                    if item.path == source_locator
+                ),
+                None,
+            )
+            state_bound_source = next(
+                (
+                    item
+                    for item in state.source_inventory
+                    if item.path == source_locator
+                ),
+                None,
+            )
+            if (
+                live_bound_source is None
+                or state_bound_source is None
+                or live_bound_source.sha256 != expected_sha256
+                or live_bound_source.size != expected_size
+                or state_bound_source.sha256 != expected_sha256
+                or state_bound_source.size != expected_size
+            ):
+                return outcome.rejected(
+                    "live_source_binding_mismatch"
+                )
+            if (
+                not isinstance(expected_manifest, str)
+                or state.metadata.get("source_manifest_sha256")
+                != expected_manifest
+                or live_inventory.manifest_sha256 != expected_manifest
+            ):
+                return outcome.rejected(
+                    "live_source_manifest_mismatch"
+                )
+            try:
+                self._require_adapter_seed_source_binding_current(
+                    state,
+                    experiment,
+                )
+            except EngineError:
+                return outcome.rejected("seed_binding_invalid")
+        if (
+            originally_verified.path
+            != challenge_root / normalize_locator(source_locator)
+            or originally_verified.source_locator != source_locator
+            or originally_verified.sha256 != expected_sha256
+            or originally_verified.size_bytes != expected_size
+        ):
+            return outcome.rejected("source_snapshot_identity_mismatch")
+        if commit_revalidation:
+            try:
+                reverified = _verify_rev_source_snapshot_tree(
+                    challenge_root.parent,
+                    source_locator,
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                    maximum_bytes=maximum_source_bytes,
+                )
+            except (OSError, SafeFileError, ValueError):
+                return outcome.rejected(
+                    "source_snapshot_reverification_failed"
+                )
+            if (
+                reverified.path != originally_verified.path
+                or reverified.source_locator
+                != originally_verified.source_locator
+                or reverified.sha256 != originally_verified.sha256
+                or reverified.size_bytes
+                != originally_verified.size_bytes
+            ):
+                return outcome.rejected(
+                    "source_snapshot_identity_mismatch"
+                )
+
+        artifact_size = stdout_artifact.size
+        if (
+            stdout_artifact.source_run_id != engine_run_id
+            or stdout_artifact.extra.get("stream") != "stdout"
+            or not isinstance(artifact_size, int)
+            or isinstance(artifact_size, bool)
+            or artifact_size < 0
+            or artifact_size > DEFAULT_STREAM_CAPTURE_MAX_BYTES
+            or not isinstance(stdout_evidence, Mapping)
+            or stdout_evidence.get("stream") != "stdout"
+            or stdout_evidence.get("artifact_id") != stdout_artifact.id
+            or stdout_evidence.get("path") != stdout_artifact.path
+            or stdout_evidence.get("sha256") != stdout_artifact.sha256
+            or stdout_evidence.get("drained_bytes") != artifact_size
+            or stdout_evidence.get("stored_bytes") != artifact_size
+            or stdout_evidence.get("capture_complete") is not True
+            or stdout_evidence.get("truncation_known") is not True
+            or stdout_evidence.get("truncated") is not False
+            or stdout_evidence.get("coverage") != "complete_stream"
+            or stdout_evidence.get("stream_error_present") is not False
+            or stdout_evidence.get("capture_error_present") is not False
+            or result.stdout_bytes != artifact_size
+            or result.stdout_stored_bytes != artifact_size
+            or not isinstance(result.stdout_limit_bytes, int)
+            or isinstance(result.stdout_limit_bytes, bool)
+            or not (
+                artifact_size
+                <= result.stdout_limit_bytes
+                <= DEFAULT_STREAM_CAPTURE_MAX_BYTES
+            )
+            or result.stdout_truncated is not False
+            or result.stdout_truncation_known is not True
+            or result.stdout_capture_complete is not True
+            or result.stdout_error is not None
+            or result.stream_capture_error is not None
+        ):
+            return outcome.rejected("stdout_capture_incomplete")
+
+        oversized_result = evaluate_rev_inventory_v2_artifact_size(
+            artifact_size,
+            expected_source_sha256=expected_sha256,
+            expected_source_size_bytes=expected_size,
+        )
+        if oversized_result is not None:
+            # Capture completeness and the durable artifact digest are already
+            # pinned above.  StateStore revalidates that exact artifact before
+            # replacement, so a complete artifact beyond the 16 KiB parser
+            # contract can be classified without copying up to 16 MiB twice.
+            return replace(
+                outcome,
+                evaluation_status="evaluated",
+                rejection_code=None,
+                result=oversized_result,
+                evaluated_at=utc_now(),
+            )
+
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".ctfos-rev-oracle-stdout-",
+                dir=challenge_paths.runtime,
+            ) as temporary:
+                stdout_snapshot = copy_bounded_regular(
+                    challenge_paths.root,
+                    stdout_artifact.path,
+                    Path(temporary) / "stdout.bin",
+                    maximum_bytes=DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+                    expected_sha256=stdout_artifact.sha256,
+                    expected_size=artifact_size,
+                    mode=0o400,
+                )
+                payload = stdout_snapshot.path.read_bytes()
+        except (OSError, SafeFileError, ValueError):
+            return outcome.rejected("stdout_snapshot_unavailable")
+        if (
+            stdout_snapshot.sha256 != stdout_artifact.sha256
+            or stdout_snapshot.size_bytes != artifact_size
+        ):
+            return outcome.rejected("stdout_snapshot_identity_mismatch")
+
+        oracle_result = evaluate_rev_inventory_v2(
+            payload,
+            expected_source_sha256=expected_sha256,
+            expected_source_size_bytes=expected_size,
+        )
+        return replace(
+            outcome,
+            evaluation_status="evaluated",
+            rejection_code=None,
+            result=oracle_result,
+            evaluated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _rev_inventory_fact_statement(
+        outcome: _RevInventoryOracleOutcome,
+    ) -> str:
+        result = outcome.result
+        if result is None:
+            raise EngineError("Rev inventory fact lacks an oracle result")
+        source_path = (
+            outcome.source_binding.get("path")
+            if outcome.source_binding is not None
+            else None
+        )
+        profile = (
+            json.dumps(
+                result.profile.to_dict(),
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if result.profile is not None
+            else "null"
+        )
+        statement = (
+            f"Rev inventory oracle {result.oracle_id}@"
+            f"{result.oracle_version} returned {result.verdict.value} "
+            f"({result.reason_code}) for "
+            f"{json.dumps(source_path, ensure_ascii=True)} at "
+            f"sha256:{result.source_sha256}; profile={profile}; "
+            f"contract={result.contract_fingerprint}."
+        )
+        return statement[:2048]
 
     def sandbox(
         self,
@@ -7030,6 +7701,7 @@ class ChallengeEngine:
                 run_request = read_json(run_paths.request)
                 if not isinstance(run_request, Mapping):
                     raise EngineError("tool run request must be a JSON object")
+                issued_run_request = copy.deepcopy(dict(run_request))
                 run_base_revision = int(run_request["base_revision"])
             except BaseException as error:
                 failure_reason = f"could not create tool run: {error}"
@@ -7466,6 +8138,31 @@ class ChallengeEngine:
                         artifact_records.clear()
                         _pending_tool_context.clear()
                     continue
+            rev_inventory_oracle_outcome = None
+            if artifact_notification_failed is False:
+                assert stdout_artifact is not None
+                rev_inventory_oracle_outcome = (
+                    self._evaluate_rev_inventory_run(
+                        running,
+                        experiment,
+                        argv=argv,
+                        engine_run_id=engine_run_id,
+                        run_paths=run_paths,
+                        run_base_revision=run_base_revision,
+                        issued_run_request=issued_run_request,
+                        commit_revalidation=False,
+                        lease_id=lease.lease_id,
+                        resource_request=request.as_dict(),
+                        seed_run_metadata=seed_run_metadata,
+                        source_snapshot_execution_binding=(
+                            source_snapshot_execution_binding
+                        ),
+                        prepared_snapshot=prepared_snapshot,
+                        result=result,
+                        stdout_artifact=stdout_artifact,
+                        stdout_evidence=receipt_stream_evidence.get("stdout"),
+                    )
+                )
             if not artifact_notification_failed:
                 try:
                     result_payload: dict[str, Any] = {
@@ -7479,6 +8176,22 @@ class ChallengeEngine:
                         ],
                         "base_revision": run_base_revision,
                     }
+                    validation_payload: dict[str, Any] = {
+                        "ok": True,
+                        "base_revision": run_base_revision,
+                        "artifact_ids": [
+                            artifact.id for artifact in artifact_records
+                        ],
+                        "errors": [],
+                    }
+                    if rev_inventory_oracle_outcome is not None:
+                        oracle_payload = (
+                            rev_inventory_oracle_outcome.to_dict()
+                        )
+                        result_payload["partial_oracle"] = oracle_payload
+                        validation_payload["partial_oracle"] = (
+                            copy.deepcopy(oracle_payload)
+                        )
                     self.store.write_run_result(
                         identity,
                         None,
@@ -7489,14 +8202,7 @@ class ChallengeEngine:
                     self.store.write_run_validation(
                         identity,
                         engine_run_id,
-                        {
-                            "ok": True,
-                            "base_revision": run_base_revision,
-                            "artifact_ids": [
-                                artifact.id for artifact in artifact_records
-                            ],
-                            "errors": [],
-                        },
+                        validation_payload,
                     )
                 except Exception as error:
                     self._finish_tool_failure(
@@ -7554,6 +8260,11 @@ class ChallengeEngine:
                     continue
 
             result_fact_id = _record_id("F", engine_run_id, "result")
+            rev_inventory_fact_id = _record_id(
+                "F",
+                engine_run_id,
+                "rev-inventory",
+            )
             receipt_id = _record_id("RCPT", engine_run_id, "result")
 
             def finish(current: ChallengeState) -> None:
@@ -7575,18 +8286,120 @@ class ChallengeEngine:
                     raise EngineError(
                         f"tool run is already committed: {engine_run_id}"
                     )
-                succeeded = result.exit_code == 0 and not result.timed_out
-                item.status = (
-                    ExperimentStatus.COMPLETED
-                    if (
-                        succeeded
-                        and current.schema_version >= STATE_SCHEMA_VERSION
-                        and item.kind is ExperimentKind.PROBE
-                    )
-                    else ExperimentStatus.AWAITING_EVALUATION
-                    if succeeded
-                    else ExperimentStatus.FAILED
+                succeeded = (
+                    rev_inventory_oracle_outcome.transport_succeeded
+                    if rev_inventory_oracle_outcome is not None
+                    else result.exit_code == 0 and not result.timed_out
                 )
+                effective_oracle_outcome = (
+                    rev_inventory_oracle_outcome
+                )
+                if (
+                    effective_oracle_outcome is not None
+                    and effective_oracle_outcome.evaluation_status
+                    == "evaluated"
+                ):
+                    commit_outcome = self._evaluate_rev_inventory_run(
+                        current,
+                        item,
+                        argv=argv,
+                        engine_run_id=engine_run_id,
+                        run_paths=run_paths,
+                        run_base_revision=run_base_revision,
+                        issued_run_request=issued_run_request,
+                        commit_revalidation=True,
+                        lease_id=lease.lease_id,
+                        resource_request=request.as_dict(),
+                        seed_run_metadata=seed_run_metadata,
+                        source_snapshot_execution_binding=(
+                            source_snapshot_execution_binding
+                        ),
+                        prepared_snapshot=prepared_snapshot,
+                        result=result,
+                        stdout_artifact=stdout_artifact,
+                        stdout_evidence=receipt_stream_evidence.get(
+                            "stdout"
+                        ),
+                    )
+                    self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        (
+                            "Rev inventory commit revalidation "
+                            "completed"
+                        ),
+                    )
+                    if (
+                        commit_outcome is None
+                        or commit_outcome.evaluation_status != "evaluated"
+                        or commit_outcome.result
+                        != effective_oracle_outcome.result
+                        or commit_outcome.request_sha256
+                        != effective_oracle_outcome.request_sha256
+                        or commit_outcome.image_reference
+                        != effective_oracle_outcome.image_reference
+                        or commit_outcome.source_binding
+                        != effective_oracle_outcome.source_binding
+                        or commit_outcome.execution_binding
+                        != effective_oracle_outcome.execution_binding
+                    ):
+                        effective_oracle_outcome = (
+                            effective_oracle_outcome.rejected(
+                                (
+                                    commit_outcome.rejection_code
+                                    if commit_outcome is not None
+                                    and commit_outcome.rejection_code
+                                    is not None
+                                    else "binding_changed_before_commit"
+                                )
+                            )
+                        )
+                oracle_result = (
+                    effective_oracle_outcome.result
+                    if effective_oracle_outcome is not None
+                    and effective_oracle_outcome.evaluation_status
+                    == "evaluated"
+                    else None
+                )
+                oracle_fact_allowed = (
+                    oracle_result is not None
+                    and oracle_result.verdict
+                    in {
+                        RevInventoryV2Verdict.CONFIRMED,
+                        RevInventoryV2Verdict.INCONCLUSIVE,
+                        RevInventoryV2Verdict.NOT_APPLICABLE,
+                    }
+                )
+                if effective_oracle_outcome is not None:
+                    if (
+                        oracle_result is not None
+                        and oracle_result.verdict
+                        is RevInventoryV2Verdict.CONFIRMED
+                    ):
+                        item.status = ExperimentStatus.COMPLETED
+                    elif (
+                        oracle_result is not None
+                        and oracle_result.verdict
+                        in {
+                            RevInventoryV2Verdict.INCONCLUSIVE,
+                            RevInventoryV2Verdict.NOT_APPLICABLE,
+                        }
+                    ):
+                        item.status = ExperimentStatus.INCONCLUSIVE
+                    else:
+                        item.status = ExperimentStatus.FAILED
+                else:
+                    item.status = (
+                        ExperimentStatus.COMPLETED
+                        if (
+                            succeeded
+                            and current.schema_version
+                            >= STATE_SCHEMA_VERSION
+                            and item.kind is ExperimentKind.PROBE
+                        )
+                        else ExperimentStatus.AWAITING_EVALUATION
+                        if succeeded
+                        else ExperimentStatus.FAILED
+                    )
                 item_result: dict[str, Any] = {
                     "run_id": engine_run_id,
                     "exit_code": result.exit_code,
@@ -7596,17 +8409,111 @@ class ChallengeEngine:
                     item_result["receipt_id"] = receipt_id
                 else:
                     item_result["fact_id"] = result_fact_id
+                if effective_oracle_outcome is not None:
+                    final_oracle_payload = (
+                        effective_oracle_outcome.to_dict()
+                    )
+                    item_result["partial_oracle"] = copy.deepcopy(
+                        final_oracle_payload
+                    )
+                    if effective_oracle_outcome != (
+                        rev_inventory_oracle_outcome
+                    ):
+                        final_result_payload = copy.deepcopy(
+                            result_payload
+                        )
+                        final_validation_payload = copy.deepcopy(
+                            validation_payload
+                        )
+                        final_result_payload["partial_oracle"] = (
+                            copy.deepcopy(final_oracle_payload)
+                        )
+                        final_validation_payload["partial_oracle"] = (
+                            copy.deepcopy(final_oracle_payload)
+                        )
+                        self.store.write_run_result(
+                            identity,
+                            None,
+                            None,
+                            engine_run_id,
+                            final_result_payload,
+                        )
+                        self.store.write_run_validation(
+                            identity,
+                            engine_run_id,
+                            final_validation_payload,
+                        )
+                    item.evidence_run_ids = list(
+                        dict.fromkeys(
+                            [*item.evidence_run_ids, engine_run_id]
+                        )
+                    )
+                    item.evidence_receipt_ids = list(
+                        dict.fromkeys(
+                            [*item.evidence_receipt_ids, receipt_id]
+                        )
+                    )
+                    if oracle_fact_allowed:
+                        item.evidence_fact_ids = list(
+                            dict.fromkeys(
+                                [
+                                    *item.evidence_fact_ids,
+                                    rev_inventory_fact_id,
+                                ]
+                            )
+                        )
+                    if item.status in {
+                        ExperimentStatus.INCONCLUSIVE,
+                        ExperimentStatus.FAILED,
+                    }:
+                        semantic_reason = (
+                            (
+                                f"{oracle_result.verdict.value}/"
+                                f"{oracle_result.reason_code}"
+                            )
+                            if oracle_result is not None
+                            else (
+                                effective_oracle_outcome.rejection_code
+                                or "no_semantic_result"
+                            )
+                        )
+                        item.evaluation_reason = (
+                            "rev_inventory:"
+                            f"{effective_oracle_outcome.evaluation_status}:"
+                            f"{semantic_reason}"
+                        )[:512]
+                        item.evaluated_at = (
+                            effective_oracle_outcome.evaluated_at
+                            or utc_now()
+                        )
                 item.result = item_result
-                item.artifact_ids.extend(
-                    artifact.id for artifact in artifact_records
+                item.artifact_ids = list(
+                    dict.fromkeys(
+                        [
+                            *item.artifact_ids,
+                            *(
+                                artifact.id
+                                for artifact in artifact_records
+                            ),
+                        ]
+                    )
                 )
+                run_extra = {
+                    "experiment_id": item.id,
+                    "wall_seconds": elapsed,
+                    **copy.deepcopy(seed_run_metadata),
+                }
+                if effective_oracle_outcome is not None:
+                    run_extra["partial_oracle_result"] = copy.deepcopy(
+                        effective_oracle_outcome.to_dict()
+                    )
                 current.runs.append(
                     RunReference(
                         id=engine_run_id,
                         base_revision=run_base_revision,
                         status=(
                             RunStatus.COMPLETED
-                            if result.exit_code == 0 and not result.timed_out
+                            if succeeded
                             else RunStatus.TIMED_OUT
                             if result.timed_out
                             else RunStatus.FAILED
@@ -7639,11 +8546,7 @@ class ChallengeEngine:
                             else None
                         ),
                         created_at=utc_now(),
-                        extra={
-                            "experiment_id": item.id,
-                            "wall_seconds": elapsed,
-                            **copy.deepcopy(seed_run_metadata),
-                        },
+                        extra=run_extra,
                     )
                 )
                 current.artifacts.extend(artifact_records)
@@ -7653,9 +8556,21 @@ class ChallengeEngine:
                             artifact
                             for artifact in artifact_records
                             if artifact.extra.get("stream") == "stderr"
-                        ),
+                            ),
                         None,
                     )
+                    receipt_extra: dict[str, Any] = {
+                        "line_count_basis": (
+                            "transport_summary_tail"
+                        ),
+                        "stream_evidence": receipt_stream_evidence,
+                    }
+                    if effective_oracle_outcome is not None:
+                        receipt_extra["partial_oracle_result"] = (
+                            copy.deepcopy(
+                                effective_oracle_outcome.to_dict()
+                            )
+                        )
                     current.receipts.append(
                         ExecutionReceipt(
                             id=receipt_id,
@@ -7687,16 +8602,34 @@ class ChallengeEngine:
                                 + bool(result.stderr_summary)
                             ),
                             preview=receipt_preview,
-                            extra={
-                                "line_count_basis": (
-                                    "transport_summary_tail"
-                                ),
-                                "stream_evidence": (
-                                    receipt_stream_evidence
-                                ),
-                            },
+                            extra=receipt_extra,
                         )
                     )
+                    if oracle_fact_allowed:
+                        assert effective_oracle_outcome is not None
+                        current.facts.append(
+                            Fact(
+                                id=rev_inventory_fact_id,
+                                statement=(
+                                    self._rev_inventory_fact_statement(
+                                        effective_oracle_outcome
+                                    )
+                                ),
+                                provenance=Provenance.EXECUTED,
+                                challenge_id=current.challenge_id,
+                                source_run_id=engine_run_id,
+                                artifact_id=stdout_artifact.id,
+                                locator=stdout_artifact.path,
+                                extra={
+                                    "partial_oracle_result": (
+                                        copy.deepcopy(
+                                            effective_oracle_outcome.to_dict()
+                                        )
+                                    ),
+                                    "receipt_id": receipt_id,
+                                },
+                            )
+                        )
                 else:
                     current.facts.append(
                         Fact(
@@ -7761,6 +8694,18 @@ class ChallengeEngine:
                 state = self.store.update(
                     identity,
                     finish,
+                    commit_guard=(
+                        lambda: self._require_before_hard_deadline(
+                            command_deadline_monotonic,
+                            (
+                                "Rev inventory canonical state commit"
+                                if rev_inventory_oracle_outcome is not None
+                                else "tool canonical state commit"
+                            ),
+                        )
+                        if result.exit_code == 0 and not result.timed_out
+                        else None
+                    ),
                 )
             except _HardDeadlineExpired as deadline_error:
                 try:
@@ -11390,13 +12335,42 @@ class ChallengeEngine:
             experiment.status is ExperimentStatus.RUNNING
             for experiment in state.experiments
         ):
-            return state
+            return self._synchronize_rev_adapter_seed_plan(state)
         recovered_at = utc_now()
 
         def apply(current: ChallengeState) -> None:
             recovered_managed_proof = False
             for experiment in current.experiments:
                 if experiment.status is not ExperimentStatus.RUNNING:
+                    continue
+                retryable_rev_inventory_orphan = (
+                    self._is_rev_inventory_oracle_experiment(
+                        current,
+                        experiment,
+                    )
+                    and experiment.result is None
+                    and experiment.source_run_id is None
+                    and not experiment.artifact_ids
+                    and not experiment.evidence_fact_ids
+                    and not experiment.evidence_run_ids
+                    and not experiment.evidence_receipt_ids
+                    and not any(
+                        run.extra.get("experiment_id") == experiment.id
+                        for run in current.runs
+                    )
+                    and not any(
+                        receipt.experiment_id == experiment.id
+                        for receipt in current.receipts
+                    )
+                )
+                if retryable_rev_inventory_orphan:
+                    experiment.status = ExperimentStatus.REGISTERED
+                    experiment.evaluation_reason = None
+                    experiment.evaluated_at = None
+                    experiment.extra["orphan_recovered_at"] = recovered_at
+                    experiment.extra["orphan_recovery"] = (
+                        "retryable_without_canonical_outcome"
+                    )
                     continue
                 experiment.status = ExperimentStatus.FAILED
                 if (
@@ -11437,11 +12411,12 @@ class ChallengeEngine:
             ):
                 current.resume_status = ChallengeStatus.ACTIVE
 
-        return self.store.update(
+        recovered = self.store.update(
             identity,
             apply,
             validate_artifacts=False,
         )
+        return self._synchronize_rev_adapter_seed_plan(recovered)
 
     def _handle_tool_postprocess_interruption(
         self,

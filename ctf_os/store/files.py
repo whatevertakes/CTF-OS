@@ -1420,13 +1420,16 @@ class StateStore:
         *,
         expected_revision: int | None = None,
         validate_artifacts: bool = True,
+        commit_guard: Callable[[], None] | None = None,
     ) -> ChallengeState:
         """Atomically load, mutate, validate, and replace a challenge state.
 
         ``update(identity, mutator)`` and
         ``update(contest, category, challenge, mutator)`` are both accepted.
         The mutator may edit its argument and return ``None`` or return a
-        replacement :class:`ChallengeState`.
+        replacement :class:`ChallengeState`.  An optional engine-owned
+        ``commit_guard`` runs after validation and serialization, immediately
+        before any canonical state bytes are replaced.
         """
 
         if isinstance(contest, (ChallengeIdentity, ChallengeState)) and callable(
@@ -1473,6 +1476,7 @@ class StateStore:
                 proposed,
                 validate_artifacts=validate_artifacts,
                 lock_wait_ms=lock_wait_ms,
+                commit_guard=commit_guard,
             )
 
     mutate = update
@@ -1485,6 +1489,7 @@ class StateStore:
         *,
         validate_artifacts: bool,
         lock_wait_ms: float = 0.0,
+        commit_guard: Callable[[], None] | None = None,
     ) -> ChallengeState:
         commit_started = time.monotonic()
         if proposed.identity != current.identity:
@@ -1557,6 +1562,8 @@ class StateStore:
             paths.state,
             expected=current.identity,
         )
+        if commit_guard is not None:
+            commit_guard()
         fsync_started = time.monotonic()
         atomic_write_bytes(paths.previous_state, previous_payload)
         atomic_write_bytes(paths.state, committed_payload)

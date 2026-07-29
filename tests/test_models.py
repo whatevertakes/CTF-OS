@@ -4,6 +4,20 @@ import copy
 import unittest
 from unittest import mock
 
+import ctf_os.models as models_module
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+    REV_INVENTORY_V2_SEED_DROP_CONDITION,
+    REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
+    REV_INVENTORY_V2_SEED_KEEP_CONDITION,
+    REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS,
+    RevInventoryV2ContractError,
+    build_rev_inventory_v2_seed_extra,
+    build_rev_inventory_v2_source_binding,
+    build_rev_inventory_v2_source_snapshot,
+    evaluate_rev_inventory_v2,
+    rev_inventory_v2_seed_command,
+)
 from ctf_os.models import (
     MAX_RECORDS_PER_COLLECTION,
     MAX_REPEATED_FIELD_ITEMS,
@@ -13,6 +27,7 @@ from ctf_os.models import (
     Experiment,
     ExperimentKind,
     ExperimentStatus,
+    ExecutionReceipt,
     Fact,
     Falsifier,
     FlagCandidate,
@@ -25,6 +40,7 @@ from ctf_os.models import (
     ProofRecipe,
     ProofRecipeInput,
     Provenance,
+    ReceiptOutcome,
     RunReference,
     RunStatus,
     new_challenge_state,
@@ -32,7 +48,278 @@ from ctf_os.models import (
 from ctf_os.store.upgrades import upgrade_state
 
 
+def _canonical_rev_inventory_error_records(
+    index: int,
+) -> tuple[
+    Experiment,
+    RunReference,
+    ExecutionReceipt,
+    ArtifactReference,
+]:
+    source_binding = build_rev_inventory_v2_source_binding(
+        manifest_generation=1,
+        manifest_sha256="a" * 64,
+        path="chall",
+        source_sha256="b" * 64,
+        source_size_bytes=83,
+    )
+    source_snapshot = build_rev_inventory_v2_source_snapshot(
+        source_binding
+    )
+    seed_extra = build_rev_inventory_v2_seed_extra(
+        source_binding,
+        source_snapshot,
+    )
+    experiment_id = f"E-rev-error-{index}"
+    run_id = f"R-rev-error-{index}"
+    receipt_id = f"RCPT-rev-error-{index}"
+    artifact_id = f"A-rev-error-{index}-stdout"
+    artifact_path = f"artifacts/{artifact_id}.log"
+    request_path = f"runs/{run_id}/request.json"
+    request_sha256 = f"{index:064x}"
+    artifact_sha256 = f"{index + 256:064x}"
+    evaluated_at = "2026-01-01T00:00:00Z"
+    snapshot_execution = {
+        "enforced": False,
+        "mode": "trusted_injected_sandbox",
+        "scope_fingerprint": "c" * 64,
+        "snapshot_id": source_snapshot["id"],
+    }
+    semantic_result = evaluate_rev_inventory_v2(
+        b"{",
+        expected_source_sha256=source_binding["sha256"],
+        expected_source_size_bytes=source_binding["size_bytes"],
+    ).to_dict()
+    execution_binding = {
+        "schema_version": 2,
+        "argv": [
+            "python3",
+            "/opt/ctf-templates/rev/inventory_v2.py",
+            "/challenge/chall",
+        ],
+        "base_revision": 0,
+        "configuration_epoch": 0,
+        "experiment": {
+            "adapter_name": seed_extra["adapter_name"],
+            "adapter_seed": seed_extra["adapter_seed"],
+            "adapter_seed_contract_version": seed_extra[
+                "adapter_seed_contract_version"
+            ],
+            "adapter_seed_order": seed_extra["adapter_seed_order"],
+            "adapter_spec_id": seed_extra["adapter_spec_id"],
+            "adapter_spec_sha256": seed_extra[
+                "adapter_spec_sha256"
+            ],
+            "adapter_spec_template_id": seed_extra[
+                "adapter_spec_template_id"
+            ],
+            "id": experiment_id,
+            "requires_explicit_execution": seed_extra[
+                "requires_explicit_execution"
+            ],
+            "resource_class": "light",
+        },
+        "image": {
+            "digest": "sha256:" + ("1" * 64),
+            "name": "ctf-os:core",
+            "reference": "sha256:" + ("1" * 64),
+        },
+        "network": {
+            "target": None,
+            "target_generation": None,
+            "target_id": None,
+        },
+        "oracle": seed_extra["partial_oracle"],
+        "request": {
+            "path": request_path,
+            "sha256": request_sha256,
+        },
+        "resource_request": {
+            "cpu": 1,
+            "gpu": 0,
+            "kvm": 0,
+            "memory_mib": 2048,
+            "network": 0,
+        },
+        "source_binding": source_binding,
+        "source_snapshot": source_snapshot,
+        "source_snapshot_execution_binding": snapshot_execution,
+        "stdout_artifact": {
+            "id": artifact_id,
+            "path": artifact_path,
+            "sha256": artifact_sha256,
+            "size": 1,
+        },
+    }
+    outcome = {
+        "schema_version": 2,
+        "transport_succeeded": True,
+        "evaluation_status": "evaluated",
+        "rejection_code": None,
+        "result": semantic_result,
+        "request_sha256": request_sha256,
+        "image_reference": "sha256:" + ("1" * 64),
+        "stdout_artifact_id": artifact_id,
+        "source_binding": source_binding,
+        "execution_binding": execution_binding,
+        "evaluated_at": evaluated_at,
+    }
+    experiment = Experiment(
+        id=experiment_id,
+        hypothesis_ids=[],
+        command=rev_inventory_v2_seed_command("chall"),
+        expected_observation=(
+            REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION
+        ),
+        keep_if=REV_INVENTORY_V2_SEED_KEEP_CONDITION,
+        drop_if=REV_INVENTORY_V2_SEED_DROP_CONDITION,
+        timeout_seconds=REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS,
+        kind=ExperimentKind.PROBE,
+        status=ExperimentStatus.FAILED,
+        result={
+            "exit_code": 0,
+            "partial_oracle": outcome,
+            "receipt_id": receipt_id,
+            "run_id": run_id,
+            "timed_out": False,
+        },
+        artifact_ids=[artifact_id],
+        evidence_run_ids=[run_id],
+        evidence_receipt_ids=[receipt_id],
+        evaluation_reason="rev_inventory:evaluated:ERROR/invalid_json",
+        evaluated_at=evaluated_at,
+        extra=seed_extra,
+    )
+    run = RunReference(
+        id=run_id,
+        base_revision=0,
+        status=RunStatus.COMPLETED,
+        request_path=request_path,
+        configuration_epoch=0,
+        extra={
+            **seed_extra,
+            "experiment_id": experiment_id,
+            "partial_oracle_result": outcome,
+            "source_snapshot_execution_binding": snapshot_execution,
+        },
+    )
+    receipt = ExecutionReceipt(
+        id=receipt_id,
+        experiment_id=experiment_id,
+        run_id=run_id,
+        outcome=ReceiptOutcome.SUCCEEDED,
+        exit_code=0,
+        stdout_artifact_id=artifact_id,
+        extra={"partial_oracle_result": outcome},
+    )
+    artifact = ArtifactReference(
+        id=artifact_id,
+        path=artifact_path,
+        sha256=artifact_sha256,
+        source_run_id=run_id,
+        size=1,
+    )
+    return experiment, run, receipt, artifact
+
+
 class ModelTests(unittest.TestCase):
+    def test_rev_inventory_source_binding_enforces_oracle_source_limit(
+        self,
+    ) -> None:
+        common = {
+            "manifest_generation": 1,
+            "manifest_sha256": "a" * 64,
+            "path": "chall",
+            "source_sha256": "b" * 64,
+        }
+        binding = build_rev_inventory_v2_source_binding(
+            **common,
+            source_size_bytes=REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+        )
+        self.assertEqual(
+            binding["size_bytes"],
+            REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+        )
+        with self.assertRaisesRegex(
+            RevInventoryV2ContractError,
+            "outside the v2 source-size contract",
+        ):
+            build_rev_inventory_v2_source_binding(
+                **common,
+                source_size_bytes=(
+                    REV_INVENTORY_V2_MAX_SOURCE_BYTES + 1
+                ),
+            )
+
+    def test_rev_inventory_link_discovery_is_one_pass_per_collection(
+        self,
+    ) -> None:
+        class CountingList(list):
+            def __init__(self, values=()):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        state = new_challenge_state(
+            ChallengeIdentity("Demo", "rev", "Linear links")
+        )
+        rev_records = [
+            _canonical_rev_inventory_error_records(index)
+            for index in range(32)
+        ]
+        state.experiments = [
+            record[0] for record in rev_records
+        ] + [
+            Experiment(
+                id=f"E-generic-{index}",
+                hypothesis_ids=[],
+                command="true",
+                expected_observation="bounded output",
+                keep_if="output exists",
+                drop_if="output is absent",
+                timeout_seconds=1,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.REGISTERED,
+            )
+            for index in range(256)
+        ]
+        raw_runs = [
+            record[1] for record in rev_records
+        ] + [
+            RunReference(
+                id=f"R-generic-{index}",
+                base_revision=0,
+                status=RunStatus.FAILED,
+                extra={"experiment_id": f"E-generic-{index}"},
+            )
+            for index in range(256)
+        ]
+        raw_receipts = [record[2] for record in rev_records]
+        raw_artifacts = [record[3] for record in rev_records]
+        state.runs = CountingList(raw_runs)
+        state.receipts = CountingList(raw_receipts)
+        state.facts = CountingList()
+
+        errors = models_module._rev_inventory_state_errors(
+            state,
+            runs={run.id: run for run in raw_runs},
+            receipts={
+                receipt.id: receipt for receipt in raw_receipts
+            },
+            artifacts={
+                artifact.id: artifact for artifact in raw_artifacts
+            },
+            facts={},
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(state.runs.iterations, 1)
+        self.assertEqual(state.receipts.iterations, 1)
+        self.assertEqual(state.facts.iterations, 1)
+
     def test_experiment_rejects_non_object_non_null_proof_recipe(self) -> None:
         payload = Experiment(
             id="E-probe",

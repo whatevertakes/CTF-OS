@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+from ctf_os.contracts.rev_inventory_v2 import (
+    REV_INVENTORY_V2_SEED_COMMAND_TEMPLATE,
+    REV_INVENTORY_V2_SEED_DROP_CONDITION,
+    REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
+    REV_INVENTORY_V2_SEED_KEEP_CONDITION,
+    REV_INVENTORY_V2_SEED_PURPOSE,
+    REV_INVENTORY_V2_SEED_RESOURCE_CLASS,
+    REV_INVENTORY_V2_SEED_TEMPLATE_ID,
+    REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS,
+)
+
 from .base import ExperimentSpec, GenericAdapter, ProgressMarker, ProofPolicy
 
 
@@ -9,18 +20,14 @@ class ReversingAdapter(GenericAdapter):
     def initial_observations(self) -> tuple[ExperimentSpec, ...]:
         return (
             ExperimentSpec(
-                "inventory_observation",
-                "collect a bounded source-bound binary inventory",
-                (
-                    "python3",
-                    "/opt/ctf-templates/rev/inventory.py",
-                    "{primary}",
-                ),
-                "canonical Rev inventory bound to the immutable primary input",
-                "the inventory contract identifies the binary profile",
-                "the inventory is malformed, stale, or not applicable",
-                "light",
-                60,
+                REV_INVENTORY_V2_SEED_TEMPLATE_ID,
+                REV_INVENTORY_V2_SEED_PURPOSE,
+                REV_INVENTORY_V2_SEED_COMMAND_TEMPLATE,
+                REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
+                REV_INVENTORY_V2_SEED_KEEP_CONDITION,
+                REV_INVENTORY_V2_SEED_DROP_CONDITION,
+                REV_INVENTORY_V2_SEED_RESOURCE_CLASS,
+                REV_INVENTORY_V2_SEED_TIMEOUT_SECONDS,
             ),
             ExperimentSpec(
                 "assembly_observation",

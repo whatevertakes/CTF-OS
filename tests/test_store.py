@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 import ctf_os.store.atomic as atomic_module
+import ctf_os.store.files as store_files
 from ctf_os.models import (
     ArtifactReference,
     CandidateStatus,
@@ -460,6 +461,66 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(unchanged.candidates, [])
         self.assertEqual(paths.state.read_bytes(), canonical)
         self.assertEqual(paths.previous_state.read_bytes(), previous)
+
+    def test_update_commit_guard_runs_after_artifact_validation_and_is_atomic(
+        self,
+    ) -> None:
+        initial = self.create()
+        paths = self.store.challenge_paths(self.identity)
+        artifact_path = paths.artifacts / "guarded.bin"
+        artifact_path.write_bytes(b"guarded evidence")
+        canonical = paths.state.read_bytes()
+        previous = paths.previous_state.read_bytes()
+        operations: list[str] = []
+
+        def add_artifact(current):
+            current.artifacts.append(
+                ArtifactReference(
+                    id="A-guarded",
+                    path="artifacts/guarded.bin",
+                    sha256=hashlib.sha256(
+                        b"guarded evidence"
+                    ).hexdigest(),
+                    size=len(b"guarded evidence"),
+                )
+            )
+
+        real_validate_artifact = store_files.validate_artifact
+
+        def observe_validation(*args, **kwargs):
+            operations.append("artifact_validation")
+            return real_validate_artifact(*args, **kwargs)
+
+        def reject_commit() -> None:
+            operations.append("commit_guard")
+            raise RuntimeError("synthetic commit guard rejection")
+
+        with (
+            mock.patch.object(
+                store_files,
+                "validate_artifact",
+                side_effect=observe_validation,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic commit guard rejection",
+            ),
+        ):
+            self.store.update(
+                self.identity,
+                add_artifact,
+                commit_guard=reject_commit,
+            )
+
+        self.assertEqual(
+            operations,
+            ["artifact_validation", "commit_guard"],
+        )
+        self.assertEqual(paths.state.read_bytes(), canonical)
+        self.assertEqual(paths.previous_state.read_bytes(), previous)
+        unchanged = self.store.load(self.identity)
+        self.assertEqual(unchanged.revision, initial.revision)
+        self.assertEqual(unchanged.artifacts, [])
 
     def test_oversized_state_read_recovers_only_from_a_bounded_previous(
         self,
