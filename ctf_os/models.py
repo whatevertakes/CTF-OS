@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from ctf_os.candidates import candidate_value_is_valid
@@ -38,6 +39,7 @@ from ctf_os.contracts.rev_inventory_v2 import (
     REV_INVENTORY_V2_CONTRACT_ID,
     REV_INVENTORY_V2_CONTRACT_VERSION,
     REV_INVENTORY_V2_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_V2_MAX_BYTES,
     REV_INVENTORY_V2_SEED_DROP_CONDITION,
     REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
     REV_INVENTORY_V2_SEED_KEEP_CONDITION,
@@ -926,7 +928,30 @@ def distinct_complete_active_hypotheses(
 
 
 _PROOF_RECIPE_INPUT_PURPOSES = frozenset(
+    {
+        "reproducer",
+        "fixture",
+        "variant_generator",
+        "verifier",
+        "accepted_input",
+    }
+)
+_PWN_PROOF_RECIPE_INPUT_PURPOSES = frozenset(
     {"reproducer", "fixture", "variant_generator", "verifier"}
+)
+_PWN_PROOF_PROTOCOL = "remote_pwn_replay_negative_control_v1"
+_REV_STDIN_PROOF_PROTOCOL = "rev_original_binary_stdin_candidate_v1"
+_REV_STDIN_ORACLE_BINDING_KIND = "rev_original_binary_stdin_v1"
+_REV_STDIN_ACCEPTED_INPUT_DESTINATION = "oracle/accepted-input.bin"
+_REV_STDIN_MAX_ACCEPTED_INPUT_BYTES = 1024 * 1024
+_REV_STDIN_RUNNER_PREFIX = (
+    "/usr/bin/python3",
+    "/opt/ctf-templates/rev/stdin_exec.py",
+    "--binary",
+)
+_REV_STDIN_RUNNER_INPUT_SUFFIX = (
+    "--input",
+    "/work/oracle/accepted-input.bin",
 )
 
 
@@ -1006,6 +1031,284 @@ class ProofRecipeInput:
                 if data.get("source_run_id") is not None
                 else None
             ),
+        )
+
+
+def _proof_binding_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _proof_binding_identifier(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and "\x00" not in value
+        and len(value.encode("utf-8")) <= 1024
+    )
+
+
+def _proof_binding_utc_timestamp(value: object) -> bool:
+    return _proof_binding_utc_datetime(value) is not None
+
+
+def _proof_binding_utc_datetime(value: object) -> datetime | None:
+    if type(value) is not str or not value:
+        return None
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.utcoffset().total_seconds() != 0
+    ):
+        return None
+    return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class RevStdinOracleBinding:
+    """Exact inventory and source pins for a managed Rev stdin proof."""
+
+    protocol: str
+    inventory_contract_id: str
+    inventory_contract_version: int
+    inventory_contract_fingerprint: str
+    inventory_experiment_id: str
+    inventory_run_id: str
+    inventory_stdout_artifact_id: str
+    inventory_stdout_sha256: str
+    inventory_stdout_size_bytes: int
+    source_binding: Mapping[str, JSONValue]
+    source_snapshot: Mapping[str, JSONValue]
+    budget_deadline_utc: str
+    schema_version: int = 1
+    kind: str = _REV_STDIN_ORACLE_BINDING_KIND
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != _REV_STDIN_ORACLE_BINDING_KIND
+            or self.protocol != _REV_STDIN_PROOF_PROTOCOL
+            or self.inventory_contract_id
+            != REV_INVENTORY_V2_CONTRACT_ID
+            or type(self.inventory_contract_version) is not int
+            or self.inventory_contract_version
+            != REV_INVENTORY_V2_CONTRACT_VERSION
+            or self.inventory_contract_fingerprint
+            != REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+            or not all(
+                _proof_binding_identifier(value)
+                for value in (
+                    self.inventory_experiment_id,
+                    self.inventory_run_id,
+                    self.inventory_stdout_artifact_id,
+                )
+            )
+            or not _proof_binding_sha256(self.inventory_stdout_sha256)
+            or type(self.inventory_stdout_size_bytes) is not int
+            or not 0
+            <= self.inventory_stdout_size_bytes
+            <= REV_INVENTORY_V2_MAX_BYTES
+            or not _proof_binding_utc_timestamp(self.budget_deadline_utc)
+            or not isinstance(self.source_binding, Mapping)
+            or not isinstance(self.source_snapshot, Mapping)
+        ):
+            raise ModelValidationError(
+                "Rev stdin oracle binding contains an invalid scalar"
+            )
+        try:
+            expected_source_binding = build_rev_inventory_v2_source_binding(
+                manifest_generation=self.source_binding.get(
+                    "manifest_generation"
+                ),  # type: ignore[arg-type]
+                manifest_sha256=self.source_binding.get(
+                    "manifest_sha256"
+                ),  # type: ignore[arg-type]
+                path=self.source_binding.get("path"),  # type: ignore[arg-type]
+                source_sha256=self.source_binding.get(
+                    "sha256"
+                ),  # type: ignore[arg-type]
+                source_size_bytes=self.source_binding.get(
+                    "size_bytes"
+                ),  # type: ignore[arg-type]
+            )
+            expected_source_snapshot = (
+                build_rev_inventory_v2_source_snapshot(
+                    expected_source_binding
+                )
+            )
+        except RevInventoryV2ContractError as error:
+            raise ModelValidationError(
+                "Rev stdin oracle binding has an invalid source pin"
+            ) from error
+        if (
+            dict(self.source_binding) != expected_source_binding
+            or dict(self.source_snapshot) != expected_source_snapshot
+        ):
+            raise ModelValidationError(
+                "Rev stdin oracle binding has a non-canonical source pin"
+            )
+        object.__setattr__(
+            self,
+            "source_binding",
+            MappingProxyType(dict(expected_source_binding)),
+        )
+        object.__setattr__(
+            self,
+            "source_snapshot",
+            MappingProxyType(dict(expected_source_snapshot)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "protocol": self.protocol,
+            "inventory_contract_id": self.inventory_contract_id,
+            "inventory_contract_version": (
+                self.inventory_contract_version
+            ),
+            "inventory_contract_fingerprint": (
+                self.inventory_contract_fingerprint
+            ),
+            "inventory_experiment_id": self.inventory_experiment_id,
+            "inventory_run_id": self.inventory_run_id,
+            "inventory_stdout_artifact_id": (
+                self.inventory_stdout_artifact_id
+            ),
+            "inventory_stdout_sha256": self.inventory_stdout_sha256,
+            "inventory_stdout_size_bytes": (
+                self.inventory_stdout_size_bytes
+            ),
+            "source_binding": dict(self.source_binding),
+            "source_snapshot": dict(self.source_snapshot),
+            "budget_deadline_utc": self.budget_deadline_utc,
+        }
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> "RevStdinOracleBinding":
+        del memo
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        protocol: str,
+        inventory_contract_id: str,
+        inventory_contract_version: int,
+        inventory_contract_fingerprint: str,
+        inventory_experiment_id: str,
+        inventory_run_id: str,
+        inventory_stdout_artifact_id: str,
+        inventory_stdout_sha256: str,
+        inventory_stdout_size_bytes: int,
+        source_binding: Mapping[str, JSONValue],
+        source_snapshot: Mapping[str, JSONValue],
+        budget_deadline_utc: str,
+    ) -> "RevStdinOracleBinding":
+        return cls(
+            protocol=protocol,
+            inventory_contract_id=inventory_contract_id,
+            inventory_contract_version=inventory_contract_version,
+            inventory_contract_fingerprint=(
+                inventory_contract_fingerprint
+            ),
+            inventory_experiment_id=inventory_experiment_id,
+            inventory_run_id=inventory_run_id,
+            inventory_stdout_artifact_id=inventory_stdout_artifact_id,
+            inventory_stdout_sha256=inventory_stdout_sha256,
+            inventory_stdout_size_bytes=inventory_stdout_size_bytes,
+            source_binding=source_binding,
+            source_snapshot=source_snapshot,
+            budget_deadline_utc=budget_deadline_utc,
+        )
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Mapping[str, Any],
+    ) -> "RevStdinOracleBinding":
+        expected = {
+            "schema_version",
+            "kind",
+            "protocol",
+            "inventory_contract_id",
+            "inventory_contract_version",
+            "inventory_contract_fingerprint",
+            "inventory_experiment_id",
+            "inventory_run_id",
+            "inventory_stdout_artifact_id",
+            "inventory_stdout_sha256",
+            "inventory_stdout_size_bytes",
+            "source_binding",
+            "source_snapshot",
+            "budget_deadline_utc",
+        }
+        if set(data) != expected:
+            raise ModelValidationError(
+                "Rev stdin oracle binding has a non-canonical schema"
+            )
+        source_binding = data.get("source_binding")
+        source_snapshot = data.get("source_snapshot")
+        if (
+            not isinstance(source_binding, Mapping)
+            or not isinstance(source_snapshot, Mapping)
+            or type(data.get("schema_version")) is not int
+            or type(data.get("inventory_contract_version")) is not int
+            or type(data.get("inventory_stdout_size_bytes")) is not int
+            or any(
+                type(data.get(field)) is not str
+                for field in (
+                    "kind",
+                    "protocol",
+                    "inventory_contract_id",
+                    "inventory_contract_fingerprint",
+                    "inventory_experiment_id",
+                    "inventory_run_id",
+                    "inventory_stdout_artifact_id",
+                    "inventory_stdout_sha256",
+                    "budget_deadline_utc",
+                )
+            )
+        ):
+            raise ModelValidationError(
+                "Rev stdin oracle binding contains a non-canonical type"
+            )
+        return cls(
+            schema_version=data["schema_version"],
+            kind=data["kind"],
+            protocol=data["protocol"],
+            inventory_contract_id=data["inventory_contract_id"],
+            inventory_contract_version=data[
+                "inventory_contract_version"
+            ],
+            inventory_contract_fingerprint=data[
+                "inventory_contract_fingerprint"
+            ],
+            inventory_experiment_id=data["inventory_experiment_id"],
+            inventory_run_id=data["inventory_run_id"],
+            inventory_stdout_artifact_id=data[
+                "inventory_stdout_artifact_id"
+            ],
+            inventory_stdout_sha256=data["inventory_stdout_sha256"],
+            inventory_stdout_size_bytes=data[
+                "inventory_stdout_size_bytes"
+            ],
+            source_binding=dict(source_binding),
+            source_snapshot=dict(source_snapshot),
+            budget_deadline_utc=data["budget_deadline_utc"],
         )
 
 
@@ -1172,9 +1475,10 @@ class ProofRecipe:
     image_reference: str
     policy: ProofPolicySnapshot
     recipe_sha256: str
+    oracle_binding: RevStdinOracleBinding | None = None
 
     def _unsigned_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "candidate_id": self.candidate_id,
             "source_experiment_id": self.source_experiment_id,
             "source_run_id": self.source_run_id,
@@ -1189,6 +1493,9 @@ class ProofRecipe:
             "image_reference": self.image_reference,
             "policy": self.policy.to_dict(),
         }
+        if self.oracle_binding is not None:
+            value["oracle_binding"] = self.oracle_binding.to_dict()
+        return value
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1216,6 +1523,7 @@ class ProofRecipe:
         source_request_sha256: str,
         image_reference: str,
         policy: ProofPolicySnapshot,
+        oracle_binding: RevStdinOracleBinding | None = None,
     ) -> "ProofRecipe":
         provisional = cls(
             candidate_id=candidate_id,
@@ -1232,6 +1540,7 @@ class ProofRecipe:
             image_reference=image_reference,
             policy=policy,
             recipe_sha256="",
+            oracle_binding=oracle_binding,
         )
         return cls(
             candidate_id=provisional.candidate_id,
@@ -1254,11 +1563,12 @@ class ProofRecipe:
             image_reference=provisional.image_reference,
             policy=provisional.policy,
             recipe_sha256=provisional.computed_sha256(),
+            oracle_binding=provisional.oracle_binding,
         )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProofRecipe":
-        expected = {
+        legacy_expected = {
             "candidate_id",
             "source_experiment_id",
             "source_run_id",
@@ -1274,9 +1584,24 @@ class ProofRecipe:
             "policy",
             "recipe_sha256",
         }
-        if set(data) != expected:
+        expected_with_binding = {
+            *legacy_expected,
+            "oracle_binding",
+        }
+        if frozenset(data) not in {
+            frozenset(legacy_expected),
+            frozenset(expected_with_binding),
+        }:
             raise ModelValidationError(
                 "proof recipe has a non-canonical schema"
+            )
+        raw_oracle_binding = data.get("oracle_binding")
+        if "oracle_binding" in data and not isinstance(
+            raw_oracle_binding,
+            Mapping,
+        ):
+            raise ModelValidationError(
+                "proof recipe oracle_binding must be a canonical object"
             )
         policy = data.get("policy")
         inputs = data.get("inputs", [])
@@ -1354,6 +1679,11 @@ class ProofRecipe:
             image_reference=data["image_reference"],
             policy=ProofPolicySnapshot.from_dict(policy),
             recipe_sha256=data["recipe_sha256"],
+            oracle_binding=(
+                RevStdinOracleBinding.from_dict(raw_oracle_binding)
+                if isinstance(raw_oracle_binding, Mapping)
+                else None
+            ),
         )
 
 
@@ -4348,6 +4678,622 @@ def _rev_inventory_state_errors(
     return errors
 
 
+_REV_PROOF_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol",
+        "recipe_sha256",
+        "policy_sha256",
+        "candidate_id",
+        "accepted_input_artifact_id",
+        "source_manifest_sha256",
+        "image_reference",
+        "oracle_binding",
+        "evaluation",
+        "evaluation_sha256",
+        "evaluation_artifact_id",
+        "deadline_guard",
+    }
+)
+_REV_PROOF_DEADLINE_GUARD_KEYS = frozenset(
+    {
+        "contract",
+        "budget_deadline_utc",
+        "attempt_deadlines_utc",
+        "evaluated_at_utc",
+        "commit_guard",
+    }
+)
+_REV_PROOF_SEMANTIC_FALSIFICATION_CODES = frozenset(
+    {
+        "negative_flag_candidate_observed",
+        "selected_candidate_not_direct",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RevProofLinkIndex:
+    proof_runs_by_experiment_id: Mapping[
+        str,
+        tuple[RunReference, ...],
+    ]
+    artifact_ids_by_source_run_id: Mapping[str, frozenset[str]]
+    candidate_proof_run_ids: Mapping[str, tuple[str, ...]]
+    candidate_proof_run_positions: Mapping[str, Mapping[str, int]]
+
+
+def _rev_proof_link_index(state: "ChallengeState") -> _RevProofLinkIndex:
+    """Build the Rev proof graph indexes in one pass per collection."""
+
+    proof_runs: dict[str, list[RunReference]] = {}
+    for run in state.runs:
+        experiment_id = run.extra.get("experiment_id")
+        if (
+            run.origin is RunOrigin.PROOF
+            and isinstance(experiment_id, str)
+        ):
+            proof_runs.setdefault(experiment_id, []).append(run)
+    artifact_ids_by_run: dict[str, set[str]] = {}
+    for artifact in state.artifacts:
+        if isinstance(artifact.source_run_id, str):
+            artifact_ids_by_run.setdefault(
+                artifact.source_run_id,
+                set(),
+            ).add(artifact.id)
+    return _RevProofLinkIndex(
+        proof_runs_by_experiment_id={
+            experiment_id: tuple(linked_runs)
+            for experiment_id, linked_runs in proof_runs.items()
+        },
+        artifact_ids_by_source_run_id={
+            run_id: frozenset(artifact_ids)
+            for run_id, artifact_ids in artifact_ids_by_run.items()
+        },
+        candidate_proof_run_ids={
+            candidate.id: tuple(candidate.proof_run_ids)
+            for candidate in state.candidates
+        },
+        candidate_proof_run_positions={
+            candidate.id: {
+                run_id: position
+                for position, run_id in enumerate(
+                    candidate.proof_run_ids
+                )
+            }
+            for candidate in state.candidates
+        },
+    )
+
+
+def _rev_proof_state_errors(
+    state: "ChallengeState",
+    *,
+    runs: Mapping[str, RunReference],
+    artifacts: Mapping[str, ArtifactReference],
+    candidates: Mapping[str, FlagCandidate],
+) -> list[str]:
+    """Validate persisted Rev proof evidence without reading artifact bytes."""
+
+    errors: list[str] = []
+    link_index = _rev_proof_link_index(state)
+    passing_slices_by_candidate: dict[
+        str,
+        set[tuple[str, ...]],
+    ] = {}
+    evaluated_slices_by_candidate: dict[
+        str,
+        dict[tuple[str, ...], bool],
+    ] = {}
+    for experiment in state.experiments:
+        recipe = experiment.proof_recipe
+        if (
+            experiment.kind is not ExperimentKind.PROOF
+            or recipe is None
+            or recipe.policy.oracle_protocol
+            != _REV_STDIN_PROOF_PROTOCOL
+        ):
+            continue
+        label = f"Rev stdin proof experiment {experiment.id}"
+        if len(recipe.inputs) != 1:
+            errors.append(f"{label} does not have one accepted input")
+            continue
+        result = experiment.result
+        raw_envelope = (
+            result.get("rev_proof_evidence")
+            if isinstance(result, Mapping)
+            else None
+        )
+        if raw_envelope is None:
+            if experiment.status in {
+                ExperimentStatus.COMPLETED,
+                ExperimentStatus.INCONCLUSIVE,
+            }:
+                errors.append(f"{label} lacks canonical proof evidence")
+            continue
+        try:
+            if (
+                not isinstance(result, Mapping)
+                or set(result)
+                != {"proof_result", "rev_proof_evidence"}
+                or not isinstance(raw_envelope, Mapping)
+                or set(raw_envelope) != _REV_PROOF_ENVELOPE_KEYS
+            ):
+                raise ModelValidationError(
+                    "proof result/envelope schema is not exact"
+                )
+            envelope = raw_envelope
+            binding = recipe.oracle_binding
+            if binding is None:
+                raise ModelValidationError("oracle binding is absent")
+            if (
+                type(envelope["schema_version"]) is not int
+                or envelope["schema_version"] != 1
+                or any(
+                    type(envelope[field]) is not str
+                    for field in (
+                        "protocol",
+                        "recipe_sha256",
+                        "policy_sha256",
+                        "candidate_id",
+                        "accepted_input_artifact_id",
+                        "source_manifest_sha256",
+                        "image_reference",
+                        "evaluation_sha256",
+                        "evaluation_artifact_id",
+                    )
+                )
+                or envelope["protocol"] != _REV_STDIN_PROOF_PROTOCOL
+                or envelope["recipe_sha256"] != recipe.recipe_sha256
+                or envelope["policy_sha256"]
+                != recipe.policy.policy_sha256
+                or envelope["candidate_id"] != recipe.candidate_id
+                or envelope["accepted_input_artifact_id"]
+                != recipe.inputs[0].artifact_id
+                or envelope["source_manifest_sha256"]
+                != recipe.source_manifest_sha256
+                or envelope["image_reference"] != recipe.image_reference
+                or envelope["oracle_binding"] != binding.to_dict()
+                or not _proof_binding_sha256(
+                    envelope["evaluation_sha256"]
+                )
+                or not _proof_binding_identifier(
+                    envelope["evaluation_artifact_id"]
+                )
+            ):
+                raise ModelValidationError(
+                    "proof envelope pins do not match its recipe"
+                )
+            from ctf_os.engine.rev_proof import (  # local: avoids cycle
+                parse_rev_proof_evaluation_evidence,
+            )
+
+            evaluation = parse_rev_proof_evaluation_evidence(
+                envelope["evaluation"]
+            )
+            if (
+                evaluation.protocol != _REV_STDIN_PROOF_PROTOCOL
+                or evaluation.evidence_sha256
+                != envelope["evaluation_sha256"]
+                or evaluation.candidate
+                != candidates[recipe.candidate_id].value
+                or evaluation.source_manifest_sha256
+                != recipe.source_manifest_sha256
+                or evaluation.accepted_input_sha256
+                != recipe.inputs[0].sha256
+                or evaluation.accepted_input_size_bytes
+                != recipe.inputs[0].size
+                or len(evaluation.plan) != 6
+                or len(evaluation.observations) != 6
+            ):
+                raise ModelValidationError(
+                    "proof evaluation does not match its recipe"
+                )
+            proof_result = result["proof_result"]
+            if (
+                not isinstance(proof_result, Mapping)
+                or set(proof_result)
+                != {
+                    "passed",
+                    "candidate",
+                    "policy_mode",
+                    "successful_attempts",
+                    "required_attempts",
+                    "total_attempts",
+                    "source_manifest_sha256",
+                    "failures",
+                    "run_ids",
+                }
+                or type(proof_result["failures"]) not in {list, tuple}
+                or type(proof_result["run_ids"]) not in {list, tuple}
+                or type(proof_result["passed"]) is not bool
+                or any(
+                    type(proof_result[field]) is not str
+                    for field in (
+                        "candidate",
+                        "policy_mode",
+                        "source_manifest_sha256",
+                    )
+                )
+                or any(
+                    type(proof_result[field]) is not int
+                    for field in (
+                        "successful_attempts",
+                        "required_attempts",
+                        "total_attempts",
+                    )
+                )
+                or proof_result["passed"] is not evaluation.passed
+                or proof_result["candidate"] != evaluation.candidate
+                or proof_result["policy_mode"]
+                != _REV_STDIN_PROOF_PROTOCOL
+                or proof_result["successful_attempts"]
+                != evaluation.positive_successes
+                or proof_result["required_attempts"] != 3
+                or proof_result["total_attempts"] != 6
+                or proof_result["source_manifest_sha256"]
+                != evaluation.source_manifest_sha256
+                or tuple(proof_result["failures"])
+                != tuple(
+                    failure.token()
+                    for failure in evaluation.failures
+                )
+                or tuple(proof_result["run_ids"])
+                != tuple(
+                    observation.run_id
+                    for observation in evaluation.observations
+                )
+            ):
+                raise ModelValidationError(
+                    "proof result contradicts its evaluation"
+                )
+            evaluation_artifact = artifacts.get(
+                envelope["evaluation_artifact_id"]
+            )
+            if (
+                evaluation_artifact is None
+                or evaluation_artifact.sha256
+                != evaluation.evidence_sha256
+                or type(evaluation_artifact.size) is not int
+                or evaluation_artifact.size
+                != len(evaluation.canonical_bytes())
+                or evaluation_artifact.source_run_id is not None
+                or evaluation_artifact.id
+                not in experiment.artifact_ids
+                or evaluation_artifact.extra
+                != {
+                    "kind": "rev_proof_evaluation",
+                    "experiment_id": experiment.id,
+                    "candidate_id": recipe.candidate_id,
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "policy_sha256": recipe.policy.policy_sha256,
+                    "protocol": _REV_STDIN_PROOF_PROTOCOL,
+                }
+            ):
+                raise ModelValidationError(
+                    "proof evaluation artifact is not exact"
+                )
+            deadline_guard = envelope["deadline_guard"]
+            if (
+                not isinstance(deadline_guard, Mapping)
+                or set(deadline_guard)
+                != _REV_PROOF_DEADLINE_GUARD_KEYS
+                or deadline_guard["contract"]
+                != "ctfos_rev_proof_deadline_guard_v1"
+                or deadline_guard["commit_guard"]
+                != "state_store_pre_replace_v1"
+                or deadline_guard["budget_deadline_utc"]
+                != binding.budget_deadline_utc
+                or type(deadline_guard["attempt_deadlines_utc"])
+                is not list
+                or len(deadline_guard["attempt_deadlines_utc"]) != 6
+                or experiment.evaluated_at
+                != deadline_guard["evaluated_at_utc"]
+            ):
+                raise ModelValidationError(
+                    "proof deadline guard is not exact"
+                )
+            budget_deadline = _proof_binding_utc_datetime(
+                binding.budget_deadline_utc
+            )
+            evaluated_at = _proof_binding_utc_datetime(
+                deadline_guard["evaluated_at_utc"]
+            )
+            attempt_deadlines = tuple(
+                _proof_binding_utc_datetime(item)
+                for item in deadline_guard["attempt_deadlines_utc"]
+            )
+            if (
+                budget_deadline is None
+                or evaluated_at is None
+                or evaluated_at > budget_deadline
+                or any(
+                    attempt_deadline is None
+                    or attempt_deadline > budget_deadline
+                    for attempt_deadline in attempt_deadlines
+                )
+            ):
+                raise ModelValidationError(
+                    "proof deadline evidence exceeds its budget"
+                )
+            observation_run_ids = tuple(
+                observation.run_id
+                for observation in evaluation.observations
+            )
+            if (
+                experiment.evidence_run_ids
+                != list(observation_run_ids)
+                or tuple(
+                    run.id
+                    for run in link_index.proof_runs_by_experiment_id.get(
+                        experiment.id,
+                        (),
+                    )
+                )
+                != observation_run_ids
+            ):
+                raise ModelValidationError(
+                    "proof observation run links are not exact"
+                )
+            stream_artifact_ids: set[str] = set()
+            ordered_artifact_ids = [recipe.inputs[0].artifact_id]
+            for index, (planned, observation) in enumerate(
+                zip(
+                    evaluation.plan,
+                    evaluation.observations,
+                    strict=True,
+                )
+            ):
+                run = runs.get(observation.run_id)
+                structural_attempt_failure = any(
+                    failure.attempt_ordinal == planned.ordinal
+                    and failure.code
+                    not in _REV_PROOF_SEMANTIC_FALSIFICATION_CODES
+                    for failure in evaluation.failures
+                )
+                expected_run_status = (
+                    RunStatus.TIMED_OUT
+                    if observation.timed_out
+                    else (
+                        RunStatus.FAILED
+                        if structural_attempt_failure
+                        else RunStatus.COMPLETED
+                    )
+                )
+                if (
+                    run is None
+                    or run.origin is not RunOrigin.PROOF
+                    or run.role != "proof"
+                    or run.status is not expected_run_status
+                    or run.result_path is None
+                    or run.validation_path is None
+                    or type(run.configuration_epoch) is not int
+                    or run.configuration_epoch
+                    != recipe.configuration_epoch
+                    or run.extra.get("experiment_id") != experiment.id
+                    or run.extra.get("rev_proof_protocol")
+                    != _REV_STDIN_PROOF_PROTOCOL
+                    or run.extra.get("rev_proof_recipe_sha256")
+                    != recipe.recipe_sha256
+                    or run.extra.get("rev_proof_attempt_ordinal")
+                    != planned.ordinal
+                    or type(
+                        run.extra.get("rev_proof_attempt_ordinal")
+                    )
+                    is not int
+                    or run.extra.get("rev_proof_phase")
+                    != planned.phase
+                    or run.extra.get("rev_proof_mutation_id")
+                    != planned.mutation_id
+                    or run.extra.get("rev_proof_input_sha256")
+                    != planned.input_sha256
+                    or run.extra.get("rev_proof_input_size_bytes")
+                    != planned.input_size_bytes
+                    or type(
+                        run.extra.get("rev_proof_input_size_bytes")
+                    )
+                    is not int
+                    or run.extra.get(
+                        "rev_proof_attempt_deadline_utc"
+                    )
+                    != deadline_guard["attempt_deadlines_utc"][index]
+                    or run.extra.get("rev_proof_observation")
+                    != observation.to_dict()
+                ):
+                    raise ModelValidationError(
+                        "proof observation Run binding is inconsistent"
+                    )
+                run_stream_artifact_ids: set[str] = set()
+                for stream_name, stream in (
+                    ("stdout", observation.stdout),
+                    ("stderr", observation.stderr),
+                ):
+                    if (
+                        stream.artifact_id is None
+                        or stream.artifact_sha256 is None
+                        or stream.artifact_size_bytes is None
+                    ):
+                        raise ModelValidationError(
+                            "proof stream artifact binding is incomplete"
+                        )
+                    artifact = artifacts.get(stream.artifact_id)
+                    if (
+                        artifact is None
+                        or artifact.source_run_id != observation.run_id
+                        or artifact.sha256 != stream.artifact_sha256
+                        or type(artifact.size) is not int
+                        or artifact.size != stream.artifact_size_bytes
+                        or artifact.id not in experiment.artifact_ids
+                        or artifact.id in stream_artifact_ids
+                        or artifact.extra.get("stream") != stream_name
+                        or artifact.extra.get("rev_proof_protocol")
+                        != _REV_STDIN_PROOF_PROTOCOL
+                        or artifact.extra.get("experiment_id")
+                        != experiment.id
+                        or artifact.extra.get(
+                            "rev_proof_attempt_ordinal"
+                        )
+                        != planned.ordinal
+                        or type(
+                            artifact.extra.get(
+                                "rev_proof_attempt_ordinal"
+                            )
+                        )
+                        is not int
+                    ):
+                        raise ModelValidationError(
+                            "proof stream artifact binding is inconsistent"
+                        )
+                    stream_artifact_ids.add(artifact.id)
+                    run_stream_artifact_ids.add(artifact.id)
+                    ordered_artifact_ids.append(artifact.id)
+                if (
+                    link_index.artifact_ids_by_source_run_id.get(
+                        observation.run_id,
+                        frozenset(),
+                    )
+                    != frozenset(run_stream_artifact_ids)
+                ):
+                    raise ModelValidationError(
+                        "proof Run has an unexpected linked artifact"
+                    )
+            ordered_artifact_ids.append(evaluation_artifact.id)
+            if experiment.artifact_ids != ordered_artifact_ids:
+                raise ModelValidationError(
+                    "proof artifact links are not exact or ordered"
+                )
+            candidate = candidates[recipe.candidate_id]
+            candidate_history = (
+                link_index.candidate_proof_run_ids.get(
+                    candidate.id,
+                    (),
+                )
+            )
+            positions = link_index.candidate_proof_run_positions.get(
+                candidate.id,
+                {},
+            )
+            observation_positions = tuple(
+                positions.get(run_id)
+                for run_id in observation_run_ids
+            )
+            if (
+                len(positions) != len(candidate_history)
+                or any(
+                    position is None
+                    for position in observation_positions
+                )
+                or observation_positions
+                != tuple(
+                    range(
+                        observation_positions[0],  # type: ignore[arg-type]
+                        observation_positions[0] + 6,  # type: ignore[operator]
+                    )
+                )
+            ):
+                raise ModelValidationError(
+                    "candidate proof history lacks a contiguous evaluation"
+                )
+            structural_evaluation_failure = any(
+                failure.code
+                not in _REV_PROOF_SEMANTIC_FALSIFICATION_CODES
+                for failure in evaluation.failures
+            )
+            evaluated_slices_by_candidate.setdefault(
+                candidate.id,
+                {},
+            )[observation_run_ids] = evaluation.passed
+            if evaluation.passed:
+                passing_slices_by_candidate.setdefault(
+                    candidate.id,
+                    set(),
+                ).add(observation_run_ids)
+                if (
+                    experiment.status is not ExperimentStatus.COMPLETED
+                ):
+                    raise ModelValidationError(
+                        "confirmed proof is not atomically promoted"
+                    )
+            else:
+                expected_experiment_status = (
+                    ExperimentStatus.FAILED
+                    if structural_evaluation_failure
+                    else ExperimentStatus.COMPLETED
+                )
+                if (
+                    experiment.status is not expected_experiment_status
+                ):
+                    raise ModelValidationError(
+                        "inconclusive proof has invalid terminal state"
+                    )
+        except (
+            KeyError,
+            IndexError,
+            ModelValidationError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} is invalid: {error}")
+    accepted_submission_candidate_ids = {
+        submission.candidate_id
+        for submission in state.submissions
+        if submission.status is SubmissionStatus.ACCEPTED
+        and submission.proof_passed is True
+    }
+    rejected_submission_candidate_ids = {
+        submission.candidate_id
+        for submission in state.submissions
+        if submission.status is SubmissionStatus.REJECTED
+        and submission.proof_passed is True
+    }
+    for candidate_id in evaluated_slices_by_candidate:
+        candidate = candidates.get(candidate_id)
+        if candidate is None:
+            continue
+        passing_slices = passing_slices_by_candidate.get(
+            candidate_id,
+            set(),
+        )
+        latest_slice = tuple(candidate.proof_run_ids[-6:])
+        if candidate.status is CandidateStatus.READY_TO_SUBMIT:
+            ready_challenge_state = (
+                state.status is ChallengeStatus.READY_TO_SUBMIT
+                or state.status is ChallengeStatus.SOLVED
+                or (
+                    state.status is ChallengeStatus.PAUSED
+                    and state.resume_status
+                    is ChallengeStatus.READY_TO_SUBMIT
+                )
+                or state.status is ChallengeStatus.ABANDONED
+            )
+            if (
+                not ready_challenge_state
+                or latest_slice not in passing_slices
+            ):
+                errors.append(
+                    f"Rev stdin proof candidate {candidate_id} READY state "
+                    "does not match its latest passing evaluation"
+                )
+        elif candidate.status is CandidateStatus.ACCEPTED:
+            if (
+                state.status is not ChallengeStatus.SOLVED
+                or latest_slice not in passing_slices
+                or candidate_id
+                not in accepted_submission_candidate_ids
+            ):
+                errors.append(
+                    f"Rev stdin proof candidate {candidate_id} ACCEPTED "
+                    "state does not match its latest passing evaluation"
+                )
+        elif candidate.status is CandidateStatus.REJECTED:
+            if candidate_id not in rejected_submission_candidate_ids:
+                errors.append(
+                    f"Rev stdin proof candidate {candidate_id} REJECTED "
+                    "state lacks its manual false-proof outcome"
+                )
+    return errors
+
+
 @dataclass
 class ChallengeState:
     contest_id: str
@@ -5412,7 +6358,10 @@ class ChallengeState:
                             f"proof experiment {experiment.id} source run "
                             "is not linked by its source experiment"
                         )
-                    else:
+                    elif (
+                        recipe.policy.oracle_protocol
+                        != _REV_STDIN_PROOF_PROTOCOL
+                    ):
                         try:
                             source_argv = tuple(
                                 shlex.split(source_experiment.command)
@@ -5660,22 +6609,44 @@ class ChallengeState:
                             f"proof experiment {experiment.id} exceeds the "
                             f"{MAX_PROOF_ATTEMPTS}-attempt proof limit"
                         )
-                    if (
-                        policy.oracle_protocol
-                        != "remote_pwn_replay_negative_control_v1"
-                    ):
+                    if policy.oracle_protocol not in {
+                        _PWN_PROOF_PROTOCOL,
+                        _REV_STDIN_PROOF_PROTOCOL,
+                    }:
                         errors.append(
                             f"proof experiment {experiment.id} uses an "
                             "unsupported oracle protocol"
                         )
-                    if (
+                    if policy.oracle_protocol == _PWN_PROOF_PROTOCOL and (
                         policy.mode != "success_distribution"
                         or policy.negative_control_repetitions != 1
                         or recipe.network_endpoint is None
+                        or recipe.oracle_binding is not None
                     ):
                         errors.append(
                             f"proof experiment {experiment.id} lacks the "
                             "required remote negative-control policy"
+                        )
+                    if (
+                        policy.oracle_protocol
+                        == _REV_STDIN_PROOF_PROTOCOL
+                        and (
+                            policy.mode != "deterministic"
+                            or policy.clean_repetitions != 3
+                            or policy.remote_repetitions != 0
+                            or policy.trial_count != 0
+                            or policy.negative_control_repetitions != 3
+                            or policy.negative_control_timeout_seconds != 30
+                            or policy.minimum_success_rate is not None
+                            or recipe.network_target_id is not None
+                            or recipe.network_target_generation is not None
+                            or recipe.network_endpoint is not None
+                            or recipe.oracle_binding is None
+                        )
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} lacks the "
+                            "required deterministic Rev stdin policy"
                         )
                     if policy.policy_sha256 != policy.computed_sha256():
                         errors.append(
@@ -5803,6 +6774,154 @@ class ChallengeState:
                             f"proof experiment {experiment.id} inputs exceed "
                             "the aggregate managed proof byte limit"
                         )
+                    if policy.oracle_protocol == _PWN_PROOF_PROTOCOL and any(
+                        proof_input.purpose
+                        not in _PWN_PROOF_RECIPE_INPUT_PURPOSES
+                        for proof_input in recipe.inputs
+                    ):
+                        errors.append(
+                            f"proof experiment {experiment.id} uses a "
+                            "non-Pwn proof input purpose"
+                        )
+                    if policy.oracle_protocol == _REV_STDIN_PROOF_PROTOCOL:
+                        binding = recipe.oracle_binding
+                        expected_argv: tuple[str, ...] = ()
+                        if binding is not None:
+                            source_locator = binding.source_binding.get(
+                                "path"
+                            )
+                            if isinstance(source_locator, str):
+                                expected_argv = (
+                                    *_REV_STDIN_RUNNER_PREFIX,
+                                    f"/challenge/{source_locator}",
+                                    *_REV_STDIN_RUNNER_INPUT_SUFFIX,
+                                )
+                            inventory_experiment = experiments.get(
+                                binding.inventory_experiment_id
+                            )
+                            inventory_run = runs.get(
+                                binding.inventory_run_id
+                            )
+                            inventory_stdout = artifacts.get(
+                                binding.inventory_stdout_artifact_id
+                            )
+                            inventory_result = (
+                                inventory_experiment.result
+                                if inventory_experiment is not None
+                                else None
+                            )
+                            inventory_outcome = (
+                                inventory_result.get("partial_oracle")
+                                if isinstance(
+                                    inventory_result,
+                                    Mapping,
+                                )
+                                else None
+                            )
+                            semantic_result = (
+                                inventory_outcome.get("result")
+                                if isinstance(
+                                    inventory_outcome,
+                                    Mapping,
+                                )
+                                else None
+                            )
+                            inventory_receipt = (
+                                receipts.get(
+                                    inventory_result.get("receipt_id")
+                                )
+                                if isinstance(
+                                    inventory_result,
+                                    Mapping,
+                                )
+                                and isinstance(
+                                    inventory_result.get("receipt_id"),
+                                    str,
+                                )
+                                else None
+                            )
+                            if (
+                                binding.protocol
+                                != _REV_STDIN_PROOF_PROTOCOL
+                                or binding.budget_deadline_utc
+                                != self.budget.deadline_utc
+                                or binding.source_binding.get(
+                                    "manifest_sha256"
+                                )
+                                != recipe.source_manifest_sha256
+                                or inventory_experiment is None
+                                or inventory_experiment.status
+                                is not ExperimentStatus.COMPLETED
+                                or inventory_run is None
+                                or inventory_run.status
+                                is not RunStatus.COMPLETED
+                                or inventory_run.origin
+                                is not RunOrigin.MANAGED_TOOL
+                                or inventory_run.extra.get("experiment_id")
+                                != binding.inventory_experiment_id
+                                or not isinstance(
+                                    inventory_result,
+                                    Mapping,
+                                )
+                                or inventory_result.get("run_id")
+                                != binding.inventory_run_id
+                                or binding.source_binding
+                                != inventory_experiment.extra.get(
+                                    "source_binding"
+                                )
+                                or binding.source_snapshot
+                                != inventory_experiment.extra.get(
+                                    "source_snapshot"
+                                )
+                                or not isinstance(
+                                    semantic_result,
+                                    Mapping,
+                                )
+                                or semantic_result.get("verdict")
+                                != "CONFIRMED"
+                                or not isinstance(
+                                    inventory_outcome,
+                                    Mapping,
+                                )
+                                or inventory_outcome.get(
+                                    "stdout_artifact_id"
+                                )
+                                != binding.inventory_stdout_artifact_id
+                                or inventory_receipt is None
+                                or inventory_receipt.run_id
+                                != binding.inventory_run_id
+                                or inventory_receipt.experiment_id
+                                != binding.inventory_experiment_id
+                                or inventory_receipt.stdout_artifact_id
+                                != binding.inventory_stdout_artifact_id
+                                or inventory_stdout is None
+                                or inventory_stdout.source_run_id
+                                != binding.inventory_run_id
+                                or inventory_stdout.sha256
+                                != binding.inventory_stdout_sha256
+                                or type(inventory_stdout.size) is not int
+                                or inventory_stdout.size
+                                != binding.inventory_stdout_size_bytes
+                            ):
+                                errors.append(
+                                    f"proof experiment {experiment.id} has "
+                                    "an invalid Rev inventory binding"
+                                )
+                        if (
+                            len(recipe.inputs) != 1
+                            or recipe.inputs[0].purpose != "accepted_input"
+                            or recipe.inputs[0].destination
+                            != _REV_STDIN_ACCEPTED_INPUT_DESTINATION
+                            or type(recipe.inputs[0].size) is not int
+                            or recipe.inputs[0].size < 0
+                            or recipe.inputs[0].size
+                            > _REV_STDIN_MAX_ACCEPTED_INPUT_BYTES
+                            or recipe.argv != expected_argv
+                        ):
+                            errors.append(
+                                f"proof experiment {experiment.id} has an "
+                                "invalid Rev accepted-input recipe"
+                            )
                 elif experiment.proof_recipe is not None:
                     errors.append(
                         f"{experiment.kind.value} experiment "
@@ -6200,6 +7319,14 @@ class ChallengeState:
                     facts=facts,
                 )
             )
+            errors.extend(
+                _rev_proof_state_errors(
+                    self,
+                    runs=runs,
+                    artifacts=artifacts,
+                    candidates=candidates,
+                )
+            )
         if errors:
             raise ModelValidationError("; ".join(errors))
 
@@ -6276,6 +7403,7 @@ __all__ = [
     "ProofRecipeInput",
     "Provenance",
     "ReceiptOutcome",
+    "RevStdinOracleBinding",
     "RunReference",
     "RunOrigin",
     "RunStatus",

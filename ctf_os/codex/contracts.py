@@ -175,6 +175,7 @@ PROOF_INPUT_PURPOSE_VALUES = (
     "fixture",
     "variant_generator",
     "verifier",
+    "accepted_input",
 )
 GOAL_ACTION_VALUES = ("create", "activate", "complete", "block", "park")
 HYPOTHESIS_STATUS_VALUES = ("open", "supported", "refuted", "confirmed")

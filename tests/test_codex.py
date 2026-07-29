@@ -471,6 +471,20 @@ class ContractTests(unittest.TestCase):
             set(proof["properties"]["inputs"]["items"]["properties"]),
             {"artifact_id", "purpose"},
         )
+        purpose_values = proof["properties"]["inputs"]["items"][
+            "properties"
+        ]["purpose"]["enum"]
+        self.assertIn("accepted_input", purpose_values)
+        rev_payload = copy.deepcopy(payload)
+        rev_payload["actions"][0]["inputs"][0][
+            "purpose"
+        ] = "accepted_input"
+        result = validate_role_output(
+            rev_payload,
+            Role.REPRODUCER,
+            contract_version=2,
+        )
+        self.assertTrue(result.valid, result.errors)
 
         wrong_role = copy.deepcopy(payload)
         wrong_role["role"] = Role.VALIDATOR.value
