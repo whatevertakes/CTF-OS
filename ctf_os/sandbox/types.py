@@ -488,6 +488,126 @@ class SandboxResult:
     stderr_bytes: int
     stdout_path: str
     stderr_path: str
+    # ``ctfwrap`` records richer stream-capture metadata than the original
+    # SandboxResult contract exposed.  Keep these fields optional so older
+    # sandbox daemons and positional test doubles remain compatible while new
+    # callers can distinguish a complete stream from one retained prefix.
+    stdout_stored_bytes: int | None = None
+    stderr_stored_bytes: int | None = None
+    stdout_limit_bytes: int | None = None
+    stderr_limit_bytes: int | None = None
+    stdout_truncated: bool | None = None
+    stderr_truncated: bool | None = None
+    stdout_truncation_known: bool = False
+    stderr_truncation_known: bool = False
+    stdout_capture_complete: bool = False
+    stderr_capture_complete: bool = False
+    stdout_summary_truncated: bool = False
+    stderr_summary_truncated: bool = False
+    stdout_error: str | None = None
+    stderr_error: str | None = None
+    stream_capture_error: str | None = None
+    orchestration_error: str | None = None
+
+
+def sandbox_result_from_mapping(
+    value: Mapping[str, object],
+    *,
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
+) -> SandboxResult:
+    """Decode one backward-compatible ``ctfwrap`` result mapping.
+
+    The required fields retain the original wire contract.  Optional capture
+    metadata is strict when present: accepting strings such as ``"false"`` as
+    booleans would turn an incomplete capture into apparently complete
+    evidence.
+    """
+
+    def optional_int(name: str) -> int | None:
+        raw = value.get(name)
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ValueError(f"{name} must be a non-negative integer or null")
+        return raw
+
+    def optional_bool(
+        name: str,
+        *,
+        default: bool = False,
+        nullable: bool = False,
+    ) -> bool | None:
+        if name not in value:
+            return None if nullable else default
+        raw = value[name]
+        if raw is None and nullable:
+            return None
+        if not isinstance(raw, bool):
+            raise ValueError(f"{name} must be a boolean")
+        return raw
+
+    def optional_text(name: str) -> str | None:
+        raw = value.get(name)
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError(f"{name} must be a string or null")
+        return raw
+
+    selected_stdout_path = (
+        stdout_path if stdout_path is not None else str(value["stdout_path"])
+    )
+    selected_stderr_path = (
+        stderr_path if stderr_path is not None else str(value["stderr_path"])
+    )
+    return SandboxResult(
+        run_id=str(value["run_id"]),
+        status=str(value["status"]),
+        exit_code=int(value["exit_code"]),
+        timed_out=bool(value["timed_out"]),
+        duration_ms=int(value["duration_ms"]),
+        stdout_summary=str(value["stdout_summary"]),
+        stderr_summary=str(value["stderr_summary"]),
+        stdout_bytes=int(value["stdout_bytes"]),
+        stderr_bytes=int(value["stderr_bytes"]),
+        stdout_path=selected_stdout_path,
+        stderr_path=selected_stderr_path,
+        stdout_stored_bytes=optional_int("stdout_stored_bytes"),
+        stderr_stored_bytes=optional_int("stderr_stored_bytes"),
+        stdout_limit_bytes=optional_int("stdout_limit_bytes"),
+        stderr_limit_bytes=optional_int("stderr_limit_bytes"),
+        stdout_truncated=optional_bool(
+            "stdout_truncated",
+            nullable=True,
+        ),
+        stderr_truncated=optional_bool(
+            "stderr_truncated",
+            nullable=True,
+        ),
+        stdout_truncation_known=bool(
+            optional_bool("stdout_truncation_known")
+        ),
+        stderr_truncation_known=bool(
+            optional_bool("stderr_truncation_known")
+        ),
+        stdout_capture_complete=bool(
+            optional_bool("stdout_capture_complete")
+        ),
+        stderr_capture_complete=bool(
+            optional_bool("stderr_capture_complete")
+        ),
+        stdout_summary_truncated=bool(
+            optional_bool("stdout_summary_truncated")
+        ),
+        stderr_summary_truncated=bool(
+            optional_bool("stderr_summary_truncated")
+        ),
+        stdout_error=optional_text("stdout_error"),
+        stderr_error=optional_text("stderr_error"),
+        stream_capture_error=optional_text("stream_capture_error"),
+        orchestration_error=optional_text("orchestration_error"),
+    )
 
 
 @dataclass(frozen=True, slots=True)

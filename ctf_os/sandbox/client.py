@@ -37,6 +37,7 @@ from .types import (
     SandboxError,
     SandboxResult,
     ScopeError,
+    sandbox_result_from_mapping,
     validate_deadline_monotonic_seconds,
 )
 
@@ -400,19 +401,7 @@ def result_from_dict(value: object) -> SandboxResult:
     if not isinstance(value, dict):
         raise SandboxError("sandbox result must be an object")
     try:
-        return SandboxResult(
-            run_id=str(value["run_id"]),
-            status=str(value["status"]),
-            exit_code=int(value["exit_code"]),
-            timed_out=bool(value["timed_out"]),
-            duration_ms=int(value["duration_ms"]),
-            stdout_summary=str(value["stdout_summary"]),
-            stderr_summary=str(value["stderr_summary"]),
-            stdout_bytes=int(value["stdout_bytes"]),
-            stderr_bytes=int(value["stderr_bytes"]),
-            stdout_path=str(value["stdout_path"]),
-            stderr_path=str(value["stderr_path"]),
-        )
+        return sandbox_result_from_mapping(value)
     except (KeyError, TypeError, ValueError) as error:
         raise SandboxError("invalid sandbox result") from error
 

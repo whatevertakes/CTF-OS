@@ -1277,6 +1277,22 @@ class SandboxTests(unittest.TestCase):
             "stderr_summary": "",
             "stdout_bytes": 2,
             "stderr_bytes": 0,
+            "stdout_stored_bytes": 2,
+            "stderr_stored_bytes": 0,
+            "stdout_limit_bytes": 4096,
+            "stderr_limit_bytes": 4096,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_truncation_known": True,
+            "stderr_truncation_known": True,
+            "stdout_capture_complete": True,
+            "stderr_capture_complete": True,
+            "stdout_summary_truncated": False,
+            "stderr_summary_truncated": False,
+            "stdout_error": None,
+            "stderr_error": None,
+            "stream_capture_error": None,
+            "orchestration_error": None,
             "stdout_path": "/work/.ctf/runs/run-00000001/stdout.log",
             "stderr_path": "/work/.ctf/runs/run-00000001/stderr.log",
         }
@@ -1293,6 +1309,12 @@ class SandboxTests(unittest.TestCase):
         backend = DockerSandboxBackend(self.scope_a, runner=fake_runner)
         result = backend.run(CommandSpec(("sleep", "1")))
         self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout_stored_bytes, 2)
+        self.assertEqual(result.stdout_limit_bytes, 4096)
+        self.assertIs(result.stdout_truncated, False)
+        self.assertTrue(result.stdout_truncation_known)
+        self.assertTrue(result.stdout_capture_complete)
+        self.assertFalse(result.stdout_summary_truncated)
         self.assertEqual(len(calls), 1)
         command = calls[0]
         self.assertEqual(command[:2], ["docker", "run"])

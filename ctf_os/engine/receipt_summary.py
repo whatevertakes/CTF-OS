@@ -1,0 +1,544 @@
+"""Bounded, deterministic summaries of immutable tool stream evidence.
+
+Raw stdout and stderr stay in hash-addressed artifacts.  This module exposes
+only small, credential-redacted head/tail excerpts for later model context.
+It deliberately never trusts ``SandboxResult.stdout_summary``: ctfwrap's
+summary is a tail of the fully drained stream, while the durable artifact can
+be a size-limited prefix.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+from pathlib import Path
+from typing import Literal, Mapping
+
+from ctf_os.sandbox.files import (
+    DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+    SafeFileError,
+    normalize_locator,
+)
+from ctf_os.sandbox.types import SandboxResult
+from ctf_os.terminal import terminal_safe
+
+StreamName = Literal["stdout", "stderr"]
+
+RECEIPT_SAMPLE_BYTES = 256
+MAX_RECEIPT_SAMPLE_BYTES = 1024
+MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
+MAX_RECEIPT_STREAM_EVIDENCE_BYTES = 4096
+MAX_RECEIPT_PREVIEW_CHARS = 160
+MAX_RECEIPT_ARTIFACT_ID_CHARS = 256
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?im)"
+    r"(\b(?:"
+    r"authorization|proxy-authorization|cookie|set-cookie|"
+    r"password|passwd|secret|client_secret|api[_-]?key|"
+    r"access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"session(?:[_-]?(?:id|key|token|cookie|secret))?"
+    r")\b[ \t]*[:=][ \t]*)"
+    r"([^\r\n]*)"
+)
+_BEARER = re.compile(
+    r"(?i)(\bbearer[ \t]+)[A-Za-z0-9._~+/=-]{4,}"
+)
+_JWT = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{4,}\."
+    r"[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"
+)
+_CREDENTIAL_QUERY = re.compile(
+    r"(?i)"
+    r"([?&](?:"
+    r"access_token|refresh_token|token|api[_-]?key|"
+    r"secret|password|passwd"
+    r")=)"
+    r"[^&#\s]*"
+)
+_URL_USERINFO = re.compile(
+    r"(?i)(\b[a-z][a-z0-9+.-]*://)"
+    r"[^/\s:@]+:[^/\s@]+@"
+)
+_PRIVATE_KEY = re.compile(
+    r"(?is)"
+    r"-----BEGIN[ \t]+[A-Z0-9 ]*PRIVATE KEY-----"
+    r".*?"
+    r"(?:-----END[ \t]+[A-Z0-9 ]*PRIVATE KEY-----|$)"
+)
+
+
+class ReceiptSummaryError(ValueError):
+    """An immutable stream artifact cannot support a trustworthy summary."""
+
+
+def _validate_artifact_identity(
+    artifact_id: str,
+    artifact_path: str,
+    artifact_sha256: str,
+) -> tuple[str, str, str]:
+    if (
+        not isinstance(artifact_id, str)
+        or not artifact_id
+        or len(artifact_id) > MAX_RECEIPT_ARTIFACT_ID_CHARS
+        or any(ord(character) < 0x20 for character in artifact_id)
+    ):
+        raise ReceiptSummaryError("artifact_id is not a bounded identifier")
+    try:
+        normalized_path = normalize_locator(artifact_path)
+    except SafeFileError as error:
+        raise ReceiptSummaryError("artifact_path is not a safe locator") from error
+    normalized_sha256 = str(artifact_sha256).lower()
+    if not _SHA256.fullmatch(normalized_sha256):
+        raise ReceiptSummaryError("artifact_sha256 is not a SHA-256 digest")
+    return artifact_id, normalized_path, normalized_sha256
+
+
+def _read_verified_samples(
+    snapshot_path: Path,
+    *,
+    expected_sha256: str,
+    sample_bytes: int,
+    maximum_snapshot_bytes: int,
+) -> tuple[int, bytes, bytes]:
+    if (
+        isinstance(sample_bytes, bool)
+        or not isinstance(sample_bytes, int)
+        or not 1 <= sample_bytes <= MAX_RECEIPT_SAMPLE_BYTES
+    ):
+        raise ReceiptSummaryError(
+            f"sample_bytes must be between 1 and {MAX_RECEIPT_SAMPLE_BYTES}"
+        )
+    if (
+        isinstance(maximum_snapshot_bytes, bool)
+        or not isinstance(maximum_snapshot_bytes, int)
+        or not 1
+        <= maximum_snapshot_bytes
+        <= DEFAULT_STREAM_CAPTURE_MAX_BYTES
+    ):
+        raise ReceiptSummaryError(
+            "maximum_snapshot_bytes is outside the stream capture bound"
+        )
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(Path(snapshot_path), flags)
+    except OSError as error:
+        raise ReceiptSummaryError(
+            "immutable stream snapshot cannot be opened safely"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ReceiptSummaryError(
+                "immutable stream snapshot is not a regular file"
+            )
+        if before.st_mode & 0o222:
+            raise ReceiptSummaryError(
+                "stream snapshot is writable instead of immutable"
+            )
+        if not 0 <= before.st_size <= maximum_snapshot_bytes:
+            raise ReceiptSummaryError(
+                "stream snapshot exceeds the receipt summary bound"
+            )
+
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            block = os.pread(
+                descriptor,
+                min(1024 * 1024, before.st_size - offset),
+                offset,
+            )
+            if not block:
+                raise ReceiptSummaryError(
+                    "stream snapshot ended before its recorded size"
+                )
+            digest.update(block)
+            offset += len(block)
+
+        head_size = min(sample_bytes, before.st_size)
+        head = os.pread(descriptor, head_size, 0)
+        if len(head) != head_size:
+            raise ReceiptSummaryError("cannot read stream snapshot head")
+        if before.st_size <= sample_bytes * 2:
+            tail = b""
+        else:
+            tail = os.pread(
+                descriptor,
+                sample_bytes,
+                before.st_size - sample_bytes,
+            )
+            if len(tail) != sample_bytes:
+                raise ReceiptSummaryError("cannot read stream snapshot tail")
+
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise ReceiptSummaryError(
+                "stream snapshot changed while it was summarized"
+            )
+        if digest.hexdigest() != expected_sha256:
+            raise ReceiptSummaryError("stream snapshot SHA-256 mismatch")
+        return before.st_size, head, tail
+    finally:
+        os.close(descriptor)
+
+
+def _json_string_size(value: str) -> int:
+    return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
+
+
+def _bounded_json_text(
+    value: str,
+    maximum_json_chars: int = MAX_RECEIPT_EXCERPT_JSON_CHARS,
+) -> tuple[str, bool]:
+    if _json_string_size(value) <= maximum_json_chars:
+        return value, False
+    suffix = "…"
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = value[:middle] + suffix
+        if _json_string_size(candidate) <= maximum_json_chars:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low] + suffix, True
+
+
+def _redact_credentials(value: str) -> tuple[str, int]:
+    redactions = 0
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return match.group(1) + "[REDACTED]"
+
+    def replace_one(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return match.group(1) + "[REDACTED]"
+
+    def replace_jwt(_match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return "[REDACTED_JWT]"
+
+    def replace_private_key(_match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return "[REDACTED_PRIVATE_KEY]"
+
+    result = _PRIVATE_KEY.sub(replace_private_key, value)
+    result = _CREDENTIAL_ASSIGNMENT.sub(replace_assignment, result)
+    result = _BEARER.sub(replace_one, result)
+    result = _JWT.sub(replace_jwt, result)
+    result = _CREDENTIAL_QUERY.sub(replace_one, result)
+    result = _URL_USERINFO.sub(replace_one, result)
+    return result, redactions
+
+
+def _text_sample(value: bytes) -> tuple[str | None, int]:
+    if not value:
+        return "", 0
+    try:
+        decoded = value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None, 0
+    disallowed_controls = sum(
+        1
+        for character in decoded
+        if (
+            ord(character) < 0x20
+            and character not in {"\n", "\r", "\t"}
+        )
+        or 0x7F <= ord(character) <= 0x9F
+    )
+    if "\x00" in decoded or disallowed_controls * 20 > max(1, len(decoded)):
+        return None, 0
+    redacted, redactions = _redact_credentials(decoded)
+    return terminal_safe(redacted, multiline=True), redactions
+
+
+def _sample_record(
+    payload: bytes,
+    *,
+    byte_start: int,
+    byte_end: int,
+) -> tuple[dict[str, object], int, bool]:
+    text, redactions = _text_sample(payload)
+    if text is None:
+        return (
+            {
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+                "encoding": "binary-omitted",
+                "sample_sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            redactions,
+            True,
+        )
+    bounded, truncated = _bounded_json_text(text)
+    return (
+        {
+            "byte_start": byte_start,
+            "byte_end": byte_end,
+            "encoding": "utf-8",
+            "text": bounded,
+            "text_truncated": truncated,
+        },
+        redactions,
+        False,
+    )
+
+
+def _stream_metadata(
+    result: SandboxResult,
+    stream: StreamName,
+    *,
+    stored_bytes: int,
+) -> dict[str, object]:
+    drained_bytes = getattr(result, f"{stream}_bytes")
+    reported_stored_bytes = getattr(result, f"{stream}_stored_bytes")
+    limit_bytes = getattr(result, f"{stream}_limit_bytes")
+    truncated = getattr(result, f"{stream}_truncated")
+    truncation_known = getattr(result, f"{stream}_truncation_known")
+    capture_complete = getattr(result, f"{stream}_capture_complete")
+    summary_truncated = getattr(result, f"{stream}_summary_truncated")
+    stream_error = getattr(result, f"{stream}_error")
+
+    for name, number in (
+        ("drained_bytes", drained_bytes),
+        ("reported_stored_bytes", reported_stored_bytes),
+        ("limit_bytes", limit_bytes),
+    ):
+        if number is not None and (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 0
+        ):
+            raise ReceiptSummaryError(f"{stream} {name} is invalid")
+    if stored_bytes > drained_bytes:
+        raise ReceiptSummaryError(
+            f"{stream} immutable snapshot exceeds drained byte count"
+        )
+    if (
+        reported_stored_bytes is not None
+        and reported_stored_bytes != stored_bytes
+    ):
+        raise ReceiptSummaryError(
+            f"{stream} stored byte count does not match immutable snapshot"
+        )
+    if limit_bytes is not None and stored_bytes > limit_bytes:
+        raise ReceiptSummaryError(
+            f"{stream} immutable snapshot exceeds its capture limit"
+        )
+    if truncation_known and truncated is None:
+        raise ReceiptSummaryError(
+            f"{stream} truncation is marked known without a value"
+        )
+    if capture_complete and not truncation_known:
+        raise ReceiptSummaryError(
+            f"{stream} complete capture has unknown truncation state"
+        )
+    if truncation_known:
+        expected_truncated = drained_bytes > stored_bytes
+        if truncated is not expected_truncated:
+            raise ReceiptSummaryError(
+                f"{stream} truncation metadata is inconsistent"
+            )
+
+    if capture_complete and not truncated and stored_bytes == drained_bytes:
+        coverage = "complete_stream"
+    elif stored_bytes < drained_bytes:
+        coverage = "retained_prefix_only"
+    elif not capture_complete and (
+        reported_stored_bytes is not None or stream_error is not None
+    ):
+        coverage = "incomplete_capture"
+    else:
+        coverage = "unknown"
+
+    return {
+        "drained_bytes": drained_bytes,
+        "stored_bytes": stored_bytes,
+        "limit_bytes": limit_bytes,
+        "capture_complete": capture_complete,
+        "truncation_known": truncation_known,
+        "truncated": truncated,
+        "coverage": coverage,
+        # The ctfwrap tail is intentionally not copied into evidence.  Keep
+        # only its completeness bit for diagnostics.
+        "transport_summary_truncated": summary_truncated,
+        "stream_error_present": stream_error is not None,
+        "capture_error_present": result.stream_capture_error is not None,
+    }
+
+
+def summarize_stream_snapshot(
+    snapshot_path: Path,
+    *,
+    artifact_id: str,
+    artifact_path: str,
+    artifact_sha256: str,
+    result: SandboxResult,
+    stream: StreamName,
+    sample_bytes: int = RECEIPT_SAMPLE_BYTES,
+    maximum_snapshot_bytes: int = DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+) -> dict[str, object]:
+    """Return one self-contained, pointer-backed stream evidence record."""
+
+    if stream not in {"stdout", "stderr"}:
+        raise ReceiptSummaryError("stream must be stdout or stderr")
+    (
+        normalized_artifact_id,
+        normalized_artifact_path,
+        normalized_sha256,
+    ) = _validate_artifact_identity(
+        artifact_id,
+        artifact_path,
+        artifact_sha256,
+    )
+    stored_bytes, head_payload, tail_payload = _read_verified_samples(
+        snapshot_path,
+        expected_sha256=normalized_sha256,
+        sample_bytes=sample_bytes,
+        maximum_snapshot_bytes=maximum_snapshot_bytes,
+    )
+    head, head_redactions, head_binary = _sample_record(
+        head_payload,
+        byte_start=0,
+        byte_end=len(head_payload),
+    )
+    tail: dict[str, object] | None = None
+    tail_redactions = 0
+    tail_binary = False
+    if tail_payload:
+        tail_start = stored_bytes - len(tail_payload)
+        tail, tail_redactions, tail_binary = _sample_record(
+            tail_payload,
+            byte_start=tail_start,
+            byte_end=stored_bytes,
+        )
+
+    metadata = _stream_metadata(
+        result,
+        stream,
+        stored_bytes=stored_bytes,
+    )
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "stream": stream,
+        "artifact_id": normalized_artifact_id,
+        "path": normalized_artifact_path,
+        "sha256": normalized_sha256,
+        **metadata,
+        "sample_policy": "immutable_snapshot_head_tail",
+        "head": head,
+        "tail": tail,
+        "omitted_stored_bytes": max(
+            0,
+            stored_bytes - len(head_payload) - len(tail_payload),
+        ),
+        "redaction_count": head_redactions + tail_redactions,
+        "binary_sample_omitted": head_binary or tail_binary,
+    }
+    encoded = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("ascii")
+    if len(encoded) > MAX_RECEIPT_STREAM_EVIDENCE_BYTES:
+        raise ReceiptSummaryError(
+            "stream evidence exceeds its serialized size bound"
+        )
+    return evidence
+
+
+def build_receipt_preview(
+    *,
+    exit_code: int | None,
+    stdout_bytes: int,
+    stderr_bytes: int,
+    stdout_evidence: Mapping[str, object] | None = None,
+    stderr_evidence: Mapping[str, object] | None = None,
+    maximum_chars: int = MAX_RECEIPT_PREVIEW_CHARS,
+) -> str:
+    """Build the legacy one-line preview from already-sanitized evidence."""
+
+    if (
+        isinstance(maximum_chars, bool)
+        or not isinstance(maximum_chars, int)
+        or not 32 <= maximum_chars <= MAX_RECEIPT_PREVIEW_CHARS
+    ):
+        raise ReceiptSummaryError(
+            f"maximum_chars must be between 32 and "
+            f"{MAX_RECEIPT_PREVIEW_CHARS}"
+        )
+    for label, value in (
+        ("stdout_bytes", stdout_bytes),
+        ("stderr_bytes", stderr_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReceiptSummaryError(f"{label} must be a non-negative integer")
+
+    preview = (
+        f"exit={exit_code if exit_code is not None else 'unknown'}; "
+        f"stdout_bytes={stdout_bytes}; stderr_bytes={stderr_bytes}"
+    )
+    for stream, evidence in (
+        ("stdout", stdout_evidence),
+        ("stderr", stderr_evidence),
+    ):
+        if not isinstance(evidence, Mapping):
+            continue
+        for sample_name in ("head", "tail"):
+            sample = evidence.get(sample_name)
+            if not isinstance(sample, Mapping):
+                continue
+            text = sample.get("text")
+            if not isinstance(text, str):
+                continue
+            line = next(
+                (
+                    part.strip()
+                    for part in text.splitlines()
+                    if part.strip()
+                ),
+                "",
+            )
+            if line:
+                preview += f"; {stream}={line}"
+                return preview[:maximum_chars]
+    return preview[:maximum_chars]
+
+
+__all__ = [
+    "MAX_RECEIPT_PREVIEW_CHARS",
+    "MAX_RECEIPT_SAMPLE_BYTES",
+    "MAX_RECEIPT_STREAM_EVIDENCE_BYTES",
+    "RECEIPT_SAMPLE_BYTES",
+    "ReceiptSummaryError",
+    "build_receipt_preview",
+    "summarize_stream_snapshot",
+]

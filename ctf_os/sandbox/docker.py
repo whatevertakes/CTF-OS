@@ -68,6 +68,7 @@ from .types import (
     SandboxResult,
     ScopeError,
     ensure_foreground_command,
+    sandbox_result_from_mapping,
     validate_deadline_monotonic_seconds,
 )
 
@@ -1052,19 +1053,7 @@ class DockerSandboxBackend:
             if value.get("kind") != "run_result":
                 raise SandboxError("ctfwrap returned the wrong result kind")
             try:
-                sandbox_result = SandboxResult(
-                    run_id=str(value["run_id"]),
-                    status=str(value["status"]),
-                    exit_code=int(value["exit_code"]),
-                    timed_out=bool(value["timed_out"]),
-                    duration_ms=int(value["duration_ms"]),
-                    stdout_summary=str(value["stdout_summary"]),
-                    stderr_summary=str(value["stderr_summary"]),
-                    stdout_bytes=int(value["stdout_bytes"]),
-                    stderr_bytes=int(value["stderr_bytes"]),
-                    stdout_path=str(value["stdout_path"]),
-                    stderr_path=str(value["stderr_path"]),
-                )
+                sandbox_result = sandbox_result_from_mapping(value)
             except (KeyError, TypeError, ValueError) as error:
                 raise SandboxError("ctfwrap returned an invalid result") from error
         self._remaining_hard_deadline(
@@ -1621,16 +1610,8 @@ class DockerSandboxBackend:
                     proof_locator = (
                         f"/work/proof/{proof_destination.name}"
                     )
-                    return SandboxResult(
-                        run_id=run_id,
-                        status=str(value["status"]),
-                        exit_code=int(value["exit_code"]),
-                        timed_out=bool(value["timed_out"]),
-                        duration_ms=int(value["duration_ms"]),
-                        stdout_summary=str(value["stdout_summary"]),
-                        stderr_summary=str(value["stderr_summary"]),
-                        stdout_bytes=int(value["stdout_bytes"]),
-                        stderr_bytes=int(value["stderr_bytes"]),
+                    return sandbox_result_from_mapping(
+                        value,
                         stdout_path=f"{proof_locator}/stdout.log",
                         stderr_path=f"{proof_locator}/stderr.log",
                     )
