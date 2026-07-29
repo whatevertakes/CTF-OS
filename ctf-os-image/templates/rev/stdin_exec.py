@@ -8,12 +8,16 @@ candidates, models, success markers, or network targets.
 
 Linux and a mounted procfs are required.  Python in the image does not expose
 ``os.fexecve``, so the already-open ELF descriptor is executed through
-``/proc/self/fd/<fd>`` and kept across ``execve`` with ``pass_fds``.
+``/proc/self/fd/<fd>`` and kept across ``execve`` with ``pass_fds``.  Input is
+copied only to a verified, sealed memfd and reopened read-only; there is no
+pipe or mutable-file fallback.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
+import resource
 import signal
 import stat
 import subprocess
@@ -28,6 +32,7 @@ WORK_ROOT = Path("/work")
 MAX_ACCEPTED_INPUT_BYTES = 1024 * 1024
 MAX_ARGUMENT_BYTES = 4096
 MAX_COMPONENT_BYTES = 255
+_READ_CHUNK_BYTES = 64 * 1024
 USAGE = (
     "Usage: stdin_exec.py --binary /challenge/RELATIVE_ELF "
     "--input /work/RELATIVE_FILE"
@@ -42,6 +47,15 @@ FIXED_ENVIRONMENT = {
 
 _ARGUMENT_ERROR = 2
 _RUNNER_ERROR = 125
+# Linux UAPI constants are stable, but some standalone CPython builds omit
+# their symbolic names from ``fcntl`` even when the running kernel supports
+# memfd sealing.  The operations below still verify the kernel's actual result.
+_F_ADD_SEALS = getattr(fcntl, "F_ADD_SEALS", 1033)
+_F_GET_SEALS = getattr(fcntl, "F_GET_SEALS", 1034)
+_F_SEAL_SEAL = getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+_F_SEAL_SHRINK = getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+_F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
+_F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
 
 
 class StdinExecError(RuntimeError):
@@ -170,6 +184,236 @@ def _stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _read_stable_input(
+    descriptor: int,
+    before: os.stat_result,
+) -> bytes:
+    """Read one bounded regular file through EOF and reject any mutation."""
+
+    if not stat.S_ISREG(before.st_mode):
+        raise StdinExecError("input_not_regular")
+    if not 0 <= before.st_size <= MAX_ACCEPTED_INPUT_BYTES:
+        raise StdinExecError("input_size_limit_exceeded")
+
+    chunks: list[bytes] = []
+    offset = 0
+    try:
+        while offset <= MAX_ACCEPTED_INPUT_BYTES:
+            requested = min(
+                _READ_CHUNK_BYTES,
+                MAX_ACCEPTED_INPUT_BYTES + 1 - offset,
+            )
+            chunk = os.pread(descriptor, requested, offset)
+            if (
+                not isinstance(chunk, bytes)
+                or len(chunk) > requested
+            ):
+                raise StdinExecError("input_read_incomplete")
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+    except StdinExecError:
+        raise
+    except OSError as error:
+        raise StdinExecError("input_read_failed") from error
+
+    if offset > MAX_ACCEPTED_INPUT_BYTES:
+        raise StdinExecError("input_size_limit_exceeded")
+    if (
+        offset != before.st_size
+        or _stable_file_identity(after) != _stable_file_identity(before)
+    ):
+        raise StdinExecError("input_changed_during_read")
+    return b"".join(chunks)
+
+
+def _memfd_contract() -> tuple[int, int]:
+    try:
+        flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        seals = (
+            _F_SEAL_WRITE
+            | _F_SEAL_GROW
+            | _F_SEAL_SHRINK
+            | _F_SEAL_SEAL
+        )
+    except AttributeError as error:
+        raise StdinExecError("sealed_memfd_unavailable") from error
+    if not callable(getattr(os, "memfd_create", None)):
+        raise StdinExecError("sealed_memfd_unavailable")
+    return flags, seals
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    offset = 0
+    try:
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if not 0 < written <= len(view) - offset:
+                raise StdinExecError("input_snapshot_write_failed")
+            offset += written
+    except StdinExecError:
+        raise
+    except OSError as error:
+        raise StdinExecError("input_snapshot_write_failed") from error
+
+
+def _read_memfd_exact(descriptor: int, expected_size: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    try:
+        while offset <= expected_size:
+            requested = min(
+                _READ_CHUNK_BYTES,
+                expected_size + 1 - offset,
+            )
+            chunk = os.pread(descriptor, requested, offset)
+            if (
+                not isinstance(chunk, bytes)
+                or len(chunk) > requested
+            ):
+                raise StdinExecError("input_snapshot_readback_failed")
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+    except StdinExecError:
+        raise
+    except OSError as error:
+        raise StdinExecError("input_snapshot_readback_failed") from error
+    if offset != expected_size:
+        raise StdinExecError("input_snapshot_readback_failed")
+    return b"".join(chunks)
+
+
+def _reopen_memfd_read_only(
+    descriptor: int,
+    expected: os.stat_result,
+    required_seals: int,
+) -> int:
+    """Reopen an internal memfd with read-only access through trusted procfs."""
+
+    proc_directory = -1
+    reopened = -1
+    keep_reopened = False
+    try:
+        proc_directory = os.open(
+            "/proc/self/fd",
+            _directory_flags(),
+        )
+        # A procfd entry is itself a Linux magic symlink.  O_NOFOLLOW on this
+        # final numeric entry would therefore always fail with ELOOP.  The
+        # directory is opened descriptor-relative with O_NOFOLLOW, the leaf
+        # name is an internally-created integer, and identity is checked below.
+        reopened = os.open(
+            str(descriptor),
+            os.O_RDONLY | os.O_CLOEXEC,
+            dir_fd=proc_directory,
+        )
+        reopened_metadata = os.fstat(reopened)
+        if (
+            reopened_metadata.st_dev != expected.st_dev
+            or reopened_metadata.st_ino != expected.st_ino
+            or not stat.S_ISREG(reopened_metadata.st_mode)
+            or reopened_metadata.st_size != expected.st_size
+        ):
+            raise StdinExecError("input_snapshot_reopen_mismatch")
+        access_mode = fcntl.fcntl(reopened, fcntl.F_GETFL) & os.O_ACCMODE
+        if access_mode != os.O_RDONLY:
+            raise StdinExecError("input_snapshot_not_read_only")
+        observed_seals = fcntl.fcntl(reopened, _F_GET_SEALS)
+        if observed_seals & required_seals != required_seals:
+            raise StdinExecError("input_snapshot_seals_missing")
+        if os.lseek(reopened, 0, os.SEEK_SET) != 0:
+            raise StdinExecError("input_snapshot_rewind_failed")
+        keep_reopened = True
+        return reopened
+    except StdinExecError:
+        raise
+    except OSError as error:
+        raise StdinExecError("input_snapshot_reopen_failed") from error
+    finally:
+        if proc_directory >= 0:
+            try:
+                os.close(proc_directory)
+            except OSError:
+                pass
+        if reopened >= 0 and not keep_reopened:
+            try:
+                os.close(reopened)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _sealed_stdin_snapshot(payload: bytes) -> Iterator[int]:
+    """Yield a sealed read-only memfd containing exactly ``payload``."""
+
+    writable = -1
+    read_only = -1
+    try:
+        flags, required_seals = _memfd_contract()
+        try:
+            writable = os.memfd_create("ctf-rev-stdin", flags)
+        except OSError as error:
+            raise StdinExecError("input_snapshot_create_failed") from error
+
+        _write_all(writable, payload)
+        metadata = os.fstat(writable)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size != len(payload)
+        ):
+            raise StdinExecError("input_snapshot_size_mismatch")
+        if _read_memfd_exact(writable, len(payload)) != payload:
+            raise StdinExecError("input_snapshot_readback_mismatch")
+
+        try:
+            fcntl.fcntl(writable, _F_ADD_SEALS, required_seals)
+            observed_seals = fcntl.fcntl(writable, _F_GET_SEALS)
+        except OSError as error:
+            raise StdinExecError("input_snapshot_seal_failed") from error
+        if observed_seals & required_seals != required_seals:
+            raise StdinExecError("input_snapshot_seals_missing")
+
+        sealed_metadata = os.fstat(writable)
+        if (
+            sealed_metadata.st_dev != metadata.st_dev
+            or sealed_metadata.st_ino != metadata.st_ino
+            or sealed_metadata.st_size != len(payload)
+        ):
+            raise StdinExecError("input_snapshot_changed_during_seal")
+        read_only = _reopen_memfd_read_only(
+            writable,
+            sealed_metadata,
+            required_seals,
+        )
+        os.close(writable)
+        writable = -1
+        yield read_only
+    finally:
+        for descriptor in (read_only, writable):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _disable_core_dumps() -> None:
+    """Permanently disable core dumps in this single-purpose runner."""
+
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        observed = resource.getrlimit(resource.RLIMIT_CORE)
+    except (OSError, ValueError) as error:
+        raise StdinExecError("core_limit_unavailable") from error
+    if observed != (0, 0):
+        raise StdinExecError("core_limit_not_enforced")
+
+
 def execute_stdin(
     binary_argument: str,
     input_argument: str,
@@ -209,17 +453,19 @@ def execute_stdin(
             input_components,
             label="input",
         ) as (input_descriptor, input_metadata):
-            if not stat.S_ISREG(input_metadata.st_mode):
-                raise StdinExecError("input_not_regular")
-            if not 0 <= input_metadata.st_size <= MAX_ACCEPTED_INPUT_BYTES:
-                raise StdinExecError("input_size_limit_exceeded")
+            payload = _read_stable_input(
+                input_descriptor,
+                input_metadata,
+            )
 
+        with _sealed_stdin_snapshot(payload) as stdin_descriptor:
             executable = f"/proc/self/fd/{binary_descriptor}"
+            _disable_core_dumps()
             try:
                 completed = subprocess.run(
-                    (executable,),
+                    (binary_argument,),
                     executable=executable,
-                    stdin=input_descriptor,
+                    stdin=stdin_descriptor,
                     stdout=None,
                     stderr=None,
                     env=dict(FIXED_ENVIRONMENT),
@@ -228,7 +474,7 @@ def execute_stdin(
                     shell=False,
                     check=False,
                 )
-            except OSError as error:
+            except (OSError, subprocess.SubprocessError) as error:
                 raise StdinExecError("target_exec_failed") from error
             return completed.returncode
 
