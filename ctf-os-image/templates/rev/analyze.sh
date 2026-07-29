@@ -40,11 +40,15 @@ target="$(realpath -e -- "$1")"
 output_dir="/work/rev"
 prepare_output_dir
 for artifact in \
+  inventory-v1.json inventory-v1.error \
   summary.txt strings-ascii.txt strings-ascii.error \
   strings-utf16le.txt strings-utf16le.error \
   strings-korean.txt strings-korean.error; do
   prepare_output_file "${output_dir}/${artifact}"
 done
+
+python3 /opt/ctf-templates/rev/inventory.py "$target" \
+  </dev/null >/dev/null 2>"${output_dir}/inventory-v1.error" || true
 
 {
   printf '[file]\n'

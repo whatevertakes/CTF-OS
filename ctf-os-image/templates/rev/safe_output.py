@@ -28,9 +28,42 @@ def open_output_dir(path: Path) -> int:
     return descriptor
 
 
+def remove_regular_output(descriptor: int, name: str) -> None:
+    """Remove one stale regular output without following special files."""
+
+    if not name or "/" in name or name in {".", ".."}:
+        raise ValueError("artifact name must be one path component")
+    try:
+        destination_stat = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(destination_stat.st_mode):
+        raise OSError(f"refusing non-regular output artifact: {name}")
+    try:
+        os.unlink(name, dir_fd=descriptor)
+    except FileNotFoundError:
+        return
+    os.fsync(descriptor)
+
+
 def atomic_write(descriptor: int, name: str, data: bytes) -> None:
     if not name or "/" in name or name in {".", ".."}:
         raise ValueError("artifact name must be one path component")
+    try:
+        destination_stat = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(destination_stat.st_mode):
+            raise OSError(f"refusing non-regular output artifact: {name}")
     temporary = f".{name}.tmp-{os.getpid()}-{secrets.token_hex(6)}"
     output = os.open(
         temporary,
@@ -55,3 +88,4 @@ def atomic_write(descriptor: int, name: str, data: bytes) -> None:
     except BaseException:
         os.unlink(temporary, dir_fd=descriptor)
         raise
+    os.fsync(descriptor)
