@@ -49,6 +49,8 @@ required=(
   ctf-os-image/scripts/gen-manifest.sh
   ctf-os-image/templates/README.md
   ctf-os-image/tests/test-capability-contract.py
+  ctf-os-image/tests/test-rev-inventory.py
+  ctf-os-image/tests/test-rev-stdin-exec.py
 )
 for path in "${required[@]}"; do
   if [[ ! -f "${path}" ]]; then
@@ -75,6 +77,8 @@ fi
 "${python_bin}" ctf-os-image/tests/test-capability-contract.py
 "${python_bin}" ctf-os-image/tests/test-tool-manifest.py
 "${python_bin}" ctf-os-image/tests/test-browser-safety.py
+"${python_bin}" ctf-os-image/tests/test-rev-inventory.py
+"${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 
 for script in ctf-os-image/scripts/* ctf-os-image/tests/*.sh; do
   IFS= read -r shebang <"${script}" || true
