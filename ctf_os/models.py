@@ -7,6 +7,7 @@ the runtime (or its virtual environment) is damaged during a contest.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -21,6 +22,12 @@ CURRENT_SCHEMA_VERSION = 1
 MAX_REPEATED_FIELD_ITEMS = 16_384
 MAX_RECORDS_PER_COLLECTION = MAX_REPEATED_FIELD_ITEMS
 MAX_EXPERIMENT_TIMEOUT_SECONDS = 8 * 60 * 60
+MAX_RECEIPT_STREAM_EVIDENCE_BYTES = 4096
+MAX_RECEIPT_STREAM_EVIDENCE_TOTAL_BYTES = (
+    2 * MAX_RECEIPT_STREAM_EVIDENCE_BYTES + 256
+)
+MAX_RECEIPT_SAMPLE_BYTES = 1024
+MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
 
 JSONValue = (
     None
@@ -1593,6 +1600,356 @@ class ExecutionReceipt:
             created_at=str(data.get("created_at", utc_now())),
             extra=_extra(data, known),
         )
+
+
+def _receipt_stream_evidence_errors(
+    receipt: ExecutionReceipt,
+    artifacts: Mapping[str, ArtifactReference],
+) -> list[str]:
+    """Validate the optional, bounded receipt-to-artifact evidence chain."""
+
+    errors: list[str] = []
+    raw_evidence = receipt.extra.get("stream_evidence")
+    line_count_basis = receipt.extra.get("line_count_basis")
+    if raw_evidence is None:
+        if line_count_basis is not None:
+            errors.append(
+                f"receipt {receipt.id} line_count_basis requires "
+                "stream_evidence"
+            )
+        return errors
+    if line_count_basis != "transport_summary_tail":
+        errors.append(
+            f"receipt {receipt.id} has invalid line_count_basis"
+        )
+    if not isinstance(raw_evidence, dict):
+        errors.append(
+            f"receipt {receipt.id} stream_evidence must be an object"
+        )
+        return errors
+    try:
+        encoded_evidence = json.dumps(
+            raw_evidence,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError):
+        errors.append(
+            f"receipt {receipt.id} stream_evidence is not canonical JSON"
+        )
+        return errors
+    if len(encoded_evidence) > MAX_RECEIPT_STREAM_EVIDENCE_TOTAL_BYTES:
+        errors.append(
+            f"receipt {receipt.id} stream_evidence exceeds its size bound"
+        )
+
+    expected_streams = {
+        stream: artifact_id
+        for stream, artifact_id in (
+            ("stdout", receipt.stdout_artifact_id),
+            ("stderr", receipt.stderr_artifact_id),
+        )
+        if artifact_id is not None
+    }
+    if set(raw_evidence) != set(expected_streams):
+        errors.append(
+            f"receipt {receipt.id} stream_evidence keys do not match "
+            "its stream artifacts"
+        )
+
+    allowed_record_keys = {
+        "schema_version",
+        "stream",
+        "artifact_id",
+        "path",
+        "sha256",
+        "drained_bytes",
+        "stored_bytes",
+        "limit_bytes",
+        "capture_complete",
+        "truncation_known",
+        "truncated",
+        "coverage",
+        "transport_summary_truncated",
+        "stream_error_present",
+        "capture_error_present",
+        "sample_policy",
+        "head",
+        "tail",
+        "omitted_stored_bytes",
+        "redaction_count",
+        "binary_sample_omitted",
+    }
+
+    def valid_nonnegative_integer(value: object) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, int)
+            and value >= 0
+        )
+
+    for stream, expected_artifact_id in expected_streams.items():
+        label = f"receipt {receipt.id} {stream} evidence"
+        evidence = raw_evidence.get(stream)
+        if not isinstance(evidence, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        try:
+            encoded_stream = json.dumps(
+                evidence,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("ascii")
+        except (TypeError, ValueError, UnicodeError):
+            errors.append(f"{label} is not canonical JSON")
+            continue
+        if len(encoded_stream) > MAX_RECEIPT_STREAM_EVIDENCE_BYTES:
+            errors.append(f"{label} exceeds its size bound")
+        if set(evidence) != allowed_record_keys:
+            errors.append(f"{label} has an invalid nested schema")
+
+        if (
+            isinstance(evidence.get("schema_version"), bool)
+            or evidence.get("schema_version") != 1
+        ):
+            errors.append(f"{label} has an invalid schema_version")
+        if evidence.get("stream") != stream:
+            errors.append(f"{label} has a mismatched stream name")
+        if evidence.get("artifact_id") != expected_artifact_id:
+            errors.append(f"{label} has a mismatched artifact_id")
+
+        artifact = artifacts.get(expected_artifact_id)
+        if artifact is None:
+            errors.append(f"{label} references an unknown artifact")
+        else:
+            if evidence.get("path") != artifact.path:
+                errors.append(f"{label} path does not match its artifact")
+            if evidence.get("sha256") != artifact.sha256:
+                errors.append(f"{label} SHA-256 does not match its artifact")
+            if evidence.get("stored_bytes") != artifact.size:
+                errors.append(f"{label} size does not match its artifact")
+            if artifact.source_run_id != receipt.run_id:
+                errors.append(f"{label} artifact/run chain is mismatched")
+            if artifact.extra.get("stream") != stream:
+                errors.append(f"{label} artifact stream is mismatched")
+
+        drained_bytes = evidence.get("drained_bytes")
+        stored_bytes = evidence.get("stored_bytes")
+        limit_bytes = evidence.get("limit_bytes")
+        receipt_bytes = (
+            receipt.stdout_bytes
+            if stream == "stdout"
+            else receipt.stderr_bytes
+        )
+        if (
+            not valid_nonnegative_integer(drained_bytes)
+            or drained_bytes != receipt_bytes
+        ):
+            errors.append(f"{label} has an invalid drained byte count")
+        if not valid_nonnegative_integer(stored_bytes):
+            errors.append(f"{label} has an invalid stored byte count")
+        if limit_bytes is not None and (
+            not valid_nonnegative_integer(limit_bytes)
+            or (
+                valid_nonnegative_integer(stored_bytes)
+                and limit_bytes < stored_bytes
+            )
+        ):
+            errors.append(f"{label} has an invalid capture limit")
+
+        capture_complete = evidence.get("capture_complete")
+        truncation_known = evidence.get("truncation_known")
+        truncated = evidence.get("truncated")
+        for name in (
+            "capture_complete",
+            "truncation_known",
+            "transport_summary_truncated",
+            "stream_error_present",
+            "capture_error_present",
+            "binary_sample_omitted",
+        ):
+            if not isinstance(evidence.get(name), bool):
+                errors.append(f"{label} {name} must be a boolean")
+        if truncated is not None and not isinstance(truncated, bool):
+            errors.append(f"{label} truncated must be boolean or null")
+        if truncation_known is True and not isinstance(truncated, bool):
+            errors.append(
+                f"{label} known truncation requires a boolean value"
+            )
+        if (
+            truncation_known is True
+            and isinstance(truncated, bool)
+            and valid_nonnegative_integer(drained_bytes)
+            and valid_nonnegative_integer(stored_bytes)
+            and truncated != (drained_bytes > stored_bytes)
+        ):
+            errors.append(
+                f"{label} truncation value is inconsistent with byte counts"
+            )
+        if capture_complete is True and truncation_known is not True:
+            errors.append(
+                f"{label} complete capture requires known truncation"
+            )
+
+        coverage = evidence.get("coverage")
+        if coverage not in {
+            "complete_stream",
+            "retained_prefix_only",
+            "incomplete_capture",
+            "unknown",
+        }:
+            errors.append(f"{label} has an invalid coverage value")
+        if (
+            coverage == "complete_stream"
+            and not (
+                capture_complete is True
+                and truncation_known is True
+                and truncated is False
+                and stored_bytes == drained_bytes
+            )
+        ):
+            errors.append(f"{label} falsely claims complete coverage")
+        if (
+            coverage == "retained_prefix_only"
+            and (
+                not valid_nonnegative_integer(stored_bytes)
+                or not valid_nonnegative_integer(drained_bytes)
+                or stored_bytes >= drained_bytes
+            )
+        ):
+            errors.append(f"{label} has invalid retained-prefix coverage")
+        if (
+            coverage == "incomplete_capture"
+            and capture_complete is not False
+        ):
+            errors.append(f"{label} has invalid incomplete coverage")
+        if coverage == "unknown" and capture_complete is not False:
+            errors.append(f"{label} has invalid unknown coverage")
+
+        if evidence.get("sample_policy") != (
+            "immutable_snapshot_head_tail"
+        ):
+            errors.append(f"{label} has an invalid sample policy")
+
+        def validate_sample(
+            name: str,
+            sample: object,
+        ) -> tuple[int, int, bool] | None:
+            sample_label = f"{label} {name}"
+            if not isinstance(sample, dict):
+                errors.append(f"{sample_label} must be an object")
+                return None
+            encoding = sample.get("encoding")
+            common_keys = {"byte_start", "byte_end", "encoding"}
+            if encoding == "utf-8":
+                expected_keys = {
+                    *common_keys,
+                    "text",
+                    "text_truncated",
+                }
+                text = sample.get("text")
+                if not isinstance(text, str):
+                    errors.append(f"{sample_label} text must be a string")
+                else:
+                    encoded_text = json.dumps(
+                        text,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                    if (
+                        len(encoded_text)
+                        > MAX_RECEIPT_EXCERPT_JSON_CHARS
+                    ):
+                        errors.append(
+                            f"{sample_label} text exceeds its size bound"
+                        )
+                if not isinstance(sample.get("text_truncated"), bool):
+                    errors.append(
+                        f"{sample_label} text_truncated must be boolean"
+                    )
+                binary = False
+            elif encoding == "binary-omitted":
+                expected_keys = {*common_keys, "sample_sha256"}
+                digest = sample.get("sample_sha256")
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in digest
+                    )
+                ):
+                    errors.append(
+                        f"{sample_label} has an invalid sample SHA-256"
+                    )
+                binary = True
+            else:
+                errors.append(f"{sample_label} has an invalid encoding")
+                expected_keys = common_keys
+                binary = False
+            if set(sample) != expected_keys:
+                errors.append(f"{sample_label} has an invalid schema")
+            byte_start = sample.get("byte_start")
+            byte_end = sample.get("byte_end")
+            if (
+                not valid_nonnegative_integer(byte_start)
+                or not valid_nonnegative_integer(byte_end)
+                or byte_start > byte_end
+                or byte_end - byte_start > MAX_RECEIPT_SAMPLE_BYTES
+                or (
+                    valid_nonnegative_integer(stored_bytes)
+                    and byte_end > stored_bytes
+                )
+            ):
+                errors.append(f"{sample_label} has an invalid byte range")
+                return None
+            return byte_start, byte_end, binary
+
+        head = validate_sample("head", evidence.get("head"))
+        tail_value = evidence.get("tail")
+        tail = (
+            validate_sample("tail", tail_value)
+            if tail_value is not None
+            else None
+        )
+        if head is not None and head[0] != 0:
+            errors.append(f"{label} head must start at byte zero")
+        if (
+            tail is not None
+            and valid_nonnegative_integer(stored_bytes)
+            and tail[1] != stored_bytes
+        ):
+            errors.append(f"{label} tail must end at the artifact size")
+        if head is not None and tail is not None and head[1] > tail[0]:
+            errors.append(f"{label} head and tail ranges overlap")
+
+        omitted = evidence.get("omitted_stored_bytes")
+        redaction_count = evidence.get("redaction_count")
+        if not valid_nonnegative_integer(omitted):
+            errors.append(f"{label} has an invalid omitted byte count")
+        if not valid_nonnegative_integer(redaction_count):
+            errors.append(f"{label} has an invalid redaction count")
+        if (
+            head is not None
+            and valid_nonnegative_integer(stored_bytes)
+            and valid_nonnegative_integer(omitted)
+        ):
+            sampled_bytes = head[1] - head[0]
+            if tail is not None:
+                sampled_bytes += tail[1] - tail[0]
+            if omitted != stored_bytes - sampled_bytes:
+                errors.append(f"{label} omitted byte count is inconsistent")
+        binary_present = bool(
+            (head is not None and head[2])
+            or (tail is not None and tail[2])
+        )
+        if evidence.get("binary_sample_omitted") is not binary_present:
+            errors.append(f"{label} binary omission marker is inconsistent")
+    return errors
 
 
 @dataclass
@@ -3254,6 +3611,12 @@ class ChallengeState:
                         errors.append(
                             f"receipt {receipt.id} {label} cannot be negative"
                         )
+                errors.extend(
+                    _receipt_stream_evidence_errors(
+                        receipt,
+                        artifacts,
+                    )
+                )
 
             for session in self.sessions:
                 if session.configuration_epoch > self.configuration_epoch:

@@ -69,6 +69,11 @@ from ctf_os.engine.proof import (
     evaluate_proof,
     write_proof_result,
 )
+from ctf_os.engine.receipt_summary import (
+    ReceiptSummaryError,
+    build_receipt_preview,
+    summarize_stream_snapshot,
+)
 from ctf_os.engine.state_machine import TransitionEvidence, validate_transition
 from ctf_os.governor import (
     GOVERNOR_METADATA_KEY,
@@ -5361,6 +5366,79 @@ class ChallengeEngine:
                 artifact_records.clear()
                 _pending_tool_context.clear()
                 continue
+            receipt_stream_evidence: dict[str, dict[str, object]] = {}
+            receipt_preview = (
+                f"exit={result.exit_code}; "
+                f"stdout_bytes={result.stdout_bytes}; "
+                f"stderr_bytes={result.stderr_bytes}"
+            )[:160]
+            if (
+                not artifact_notification_failed
+                and running.schema_version >= STATE_SCHEMA_VERSION
+            ):
+                try:
+                    challenge_root = self.store.challenge_paths(
+                        identity
+                    ).root
+                    for artifact in artifact_records:
+                        stream_name = artifact.extra.get("stream")
+                        if stream_name not in {"stdout", "stderr"}:
+                            continue
+                        receipt_stream_evidence[stream_name] = (
+                            summarize_stream_snapshot(
+                                challenge_root / artifact.path,
+                                artifact_id=artifact.id,
+                                artifact_path=artifact.path,
+                                artifact_sha256=artifact.sha256,
+                                result=result,
+                                stream=stream_name,
+                            )
+                        )
+                    receipt_preview = build_receipt_preview(
+                        exit_code=result.exit_code,
+                        stdout_bytes=result.stdout_bytes,
+                        stderr_bytes=result.stderr_bytes,
+                        stdout_evidence=receipt_stream_evidence.get(
+                            "stdout"
+                        ),
+                        stderr_evidence=receipt_stream_evidence.get(
+                            "stderr"
+                        ),
+                    )
+                except ReceiptSummaryError as error:
+                    summary_error = EngineError(
+                        "tool stream evidence summary failed: "
+                        f"{error}"
+                    )
+                    try:
+                        self._record_tool_failure(
+                            identity,
+                            experiment.id,
+                            str(summary_error),
+                            run_id=engine_run_id,
+                            base_revision=run_base_revision,
+                            _live_only=_live_only,
+                        )
+                    finally:
+                        self._cleanup_uncommitted_artifacts(
+                            identity,
+                            artifact_records,
+                            cause=summary_error,
+                        )
+                    artifact_records.clear()
+                    _pending_tool_context.clear()
+                    continue
+                except BaseException as error:
+                    self._handle_tool_postprocess_interruption(
+                        identity,
+                        experiment.id,
+                        run_id=engine_run_id,
+                        base_revision=run_base_revision,
+                        artifacts=artifact_records,
+                        error=error,
+                        _live_only=_live_only,
+                    )
+                    raise
             if (
                 not artifact_notification_failed
                 and result.exit_code == 0
@@ -5609,11 +5687,15 @@ class ChallengeEngine:
                                 result.stderr_summary.count("\n")
                                 + bool(result.stderr_summary)
                             ),
-                            preview=(
-                                f"exit={result.exit_code}; "
-                                f"stdout_bytes={result.stdout_bytes}; "
-                                f"stderr_bytes={result.stderr_bytes}"
-                            )[:160],
+                            preview=receipt_preview,
+                            extra={
+                                "line_count_basis": (
+                                    "transport_summary_tail"
+                                ),
+                                "stream_evidence": (
+                                    receipt_stream_evidence
+                                ),
+                            },
                         )
                     )
                 else:

@@ -40,6 +40,7 @@ from ctf_os.engine.flags import (
     DetectedFlag,
     FlagDetector,
 )
+from ctf_os.engine.receipt_summary import ReceiptSummaryError
 from ctf_os.governor import (
     GOVERNOR_METADATA_KEY,
     RecoveryAction,
@@ -66,6 +67,7 @@ from ctf_os.sandbox import (
     LocalChallengeSandboxClient,
     SandboxResult,
 )
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import (
     ArtifactValidationError,
     ChallengeLock,
@@ -4239,6 +4241,84 @@ class EngineTests(unittest.TestCase):
                 for fact in state.facts
             )
         )
+
+    def test_receipt_summary_failure_cleans_snapshot_handoff(
+        self,
+    ) -> None:
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=(
+                lambda state, work, policy: FakeSandbox(work)
+            ),
+        )
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="exit zero",
+            keep_if="zero",
+            drop_if="nonzero",
+        )
+        pending_artifacts: list[ArtifactReference] = []
+        pending_context: dict[str, object] = {}
+
+        with mock.patch(
+            "ctf_os.engine.challenge.summarize_stream_snapshot",
+            side_effect=ReceiptSummaryError(
+                "synthetic receipt summary failure"
+            ),
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(experiment_id,),
+                _pending_artifact_handoff=pending_artifacts,
+                _pending_tool_context=pending_context,
+            )
+
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertIn(
+            "tool stream evidence summary failed",
+            experiment.result["error"],
+        )
+        tool_run = next(run for run in state.runs if run.role == "tool")
+        self.assertIs(tool_run.status, RunStatus.FAILED)
+        self.assertFalse(
+            any(
+                artifact.source_run_id == tool_run.id
+                for artifact in state.artifacts
+            )
+        )
+        failure_receipt = next(
+            receipt
+            for receipt in state.receipts
+            if receipt.run_id == tool_run.id
+        )
+        self.assertIsNone(failure_receipt.stdout_artifact_id)
+        self.assertIsNone(failure_receipt.stderr_artifact_id)
+        self.assertNotIn(
+            "stream_evidence",
+            failure_receipt.extra,
+        )
+        snapshots = (
+            engine.store.challenge_paths(self.identity).artifacts
+            / "snapshots"
+        )
+        self.assertEqual(list(snapshots.glob("*.log")), [])
+        self.assertEqual(pending_artifacts, [])
+        self.assertEqual(pending_context, {})
 
     def test_missing_stdout_diagnostic_failure_cleans_stderr_snapshot(
         self,

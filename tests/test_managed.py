@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import ctf_os.migration as migration_module
+from ctf_os.adapters import get_adapter
 from ctf_os.codex import (
     BatchRunner,
     FifoModelCallLimiter,
@@ -19,6 +21,7 @@ from ctf_os.codex import (
 )
 from ctf_os.config import load_config
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.lifecycle import close_challenge, create_checkpoint
 from ctf_os.managed import ManagedError, ManagedOrchestrator
 from ctf_os.migration import (
@@ -30,10 +33,12 @@ from ctf_os.models import (
     ChallengeIdentity,
     ChallengeStatus,
     ExperimentStatus,
+    ModelValidationError,
     RunOrigin,
     RunReference,
     RunStatus,
 )
+from ctf_os.sandbox import SandboxResult
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.storage import (
     quarantine_unreachable,
@@ -82,6 +87,7 @@ class ProbeRoleExecutor:
         self.active = 0
         self.max_active = 0
         self.roles: list[Role] = []
+        self.prompts: list[tuple[Role, str]] = []
 
     def run(self, command, *, cwd, timeout, on_stdout_line):
         del cwd, timeout
@@ -90,6 +96,7 @@ class ProbeRoleExecutor:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
             self.roles.append(role)
+            self.prompts.append((role, command.stdin))
         try:
             payload = _payload(role)
             if role is not Role.CAPTAIN:
@@ -222,6 +229,61 @@ class SlowSandbox(FakeSandbox):
             return super().run(spec)
         finally:
             self.concurrency.leave()
+
+
+class ReceiptCanarySandbox(FakeSandbox):
+    canary = "RECEIPT_CANARY route-count=7"
+    credential = "must-not-reach-model"
+
+    def __init__(self, work: Path) -> None:
+        super().__init__(work)
+        self._receipt_lock = threading.Lock()
+        self._receipt_counter = 0
+
+    def run(self, spec):
+        self.specs.append(spec)
+        with self._receipt_lock:
+            self._receipt_counter += 1
+            ordinal = self._receipt_counter
+        relative = Path("raw") / f"receipt-{ordinal}"
+        raw = self.work / relative
+        raw.mkdir(parents=True, exist_ok=False)
+        stdout = raw / "stdout.log"
+        stderr = raw / "stderr.log"
+        payload = (
+            f"{self.canary}\n"
+            f"Authorization: Bearer {self.credential}\n"
+        )
+        stdout.write_text(payload, encoding="utf-8")
+        stderr.write_bytes(b"")
+        return SandboxResult(
+            run_id=f"tool-{ordinal}",
+            status="completed",
+            exit_code=0,
+            timed_out=False,
+            duration_ms=5,
+            # The transport tail intentionally contains the credential.  The
+            # receipt integration must read only the immutable snapshot and
+            # redact it rather than forwarding this field.
+            stdout_summary=payload,
+            stderr_summary="",
+            stdout_bytes=stdout.stat().st_size,
+            stderr_bytes=0,
+            stdout_path=f"/work/{relative.as_posix()}/stdout.log",
+            stderr_path=f"/work/{relative.as_posix()}/stderr.log",
+            stdout_stored_bytes=stdout.stat().st_size,
+            stderr_stored_bytes=0,
+            stdout_limit_bytes=4096,
+            stderr_limit_bytes=4096,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_truncation_known=True,
+            stderr_truncation_known=True,
+            stdout_capture_complete=True,
+            stderr_capture_complete=True,
+            stdout_summary_truncated=False,
+            stderr_summary_truncated=False,
+        )
 
 
 class FailingSandbox(FakeSandbox):
@@ -393,6 +455,215 @@ class ManagedV2Tests(unittest.TestCase):
                 for item in wave_experiments
             )
         )
+
+    def test_managed_receipt_evidence_reaches_first_captain_safely(
+        self,
+    ):
+        executor = ProbeRoleExecutor()
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            return ReceiptCanarySandbox(work)
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain_prompts = [
+            prompt
+            for role, prompt in executor.prompts
+            if role is Role.CAPTAIN
+        ]
+        self.assertEqual(len(captain_prompts), 1)
+        self.assertIn(
+            ReceiptCanarySandbox.canary,
+            captain_prompts[0],
+        )
+        self.assertNotIn(
+            ReceiptCanarySandbox.credential,
+            captain_prompts[0],
+        )
+
+        paths = engine.store.challenge_paths(self.identity)
+        captain_run_id = state.cycles[0].captain_run_id
+        captain_paths = engine.store.run_paths(
+            self.identity,
+            run_id=captain_run_id,
+        )
+        captain_request = read_json(captain_paths.request)
+        archived_context = (
+            paths.root / captain_request["context_path"]
+        )
+        archive_text = archived_context.read_text(encoding="utf-8")
+        self.assertIn(ReceiptCanarySandbox.canary, archive_text)
+        self.assertNotIn(
+            ReceiptCanarySandbox.credential,
+            archive_text,
+        )
+        archive_records = [
+            strict_json_loads(line)
+            for line in archive_text.splitlines()
+            if line
+        ]
+        recent_records = [
+            item
+            for item in archive_records
+            if item.get("kind") == "recent_execution_receipt"
+        ]
+        self.assertEqual(len(recent_records), 3)
+        recent_ids = {item["id"] for item in recent_records}
+        self.assertFalse(
+            any(
+                item.get("kind") == "execution_receipt"
+                and item.get("id") in recent_ids
+                for item in archive_records
+            )
+        )
+        for record in recent_records:
+            stdout = record["streams"]["stdout"]
+            self.assertIn(
+                ReceiptCanarySandbox.canary,
+                stdout["head"]["text"],
+            )
+            self.assertEqual(stdout["head"]["byte_start"], 0)
+            self.assertEqual(len(stdout["sha256"]), 64)
+            self.assertTrue(
+                stdout["path"].startswith("artifacts/snapshots/")
+            )
+
+        receipt = state.receipts[0]
+        self.assertEqual(
+            receipt.extra["line_count_basis"],
+            "transport_summary_tail",
+        )
+        stdout_evidence = receipt.extra["stream_evidence"]["stdout"]
+        artifact = next(
+            item
+            for item in state.artifacts
+            if item.id == receipt.stdout_artifact_id
+        )
+        snapshot = paths.root / artifact.path
+        raw_output = snapshot.read_text(encoding="utf-8")
+        self.assertIn(ReceiptCanarySandbox.canary, raw_output)
+        self.assertIn(ReceiptCanarySandbox.credential, raw_output)
+        self.assertNotIn(
+            ReceiptCanarySandbox.credential,
+            json.dumps(
+                receipt.extra["stream_evidence"],
+                sort_keys=True,
+            ),
+        )
+        self.assertIn("[REDACTED]", stdout_evidence["head"]["text"])
+        self.assertEqual(stdout_evidence["artifact_id"], artifact.id)
+        self.assertEqual(stdout_evidence["path"], artifact.path)
+        self.assertEqual(stdout_evidence["sha256"], artifact.sha256)
+        self.assertEqual(stdout_evidence["stored_bytes"], artifact.size)
+        self.assertEqual(
+            hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            stdout_evidence["sha256"],
+        )
+        self.assertEqual(stdout_evidence["head"]["byte_start"], 0)
+        self.assertEqual(
+            stdout_evidence["head"]["byte_end"],
+            artifact.size,
+        )
+
+        pressure = build_context_pack(
+            state,
+            get_adapter(state.category),
+            state_path=paths.state,
+            max_chars=4096,
+        )
+        self.assertLessEqual(len(pressure.text), 4096)
+        pressure_records = [
+            strict_json_loads(line)
+            for line in pressure.text.splitlines()
+            if line
+        ]
+        pressure_receipts = [
+            item
+            for item in pressure_records
+            if item.get("kind") == "recent_execution_receipt"
+        ]
+        self.assertTrue(pressure_receipts)
+        newest_stdout = pressure_receipts[0]["streams"]["stdout"]
+        self.assertIn(
+            ReceiptCanarySandbox.canary,
+            newest_stdout["head"]["text"],
+        )
+        self.assertTrue(newest_stdout["path"])
+        self.assertEqual(len(newest_stdout["sha256"]), 64)
+
+        tampered_path = copy.deepcopy(state)
+        tampered_path.receipts[0].extra["stream_evidence"]["stdout"][
+            "path"
+        ] = "artifacts/snapshots/tampered.log"
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "path does not match",
+        ):
+            tampered_path.validate()
+
+        tampered_hash = copy.deepcopy(state)
+        tampered_hash.receipts[0].extra["stream_evidence"]["stdout"][
+            "sha256"
+        ] = "0" * 64
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "SHA-256 does not match",
+        ):
+            tampered_hash.validate()
+
+        tampered_size = copy.deepcopy(state)
+        tampered_size.receipts[0].extra["stream_evidence"]["stdout"][
+            "stored_bytes"
+        ] += 1
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "size does not match",
+        ):
+            tampered_size.validate()
+
+        tampered_schema = copy.deepcopy(state)
+        tampered_schema.receipts[0].extra["stream_evidence"]["stdout"][
+            "unexpected"
+        ] = True
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid nested schema",
+        ):
+            tampered_schema.validate()
+
+        tampered_range = copy.deepcopy(state)
+        tampered_stdout = tampered_range.receipts[0].extra[
+            "stream_evidence"
+        ]["stdout"]
+        tampered_stdout["head"]["byte_end"] = (
+            tampered_stdout["stored_bytes"] + 1
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid byte range",
+        ):
+            tampered_range.validate()
+
+        tampered_truncation = copy.deepcopy(state)
+        tampered_stdout = tampered_truncation.receipts[0].extra[
+            "stream_evidence"
+        ]["stdout"]
+        tampered_stdout["truncated"] = True
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "truncation value is inconsistent",
+        ):
+            tampered_truncation.validate()
 
     def test_attack_route_with_insufficient_frontier_creates_repair_checkpoint(
         self,

@@ -43,6 +43,89 @@ def _bounded(value: object, maximum: int = 2048) -> str:
     return text[: maximum - 1] + "…"
 
 
+def _bounded_canonical_text(value: object, maximum: int = 160) -> str:
+    """Bound text by its escaped canonical-JSON representation."""
+
+    text = str(value)
+    if len(canonical_json_record(text)) <= maximum:
+        return text
+    suffix = "…"
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = text[:middle] + suffix
+        if len(canonical_json_record(candidate)) <= maximum:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + suffix
+
+
+def _compact_receipt_sample(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    compact: dict[str, object] = {
+        "byte_start": value.get("byte_start"),
+        "byte_end": value.get("byte_end"),
+        "encoding": value.get("encoding"),
+    }
+    if value.get("encoding") == "utf-8":
+        compact["text"] = _bounded_canonical_text(
+            value.get("text", ""),
+        )
+        compact["text_truncated"] = value.get("text_truncated", False)
+    elif value.get("encoding") == "binary-omitted":
+        compact["sample_sha256"] = value.get("sample_sha256")
+    return compact
+
+
+def _compact_receipt_streams(receipt: Any) -> dict[str, object]:
+    value = receipt.extra.get("stream_evidence")
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, object] = {}
+    for stream in ("stdout", "stderr"):
+        evidence = value.get(stream)
+        if not isinstance(evidence, dict):
+            continue
+        if (
+            stream == "stderr"
+            and evidence.get("stored_bytes") == 0
+            and evidence.get("stream_error_present") is False
+            and evidence.get("capture_error_present") is False
+        ):
+            continue
+        compact_stream: dict[str, object] = {
+            "artifact_id": evidence.get("artifact_id"),
+            "path": evidence.get("path"),
+            "sha256": evidence.get("sha256"),
+            "stored_bytes": evidence.get("stored_bytes"),
+            "drained_bytes": evidence.get("drained_bytes"),
+            "coverage": evidence.get("coverage"),
+            "head": _compact_receipt_sample(evidence.get("head")),
+        }
+        tail = _compact_receipt_sample(evidence.get("tail"))
+        if tail is not None:
+            compact_stream["tail"] = tail
+        compact[stream] = compact_stream
+    return compact
+
+
+def _receipt_context_record(receipt: Any) -> str:
+    return _record(
+        "recent_execution_receipt",
+        trust="evidence",
+        id=receipt.id,
+        experiment_id=receipt.experiment_id,
+        run_id=receipt.run_id,
+        outcome=receipt.outcome.value,
+        exit_code=receipt.exit_code,
+        line_count_basis=receipt.extra.get("line_count_basis"),
+        streams=_compact_receipt_streams(receipt),
+    )
+
+
 def _bounded_string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -356,7 +439,20 @@ def build_context_pack(
         mandatory.append(checkpoint_record)
         if checkpoint_omitted:
             early_omitted["latest_checkpoint_fields"] = checkpoint_omitted
+    newest_receipts = list(reversed(state.receipts[-3:]))
+    if newest_receipts:
+        # The newest executable evidence must survive even at the minimum
+        # context budget.  Keep it mandatory, and let the remaining two
+        # receipts compete in the critical tier ahead of operator text.
+        mandatory.append(_receipt_context_record(newest_receipts[0]))
     critical_groups = [
+        _Group(
+            "recent_receipts",
+            tuple(
+                _receipt_context_record(item)
+                for item in newest_receipts[1:]
+            ),
+        ),
         _Group(
             "operator_context",
             tuple(operator_records),
@@ -609,7 +705,7 @@ def build_context_pack(
                     stderr_lines=item.stderr_lines,
                     preview=item.preview,
                 )
-                for item in reversed(state.receipts[-20:])
+                for item in reversed(state.receipts[:-3][-17:])
             ),
         ),
         _Group(
