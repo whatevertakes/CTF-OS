@@ -70,6 +70,14 @@ _PRIVATE_KEY = re.compile(
     r".*?"
     r"(?:-----END[ \t]+[A-Z0-9 ]*PRIVATE KEY-----|$)"
 )
+_SENSITIVE_CONTEXT_PATTERNS = (
+    _CREDENTIAL_ASSIGNMENT,
+    _BEARER,
+    _JWT,
+    _CREDENTIAL_QUERY,
+    _URL_USERINFO,
+    _PRIVATE_KEY,
+)
 
 
 class ReceiptSummaryError(ValueError):
@@ -104,7 +112,7 @@ def _read_verified_samples(
     expected_sha256: str,
     sample_bytes: int,
     maximum_snapshot_bytes: int,
-) -> tuple[int, bytes, bytes]:
+) -> tuple[int, bytes, bytes, bool, bool]:
     if (
         isinstance(sample_bytes, bool)
         or not isinstance(sample_bytes, int)
@@ -148,6 +156,7 @@ def _read_verified_samples(
             )
 
         digest = hashlib.sha256()
+        snapshot_payload = bytearray()
         offset = 0
         while offset < before.st_size:
             block = os.pread(
@@ -160,22 +169,17 @@ def _read_verified_samples(
                     "stream snapshot ended before its recorded size"
                 )
             digest.update(block)
+            snapshot_payload.extend(block)
             offset += len(block)
 
         head_size = min(sample_bytes, before.st_size)
-        head = os.pread(descriptor, head_size, 0)
-        if len(head) != head_size:
-            raise ReceiptSummaryError("cannot read stream snapshot head")
+        head = bytes(snapshot_payload[:head_size])
         if before.st_size <= sample_bytes * 2:
             tail = b""
+            tail_start = before.st_size
         else:
-            tail = os.pread(
-                descriptor,
-                sample_bytes,
-                before.st_size - sample_bytes,
-            )
-            if len(tail) != sample_bytes:
-                raise ReceiptSummaryError("cannot read stream snapshot tail")
+            tail_start = before.st_size - sample_bytes
+            tail = bytes(snapshot_payload[tail_start:])
 
         after = os.fstat(descriptor)
         stable_fields = (
@@ -196,9 +200,84 @@ def _read_verified_samples(
             )
         if digest.hexdigest() != expected_sha256:
             raise ReceiptSummaryError("stream snapshot SHA-256 mismatch")
-        return before.st_size, head, tail
+        (
+            head_requires_omission,
+            tail_requires_omission,
+        ) = _sensitive_context_omissions(
+            bytes(snapshot_payload),
+            head_end=head_size,
+            tail_start=tail_start,
+        )
+        return (
+            before.st_size,
+            head,
+            tail,
+            head_requires_omission,
+            tail_requires_omission,
+        )
     finally:
         os.close(descriptor)
+
+
+def _sensitive_context_omissions(
+    snapshot_payload: bytes,
+    *,
+    head_end: int,
+    tail_start: int,
+) -> tuple[bool, bool]:
+    """Identify sensitive spans crossing either retained sample boundary.
+
+    Isolated sample redaction is unsafe when only part of a credential, URL
+    userinfo span, JWT, or private-key block is retained.  Analyze the already
+    bounded and verified immutable snapshot so a match crossing either byte
+    boundary causes that complete sample text to be omitted.  If byte-to-text
+    boundary mapping is uncertain, fail closed for the affected sample.
+    """
+
+    payload_size = len(snapshot_payload)
+    head_has_boundary = 0 < head_end < payload_size
+    tail_has_boundary = 0 < tail_start < payload_size
+    if not head_has_boundary and not tail_has_boundary:
+        return False, False
+    try:
+        complete_text = snapshot_payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return head_has_boundary, tail_has_boundary
+
+    def character_boundary(byte_boundary: int) -> int | None:
+        try:
+            return len(
+                snapshot_payload[:byte_boundary].decode(
+                    "utf-8",
+                    errors="strict",
+                )
+            )
+        except UnicodeDecodeError:
+            return None
+
+    head_character_end = (
+        character_boundary(head_end) if head_has_boundary else None
+    )
+    tail_character_start = (
+        character_boundary(tail_start) if tail_has_boundary else None
+    )
+    head_omitted = head_has_boundary and head_character_end is None
+    tail_omitted = tail_has_boundary and tail_character_start is None
+    for pattern in _SENSITIVE_CONTEXT_PATTERNS:
+        for match in pattern.finditer(complete_text):
+            if (
+                head_character_end is not None
+                and match.start() < head_character_end < match.end()
+            ):
+                head_omitted = True
+            if (
+                tail_character_start is not None
+                and match.start() < tail_character_start < match.end()
+            ):
+                tail_omitted = True
+            if head_omitted and tail_omitted:
+                return True, True
+    return head_omitted, tail_omitted
 
 
 def _json_string_size(value: str) -> int:
@@ -283,7 +362,19 @@ def _sample_record(
     *,
     byte_start: int,
     byte_end: int,
+    omit_text: bool = False,
 ) -> tuple[dict[str, object], int, bool]:
+    if omit_text:
+        return (
+            {
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+                "encoding": "binary-omitted",
+                "sample_sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            0,
+            True,
+        )
     text, redactions = _text_sample(payload)
     if text is None:
         return (
@@ -417,7 +508,13 @@ def summarize_stream_snapshot(
         artifact_path,
         artifact_sha256,
     )
-    stored_bytes, head_payload, tail_payload = _read_verified_samples(
+    (
+        stored_bytes,
+        head_payload,
+        tail_payload,
+        head_requires_omission,
+        tail_requires_omission,
+    ) = _read_verified_samples(
         snapshot_path,
         expected_sha256=normalized_sha256,
         sample_bytes=sample_bytes,
@@ -427,6 +524,7 @@ def summarize_stream_snapshot(
         head_payload,
         byte_start=0,
         byte_end=len(head_payload),
+        omit_text=head_requires_omission,
     )
     tail: dict[str, object] | None = None
     tail_redactions = 0
@@ -437,6 +535,7 @@ def summarize_stream_snapshot(
             tail_payload,
             byte_start=tail_start,
             byte_end=stored_bytes,
+            omit_text=tail_requires_omission,
         )
 
     metadata = _stream_metadata(

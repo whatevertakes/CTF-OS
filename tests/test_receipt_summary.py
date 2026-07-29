@@ -155,6 +155,191 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertLessEqual(len(preview), 160)
         self.assertEqual(evidence["redaction_count"], 1)
 
+    def test_tail_omits_authorization_value_split_across_boundary(
+        self,
+    ) -> None:
+        sample_bytes = 24
+        secret = b"must-not-leak-across-tail-boundary"
+        payload = b"safe\nAuthorization: Bearer " + secret + b"\n"
+        tail_start = len(payload) - sample_bytes
+        value_start = payload.index(b"Bearer ") + len(b"Bearer ")
+        self.assertLess(value_start, tail_start)
+        self.assertLess(tail_start, len(payload) - 1)
+
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(stdout_bytes=len(payload)),
+            sample_bytes=sample_bytes,
+        )
+
+        tail = evidence["tail"]
+        self.assertEqual(tail["byte_start"], tail_start)
+        self.assertEqual(tail["byte_end"], len(payload))
+        self.assertEqual(tail["encoding"], "binary-omitted")
+        self.assertEqual(
+            tail["sample_sha256"],
+            hashlib.sha256(payload[tail_start:]).hexdigest(),
+        )
+        self.assertNotIn("text", tail)
+        self.assertNotIn(
+            payload[tail_start:].decode().strip(),
+            json.dumps(evidence, sort_keys=True),
+        )
+
+    def test_head_omits_bare_jwt_and_url_userinfo_crossing_boundary(
+        self,
+    ) -> None:
+        jwt = (
+            b"eyJ"
+            + b"A" * 40
+            + b"."
+            + b"B" * 40
+            + b"."
+            + b"C" * 40
+        )
+        cases = {
+            "jwt": b"prefix " + jwt + b"\n" + b"x" * 96,
+            "url_userinfo": (
+                b"https://alice:super-long-password-value@example.test/path\n"
+                + b"x" * 96
+            ),
+        }
+        sample_bytes = 32
+
+        for name, payload in cases.items():
+            with self.subTest(name=name):
+                path = self.snapshot(payload, name=f"head-{name}.log")
+                evidence = self.summarize(
+                    path,
+                    self.result(stdout_bytes=len(payload)),
+                    sample_bytes=sample_bytes,
+                )
+
+                head = evidence["head"]
+                self.assertEqual(head["byte_start"], 0)
+                self.assertEqual(head["byte_end"], sample_bytes)
+                self.assertEqual(head["encoding"], "binary-omitted")
+                self.assertEqual(
+                    head["sample_sha256"],
+                    hashlib.sha256(payload[:sample_bytes]).hexdigest(),
+                )
+                self.assertNotIn("text", head)
+                self.assertNotIn(
+                    payload[:sample_bytes].decode(),
+                    json.dumps(evidence, sort_keys=True),
+                )
+
+    def test_invalid_omitted_context_fails_closed_for_text_samples(
+        self,
+    ) -> None:
+        sample_bytes = 16
+        payload = (
+            b"safe-head-line\n"
+            + b"x" * 40
+            + b"\xff"
+            + b"x" * 40
+            + b"\nsafe-tail-line\n"
+        )
+        path = self.snapshot(payload)
+
+        evidence = self.summarize(
+            path,
+            self.result(stdout_bytes=len(payload)),
+            sample_bytes=sample_bytes,
+        )
+
+        for sample_name, expected in (
+            ("head", payload[:sample_bytes]),
+            ("tail", payload[-sample_bytes:]),
+        ):
+            sample = evidence[sample_name]
+            self.assertEqual(sample["encoding"], "binary-omitted")
+            self.assertNotIn("text", sample)
+            self.assertEqual(
+                sample["sample_sha256"],
+                hashlib.sha256(expected).hexdigest(),
+            )
+
+    def test_tail_omits_query_and_jwt_split_across_boundary(self) -> None:
+        jwt = (
+            b"eyJ"
+            + b"A" * 40
+            + b"."
+            + b"B" * 40
+            + b"."
+            + b"C" * 40
+        )
+        cases = {
+            "query": (
+                b"safe\nGET /cb?access_token="
+                + b"query-secret-" * 6
+                + b" HTTP/1.1\n"
+            ),
+            "jwt": b"safe\nJWT=" + jwt + b"\n",
+        }
+        sample_bytes = 32
+
+        for name, payload in cases.items():
+            with self.subTest(name=name):
+                tail_start = len(payload) - sample_bytes
+                path = self.snapshot(payload, name=f"{name}.log")
+                evidence = self.summarize(
+                    path,
+                    self.result(stdout_bytes=len(payload)),
+                    sample_bytes=sample_bytes,
+                )
+
+                tail = evidence["tail"]
+                self.assertEqual(tail["byte_start"], tail_start)
+                self.assertEqual(tail["encoding"], "binary-omitted")
+                self.assertEqual(
+                    tail["sample_sha256"],
+                    hashlib.sha256(payload[tail_start:]).hexdigest(),
+                )
+                self.assertNotIn("text", tail)
+                self.assertNotIn(
+                    payload[tail_start:].decode().strip(),
+                    json.dumps(evidence, sort_keys=True),
+                )
+
+    def test_tail_omits_private_key_body_when_begin_is_before_tail(
+        self,
+    ) -> None:
+        tail_block = (
+            b"B" * 40
+            + b"\n-----END PRIVATE KEY-----\n"
+        )
+        payload = (
+            b"safe\n-----BEGIN PRIVATE KEY-----\n"
+            + b"A" * 96
+            + b"\n"
+            + tail_block
+        )
+        sample_bytes = len(tail_block)
+        tail_start = len(payload) - sample_bytes
+        self.assertEqual(payload[tail_start - 1 : tail_start], b"\n")
+
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(stdout_bytes=len(payload)),
+            sample_bytes=sample_bytes,
+        )
+
+        tail = evidence["tail"]
+        self.assertEqual(tail["byte_start"], tail_start)
+        self.assertEqual(tail["byte_end"], len(payload))
+        self.assertEqual(tail["encoding"], "binary-omitted")
+        self.assertEqual(
+            tail["sample_sha256"],
+            hashlib.sha256(tail_block).hexdigest(),
+        )
+        self.assertNotIn("text", tail)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn("B" * 20, serialized)
+        self.assertNotIn("END PRIVATE KEY", serialized)
+
     def test_binary_sample_is_omitted_instead_of_base64_encoded(self) -> None:
         payload = b"\x00\xff\x80private-binary\x00"
         path = self.snapshot(payload)
