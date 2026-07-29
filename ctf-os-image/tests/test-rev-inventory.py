@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -30,6 +31,21 @@ assert module_spec is not None and module_spec.loader is not None
 inventory = importlib.util.module_from_spec(module_spec)
 sys.modules[module_spec.name] = inventory
 module_spec.loader.exec_module(inventory)
+
+
+class CountingBytesIO(io.BytesIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_calls = 0
+
+    def write(self, value: bytes) -> int:
+        self.write_calls += 1
+        return super().write(value)
+
+
+class BinaryStdout:
+    def __init__(self) -> None:
+        self.buffer = CountingBytesIO()
 
 
 class RevInventoryProducerTests(unittest.TestCase):
@@ -125,15 +141,18 @@ class RevInventoryProducerTests(unittest.TestCase):
 
     def test_success_is_canonical_source_bound_and_bounded(self) -> None:
         executable = self.fake_executable(self.rabin_payload())
+        emitted: list[bytes] = []
 
         observed = inventory.produce_inventory(
             self.source,
             self.output,
             rabin2_executable=str(executable),
+            emit_document=emitted.append,
         )
 
         self.assertTrue(observed)
         payload, document = self.read_inventory()
+        self.assertEqual(emitted, [payload])
         self.assertEqual(
             payload,
             inventory._canonical_json_bytes(document),
@@ -184,15 +203,18 @@ class RevInventoryProducerTests(unittest.TestCase):
             duplicate,
             name="duplicate-rabin2",
         )
+        emitted: list[bytes] = []
 
         observed = inventory.produce_inventory(
             self.source,
             self.output,
             rabin2_executable=str(bad),
+            emit_document=emitted.append,
         )
 
         self.assertFalse(observed)
-        _payload, document = self.read_inventory()
+        payload, document = self.read_inventory()
+        self.assertEqual(emitted, [payload])
         self.assertEqual(document["status"], "error")
         self.assertEqual(
             document["error"],
@@ -251,15 +273,76 @@ class RevInventoryProducerTests(unittest.TestCase):
         self.assertTrue(destination.is_file())
         self.source.unlink()
         self.source.mkdir()
+        emitted: list[bytes] = []
 
         with self.assertRaises(OSError):
             inventory.produce_inventory(
                 self.source,
                 self.output,
                 rabin2_executable=str(executable),
+                emit_document=emitted.append,
             )
 
+        self.assertEqual(emitted, [])
         self.assertFalse(destination.exists())
+
+    def test_main_wires_exact_stdout_once_and_fatal_open_emits_none(
+        self,
+    ) -> None:
+        for observed in (True, False):
+            with self.subTest(observed=observed):
+                payload = (
+                    b'{"status":"'
+                    + (b"ok" if observed else b"error")
+                    + b'"}\n'
+                )
+                stdout = BinaryStdout()
+
+                def produce(source, *, emit_document):
+                    self.assertEqual(source, self.source)
+                    emit_document(payload)
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        inventory,
+                        "_challenge_source",
+                        return_value=self.source,
+                    ),
+                    mock.patch.object(
+                        inventory,
+                        "produce_inventory",
+                        side_effect=produce,
+                    ),
+                    mock.patch.object(inventory.sys, "stdout", stdout),
+                ):
+                    exit_code = inventory.main(["/challenge/sample.bin"])
+
+                self.assertEqual(exit_code, 0 if observed else 1)
+                self.assertEqual(stdout.buffer.getvalue(), payload)
+                self.assertEqual(stdout.buffer.write_calls, 1)
+
+        fatal_stdout = BinaryStdout()
+        fatal_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                inventory,
+                "_challenge_source",
+                return_value=self.source,
+            ),
+            mock.patch.object(
+                inventory,
+                "produce_inventory",
+                side_effect=OSError("synthetic source-open failure"),
+            ),
+            mock.patch.object(inventory.sys, "stdout", fatal_stdout),
+            mock.patch.object(inventory.sys, "stderr", fatal_stderr),
+        ):
+            exit_code = inventory.main(["/challenge/sample.bin"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(fatal_stdout.buffer.getvalue(), b"")
+        self.assertEqual(fatal_stdout.buffer.write_calls, 0)
 
     def test_subprocess_stdout_and_deadline_are_hard_bounded(self) -> None:
         noisy = self.fake_executable(b"x" * 4096, name="noisy-rabin2")

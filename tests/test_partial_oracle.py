@@ -13,6 +13,7 @@ from ctf_os.engine.partial_oracle import (
     REV_INVENTORY_CONTRACT_FINGERPRINT,
     REV_INVENTORY_CONTRACT_ID,
     REV_INVENTORY_CONTRACT_VERSION,
+    REV_INVENTORY_DOCUMENT_TRANSPORT,
     REV_INVENTORY_MAX_BYTES,
     REV_INVENTORY_SCHEMA_VERSION,
     evaluate_rev_inventory,
@@ -22,6 +23,10 @@ from ctf_os.engine.partial_oracle import (
 SOURCE_BYTES = b"\x7fELFpartial-oracle-fixture"
 SOURCE_SHA256 = hashlib.sha256(SOURCE_BYTES).hexdigest()
 SOURCE_SIZE = len(SOURCE_BYTES)
+EXPECTED_CONTRACT_FINGERPRINT = (
+    "873e1bb39f81e5f0fb6f123ecc282efd2"
+    "e84bc23593e99dc4149ce1d46620b0c"
+)
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -109,10 +114,18 @@ class RevPartialOracleTests(unittest.TestCase):
             module.CONTRACT_FINGERPRINT,
             REV_INVENTORY_CONTRACT_FINGERPRINT,
         )
+        self.assertEqual(
+            REV_INVENTORY_CONTRACT_FINGERPRINT,
+            EXPECTED_CONTRACT_FINGERPRINT,
+        )
         self.assertEqual(module.CONTRACT_ID, REV_INVENTORY_CONTRACT_ID)
         self.assertEqual(
             module.CONTRACT_VERSION,
             REV_INVENTORY_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            module.DOCUMENT_TRANSPORT,
+            REV_INVENTORY_DOCUMENT_TRANSPORT,
         )
 
     def test_duplicate_keys_are_rejected_at_every_object_level(self) -> None:

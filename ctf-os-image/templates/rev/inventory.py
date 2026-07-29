@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ CONTRACT_VERSION = 1
 OUTPUT_NAME = "inventory-v1.json"
 OUTPUT_DIR = Path("/work/rev")
 RABIN2_EXECUTABLE = "/usr/bin/rabin2"
+DOCUMENT_TRANSPORT = "atomic-work-file-plus-exact-stdout-once-v1"
 
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
 SOURCE_HASH_TIMEOUT_SECONDS = 30
@@ -44,6 +46,7 @@ MAX_JSON_DEPTH = 8
 _CONTRACT_DESCRIPTOR = {
     "contract_id": CONTRACT_ID,
     "contract_version": CONTRACT_VERSION,
+    "document_transport": DOCUMENT_TRANSPORT,
     "document_shape": (
         "contract(fingerprint,id,version);schema_version;status;"
         "source(sha256,size_bytes);"
@@ -467,11 +470,18 @@ def _error_document(source: SourceBinding, code: str) -> dict[str, object]:
     }
 
 
-def _publish_document(output_descriptor: int, document: dict[str, object]) -> None:
+def _publish_document(
+    output_descriptor: int,
+    document: dict[str, object],
+    *,
+    emit_document: Callable[[bytes], None] | None = None,
+) -> None:
     encoded = _canonical_json_bytes(document)
     if len(encoded) > MAX_INVENTORY_BYTES:
         raise OSError("normalized inventory exceeds its byte limit")
     atomic_write(output_descriptor, OUTPUT_NAME, encoded)
+    if emit_document is not None:
+        emit_document(encoded)
 
 
 def produce_inventory(
@@ -479,8 +489,9 @@ def produce_inventory(
     output_dir: Path = OUTPUT_DIR,
     *,
     rabin2_executable: str = RABIN2_EXECUTABLE,
+    emit_document: Callable[[bytes], None] | None = None,
 ) -> bool:
-    """Publish one inventory; return whether rabin2 produced usable metadata."""
+    """Publish one inventory; optionally emit the exact canonical bytes once."""
 
     output_descriptor = open_output_dir(output_dir)
     source_descriptor: int | None = None
@@ -510,11 +521,13 @@ def produce_inventory(
             _publish_document(
                 output_descriptor,
                 _error_document(source, error.code),
+                emit_document=emit_document,
             )
             return False
         _publish_document(
             output_descriptor,
             _success_document(source, binary),
+            emit_document=emit_document,
         )
         return True
     finally:
@@ -534,13 +547,23 @@ def _challenge_source(argument: str) -> Path:
     return parent / source.name
 
 
+def _emit_stdout_document(payload: bytes) -> None:
+    written = sys.stdout.buffer.write(payload)
+    if written != len(payload):
+        raise OSError("could not emit the complete Rev inventory document")
+    sys.stdout.buffer.flush()
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 1:
         print("Usage: inventory.py /challenge/BINARY", file=sys.stderr)
         return 2
     try:
         source = _challenge_source(argv[0])
-        observed = produce_inventory(source)
+        observed = produce_inventory(
+            source,
+            emit_document=_emit_stdout_document,
+        )
     except (OSError, TimeoutError, ValueError) as error:
         print(f"rev inventory: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
