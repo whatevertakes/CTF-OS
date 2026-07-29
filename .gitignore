@@ -1,0 +1,12 @@
+# Challenge input and canonical challenge state. .ctfos/ holds run artifacts
+# (currently 15 GB) and incoming/ holds untrusted challenge input; neither is
+# ever a tracked source of truth. Removing these two lines commits both.
+.ctfos/
+incoming/
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

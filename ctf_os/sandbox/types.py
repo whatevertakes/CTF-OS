@@ -1,0 +1,607 @@
+"""Shared typed contracts for challenge-scoped sandbox operations."""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import math
+import re
+import shlex
+import unicodedata
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
+
+from ctf_os.director.resources import ResourceVector
+from ctf_os.sandbox.files import (
+    DEFAULT_SNAPSHOT_MAX_BYTES,
+    SafeFileError,
+    normalize_locator,
+)
+
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+JOB_ID = re.compile(r"^job-[0-9]{8}$")
+
+
+def validate_deadline_monotonic_seconds(
+    value: int | float | None,
+) -> float | None:
+    """Validate one absolute same-host monotonic deadline."""
+
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValueError(
+            "deadline_monotonic_seconds must be positive and finite"
+        )
+    return float(value)
+
+
+class SandboxError(RuntimeError):
+    """An expected sandbox boundary failure."""
+
+
+class ScopeError(SandboxError):
+    """A challenge scope or scoped reference is invalid."""
+
+
+class NetworkDenied(SandboxError):
+    """A command requested network access outside the explicit policy."""
+
+
+class BackgroundJobUnsupported(SandboxError):
+    """A background start was requested without a lease supervisor."""
+
+
+_BACKGROUND_STARTERS = frozenset(
+    {
+        "ctf-bg",
+        "daemon",
+        "nohup",
+        "setsid",
+        "start-stop-daemon",
+        "systemd-run",
+    }
+)
+_SHELL_ENTRYPOINTS = frozenset({"ash", "bash", "dash", "sh", "zsh"})
+
+
+def ensure_foreground_command(argv: Sequence[str]) -> None:
+    """Reject explicit detach/background entrypoints.
+
+    ``ctfwrap`` supervises ordinary foreground descendants.  CTF-OS does not
+    yet have a supervisor that can keep a host resource lease for the complete
+    lifetime of a deliberately detached job, so those starts fail closed.
+    Existing job query/log/cancel utilities remain valid foreground commands.
+    """
+
+    if not argv:
+        raise ValueError("command cannot be empty")
+    executable = Path(argv[0]).name
+    if executable in _BACKGROUND_STARTERS:
+        raise BackgroundJobUnsupported(
+            f"background job start is disabled without a lease supervisor: "
+            f"{executable}"
+        )
+    if executable not in _SHELL_ENTRYPOINTS:
+        return
+
+    script: str | None = None
+    for index, argument in enumerate(argv[:-1]):
+        if (
+            argument == "-c"
+            or (
+                argument.startswith("-")
+                and not argument.startswith("--")
+                and "c" in argument[1:]
+            )
+        ):
+            script = argv[index + 1]
+            break
+    if script is None:
+        return
+    try:
+        lexer = shlex.shlex(
+            script,
+            posix=True,
+            punctuation_chars=";&|()",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        # The shell itself will report malformed quoting as a foreground error.
+        return
+    for token in tokens:
+        if token == "&" or Path(token).name in _BACKGROUND_STARTERS:
+            raise BackgroundJobUnsupported(
+                "shell command requests an unsupported detached/background job"
+            )
+
+
+def _validate_scope_component(value: str, label: str) -> None:
+    """Match the literal-directory identity rules used by ``StateStore``."""
+
+    if not isinstance(value, str):
+        raise ScopeError(f"{label} must be a string")
+    if not value or not value.strip():
+        raise ScopeError(f"{label} cannot be empty")
+    if value in {".", ".."}:
+        raise ScopeError(f"{label} cannot be '.' or '..'")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise ScopeError(f"{label} cannot contain a path separator or NUL")
+    if Path(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        raise ScopeError(f"{label} cannot be an absolute path")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ScopeError(f"{label} cannot contain control characters")
+
+
+@dataclass(frozen=True, slots=True)
+class ChallengeScope:
+    """A fixed challenge/workspace mapping.
+
+    Paths are canonicalized once.  Individual API calls never accept mount
+    paths, which prevents a caller from substituting another challenge.
+    """
+
+    challenge_id: str
+    challenge_dir: Path
+    work_dir: Path
+    contest_id: str = "default"
+    category: str = "misc"
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("contest_id", self.contest_id),
+            ("category", self.category),
+            ("challenge_id", self.challenge_id),
+        ):
+            _validate_scope_component(value, label)
+
+        challenge = self.challenge_dir.expanduser().resolve(strict=True)
+        if not challenge.is_dir():
+            raise ScopeError(f"challenge path is not a directory: {challenge}")
+        work = self.work_dir.expanduser().resolve()
+        work.mkdir(parents=True, exist_ok=True)
+        if not work.is_dir():
+            raise ScopeError(f"work path is not a directory: {work}")
+        if (
+            challenge == work
+            or challenge in work.parents
+            or work in challenge.parents
+        ):
+            raise ScopeError("challenge and work paths must not overlap")
+        object.__setattr__(self, "challenge_dir", challenge)
+        object.__setattr__(self, "work_dir", work)
+        identity = json.dumps(
+            {
+                "contest_id": self.contest_id,
+                "category": self.category,
+                "challenge_id": self.challenge_id,
+                "challenge_dir": str(challenge),
+                "work_dir": str(work),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        object.__setattr__(
+            self,
+            "fingerprint",
+            hashlib.sha256(identity).hexdigest(),
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        contest_id: str,
+        category: str,
+        challenge_id: str,
+        challenge_dir: Path,
+        work_dir: Path,
+    ) -> ChallengeScope:
+        """Construct a scope with the full identity spelled out."""
+
+        return cls(
+            challenge_id=challenge_id,
+            challenge_dir=challenge_dir,
+            work_dir=work_dir,
+            contest_id=contest_id,
+            category=category,
+        )
+
+    @property
+    def qualified_id(self) -> str:
+        return f"{self.contest_id}/{self.category}/{self.challenge_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkTarget:
+    host: str
+    port: int | None = None
+    scheme: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.host, str):
+            raise ValueError("network target host must be a string")
+        host = self.host.strip().lower().rstrip(".")
+        if (
+            not host
+            or len(host) > 253
+            or any(character in host for character in "/\\\x00 \t\r\n")
+        ):
+            raise ValueError(f"invalid network target host: {self.host!r}")
+        try:
+            host = ipaddress.ip_address(host).compressed
+        except ValueError:
+            labels = host.split(".")
+            if any(
+                not label
+                or len(label) > 63
+                or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+                for label in labels
+            ):
+                raise ValueError(f"invalid network target host: {self.host!r}")
+        if self.port is not None and (
+            isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not 1 <= self.port <= 65535
+        ):
+            raise ValueError("network target port must be between 1 and 65535")
+        scheme = self.scheme.lower() if self.scheme is not None else None
+        if scheme is not None and not re.fullmatch(r"[a-z][a-z0-9+.-]{0,31}", scheme):
+            raise ValueError(f"invalid network target scheme: {self.scheme!r}")
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "scheme", scheme)
+
+    @classmethod
+    def parse(cls, value: str) -> NetworkTarget:
+        """Parse ``host``, ``host:port``, or ``scheme://host:port``."""
+
+        from urllib.parse import urlsplit
+
+        if "://" in value:
+            parsed = urlsplit(value)
+            if (
+                not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(f"invalid network target: {value!r}")
+            try:
+                port = parsed.port
+            except ValueError as error:
+                raise ValueError(f"invalid network target: {value!r}") from error
+            return cls(parsed.hostname, port, parsed.scheme)
+        if value.startswith("["):
+            parsed = urlsplit(f"target://{value}")
+            try:
+                port = parsed.port
+            except ValueError as error:
+                raise ValueError(f"invalid network target: {value!r}") from error
+            if not parsed.hostname:
+                raise ValueError(f"invalid network target: {value!r}")
+            return cls(parsed.hostname, port)
+        if value.count(":") == 1:
+            host, possible_port = value.rsplit(":", 1)
+            if possible_port.isdigit():
+                return cls(host, int(possible_port))
+        return cls(value)
+
+    def matches(self, requested: NetworkTarget) -> bool:
+        return (
+            self.host == requested.host
+            and (self.port is None or self.port == requested.port)
+            and (self.scheme is None or self.scheme == requested.scheme)
+        )
+
+    def as_text(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        value = f"{host}:{self.port}" if self.port is not None else host
+        return f"{self.scheme}://{value}" if self.scheme else value
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkPolicy:
+    """Fail-closed network selection for a challenge container.
+
+    Docker's built-in bridge cannot enforce a destination allowlist.  This
+    contract therefore requires both a declared target and an explicit
+    allowlist before selecting the configured network.  Deployments requiring
+    adversarial destination enforcement should set ``enforcement`` to
+    ``"proxy"`` and provide a separately restricted Docker network/proxy.
+    """
+
+    allow_targets: tuple[NetworkTarget, ...] = ()
+    docker_network: str = "none"
+    enforcement: str = "deny"
+
+    def __post_init__(self) -> None:
+        if self.enforcement not in {"deny", "declared", "proxy"}:
+            raise ValueError("network enforcement must be deny, declared, or proxy")
+        if self.allow_targets:
+            if self.docker_network == "none":
+                raise ValueError("an allowlist requires an explicit Docker network")
+            if self.enforcement == "deny":
+                raise ValueError("an allowlist requires declared or proxy enforcement")
+            if self.enforcement == "proxy" and self.docker_network in {
+                "bridge",
+                "default",
+                "host",
+            }:
+                raise ValueError(
+                    "proxy enforcement requires a dedicated restricted "
+                    "Docker network"
+                )
+        elif self.docker_network != "none":
+            raise ValueError("network without an allowlist is not permitted")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.docker_network):
+            raise ValueError(f"invalid Docker network: {self.docker_network!r}")
+
+    @classmethod
+    def deny_all(cls) -> NetworkPolicy:
+        return cls()
+
+    @classmethod
+    def allow(
+        cls,
+        targets: Sequence[NetworkTarget | str],
+        *,
+        docker_network: str,
+        enforcement: str = "declared",
+    ) -> NetworkPolicy:
+        parsed = tuple(
+            target if isinstance(target, NetworkTarget) else NetworkTarget.parse(target)
+            for target in targets
+        )
+        if not parsed:
+            raise ValueError("at least one network target is required")
+        return cls(parsed, docker_network, enforcement)
+
+    def authorize(self, target: NetworkTarget | None) -> str:
+        if target is None:
+            return "none"
+        if not any(allowed.matches(target) for allowed in self.allow_targets):
+            raise NetworkDenied(f"network target is not allowed: {target.as_text()}")
+        if self.enforcement != "proxy":
+            raise NetworkDenied(
+                "declared target metadata is not an egress boundary; configure "
+                "an externally restricted proxy Docker network and select "
+                "enforcement=proxy"
+            )
+        return self.docker_network
+
+
+@dataclass(frozen=True, slots=True)
+class CommandSpec:
+    argv: tuple[str, ...]
+    timeout_seconds: int = 300
+    summary_bytes: int = 4096
+    environment: Mapping[str, str] = field(default_factory=dict)
+    network_target: NetworkTarget | None = None
+    resource_request: ResourceVector = field(
+        default_factory=lambda: ResourceVector(cpu=1, memory_mib=2 * 1024)
+    )
+    deadline_monotonic_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.argv or len(self.argv) > 4096:
+            raise ValueError("command must contain between 1 and 4096 arguments")
+        total_argument_bytes = 0
+        for argument in self.argv:
+            if (
+                not isinstance(argument, str)
+                or "\x00" in argument
+                or len(argument.encode("utf-8")) > 1024 * 1024
+            ):
+                raise ValueError("command contains an invalid argument")
+            total_argument_bytes += len(argument.encode("utf-8"))
+        if total_argument_bytes > 1024 * 1024:
+            raise ValueError("command arguments exceed 1 MiB")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int)
+            or not 0 <= self.timeout_seconds <= 604800
+        ):
+            raise ValueError("timeout_seconds must be between 0 and 604800")
+        object.__setattr__(
+            self,
+            "deadline_monotonic_seconds",
+            validate_deadline_monotonic_seconds(
+                self.deadline_monotonic_seconds
+            ),
+        )
+        if (
+            isinstance(self.summary_bytes, bool)
+            or not isinstance(self.summary_bytes, int)
+            or not 0 <= self.summary_bytes <= 65536
+        ):
+            raise ValueError("summary_bytes must be between 0 and 65536")
+        environment = dict(self.environment)
+        if len(environment) > 256:
+            raise ValueError("environment cannot contain more than 256 variables")
+        total_environment_bytes = 0
+        for name, value in environment.items():
+            if not ENV_NAME.fullmatch(name):
+                raise ValueError(f"invalid environment variable name: {name!r}")
+            if (
+                not isinstance(value, str)
+                or "\x00" in value
+                or len(value.encode("utf-8")) > 64 * 1024
+            ):
+                raise ValueError(f"invalid environment value for {name}")
+            total_environment_bytes += len(name.encode("ascii")) + len(
+                value.encode("utf-8")
+            )
+        if total_environment_bytes > 1024 * 1024:
+            raise ValueError("environment exceeds 1 MiB")
+        request = self.resource_request
+        if not isinstance(request, ResourceVector):
+            raise ValueError("resource_request must be a ResourceVector")
+        if request.cpu <= 0:
+            raise ValueError("resource_request must include at least one CPU")
+        if request.memory_mib < 256:
+            raise ValueError(
+                "resource_request must include at least 256 MiB of memory"
+            )
+        if request.gpu > 1 or request.kvm > 1 or request.network > 1:
+            raise ValueError(
+                "GPU, KVM, and network requests are single-slot resources"
+            )
+        if (self.network_target is not None) != bool(request.network):
+            raise ValueError(
+                "network resource request must match network_target presence"
+            )
+        object.__setattr__(self, "environment", MappingProxyType(environment))
+
+    @classmethod
+    def create(
+        cls,
+        argv: Sequence[str],
+        **kwargs: object,
+    ) -> CommandSpec:
+        return cls(tuple(argv), **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxResult:
+    run_id: str
+    status: str
+    exit_code: int
+    timed_out: bool
+    duration_ms: int
+    stdout_summary: str
+    stderr_summary: str
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_path: str
+    stderr_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProofInput:
+    """One immutable proof input and its destination inside clean ``/work``."""
+
+    source_locator: str
+    destination_locator: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        try:
+            source = normalize_locator(self.source_locator)
+            destination = normalize_locator(self.destination_locator)
+        except SafeFileError as error:
+            raise ValueError(str(error)) from error
+        if not isinstance(self.sha256, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", self.sha256
+        ):
+            raise ValueError("proof input sha256 must be a SHA-256 digest")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or not 0 <= self.size_bytes <= DEFAULT_SNAPSHOT_MAX_BYTES
+        ):
+            raise ValueError("proof input size is outside the snapshot bound")
+        object.__setattr__(self, "source_locator", source)
+        object.__setattr__(self, "destination_locator", destination)
+        object.__setattr__(self, "sha256", self.sha256.lower())
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "source_locator": self.source_locator,
+            "destination_locator": self.destination_locator,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> ProofInput:
+        source_locator = value.get("source_locator")
+        destination_locator = value.get("destination_locator")
+        sha256 = value.get("sha256")
+        size_bytes = value.get("size_bytes")
+        if (
+            not isinstance(source_locator, str)
+            or not isinstance(destination_locator, str)
+            or not isinstance(sha256, str)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+        ):
+            raise TypeError("proof input fields have invalid types")
+        return cls(
+            source_locator=source_locator,
+            destination_locator=destination_locator,
+            sha256=sha256,
+            size_bytes=size_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class JobRef:
+    job_id: str
+    scope_fingerprint: str
+    runtime_id: str = "none"
+
+    def __post_init__(self) -> None:
+        if not JOB_ID.fullmatch(self.job_id):
+            raise ValueError(f"invalid sandbox job id: {self.job_id!r}")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.scope_fingerprint):
+            raise ValueError("invalid scope fingerprint")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.runtime_id):
+            raise ValueError("invalid sandbox runtime id")
+
+
+class JobState(str, Enum):
+    STARTING = "starting"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    LOST = "lost"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class JobStatus:
+    ref: JobRef
+    status: JobState
+    exit_code: int | None = None
+    timed_out: bool = False
+    cancelled: bool = False
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JobLog:
+    ref: JobRef
+    stdout: str
+    stderr: str
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRef:
+    locator: str
+    sha256: str
+    size_bytes: int
+    scope_fingerprint: str

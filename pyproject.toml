@@ -1,0 +1,15 @@
+[project]
+name = "ctf-os"
+version = "0.1.0"
+description = "Challenge-scoped CTF solving engine with Codex roles and sandboxed tools"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+ctfos = "ctf_os.cli:main"
+ctf-container = "ctf_os.container_tools:main"
+ctfos-live-mcp = "ctf_os.live_mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

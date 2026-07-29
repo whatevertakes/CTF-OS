@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+toolkit_version=1.19.1-1
+keyring=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+source_list=/etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+if docker ps -q | grep -q .; then
+  printf 'Stop running Docker containers before configuring the runtime.\n' >&2
+  exit 2
+fi
+
+sudo -v
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2 jq
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor --yes -o "${keyring}"
+curl -fsSL \
+  https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed "s#deb https://#deb [signed-by=${keyring}] https://#g" \
+  | sudo tee "${source_list}" >/dev/null
+
+sudo apt-get update
+sudo apt-get install -y \
+  "nvidia-container-toolkit=${toolkit_version}" \
+  "nvidia-container-toolkit-base=${toolkit_version}" \
+  "libnvidia-container-tools=${toolkit_version}" \
+  "libnvidia-container1=${toolkit_version}"
+
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart nvidia-cdi-refresh.service
+sudo systemctl restart docker
+
+nvidia-ctk cdi list | grep -Fx 'nvidia.com/gpu=all' >/dev/null
+docker info --format '{{json .Runtimes}}' \
+  | jq -e 'has("nvidia")' >/dev/null
+printf 'NVIDIA Container Toolkit %s and Docker CDI are ready.\n' \
+  "${toolkit_version}"
