@@ -1226,6 +1226,149 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertEqual(session.status, SessionStatus.COMPLETED)
         self.assertIn("terminal challenge", session.stop_reason or "")
 
+    def test_managed_public_wrappers_refresh_empty_init_before_cartography(
+        self,
+    ) -> None:
+        for wrapper_name in ("run_cycle", "run_cycles"):
+            with self.subTest(wrapper=wrapper_name):
+                identity = ChallengeIdentity(
+                    "Managed CTF",
+                    "rev",
+                    f"late-input-{wrapper_name}",
+                )
+                incoming = (
+                    self.root
+                    / "incoming"
+                    / identity.contest_id
+                    / identity.category
+                    / identity.challenge_id
+                )
+                incoming.mkdir(parents=True)
+                events: list[tuple[str, object]] = []
+                events_lock = threading.Lock()
+
+                class OrderedExecutor(ProbeRoleExecutor):
+                    def run(
+                        inner_self,
+                        command,
+                        *,
+                        cwd,
+                        timeout,
+                        on_stdout_line,
+                    ):
+                        with events_lock:
+                            events.append(
+                                ("model", _role_for(command).value)
+                            )
+                        return super().run(
+                            command,
+                            cwd=cwd,
+                            timeout=timeout,
+                            on_stdout_line=on_stdout_line,
+                        )
+
+                class OrderedSandbox(FakeSandbox):
+                    def run(inner_self, spec):
+                        with events_lock:
+                            events.append(("tool", tuple(spec.argv)))
+                        return super().run(spec)
+
+                engine = self.engine(
+                    OrderedExecutor(),
+                    sandbox_factory=(
+                        lambda state, work, policy: OrderedSandbox(work)
+                    ),
+                )
+                initial = engine.add_challenge(
+                    identity,
+                    prompt="solve input added after session creation",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                self.assertFalse(
+                    any(
+                        experiment.extra.get("adapter_seed") is True
+                        for experiment in initial.experiments
+                    )
+                )
+                (incoming / "challenge.bin").write_bytes(
+                    b"\x7fELFmanaged-late-input"
+                )
+                orchestrator = ManagedOrchestrator(
+                    engine,
+                    capability_probe=self.capability,
+                )
+
+                if wrapper_name == "run_cycle":
+                    state = orchestrator.run_cycle(identity)
+                else:
+                    state = orchestrator.run_cycles(
+                        identity,
+                        max_cycles=1,
+                    )
+
+                seed_experiments = [
+                    experiment
+                    for experiment in state.experiments
+                    if experiment.extra.get("adapter_seed") is True
+                ]
+                self.assertEqual(
+                    [
+                        experiment.extra["adapter_spec_template_id"]
+                        for experiment in seed_experiments
+                    ],
+                    [
+                        "inventory_observation",
+                        "assembly_observation",
+                        "dynamic_observation",
+                    ],
+                )
+                first_cycle = state.cycles[0]
+                self.assertTrue(
+                    {
+                        experiment.id for experiment in seed_experiments
+                    }.issubset(first_cycle.selected_action_ids)
+                )
+                seed_run_ids = {
+                    run.extra.get("experiment_id")
+                    for run in state.runs
+                    if run.origin is RunOrigin.MANAGED_TOOL
+                }
+                self.assertTrue(
+                    {
+                        experiment.id for experiment in seed_experiments
+                    }.issubset(seed_run_ids)
+                )
+                captain_index = events.index(
+                    ("model", Role.CAPTAIN.value)
+                )
+                pre_captain_argv = {
+                    tuple(payload)
+                    for kind, payload in events[:captain_index]
+                    if kind == "tool"
+                }
+                self.assertTrue(
+                    any(
+                        argv[:2]
+                        == (
+                            "python3",
+                            "/opt/ctf-templates/rev/inventory.py",
+                        )
+                        for argv in pre_captain_argv
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        argv and argv[0] == "objdump"
+                        for argv in pre_captain_argv
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        argv and argv[0] == "ctfwrap"
+                        for argv in pre_captain_argv
+                    )
+                )
+
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()
         concurrency = ToolConcurrency()

@@ -7,6 +7,7 @@ challenge session explicitly; there is no contest-wide automatic switch.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -68,6 +69,13 @@ from ctf_os.engine.proof import (
     ProofResult,
     evaluate_proof,
     write_proof_result,
+)
+from ctf_os.engine.partial_oracle import (
+    REV_INVENTORY_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_CONTRACT_ID,
+    REV_INVENTORY_CONTRACT_VERSION,
+    REV_INVENTORY_DOCUMENT_TRANSPORT,
+    REV_INVENTORY_MAX_SOURCE_BYTES,
 )
 from ctf_os.engine.receipt_summary import (
     ReceiptSummaryError,
@@ -160,6 +168,7 @@ from ctf_os.sandbox.files import (
     SafeFileError,
     copy_bounded_regular,
     ensure_private_directory,
+    ensure_relative_directory,
     normalize_locator,
 )
 from ctf_os.stages.ingest import inventory_challenge
@@ -694,6 +703,158 @@ def _select_adapter_primary_source(
     return selected.source
 
 
+def _verify_rev_source_snapshot_tree(
+    snapshot_root: Path,
+    locator: str,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    maximum_bytes: int,
+) -> ImmutableFile:
+    """Verify the complete, single-file Rev snapshot topology."""
+
+    normalized = normalize_locator(locator)
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or expected_sha256 != expected_sha256.lower()
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_sha256
+        )
+        or isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+        or expected_size > maximum_bytes
+    ):
+        raise SafeFileError("immutable snapshot binding is invalid")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    try:
+        directory_descriptor = os.open(snapshot_root, directory_flags)
+        descriptors.append(directory_descriptor)
+        root_metadata = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or stat.S_IMODE(root_metadata.st_mode)
+            != _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE
+            or os.listdir(directory_descriptor) != ["challenge"]
+        ):
+            raise SafeFileError(
+                "immutable snapshot root topology is invalid"
+            )
+        directory_descriptor = os.open(
+            "challenge",
+            directory_flags,
+            dir_fd=directory_descriptor,
+        )
+        descriptors.append(directory_descriptor)
+        challenge_metadata = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(challenge_metadata.st_mode)
+            or stat.S_IMODE(challenge_metadata.st_mode)
+            != _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE
+        ):
+            raise SafeFileError(
+                "immutable snapshot challenge directory is invalid"
+            )
+        parts = normalized.split("/")
+        for component in parts[:-1]:
+            if os.listdir(directory_descriptor) != [component]:
+                raise SafeFileError(
+                    "immutable snapshot ancestor topology is invalid"
+                )
+            directory_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            descriptors.append(directory_descriptor)
+            ancestor = os.fstat(directory_descriptor)
+            if (
+                not stat.S_ISDIR(ancestor.st_mode)
+                or stat.S_IMODE(ancestor.st_mode)
+                != _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE
+            ):
+                raise SafeFileError(
+                    "immutable snapshot ancestor is invalid"
+                )
+        if os.listdir(directory_descriptor) != [parts[-1]]:
+            raise SafeFileError(
+                "immutable snapshot leaf topology is invalid"
+            )
+        file_descriptor = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        descriptors.append(file_descriptor)
+        before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode)
+            != _REV_SOURCE_SNAPSHOT_FILE_MODE
+            or before.st_nlink != 1
+            or before.st_size != expected_size
+            or before.st_size > maximum_bytes
+        ):
+            raise SafeFileError(
+                "immutable snapshot metadata does not match its binding"
+            )
+        digest = hashlib.sha256()
+        total = 0
+        while total <= maximum_bytes:
+            block = os.read(
+                file_descriptor,
+                min(1024 * 1024, maximum_bytes + 1 - total),
+            )
+            if not block:
+                break
+            digest.update(block)
+            total += len(block)
+        after = os.fstat(file_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            total != expected_size
+            or digest.hexdigest() != expected_sha256
+            or any(
+                getattr(after, field) != getattr(before, field)
+                for field in stable_fields
+            )
+        ):
+            raise SafeFileError(
+                "immutable snapshot bytes do not match their binding"
+            )
+    except OSError as error:
+        raise SafeFileError(
+            "immutable snapshot cannot be inspected safely"
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return ImmutableFile(
+        path=snapshot_root / "challenge" / normalized,
+        source_locator=normalized,
+        sha256=expected_sha256,
+        size_bytes=expected_size,
+    )
+
+
 def _run_id(prefix: str) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", prefix).strip("-") or "run"
@@ -719,6 +880,61 @@ def _durable_unlink(path: Path) -> None:
 def _record_id(kind: str, run_id: str, local: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "-", local).strip("-")
     return f"{kind}-{run_id}-{normalized or uuid.uuid4().hex[:8]}"
+
+
+_ADAPTER_SEED_RUN_METADATA_KEYS = (
+    "adapter_name",
+    "adapter_seed",
+    "adapter_seed_contract_version",
+    "adapter_seed_order",
+    "adapter_spec_id",
+    "adapter_spec_sha256",
+    "adapter_spec_template_id",
+    "partial_oracle",
+    "requires_explicit_execution",
+    "source_binding",
+    "source_snapshot",
+)
+_REV_ADAPTER_SEED_CONTRACT_VERSION = 1
+_REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = True
+_REV_SOURCE_SNAPSHOT_TREE_CONTRACT = "exact-single-primary-v1"
+_REV_SOURCE_SNAPSHOT_FILE_MODE = 0o500
+_REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = 0o500
+_REV_SOURCE_SNAPSHOT_PUBLISH = "staged-atomic-no-repair-v1"
+
+
+def _adapter_seed_run_metadata(
+    experiment: Experiment,
+) -> dict[str, Any]:
+    if experiment.extra.get("adapter_seed") is not True:
+        return {}
+    return {
+        "adapter_name": experiment.extra.get("adapter_name"),
+        "adapter_seed": True,
+        "adapter_seed_contract_version": experiment.extra.get(
+            "adapter_seed_contract_version"
+        ),
+        "adapter_seed_order": experiment.extra.get("adapter_seed_order"),
+        "adapter_spec_id": experiment.extra.get("adapter_spec_id"),
+        "adapter_spec_sha256": experiment.extra.get(
+            "adapter_spec_sha256"
+        ),
+        "adapter_spec_template_id": experiment.extra.get(
+            "adapter_spec_template_id"
+        ),
+        "partial_oracle": copy.deepcopy(
+            experiment.extra.get("partial_oracle")
+        ),
+        "requires_explicit_execution": experiment.extra.get(
+            "requires_explicit_execution"
+        ),
+        "source_binding": copy.deepcopy(
+            experiment.extra.get("source_binding")
+        ),
+        "source_snapshot": copy.deepcopy(
+            experiment.extra.get("source_snapshot")
+        ),
+    }
 
 
 def _relative_workspace_artifact(value: str, role: Role) -> str:
@@ -1296,6 +1512,9 @@ class ChallengeEngine:
     ) -> ChallengeState:
         """Register the adapter's deterministic initial plan exactly once."""
 
+        if str(adapter.name) == "reversing":
+            return self._synchronize_rev_adapter_seed_plan(state, adapter)
+
         def apply(current: ChallengeState) -> None:
             current.metadata["adapter_name"] = str(adapter.name)
             current.metadata["failure_labels"] = list(
@@ -1356,6 +1575,314 @@ class ChallengeEngine:
                 existing_ids.add(experiment_id)
 
         return self.store.update(state.identity, apply)
+
+    def _rev_adapter_seed_plan(
+        self,
+        state: ChallengeState,
+        adapter: Any,
+    ) -> tuple[
+        SourceFile | None,
+        tuple[tuple[Any, str, tuple[str, ...], dict[str, Any]], ...],
+    ]:
+        """Derive the exact Rev seed plan from the current source manifest."""
+
+        primary_source = _select_adapter_primary_source(
+            state.category,
+            self.challenge_input(state.identity),
+            state.source_inventory,
+        )
+        if primary_source is None:
+            return None, ()
+        manifest = state.metadata.get("source_manifest_sha256")
+        if (
+            not isinstance(manifest, str)
+            or len(manifest) != 64
+            or manifest != manifest.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in manifest
+            )
+        ):
+            raise EngineError(
+                "Rev adapter seeds require a canonical source manifest"
+            )
+        if (
+            not isinstance(primary_source.sha256, str)
+            or len(primary_source.sha256) != 64
+            or primary_source.sha256 != primary_source.sha256.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in primary_source.sha256
+            )
+            or isinstance(primary_source.size, bool)
+            or not isinstance(primary_source.size, int)
+            or primary_source.size < 0
+        ):
+            raise EngineError(
+                "Rev adapter primary source has an invalid immutable binding"
+            )
+        manifest_history = state.metadata.get(
+            "source_manifest_history",
+            [],
+        )
+        if not isinstance(manifest_history, list):
+            raise EngineError(
+                "Rev adapter seeds require canonical manifest history"
+            )
+        manifest_generation = len(manifest_history) + 1
+
+        source_binding: dict[str, Any] = {
+            "manifest_generation": manifest_generation,
+            "manifest_sha256": manifest,
+            "path": primary_source.path,
+            "sha256": primary_source.sha256,
+            "size_bytes": primary_source.size,
+        }
+        snapshot_contract = {
+            "directory_mode": _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
+            "file_mode": _REV_SOURCE_SNAPSHOT_FILE_MODE,
+            "mount_requirement": "challenge_read_only",
+            "publish": _REV_SOURCE_SNAPSHOT_PUBLISH,
+            "tree_contract": _REV_SOURCE_SNAPSHOT_TREE_CONTRACT,
+        }
+        binding_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "source_binding": source_binding,
+                    "snapshot_contract": snapshot_contract,
+                },
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
+        source_snapshot = {
+            "binding_sha256": binding_sha256,
+            "challenge_dir": (
+                "runtime/source-snapshots/"
+                f"rev-primary-{binding_sha256}/challenge"
+            ),
+            **snapshot_contract,
+            "id": f"rev-primary-{binding_sha256}",
+            "sha256": primary_source.sha256,
+            "size_bytes": primary_source.size,
+            "source_locator": primary_source.path,
+        }
+        primary = f"/challenge/{primary_source.path}"
+        plan: list[
+            tuple[Any, str, tuple[str, ...], dict[str, Any]]
+        ] = []
+        managed_specs = tuple(
+            spec
+            for spec in adapter.initial_observations()
+            if str(spec.id) != "decompiler_observation"
+        )
+        for ordinal, spec in enumerate(managed_specs):
+            partial_oracle = (
+                {
+                    "oracle_id": REV_INVENTORY_CONTRACT_ID,
+                    "oracle_version": REV_INVENTORY_CONTRACT_VERSION,
+                    "contract_fingerprint": (
+                        REV_INVENTORY_CONTRACT_FINGERPRINT
+                    ),
+                    "document_transport": (
+                        REV_INVENTORY_DOCUMENT_TRANSPORT
+                    ),
+                }
+                if str(spec.id) == "inventory_observation"
+                else None
+            )
+            spec_descriptor = {
+                "adapter": str(adapter.name),
+                "adapter_seed": True,
+                "adapter_seed_contract_version": (
+                    _REV_ADAPTER_SEED_CONTRACT_VERSION
+                ),
+                "adapter_seed_order": ordinal,
+                "command_template": list(spec.command_template),
+                "drop_condition": str(spec.drop_condition),
+                "expected_observation": str(spec.expected_observation),
+                "keep_condition": str(spec.keep_condition),
+                "oracle": partial_oracle,
+                "purpose": str(spec.purpose),
+                "requires_explicit_execution": (
+                    _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
+                ),
+                "requires_network": bool(spec.requires_network),
+                "resource_class": str(spec.resource_class),
+                "source_binding": source_binding,
+                "source_snapshot": source_snapshot,
+                "template_spec_id": str(spec.id),
+                "timeout_s": int(spec.timeout_s),
+            }
+            spec_sha256 = hashlib.sha256(
+                json.dumps(
+                    spec_descriptor,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ).hexdigest()
+            bound_spec_id = f"{spec.id}@{spec_sha256}"
+            experiment_id = _record_id(
+                "E-adapter",
+                str(adapter.name),
+                bound_spec_id,
+            )
+            argv = tuple(
+                argument.replace("{primary}", primary)
+                for argument in spec.command_template
+            )
+            extra: dict[str, Any] = {
+                "adapter_name": str(adapter.name),
+                "adapter_seed": True,
+                "adapter_seed_contract_version": (
+                    _REV_ADAPTER_SEED_CONTRACT_VERSION
+                ),
+                "adapter_seed_order": ordinal,
+                "adapter_spec_id": bound_spec_id,
+                "adapter_spec_sha256": spec_sha256,
+                "adapter_spec_template_id": str(spec.id),
+                "purpose": spec.purpose,
+                "requires_explicit_execution": (
+                    _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
+                ),
+                "source_binding": copy.deepcopy(source_binding),
+                "source_snapshot": copy.deepcopy(source_snapshot),
+            }
+            if partial_oracle is not None:
+                extra["partial_oracle"] = partial_oracle
+            plan.append((spec, experiment_id, argv, extra))
+        return primary_source, tuple(plan)
+
+    def _rev_adapter_seed_plan_needs_sync(
+        self,
+        state: ChallengeState,
+        adapter: Any,
+        primary_source: SourceFile | None,
+        plan: Sequence[
+            tuple[Any, str, tuple[str, ...], Mapping[str, Any]]
+        ],
+    ) -> bool:
+        desired_ids = {item[1] for item in plan}
+        existing_ids = {item.id for item in state.experiments}
+        if state.metadata.get("adapter_name") != str(adapter.name):
+            return True
+        if state.metadata.get("failure_labels") != list(
+            adapter.failure_labels()
+        ):
+            return True
+        if primary_source is None:
+            if "adapter_primary_source" in state.metadata:
+                return True
+            if "adapter_seed_source_binding" in state.metadata:
+                return True
+        else:
+            expected_binding = plan[0][3]["source_binding"]
+            if (
+                state.metadata.get("adapter_primary_source")
+                != primary_source.path
+                or state.metadata.get("adapter_seed_source_binding")
+                != expected_binding
+            ):
+                return True
+        if any(
+            item.extra.get("adapter_seed") is True
+            and item.status is ExperimentStatus.REGISTERED
+            and item.id not in desired_ids
+            for item in state.experiments
+        ):
+            return True
+        return any(item[1] not in existing_ids for item in plan)
+
+    def _synchronize_rev_adapter_seed_plan(
+        self,
+        state: ChallengeState,
+        adapter: Any | None = None,
+    ) -> ChallengeState:
+        """Synchronize Rev cartography seeds without rewriting history."""
+
+        selected_adapter = adapter or get_adapter(state.category)
+        if str(selected_adapter.name) != "reversing":
+            return state
+        primary_source, plan = self._rev_adapter_seed_plan(
+            state,
+            selected_adapter,
+        )
+        if not self._rev_adapter_seed_plan_needs_sync(
+            state,
+            selected_adapter,
+            primary_source,
+            plan,
+        ):
+            return state
+
+        def apply(current: ChallengeState) -> None:
+            current_primary, current_plan = self._rev_adapter_seed_plan(
+                current,
+                selected_adapter,
+            )
+            desired_ids = {item[1] for item in current_plan}
+            current.metadata["adapter_name"] = str(selected_adapter.name)
+            current.metadata["failure_labels"] = list(
+                selected_adapter.failure_labels()
+            )
+            if current_primary is None:
+                current.metadata.pop("adapter_primary_source", None)
+                current.metadata.pop("adapter_seed_source_binding", None)
+            else:
+                current.metadata["adapter_primary_source"] = (
+                    current_primary.path
+                )
+                current.metadata["adapter_seed_source_binding"] = (
+                    copy.deepcopy(current_plan[0][3]["source_binding"])
+                )
+            for experiment in current.experiments:
+                if (
+                    experiment.extra.get("adapter_seed") is True
+                    and experiment.status is ExperimentStatus.REGISTERED
+                    and experiment.id not in desired_ids
+                ):
+                    experiment.status = ExperimentStatus.CANCELLED
+                    experiment.extra["cancelled_at"] = utc_now()
+                    experiment.extra["cancelled_reason"] = (
+                        "source_binding_replaced"
+                        if current_primary is not None
+                        else "source_binding_unavailable"
+                    )
+            existing_ids = {
+                experiment.id for experiment in current.experiments
+            }
+            for spec, experiment_id, argv, extra in current_plan:
+                if experiment_id in existing_ids:
+                    continue
+                current.experiments.append(
+                    Experiment(
+                        id=experiment_id,
+                        hypothesis_ids=[],
+                        command=shlex.join(argv),
+                        expected_observation=spec.expected_observation,
+                        keep_if=spec.keep_condition,
+                        drop_if=spec.drop_condition,
+                        timeout_seconds=self._budget_command_timeout(
+                            current,
+                            int(spec.timeout_s),
+                        ),
+                        resource_class=spec.resource_class,
+                        kind=ExperimentKind.PROBE,
+                        status=ExperimentStatus.REGISTERED,
+                        extra=copy.deepcopy(extra),
+                    )
+                )
+                existing_ids.add(experiment_id)
+
+        return self.store.update(
+            state.identity,
+            apply,
+            expected_revision=state.revision,
+        )
 
     def add_network_target(
         self,
@@ -1659,7 +2186,7 @@ class ChallengeEngine:
             prior_manifest == inventory.manifest_sha256
             and len(current.source_inventory) == len(inventory.files)
         ):
-            return current
+            return self._synchronize_rev_adapter_seed_plan(current)
 
         def apply(state: ChallengeState) -> None:
             old_manifest = state.metadata.get("source_manifest_sha256")
@@ -1723,12 +2250,13 @@ class ChallengeEngine:
             )
             state.metadata["source_total_bytes"] = inventory.total_bytes
 
-        return self.store.update(
+        refreshed = self.store.update(
             identity,
             apply,
             expected_revision=current.revision,
             validate_artifacts=False,
         )
+        return self._synchronize_rev_adapter_seed_plan(refreshed)
 
     def update_prompt(
         self,
@@ -2838,11 +3366,300 @@ class ChallengeEngine:
             )
         self._network_policy(state).authorize(parsed)
 
+    def _require_adapter_seed_source_binding_current(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> None:
+        """Fail closed if a Rev seed no longer matches the current input."""
+
+        if experiment.extra.get("adapter_seed") is not True:
+            return
+        adapter = get_adapter(state.category)
+        if str(adapter.name) != "reversing":
+            return
+        _primary_source, plan = self._rev_adapter_seed_plan(state, adapter)
+        expected = next(
+            (item for item in plan if item[1] == experiment.id),
+            None,
+        )
+        if expected is None:
+            raise EngineError(
+                "Rev adapter experiment source binding is stale"
+            )
+        _spec, _experiment_id, argv, expected_extra = expected
+        if experiment.command != shlex.join(argv):
+            raise EngineError(
+                "Rev adapter experiment argv does not match its source "
+                "binding"
+            )
+        pinned_keys = {
+            "adapter_name",
+            "adapter_seed_contract_version",
+            "adapter_seed_order",
+            "adapter_spec_id",
+            "adapter_spec_sha256",
+            "adapter_spec_template_id",
+            "partial_oracle",
+            "requires_explicit_execution",
+            "source_binding",
+            "source_snapshot",
+        }
+        if any(
+            experiment.extra.get(key) != expected_extra.get(key)
+            for key in pinned_keys
+        ):
+            raise EngineError(
+                "Rev adapter experiment metadata does not match its current "
+                "source binding"
+            )
+
+    def _prepare_rev_adapter_source_snapshot(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> tuple[Path, ImmutableFile] | None:
+        """Install and verify the exact bytes mounted for one Rev seed."""
+
+        if (
+            experiment.extra.get("adapter_seed") is not True
+            or str(experiment.extra.get("adapter_name")) != "reversing"
+        ):
+            return None
+        source_binding = experiment.extra.get("source_binding")
+        source_snapshot = experiment.extra.get("source_snapshot")
+        if not isinstance(source_binding, Mapping) or not isinstance(
+            source_snapshot,
+            Mapping,
+        ):
+            raise EngineError(
+                "Rev adapter experiment lacks an immutable source snapshot"
+            )
+        source_locator = source_binding.get("path")
+        expected_sha256 = source_binding.get("sha256")
+        expected_size = source_binding.get("size_bytes")
+        snapshot_id = source_snapshot.get("id")
+        snapshot_relative = source_snapshot.get("challenge_dir")
+        snapshot_contract = {
+            "directory_mode": _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
+            "file_mode": _REV_SOURCE_SNAPSHOT_FILE_MODE,
+            "mount_requirement": "challenge_read_only",
+            "publish": _REV_SOURCE_SNAPSHOT_PUBLISH,
+            "tree_contract": _REV_SOURCE_SNAPSHOT_TREE_CONTRACT,
+        }
+        try:
+            expected_binding_sha256 = hashlib.sha256(
+                json.dumps(
+                    {
+                        "source_binding": dict(source_binding),
+                        "snapshot_contract": snapshot_contract,
+                    },
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ).hexdigest()
+        except (TypeError, ValueError) as error:
+            raise EngineError(
+                "Rev adapter source snapshot metadata is invalid"
+            ) from error
+        if (
+            set(source_binding)
+            != {
+                "manifest_generation",
+                "manifest_sha256",
+                "path",
+                "sha256",
+                "size_bytes",
+            }
+            or set(source_snapshot)
+            != {
+                "binding_sha256",
+                "challenge_dir",
+                "directory_mode",
+                "file_mode",
+                "id",
+                "mount_requirement",
+                "publish",
+                "sha256",
+                "size_bytes",
+                "source_locator",
+                "tree_contract",
+            }
+            or not isinstance(source_locator, str)
+            or not isinstance(expected_sha256, str)
+            or isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or not isinstance(snapshot_id, str)
+            or not re.fullmatch(
+                r"rev-primary-[0-9a-f]{64}",
+                snapshot_id,
+            )
+            or not isinstance(snapshot_relative, str)
+            or snapshot_relative
+            != f"runtime/source-snapshots/{snapshot_id}/challenge"
+            or source_snapshot.get("binding_sha256")
+            != expected_binding_sha256
+            or snapshot_id
+            != f"rev-primary-{expected_binding_sha256}"
+            or source_snapshot.get("source_locator") != source_locator
+            or source_snapshot.get("sha256") != expected_sha256
+            or source_snapshot.get("size_bytes") != expected_size
+            or any(
+                source_snapshot.get(key) != value
+                for key, value in snapshot_contract.items()
+            )
+        ):
+            raise EngineError(
+                "Rev adapter source snapshot metadata is invalid"
+            )
+        maximum_bytes = min(
+            REV_INVENTORY_MAX_SOURCE_BYTES,
+            self.store.max_artifact_bytes,
+        )
+        if expected_size < 0 or expected_size > maximum_bytes:
+            raise EngineError(
+                "Rev adapter source exceeds the immutable snapshot bound"
+            )
+        paths = self.store.challenge_paths(state.identity)
+        snapshot_parent = ensure_private_directory(
+            paths.runtime / "source-snapshots"
+        )
+        snapshot_base = snapshot_parent / snapshot_id
+        challenge_root = snapshot_base / "challenge"
+        lock_path = snapshot_parent / f".{snapshot_id}.lock"
+        try:
+            with FileLock(lock_path) as snapshot_lock:
+                snapshot_lock.acquire()
+                try:
+                    os.lstat(snapshot_base)
+                except FileNotFoundError:
+                    snapshot_exists = False
+                except OSError as error:
+                    raise EngineError(
+                        "Rev adapter source snapshot path is unavailable"
+                    ) from error
+                else:
+                    snapshot_exists = True
+                if snapshot_exists:
+                    try:
+                        verified = _verify_rev_source_snapshot_tree(
+                            snapshot_base,
+                            source_locator,
+                            expected_sha256=expected_sha256,
+                            expected_size=expected_size,
+                            maximum_bytes=maximum_bytes,
+                        )
+                    except SafeFileError as verification_error:
+                        raise EngineError(
+                            "Rev adapter source snapshot failed verification"
+                        ) from verification_error
+                else:
+                    try:
+                        with tempfile.TemporaryDirectory(
+                            prefix=f".{snapshot_id}.staging-",
+                            dir=snapshot_parent,
+                        ) as staging_name:
+                            staging_base = Path(staging_name)
+                            staging_challenge = ensure_private_directory(
+                                staging_base / "challenge"
+                            )
+                            parent = PurePosixPath(source_locator).parent
+                            if parent != PurePosixPath("."):
+                                ensure_relative_directory(
+                                    staging_challenge,
+                                    parent.as_posix(),
+                                )
+                            staging_destination = (
+                                staging_challenge
+                                / normalize_locator(source_locator)
+                            )
+                            copy_bounded_regular(
+                                self.challenge_input(state.identity),
+                                source_locator,
+                                staging_destination,
+                                maximum_bytes=maximum_bytes,
+                                expected_sha256=expected_sha256,
+                                expected_size=expected_size,
+                                mode=_REV_SOURCE_SNAPSHOT_FILE_MODE,
+                            )
+                            current = staging_destination.parent
+                            while True:
+                                os.chmod(
+                                    current,
+                                    _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
+                                )
+                                if current == staging_challenge:
+                                    break
+                                current = current.parent
+                            os.chmod(
+                                staging_base,
+                                _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE,
+                            )
+                            _verify_rev_source_snapshot_tree(
+                                staging_base,
+                                source_locator,
+                                expected_sha256=expected_sha256,
+                                expected_size=expected_size,
+                                maximum_bytes=maximum_bytes,
+                            )
+                            try:
+                                os.lstat(snapshot_base)
+                            except FileNotFoundError:
+                                pass
+                            else:
+                                raise SafeFileError(
+                                    "immutable snapshot appeared before "
+                                    "publish"
+                                )
+                            os.rename(staging_base, snapshot_base)
+                            parent_flags = os.O_RDONLY | os.O_CLOEXEC
+                            parent_flags |= getattr(
+                                os,
+                                "O_DIRECTORY",
+                                0,
+                            )
+                            parent_flags |= getattr(
+                                os,
+                                "O_NOFOLLOW",
+                                0,
+                            )
+                            parent_descriptor = os.open(
+                                snapshot_parent,
+                                parent_flags,
+                            )
+                            try:
+                                os.fsync(parent_descriptor)
+                            finally:
+                                os.close(parent_descriptor)
+                        verified = _verify_rev_source_snapshot_tree(
+                            snapshot_base,
+                            source_locator,
+                            expected_sha256=expected_sha256,
+                            expected_size=expected_size,
+                            maximum_bytes=maximum_bytes,
+                        )
+                    except (
+                        OSError,
+                        SafeFileError,
+                        ValueError,
+                    ) as error:
+                        raise EngineError(
+                            "Rev adapter source snapshot could not be created"
+                        ) from error
+        except (OSError, SafeFileError) as error:
+            raise EngineError(
+                "Rev adapter source snapshot lock is unavailable"
+            ) from error
+        return challenge_root, verified
+
     def sandbox(
         self,
         state: ChallengeState,
         *,
         workspace_override: Path | None = None,
+        challenge_dir_override: Path | None = None,
     ) -> ChallengeSandboxClient:
         workspace = workspace_override or self._workspace(state)
         policy = self._network_policy(state)
@@ -2852,7 +3669,11 @@ class ChallengeEngine:
             contest_id=state.contest_id,
             category=state.category,
             challenge_id=state.challenge_id,
-            challenge_dir=self.challenge_input(state.identity),
+            challenge_dir=(
+                challenge_dir_override
+                if challenge_dir_override is not None
+                else self.challenge_input(state.identity)
+            ),
             work_dir=workspace,
         )
         return LocalChallengeSandboxClient(
@@ -5940,6 +6761,13 @@ class ChallengeEngine:
         )
         self._remaining_budget_seconds(state)
         selected_ids = set(experiment_ids or ())
+        if str(get_adapter(state.category).name) == "reversing":
+            state = self.refresh_ingest(identity)
+            self._require_model_work_allowed(
+                state,
+                automated=_automated,
+            )
+            self._remaining_budget_seconds(state)
         pending = [
             experiment
             for experiment in state.experiments
@@ -6001,10 +6829,6 @@ class ChallengeEngine:
                 )
                 or self._workspace(latest_before_start)
             )
-            client = self.sandbox(
-                latest_before_start,
-                workspace_override=execution_workspace,
-            )
 
             def mark_running(current: ChallengeState) -> None:
                 self._require_model_work_allowed(
@@ -6021,6 +6845,10 @@ class ChallengeEngine:
                         f"experiment is no longer registered: {item.id}"
                     )
                 self._require_experiment_target_current(current, item)
+                self._require_adapter_seed_source_binding_current(
+                    current,
+                    item,
+                )
                 item.status = ExperimentStatus.RUNNING
 
             try:
@@ -6037,6 +6865,11 @@ class ChallengeEngine:
                 ):
                     break
                 raise
+            experiment = next(
+                item
+                for item in running.experiments
+                if item.id == experiment.id
+            )
             try:
                 argv = tuple(shlex.split(experiment.command))
             except ValueError as error:
@@ -6062,6 +6895,47 @@ class ChallengeEngine:
                     identity,
                     experiment.id,
                     str(error),
+                    _live_only=_live_only,
+                )
+                continue
+            try:
+                prepared_snapshot = (
+                    self._prepare_rev_adapter_source_snapshot(
+                        running,
+                        experiment,
+                    )
+                )
+                challenge_dir_override = (
+                    prepared_snapshot[0]
+                    if prepared_snapshot is not None
+                    else None
+                )
+                client = self.sandbox(
+                    running,
+                    workspace_override=execution_workspace,
+                    challenge_dir_override=challenge_dir_override,
+                )
+                source_snapshot_execution_binding = (
+                    {
+                        "enforced": self._sandbox_factory is None,
+                        "mode": (
+                            "production_read_only_snapshot_scope"
+                            if self._sandbox_factory is None
+                            else "trusted_injected_sandbox"
+                        ),
+                        "scope_fingerprint": client.scope_fingerprint,
+                        "snapshot_id": experiment.extra[
+                            "source_snapshot"
+                        ]["id"],
+                    }
+                    if prepared_snapshot is not None
+                    else None
+                )
+            except Exception as error:
+                self._finish_tool_failure(
+                    identity,
+                    experiment.id,
+                    f"could not bind immutable challenge input: {error}",
                     _live_only=_live_only,
                 )
                 continue
@@ -6117,6 +6991,11 @@ class ChallengeEngine:
                 continue
             engine_run_id = _run_id(f"tool-{experiment.id}")
             active_tool_run_id = engine_run_id
+            seed_run_metadata = _adapter_seed_run_metadata(experiment)
+            if source_snapshot_execution_binding is not None:
+                seed_run_metadata[
+                    "source_snapshot_execution_binding"
+                ] = source_snapshot_execution_binding
             try:
                 run_paths = self.store.create_run(
                     identity,
@@ -6144,6 +7023,7 @@ class ChallengeEngine:
                             "network_target_generation"
                         ),
                         "configuration_epoch": running.configuration_epoch,
+                        **seed_run_metadata,
                     },
                     base_revision=None,
                 )
@@ -6762,6 +7642,7 @@ class ChallengeEngine:
                         extra={
                             "experiment_id": item.id,
                             "wall_seconds": elapsed,
+                            **copy.deepcopy(seed_run_metadata),
                         },
                     )
                 )
@@ -10669,6 +11550,112 @@ class ChallengeEngine:
             raise write_error
         return state
 
+    def _failure_tool_request(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one exact durable tool request for failure terminalization."""
+
+        paths = self.store.challenge_paths(identity)
+        request_path = self.store.run_paths(
+            identity,
+            run_id=run_id,
+        ).request
+        try:
+            request_relative = request_path.relative_to(paths.root).as_posix()
+            with tempfile.TemporaryDirectory(
+                prefix=".ctfos-tool-failure-request-",
+                dir=paths.runtime,
+            ) as temporary:
+                snapshot = copy_bounded_regular(
+                    paths.root,
+                    request_relative,
+                    Path(temporary) / "request.json",
+                    maximum_bytes=1024 * 1024,
+                    mode=0o400,
+                )
+                request = strict_json_loads(
+                    snapshot.path.read_bytes(),
+                    max_bytes=1024 * 1024,
+                )
+        except (
+            OSError,
+            SafeFileError,
+            StrictJSONError,
+            ValueError,
+        ):
+            return None
+        if (
+            not isinstance(request, Mapping)
+            or request.get("kind") != "tool"
+            or request.get("run_id") != run_id
+            or request.get("experiment_id") != experiment_id
+            or isinstance(request.get("base_revision"), bool)
+            or not isinstance(request.get("base_revision"), int)
+            or request["base_revision"] < 0
+        ):
+            return None
+        return copy.deepcopy(dict(request))
+
+    def _failure_seed_metadata_from_request(
+        self,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Recover only engine-pinned seed fields from a tool request."""
+
+        if request.get("adapter_seed") is not True or any(
+            key not in request
+            for key in _ADAPTER_SEED_RUN_METADATA_KEYS
+        ):
+            return None
+        metadata = {
+            key: copy.deepcopy(request[key])
+            for key in _ADAPTER_SEED_RUN_METADATA_KEYS
+        }
+        execution_binding = request.get(
+            "source_snapshot_execution_binding"
+        )
+        source_snapshot = metadata.get("source_snapshot")
+        if (
+            not isinstance(execution_binding, Mapping)
+            or set(execution_binding)
+            != {
+                "enforced",
+                "mode",
+                "scope_fingerprint",
+                "snapshot_id",
+            }
+            or not isinstance(execution_binding.get("enforced"), bool)
+            or execution_binding.get("mode")
+            not in {
+                "production_read_only_snapshot_scope",
+                "trusted_injected_sandbox",
+            }
+            or (
+                execution_binding.get("mode")
+                == "production_read_only_snapshot_scope"
+            )
+            != execution_binding.get("enforced")
+            or not isinstance(source_snapshot, Mapping)
+            or not isinstance(
+                execution_binding.get("scope_fingerprint"),
+                str,
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(execution_binding.get("scope_fingerprint")),
+            )
+            or execution_binding.get("snapshot_id")
+            != source_snapshot.get("id")
+        ):
+            return None
+        metadata["source_snapshot_execution_binding"] = copy.deepcopy(
+            dict(execution_binding)
+        )
+        return metadata
+
     def _finish_tool_failure(
         self,
         identity: ChallengeIdentity,
@@ -10679,6 +11666,27 @@ class ChallengeEngine:
         _live_only: bool = False,
     ) -> ChallengeState:
         bounded_reason = str(reason)[:4096]
+        failure_request = (
+            self._failure_tool_request(
+                identity,
+                experiment_id,
+                run_id,
+            )
+            if run_id is not None
+            else None
+        )
+        request_seed_metadata = (
+            self._failure_seed_metadata_from_request(
+                failure_request,
+            )
+            if failure_request is not None
+            else None
+        )
+        request_base_revision = (
+            int(failure_request["base_revision"])
+            if failure_request is not None
+            else None
+        )
 
         def apply(state: ChallengeState) -> None:
             experiment = next(
@@ -10709,10 +11717,42 @@ class ChallengeEngine:
                     ),
                     None,
                 )
+                failure_run_extra: dict[str, Any] = {
+                    "error": bounded_reason,
+                    "experiment_id": experiment_id,
+                }
+                expected_seed_metadata = _adapter_seed_run_metadata(
+                    experiment
+                )
+                request_pinned_metadata = (
+                    {
+                        key: request_seed_metadata[key]
+                        for key in _ADAPTER_SEED_RUN_METADATA_KEYS
+                    }
+                    if request_seed_metadata is not None
+                    else None
+                )
+                if (
+                    request_pinned_metadata == expected_seed_metadata
+                ):
+                    failure_run_extra.update(
+                        copy.deepcopy(expected_seed_metadata)
+                    )
+                    failure_run_extra[
+                        "source_snapshot_execution_binding"
+                    ] = copy.deepcopy(
+                        request_seed_metadata[
+                            "source_snapshot_execution_binding"
+                        ]
+                    )
                 state.runs.append(
                     RunReference(
                         id=run_id,
-                        base_revision=state.revision,
+                        base_revision=(
+                            request_base_revision
+                            if request_base_revision is not None
+                            else state.revision
+                        ),
                         status=RunStatus.FAILED,
                         request_path=(
                             run_paths.request.relative_to(root).as_posix()
@@ -10759,7 +11799,7 @@ class ChallengeEngine:
                             )
                             else None
                         ),
-                        extra={"error": bounded_reason},
+                        extra=failure_run_extra,
                     )
                 )
                 if (

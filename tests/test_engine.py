@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import inspect
 import json
+import os
+import stat
 import struct
 import sys
 import tempfile
@@ -15,6 +18,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import ctf_os.engine.challenge as challenge_module
+from ctf_os.adapters import get_adapter
 from ctf_os.budget import deadline_epoch
 from ctf_os.codex import (
     BatchRunner,
@@ -39,6 +44,12 @@ from ctf_os.engine.flags import (
     PROOF_LIVE_DIRECTORY,
     DetectedFlag,
     FlagDetector,
+)
+from ctf_os.engine.partial_oracle import (
+    REV_INVENTORY_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_CONTRACT_ID,
+    REV_INVENTORY_CONTRACT_VERSION,
+    REV_INVENTORY_DOCUMENT_TRANSPORT,
 )
 from ctf_os.engine.receipt_summary import ReceiptSummaryError
 from ctf_os.governor import (
@@ -65,6 +76,7 @@ from ctf_os.models import (
 from ctf_os.sandbox import (
     ArtifactRef,
     LocalChallengeSandboxClient,
+    SandboxError,
     SandboxResult,
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
@@ -486,6 +498,9 @@ class EngineTests(unittest.TestCase):
         self,
     ) -> None:
         engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
         state = engine.add_challenge(self.identity, prompt="solve")
         seeded = [
             experiment
@@ -536,6 +551,957 @@ class EngineTests(unittest.TestCase):
         self.assertIs(
             selected.status,
             ExperimentStatus.AWAITING_EVALUATION,
+        )
+
+    def test_rev_seed_refreshes_after_an_empty_session_gains_input(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        state = engine.add_challenge(self.identity, prompt="solve")
+
+        self.assertFalse(
+            any(
+                experiment.extra.get("adapter_seed") is True
+                for experiment in state.experiments
+            )
+        )
+        self.assertNotIn("adapter_primary_source", state.metadata)
+
+        input_dir = engine.challenge_input(self.identity)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.refresh_ingest(self.identity)
+        seeded = [
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+            and experiment.status is ExperimentStatus.REGISTERED
+        ]
+
+        self.assertEqual(
+            [
+                experiment.extra["adapter_spec_template_id"]
+                for experiment in seeded
+            ],
+            [
+                "inventory_observation",
+                "assembly_observation",
+                "dynamic_observation",
+            ],
+        )
+        self.assertNotIn(
+            "ghidra-decompile",
+            "\n".join(experiment.command for experiment in seeded),
+        )
+        self.assertIn(
+            "decompiler_observation",
+            {
+                spec.id
+                for spec in get_adapter(
+                    self.identity.category
+                ).initial_observations()
+            },
+        )
+        self.assertTrue(
+            all(
+                experiment.extra["source_binding"]
+                == {
+                    "manifest_generation": (
+                        len(
+                            state.metadata.get(
+                                "source_manifest_history",
+                                [],
+                            )
+                        )
+                        + 1
+                    ),
+                    "manifest_sha256": (
+                        state.metadata["source_manifest_sha256"]
+                    ),
+                    "path": "chall",
+                    "sha256": state.source_inventory[0].sha256,
+                    "size_bytes": state.source_inventory[0].size,
+                }
+                for experiment in seeded
+            )
+        )
+        inventory_oracle = seeded[0].extra["partial_oracle"]
+        self.assertEqual(
+            inventory_oracle,
+            {
+                "oracle_id": REV_INVENTORY_CONTRACT_ID,
+                "oracle_version": REV_INVENTORY_CONTRACT_VERSION,
+                "contract_fingerprint": (
+                    REV_INVENTORY_CONTRACT_FINGERPRINT
+                ),
+                "document_transport": (
+                    REV_INVENTORY_DOCUMENT_TRANSPORT
+                ),
+            },
+        )
+        self.assertTrue(
+            all(
+                experiment.extra["adapter_spec_id"].startswith(
+                    experiment.extra["adapter_spec_template_id"] + "@"
+                )
+                for experiment in seeded
+            )
+        )
+        self.assertEqual(
+            len(
+                {
+                    experiment.extra["adapter_spec_id"]
+                    for experiment in seeded
+                }
+            ),
+            3,
+        )
+
+    def test_rev_seed_refresh_is_idempotent_for_the_same_manifest(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.add_challenge(self.identity, prompt="solve")
+        original_ids = [
+            experiment.id
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        ]
+        original_revision = state.revision
+
+        first = engine.refresh_ingest(self.identity)
+        second = engine.refresh_ingest(self.identity)
+
+        self.assertEqual(first.revision, original_revision)
+        self.assertEqual(second.revision, original_revision)
+        self.assertEqual(
+            [
+                experiment.id
+                for experiment in second.experiments
+                if experiment.extra.get("adapter_seed") is True
+            ],
+            original_ids,
+        )
+        self.assertFalse(
+            any(
+                experiment.status is ExperimentStatus.CANCELLED
+                for experiment in second.experiments
+                if experiment.extra.get("adapter_seed") is True
+            )
+        )
+
+    def test_rev_execute_all_synchronizes_input_added_after_empty_init(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        state = engine.add_challenge(self.identity, prompt="solve")
+        self.assertFalse(
+            any(
+                experiment.extra.get("adapter_seed") is True
+                for experiment in state.experiments
+            )
+        )
+        input_dir = engine.challenge_input(self.identity)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+
+        state = engine.execute_registered_experiments(self.identity)
+
+        seeded = [
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        ]
+        self.assertEqual(len(seeded), 3)
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.REGISTERED
+                for experiment in seeded
+            )
+        )
+        self.assertEqual(state.runs, [])
+
+    def test_rev_bound_spec_id_covers_seed_execution_semantics(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.add_challenge(self.identity, prompt="solve")
+        adapter = get_adapter(self.identity.category)
+        _primary, baseline = engine._rev_adapter_seed_plan(
+            state,
+            adapter,
+        )
+        baseline_ids = {item[1] for item in baseline}
+
+        with mock.patch.object(
+            challenge_module,
+            "_REV_ADAPTER_SEED_CONTRACT_VERSION",
+            2,
+        ):
+            _primary, changed_contract = engine._rev_adapter_seed_plan(
+                state,
+                adapter,
+            )
+        with mock.patch.object(
+            challenge_module,
+            "_REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION",
+            False,
+        ):
+            _primary, changed_execution = engine._rev_adapter_seed_plan(
+                state,
+                adapter,
+            )
+        with mock.patch.object(
+            challenge_module,
+            "_REV_SOURCE_SNAPSHOT_TREE_CONTRACT",
+            "exact-single-primary-v2",
+        ):
+            _primary, changed_snapshot_contract = (
+                engine._rev_adapter_seed_plan(
+                    state,
+                    adapter,
+                )
+            )
+
+        self.assertTrue(
+            baseline_ids.isdisjoint(
+                {item[1] for item in changed_contract}
+            )
+        )
+        self.assertTrue(
+            baseline_ids.isdisjoint(
+                {item[1] for item in changed_execution}
+            )
+        )
+        self.assertTrue(
+            baseline_ids.isdisjoint(
+                {item[1] for item in changed_snapshot_contract}
+            )
+        )
+        self.assertEqual(
+            [item[3]["adapter_seed_order"] for item in baseline],
+            [0, 1, 2],
+        )
+
+    def test_rev_manifest_recurrence_gets_fresh_bound_seed_records(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        primary = input_dir / "chall"
+        source_a = _elf64_image(2) + b"A"
+        source_b = _elf64_image(2) + b"B"
+        primary.write_bytes(source_a)
+        first = engine.add_challenge(self.identity, prompt="solve")
+        first_ids = {
+            experiment.id
+            for experiment in first.experiments
+            if experiment.extra.get("adapter_seed") is True
+        }
+        first_generation = next(
+            experiment
+            for experiment in first.experiments
+            if experiment.id in first_ids
+        ).extra["source_binding"]["manifest_generation"]
+
+        primary.write_bytes(source_b)
+        second = engine.refresh_ingest(self.identity)
+        second_ids = {
+            experiment.id
+            for experiment in second.experiments
+            if experiment.extra.get("adapter_seed") is True
+            and experiment.id not in first_ids
+        }
+        primary.write_bytes(source_a)
+        third = engine.refresh_ingest(self.identity)
+        third_ids = {
+            experiment.id
+            for experiment in third.experiments
+            if experiment.extra.get("adapter_seed") is True
+            and experiment.id not in first_ids | second_ids
+        }
+
+        self.assertEqual(len(first_ids), 3)
+        self.assertEqual(len(second_ids), 3)
+        self.assertEqual(len(third_ids), 3)
+        self.assertTrue(first_ids.isdisjoint(second_ids))
+        self.assertTrue(first_ids.isdisjoint(third_ids))
+        self.assertTrue(second_ids.isdisjoint(third_ids))
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.CANCELLED
+                for experiment in third.experiments
+                if experiment.id in first_ids | second_ids
+            )
+        )
+        current = [
+            experiment
+            for experiment in third.experiments
+            if experiment.id in third_ids
+        ]
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.REGISTERED
+                for experiment in current
+            )
+        )
+        self.assertEqual(
+            {
+                experiment.extra["source_binding"][
+                    "manifest_generation"
+                ]
+                for experiment in current
+            },
+            {first_generation + 2},
+        )
+        stable_revision = third.revision
+        repeated = engine.refresh_ingest(self.identity)
+        self.assertEqual(repeated.revision, stable_revision)
+        self.assertEqual(
+            {
+                experiment.id
+                for experiment in repeated.experiments
+                if experiment.extra.get("adapter_seed") is True
+                and experiment.status is ExperimentStatus.REGISTERED
+            },
+            third_ids,
+        )
+
+    def test_rev_seed_execution_refresh_cancels_a_stale_primary_binding(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        original = input_dir / "old-chall"
+        original.write_bytes(_elf64_image(2))
+        state = engine.add_challenge(self.identity, prompt="solve")
+        old_seed_ids = [
+            experiment.id
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        ]
+        old_inventory_id = old_seed_ids[0]
+
+        original.unlink()
+        (input_dir / "new-chall").write_bytes(
+            _elf64_image(2) + b"replacement"
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(old_inventory_id,),
+        )
+
+        old_seeds = [
+            experiment
+            for experiment in state.experiments
+            if experiment.id in old_seed_ids
+        ]
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.CANCELLED
+                for experiment in old_seeds
+            )
+        )
+        self.assertFalse(
+            any(
+                run.extra.get("experiment_id") == old_inventory_id
+                for run in state.runs
+            )
+        )
+        new_seeds = [
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+            and experiment.id not in old_seed_ids
+        ]
+        self.assertEqual(len(new_seeds), 3)
+        self.assertTrue(
+            all(
+                "/challenge/new-chall" in experiment.command
+                for experiment in new_seeds
+            )
+        )
+        self.assertTrue(
+            all(
+                experiment.extra["source_binding"]["path"] == "new-chall"
+                for experiment in new_seeds
+            )
+        )
+
+    def test_rev_execute_all_refreshes_a_same_path_binding_change(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        primary = input_dir / "chall"
+        primary.write_bytes(_elf64_image(2))
+        state = engine.add_challenge(self.identity, prompt="solve")
+        old_seed_ids = {
+            experiment.id
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        }
+        old_sha256 = state.source_inventory[0].sha256
+
+        primary.write_bytes(_elf64_image(2) + b"same-path-replacement")
+        state = engine.execute_registered_experiments(self.identity)
+
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.CANCELLED
+                for experiment in state.experiments
+                if experiment.id in old_seed_ids
+            )
+        )
+        self.assertFalse(
+            any(
+                run.extra.get("experiment_id") in old_seed_ids
+                for run in state.runs
+            )
+        )
+        new_seeds = [
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+            and experiment.id not in old_seed_ids
+        ]
+        self.assertEqual(len(new_seeds), 3)
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.REGISTERED
+                and experiment.extra["source_binding"]["path"] == "chall"
+                and experiment.extra["source_binding"]["sha256"]
+                != old_sha256
+                for experiment in new_seeds
+            )
+        )
+
+    def test_rev_seed_refresh_preserves_terminal_history_and_pins_run(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        original = input_dir / "chall"
+        original.write_bytes(_elf64_image(2))
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        old_manifest = state.metadata["source_manifest_sha256"]
+        old_seed_ids = [
+            experiment.id
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        ]
+        inventory = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == old_seed_ids[0]
+        )
+        expected_binding = copy.deepcopy(
+            inventory.extra["source_binding"]
+        )
+        expected_oracle = copy.deepcopy(
+            inventory.extra["partial_oracle"]
+        )
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+        completed = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == inventory.id
+        )
+        self.assertIs(completed.status, ExperimentStatus.COMPLETED)
+        run = next(
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == inventory.id
+        )
+        request_path = (
+            engine.store.challenge_paths(self.identity).root
+            / run.request_path
+        )
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual(request["source_binding"], expected_binding)
+        self.assertEqual(request["partial_oracle"], expected_oracle)
+        self.assertEqual(run.extra["source_binding"], expected_binding)
+        self.assertEqual(run.extra["partial_oracle"], expected_oracle)
+
+        original.unlink()
+        (input_dir / "replacement").write_bytes(
+            _elf64_image(2) + b"new"
+        )
+        state = engine.refresh_ingest(self.identity)
+
+        historical = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == inventory.id
+        )
+        self.assertIs(historical.status, ExperimentStatus.COMPLETED)
+        self.assertTrue(
+            all(
+                next(
+                    experiment
+                    for experiment in state.experiments
+                    if experiment.id == experiment_id
+                ).status
+                is ExperimentStatus.CANCELLED
+                for experiment_id in old_seed_ids[1:]
+            )
+        )
+        self.assertIn(
+            old_manifest,
+            {
+                item["sha256"]
+                for item in state.metadata["source_manifest_history"]
+            },
+        )
+        self.assertEqual(
+            len(
+                [
+                    experiment
+                    for experiment in state.experiments
+                    if experiment.extra.get("adapter_seed") is True
+                    and experiment.id not in old_seed_ids
+                    and experiment.status is ExperimentStatus.REGISTERED
+                ]
+            ),
+            3,
+        )
+
+    def test_rev_seed_executes_from_verified_read_only_snapshot(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        nested = input_dir / "nested"
+        nested.mkdir(parents=True)
+        primary = nested / "chall"
+        original_bytes = _elf64_image(2) + b"snapshot-original"
+        replacement_bytes = _elf64_image(2) + b"incoming-replaced"
+        primary.write_bytes(original_bytes)
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        observed_overrides: list[Path] = []
+
+        class SnapshotReadingSandbox(FakeSandbox):
+            def __init__(self, work: Path, challenge_root: Path) -> None:
+                super().__init__(work)
+                self.challenge_root = challenge_root
+
+            def run(self, spec):
+                self_outer.assertEqual(
+                    spec.argv[-1],
+                    "/challenge/nested/chall",
+                )
+                self_outer.assertEqual(
+                    (self.challenge_root / "nested" / "chall").read_bytes(),
+                    original_bytes,
+                )
+                return super().run(spec)
+
+        self_outer = self
+
+        def sandbox(
+            current,
+            *,
+            workspace_override=None,
+            challenge_dir_override=None,
+        ):
+            del current
+            self.assertIsNotNone(challenge_dir_override)
+            assert challenge_dir_override is not None
+            observed_overrides.append(challenge_dir_override)
+            primary.write_bytes(replacement_bytes)
+            return SnapshotReadingSandbox(
+                Path(workspace_override),
+                challenge_dir_override,
+            )
+
+        with mock.patch.object(engine, "sandbox", side_effect=sandbox):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        self.assertEqual(len(observed_overrides), 1)
+        snapshot_root = observed_overrides[0]
+        snapshot_file = snapshot_root / "nested" / "chall"
+        self.assertEqual(snapshot_file.read_bytes(), original_bytes)
+        self.assertEqual(
+            stat.S_IMODE(snapshot_file.stat().st_mode),
+            0o500,
+        )
+        self.assertEqual(snapshot_file.stat().st_nlink, 1)
+        run = next(
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == inventory.id
+        )
+        expected_snapshot = inventory.extra["source_snapshot"]
+        self.assertEqual(
+            {
+                key: expected_snapshot[key]
+                for key in (
+                    "tree_contract",
+                    "file_mode",
+                    "directory_mode",
+                    "publish",
+                )
+            },
+            {
+                "tree_contract": "exact-single-primary-v1",
+                "file_mode": 0o500,
+                "directory_mode": 0o500,
+                "publish": "staged-atomic-no-repair-v1",
+            },
+        )
+        request_path = (
+            engine.store.challenge_paths(self.identity).root
+            / run.request_path
+        )
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual(request["source_snapshot"], expected_snapshot)
+        self.assertEqual(run.extra["source_snapshot"], expected_snapshot)
+        self.assertEqual(
+            request["source_snapshot_execution_binding"],
+            {
+                "enforced": False,
+                "mode": "trusted_injected_sandbox",
+                "scope_fingerprint": "a" * 64,
+                "snapshot_id": expected_snapshot["id"],
+            },
+        )
+        self.assertEqual(
+            run.extra["source_snapshot_execution_binding"],
+            request["source_snapshot_execution_binding"],
+        )
+        self.assertEqual(
+            snapshot_root,
+            engine.store.challenge_paths(self.identity).root
+            / expected_snapshot["challenge_dir"],
+        )
+
+    def test_rev_snapshot_reuse_rejects_non_exact_tree_variants(
+        self,
+    ) -> None:
+        mutations = (
+            "extra",
+            "symlink",
+            "hardlink",
+            "partial",
+            "tamper",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                identity = ChallengeIdentity(
+                    "snapshot topology",
+                    "rev",
+                    mutation,
+                )
+                engine = self.engine_with_executor(RoleExecutor())
+                input_dir = engine.challenge_input(identity)
+                nested = input_dir / "nested"
+                nested.mkdir(parents=True)
+                source_bytes = _elf64_image(2) + mutation.encode("ascii")
+                source = nested / "chall"
+                source.write_bytes(source_bytes)
+                state = engine.add_challenge(
+                    identity,
+                    prompt="solve",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                inventory = next(
+                    experiment
+                    for experiment in state.experiments
+                    if experiment.extra.get("adapter_spec_template_id")
+                    == "inventory_observation"
+                )
+                snapshot = inventory.extra["source_snapshot"]
+                challenge_root = (
+                    engine.store.challenge_paths(identity).root
+                    / snapshot["challenge_dir"]
+                )
+                snapshot_root = challenge_root.parent
+                leaf = challenge_root / "nested" / "chall"
+
+                if mutation == "partial":
+                    (challenge_root / "nested").mkdir(parents=True)
+                    for directory in (
+                        challenge_root / "nested",
+                        challenge_root,
+                        snapshot_root,
+                    ):
+                        directory.chmod(0o500)
+                else:
+                    engine._prepare_rev_adapter_source_snapshot(
+                        state,
+                        inventory,
+                    )
+                    if mutation == "extra":
+                        challenge_root.chmod(0o700)
+                        extra = challenge_root / "injected.conf"
+                        extra.write_text(
+                            "behavior-changing-sidecar",
+                            encoding="utf-8",
+                        )
+                        extra.chmod(0o500)
+                        challenge_root.chmod(0o500)
+                    elif mutation == "symlink":
+                        leaf.parent.chmod(0o700)
+                        leaf.unlink()
+                        leaf.symlink_to(source)
+                        leaf.parent.chmod(0o500)
+                    elif mutation == "hardlink":
+                        leaf.chmod(0o500)
+                        os.link(
+                            leaf,
+                            snapshot_root.parent
+                            / f"{snapshot_root.name}.outside-hardlink",
+                        )
+                    elif mutation == "tamper":
+                        leaf.chmod(0o700)
+                        leaf.write_bytes(b"X" * len(source_bytes))
+                        leaf.chmod(0o500)
+
+                with self.assertRaisesRegex(
+                    EngineError,
+                    "snapshot failed verification",
+                ):
+                    engine._prepare_rev_adapter_source_snapshot(
+                        state,
+                        inventory,
+                    )
+
+    def test_rev_snapshot_publish_failure_cleans_only_its_staging_tree(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        snapshot = inventory.extra["source_snapshot"]
+        snapshot_parent = (
+            engine.store.challenge_paths(self.identity).runtime
+            / "source-snapshots"
+        )
+        snapshot_parent.mkdir(parents=True)
+        sentinel = snapshot_parent / "unrelated-staging-sentinel"
+        sentinel.mkdir()
+        (sentinel / "keep").write_text("keep", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                challenge_module.os,
+                "rename",
+                side_effect=OSError("synthetic publish failure"),
+            ),
+            self.assertRaisesRegex(
+                EngineError,
+                "snapshot could not be created",
+            ),
+        ):
+            engine._prepare_rev_adapter_source_snapshot(
+                state,
+                inventory,
+            )
+
+        self.assertEqual(
+            (sentinel / "keep").read_text(encoding="utf-8"),
+            "keep",
+        )
+        self.assertFalse(
+            (
+                snapshot_parent
+                / snapshot["id"]
+            ).exists()
+        )
+        self.assertEqual(
+            list(
+                snapshot_parent.glob(
+                    f".{snapshot['id']}.staging-*"
+                )
+            ),
+            [],
+        )
+
+    def test_rev_snapshot_failure_terminalizes_before_durable_run(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        with mock.patch.object(
+            engine,
+            "_prepare_rev_adapter_source_snapshot",
+            side_effect=EngineError("snapshot hash mismatch"),
+        ):
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(inventory.id,),
+            )
+
+        failed = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == inventory.id
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        self.assertFalse(
+            any(
+                run.extra.get("experiment_id") == inventory.id
+                for run in state.runs
+            )
+        )
+
+    def test_failed_rev_seed_run_preserves_durable_binding_pins(
+        self,
+    ) -> None:
+        engine_holder: dict[str, ChallengeEngine] = {}
+
+        class FailingSeedSandbox(FakeSandbox):
+            def run(self, spec):
+                del spec
+                engine_holder["engine"].store.update(
+                    self_outer.identity,
+                    lambda current: current.metadata.__setitem__(
+                        "synthetic_concurrent_state_bump",
+                        True,
+                    ),
+                )
+                raise SandboxError("synthetic sandbox failure")
+
+        self_outer = self
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                limiter=FifoModelCallLimiter(1),
+                limiter_wait_timeout=2,
+                max_schema_retries=0,
+            ),
+            sandbox_factory=(
+                lambda state, work, policy: FailingSeedSandbox(work)
+            ),
+        )
+        engine_holder["engine"] = engine
+        input_dir = engine.challenge_input(self.identity)
+        input_dir.mkdir(parents=True)
+        (input_dir / "chall").write_bytes(_elf64_image(2))
+        state = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        inventory = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(inventory.id,),
+        )
+
+        failed = next(
+            experiment
+            for experiment in state.experiments
+            if experiment.id == inventory.id
+        )
+        self.assertIs(failed.status, ExperimentStatus.FAILED)
+        run = next(
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == inventory.id
+        )
+        self.assertIs(run.status, RunStatus.FAILED)
+        root = engine.store.challenge_paths(self.identity).root
+        request = json.loads(
+            (root / run.request_path).read_text(encoding="utf-8")
+        )
+        result = json.loads(
+            (root / run.result_path).read_text(encoding="utf-8")
+        )
+        validation = json.loads(
+            (root / run.validation_path).read_text(encoding="utf-8")
+        )
+        self.assertEqual(run.base_revision, request["base_revision"])
+        self.assertEqual(result["base_revision"], request["base_revision"])
+        self.assertEqual(
+            validation["base_revision"],
+            request["base_revision"],
+        )
+        self.assertLess(run.base_revision, state.revision)
+        for key in (
+            "adapter_name",
+            "adapter_seed",
+            "adapter_seed_contract_version",
+            "adapter_seed_order",
+            "adapter_spec_id",
+            "adapter_spec_sha256",
+            "adapter_spec_template_id",
+            "partial_oracle",
+            "requires_explicit_execution",
+            "source_binding",
+            "source_snapshot",
+        ):
+            self.assertEqual(run.extra[key], inventory.extra[key])
+        self.assertEqual(
+            run.extra["source_snapshot_execution_binding"],
+            {
+                "enforced": False,
+                "mode": "trusted_injected_sandbox",
+                "scope_fingerprint": "a" * 64,
+                "snapshot_id": inventory.extra["source_snapshot"]["id"],
+            },
         )
 
     def test_adapter_seed_prefers_elf_executable_over_libc_and_archive(

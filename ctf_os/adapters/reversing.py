@@ -9,6 +9,20 @@ class ReversingAdapter(GenericAdapter):
     def initial_observations(self) -> tuple[ExperimentSpec, ...]:
         return (
             ExperimentSpec(
+                "inventory_observation",
+                "collect a bounded source-bound binary inventory",
+                (
+                    "python3",
+                    "/opt/ctf-templates/rev/inventory.py",
+                    "{primary}",
+                ),
+                "canonical Rev inventory bound to the immutable primary input",
+                "the inventory contract identifies the binary profile",
+                "the inventory is malformed, stale, or not applicable",
+                "light",
+                60,
+            ),
+            ExperimentSpec(
                 "assembly_observation",
                 "collect independent disassembly and symbols",
                 ("objdump", "-d", "{primary}"),
@@ -72,4 +86,3 @@ class ReversingAdapter(GenericAdapter):
             "conflict prefer assembly plus executed behavior. Produce a runnable "
             "solver or keygen, not only an explanation."
         )
-
