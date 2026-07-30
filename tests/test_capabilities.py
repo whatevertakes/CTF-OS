@@ -46,7 +46,7 @@ def capability_payload(
 
 class CapabilityTests(unittest.TestCase):
     def test_host_attestations_match_vendored_v2_manifest(self):
-        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 11)
+        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 12)
         manifest = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -210,6 +210,7 @@ class CapabilityTests(unittest.TestCase):
             [
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
+                "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
@@ -291,6 +292,30 @@ class CapabilityTests(unittest.TestCase):
             report["attestations"],
         )
 
+    def test_pwn_interaction_capability_missing_fails_closed(self):
+        def runner(argv, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    capability_payload(
+                        excluded_attestations=frozenset(
+                            {"pwn_interaction_v1"}
+                        )
+                    )
+                ).encode(),
+                b"",
+            )
+
+        report = inspect_pinned_capabilities(DIGEST, runner=runner)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["missing"], ["pwn_interaction_v1"])
+        self.assertNotIn(
+            "pwn_interaction_v1",
+            report["attestations"],
+        )
+
     def test_managed_fingerprint_or_version_mismatch_fails_closed(self):
         payload = capability_payload()
         records = payload["capabilities"]
@@ -337,6 +362,12 @@ class CapabilityTests(unittest.TestCase):
         exploit_effect["attestation"]["path"] = (
             "/opt/ctf-templates/pwn/stale-exploit-effect.py"
         )
+        interaction = next(
+            item
+            for item in records
+            if item["name"] == "pwn_interaction_v1"
+        )
+        interaction["attestation"]["sha256"] = "e" * 64
 
         def runner(argv, **kwargs):
             del kwargs
@@ -354,6 +385,7 @@ class CapabilityTests(unittest.TestCase):
             [
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
+                "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
@@ -365,6 +397,7 @@ class CapabilityTests(unittest.TestCase):
             {
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
+                "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",

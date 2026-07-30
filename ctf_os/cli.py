@@ -1069,6 +1069,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pwn_effect.add_argument("--timeout", type=int, default=300)
 
+    pwn_interaction = commands.add_parser(
+        "pwn-prove-interaction",
+        help=(
+            "실행 증거 부모와 bounded data-only recipe를 결속해 "
+            "network-denied 원본 3회 + producer control 3회로 동적 "
+            "exploit effect 검증"
+        ),
+    )
+    _identity_values(pwn_interaction)
+    pwn_interaction.add_argument(
+        "--parent",
+        required=True,
+        help=(
+            "typed RIP-control 또는 canonical executed parent "
+            "experiment ID"
+        ),
+    )
+    pwn_interaction.add_argument(
+        "--recipe",
+        required=True,
+        help="challenge workspace 안의 canonical interaction recipe",
+    )
+    pwn_interaction.add_argument("--timeout", type=int, default=900)
+
     web_prove = commands.add_parser(
         "web-prove",
         help=(
@@ -2103,6 +2127,30 @@ def main(
                 }
             )
             return 0 if result.status.value == "PROVEN" else 1
+
+        if args.command == "pwn-prove-interaction":
+            state, evaluation = engine.prove_pwn_interaction(
+                _identity(args),
+                parent_experiment_id=args.parent,
+                recipe_locator=args.recipe,
+                timeout_seconds=args.timeout,
+            )
+            _print_json(
+                {
+                    "attack_replay_count": len(
+                        evaluation.attack_receipts
+                    ),
+                    "control_replay_count": len(
+                        evaluation.control_receipts
+                    ),
+                    "evaluation": evaluation.to_dict(),
+                    "passed": evaluation.passed,
+                    "reason_code": evaluation.reason_code,
+                    "state_revision": state.revision,
+                    "submission_authorized": False,
+                }
+            )
+            return 0 if evaluation.passed else 1
 
         if args.command == "web-prove":
             state, result = engine.prove_web_impact(

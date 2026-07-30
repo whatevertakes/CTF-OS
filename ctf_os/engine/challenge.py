@@ -26038,6 +26038,30 @@ class ChallengeEngine:
             _session_owned=_session_owned,
         )
 
+    def prove_pwn_interaction(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        parent_experiment_id: str,
+        recipe_locator: str,
+        timeout_seconds: int = 900,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, Any]:
+        """Run an engine-preissued dynamic Pwn interaction 3+3 matrix."""
+
+        from ctf_os.engine.pwn_interaction_hotpath import (
+            prove_pwn_interaction,
+        )
+
+        return prove_pwn_interaction(
+            self,
+            identity,
+            parent_experiment_id=parent_experiment_id,
+            recipe_locator=recipe_locator,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
     def query_pwn_dependency_graph(
         self,
         identity: ChallengeIdentity,

@@ -28,6 +28,7 @@ REQUIRED_MANAGED_CAPABILITIES = frozenset(
         "pwn_crash_v1",
         "pwn_runtime_snapshot_v1",
         "pwn_exploit_effect_v1",
+        "pwn_interaction_v1",
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
@@ -62,6 +63,16 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "sha256": (
             "ef8827eb7cf5189893302c43560930de1"
             "f1e0a6c66636c9e5d485c0ecb114835"
+        ),
+    },
+    "pwn_interaction_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.pwn.interaction",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/pwn/interaction.py",
+        "sha256": (
+            "d2a5a4370242adb0fae75ac4ddc68ffd"
+            "43952e671ba0abc0ad68f1924423b5b9"
         ),
     },
     "rev_inventory_v2": {
