@@ -172,6 +172,7 @@ ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", 
 MANAGED_PROOF_ACTION_KIND = "prove_candidate"
 MANAGED_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
 MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND = "prove_pwn_exploit_effect"
+MANAGED_PWN_INTERACTION_ACTION_KIND = "prove_pwn_interaction"
 MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND = "rev_accepted_input"
 MANAGED_WEB_IMPACT_ACTION_KIND = "prove_web_impact"
 MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND = "prove_web_active_probe"
@@ -180,6 +181,7 @@ MANAGED_FORENSIC_ASSERTION_ACTION_KIND = "prove_forensic_assertion"
 MANAGED_MISC_TRANSFORM_ACTION_KIND = "evaluate_misc_transform"
 MANAGED_TYPED_GATE_ACTION_KINDS = (
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_PWN_INTERACTION_ACTION_KIND,
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_WEB_IMPACT_ACTION_KIND,
     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
@@ -472,6 +474,34 @@ def role_output_schema(
                                 managed_reference_schema
                             ),
                             "payload_artifact_path": managed_path_schema,
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 3600,
+                            },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_PWN_INTERACTION_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "parent_experiment_id",
+                            "recipe_artifact_path",
+                            "timeout_seconds",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "parent_experiment_id": (
+                                managed_reference_schema
+                            ),
+                            "recipe_artifact_path": managed_path_schema,
                             "timeout_seconds": {
                                 "type": "integer",
                                 "minimum": 1,
@@ -1559,6 +1589,13 @@ def validate_role_output(
                         "payload_artifact_path",
                         "timeout_seconds",
                     },
+                    MANAGED_PWN_INTERACTION_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "parent_experiment_id",
+                        "recipe_artifact_path",
+                        "timeout_seconds",
+                    },
                     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: {
                         "kind",
                         "operator_spec_artifact_path",
@@ -1669,6 +1706,7 @@ def validate_role_output(
                         )
                 timeout_limits = {
                     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
+                    MANAGED_PWN_INTERACTION_ACTION_KIND: 3600,
                     MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
                     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: 86_400,
                     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
@@ -2048,7 +2086,8 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "Supply only canonical candidate, experiment, and hypothesis "
                 "IDs already present in state or proposed by this run. Never "
                 "supply a verdict: the engine alone executes and reduces the "
-                "Pwn effect, Rev accepted-input, Web impact or active "
+                "Pwn effect or bounded interaction, Rev accepted-input, "
+                "Web impact or active "
                 "race/OOB, Crypto metamorphic, Forensic assertion, or Misc "
                 "DAG gate. For "
                 "rev_accepted_input, keep the accepted bytes only in the "

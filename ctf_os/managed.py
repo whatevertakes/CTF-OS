@@ -7,6 +7,7 @@ never falls back to assisted solving after a managed failure.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 import uuid
@@ -34,6 +35,7 @@ from ctf_os.codex.contracts import (
     MANAGED_MISC_TRANSFORM_ACTION_KIND,
     MANAGED_PWN_CRASH_ACTION_KIND,
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_PWN_INTERACTION_ACTION_KIND,
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_TYPED_GATE_ACTION_KINDS,
     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
@@ -53,6 +55,12 @@ from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_CONTRACT_VERSION,
     PWN_CRASH_V1_MAX_INPUT_BYTES,
     PWN_CRASH_V1_PROTOCOL,
+)
+from ctf_os.contracts.pwn_interaction_v1 import (
+    PWN_INTERACTION_V1_CONTRACT_FINGERPRINT,
+    PWN_INTERACTION_V1_MAX_DOCUMENT_BYTES,
+    PwnInteractionRecipeError,
+    parse_pwn_interaction_v1_recipe,
 )
 from ctf_os.engine.challenge import (
     WAVE_ROLES,
@@ -180,6 +188,7 @@ _MAX_MANAGED_REJECTED_ACTIONS = 64
 _MAX_MANAGED_TYPED_GATE_PATHS = 4
 _MANAGED_TYPED_GATE_CATEGORIES = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: "pwn",
+    MANAGED_PWN_INTERACTION_ACTION_KIND: "pwn",
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: "reversing",
     MANAGED_WEB_IMPACT_ACTION_KIND: "web",
     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: "web",
@@ -190,6 +199,9 @@ _MANAGED_TYPED_GATE_CATEGORIES = {
 _MANAGED_TYPED_GATE_PATH_FIELDS = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: (
         "payload_artifact_path",
+    ),
+    MANAGED_PWN_INTERACTION_ACTION_KIND: (
+        "recipe_artifact_path",
     ),
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: (
         "operator_spec_artifact_path",
@@ -221,6 +233,15 @@ _MANAGED_TYPED_GATE_KEYS = {
             "description",
             "parent_experiment_id",
             "payload_artifact_path",
+            "timeout_seconds",
+        }
+    ),
+    MANAGED_PWN_INTERACTION_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "parent_experiment_id",
+            "recipe_artifact_path",
             "timeout_seconds",
         }
     ),
@@ -287,6 +308,7 @@ _MANAGED_TYPED_GATE_KEYS = {
 }
 _MANAGED_TYPED_GATE_TIMEOUT_LIMITS = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
+    MANAGED_PWN_INTERACTION_ACTION_KIND: 3600,
     MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: 86_400,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
@@ -2162,6 +2184,59 @@ class ManagedOrchestrator:
             None,
         )
 
+    def _bind_managed_pwn_interaction_recipe(
+        self,
+        identity: ChallengeIdentity,
+        artifact_bindings: Mapping[str, object],
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Reparse the exact published data-only interaction recipe."""
+
+        if set(artifact_bindings) != {"recipe_artifact_path"}:
+            return None, "typed_gate_artifact_unbound"
+        binding = artifact_bindings.get("recipe_artifact_path")
+        if type(binding) is not dict:
+            return None, "typed_gate_artifact_unbound"
+        locator = _safe_managed_artifact_locator(binding.get("locator"))
+        digest = binding.get("sha256")
+        size = binding.get("size_bytes")
+        if (
+            locator is None
+            or type(digest) is not str
+            or type(size) is not int
+            or not 1 <= size <= PWN_INTERACTION_V1_MAX_DOCUMENT_BYTES
+        ):
+            return None, "typed_gate_recipe_invalid"
+        workspace = (
+            self.engine.store.challenge_paths(identity).artifacts
+            / "workspace"
+        )
+        try:
+            payload = read_bounded_regular(
+                workspace,
+                locator,
+                maximum_bytes=PWN_INTERACTION_V1_MAX_DOCUMENT_BYTES,
+                expected_sha256=digest,
+                expected_size=size,
+            )
+            recipe = parse_pwn_interaction_v1_recipe(payload)
+        except (OSError, SafeFileError, PwnInteractionRecipeError):
+            return None, "typed_gate_recipe_invalid"
+        if (
+            recipe.canonical_bytes != payload
+            or recipe.sha256 != digest
+        ):
+            return None, "typed_gate_recipe_invalid"
+        return (
+            {
+                "recipe_contract_fingerprint": (
+                    PWN_INTERACTION_V1_CONTRACT_FINGERPRINT
+                ),
+                "recipe_sha256": recipe.sha256,
+                "recipe_size_bytes": len(recipe.canonical_bytes),
+            },
+            None,
+        )
+
     def _execute_typed_gate_experiment(
         self,
         identity: ChallengeIdentity,
@@ -2301,6 +2376,24 @@ class ManagedOrchestrator:
                 raise ManagedError(
                     "managed Rev accepted-input declaration changed"
                 )
+        elif kind == MANAGED_PWN_INTERACTION_ACTION_KIND:
+            recipe_reference, recipe_error = (
+                self._bind_managed_pwn_interaction_recipe(
+                    identity,
+                    bindings,
+                )
+            )
+            if (
+                recipe_error is not None
+                or recipe_reference is None
+                or any(
+                    request.get(field) != value
+                    for field, value in recipe_reference.items()
+                )
+            ):
+                raise ManagedError(
+                    "managed Pwn interaction recipe changed"
+                )
 
         def mark_running(state: ChallengeState) -> None:
             target = next(
@@ -2343,6 +2436,30 @@ class ManagedOrchestrator:
                 passed = bool(evaluation.exploit_effect_proven)
                 reason_codes = (str(evaluation.reason_code),)
                 evaluation_sha256 = str(evaluation.evidence_sha256)
+            elif kind == MANAGED_PWN_INTERACTION_ACTION_KIND:
+                _state, evaluation = self.engine.prove_pwn_interaction(
+                    identity,
+                    parent_experiment_id=str(
+                        request["parent_experiment_id"]
+                    ),
+                    recipe_locator=locators["recipe_artifact_path"],
+                    timeout_seconds=int(request["timeout_seconds"]),
+                    _session_owned=True,
+                )
+                replay_shape_valid = (
+                    evaluation.passed is True
+                    and len(evaluation.attack_receipts) == 3
+                    and len(evaluation.control_receipts) == 3
+                )
+                passed = replay_shape_valid
+                reason_codes = (
+                    (str(evaluation.reason_code),)
+                    if replay_shape_valid
+                    else ("pwn_interaction_replay_matrix_invalid",)
+                )
+                evaluation_sha256 = hashlib.sha256(
+                    evaluation.canonical_bytes()
+                ).hexdigest()
             elif kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
                 _state, evaluation = (
                     self.engine.prove_rev_accepted_input(
@@ -3323,7 +3440,10 @@ class ManagedOrchestrator:
                 resolved_hypotheses.append(next(iter(candidates)))
 
             reference: dict[str, object] = {}
-            if kind == MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND:
+            if kind in {
+                MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+                MANAGED_PWN_INTERACTION_ACTION_KIND,
+            }:
                 parent_id = action.get("parent_experiment_id")
                 if (
                     type(parent_id) is not str
@@ -3347,6 +3467,25 @@ class ManagedOrchestrator:
                         timeout,
                     ),
                 }
+                if kind == MANAGED_PWN_INTERACTION_ACTION_KIND:
+                    recipe_reference, recipe_error = (
+                        self._bind_managed_pwn_interaction_recipe(
+                            identity,
+                            artifact_bindings,
+                        )
+                    )
+                    if (
+                        recipe_error is not None
+                        or recipe_reference is None
+                    ):
+                        reject(
+                            run,
+                            index,
+                            recipe_error
+                            or "typed_gate_recipe_invalid",
+                        )
+                        return
+                    reference.update(recipe_reference)
             elif kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
                 rev_reference, rev_error = (
                     self._bind_managed_rev_accepted_input(

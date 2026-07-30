@@ -49,6 +49,7 @@ class ScaffoldBindingTests(unittest.TestCase):
                 "prove_candidate",
                 "verify_pwn_crash",
                 "prove_pwn_exploit_effect",
+                "prove_pwn_interaction",
                 "rev_accepted_input",
                 "prove_web_impact",
                 "prove_web_active_probe",
