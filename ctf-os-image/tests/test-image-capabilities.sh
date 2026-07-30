@@ -29,11 +29,15 @@ jq -e '
 ctf-capabilities --json >"${test_root}/managed-capabilities.json"
 jq -e '
     .schema_version == 2
-    and (.capabilities | length == 8)
+    and (.capabilities | length == 11)
     and all(.capabilities[]; .available == true)
     and all(
         .capabilities[]
         | select(
+            .name == "pwn_crash_v1"
+            or .name == "pwn_runtime_snapshot_v1"
+            or .name == "pwn_exploit_effect_v1"
+            or
             .name == "rev_inventory_v2"
             or .name == "rev_safe_output"
             or .name == "rev_stdin_exec"
@@ -41,7 +45,11 @@ jq -e '
         .attestation.schema_version == 1
         and (.attestation.contract_id | type == "string")
         and (.attestation.contract_version | type == "number")
-        and (.attestation.path | startswith("/opt/ctf-templates/rev/"))
+        and (
+            .attestation.path
+            | startswith("/opt/ctf-templates/pwn/")
+              or startswith("/opt/ctf-templates/rev/")
+        )
         and (.attestation.sha256 | test("^[0-9a-f]{64}$"))
     )
 ' "${test_root}/managed-capabilities.json" >/dev/null
