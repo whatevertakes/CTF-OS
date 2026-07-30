@@ -112,6 +112,7 @@ class BatchInvocation:
     deadline_epoch_seconds: float | None = None
     deadline_monotonic_seconds: float | None = None
     contract_version: int = 1
+    resume_thread_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id or "/" in self.run_id or "\\" in self.run_id:
@@ -156,6 +157,21 @@ class BatchInvocation:
             or self.contract_version not in {1, 2}
         ):
             raise ValueError("contract_version must be 1 or 2")
+        if self.resume_thread_id is not None and (
+            not self.resume_thread_id
+            or len(self.resume_thread_id.encode("utf-8", errors="strict")) > 256
+            or any(
+                character not in (
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "0123456789._:-"
+                )
+                for character in self.resume_thread_id
+            )
+        ):
+            raise ValueError(
+                "resume_thread_id must be a bounded opaque thread identifier"
+            )
 
 
 @dataclass(frozen=True)

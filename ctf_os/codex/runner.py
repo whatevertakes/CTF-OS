@@ -2114,7 +2114,10 @@ class BatchRunner:
         orchestration_failures: list[ExecutionFailure] = []
         validation = ContractValidation(False, ("$: no attempt completed",), None)
         correction: str | None = None
-        resume_thread_id: str | None = None
+        # Cross-cycle continuity is opt-in per invocation.  Schema repair then
+        # remains on that exact lane instead of accidentally starting a fresh
+        # conversation when a resumed CLI emits no new thread.started event.
+        resume_thread_id = invocation.resume_thread_id
         queued_at = time.time()
         first_started_at: float | None = None
         final_finished_at = queued_at
@@ -2550,7 +2553,7 @@ class BatchRunner:
             if attempt_number > self.max_schema_retries:
                 break
             correction = "\n".join(f"- {error}" for error in validation.errors)
-            resume_thread_id = accumulator.thread_id
+            resume_thread_id = accumulator.thread_id or resume_thread_id
 
         started_at = first_started_at if first_started_at is not None else final_finished_at
         timing = CallTiming(
@@ -2567,7 +2570,7 @@ class BatchRunner:
             attempts=tuple(attempts),
             output=output,
             validation=validation,
-            thread_id=accumulator.thread_id,
+            thread_id=accumulator.thread_id or invocation.resume_thread_id,
             events=tuple(accumulator.events),
             usage=accumulator.usage,
             failures=tuple(accumulator.failures) + tuple(orchestration_failures),
