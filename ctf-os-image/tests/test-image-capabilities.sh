@@ -29,7 +29,7 @@ jq -e '
 ctf-capabilities --json >"${test_root}/managed-capabilities.json"
 jq -e '
     .schema_version == 2
-    and (.capabilities | length == 11)
+    and (.capabilities | length == 12)
     and all(.capabilities[]; .available == true)
     and all(
         .capabilities[]
@@ -37,6 +37,7 @@ jq -e '
             .name == "pwn_crash_v1"
             or .name == "pwn_runtime_snapshot_v1"
             or .name == "pwn_exploit_effect_v1"
+            or .name == "pwn_interaction_v1"
             or
             .name == "rev_inventory_v2"
             or .name == "rev_safe_output"

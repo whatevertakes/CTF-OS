@@ -59,6 +59,15 @@
       "sha256": "ef8827eb7cf5189893302c43560930de1f1e0a6c66636c9e5d485c0ecb114835"
     },
     {
+      "name": "pwn_interaction_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/pwn/interaction.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.pwn.interaction",
+      "contract_version": 1,
+      "sha256": "d2a5a4370242adb0fae75ac4ddc68ffd43952e671ba0abc0ad68f1924423b5b9"
+    },
+    {
       "name": "rev_inventory_v2",
       "kind": "file_sha256",
       "path": "/opt/ctf-templates/rev/inventory_v2.py",
