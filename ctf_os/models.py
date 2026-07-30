@@ -5298,12 +5298,7 @@ def _pwn_exploit_effect_state_marker(value: object) -> bool:
     extra = getattr(value, "extra", None)
     return (
         type(extra) is dict
-        and (
-            extra.get("engine_executor")
-            == "ctfos.pwn.exploit_effect.hotpath.v1"
-            or "pwn_exploit_effect_replay" in extra
-            or "pwn_exploit_effect" in extra
-        )
+        and "pwn_exploit_effect_state" in extra
     )
 
 
@@ -14753,6 +14748,18 @@ class ChallengeState:
             )
 
             errors.extend(forensic_assertion_state_graph_errors(self))
+
+            # Pwn exploit-effect execution is a single child with six
+            # receipts.  The generic multi-receipt exception is marker-gated;
+            # this lazy exact validator makes a copied marker insufficient by
+            # reconstructing the complete PREISSUED or FINAL graph.
+            from ctf_os.engine.pwn_exploit_effect_state import (
+                pwn_exploit_effect_state_graph_errors,
+            )
+
+            errors.extend(
+                pwn_exploit_effect_state_graph_errors(self)
+            )
         if errors:
             raise ModelValidationError("; ".join(errors))
 
