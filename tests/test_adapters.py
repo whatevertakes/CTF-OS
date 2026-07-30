@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 from ctf_os.adapters import get_adapter
 from ctf_os.sandbox.types import CommandSpec, ensure_foreground_command
@@ -44,11 +48,51 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(baseline.timeout_s, 15)
         self.assertEqual(baseline.resource_class, "light")
         self.assertNotIn(primary, argv[2])
-        self.assertIn("/usr/bin/timeout --signal=TERM 3", argv[2])
-        self.assertIn("ulimit -f 128", argv[2])
+        self.assertIn(
+            "/usr/bin/timeout --signal=TERM --kill-after=1 3",
+            argv[2],
+        )
+        self.assertIn("--kill-after=1", argv[2])
+        self.assertNotIn("ulimit -f", argv[2])
         self.assertIn("/usr/bin/head -c 65536", argv[2])
+        self.assertIn("ctfos_runtime_baseline_exit=", argv[2])
         CommandSpec.create(argv)
         ensure_foreground_command(argv)
+
+    def test_pwn_runtime_baseline_drains_an_unbounded_menu_without_disk_capture(
+        self,
+    ) -> None:
+        baseline = next(
+            experiment
+            for experiment in get_adapter("pwn").initial_observations()
+            if experiment.id == "runtime_baseline"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="ctfos-pwn-baseline-test-"
+        ) as temporary:
+            target = Path(temporary) / "menu"
+            target.write_text(
+                "#!/bin/sh\nexec /usr/bin/yes MENU\n",
+                encoding="utf-8",
+            )
+            os.chmod(target, 0o700)
+            argv = tuple(
+                argument.replace("{primary}", str(target))
+                for argument in baseline.command_template
+            )
+            result = subprocess.run(
+                argv,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLessEqual(len(result.stdout), 65_700)
+        self.assertTrue(result.stdout.startswith(b"MENU\n"))
+        self.assertIn(b"ctfos_runtime_baseline_exit=", result.stdout)
+        self.assertIn(b"pipe_exit=0", result.stdout)
 
     def test_web_intake_never_makes_an_implicit_remote_request(self) -> None:
         adapter = get_adapter("web")

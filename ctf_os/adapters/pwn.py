@@ -22,13 +22,18 @@ class PwnAdapter(GenericAdapter):
                 (
                     "/bin/sh",
                     "-lc",
-                    "set +e; capture=/tmp/ctfos-pwn-baseline.$$; "
-                    "ulimit -f 128; /usr/bin/timeout --signal=TERM 3 "
-                    "\"$1\" </dev/null >\"$capture\" 2>&1; rc=$?; "
-                    "/usr/bin/head -c 65536 \"$capture\"; "
-                    "rm -f \"$capture\"; "
-                    "printf '\\nctfos_runtime_baseline_exit=%s\\n' "
-                    "\"$rc\"; exit 0",
+                    "set +e; umask 077; "
+                    "status=/tmp/ctfos-pwn-baseline-status.$$; "
+                    "trap 'rm -f \"$status\"' EXIT HUP INT TERM; "
+                    "{ /usr/bin/timeout --signal=TERM --kill-after=1 3 "
+                    "\"$1\" </dev/null; "
+                    "printf '%s\\n' \"$?\" >\"$status\"; "
+                    "} 2>&1 | /usr/bin/head -c 65536; pipe_rc=$?; "
+                    "if [ -r \"$status\" ]; then "
+                    "IFS= read -r rc <\"$status\" || rc=unknown; "
+                    "else rc=unknown; fi; "
+                    "printf '\\nctfos_runtime_baseline_exit=%s "
+                    "pipe_exit=%s\\n' \"$rc\" \"$pipe_rc\"; exit 0",
                     "ctfos-pwn-runtime-baseline",
                     "{primary}",
                 ),
