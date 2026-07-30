@@ -13086,6 +13086,7 @@ class ChallengeState:
                 experiment.status in evaluated_statuses
                 and not _pwn_crash_experiment_marker(experiment)
                 and not _web_impact_state_marker(experiment)
+                and not _forensic_assertion_state_marker(experiment)
             ):
                 result_run_id = (
                     experiment.result.get("run_id")
