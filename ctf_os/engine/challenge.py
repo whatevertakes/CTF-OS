@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -37,6 +38,7 @@ from ctf_os.candidates import (
     FlagNotificationError,
     candidate_value_is_valid,
 )
+from ctf_os.capabilities import inspect_pinned_capabilities
 from ctf_os.codex import (
     BatchCommandBuilder,
     BatchInvocation,
@@ -81,6 +83,17 @@ from ctf_os.contracts.rev_inventory_v2 import (
     rev_inventory_v2_seed_argv,
     rev_inventory_v2_seed_spec_sha256,
 )
+from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+    PWN_CRASH_V1_CONTRACT_ID,
+    PWN_CRASH_V1_CONTRACT_VERSION,
+    PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES,
+    PWN_CRASH_V1_MAX_INPUT_BYTES,
+    PWN_CRASH_V1_MAX_SOURCE_BYTES,
+    PWN_CRASH_V1_PROTOCOL,
+    PwnCrashV1Verdict,
+)
 from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceLimits, tool_profile
 from ctf_os.engine.context_archive import archive_context_pack
@@ -97,6 +110,22 @@ from ctf_os.engine.proof import (
     ProofResult,
     evaluate_proof,
     write_proof_result,
+)
+from ctf_os.engine.pwn_crash import (
+    PWN_CRASH_INPUT_DESTINATION_LOCATOR,
+    PWN_CRASH_NETWORK_POLICY,
+    PWN_CRASH_ONE_SHOT,
+    PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+    PWN_CRASH_PRODUCER_FILE_SHA256,
+    PWN_CRASH_PRODUCER_INTERPRETER_PATH,
+    PWN_CRASH_PRODUCER_PATH,
+    PWN_CRASH_SANDBOX_METHOD,
+    PwnCrashCapabilityAttestation,
+    PwnCrashReceiptMetadata,
+    PwnCrashRecipe,
+    PwnCrashRecipeError,
+    evaluate_pwn_crash_gate,
+    normalize_pwn_crash_capability_attestation,
 )
 from ctf_os.engine.rev_proof import (
     REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT,
@@ -279,6 +308,23 @@ class _ProofInputPreparation:
     manifest_path: Path
     manifest_sha256: str
     created_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PwnCrashAttemptEvidence:
+    ordinal: int
+    phase: str
+    input_sha256: str
+    input_size_bytes: int
+    run: RunReference
+    receipt: ExecutionReceipt
+    receipt_metadata: PwnCrashReceiptMetadata
+    stdout_artifact: ArtifactReference
+    stderr_artifact: ArtifactReference
+    stdout_payload: bytes
+    execution_contract: dict[str, Any]
+    execution_contract_sha256: str
+    request_sha256: str
 
 
 WAVE_ROLES: dict[str, tuple[Role, Role, Role]] = {
@@ -923,6 +969,22 @@ def _durable_unlink(path: Path) -> None:
         os.close(descriptor)
 
 
+def _durable_rmdir(path: Path) -> None:
+    """Remove one exact engine-owned directory and persist its parent."""
+
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        return
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _record_id(kind: str, run_id: str, local: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "-", local).strip("-")
     return f"{kind}-{run_id}-{normalized or uuid.uuid4().hex[:8]}"
@@ -971,6 +1033,42 @@ _REV_STDIN_SEMANTIC_FAILURE_CODES = frozenset(
         "selected_candidate_not_direct",
     }
 )
+_PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
+_PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_CRASH_REQUEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract_id",
+        "contract_version",
+        "contract_fingerprint",
+        "protocol",
+        "configuration_epoch",
+        "payload_artifact_id",
+        "payload_reported_locator",
+        "payload_sha256",
+        "payload_size_bytes",
+        "hypothesis_id",
+        "source_builder_run_id",
+    }
+)
+_PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES = (
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES
+    - (6 * PWN_CRASH_V1_MAX_DOCUMENT_BYTES)
+) // 6
+
+
+def _pwn_crash_canonical_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1309,6 +1407,9 @@ class ChallengeEngine:
             Callable[[ChallengeState, Path, NetworkPolicy], ChallengeSandboxClient]
             | None
         ) = None,
+        capability_probe: Callable[[str], Mapping[str, Any]] = (
+            inspect_pinned_capabilities
+        ),
     ) -> None:
         self.config = config or load_config(workspace_root)
         if store is None:
@@ -1345,6 +1446,7 @@ class ChallengeEngine:
         )
         self.live_builder = live_builder or LiveCommandBuilder(models=catalog)
         self._sandbox_factory = sandbox_factory
+        self._capability_probe = capability_probe
         limits = ResourceLimits(
             cpu=self.config.resources.tool_cpu_budget,
             memory_mib=self.config.resources.tool_memory_gib * 1024,
@@ -7825,6 +7927,1832 @@ class ChallengeEngine:
             session_lock.release()
         return self.store.load(identity)
 
+    def _pwn_crash_recipe_for_request(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+        *,
+        required_status: ExperimentStatus,
+    ) -> tuple[PwnCrashRecipe, ArtifactReference, SourceFile]:
+        """Resolve a model nomination into one fully engine-owned recipe."""
+
+        if (
+            state.schema_version < STATE_SCHEMA_VERSION
+            or str(get_adapter(state.category).name) != "pwn"
+            or experiment.kind is not ExperimentKind.STRATEGIC
+            or experiment.status is not required_status
+            or experiment.command != _PWN_CRASH_ENGINE_COMMAND
+            or experiment.extra.get("managed_contract_version") != 2
+            or experiment.extra.get("managed_action_kind")
+            != _PWN_CRASH_ACTION_KIND
+            or experiment.extra.get("engine_executor")
+            != _PWN_CRASH_ENGINE_EXECUTOR
+            or state.active_managed_session_id is None
+            or experiment.resource_class != "standard"
+        ):
+            raise EngineError(
+                "Pwn crash gate requires one registered v2 managed Pwn "
+                "Builder request"
+            )
+        request = experiment.extra.get("pwn_crash_request")
+        if not isinstance(request, dict) or set(request) != (
+            _PWN_CRASH_REQUEST_KEYS
+        ):
+            raise EngineError("Pwn crash request schema is not canonical")
+        if (
+            request.get("schema_version") != 1
+            or request.get("contract_id") != PWN_CRASH_V1_CONTRACT_ID
+            or request.get("contract_version")
+            != PWN_CRASH_V1_CONTRACT_VERSION
+            or request.get("contract_fingerprint")
+            != PWN_CRASH_V1_CONTRACT_FINGERPRINT
+            or request.get("protocol") != PWN_CRASH_V1_PROTOCOL
+            or request.get("configuration_epoch")
+            != state.configuration_epoch
+            or experiment.extra.get("configuration_epoch")
+            != state.configuration_epoch
+            or not isinstance(request.get("hypothesis_id"), str)
+            or experiment.hypothesis_ids
+            != [request.get("hypothesis_id")]
+            or request.get("source_builder_run_id")
+            != experiment.source_run_id
+        ):
+            raise EngineError("Pwn crash request binding is stale or invalid")
+        hypothesis_id = str(request["hypothesis_id"])
+        hypothesis = next(
+            (
+                item
+                for item in state.hypotheses
+                if item.id == hypothesis_id
+            ),
+            None,
+        )
+        if (
+            hypothesis is None
+            or hypothesis.status
+            not in {
+                HypothesisStatus.OPEN,
+                HypothesisStatus.SUPPORTED,
+            }
+        ):
+            raise EngineError(
+                "Pwn crash request requires one active bound hypothesis"
+            )
+        source_run_id = request.get("source_builder_run_id")
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == source_run_id
+            ),
+            None,
+        )
+        wave = next(
+            (
+                item
+                for item in state.waves
+                if source_run is not None
+                and item.id == source_run.wave_id
+            ),
+            None,
+        )
+        cycle = next(
+            (
+                item
+                for item in state.cycles
+                if source_run is not None
+                and item.id == source_run.cycle_id
+            ),
+            None,
+        )
+        if (
+            source_run is None
+            or source_run.status is not RunStatus.COMPLETED
+            or source_run.origin is not RunOrigin.MANAGED_MODEL
+            or source_run.role != Role.BUILDER.value
+            or source_run.extra.get("semantic_merge") is not True
+            or source_run.session_id != state.active_managed_session_id
+            or source_run.configuration_epoch != state.configuration_epoch
+            or wave is None
+            or wave.kind is not WaveKind.ATTACK
+            or wave.session_id != state.active_managed_session_id
+            or wave.configuration_epoch != state.configuration_epoch
+            or wave.role_run_ids.get(Role.BUILDER.value) != source_run.id
+            or cycle is None
+            or cycle.session_id != state.active_managed_session_id
+            or cycle.configuration_epoch != state.configuration_epoch
+            or cycle.wave_id != wave.id
+            or experiment.id not in cycle.selected_action_ids
+        ):
+            raise EngineError(
+                "Pwn crash request is not bound to the selected v2 attack "
+                "Builder action"
+            )
+        payload_id = request.get("payload_artifact_id")
+        payload = next(
+            (
+                item
+                for item in state.artifacts
+                if item.id == payload_id
+            ),
+            None,
+        )
+        if (
+            payload is None
+            or payload.source_run_id != source_run.id
+            or experiment.artifact_ids != [payload.id]
+            or payload.sha256 != request.get("payload_sha256")
+            or payload.size != request.get("payload_size_bytes")
+            or payload.extra.get("reported_locator")
+            != request.get("payload_reported_locator")
+            or isinstance(payload.size, bool)
+            or not isinstance(payload.size, int)
+            or not 1 <= payload.size <= PWN_CRASH_V1_MAX_INPUT_BYTES
+        ):
+            raise EngineError(
+                "Pwn crash request payload is not one exact canonical "
+                "Builder artifact"
+            )
+        source = _select_adapter_primary_source(
+            state.category,
+            self.challenge_input(state.identity),
+            state.source_inventory,
+        )
+        source_probe = (
+            _classify_primary_source(
+                self.challenge_input(state.identity),
+                source,
+            )
+            if source is not None
+            else None
+        )
+        manifest = state.metadata.get("source_manifest_sha256")
+        image_digest = self.config.runtime.image_digest
+        image_reference = self.config.runtime.image
+        if (
+            source is None
+            or source_probe is None
+            or not source_probe.inspected
+            or not source_probe.elf_executable
+            or not source_probe.executable_mode
+            or not 1 <= source.size <= PWN_CRASH_V1_MAX_SOURCE_BYTES
+            or not isinstance(manifest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest)
+            or not isinstance(image_digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest)
+            or not isinstance(image_reference, str)
+            or not image_reference
+        ):
+            raise EngineError(
+                "Pwn crash gate requires a pinned image and one immutable "
+                "executable ELF primary source"
+            )
+        try:
+            recipe = PwnCrashRecipe(
+                configuration_epoch=state.configuration_epoch,
+                experiment_id=experiment.id,
+                hypothesis_id=hypothesis_id,
+                primary_elf_locator=source.path,
+                source_manifest_sha256=manifest,
+                source_sha256=source.sha256,
+                source_size_bytes=source.size,
+                payload_artifact_id=payload.id,
+                payload_source_run_id=source_run.id,
+                payload_artifact_locator=payload.path,
+                payload_sha256=payload.sha256,
+                payload_size_bytes=payload.size,
+                image_reference=image_reference,
+                image_digest=image_digest,
+                producer_file_sha256=PWN_CRASH_PRODUCER_FILE_SHA256,
+            )
+        except PwnCrashRecipeError as error:
+            raise EngineError(
+                f"Pwn crash engine recipe is invalid: {error.code}"
+            ) from error
+        return recipe, payload, source
+
+    def _prepare_pwn_crash_source_snapshot(
+        self,
+        state: ChallengeState,
+        recipe: PwnCrashRecipe,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Path, ImmutableFile]:
+        """Copy only the bound ELF into a private read-only mount root."""
+
+        paths = self.store.challenge_paths(state.identity)
+        snapshot_parent = ensure_private_directory(
+            paths.runtime / "pwn-crash-source-snapshots"
+        )
+        staging = tempfile.TemporaryDirectory(
+            prefix=f"{recipe.recipe_sha256[:16]}-",
+            dir=snapshot_parent,
+        )
+        try:
+            snapshot_root = Path(staging.name)
+            challenge_root = ensure_private_directory(
+                snapshot_root / "challenge"
+            )
+            parent = PurePosixPath(recipe.primary_elf_locator).parent
+            if parent != PurePosixPath("."):
+                ensure_relative_directory(
+                    challenge_root,
+                    parent.as_posix(),
+                )
+            destination = (
+                challenge_root
+                / normalize_locator(recipe.primary_elf_locator)
+            )
+            snapshot = copy_bounded_regular(
+                self.challenge_input(state.identity),
+                recipe.primary_elf_locator,
+                destination,
+                maximum_bytes=min(
+                    PWN_CRASH_V1_MAX_SOURCE_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=recipe.source_sha256,
+                expected_size=recipe.source_size_bytes,
+                mode=0o500,
+            )
+            return staging, challenge_root, snapshot
+        except BaseException:
+            staging.cleanup()
+            raise
+
+    def _prepare_pwn_crash_inputs(
+        self,
+        state: ChallengeState,
+        recipe: PwnCrashRecipe,
+        payload: ArtifactReference,
+        workspace: Path,
+    ) -> tuple[
+        tempfile.TemporaryDirectory[str],
+        bytes,
+        ProofInput,
+        ProofInput,
+    ]:
+        """Stage the exact payload and an engine-created empty control."""
+
+        staging = tempfile.TemporaryDirectory(
+            prefix=".pwn-crash-input-",
+            dir=workspace,
+        )
+        try:
+            root = Path(staging.name)
+            payload_snapshot = copy_bounded_regular(
+                self.store.challenge_paths(state.identity).root,
+                payload.path,
+                root / "payload.bin",
+                maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+                expected_sha256=recipe.payload_sha256,
+                expected_size=recipe.payload_size_bytes,
+                mode=0o400,
+            )
+            empty_path = root / "empty.bin"
+            atomic_write_bytes(empty_path, b"", mode=0o400)
+            poc_input = payload_snapshot.path.read_bytes()
+            recipe.validate_payload(poc_input)
+            relative_root = root.relative_to(workspace)
+            return (
+                staging,
+                poc_input,
+                ProofInput(
+                    source_locator=(
+                        relative_root / "payload.bin"
+                    ).as_posix(),
+                    destination_locator=(
+                        PWN_CRASH_INPUT_DESTINATION_LOCATOR
+                    ),
+                    sha256=recipe.payload_sha256,
+                    size_bytes=recipe.payload_size_bytes,
+                ),
+                ProofInput(
+                    source_locator=(
+                        relative_root / "empty.bin"
+                    ).as_posix(),
+                    destination_locator=(
+                        PWN_CRASH_INPUT_DESTINATION_LOCATOR
+                    ),
+                    sha256=hashlib.sha256(b"").hexdigest(),
+                    size_bytes=0,
+                ),
+            )
+        except BaseException:
+            staging.cleanup()
+            raise
+
+    def _snapshot_pwn_crash_stream(
+        self,
+        state: ChallengeState,
+        client: ChallengeSandboxClient,
+        *,
+        workspace: Path,
+        locator: str,
+        destination: Path,
+        maximum_bytes: int,
+    ) -> ImmutableFile:
+        """Snapshot one exact bounded producer stream."""
+
+        reference = client.register_artifact(
+            locator,
+            maximum_bytes=maximum_bytes,
+        )
+        if reference.scope_fingerprint != client.scope_fingerprint:
+            raise EngineError(
+                "Pwn crash stream came from another sandbox scope"
+            )
+        try:
+            return copy_bounded_regular(
+                workspace,
+                reference.locator,
+                destination,
+                maximum_bytes=maximum_bytes,
+                expected_sha256=reference.sha256,
+                expected_size=reference.size_bytes,
+                mode=0o400,
+            )
+        except (OSError, SafeFileError, ValueError) as error:
+            raise EngineError(
+                "Pwn crash stream could not be snapshotted safely"
+            ) from error
+
+    def _require_pwn_crash_external_pins(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+        recipe: PwnCrashRecipe,
+        *,
+        source_snapshot_root: Path,
+        workspace: Path,
+        payload_input: ProofInput,
+        control_input: ProofInput,
+        capability_attestation: PwnCrashCapabilityAttestation,
+        capability_artifact: ArtifactReference,
+        attempts: Sequence[_PwnCrashAttemptEvidence],
+        probe_capability: bool,
+        deadline_monotonic_seconds: float,
+        automated: bool,
+        live_only: bool,
+    ) -> None:
+        """Re-read every non-state pin immediately before state replacement."""
+
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Pwn crash external commit guards",
+        )
+        self._require_model_work_allowed(state, automated=automated)
+        if live_only:
+            self._require_live_mutation_allowed(state)
+        if (
+            self.config.runtime.image != recipe.image_reference
+            or self.config.runtime.image_digest != recipe.image_digest
+            or recipe.producer_file_sha256
+            != PWN_CRASH_PRODUCER_FILE_SHA256
+        ):
+            raise EngineError(
+                "Pwn crash image or producer pin changed before commit"
+            )
+        if probe_capability:
+            try:
+                live_capability = (
+                    normalize_pwn_crash_capability_attestation(
+                        dict(self._capability_probe(recipe.image_digest)),
+                        image_digest=recipe.image_digest,
+                        recipe_sha256=recipe.recipe_sha256,
+                    )
+                )
+            except Exception as error:
+                raise EngineError(
+                    "Pwn crash capability re-probe failed before commit"
+                ) from error
+            if live_capability != capability_attestation:
+                raise EngineError(
+                    "Pwn crash capability attestation changed before commit"
+                )
+            self._require_before_hard_deadline(
+                deadline_monotonic_seconds,
+                "Pwn crash capability re-probe",
+            )
+        item = next(
+            (
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            ),
+            None,
+        )
+        if item is None:
+            raise EngineError("Pwn crash experiment disappeared before commit")
+        rebuilt, payload, source = self._pwn_crash_recipe_for_request(
+            state,
+            item,
+            required_status=ExperimentStatus.RUNNING,
+        )
+        stored_recipe = item.extra.get("pwn_crash_recipe")
+        try:
+            parsed_stored = (
+                PwnCrashRecipe.from_dict(stored_recipe)
+                if isinstance(stored_recipe, dict)
+                else None
+            )
+        except PwnCrashRecipeError as error:
+            raise EngineError(
+                "Pwn crash stored recipe is not canonical"
+            ) from error
+        if rebuilt != recipe or parsed_stored != recipe:
+            raise EngineError("Pwn crash recipe changed before commit")
+        try:
+            live_inventory = inventory_challenge(
+                self.challenge_input(state.identity)
+            )
+        except (OSError, ValueError) as error:
+            raise EngineError(
+                "Pwn crash live source inventory is unavailable"
+            ) from error
+        live_source = next(
+            (
+                value
+                for value in live_inventory.files
+                if value.path == recipe.primary_elf_locator
+            ),
+            None,
+        )
+        if (
+            live_inventory.manifest_sha256
+            != recipe.source_manifest_sha256
+            or live_source is None
+            or live_source.sha256 != recipe.source_sha256
+            or live_source.size != recipe.source_size_bytes
+            or source.path != recipe.primary_elf_locator
+        ):
+            raise EngineError("Pwn crash source changed before commit")
+        paths = self.store.challenge_paths(state.identity)
+        with tempfile.TemporaryDirectory(
+            prefix=".pwn-crash-commit-guard-",
+            dir=paths.runtime,
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            copy_bounded_regular(
+                paths.root,
+                payload.path,
+                temporary / "canonical-payload.bin",
+                maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+                expected_sha256=recipe.payload_sha256,
+                expected_size=recipe.payload_size_bytes,
+                mode=0o400,
+            )
+            copy_bounded_regular(
+                workspace,
+                payload_input.source_locator,
+                temporary / "staged-payload.bin",
+                maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+                expected_sha256=recipe.payload_sha256,
+                expected_size=recipe.payload_size_bytes,
+                mode=0o400,
+            )
+            empty_sha256 = hashlib.sha256(b"").hexdigest()
+            copy_bounded_regular(
+                workspace,
+                control_input.source_locator,
+                temporary / "staged-empty.bin",
+                maximum_bytes=1,
+                expected_sha256=empty_sha256,
+                expected_size=0,
+                mode=0o400,
+            )
+            copy_bounded_regular(
+                source_snapshot_root,
+                recipe.primary_elf_locator,
+                temporary / "source.bin",
+                maximum_bytes=min(
+                    PWN_CRASH_V1_MAX_SOURCE_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=recipe.source_sha256,
+                expected_size=recipe.source_size_bytes,
+                mode=0o400,
+            )
+            capability_snapshot = copy_bounded_regular(
+                paths.root,
+                capability_artifact.path,
+                temporary / "capability-attestation.json",
+                maximum_bytes=16 * 1024,
+                expected_sha256=capability_artifact.sha256,
+                expected_size=capability_artifact.size,
+                mode=0o400,
+            )
+            if (
+                capability_snapshot.path.read_bytes()
+                != capability_attestation.canonical_bytes()
+                or capability_artifact.sha256
+                != capability_attestation.evidence_sha256
+            ):
+                raise EngineError(
+                    "Pwn crash capability artifact changed before commit"
+                )
+        if len(attempts) != 6:
+            raise EngineError("Pwn crash gate lacks six durable attempts")
+        for ordinal, attempt in enumerate(attempts, start=1):
+            binding = recipe.attempt_input_binding(ordinal)
+            if (
+                attempt.ordinal != ordinal
+                or attempt.phase != binding["phase"]
+                or attempt.input_sha256 != binding["input_sha256"]
+                or attempt.input_size_bytes != binding["input_size_bytes"]
+                or attempt.run.configuration_epoch
+                != recipe.configuration_epoch
+                or attempt.stdout_artifact.source_run_id != attempt.run.id
+                or attempt.stderr_artifact.source_run_id != attempt.run.id
+                or attempt.receipt.run_id != attempt.run.id
+                or attempt.receipt.stdout_artifact_id
+                != attempt.stdout_artifact.id
+                or attempt.receipt.stderr_artifact_id
+                != attempt.stderr_artifact.id
+                or attempt.receipt_metadata.run_id != attempt.run.id
+                or attempt.receipt_metadata.stdout_artifact_id
+                != attempt.stdout_artifact.id
+                or attempt.receipt_metadata.request_sha256
+                != attempt.request_sha256
+                or attempt.receipt_metadata.execution_contract_sha256
+                != attempt.execution_contract_sha256
+                or (
+                    attempt.receipt_metadata
+                    .capability_attestation_artifact_id
+                    != capability_artifact.id
+                )
+                or (
+                    attempt.receipt_metadata
+                    .capability_attestation_sha256
+                    != capability_artifact.sha256
+                )
+                or hashlib.sha256(attempt.stdout_payload).hexdigest()
+                != attempt.stdout_artifact.sha256
+                or len(attempt.stdout_payload)
+                != attempt.stdout_artifact.size
+            ):
+                raise EngineError(
+                    "Pwn crash attempt evidence changed before commit"
+                )
+            request_sha256 = attempt.run.extra.get(
+                "pwn_crash", {}
+            ).get("request_sha256")
+            if not isinstance(request_sha256, str) or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                request_sha256,
+            ):
+                raise EngineError(
+                    "Pwn crash durable attempt request changed before commit"
+                )
+            if request_sha256 != attempt.request_sha256:
+                raise EngineError(
+                    "Pwn crash attempt request hash is not bound to its run"
+                )
+            if attempt.run.request_path is None:
+                raise EngineError(
+                    "Pwn crash durable attempt request is unavailable"
+                )
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=f".pwn-crash-request-{ordinal}-",
+                    dir=paths.runtime,
+                ) as request_temporary:
+                    request_snapshot = copy_bounded_regular(
+                        paths.root,
+                        attempt.run.request_path,
+                        Path(request_temporary) / "request.json",
+                        maximum_bytes=256 * 1024,
+                        expected_sha256=attempt.request_sha256,
+                        mode=0o400,
+                    )
+                    request_value = strict_json_loads(
+                        request_snapshot.path.read_bytes(),
+                        max_bytes=256 * 1024,
+                    )
+            except (
+                OSError,
+                SafeFileError,
+                StrictJSONError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "Pwn crash durable request cannot be read safely"
+                ) from error
+            expected_request_keys = {
+                "base_revision",
+                "category",
+                "challenge_id",
+                "contest_id",
+                "created_at",
+                "execution_contract",
+                "execution_contract_sha256",
+                "experiment_id",
+                "kind",
+                "run_id",
+                "schema_version",
+            }
+            if (
+                not isinstance(request_value, dict)
+                or set(request_value) != expected_request_keys
+                or request_value.get("schema_version")
+                != RUN_ENVELOPE_SCHEMA_VERSION
+                or request_value.get("contest_id") != state.contest_id
+                or request_value.get("category") != state.category
+                or request_value.get("challenge_id")
+                != state.challenge_id
+                or request_value.get("run_id") != attempt.run.id
+                or request_value.get("base_revision")
+                != attempt.run.base_revision
+                or not isinstance(request_value.get("created_at"), str)
+                or request_value.get("kind") != "pwn_crash_gate"
+                or request_value.get("experiment_id") != experiment_id
+                or request_value.get("execution_contract")
+                != attempt.execution_contract
+                or request_value.get("execution_contract_sha256")
+                != attempt.execution_contract_sha256
+                or hashlib.sha256(
+                    _pwn_crash_canonical_bytes(
+                        attempt.execution_contract
+                    )
+                ).hexdigest()
+                != attempt.execution_contract_sha256
+            ):
+                raise EngineError(
+                    "Pwn crash durable request schema or binding changed"
+                )
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Pwn crash canonical state commit",
+        )
+
+    def _cleanup_uncommitted_pwn_crash_runs(
+        self,
+        identity: ChallengeIdentity,
+        run_ids: Sequence[str],
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Remove only exact gate run directories absent from canonical state."""
+
+        unique_ids = tuple(dict.fromkeys(run_ids))
+        if len(unique_ids) > 6:
+            raise EngineError(
+                "Pwn crash cleanup set exceeds its six-attempt bound"
+            )
+        if not unique_ids:
+            return
+        try:
+            canonical = self.store.load(identity, recover=False)
+        except Exception as verification_error:
+            raise EngineError(
+                "Pwn crash state could not be verified before run cleanup"
+            ) from verification_error
+        canonical_ids = {run.id for run in canonical.runs}
+        challenge_paths = self.store.challenge_paths(identity)
+        cleanup_errors: list[str] = []
+        for run_id in unique_ids:
+            if run_id in canonical_ids:
+                continue
+            try:
+                run_paths = self.store.run_paths(identity, run_id=run_id)
+            except (TypeError, ValueError) as cleanup_error:
+                cleanup_errors.append(f"{run_id}: {cleanup_error}")
+                continue
+            if (
+                run_paths.root.parent != challenge_paths.runs
+                or run_paths.root.name != run_id
+            ):
+                cleanup_errors.append(
+                    f"{run_id}: run path escaped the challenge run root"
+                )
+                continue
+            try:
+                for path in (
+                    run_paths.validation,
+                    run_paths.result,
+                    run_paths.request,
+                ):
+                    _durable_unlink(path)
+                _durable_rmdir(run_paths.raw)
+                _durable_rmdir(run_paths.root)
+            except OSError as cleanup_error:
+                cleanup_errors.append(f"{run_id}: {cleanup_error}")
+        if cleanup_errors:
+            error = EngineError(
+                "Pwn crash state update failed and exact run cleanup failed: "
+                + "; ".join(cleanup_errors)
+            )
+            if cause is not None:
+                raise error from cause
+            raise error
+
+    def _terminalize_pwn_crash_interruption(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        error: BaseException,
+        *,
+        live_only: bool,
+    ) -> None:
+        """Leave an interrupted typed gate terminal without masking control flow."""
+
+        try:
+            canonical = self.store.load(identity, recover=False)
+            experiment = next(
+                item
+                for item in canonical.experiments
+                if item.id == experiment_id
+            )
+        except BaseException as inspection_error:
+            error.add_note(
+                "Pwn crash interruption state inspection failed: "
+                f"{inspection_error}"
+            )
+            return
+        if experiment.status is not ExperimentStatus.RUNNING:
+            return
+        reason = (
+            "Pwn crash gate failed closed: interrupted by "
+            f"{type(error).__name__}: {error}"
+        )
+        try:
+            self._finish_tool_failure(
+                identity,
+                experiment_id,
+                reason,
+                _live_only=live_only,
+            )
+        except BaseException as terminal_error:
+            error.add_note(
+                "Pwn crash interruption terminalization failed: "
+                f"{terminal_error}"
+            )
+
+    def _execute_pwn_crash_differential(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        *,
+        automated: bool,
+        live_only: bool,
+    ) -> ChallengeState:
+        """Execute the fixed local stdin D→V crash gate."""
+
+        current = self.store.load(identity)
+        self._require_model_work_allowed(current, automated=automated)
+        experiment = next(
+            (
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if experiment is None:
+            raise EngineError(f"unknown experiment: {experiment_id}")
+        recipe, payload, _source = self._pwn_crash_recipe_for_request(
+            current,
+            experiment,
+            required_status=ExperimentStatus.REGISTERED,
+        )
+        source_run = next(
+            run
+            for run in current.runs
+            if run.id == recipe.payload_source_run_id
+        )
+
+        def mark_running(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            )
+            rebuilt, _payload, _primary = (
+                self._pwn_crash_recipe_for_request(
+                    state,
+                    item,
+                    required_status=ExperimentStatus.REGISTERED,
+                )
+            )
+            if rebuilt != recipe:
+                raise EngineError(
+                    "Pwn crash recipe changed before execution"
+                )
+            item.status = ExperimentStatus.RUNNING
+            item.extra["pwn_crash_recipe"] = recipe.to_dict()
+
+        running = self.store.update(
+            identity,
+            mark_running,
+            expected_revision=current.revision,
+        )
+        experiment = next(
+            item
+            for item in running.experiments
+            if item.id == experiment_id
+        )
+        workspace = self._managed_action_workspace(
+            running,
+            experiment,
+        )
+        if workspace is None:
+            raise EngineError(
+                "Pwn crash gate requires a managed action workspace"
+            )
+        (
+            gate_deadline_monotonic,
+            gate_deadline_epoch,
+        ) = self._budget_deadline_pair(
+            running,
+            experiment.timeout_seconds,
+        )
+        flag_policy = resolve_flag_format(
+            running,
+            self.config.runtime.flag_patterns,
+        )
+        detected_pwn_flags: list[tuple[DetectedFlag, str]] = []
+        active_pwn_run_id: str | None = None
+
+        def receive_pwn_flag(detected: DetectedFlag) -> None:
+            if (
+                not candidate_value_is_valid(detected.value)
+                or active_pwn_run_id is None
+            ):
+                return
+            self.store.record_candidate_intent(
+                identity,
+                value=detected.value,
+                source=detected.source,
+                source_run_id=active_pwn_run_id,
+                observed_at=detected.observed_at,
+                tier=flag_policy.tier_for(detected.value),
+                format_epoch=flag_policy.configuration_epoch,
+            )
+            detected_pwn_flags.append(
+                (detected, active_pwn_run_id)
+            )
+            self._on_tool_flag(identity, detected)
+
+        pwn_flag_detector = FlagDetector(
+            flag_policy.patterns,
+            callback=receive_pwn_flag,
+        )
+        source_staging = None
+        input_staging = None
+        committed = False
+        committed_state: ChallengeState | None = None
+        active_error: BaseException | None = None
+        pending_artifacts: list[ArtifactReference] = []
+        planned_run_ids: list[str] = []
+        attempts: list[_PwnCrashAttemptEvidence] = []
+        started_gate = time.monotonic()
+        try:
+            self._require_before_hard_deadline(
+                gate_deadline_monotonic,
+                "Pwn crash source snapshot",
+            )
+            (
+                source_staging,
+                challenge_root,
+                source_snapshot,
+            ) = self._prepare_pwn_crash_source_snapshot(
+                running,
+                recipe,
+            )
+            (
+                input_staging,
+                poc_input,
+                payload_input,
+                control_input,
+            ) = self._prepare_pwn_crash_inputs(
+                running,
+                recipe,
+                payload,
+                workspace,
+            )
+            self._require_before_hard_deadline(
+                gate_deadline_monotonic,
+                "Pwn crash input snapshots",
+            )
+            request = tool_profile(
+                experiment.resource_class,
+                needs_kvm=False,
+                network=False,
+            )
+            if request.network != 0:
+                raise EngineError(
+                    "Pwn crash resource request must deny network"
+                )
+            paths = self.store.challenge_paths(identity)
+            evidence_root = ensure_private_directory(
+                paths.artifacts
+                / "snapshots"
+                / f"pwn-crash-{recipe.recipe_sha256}"
+            )
+            try:
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    "Pwn crash capability probe",
+                )
+                capability_attestation = (
+                    normalize_pwn_crash_capability_attestation(
+                        dict(self._capability_probe(recipe.image_digest)),
+                        image_digest=recipe.image_digest,
+                        recipe_sha256=recipe.recipe_sha256,
+                    )
+                )
+            except Exception as error:
+                raise EngineError(
+                    "Pwn crash pinned-image capability probe failed"
+                ) from error
+            self._require_before_hard_deadline(
+                gate_deadline_monotonic,
+                "Pwn crash capability probe",
+            )
+            capability_artifact_id = _record_id(
+                "A",
+                experiment_id,
+                "pwn-crash-capability",
+            )
+            capability_path = (
+                evidence_root / "capability-attestation.json"
+            )
+            atomic_write_bytes(
+                capability_path,
+                capability_attestation.canonical_bytes(),
+                mode=0o400,
+            )
+            capability_artifact = ArtifactReference(
+                id=capability_artifact_id,
+                path=capability_path.relative_to(paths.root).as_posix(),
+                sha256=capability_attestation.evidence_sha256,
+                source_run_id=None,
+                size=len(capability_attestation.canonical_bytes()),
+                media_type="application/json",
+                extra={
+                    "kind": "pwn_crash_capability_attestation",
+                    "engine_executor": _PWN_CRASH_ENGINE_EXECUTOR,
+                    "recipe_sha256": recipe.recipe_sha256,
+                },
+            )
+            pending_artifacts.append(capability_artifact)
+            persisted_evidence_bytes = capability_artifact.size or 0
+            for ordinal in range(1, 7):
+                latest = self.store.load(identity)
+                self._require_model_work_allowed(
+                    latest,
+                    automated=automated,
+                )
+                current_item = next(
+                    item
+                    for item in latest.experiments
+                    if item.id == experiment_id
+                )
+                rebuilt, _payload, _primary = (
+                    self._pwn_crash_recipe_for_request(
+                        latest,
+                        current_item,
+                        required_status=ExperimentStatus.RUNNING,
+                    )
+                )
+                if rebuilt != recipe:
+                    raise EngineError(
+                        "Pwn crash recipe changed during execution"
+                    )
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    f"Pwn crash attempt {ordinal}",
+                )
+                binding = recipe.attempt_input_binding(ordinal)
+                proof_input = (
+                    payload_input
+                    if binding["phase"] == "positive"
+                    else control_input
+                )
+                argv = recipe.argv_for_attempt(ordinal)
+                gate_remaining = (
+                    gate_deadline_monotonic - time.monotonic()
+                )
+                if gate_remaining <= 0:
+                    raise _HardDeadlineExpired(
+                        "Pwn crash gate deadline expired before attempt "
+                        f"{ordinal}"
+                    )
+                command_timeout = min(
+                    10,
+                    experiment.timeout_seconds,
+                    max(1, int(math.ceil(gate_remaining))),
+                )
+                command_deadline = gate_deadline_monotonic
+                run_id = _run_id(
+                    f"pwn-crash-{experiment_id}-{ordinal}"
+                )
+                execution_contract = {
+                    "schema_version": 1,
+                    "contract": {
+                        "id": PWN_CRASH_V1_CONTRACT_ID,
+                        "version": PWN_CRASH_V1_CONTRACT_VERSION,
+                        "fingerprint": (
+                            PWN_CRASH_V1_CONTRACT_FINGERPRINT
+                        ),
+                    },
+                    "protocol": PWN_CRASH_V1_PROTOCOL,
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "configuration_epoch": recipe.configuration_epoch,
+                    "gate": {
+                        "timeout_seconds": experiment.timeout_seconds,
+                        "deadline_epoch_seconds": gate_deadline_epoch,
+                    },
+                    "attempt": {
+                        "ordinal": ordinal,
+                        "phase": binding["phase"],
+                    },
+                    "input": {
+                        "kind": binding["input_kind"],
+                        "artifact_id": (
+                            recipe.payload_artifact_id
+                            if binding["phase"] == "positive"
+                            else None
+                        ),
+                        "sha256": binding["input_sha256"],
+                        "size_bytes": binding["input_size_bytes"],
+                        "destination_locator": (
+                            PWN_CRASH_INPUT_DESTINATION_LOCATOR
+                        ),
+                    },
+                    "argv": list(argv),
+                    "sandbox": {
+                        "method": PWN_CRASH_SANDBOX_METHOD,
+                        "one_shot": PWN_CRASH_ONE_SHOT,
+                        "outer_timeout_seconds": command_timeout,
+                        "environment": {},
+                        "resource_request": request.as_dict(),
+                        "image": {
+                            "reference": recipe.image_reference,
+                            "digest": recipe.image_digest,
+                        },
+                        "network": PWN_CRASH_NETWORK_POLICY,
+                        "network_target": None,
+                    },
+                    "producer": {
+                        "interpreter_path": (
+                            PWN_CRASH_PRODUCER_INTERPRETER_PATH
+                        ),
+                        "path": PWN_CRASH_PRODUCER_PATH,
+                        "capability_name": (
+                            PWN_CRASH_PRODUCER_CAPABILITY_NAME
+                        ),
+                        "file_sha256": recipe.producer_file_sha256,
+                        "capability_attestation_artifact_id": (
+                            capability_artifact.id
+                        ),
+                        "capability_attestation_sha256": (
+                            capability_artifact.sha256
+                        ),
+                    },
+                }
+                execution_contract_sha256 = hashlib.sha256(
+                    _pwn_crash_canonical_bytes(execution_contract)
+                ).hexdigest()
+                planned_run_ids.append(run_id)
+                run_paths = self.store.create_run(
+                    identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "pwn_crash_gate",
+                        "experiment_id": experiment_id,
+                        "execution_contract": execution_contract,
+                        "execution_contract_sha256": (
+                            execution_contract_sha256
+                        ),
+                    },
+                    base_revision=latest.revision,
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix=f".pwn-crash-issued-{ordinal}-",
+                    dir=paths.runtime,
+                ) as issued_temporary:
+                    issued_request = copy_bounded_regular(
+                        paths.root,
+                        run_paths.request.relative_to(paths.root).as_posix(),
+                        Path(issued_temporary) / "request.json",
+                        maximum_bytes=256 * 1024,
+                        mode=0o400,
+                    )
+                    request_sha256 = issued_request.sha256
+                lease = None
+                result: SandboxResult | None = None
+                orchestration_error: str | None = None
+                attempt_started = time.monotonic()
+                try:
+                    self._require_before_hard_deadline(
+                        gate_deadline_monotonic,
+                        f"Pwn crash attempt {ordinal} resource lease",
+                    )
+                    lease_remaining = (
+                        gate_deadline_monotonic - time.monotonic()
+                    )
+                    if lease_remaining <= 0:
+                        raise _HardDeadlineExpired(
+                            "Pwn crash gate deadline expired before "
+                            f"attempt {ordinal} resource lease"
+                        )
+                    lease = self.lease_broker.acquire(
+                        request,
+                        timeout=min(
+                            self._budget_wait_timeout(
+                                latest,
+                                self.config.resources.lease_wait_timeout_s,
+                            ),
+                            lease_remaining,
+                        ),
+                        owner=f"{identity.key}:{experiment_id}:{ordinal}",
+                    )
+                    if lease is None:
+                        orchestration_error = "lease_unavailable"
+                    else:
+                        client = self.sandbox(
+                            latest,
+                            workspace_override=workspace,
+                            challenge_dir_override=challenge_root,
+                            network_policy_override=(
+                                NetworkPolicy.deny_all()
+                            ),
+                        )
+                        result = client.run_clean_proof(
+                            CommandSpec.create(
+                                argv,
+                                timeout_seconds=command_timeout,
+                                deadline_monotonic_seconds=command_deadline,
+                                environment={},
+                                network_target=None,
+                                resource_request=request,
+                            ),
+                            proof_inputs=(proof_input,),
+                        )
+                except _HardDeadlineExpired:
+                    raise
+                except Exception:
+                    orchestration_error = "sandbox_error"
+                finally:
+                    if lease is not None and not lease.released:
+                        lease.release()
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    f"Pwn crash attempt {ordinal} result capture",
+                )
+                elapsed = time.monotonic() - attempt_started
+                artifact_records: dict[str, ArtifactReference] = {}
+                stream_payloads: dict[str, bytes] = {}
+                snapshot_failed: dict[str, bool] = {}
+                for stream, maximum_bytes in (
+                    ("stdout", PWN_CRASH_V1_MAX_DOCUMENT_BYTES),
+                    ("stderr", _PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES),
+                ):
+                    artifact_id = _record_id(
+                        "A",
+                        run_id,
+                        stream,
+                    )
+                    destination = (
+                        evidence_root
+                        / f"{ordinal:02d}-{run_id}-{stream}.log"
+                    )
+                    locator = (
+                        getattr(result, f"{stream}_path")
+                        if result is not None
+                        else None
+                    )
+                    snapshot = None
+                    if isinstance(locator, str):
+                        try:
+                            snapshot = self._snapshot_pwn_crash_stream(
+                                latest,
+                                client,
+                                workspace=workspace,
+                                locator=(
+                                    locator.removeprefix("/work/").lstrip("/")
+                                ),
+                                destination=destination,
+                                maximum_bytes=maximum_bytes,
+                            )
+                            if (
+                                persisted_evidence_bytes
+                                + snapshot.size_bytes
+                                > PWN_CRASH_V1_MAX_EVIDENCE_BYTES
+                            ):
+                                raise EngineError(
+                                    "Pwn crash aggregate evidence exceeds "
+                                    "its bound"
+                                )
+                        except (EngineError, SandboxError, OSError, ValueError):
+                            snapshot = None
+                    if snapshot is None:
+                        atomic_write_bytes(destination, b"", mode=0o400)
+                        stream_bytes = b""
+                        stream_sha256 = hashlib.sha256(b"").hexdigest()
+                        stream_size = 0
+                        snapshot_failed[stream] = True
+                    else:
+                        stream_bytes = snapshot.path.read_bytes()
+                        stream_sha256 = snapshot.sha256
+                        stream_size = snapshot.size_bytes
+                        snapshot_failed[stream] = False
+                        persisted_evidence_bytes += stream_size
+                    artifact = ArtifactReference(
+                        id=artifact_id,
+                        path=destination.relative_to(paths.root).as_posix(),
+                        sha256=stream_sha256,
+                        source_run_id=run_id,
+                        size=stream_size,
+                        extra={
+                            "stream": stream,
+                            "engine_executor": (
+                                _PWN_CRASH_ENGINE_EXECUTOR
+                            ),
+                            "recipe_sha256": recipe.recipe_sha256,
+                            "ordinal": ordinal,
+                            "phase": binding["phase"],
+                            "capture_placeholder": (
+                                snapshot_failed[stream]
+                            ),
+                        },
+                    )
+                    pending_artifacts.append(artifact)
+                    artifact_records[stream] = artifact
+                    stream_payloads[stream] = stream_bytes
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    f"Pwn crash attempt {ordinal} stream snapshots",
+                )
+                active_pwn_run_id = run_id
+                try:
+                    scan_bytes = stream_payloads["stderr"][
+                        : self.config.runtime.flag_scan_max_bytes
+                    ]
+                    pwn_flag_detector.feed(
+                        scan_bytes.decode("utf-8", errors="replace"),
+                        source=f"tool:{run_id}:stderr",
+                    )
+                finally:
+                    active_pwn_run_id = None
+
+                if result is None:
+                    outcome = "failed"
+                    exit_code = None
+                    timed_out = False
+                    stdout_bytes = 0
+                    stderr_bytes = 0
+                    stdout_stored = 0
+                    stdout_capture_complete = False
+                    stdout_truncation_known = False
+                    stdout_truncated = None
+                    stdout_error = None
+                    stream_capture_error = "stream_unavailable"
+                    status = "orchestration_error"
+                    duration_ms = int(elapsed * 1000)
+                else:
+                    timed_out = result.timed_out
+                    exit_code = result.exit_code
+                    outcome = (
+                        "timed_out"
+                        if result.timed_out
+                        else "succeeded"
+                        if (
+                            result.exit_code == 0
+                            and result.orchestration_error is None
+                            and orchestration_error is None
+                        )
+                        else "failed"
+                    )
+                    stdout_bytes = result.stdout_bytes
+                    stderr_bytes = result.stderr_bytes
+                    stdout_stored = (
+                        result.stdout_stored_bytes
+                        if result.stdout_stored_bytes is not None
+                        else artifact_records["stdout"].size or 0
+                    )
+                    stdout_capture_complete = (
+                        result.stdout_capture_complete
+                        and not snapshot_failed["stdout"]
+                    )
+                    stdout_truncation_known = (
+                        result.stdout_truncation_known
+                    )
+                    stdout_truncated = result.stdout_truncated
+                    stdout_error = (
+                        "stdout_capture_error"
+                        if result.stdout_error is not None
+                        else None
+                    )
+                    stream_capture_error = (
+                        "stream_capture_error"
+                        if result.stream_capture_error is not None
+                        else None
+                    )
+                    if snapshot_failed["stdout"]:
+                        stream_capture_error = "stdout_snapshot_unavailable"
+                    status = result.status
+                    duration_ms = result.duration_ms
+                    if result.orchestration_error is not None:
+                        orchestration_error = "orchestration_error"
+                receipt_id = _record_id("RCPT", run_id, "result")
+                stdout_artifact = artifact_records["stdout"]
+                stderr_artifact = artifact_records["stderr"]
+                receipt_metadata = PwnCrashReceiptMetadata(
+                    ordinal=ordinal,
+                    receipt_id=receipt_id,
+                    run_id=run_id,
+                    outcome=outcome,
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    clean_workspace=True,
+                    one_shot=PWN_CRASH_ONE_SHOT,
+                    sandbox_method=PWN_CRASH_SANDBOX_METHOD,
+                    network=PWN_CRASH_NETWORK_POLICY,
+                    configuration_epoch=recipe.configuration_epoch,
+                    image_digest=recipe.image_digest,
+                    recipe_sha256=recipe.recipe_sha256,
+                    request_sha256=request_sha256,
+                    execution_contract_sha256=(
+                        execution_contract_sha256
+                    ),
+                    capability_attestation_artifact_id=(
+                        capability_artifact.id
+                    ),
+                    capability_attestation_sha256=(
+                        capability_artifact.sha256
+                    ),
+                    producer_capability_name=(
+                        PWN_CRASH_PRODUCER_CAPABILITY_NAME
+                    ),
+                    producer_file_sha256=(
+                        recipe.producer_file_sha256
+                    ),
+                    stdout_artifact_id=stdout_artifact.id,
+                    stdout_artifact_sha256=stdout_artifact.sha256,
+                    stdout_artifact_size_bytes=stdout_artifact.size,
+                    stdout_drained_bytes=stdout_bytes,
+                    stdout_stored_bytes=stdout_stored,
+                    stdout_capture_complete=stdout_capture_complete,
+                    stdout_truncation_known=stdout_truncation_known,
+                    stdout_truncated=stdout_truncated,
+                    stdout_error=stdout_error,
+                    stream_capture_error=stream_capture_error,
+                    orchestration_error=orchestration_error,
+                    durable_stdout_artifact_complete=(
+                        not snapshot_failed["stdout"]
+                        and stdout_artifact.size == stdout_bytes
+                        and stdout_artifact.size == stdout_stored
+                    ),
+                )
+                pwn_record = {
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "request_sha256": request_sha256,
+                    "execution_contract": copy.deepcopy(
+                        execution_contract
+                    ),
+                    "execution_contract_sha256": (
+                        execution_contract_sha256
+                    ),
+                    "ordinal": ordinal,
+                    "phase": binding["phase"],
+                    "input_sha256": binding["input_sha256"],
+                    "input_size_bytes": binding["input_size_bytes"],
+                    "receipt": receipt_metadata.to_dict(),
+                }
+                run_reference = RunReference(
+                    id=run_id,
+                    base_revision=latest.revision,
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if timed_out
+                        else RunStatus.COMPLETED
+                        if outcome == "succeeded"
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="pwn_crash_gate",
+                    origin=RunOrigin.MANAGED_TOOL,
+                    session_id=source_run.session_id,
+                    cycle_id=source_run.cycle_id,
+                    wave_id=source_run.wave_id,
+                    configuration_epoch=recipe.configuration_epoch,
+                    extra={
+                        "experiment_id": experiment_id,
+                        "pwn_crash": copy.deepcopy(pwn_record),
+                    },
+                )
+                receipt = ExecutionReceipt(
+                    id=receipt_id,
+                    experiment_id=experiment_id,
+                    run_id=run_id,
+                    outcome=(
+                        ReceiptOutcome.TIMED_OUT
+                        if timed_out
+                        else ReceiptOutcome.SUCCEEDED
+                        if outcome == "succeeded"
+                        else ReceiptOutcome.FAILED
+                    ),
+                    exit_code=exit_code,
+                    wall_seconds=elapsed,
+                    stdout_artifact_id=stdout_artifact.id,
+                    stderr_artifact_id=stderr_artifact.id,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    stdout_lines=0,
+                    stderr_lines=0,
+                    preview=(
+                        f"Pwn crash gate attempt {ordinal}/6; "
+                        f"producer_exit={exit_code}; capture="
+                        f"{'complete' if stdout_capture_complete else 'invalid'}"
+                    )[:160],
+                    extra={
+                        "pwn_crash": copy.deepcopy(pwn_record),
+                    },
+                )
+                attempt = _PwnCrashAttemptEvidence(
+                    ordinal=ordinal,
+                    phase=str(binding["phase"]),
+                    input_sha256=str(binding["input_sha256"]),
+                    input_size_bytes=int(binding["input_size_bytes"]),
+                    run=run_reference,
+                    receipt=receipt,
+                    receipt_metadata=receipt_metadata,
+                    stdout_artifact=stdout_artifact,
+                    stderr_artifact=stderr_artifact,
+                    stdout_payload=stream_payloads["stdout"],
+                    execution_contract=copy.deepcopy(
+                        execution_contract
+                    ),
+                    execution_contract_sha256=(
+                        execution_contract_sha256
+                    ),
+                    request_sha256=request_sha256,
+                )
+                attempts.append(attempt)
+                self.store.write_run_result(
+                    identity,
+                    None,
+                    None,
+                    run_id,
+                    {
+                        "status": status,
+                        "exit_code": exit_code,
+                        "timed_out": timed_out,
+                        "duration_ms": duration_ms,
+                        "pwn_crash": copy.deepcopy(pwn_record),
+                        "artifacts": [
+                            stdout_artifact.to_dict(),
+                            stderr_artifact.to_dict(),
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    {
+                        "ok": outcome == "succeeded",
+                        "pwn_crash": copy.deepcopy(pwn_record),
+                        "errors": (
+                            []
+                            if outcome == "succeeded"
+                            else ["producer_transport_failed"]
+                        ),
+                    },
+                )
+
+            self._require_before_hard_deadline(
+                gate_deadline_monotonic,
+                "Pwn crash semantic evaluation",
+            )
+            evaluation = evaluate_pwn_crash_gate(
+                recipe,
+                poc_input=poc_input,
+                stdout_payloads=tuple(
+                    item.stdout_payload for item in attempts
+                ),
+                receipts=tuple(
+                    item.receipt_metadata for item in attempts
+                ),
+            )
+            evaluation.canonical_bytes()
+            verdict = evaluation.verdict
+            reason_code = evaluation.reason_code
+            evaluated_at = utc_now()
+            run_ids = [item.run.id for item in attempts]
+            receipt_ids = [item.receipt.id for item in attempts]
+            stdout_artifact_ids = [
+                item.stdout_artifact.id for item in attempts
+            ]
+            result_payload = {
+                "pwn_crash_evidence": {
+                    "schema_version": 1,
+                    "protocol": PWN_CRASH_V1_PROTOCOL,
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "evaluated_at": evaluated_at,
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.evidence_sha256,
+                    "attempts": [
+                        {
+                            "ordinal": attempt.ordinal,
+                            "run_id": attempt.run.id,
+                            "receipt_id": attempt.receipt.id,
+                            "stdout_artifact_id": (
+                                attempt.stdout_artifact.id
+                            ),
+                        }
+                        for attempt in attempts
+                    ],
+                }
+            }
+            guarded_states: list[ChallengeState] = []
+
+            def finish(state: ChallengeState) -> None:
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    "Pwn crash canonical state reduction",
+                )
+                self._require_model_work_allowed(
+                    state,
+                    automated=automated,
+                )
+                if live_only:
+                    self._require_live_mutation_allowed(state)
+                item = next(
+                    value
+                    for value in state.experiments
+                    if value.id == experiment_id
+                )
+                rebuilt, _payload, _primary = (
+                    self._pwn_crash_recipe_for_request(
+                        state,
+                        item,
+                        required_status=ExperimentStatus.RUNNING,
+                    )
+                )
+                if rebuilt != recipe:
+                    raise EngineError(
+                        "Pwn crash recipe changed before result commit"
+                    )
+                # Preserve the exact pre-promotion state for the two external
+                # commit guards.  The proposed terminal state intentionally
+                # has six additional evidence chains and is validated by the
+                # canonical model after this mutator returns.
+                guarded_states.append(copy.deepcopy(state))
+                item.status = (
+                    ExperimentStatus.KEPT
+                    if verdict is PwnCrashV1Verdict.CONFIRMED
+                    else ExperimentStatus.INCONCLUSIVE
+                    if verdict is PwnCrashV1Verdict.INCONCLUSIVE
+                    else ExperimentStatus.FAILED
+                )
+                item.result = copy.deepcopy(result_payload)
+                item.evaluation_reason = (
+                    f"pwn_crash:{verdict.value}:{reason_code}"
+                )[:512]
+                item.evaluated_at = evaluated_at
+                item.evidence_run_ids = list(run_ids)
+                item.evidence_receipt_ids = list(receipt_ids)
+                item.artifact_ids = list(
+                    dict.fromkeys(
+                        [
+                            *item.artifact_ids,
+                            *stdout_artifact_ids,
+                        ]
+                    )
+                )
+                state.runs.extend(item.run for item in attempts)
+                state.receipts.extend(item.receipt for item in attempts)
+                state.artifacts.append(capability_artifact)
+                state.artifacts.extend(
+                    artifact
+                    for attempt in attempts
+                    for artifact in (
+                        attempt.stdout_artifact,
+                        attempt.stderr_artifact,
+                    )
+                )
+                existing_candidate_values = {
+                    candidate.value for candidate in state.candidates
+                }
+                for index, (
+                    detected,
+                    candidate_run_id,
+                ) in enumerate(detected_pwn_flags, start=1):
+                    if detected.value in existing_candidate_values:
+                        continue
+                    state.candidates.append(
+                        FlagCandidate(
+                            id=_record_id(
+                                "C",
+                                candidate_run_id,
+                                f"pwn-crash-{index}",
+                            ),
+                            value=detected.value,
+                            status=(
+                                CandidateStatus.OBSERVED_CANDIDATE
+                            ),
+                            source_run_id=candidate_run_id,
+                            locator=detected.source,
+                            created_at=detected.observed_at,
+                            tier=flag_policy.tier_for(detected.value),
+                            format_epoch=(
+                                flag_policy.configuration_epoch
+                            ),
+                        )
+                    )
+                    existing_candidate_values.add(detected.value)
+                if verdict is PwnCrashV1Verdict.CONFIRMED:
+                    hypothesis = next(
+                        value
+                        for value in state.hypotheses
+                        if value.id == recipe.hypothesis_id
+                    )
+                    hypothesis.status = HypothesisStatus.SUPPORTED
+                    hypothesis.refuted_by = None
+                    hypothesis.evidence_run_ids = list(
+                        dict.fromkeys(
+                            [*hypothesis.evidence_run_ids, *run_ids]
+                        )
+                    )
+                    hypothesis.evidence_receipt_ids = list(
+                        dict.fromkeys(
+                            [
+                                *hypothesis.evidence_receipt_ids,
+                                *receipt_ids,
+                            ]
+                        )
+                    )
+                    hypothesis.evidence_artifact_ids = list(
+                        dict.fromkeys(
+                            [
+                                *hypothesis.evidence_artifact_ids,
+                                *stdout_artifact_ids,
+                            ]
+                        )
+                    )
+                elapsed = max(0, int(time.monotonic() - started_gate))
+                state.budget.spent_seconds += elapsed
+
+            def guard(*, probe_capability: bool) -> None:
+                if len(guarded_states) != 1:
+                    raise EngineError(
+                        "Pwn crash commit guard state is unavailable"
+                    )
+                self._require_pwn_crash_external_pins(
+                    guarded_states[0],
+                    experiment_id,
+                    recipe,
+                    source_snapshot_root=challenge_root,
+                    workspace=workspace,
+                    payload_input=payload_input,
+                    control_input=control_input,
+                    capability_attestation=capability_attestation,
+                    capability_artifact=capability_artifact,
+                    attempts=attempts,
+                    probe_capability=probe_capability,
+                    deadline_monotonic_seconds=(
+                        gate_deadline_monotonic
+                    ),
+                    automated=automated,
+                    live_only=live_only,
+                )
+
+            committed_state = self.store.update(
+                identity,
+                finish,
+                commit_guard=lambda: guard(probe_capability=True),
+                pre_replace_guard=lambda: guard(
+                    probe_capability=False
+                ),
+            )
+            committed = True
+            try:
+                self.store.clear_candidate_intents(
+                    identity,
+                    tuple(
+                        detected.value
+                        for detected, _run_id_value in detected_pwn_flags
+                    ),
+                )
+            except Exception as cleanup_error:
+                print(
+                    "warning: Pwn crash candidate intent cleanup failed "
+                    f"after canonical commit: {cleanup_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except BaseException as error:
+            active_error = error
+            if not isinstance(error, Exception):
+                self._terminalize_pwn_crash_interruption(
+                    identity,
+                    experiment_id,
+                    error,
+                    live_only=live_only,
+                )
+            raise
+        finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            if not committed:
+                try:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        pending_artifacts,
+                        cause=active_error,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(("artifacts", cleanup_error))
+                try:
+                    self._cleanup_uncommitted_pwn_crash_runs(
+                        identity,
+                        planned_run_ids,
+                        cause=active_error,
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(("runs", cleanup_error))
+            for label, staging in (
+                ("inputs", input_staging),
+                ("source", source_staging),
+            ):
+                if staging is None:
+                    continue
+                try:
+                    staging.cleanup()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append((label, cleanup_error))
+            if cleanup_errors:
+                if active_error is not None:
+                    for label, cleanup_error in cleanup_errors:
+                        active_error.add_note(
+                            "Pwn crash "
+                            f"{label} cleanup failed: {cleanup_error}"
+                        )
+                    control_error = next(
+                        (
+                            cleanup_error
+                            for _label, cleanup_error in cleanup_errors
+                            if not isinstance(cleanup_error, Exception)
+                        ),
+                        None,
+                    )
+                    if (
+                        control_error is not None
+                        and isinstance(active_error, Exception)
+                    ):
+                        control_error.add_note(
+                            "Pwn crash execution also failed before "
+                            f"cleanup: {active_error}"
+                        )
+                        self._terminalize_pwn_crash_interruption(
+                            identity,
+                            experiment_id,
+                            control_error,
+                            live_only=live_only,
+                        )
+                        raise control_error
+                elif committed:
+                    for label, cleanup_error in cleanup_errors:
+                        print(
+                            "warning: committed Pwn crash "
+                            f"{label} cleanup failed: {cleanup_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    control_error = next(
+                        (
+                            cleanup_error
+                            for _label, cleanup_error in cleanup_errors
+                            if not isinstance(cleanup_error, Exception)
+                        ),
+                        None,
+                    )
+                    if control_error is not None:
+                        control_error.add_note(
+                            "Pwn crash terminal outcome was committed "
+                            "before cleanup was interrupted"
+                        )
+                        raise control_error
+                else:
+                    label, cleanup_error = cleanup_errors[0]
+                    raise EngineError(
+                        f"Pwn crash {label} cleanup failed"
+                    ) from cleanup_error
+        if committed_state is None:
+            raise EngineError(
+                "Pwn crash gate did not produce canonical terminal state"
+            )
+        return committed_state
+
     def execute_registered_experiments(
         self,
         identity: ChallengeIdentity,
@@ -7932,6 +9860,31 @@ class ChallengeEngine:
                 automated=_automated,
             )
             self._remaining_budget_seconds(state)
+        elif (
+            str(get_adapter(state.category).name) == "pwn"
+            and any(
+                experiment.status is ExperimentStatus.REGISTERED
+                and (
+                    experiment.command == _PWN_CRASH_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_CRASH_ENGINE_EXECUTOR
+                )
+                and (
+                    not selected_ids
+                    or experiment.id in selected_ids
+                )
+                for experiment in state.experiments
+            )
+        ):
+            # The recipe is minted only after a fresh immutable-input
+            # inventory.  The model registration deliberately does not bind
+            # source bytes, image, command, signals, or the repetition plan.
+            state = self.refresh_ingest(identity)
+            self._require_model_work_allowed(
+                state,
+                automated=_automated,
+            )
+            self._remaining_budget_seconds(state)
         pending = [
             experiment
             for experiment in state.experiments
@@ -7986,6 +9939,49 @@ class ChallengeEngine:
             )
             self._remaining_budget_seconds(latest_before_start)
             first_new_flag = len(detected_flags)
+            if (
+                experiment.command == _PWN_CRASH_ENGINE_COMMAND
+                or experiment.extra.get("engine_executor")
+                == _PWN_CRASH_ENGINE_EXECUTOR
+            ):
+                try:
+                    state = self._execute_pwn_crash_differential(
+                        identity,
+                        experiment.id,
+                        automated=_automated,
+                        live_only=_live_only,
+                    )
+                except Exception as error:
+                    latest_after_error = self.store.load(
+                        identity,
+                        recover=False,
+                    )
+                    current_item = next(
+                        item
+                        for item in latest_after_error.experiments
+                        if item.id == experiment.id
+                    )
+                    if current_item.status in {
+                        ExperimentStatus.REGISTERED,
+                        ExperimentStatus.RUNNING,
+                    }:
+                        state = self._finish_tool_failure(
+                            identity,
+                            experiment.id,
+                            f"Pwn crash gate failed closed: {error}",
+                            _live_only=_live_only,
+                        )
+                    else:
+                        # A cleanup/reporting exception after the atomic
+                        # terminal commit must never double-finalize the gate.
+                        state = latest_after_error
+                        print(
+                            "warning: Pwn crash raised after its canonical "
+                            f"terminal commit: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                continue
             execution_workspace = (
                 self._managed_action_workspace(
                     latest_before_start,
@@ -14456,6 +16452,24 @@ class ChallengeEngine:
                     experiment.extra["orphan_recovered_at"] = recovered_at
                     experiment.extra["orphan_recovery"] = (
                         "retryable_without_canonical_outcome"
+                    )
+                    continue
+                if (
+                    experiment.command == _PWN_CRASH_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_CRASH_ENGINE_EXECUTOR
+                ):
+                    experiment.status = ExperimentStatus.FAILED
+                    experiment.result = {
+                        "error": (
+                            "Pwn crash gate failed closed: orphaned "
+                            "execution recovered after the previous "
+                            "session owner exited"
+                        )
+                    }
+                    experiment.extra["orphan_recovered_at"] = recovered_at
+                    experiment.extra["orphan_recovery"] = (
+                        "failed_closed_without_canonical_evidence"
                     )
                     continue
                 experiment.status = ExperimentStatus.FAILED

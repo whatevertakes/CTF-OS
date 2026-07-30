@@ -5352,7 +5352,23 @@ def _pwn_crash_execution_contract_errors(
     ):
         return [f"{label} execution contract hash does not match"]
 
+    gate = value.get("gate")
     sandbox = value.get("sandbox")
+    gate_deadline = (
+        gate.get("deadline_epoch_seconds")
+        if type(gate) is dict
+        else None
+    )
+    if (
+        type(gate) is not dict
+        or set(gate)
+        != {"timeout_seconds", "deadline_epoch_seconds"}
+        or gate.get("timeout_seconds") != experiment.timeout_seconds
+        or type(gate_deadline) not in {int, float}
+        or not math.isfinite(float(gate_deadline))
+        or float(gate_deadline) <= 0
+    ):
+        return [f"{label} gate deadline binding is invalid"]
     outer_timeout = (
         sandbox.get("outer_timeout_seconds")
         if type(sandbox) is dict
@@ -5386,6 +5402,10 @@ def _pwn_crash_execution_contract_errors(
             "protocol": PWN_CRASH_V1_PROTOCOL,
             "recipe_sha256": recipe.recipe_sha256,
             "configuration_epoch": recipe.configuration_epoch,
+            "gate": {
+                "timeout_seconds": experiment.timeout_seconds,
+                "deadline_epoch_seconds": gate_deadline,
+            },
             "attempt": {
                 "ordinal": ordinal,
                 "phase": binding["phase"],
@@ -5469,6 +5489,7 @@ def _pwn_crash_attempt_graph_errors(
     seen_stdout: set[str] = set()
     seen_requests: set[str] = set()
     seen_execution_contracts: set[str] = set()
+    shared_gate_binding: Mapping[str, Any] | None = None
 
     try:
         from ctf_os.engine.pwn_crash import (  # local: avoids cycle
@@ -5608,6 +5629,19 @@ def _pwn_crash_attempt_graph_errors(
                 capability_sha256=current_capability_sha256,
             )
         )
+        execution_contract = pwn_record.get("execution_contract")
+        current_gate_binding = (
+            execution_contract.get("gate")
+            if type(execution_contract) is dict
+            else None
+        )
+        if type(current_gate_binding) is dict:
+            if shared_gate_binding is None:
+                shared_gate_binding = dict(current_gate_binding)
+            elif current_gate_binding != shared_gate_binding:
+                errors.append(
+                    f"{attempt_label} changed the shared gate deadline"
+                )
 
         if (
             run.origin is not RunOrigin.MANAGED_TOOL
