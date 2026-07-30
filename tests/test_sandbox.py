@@ -47,6 +47,7 @@ from ctf_os.sandbox.files import (
     copy_bounded_regular,
     measure_work_tree,
     read_bounded_regular,
+    read_regular_prefix,
 )
 from ctf_os.sandbox.types import (
     BackgroundJobUnsupported,
@@ -3151,6 +3152,97 @@ class SandboxTests(unittest.TestCase):
                 expected_sha256="0" * 64,
                 expected_size=len(payload),
             )
+
+    def test_prefix_read_is_exact_bounded_and_nofollow(self) -> None:
+        source_root = self.root / "prefix-read-source"
+        nested = source_root / "nested"
+        nested.mkdir(parents=True)
+        payload = bytes(range(256)) * 32
+        source = nested / "source.bin"
+        source.write_bytes(payload)
+
+        self.assertEqual(
+            read_regular_prefix(
+                source_root,
+                "nested/source.bin",
+                maximum_prefix_bytes=4096,
+                expected_size=len(payload),
+            ),
+            payload[:4096],
+        )
+        self.assertEqual(
+            read_regular_prefix(
+                source_root,
+                "nested/source.bin",
+                maximum_prefix_bytes=len(payload) * 2,
+                expected_size=len(payload),
+            ),
+            payload,
+        )
+        empty = source_root / "empty.bin"
+        empty.write_bytes(b"")
+        self.assertEqual(
+            read_regular_prefix(
+                source_root,
+                "empty.bin",
+                maximum_prefix_bytes=4096,
+                expected_size=0,
+            ),
+            b"",
+        )
+        with self.assertRaisesRegex(SafeFileError, "size.*binding"):
+            read_regular_prefix(
+                source_root,
+                "nested/source.bin",
+                maximum_prefix_bytes=4096,
+                expected_size=len(payload) + 1,
+            )
+        outside = self.root / "prefix-read-outside.bin"
+        outside.write_bytes(b"outside")
+        (source_root / "link.bin").symlink_to(outside)
+        with self.assertRaisesRegex(SafeFileError, "safely|regular"):
+            read_regular_prefix(
+                source_root,
+                "link.bin",
+                maximum_prefix_bytes=4096,
+                expected_size=len(b"outside"),
+            )
+
+    def test_prefix_read_rejects_same_size_mutation(self) -> None:
+        source_root = self.root / "prefix-read-race"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        original = b"A" * 8192
+        source.write_bytes(original)
+        real_read = sandbox_files.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor, size):
+            nonlocal mutated
+            block = real_read(descriptor, size)
+            if block and not mutated:
+                mutated = True
+                source.write_bytes(b"B" * len(original))
+            return block
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "read",
+                side_effect=mutate_after_read,
+            ),
+            self.assertRaisesRegex(
+                SafeFileError,
+                "changed while reading",
+            ),
+        ):
+            read_regular_prefix(
+                source_root,
+                source.name,
+                maximum_prefix_bytes=4096,
+                expected_size=len(original),
+            )
+        self.assertTrue(mutated)
 
     def test_bounded_read_rejects_symlinks_and_non_regular_files(
         self,

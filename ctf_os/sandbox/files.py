@@ -702,6 +702,91 @@ def read_bounded_regular(
         )
 
 
+def read_regular_prefix(
+    root: Path,
+    locator: str,
+    *,
+    maximum_prefix_bytes: int,
+    expected_size: int,
+) -> bytes:
+    """Read an exact regular-file prefix through a no-follow descriptor path.
+
+    This is intended for cheap probes after a separate full-file inventory.
+    It binds the file size and mutation-sensitive descriptor metadata, but it
+    deliberately does not claim to revalidate bytes beyond the returned
+    prefix.  Callers that need full-content authority must also bind a fresh
+    full inventory or use :func:`read_bounded_regular`.
+    """
+
+    _validate_maximum_bytes(maximum_prefix_bytes)
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+        or expected_size > (1 << 47)
+    ):
+        raise ValueError("expected_size is outside the prefix read bound")
+
+    source_descriptor: int | None = None
+    owned_source_descriptors: _OwnedDescriptors = {}
+    payload = bytearray()
+    expected_prefix_size = min(expected_size, maximum_prefix_bytes)
+    try:
+        source_descriptor, before, _normalized = _open_relative_regular(
+            root,
+            locator,
+            maximum_bytes=max(1, expected_size),
+            owned_source_descriptors=owned_source_descriptors,
+        )
+        if before.st_size != expected_size:
+            raise SafeFileError(
+                "prefix source size does not match its expected binding"
+            )
+        while len(payload) < expected_prefix_size:
+            block = os.read(
+                source_descriptor,
+                expected_prefix_size - len(payload),
+            )
+            if not block:
+                raise SafeFileError(
+                    "prefix source ended before its expected prefix"
+                )
+            payload.extend(block)
+
+        after = os.fstat(source_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(after, field) != getattr(before, field)
+            for field in stable_fields
+        ):
+            raise SafeFileError("prefix source changed while reading")
+        if len(payload) != expected_prefix_size:
+            raise SafeFileError(
+                "prefix source length does not match its expected binding"
+            )
+        return bytes(payload)
+    except OSError as error:
+        raise SafeFileError("prefix source read failed") from error
+    finally:
+        active_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            _close_owned_descriptors(owned_source_descriptors)
+        except BaseException as error:
+            cleanup_errors.append(("source descriptor", error))
+        _resolve_cleanup_errors(
+            active_error,
+            cleanup_errors,
+            context="prefix source read",
+        )
+
+
 def copy_bounded_regular(
     source_root: Path,
     source_locator: str,
