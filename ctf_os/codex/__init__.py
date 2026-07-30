@@ -4,6 +4,8 @@ from .commands import (
     BatchCommandBuilder,
     BatchInvocation,
     BuiltCommand,
+    LIVE_FULL_SCAFFOLD,
+    LIVE_THIN_SCAFFOLD,
     LiveCommandBuilder,
     LiveSession,
 )
@@ -67,6 +69,8 @@ __all__ = [
     "FlagDetector",
     "FlagNotificationError",
     "LimiterSnapshot",
+    "LIVE_FULL_SCAFFOLD",
+    "LIVE_THIN_SCAFFOLD",
     "LiveCommandBuilder",
     "LiveSession",
     "ModelCallLimitTimeout",
