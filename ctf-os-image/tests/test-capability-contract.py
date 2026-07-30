@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import pathlib
 import re
+import runpy
+import tempfile
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -112,8 +115,83 @@ ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2
 assert {
     item["name"] for item in managed_manifest["capabilities"]
-} == {"convert", "sqlite_readonly", "z3", "ortools", "angr_python"}
+} == {
+    "convert",
+    "sqlite_readonly",
+    "z3",
+    "ortools",
+    "angr_python",
+    "rev_inventory_v2",
+    "rev_safe_output",
+    "rev_stdin_exec",
+}
+rev_attestations = {
+    item["name"]: item
+    for item in managed_manifest["capabilities"]
+    if item["name"]
+    in {"rev_inventory_v2", "rev_safe_output", "rev_stdin_exec"}
+}
+expected_rev_attestations = {
+    "rev_inventory_v2": {
+        "path": "/opt/ctf-templates/rev/inventory_v2.py",
+        "source": REPO_ROOT / "templates" / "rev" / "inventory_v2.py",
+        "contract_id": "ctfos.rev.inventory",
+        "contract_version": 2,
+    },
+    "rev_stdin_exec": {
+        "path": "/opt/ctf-templates/rev/stdin_exec.py",
+        "source": REPO_ROOT / "templates" / "rev" / "stdin_exec.py",
+        "contract_id": "ctfos.rev.stdin_exec",
+        "contract_version": 1,
+    },
+    "rev_safe_output": {
+        "path": "/opt/ctf-templates/rev/safe_output.py",
+        "source": REPO_ROOT / "templates" / "rev" / "safe_output.py",
+        "contract_id": "ctfos.rev.safe_output",
+        "contract_version": 1,
+    },
+}
+probe_namespace = runpy.run_path(
+    str(REPO_ROOT / "scripts" / "ctf-capabilities"),
+    run_name="ctf_capabilities_under_test",
+)
+probe_file = probe_namespace["_probe"]
+for name, expected in expected_rev_attestations.items():
+    record = rev_attestations[name]
+    assert record["kind"] == "file_sha256"
+    assert record["path"] == expected["path"]
+    assert record["attestation_schema_version"] == 1
+    assert record["contract_id"] == expected["contract_id"]
+    assert record["contract_version"] == expected["contract_version"]
+    source = expected["source"]
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert record["sha256"] == source_sha256
+    local_record = dict(record)
+    local_record["path"] = str(source)
+    observation = probe_file(local_record)
+    assert observation["available"] is True
+    assert observation["attestation"] == {
+        "schema_version": 1,
+        "contract_id": expected["contract_id"],
+        "contract_version": expected["contract_version"],
+        "path": str(source),
+        "sha256": source_sha256,
+    }
+
+with tempfile.TemporaryDirectory() as temporary:
+    changed = pathlib.Path(temporary) / "inventory_v2.py"
+    inventory = expected_rev_attestations["rev_inventory_v2"]["source"]
+    changed.write_bytes(inventory.read_bytes() + b"\n")
+    changed_record = dict(rev_attestations["rev_inventory_v2"])
+    changed_record["path"] = str(changed)
+    changed_observation = probe_file(changed_record)
+    assert changed_observation["available"] is False
+    assert (
+        changed_observation["attestation"]["sha256"]
+        != changed_record["sha256"]
+    )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
+assert "(.capabilities | length == 8)" in dockerfile
 assert "--network" not in managed_probe_source
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source

@@ -30,6 +30,33 @@
       "kind": "python_module",
       "command": "/opt/venvs/angr/bin/python",
       "module": "angr"
+    },
+    {
+      "name": "rev_inventory_v2",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/rev/inventory_v2.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.rev.inventory",
+      "contract_version": 2,
+      "sha256": "782d41566f3a288b458ae3fdbb04a0684f281158b14286739ea3cc1ecc39daee"
+    },
+    {
+      "name": "rev_safe_output",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/rev/safe_output.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.rev.safe_output",
+      "contract_version": 1,
+      "sha256": "24fbff27464dc2ff12a754831ec87a1a8e9a0ffb4dde790bb738f83d97852951"
+    },
+    {
+      "name": "rev_stdin_exec",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/rev/stdin_exec.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.rev.stdin_exec",
+      "contract_version": 1,
+      "sha256": "036edb158461aa32c6688a7f33f3d523f593202409b62377288c8c8e54b45610"
     }
   ]
 }

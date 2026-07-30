@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -14,6 +16,8 @@ from typing import Any
 
 MANIFEST = Path("/tools/capabilities.json")
 MAX_BYTES = 256 * 1024
+MAX_ATTESTED_FILE_BYTES = 4 * 1024 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class CapabilityProbeError(RuntimeError):
@@ -51,11 +55,20 @@ def _load() -> dict[str, Any]:
 
 
 def _probe(record: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise CapabilityProbeError("capability record must be an object")
     name = record.get("name")
     kind = record.get("kind")
+    if not isinstance(name, str) or not name:
+        raise CapabilityProbeError("capability requires name")
+    if kind == "file_sha256":
+        return _probe_file_sha256(name, record)
+
     command = record.get("command")
-    if not isinstance(name, str) or not isinstance(command, str):
-        raise CapabilityProbeError("capability requires name and command")
+    if not isinstance(command, str):
+        raise CapabilityProbeError(
+            f"capability {name} requires command"
+        )
     if not Path(command).is_file() or not os.access(command, os.X_OK):
         return {"name": name, "available": False}
     if kind == "command":
@@ -88,6 +101,100 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired):
         return {"name": name, "available": False}
     return {"name": name, "available": result.returncode == 0}
+
+
+def _probe_file_sha256(
+    name: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    path = record.get("path")
+    schema_version = record.get("attestation_schema_version")
+    contract_id = record.get("contract_id")
+    contract_version = record.get("contract_version")
+    expected_sha256 = record.get("sha256")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or "\x00" in path
+        or ".." in Path(path).parts
+        or type(schema_version) is not int
+        or schema_version != 1
+        or not isinstance(contract_id, str)
+        or not contract_id
+        or type(contract_version) is not int
+        or contract_version < 1
+        or not isinstance(expected_sha256, str)
+        or _SHA256.fullmatch(expected_sha256) is None
+    ):
+        raise CapabilityProbeError(
+            f"invalid file attestation for {name}"
+        )
+
+    actual_sha256 = _stable_regular_file_sha256(path)
+    output: dict[str, Any] = {
+        "name": name,
+        "available": actual_sha256 == expected_sha256,
+    }
+    if actual_sha256 is not None:
+        output["attestation"] = {
+            "schema_version": schema_version,
+            "contract_id": contract_id,
+            "contract_version": contract_version,
+            "path": path,
+            "sha256": actual_sha256,
+        }
+    return output
+
+
+def _stable_regular_file_sha256(path: str) -> str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        return None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags | nofollow)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink < 1
+            or not 0 <= before.st_size <= MAX_ATTESTED_FILE_BYTES
+        ):
+            return None
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            return None
+        after = os.fstat(descriptor)
+        identity = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in identity
+        ):
+            return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def main() -> int:

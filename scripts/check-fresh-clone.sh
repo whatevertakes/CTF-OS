@@ -49,6 +49,9 @@ required=(
   ctf-os-image/scripts/entrypoint.sh
   ctf-os-image/scripts/gen-manifest.sh
   ctf-os-image/templates/README.md
+  ctf-os-image/templates/rev/inventory_v2.py
+  ctf-os-image/templates/rev/safe_output.py
+  ctf-os-image/templates/rev/stdin_exec.py
   ctf-os-image/tests/test-capability-contract.py
   ctf-os-image/tests/test-rev-inventory.py
   ctf-os-image/tests/test-rev-stdin-exec.py

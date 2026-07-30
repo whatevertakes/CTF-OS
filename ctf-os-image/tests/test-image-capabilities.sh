@@ -26,6 +26,26 @@ jq -e '
     and all(.tools[]; .available == true and (.path | startswith("/")))
 ' /tools/manifest.json >/dev/null
 
+ctf-capabilities --json >"${test_root}/managed-capabilities.json"
+jq -e '
+    .schema_version == 2
+    and (.capabilities | length == 8)
+    and all(.capabilities[]; .available == true)
+    and all(
+        .capabilities[]
+        | select(
+            .name == "rev_inventory_v2"
+            or .name == "rev_safe_output"
+            or .name == "rev_stdin_exec"
+        );
+        .attestation.schema_version == 1
+        and (.attestation.contract_id | type == "string")
+        and (.attestation.contract_version | type == "number")
+        and (.attestation.path | startswith("/opt/ctf-templates/rev/"))
+        and (.attestation.sha256 | test("^[0-9a-f]{64}$"))
+    )
+' "${test_root}/managed-capabilities.json" >/dev/null
+
 required_tools=(
     bkcrack crypto-python ctf-browser evtxexport fls frida-trace hash_extender
     msoffcrypto-tool pahole pdfimages playwright pw-python qemu-img
