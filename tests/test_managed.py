@@ -5242,6 +5242,41 @@ class ManagedTypedGateTests(unittest.TestCase):
                 drop_if="primitive is absent",
             )
             action["parent_experiment_id"] = parent_id
+        if "oracle_preissue_id" in action:
+            state = engine.store.load(identity)
+            workspace = engine._workspace(state)
+            if category == "crypto":
+                (workspace / "operator-variant.json").write_text(
+                    '{"variant":1}\n',
+                    encoding="utf-8",
+                )
+                (workspace / "operator-expected.bin").write_bytes(
+                    b"operator-expected\n"
+                )
+                _state, record = (
+                    engine.preissue_managed_crypto_oracle(
+                        identity,
+                        variant_parameters_locator=(
+                            "operator-variant.json"
+                        ),
+                        variant_expected_output_locator=(
+                            "operator-expected.bin"
+                        ),
+                        mutation_id="operator-variant-1",
+                    )
+                )
+            else:
+                (workspace / "operator-verifier.py").write_text(
+                    "raise SystemExit(1)\n",
+                    encoding="utf-8",
+                )
+                _state, record = engine.preissue_managed_misc_oracle(
+                    identity,
+                    verifier_locator="operator-verifier.py",
+                    verifier_id="operator-verifier-v1",
+                    oracle_id="operator-oracle-v1",
+                )
+            action["oracle_preissue_id"] = record["preissue_id"]
 
         orchestrator = ManagedOrchestrator(
             engine,
@@ -5440,13 +5475,7 @@ class ManagedTypedGateTests(unittest.TestCase):
                     "original_parameters_artifact_path": (
                         "crypto/original.json"
                     ),
-                    "variant_parameters_artifact_path": (
-                        "crypto/variant.json"
-                    ),
-                    "variant_expected_output_artifact_path": (
-                        "crypto/expected.bin"
-                    ),
-                    "mutation_id": "variant-1",
+                    "oracle_preissue_id": "placeholder",
                     "runtime": "python",
                 },
             ),
@@ -5467,6 +5496,7 @@ class ManagedTypedGateTests(unittest.TestCase):
                     "description": "evaluate DAG",
                     "candidate_id": "placeholder",
                     "spec_artifact_path": "misc/spec.json",
+                    "oracle_preissue_id": "placeholder",
                 },
             ),
         )
@@ -5527,7 +5557,7 @@ class ManagedTypedGateTests(unittest.TestCase):
                     "managed_typed_gate_v1",
                 )
 
-    def test_crypto_and_misc_private_dispatch_reuse_session_lock(self):
+    def test_crypto_and_misc_private_dispatch_rejects_raw_oracle_bypass(self):
         cases = (
             ("crypto", "prove_crypto_metamorphic_candidate"),
             ("misc", "evaluate_misc_transform_candidate"),
@@ -5586,7 +5616,10 @@ class ManagedTypedGateTests(unittest.TestCase):
                         raised.exception,
                         SessionAlreadyRunning,
                     )
-                    self.assertIn("unknown candidate", str(raised.exception))
+                    self.assertIn(
+                        "preissue",
+                        str(raised.exception).lower(),
+                    )
                 finally:
                     lock.release()
 
@@ -5846,6 +5879,7 @@ class ManagedTypedGateTests(unittest.TestCase):
             "description": "evaluate DAG",
             "candidate_id": "placeholder",
             "spec_artifact_path": "misc/spec.json",
+            "oracle_preissue_id": "placeholder",
         }
         (
             engine,

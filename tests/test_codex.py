@@ -622,11 +622,7 @@ class ContractTests(unittest.TestCase):
                 "candidate_id": "C-crypto",
                 "solver_artifact_path": "crypto/solver.py",
                 "original_parameters_artifact_path": "crypto/original.json",
-                "variant_parameters_artifact_path": "crypto/variant.json",
-                "variant_expected_output_artifact_path": (
-                    "crypto/expected.bin"
-                ),
-                "mutation_id": "variant-1",
+                "oracle_preissue_id": "oracle-preissue-crypto-1",
                 "runtime": "python",
             },
             "prove_forensic_assertion": {
@@ -641,6 +637,7 @@ class ContractTests(unittest.TestCase):
                 "description": "Execute and reverse-check the transform DAG.",
                 "candidate_id": "C-misc",
                 "spec_artifact_path": "misc/spec.json",
+                "oracle_preissue_id": "oracle-preissue-misc-1",
             },
         }
         schema = role_output_schema(

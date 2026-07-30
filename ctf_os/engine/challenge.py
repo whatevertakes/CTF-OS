@@ -158,8 +158,26 @@ from ctf_os.engine.misc_execution import (
     MISC_EXECUTION_RUNTIME,
     MISC_EXECUTION_TRANSFORM_INTERFACE,
     MISC_EXECUTION_VERIFIER_INTERFACE,
+    MiscExecutionSpec,
     MiscExecutionSpecError,
+    MiscExecutionVerifier,
+    parse_misc_execution_dag_spec,
     parse_misc_execution_spec,
+)
+from ctf_os.engine.managed_oracle_preissue import (
+    MANAGED_ORACLE_PREISSUE_CRYPTO,
+    MANAGED_ORACLE_PREISSUE_MAX_HISTORY,
+    MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES,
+    MANAGED_ORACLE_PREISSUE_MISC,
+    MANAGED_ORACLE_PREISSUE_PROTOCOL,
+    MANAGED_ORACLE_PREISSUE_STATE_KEY,
+    ManagedOraclePreissueError,
+    ManagedOraclePreissueInput,
+    ManagedOraclePreissueManifest,
+    build_manifest as build_managed_oracle_preissue_manifest,
+    parse_manifest as parse_managed_oracle_preissue_manifest,
+    public_record as managed_oracle_preissue_public_record,
+    validate_public_record as validate_managed_oracle_preissue_public_record,
 )
 from ctf_os.engine.misc_transform import (
     MISC_TRANSFORM_PROTOCOL,
@@ -554,6 +572,12 @@ class _ProofInputPreparation:
     manifest_path: Path
     manifest_sha256: str
     created_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedOraclePreissueResolution:
+    manifest: ManagedOraclePreissueManifest
+    bindings: tuple[tuple[ArtifactReference, ProofRecipeInput], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -21241,6 +21265,581 @@ class ChallengeEngine:
                 preparation_error.add_note(str(cleanup_failure))
             raise
 
+    def preissue_managed_crypto_oracle(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        variant_parameters_locator: str,
+        variant_expected_output_locator: str,
+        mutation_id: str,
+    ) -> tuple[ChallengeState, Mapping[str, object]]:
+        """Snapshot an operator-only Crypto variant before a Builder runs."""
+
+        return self._preissue_managed_oracle(
+            identity,
+            kind=MANAGED_ORACLE_PREISSUE_CRYPTO,
+            input_locators=(
+                variant_parameters_locator,
+                variant_expected_output_locator,
+            ),
+            input_purposes=(
+                "variant_parameters",
+                "variant_expected_output",
+            ),
+            metadata={"mutation_id": mutation_id},
+        )
+
+    def preissue_managed_misc_oracle(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        verifier_locator: str,
+        verifier_id: str,
+        oracle_id: str,
+    ) -> tuple[ChallengeState, Mapping[str, object]]:
+        """Snapshot an operator-only Misc verifier before a Builder runs."""
+
+        return self._preissue_managed_oracle(
+            identity,
+            kind=MANAGED_ORACLE_PREISSUE_MISC,
+            input_locators=(verifier_locator,),
+            input_purposes=("verifier_tool",),
+            metadata={
+                "verifier_id": verifier_id,
+                "oracle_id": oracle_id,
+            },
+        )
+
+    def _preissue_managed_oracle(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        kind: str,
+        input_locators: Sequence[str],
+        input_purposes: Sequence[str],
+        metadata: Mapping[str, str],
+    ) -> tuple[ChallengeState, Mapping[str, object]]:
+        """Create one bounded private oracle bundle under operator authority."""
+
+        if (
+            len(input_locators) != len(input_purposes)
+            or len(set(input_locators)) != len(input_locators)
+        ):
+            raise EngineError(
+                "managed oracle inputs must be unique and purpose-complete"
+            )
+        paths = self.store.challenge_paths(identity)
+        try:
+            session_lock = ChallengeLock(
+                paths.runtime / "session.lock",
+                timeout=0,
+            ).acquire()
+        except LockTimeout as error:
+            raise SessionAlreadyRunning(
+                "managed oracle preissue must occur before the managed "
+                f"Builder session owns {identity.key}"
+            ) from error
+        artifacts: list[ArtifactReference] = []
+        committed = False
+        try:
+            self._recover_session_boundary(identity)
+            state = self.refresh_ingest(identity)
+            expected_category = (
+                "crypto"
+                if kind == MANAGED_ORACLE_PREISSUE_CRYPTO
+                else "misc"
+            )
+            if get_adapter(state.category).name != expected_category:
+                raise EngineError(
+                    f"managed {expected_category} oracle preissue requires "
+                    f"a {expected_category} challenge"
+                )
+            if state.schema_version < STATE_SCHEMA_VERSION:
+                raise EngineError(
+                    "managed oracle preissue requires the current state schema"
+                )
+            if state.primary_target_id is not None:
+                raise EngineError(
+                    "managed oracle preissue is local and network-denied"
+                )
+            if state.status in {
+                ChallengeStatus.NEW,
+                ChallengeStatus.PAUSED,
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+                ChallengeStatus.PROVING,
+                ChallengeStatus.READY_TO_SUBMIT,
+            }:
+                raise EngineError(
+                    "managed oracle preissue cannot start in "
+                    f"{state.status.value}"
+                )
+            source_manifest = state.metadata.get("source_manifest_sha256")
+            if (
+                type(source_manifest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", source_manifest) is None
+            ):
+                raise EngineError("source manifest is unavailable")
+            image_digest = self.config.runtime.image_digest
+            if (
+                type(image_digest) is not str
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None
+            ):
+                raise EngineError(
+                    "managed oracle preissue requires a digest-pinned image"
+                )
+            history = state.extra.get(
+                MANAGED_ORACLE_PREISSUE_STATE_KEY,
+                {},
+            )
+            if (
+                type(history) is not dict
+                or len(history) >= MANAGED_ORACLE_PREISSUE_MAX_HISTORY
+            ):
+                raise EngineError(
+                    "managed oracle preissue history is invalid or full"
+                )
+            preissue_id = _run_id("oracle-preissue")
+            issued_at = utc_now()
+            issue_revision = state.revision + 1
+            directory = ensure_private_directory(
+                paths.artifacts
+                / MANAGED_ORACLE_PREISSUE_PROTOCOL
+                / preissue_id
+            )
+            client = self.sandbox(state)
+            inputs: list[ManagedOraclePreissueInput] = []
+            for ordinal, (locator, purpose) in enumerate(
+                zip(input_locators, input_purposes, strict=True),
+                start=1,
+            ):
+                artifact_id = _record_id(
+                    "A",
+                    preissue_id,
+                    f"oracle-input-{ordinal:02d}",
+                )
+                snapshot = self._snapshot_workspace_file(
+                    state,
+                    client,
+                    locator,
+                    directory / f"input-{ordinal:02d}.bin",
+                )
+                if snapshot.size_bytes < 1:
+                    raise EngineError(
+                        "managed oracle inputs must be non-empty"
+                    )
+                artifact = ArtifactReference(
+                    id=artifact_id,
+                    path=snapshot.path.relative_to(paths.root).as_posix(),
+                    sha256=snapshot.sha256,
+                    size=snapshot.size_bytes,
+                    extra={
+                        "kind": "managed_oracle_preissue_input",
+                        "protocol": MANAGED_ORACLE_PREISSUE_PROTOCOL,
+                        "preissue_id": preissue_id,
+                        "purpose": purpose,
+                        "context_visibility": "engine_private",
+                    },
+                )
+                artifacts.append(artifact)
+                inputs.append(
+                    ManagedOraclePreissueInput(
+                        purpose=purpose,
+                        artifact_id=artifact.id,
+                        sha256=artifact.sha256,
+                        size_bytes=int(artifact.size or 0),
+                    )
+                )
+            try:
+                manifest = build_managed_oracle_preissue_manifest(
+                    preissue_id=preissue_id,
+                    kind=kind,
+                    issued_at=issued_at,
+                    issue_revision=issue_revision,
+                    configuration_epoch=state.configuration_epoch,
+                    source_manifest_sha256=source_manifest,
+                    image_digest=image_digest,
+                    seal_nonce=hashlib.sha256(os.urandom(32)).hexdigest(),
+                    metadata=metadata,
+                    inputs=inputs,
+                )
+            except ManagedOraclePreissueError as error:
+                raise EngineError(
+                    "managed oracle preissue metadata is invalid"
+                ) from error
+            manifest_path = directory / "manifest.json"
+            atomic_write_bytes(
+                manifest_path,
+                manifest.canonical_bytes,
+                mode=0o400,
+            )
+            manifest_artifact = ArtifactReference(
+                id=_record_id("A", preissue_id, "oracle-manifest"),
+                path=manifest_path.relative_to(paths.root).as_posix(),
+                sha256=manifest.sha256,
+                size=len(manifest.canonical_bytes),
+                extra={
+                    "kind": "managed_oracle_preissue_manifest",
+                    "protocol": MANAGED_ORACLE_PREISSUE_PROTOCOL,
+                    "preissue_id": preissue_id,
+                    "context_visibility": "engine_private",
+                },
+            )
+            artifacts.append(manifest_artifact)
+            record = managed_oracle_preissue_public_record(manifest)
+
+            def verify_snapshots() -> None:
+                if self.config.runtime.image_digest != image_digest:
+                    raise EngineError(
+                        "managed oracle image changed before preissue commit"
+                    )
+                current_inventory = inventory_challenge(
+                    self.challenge_input(identity)
+                )
+                if current_inventory.manifest_sha256 != source_manifest:
+                    raise EngineError(
+                        "incoming source changed before oracle preissue commit"
+                    )
+                for artifact in artifacts:
+                    read_bounded_regular(
+                        paths.root,
+                        artifact.path,
+                        maximum_bytes=max(int(artifact.size or 0), 1),
+                        expected_sha256=artifact.sha256,
+                        expected_size=int(artifact.size or 0),
+                    )
+
+            def commit_preissue(current: ChallengeState) -> None:
+                if (
+                    current.configuration_epoch != state.configuration_epoch
+                    or current.metadata.get("source_manifest_sha256")
+                    != source_manifest
+                ):
+                    raise EngineError(
+                        "managed oracle pins changed before preissue commit"
+                    )
+                current_history = current.extra.get(
+                    MANAGED_ORACLE_PREISSUE_STATE_KEY,
+                    {},
+                )
+                if (
+                    type(current_history) is not dict
+                    or len(current_history)
+                    >= MANAGED_ORACLE_PREISSUE_MAX_HISTORY
+                    or preissue_id in current_history
+                ):
+                    raise EngineError(
+                        "managed oracle preissue history changed"
+                    )
+                next_history = copy.deepcopy(current_history)
+                next_history[preissue_id] = dict(record)
+                current.extra[
+                    MANAGED_ORACLE_PREISSUE_STATE_KEY
+                ] = next_history
+                current.artifacts.extend(copy.deepcopy(artifacts))
+
+            try:
+                result = self.store.update(
+                    identity,
+                    commit_preissue,
+                    expected_revision=state.revision,
+                    commit_guard=verify_snapshots,
+                    pre_replace_guard=verify_snapshots,
+                )
+            except BaseException as error:
+                try:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        tuple(artifacts),
+                        cause=error,
+                    )
+                finally:
+                    artifacts.clear()
+                raise
+            committed = True
+            return result, dict(record)
+        finally:
+            session_lock.release()
+            if not committed and artifacts:
+                # The primary exception path above performs canonical-aware
+                # cleanup.  This handles failures before the state update.
+                try:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        tuple(artifacts),
+                    )
+                except Exception:
+                    if sys.exception() is None:
+                        raise
+
+    def _consume_managed_oracle_preissue(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        preissue_id: str,
+        expected_kind: str,
+        builder_run_id: str,
+        experiment_id: str,
+    ) -> _ManagedOraclePreissueResolution:
+        """Atomically consume and return one still-hidden canonical bundle."""
+
+        state = self.store.load(identity)
+        history = state.extra.get(MANAGED_ORACLE_PREISSUE_STATE_KEY)
+        if type(history) is not dict:
+            raise EngineError("managed oracle preissue is unavailable")
+        raw_record = history.get(preissue_id)
+        try:
+            record = validate_managed_oracle_preissue_public_record(
+                raw_record
+            )
+        except ManagedOraclePreissueError as error:
+            raise EngineError(
+                "managed oracle preissue record is invalid"
+            ) from error
+        if (
+            record["preissue_id"] != preissue_id
+            or record["kind"] != expected_kind
+            or record["status"] != "unused"
+            or record["configuration_epoch"] != state.configuration_epoch
+            or record["source_manifest_sha256"]
+            != state.metadata.get("source_manifest_sha256")
+            or record["image_digest"] != self.config.runtime.image_digest
+        ):
+            raise EngineError(
+                "managed oracle preissue is stale, rebound, or consumed"
+            )
+        builder_run = next(
+            (item for item in state.runs if item.id == builder_run_id),
+            None,
+        )
+        experiment = next(
+            (item for item in state.experiments if item.id == experiment_id),
+            None,
+        )
+        if (
+            builder_run is None
+            or builder_run.role != Role.BUILDER.value
+            or builder_run.origin is not RunOrigin.MANAGED_MODEL
+            or builder_run.status is not RunStatus.COMPLETED
+            or builder_run.base_revision < int(record["issue_revision"])
+            or experiment is None
+            or experiment.source_run_id != builder_run_id
+            or experiment.status is not ExperimentStatus.RUNNING
+        ):
+            raise EngineError(
+                "managed oracle was not issued before its Builder subject"
+            )
+        manifest_matches = [
+            artifact
+            for artifact in state.artifacts
+            if artifact.extra.get("kind")
+            == "managed_oracle_preissue_manifest"
+            and artifact.extra.get("protocol")
+            == MANAGED_ORACLE_PREISSUE_PROTOCOL
+            and artifact.extra.get("preissue_id") == preissue_id
+            and artifact.extra.get("context_visibility")
+            == "engine_private"
+        ]
+        if len(manifest_matches) != 1:
+            raise EngineError(
+                "managed oracle private manifest binding is invalid"
+            )
+        manifest_artifact = manifest_matches[0]
+        if (
+            manifest_artifact.sha256 != record["oracle_seal_sha256"]
+            or type(manifest_artifact.size) is not int
+            or not 1 <= manifest_artifact.size
+            <= MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES
+        ):
+            raise EngineError(
+                "managed oracle private manifest seal is invalid"
+            )
+        paths = self.store.challenge_paths(identity)
+
+        def read_manifest() -> ManagedOraclePreissueManifest:
+            try:
+                payload = read_bounded_regular(
+                    paths.root,
+                    manifest_artifact.path,
+                    maximum_bytes=MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES,
+                    expected_sha256=str(record["oracle_seal_sha256"]),
+                    expected_size=int(manifest_artifact.size or 0),
+                )
+                parsed = parse_managed_oracle_preissue_manifest(
+                    strict_json_loads(
+                        payload.decode("utf-8", errors="strict")
+                    )
+                )
+            except (
+                OSError,
+                UnicodeError,
+                SafeFileError,
+                StrictJSONError,
+                ManagedOraclePreissueError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "managed oracle private manifest changed"
+                ) from error
+            if payload != parsed.canonical_bytes:
+                raise EngineError(
+                    "managed oracle private manifest is not canonical"
+                )
+            return parsed
+
+        manifest = read_manifest()
+        if (
+            manifest.preissue_id != preissue_id
+            or manifest.kind != expected_kind
+            or manifest.issued_at != record["issued_at"]
+            or manifest.issue_revision != record["issue_revision"]
+            or manifest.configuration_epoch != state.configuration_epoch
+            or manifest.source_manifest_sha256
+            != state.metadata.get("source_manifest_sha256")
+            or manifest.image_digest != self.config.runtime.image_digest
+            or manifest.sha256 != record["oracle_seal_sha256"]
+        ):
+            raise EngineError("managed oracle private pins were rebound")
+        artifact_index = {artifact.id: artifact for artifact in state.artifacts}
+        bindings: list[
+            tuple[ArtifactReference, ProofRecipeInput]
+        ] = []
+        destinations = {
+            "variant_parameters": (
+                "oracle/variant-parameters-source.json"
+            ),
+            "variant_expected_output": (
+                "oracle/variant-expected-output-source.bin"
+            ),
+            "verifier_tool": "oracle/verifier.py",
+        }
+        bound_artifacts: list[ArtifactReference] = []
+        for expected_input in manifest.inputs:
+            artifact = artifact_index.get(expected_input.artifact_id)
+            if (
+                artifact is None
+                or artifact.sha256 != expected_input.sha256
+                or artifact.size != expected_input.size_bytes
+                or artifact.source_run_id is not None
+                or artifact.extra.get("kind")
+                != "managed_oracle_preissue_input"
+                or artifact.extra.get("protocol")
+                != MANAGED_ORACLE_PREISSUE_PROTOCOL
+                or artifact.extra.get("preissue_id") != preissue_id
+                or artifact.extra.get("purpose") != expected_input.purpose
+                or artifact.extra.get("context_visibility")
+                != "engine_private"
+            ):
+                raise EngineError(
+                    "managed oracle private input binding is invalid"
+                )
+            bound_artifacts.append(artifact)
+            bindings.append(
+                (
+                    artifact,
+                    ProofRecipeInput(
+                        artifact_id=artifact.id,
+                        destination=destinations[expected_input.purpose],
+                        purpose=expected_input.purpose,
+                        sha256=artifact.sha256,
+                        size=int(artifact.size or 0),
+                        source_run_id=None,
+                    ),
+                )
+            )
+
+        def verify_private_bundle() -> None:
+            if self.config.runtime.image_digest != manifest.image_digest:
+                raise EngineError(
+                    "managed oracle runtime image changed before consume"
+                )
+            if (
+                inventory_challenge(
+                    self.challenge_input(identity)
+                ).manifest_sha256
+                != manifest.source_manifest_sha256
+            ):
+                raise EngineError(
+                    "incoming source changed before oracle consume"
+                )
+            current_manifest = read_manifest()
+            if current_manifest != manifest:
+                raise EngineError(
+                    "managed oracle manifest changed during consume"
+                )
+            for artifact in bound_artifacts:
+                read_bounded_regular(
+                    paths.root,
+                    artifact.path,
+                    maximum_bytes=max(int(artifact.size or 0), 1),
+                    expected_sha256=artifact.sha256,
+                    expected_size=int(artifact.size or 0),
+                )
+
+        consumed_at = utc_now()
+
+        def consume(current: ChallengeState) -> None:
+            current_history = current.extra.get(
+                MANAGED_ORACLE_PREISSUE_STATE_KEY
+            )
+            current_builder = next(
+                (
+                    item
+                    for item in current.runs
+                    if item.id == builder_run_id
+                ),
+                None,
+            )
+            current_experiment = next(
+                (
+                    item
+                    for item in current.experiments
+                    if item.id == experiment_id
+                ),
+                None,
+            )
+            if (
+                type(current_history) is not dict
+                or current_history.get(preissue_id) != raw_record
+                or current.configuration_epoch != manifest.configuration_epoch
+                or current.metadata.get("source_manifest_sha256")
+                != manifest.source_manifest_sha256
+                or current_builder != builder_run
+                or current_experiment is None
+                or current_experiment.status is not ExperimentStatus.RUNNING
+                or current_experiment.source_run_id != builder_run_id
+            ):
+                raise EngineError(
+                    "managed oracle binding changed before consume"
+                )
+            next_record = copy.deepcopy(record)
+            next_record.update(
+                {
+                    "status": "consumed",
+                    "consumed_at": consumed_at,
+                    "consumed_by_builder_run_id": builder_run_id,
+                    "consumed_by_experiment_id": experiment_id,
+                }
+            )
+            validate_managed_oracle_preissue_public_record(next_record)
+            next_history = copy.deepcopy(current_history)
+            next_history[preissue_id] = next_record
+            current.extra[
+                MANAGED_ORACLE_PREISSUE_STATE_KEY
+            ] = next_history
+
+        self.store.update(
+            identity,
+            consume,
+            expected_revision=state.revision,
+            commit_guard=verify_private_bundle,
+            pre_replace_guard=verify_private_bundle,
+        )
+        return _ManagedOraclePreissueResolution(
+            manifest=manifest,
+            bindings=tuple(bindings),
+        )
+
     def register_workspace_artifact(
         self,
         identity: ChallengeIdentity,
@@ -23246,7 +23845,10 @@ class ChallengeEngine:
         candidate_id: str,
         *,
         spec_locator: str,
+        oracle_preissue_id: str | None = None,
         _session_owned: bool = False,
+        _managed_builder_run_id: str | None = None,
+        _managed_experiment_id: str | None = None,
     ) -> tuple[ChallengeState, object]:
         """Execute one operator-declared Misc DAG and original-condition oracle.
 
@@ -23256,6 +23858,28 @@ class ChallengeEngine:
         hash-bound inputs in a new clean sandbox.  A verifier exit status of
         zero is an explicit operator oracle, not proof that a flag is correct.
         """
+
+        if _session_owned:
+            if (
+                type(oracle_preissue_id) is not str
+                or not oracle_preissue_id
+                or type(_managed_builder_run_id) is not str
+                or not _managed_builder_run_id
+                or type(_managed_experiment_id) is not str
+                or not _managed_experiment_id
+            ):
+                raise EngineError(
+                    "managed Misc evaluation requires an operator oracle "
+                    "preissue and forbids Builder-supplied verifier locators"
+                )
+        elif (
+            oracle_preissue_id is not None
+            or _managed_builder_run_id is not None
+            or _managed_experiment_id is not None
+        ):
+            raise EngineError(
+                "direct Misc evaluation must use its operator verifier spec"
+            )
 
         paths = self.store.challenge_paths(identity)
         session_lock: ChallengeLock | None = None
@@ -23337,6 +23961,22 @@ class ChallengeEngine:
             result_directory = (
                 paths.proof / candidate_id / evaluation_id
             )
+            preissue_resolution: (
+                _ManagedOraclePreissueResolution | None
+            ) = None
+            if _session_owned:
+                assert oracle_preissue_id is not None
+                assert _managed_builder_run_id is not None
+                assert _managed_experiment_id is not None
+                preissue_resolution = (
+                    self._consume_managed_oracle_preissue(
+                        identity,
+                        preissue_id=oracle_preissue_id,
+                        expected_kind=MANAGED_ORACLE_PREISSUE_MISC,
+                        builder_run_id=_managed_builder_run_id,
+                        experiment_id=_managed_experiment_id,
+                    )
+                )
 
             spec_preparation = self._prepare_proof_inputs(
                 state,
@@ -23360,7 +24000,30 @@ class ChallengeEngine:
                 raw_spec = strict_json_loads(
                     spec_payload.decode("utf-8", errors="strict")
                 )
-                execution_spec = parse_misc_execution_spec(raw_spec)
+                if preissue_resolution is None:
+                    execution_spec = parse_misc_execution_spec(raw_spec)
+                else:
+                    dag_spec = parse_misc_execution_dag_spec(raw_spec)
+                    execution_spec = MiscExecutionSpec(
+                        sources=dag_spec.sources,
+                        steps=dag_spec.steps,
+                        terminal_step_id=dag_spec.terminal_step_id,
+                        verifier=MiscExecutionVerifier(
+                            verifier_id=(
+                                preissue_resolution.manifest.metadata[
+                                    "verifier_id"
+                                ]
+                            ),
+                            tool_locator=(
+                                "engine-private/preissued-verifier.py"
+                            ),
+                            oracle_id=(
+                                preissue_resolution.manifest.metadata[
+                                    "oracle_id"
+                                ]
+                            ),
+                        ),
+                    )
             except (
                 OSError,
                 UnicodeError,
@@ -23414,7 +24077,11 @@ class ChallengeEngine:
             all_locators = (
                 *staged_source_locators,
                 *(item.tool_locator for item in execution_spec.steps),
-                execution_spec.verifier.tool_locator,
+                *(
+                    (execution_spec.verifier.tool_locator,)
+                    if preissue_resolution is None
+                    else ()
+                ),
             )
             destinations = (
                 *(
@@ -23425,7 +24092,11 @@ class ChallengeEngine:
                     f"tools/{index:03d}.py"
                     for index in range(1, len(execution_spec.steps) + 1)
                 ),
-                "oracle/verifier.py",
+                *(
+                    ("oracle/verifier.py",)
+                    if preissue_resolution is None
+                    else ()
+                ),
             )
             payload_preparation = self._prepare_proof_inputs(
                 state,
@@ -23436,7 +24107,19 @@ class ChallengeEngine:
                 input_destinations=destinations,
                 pending_handoff=preparations,
             )
-            entries = payload_preparation.manifest["inputs"]
+            entries = list(payload_preparation.manifest["inputs"])
+            oracle_preparation: _ProofInputPreparation | None = None
+            if preissue_resolution is not None:
+                oracle_preparation = self._prepare_proof_inputs(
+                    state,
+                    client,
+                    (),
+                    result_directory / "preissued-oracle",
+                    f"{evaluation_id}-preissued-oracle",
+                    canonical_bindings=preissue_resolution.bindings,
+                    pending_handoff=preparations,
+                )
+                entries.extend(oracle_preparation.manifest["inputs"])
             source_count = len(execution_spec.sources)
             step_count = len(execution_spec.steps)
             if len(entries) != source_count + step_count + 1:
@@ -23534,10 +24217,35 @@ class ChallengeEngine:
                     "context_visibility": "engine_private",
                 },
             )
+            oracle_manifest_artifacts: tuple[ArtifactReference, ...] = ()
+            if oracle_preparation is not None:
+                oracle_manifest_artifacts = (
+                    ArtifactReference(
+                        id=_record_id(
+                            "A",
+                            evaluation_id,
+                            "preissued-oracle-manifest",
+                        ),
+                        path=oracle_preparation.manifest_path.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        sha256=oracle_preparation.manifest_sha256,
+                        size=oracle_preparation.manifest_path.stat().st_size,
+                        extra={
+                            "kind": "misc_transform_input_manifest",
+                            "purpose": "preissued_oracle",
+                            "protocol": MISC_TRANSFORM_PROTOCOL,
+                            "misc_evaluation_id": evaluation_id,
+                            "oracle_preissue_id": oracle_preissue_id,
+                            "context_visibility": "engine_private",
+                        },
+                    ),
+                )
             input_artifacts = (
                 *spec_artifacts,
                 *payload_artifacts,
                 payload_manifest_artifact,
+                *oracle_manifest_artifacts,
             )
             source_refs = tuple(
                 MiscArtifactRef(
@@ -23612,7 +24320,11 @@ class ChallengeEngine:
                 ),
                 oracle_contract_sha256=contract_sha256(
                     {
-                        "authority": "explicit_operator_exit_status",
+                        "authority": (
+                            MANAGED_ORACLE_PREISSUE_PROTOCOL
+                            if _session_owned
+                            else "explicit_operator_exit_status"
+                        ),
                         "oracle_id": execution_spec.verifier.oracle_id,
                     }
                 ),
@@ -23690,7 +24402,11 @@ class ChallengeEngine:
                 ]
                 for index in range(step_count)
             )
-            verifier_tool_input = payload_preparation.prepared_inputs[-1]
+            verifier_tool_input = (
+                payload_preparation.prepared_inputs[-1]
+                if oracle_preparation is None
+                else oracle_preparation.prepared_inputs[0]
+            )
             known_inputs: dict[
                 str,
                 tuple[MiscArtifactRef, str, str],
@@ -24288,6 +25004,212 @@ class ChallengeEngine:
                 )
 
             terminal = known_inputs.get(plan.terminal_step_id)
+            oracle_control_run_ids: list[str] = []
+            managed_oracle_control_passed = not _session_owned
+            if (
+                _session_owned
+                and not stop_transform
+                and terminal is not None
+            ):
+                if source_staging_root is None:
+                    raise EngineError(
+                        "Misc managed oracle control staging is unavailable"
+                    )
+                negative_payload = (
+                    b"ctfos-managed-misc-negative-v1\x00"
+                    + hashlib.sha256(
+                        candidate.value.encode("utf-8")
+                    ).digest()
+                )
+                if negative_payload == candidate.value.encode("utf-8"):
+                    negative_payload += b"\x00"
+                negative_path = source_staging_root / "negative-candidate.bin"
+                atomic_write_bytes(
+                    negative_path,
+                    negative_payload,
+                    mode=0o400,
+                )
+                negative_locator = negative_path.relative_to(
+                    self._workspace(state)
+                ).as_posix()
+                verifier_input = ProofInput(
+                    source_locator=verifier_tool_input.source_locator,
+                    destination_locator="oracle/verifier.py",
+                    sha256=verifier_tool_input.sha256,
+                    size_bytes=verifier_tool_input.size_bytes,
+                )
+                negative_input = ProofInput(
+                    source_locator=negative_locator,
+                    destination_locator="candidate/candidate.bin",
+                    sha256=hashlib.sha256(negative_payload).hexdigest(),
+                    size_bytes=len(negative_payload),
+                )
+                original_inputs = tuple(
+                    ProofInput(
+                        source_locator=source_proof_inputs[index].source_locator,
+                        destination_locator=f"sources/{index + 1:03d}.bin",
+                        sha256=source_refs[index].sha256,
+                        size_bytes=source_refs[index].size_bytes,
+                    )
+                    for index in range(source_count)
+                )
+                control_command = (
+                    MISC_EXECUTION_RUNTIME,
+                    "/work/oracle/verifier.py",
+                    "/work/candidate/candidate.bin",
+                    *(
+                        f"/work/sources/{index:03d}.bin"
+                        for index in range(1, source_count + 1)
+                    ),
+                )
+                current, control_run_id, control_paths, control_result = (
+                    run_clean(
+                        phase="oracle-control",
+                        ordinal=1,
+                        command=control_command,
+                        proof_inputs=(
+                            verifier_input,
+                            negative_input,
+                            *original_inputs,
+                        ),
+                        request_extra={
+                            "verifier_id": verifier_spec.verifier_id,
+                            "oracle_authority": (
+                                MANAGED_ORACLE_PREISSUE_PROTOCOL
+                            ),
+                            "oracle_preissue_id": oracle_preissue_id,
+                            "negative_control_sha256": (
+                                negative_input.sha256
+                            ),
+                        },
+                    )
+                )
+                try:
+                    (
+                        control_artifacts,
+                        control_stdout,
+                        control_stderr,
+                        _control_output,
+                    ) = snapshot_run(
+                        current,
+                        control_run_id,
+                        control_result,
+                        phase="oracle-control",
+                        ordinal=1,
+                        include_output=False,
+                    )
+                except BaseException as error:
+                    terminalize_run(
+                        current,
+                        control_run_id,
+                        control_paths,
+                        phase="oracle-control",
+                        ordinal=1,
+                        error=error,
+                    )
+                    raise
+                managed_oracle_control_passed = (
+                    control_result.status == "completed"
+                    and control_result.exit_code not in {None, 0}
+                    and not control_result.timed_out
+                    and control_result.orchestration_error is None
+                    and control_stdout.size_bytes == 0
+                    and control_result.stdout_capture_complete is True
+                    and control_result.stderr_capture_complete is True
+                    and control_result.stdout_truncated is False
+                    and control_result.stderr_truncated is False
+                )
+                self.store.write_run_result(
+                    identity,
+                    control_run_id,
+                    {
+                        "status": control_result.status,
+                        "exit_code": control_result.exit_code,
+                        "timed_out": control_result.timed_out,
+                        "phase": "oracle-control",
+                        "ordinal": 1,
+                        "plan_sha256": plan.sha256,
+                        "negative_control_rejected": (
+                            managed_oracle_control_passed
+                        ),
+                        "artifacts": [
+                            item.to_dict() for item in control_artifacts
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    control_run_id,
+                    {
+                        "ok": managed_oracle_control_passed,
+                        "phase": "oracle-control",
+                        "ordinal": 1,
+                        "protocol": MISC_TRANSFORM_PROTOCOL,
+                        "plan_sha256": plan.sha256,
+                    },
+                )
+                control_reference = RunReference(
+                    id=control_run_id,
+                    base_revision=current.revision,
+                    status=(
+                        RunStatus.COMPLETED
+                        if managed_oracle_control_passed
+                        else RunStatus.FAILED
+                    ),
+                    request_path=control_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=control_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=control_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="misc_transform",
+                    origin=RunOrigin.PROOF,
+                    configuration_epoch=configuration_epoch,
+                    extra={
+                        "misc_transform_protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "plan_sha256": plan.sha256,
+                        "phase": "oracle-control",
+                        "ordinal": 1,
+                        "verifier_id": verifier_spec.verifier_id,
+                        "oracle_authority": (
+                            MANAGED_ORACLE_PREISSUE_PROTOCOL
+                        ),
+                        "oracle_preissue_id": oracle_preissue_id,
+                        "negative_control_rejected": (
+                            managed_oracle_control_passed
+                        ),
+                    },
+                )
+
+                def commit_oracle_control(
+                    latest: ChallengeState,
+                ) -> None:
+                    require_current(latest)
+                    latest.runs.append(control_reference)
+                    latest.artifacts.extend(control_artifacts)
+
+                try:
+                    self.store.update(
+                        identity,
+                        commit_oracle_control,
+                        expected_revision=current.revision,
+                    )
+                except BaseException as error:
+                    self._handle_proof_interruption(
+                        identity,
+                        control_artifacts,
+                        error,
+                    )
+                    raise
+                evidence_artifacts.extend(control_artifacts)
+                oracle_control_run_ids.append(control_run_id)
+            if not stop_transform and terminal is not None:
+                if not managed_oracle_control_passed:
+                    terminal = None
             if not stop_transform and terminal is not None:
                 for ordinal in range(
                     1,
@@ -24341,7 +25263,18 @@ class ChallengeEngine:
                         request_extra={
                             "verifier_id": verifier_spec.verifier_id,
                             "oracle_authority": (
-                                "explicit_operator_exit_status"
+                                MANAGED_ORACLE_PREISSUE_PROTOCOL
+                                if _session_owned
+                                else "explicit_operator_exit_status"
+                            ),
+                            **(
+                                {
+                                    "oracle_preissue_id": (
+                                        oracle_preissue_id
+                                    )
+                                }
+                                if _session_owned
+                                else {}
                             ),
                         },
                     )
@@ -24452,7 +25385,18 @@ class ChallengeEngine:
                                 "misc_evaluation_id": evaluation_id,
                                 "plan_sha256": plan.sha256,
                                 "oracle_authority": (
-                                    "explicit_operator_exit_status"
+                                    MANAGED_ORACLE_PREISSUE_PROTOCOL
+                                    if _session_owned
+                                    else "explicit_operator_exit_status"
+                                ),
+                                **(
+                                    {
+                                        "oracle_preissue_id": (
+                                            oracle_preissue_id
+                                        )
+                                    }
+                                    if _session_owned
+                                    else {}
                                 ),
                             },
                         )
@@ -24580,7 +25524,18 @@ class ChallengeEngine:
                             "ordinal": ordinal,
                             "verifier_id": verifier_spec.verifier_id,
                             "oracle_authority": (
-                                "explicit_operator_exit_status"
+                                MANAGED_ORACLE_PREISSUE_PROTOCOL
+                                if _session_owned
+                                else "explicit_operator_exit_status"
+                            ),
+                            **(
+                                {
+                                    "oracle_preissue_id": (
+                                        oracle_preissue_id
+                                    )
+                                }
+                                if _session_owned
+                                else {}
                             ),
                         },
                     )
@@ -24724,13 +25679,32 @@ class ChallengeEngine:
                     "evaluation_sha256": evaluation.sha256,
                     "misc_evaluation_id": evaluation_id,
                     "oracle_authority": (
-                        "explicit_operator_exit_status"
+                        MANAGED_ORACLE_PREISSUE_PROTOCOL
+                        if _session_owned
+                        else "explicit_operator_exit_status"
+                    ),
+                    **(
+                        {"oracle_preissue_id": oracle_preissue_id}
+                        if _session_owned
+                        else {}
                     ),
                     "passed": evaluation.passed,
                     "plan_sha256": plan.sha256,
                     "protocol": MISC_TRANSFORM_PROTOCOL,
                     "run_ids": list(run_ids),
                     "source_manifest_sha256": manifest,
+                    **(
+                        {
+                            "oracle_control_run_ids": list(
+                                oracle_control_run_ids
+                            ),
+                            "oracle_negative_control_passed": (
+                                managed_oracle_control_passed
+                            ),
+                        }
+                        if _session_owned
+                        else {}
+                    ),
                 }
                 latest_candidate.extra["misc_transform_evidence"] = binding
                 records = (
@@ -25093,32 +26067,65 @@ class ChallengeEngine:
         *,
         solver_locator: str,
         original_parameters_locator: str,
-        variant_parameters_locator: str,
-        variant_expected_output_locator: str,
-        mutation_id: str,
+        variant_parameters_locator: str | None = None,
+        variant_expected_output_locator: str | None = None,
+        mutation_id: str | None = None,
         runtime: str = "python",
+        oracle_preissue_id: str | None = None,
         _session_owned: bool = False,
+        _managed_builder_run_id: str | None = None,
+        _managed_experiment_id: str | None = None,
     ) -> tuple[ChallengeState, ProofResult]:
         """Run one pinned Crypto solver in the mandatory clean 3+3 matrix.
 
-        This is an explicit, local operator hot path: the operator is the
-        authority supplying the changed parameters and their independently
-        expected output.  A managed caller may use the private lock-owned path
-        only after its Builder action is bound to canonical workspace
-        artifacts.  It never selects a challenge, enables a target, or submits
-        a candidate.  The solver receives exactly one canonical JSON file path
-        and must write the exact result bytes to stdout without diagnostics.
-        Stderr remains preserved as bounded evidence.
+        The direct operator CLI retains raw variant locators.  A managed caller
+        must instead consume an earlier operator preissue and cannot supply
+        variant bytes, their paths, or the mutation identity.
         """
 
         if runtime not in {"python", "sage"}:
             raise EngineError("Crypto proof runtime must be python or sage")
-        locators = (
-            solver_locator,
-            original_parameters_locator,
-            variant_parameters_locator,
-            variant_expected_output_locator,
-        )
+        if _session_owned:
+            if (
+                type(oracle_preissue_id) is not str
+                or not oracle_preissue_id
+                or variant_parameters_locator is not None
+                or variant_expected_output_locator is not None
+                or mutation_id is not None
+                or type(_managed_builder_run_id) is not str
+                or not _managed_builder_run_id
+                or type(_managed_experiment_id) is not str
+                or not _managed_experiment_id
+            ):
+                raise EngineError(
+                    "managed Crypto proof requires an operator oracle "
+                    "preissue and forbids raw oracle locators"
+                )
+            locators = (
+                solver_locator,
+                original_parameters_locator,
+            )
+        else:
+            if (
+                type(variant_parameters_locator) is not str
+                or not variant_parameters_locator
+                or type(variant_expected_output_locator) is not str
+                or not variant_expected_output_locator
+                or type(mutation_id) is not str
+                or not mutation_id
+                or oracle_preissue_id is not None
+                or _managed_builder_run_id is not None
+                or _managed_experiment_id is not None
+            ):
+                raise EngineError(
+                    "direct Crypto proof requires raw operator variant inputs"
+                )
+            locators = (
+                solver_locator,
+                original_parameters_locator,
+                variant_parameters_locator,
+                variant_expected_output_locator,
+            )
         if len(set(locators)) != len(locators):
             raise EngineError("Crypto proof locators must be unique")
 
@@ -25135,7 +26142,7 @@ class ChallengeEngine:
                     f"another session already owns {identity.key}"
                 ) from error
 
-        preparation: _ProofInputPreparation | None = None
+        preparations: list[_ProofInputPreparation] = []
         input_artifacts: tuple[ArtifactReference, ...] = ()
         evaluation_artifact: ArtifactReference | None = None
         finalized = False
@@ -25204,20 +26211,104 @@ class ChallengeEngine:
             result_directory = (
                 paths.proof / candidate_id / evaluation_id
             )
+            preissue_resolution: (
+                _ManagedOraclePreissueResolution | None
+            ) = None
+            if _session_owned:
+                assert oracle_preissue_id is not None
+                assert _managed_builder_run_id is not None
+                assert _managed_experiment_id is not None
+                preissue_resolution = (
+                    self._consume_managed_oracle_preissue(
+                        identity,
+                        preissue_id=oracle_preissue_id,
+                        expected_kind=MANAGED_ORACLE_PREISSUE_CRYPTO,
+                        builder_run_id=_managed_builder_run_id,
+                        experiment_id=_managed_experiment_id,
+                    )
+                )
+                mutation_id = preissue_resolution.manifest.metadata[
+                    "mutation_id"
+                ]
             preparation = self._prepare_proof_inputs(
                 state,
                 client,
                 locators,
                 result_directory,
-                evaluation_id,
+                f"{evaluation_id}-builder"
+                if _session_owned
+                else evaluation_id,
                 input_destinations=(
                     "oracle/solver-source",
                     "oracle/original-parameters-source.json",
-                    "oracle/variant-parameters-source.json",
-                    "oracle/variant-expected-output-source.bin",
+                    *(
+                        ()
+                        if _session_owned
+                        else (
+                            "oracle/variant-parameters-source.json",
+                            "oracle/variant-expected-output-source.bin",
+                        )
+                    ),
                 ),
+                pending_handoff=preparations,
             )
-            entries = preparation.manifest["inputs"]
+            prepared_inputs = list(preparation.prepared_inputs)
+            entries = list(preparation.manifest["inputs"])
+            manifest_artifacts: list[ArtifactReference] = [
+                ArtifactReference(
+                    id=_record_id(
+                        "A",
+                        evaluation_id,
+                        "builder-input-manifest",
+                    ),
+                    path=preparation.manifest_path.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    sha256=preparation.manifest_sha256,
+                    size=preparation.manifest_path.stat().st_size,
+                    extra={
+                        "kind": "crypto_metamorphic_input_manifest",
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "context_visibility": "engine_private",
+                    },
+                )
+            ]
+            if preissue_resolution is not None:
+                oracle_preparation = self._prepare_proof_inputs(
+                    state,
+                    client,
+                    (),
+                    result_directory / "preissued-oracle",
+                    f"{evaluation_id}-preissued-oracle",
+                    canonical_bindings=preissue_resolution.bindings,
+                    pending_handoff=preparations,
+                )
+                entries.extend(oracle_preparation.manifest["inputs"])
+                prepared_inputs.extend(oracle_preparation.prepared_inputs)
+                manifest_artifacts.append(
+                    ArtifactReference(
+                        id=_record_id(
+                            "A",
+                            evaluation_id,
+                            "preissued-oracle-input-manifest",
+                        ),
+                        path=oracle_preparation.manifest_path.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        sha256=oracle_preparation.manifest_sha256,
+                        size=oracle_preparation.manifest_path.stat().st_size,
+                        extra={
+                            "kind": (
+                                "crypto_metamorphic_input_manifest"
+                            ),
+                            "protocol": (
+                                CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                            ),
+                            "oracle_preissue_id": oracle_preissue_id,
+                            "context_visibility": "engine_private",
+                        },
+                    )
+                )
             if not isinstance(entries, list) or len(entries) != 4:
                 raise EngineError(
                     "Crypto proof input manifest is incomplete"
@@ -25248,7 +26339,17 @@ class ChallengeEngine:
                         "context_visibility": (
                             "engine_private"
                             if purpose == "variant_expected_output"
+                            or (
+                                _session_owned
+                                and purpose == "variant_parameters"
+                            )
                             else "model_visible"
+                        ),
+                        **(
+                            {"oracle_preissue_id": oracle_preissue_id}
+                            if _session_owned
+                            and purpose.startswith("variant_")
+                            else {}
                         ),
                     },
                 )
@@ -25265,25 +26366,7 @@ class ChallengeEngine:
                     ),
                     start=1,
                 )
-            ) + (
-                ArtifactReference(
-                    id=_record_id(
-                        "A",
-                        evaluation_id,
-                        "input-manifest",
-                    ),
-                    path=preparation.manifest_path.relative_to(
-                        paths.root
-                    ).as_posix(),
-                    sha256=preparation.manifest_sha256,
-                    size=preparation.manifest_path.stat().st_size,
-                    extra={
-                        "kind": "crypto_metamorphic_input_manifest",
-                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
-                        "context_visibility": "engine_private",
-                    },
-                ),
-            )
+            ) + tuple(manifest_artifacts)
             solver_bytes = read_bounded_regular(
                 paths.root,
                 snapshots[0][0].relative_to(paths.root).as_posix(),
@@ -25333,7 +26416,7 @@ class ChallengeEngine:
                 original_parameters,
                 variant_parameters,
                 variant_expected_output,
-                mutation_id=mutation_id,
+                mutation_id=str(mutation_id),
             )
             if (
                 original_parameters != plan.cases[0].parameters
@@ -25375,7 +26458,7 @@ class ChallengeEngine:
             )
             solver_input = ProofInput(
                 source_locator=(
-                    preparation.prepared_inputs[0].source_locator
+                    prepared_inputs[0].source_locator
                 ),
                 destination_locator=solver_destination,
                 sha256=snapshots[0][1],
@@ -25384,7 +26467,7 @@ class ChallengeEngine:
             case_inputs = {
                 "original": ProofInput(
                     source_locator=(
-                        preparation.prepared_inputs[1].source_locator
+                        prepared_inputs[1].source_locator
                     ),
                     destination_locator="oracle/parameters.json",
                     sha256=plan.cases[0].parameters_sha256,
@@ -25392,7 +26475,7 @@ class ChallengeEngine:
                 ),
                 "metamorphic-variant": ProofInput(
                     source_locator=(
-                        preparation.prepared_inputs[2].source_locator
+                        prepared_inputs[2].source_locator
                     ),
                     destination_locator="oracle/parameters.json",
                     sha256=plan.cases[1].parameters_sha256,
@@ -25879,7 +26962,7 @@ class ChallengeEngine:
                     original_parameters,
                     variant_parameters,
                     variant_expected_output,
-                    mutation_id=mutation_id,
+                    mutation_id=str(mutation_id),
                     source_manifest_sha256=manifest,
                     solver_artifact_sha256=snapshots[0][1],
                     runtime_fingerprint_sha256=runtime_fingerprint,
@@ -25944,7 +27027,16 @@ class ChallengeEngine:
                     "artifact_id": evaluation_artifact.id,
                     "evaluation": evaluation.to_dict(),
                     "evaluation_sha256": evaluation.sha256,
-                    "oracle_authority": "explicit_operator_input",
+                    "oracle_authority": (
+                        MANAGED_ORACLE_PREISSUE_PROTOCOL
+                        if _session_owned
+                        else "explicit_operator_input"
+                    ),
+                    **(
+                        {"oracle_preissue_id": oracle_preissue_id}
+                        if _session_owned
+                        else {}
+                    ),
                     "passed": proof_result.passed,
                     "plan_sha256": plan.sha256,
                     "proof_result": proof_result.to_dict(),
@@ -25996,7 +27088,18 @@ class ChallengeEngine:
                                     CRYPTO_METAMORPHIC_PROOF_PROTOCOL
                                 ),
                                 "oracle_authority": (
-                                    "explicit_operator_input"
+                                    MANAGED_ORACLE_PREISSUE_PROTOCOL
+                                    if _session_owned
+                                    else "explicit_operator_input"
+                                ),
+                                **(
+                                    {
+                                        "oracle_preissue_id": (
+                                            oracle_preissue_id
+                                        )
+                                    }
+                                    if _session_owned
+                                    else {}
                                 ),
                             },
                         )
@@ -26022,11 +27125,17 @@ class ChallengeEngine:
         finally:
             active_error = sys.exception()
             cleanup_error: BaseException | None = None
-            if preparation is not None:
+            for preparation in reversed(preparations):
                 try:
                     preparation.staging.cleanup()
                 except BaseException as error:
-                    cleanup_error = error
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Crypto proof staging cleanup also failed: "
+                            f"{error}"
+                        )
             pending_final_artifacts = (
                 *input_artifacts,
                 *(

@@ -65,6 +65,13 @@ from ctf_os.engine.failure_capsule import (
     build_failure_capsule,
     selected_pwn_crash_failure_reason,
 )
+from ctf_os.engine.managed_oracle_preissue import (
+    MANAGED_ORACLE_PREISSUE_CRYPTO,
+    MANAGED_ORACLE_PREISSUE_MISC,
+    MANAGED_ORACLE_PREISSUE_STATE_KEY,
+    ManagedOraclePreissueError,
+    validate_public_record as validate_managed_oracle_preissue_public_record,
+)
 from ctf_os.engine.rev_acceptance import (
     REV_ACCEPTANCE_MAX_INPUT_BYTES,
     REV_ACCEPTANCE_MAX_SPEC_BYTES,
@@ -199,8 +206,6 @@ _MANAGED_TYPED_GATE_PATH_FIELDS = {
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: (
         "solver_artifact_path",
         "original_parameters_artifact_path",
-        "variant_parameters_artifact_path",
-        "variant_expected_output_artifact_path",
     ),
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: (
         "operator_spec_artifact_path",
@@ -257,9 +262,7 @@ _MANAGED_TYPED_GATE_KEYS = {
             "candidate_id",
             "solver_artifact_path",
             "original_parameters_artifact_path",
-            "variant_parameters_artifact_path",
-            "variant_expected_output_artifact_path",
-            "mutation_id",
+            "oracle_preissue_id",
             "runtime",
         }
     ),
@@ -278,6 +281,7 @@ _MANAGED_TYPED_GATE_KEYS = {
             "description",
             "candidate_id",
             "spec_artifact_path",
+            "oracle_preissue_id",
         }
     ),
 }
@@ -547,7 +551,7 @@ def _managed_typed_gate_action_shape_error(
     for field in (
         "candidate_id",
         "parent_experiment_id",
-        "mutation_id",
+        "oracle_preissue_id",
     ):
         if field in action:
             value = action.get(field)
@@ -2413,15 +2417,13 @@ class ManagedOrchestrator:
                         original_parameters_locator=locators[
                             "original_parameters_artifact_path"
                         ],
-                        variant_parameters_locator=locators[
-                            "variant_parameters_artifact_path"
-                        ],
-                        variant_expected_output_locator=locators[
-                            "variant_expected_output_artifact_path"
-                        ],
-                        mutation_id=str(request["mutation_id"]),
                         runtime=str(request["runtime"]),
+                        oracle_preissue_id=str(
+                            request["oracle_preissue_id"]
+                        ),
                         _session_owned=True,
+                        _managed_builder_run_id=source_run.id,
+                        _managed_experiment_id=experiment_id,
                     )
                 )
                 passed = bool(evaluation.passed)
@@ -2446,7 +2448,12 @@ class ManagedOrchestrator:
                         identity,
                         str(request["candidate_id"]),
                         spec_locator=locators["spec_artifact_path"],
+                        oracle_preissue_id=str(
+                            request["oracle_preissue_id"]
+                        ),
                         _session_owned=True,
+                        _managed_builder_run_id=source_run.id,
+                        _managed_experiment_id=experiment_id,
                     )
                 )
                 passed = bool(evaluation.passed)
@@ -3404,24 +3411,58 @@ class ManagedOrchestrator:
                 if candidate is None:
                     reject(run, index, "typed_gate_reference_invalid")
                     return
-                reference = {"candidate_id": candidate.id}
+                oracle_preissue_id = action.get("oracle_preissue_id")
+                history = state.extra.get(
+                    MANAGED_ORACLE_PREISSUE_STATE_KEY
+                )
+                raw_preissue = (
+                    history.get(oracle_preissue_id)
+                    if type(history) is dict
+                    and type(oracle_preissue_id) is str
+                    else None
+                )
+                try:
+                    preissue = (
+                        validate_managed_oracle_preissue_public_record(
+                            raw_preissue
+                        )
+                    )
+                except ManagedOraclePreissueError:
+                    reject(run, index, "typed_gate_oracle_preissue_invalid")
+                    return
+                expected_preissue_kind = (
+                    MANAGED_ORACLE_PREISSUE_CRYPTO
+                    if kind
+                    == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND
+                    else MANAGED_ORACLE_PREISSUE_MISC
+                )
+                if (
+                    preissue.get("preissue_id")
+                    != oracle_preissue_id
+                    or preissue.get("kind") != expected_preissue_kind
+                    or preissue.get("status") != "unused"
+                    or preissue.get("issuer") != "operator"
+                    or preissue.get("configuration_epoch")
+                    != state.configuration_epoch
+                    or preissue.get("source_manifest_sha256")
+                    != state.metadata.get("source_manifest_sha256")
+                    or preissue.get("image_digest")
+                    != self.engine.config.runtime.image_digest
+                    or run.base_revision
+                    < int(preissue.get("issue_revision", 0))
+                ):
+                    reject(run, index, "typed_gate_oracle_preissue_invalid")
+                    return
+                reference = {
+                    "candidate_id": candidate.id,
+                    "oracle_preissue_id": oracle_preissue_id,
+                }
                 if kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND:
-                    mutation_id = action.get("mutation_id")
                     runtime = action.get("runtime")
-                    if (
-                        type(mutation_id) is not str
-                        or not mutation_id
-                        or len(mutation_id) > 256
-                        or runtime not in {"python", "sage"}
-                    ):
+                    if runtime not in {"python", "sage"}:
                         reject(run, index, "typed_gate_action_invalid")
                         return
-                    reference.update(
-                        {
-                            "mutation_id": mutation_id,
-                            "runtime": runtime,
-                        }
-                    )
+                    reference["runtime"] = runtime
 
             request = {
                 "schema_version": 1,

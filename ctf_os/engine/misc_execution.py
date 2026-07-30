@@ -67,6 +67,15 @@ class MiscExecutionSpec:
     verifier: MiscExecutionVerifier
 
 
+@dataclass(frozen=True, slots=True)
+class MiscExecutionDagSpec:
+    """Builder-visible transform graph without an oracle implementation."""
+
+    sources: tuple[MiscExecutionSource, ...]
+    steps: tuple[MiscExecutionStep, ...]
+    terminal_step_id: str
+
+
 def _exact_keys(
     value: Mapping[str, object],
     expected: frozenset[str],
@@ -107,24 +116,17 @@ def _locator(value: object, label: str) -> str:
     return value
 
 
-def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
-    """Parse the exact bounded v1 operator document."""
-
-    if not isinstance(value, Mapping):
-        raise MiscExecutionSpecError("Misc execution spec must be an object")
-    _exact_keys(
-        value,
-        frozenset(
-            {
-                "schema_version",
-                "sources",
-                "steps",
-                "terminal_step_id",
-                "verifier",
-            }
-        ),
-        "Misc execution spec",
-    )
+def _parse_misc_execution_graph(
+    value: Mapping[str, object],
+    *,
+    expected_keys: frozenset[str],
+    label: str,
+) -> tuple[
+    tuple[MiscExecutionSource, ...],
+    tuple[MiscExecutionStep, ...],
+    str,
+]:
+    _exact_keys(value, expected_keys, label)
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"]
@@ -133,13 +135,11 @@ def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
         raise MiscExecutionSpecError("unsupported Misc execution spec schema")
     raw_sources = value["sources"]
     raw_steps = value["steps"]
-    raw_verifier = value["verifier"]
     if (
         type(raw_sources) is not list
         or not 1 <= len(raw_sources) <= MISC_TRANSFORM_MAX_SOURCES
         or type(raw_steps) is not list
         or not 1 <= len(raw_steps) <= MISC_TRANSFORM_MAX_STEPS
-        or not isinstance(raw_verifier, Mapping)
     ):
         raise MiscExecutionSpecError("Misc execution spec count is invalid")
 
@@ -188,6 +188,68 @@ def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
             )
         )
 
+    terminal = _safe_id(value["terminal_step_id"], "terminal step id")
+    ids = [item.source_id for item in sources]
+    ids.extend(item.step_id for item in steps)
+    if len(set(ids)) != len(ids):
+        raise MiscExecutionSpecError("source and step ids must be unique")
+    if terminal not in {item.step_id for item in steps}:
+        raise MiscExecutionSpecError("terminal step is unknown")
+    if len(
+        {
+            *(item.locator for item in sources),
+            *(item.tool_locator for item in steps),
+        }
+    ) != len(sources) + len(steps):
+        raise MiscExecutionSpecError("all source and tool locators must be unique")
+    return tuple(sources), tuple(steps), terminal
+
+
+def parse_misc_execution_dag_spec(value: object) -> MiscExecutionDagSpec:
+    """Parse the exact Builder-visible v1 graph (no verifier or oracle)."""
+
+    if not isinstance(value, Mapping):
+        raise MiscExecutionSpecError("Misc execution spec must be an object")
+    sources, steps, terminal = _parse_misc_execution_graph(
+        value,
+        expected_keys=frozenset(
+            {
+                "schema_version",
+                "sources",
+                "steps",
+                "terminal_step_id",
+            }
+        ),
+        label="Misc execution DAG spec",
+    )
+    return MiscExecutionDagSpec(
+        sources=sources,
+        steps=steps,
+        terminal_step_id=terminal,
+    )
+
+
+def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
+    """Parse the exact bounded v1 operator document."""
+
+    if not isinstance(value, Mapping):
+        raise MiscExecutionSpecError("Misc execution spec must be an object")
+    sources, steps, terminal = _parse_misc_execution_graph(
+        value,
+        expected_keys=frozenset(
+            {
+                "schema_version",
+                "sources",
+                "steps",
+                "terminal_step_id",
+                "verifier",
+            }
+        ),
+        label="Misc execution spec",
+    )
+    raw_verifier = value["verifier"]
+    if not isinstance(raw_verifier, Mapping):
+        raise MiscExecutionSpecError("Misc verifier must be an object")
     _exact_keys(
         raw_verifier,
         frozenset({"id", "tool_locator", "oracle_id"}),
@@ -201,14 +263,6 @@ def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
         ),
         oracle_id=_safe_id(raw_verifier["oracle_id"], "oracle id"),
     )
-    terminal = _safe_id(value["terminal_step_id"], "terminal step id")
-
-    ids = [item.source_id for item in sources]
-    ids.extend(item.step_id for item in steps)
-    if len(set(ids)) != len(ids):
-        raise MiscExecutionSpecError("source and step ids must be unique")
-    if terminal not in {item.step_id for item in steps}:
-        raise MiscExecutionSpecError("terminal step is unknown")
     if len(
         {
             *(item.locator for item in sources),
@@ -219,8 +273,8 @@ def parse_misc_execution_spec(value: object) -> MiscExecutionSpec:
         raise MiscExecutionSpecError("all source and tool locators must be unique")
 
     return MiscExecutionSpec(
-        sources=tuple(sources),
-        steps=tuple(steps),
+        sources=sources,
+        steps=steps,
         terminal_step_id=terminal,
         verifier=verifier,
     )
@@ -232,10 +286,12 @@ __all__ = [
     "MISC_EXECUTION_SPEC_SCHEMA_VERSION",
     "MISC_EXECUTION_TRANSFORM_INTERFACE",
     "MISC_EXECUTION_VERIFIER_INTERFACE",
+    "MiscExecutionDagSpec",
     "MiscExecutionSource",
     "MiscExecutionSpec",
     "MiscExecutionSpecError",
     "MiscExecutionStep",
     "MiscExecutionVerifier",
+    "parse_misc_execution_dag_spec",
     "parse_misc_execution_spec",
 ]

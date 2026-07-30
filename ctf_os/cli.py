@@ -1118,6 +1118,35 @@ def build_parser() -> argparse.ArgumentParser:
     rev_accept.add_argument("--spec", required=True)
     rev_accept.add_argument("--timeout", type=int, default=300)
 
+    crypto_preissue = commands.add_parser(
+        "managed-oracle-preissue-crypto",
+        aliases=["oracle-preissue-crypto"],
+        help=(
+            "managed Builder 시작 전에 Crypto variant와 expected output을 "
+            "engine-private one-shot oracle로 봉인"
+        ),
+    )
+    _identity_values(crypto_preissue)
+    crypto_preissue.add_argument("--variant-parameters", required=True)
+    crypto_preissue.add_argument(
+        "--variant-expected-output",
+        required=True,
+    )
+    crypto_preissue.add_argument("--mutation-id", required=True)
+
+    misc_preissue = commands.add_parser(
+        "managed-oracle-preissue-misc",
+        aliases=["oracle-preissue-misc"],
+        help=(
+            "managed Builder 시작 전에 Misc verifier와 oracle id를 "
+            "engine-private one-shot oracle로 봉인"
+        ),
+    )
+    _identity_values(misc_preissue)
+    misc_preissue.add_argument("--verifier", required=True)
+    misc_preissue.add_argument("--verifier-id", required=True)
+    misc_preissue.add_argument("--oracle-id", required=True)
+
     crypto_prove = commands.add_parser(
         "crypto-prove",
         help=(
@@ -2184,6 +2213,44 @@ def main(
             )
             _print_json(result.to_dict())
             return 0 if result.passed else 1
+
+        if args.command in {
+            "managed-oracle-preissue-crypto",
+            "oracle-preissue-crypto",
+        }:
+            state, record = engine.preissue_managed_crypto_oracle(
+                _identity(args),
+                variant_parameters_locator=args.variant_parameters,
+                variant_expected_output_locator=(
+                    args.variant_expected_output
+                ),
+                mutation_id=args.mutation_id,
+            )
+            _print_json(
+                {
+                    **dict(record),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0
+
+        if args.command in {
+            "managed-oracle-preissue-misc",
+            "oracle-preissue-misc",
+        }:
+            state, record = engine.preissue_managed_misc_oracle(
+                _identity(args),
+                verifier_locator=args.verifier,
+                verifier_id=args.verifier_id,
+                oracle_id=args.oracle_id,
+            )
+            _print_json(
+                {
+                    **dict(record),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0
 
         if args.command == "misc-prove":
             state, result = engine.evaluate_misc_transform_candidate(

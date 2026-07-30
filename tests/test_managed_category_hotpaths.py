@@ -383,14 +383,18 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
             locators = (
                 "solver.py",
                 "original.json",
-                "variant.json",
-                "variant.out",
             )
             payloads = {
                 locator: (workspace / locator).read_bytes()
                 for locator in locators
             }
-            for locator in locators:
+            _state, preissue = engine.preissue_managed_crypto_oracle(
+                case.identity,
+                variant_parameters_locator="variant.json",
+                variant_expected_output_locator="variant.out",
+                mutation_id="managed-rsa-variant",
+            )
+            for locator in (*locators, "variant.json", "variant.out"):
                 (workspace / locator).unlink()
             action = {
                 "kind": "prove_crypto_metamorphic",
@@ -398,9 +402,7 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                 "candidate_id": "C-crypto-candidate",
                 "solver_artifact_path": "solver.py",
                 "original_parameters_artifact_path": "original.json",
-                "variant_parameters_artifact_path": "variant.json",
-                "variant_expected_output_artifact_path": "variant.out",
-                "mutation_id": "managed-rsa-variant",
+                "oracle_preissue_id": preissue["preissue_id"],
                 "runtime": "python",
             }
 
@@ -471,14 +473,18 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
             locators = (
                 "solver.py",
                 "original.json",
-                "variant.json",
-                "variant.out",
             )
             payloads = {
                 locator: (workspace / locator).read_bytes()
                 for locator in locators
             }
-            for locator in locators:
+            _state, preissue = engine.preissue_managed_crypto_oracle(
+                case.identity,
+                variant_parameters_locator="variant.json",
+                variant_expected_output_locator="variant.out",
+                mutation_id="managed-rsa-variant",
+            )
+            for locator in (*locators, "variant.json", "variant.out"):
                 (workspace / locator).unlink()
             action = {
                 "kind": "prove_crypto_metamorphic",
@@ -486,9 +492,7 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                 "candidate_id": "C-crypto-candidate",
                 "solver_artifact_path": "solver.py",
                 "original_parameters_artifact_path": "original.json",
-                "variant_parameters_artifact_path": "variant.json",
-                "variant_expected_output_artifact_path": "variant.out",
-                "mutation_id": "managed-rsa-variant",
+                "oracle_preissue_id": preissue["preissue_id"],
                 "runtime": "python",
             }
             before = engine.store.load(case.identity)
@@ -508,7 +512,7 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
             self.assertEqual(
                 len(final.workspace_publishes)
                 - len(before.workspace_publishes),
-                4,
+                2,
             )
             self.assertIn(Role.CAPTAIN, executor.roles)
             self.assertIn(Role.BUILDER, executor.roles)
@@ -561,22 +565,37 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
             workspace = engine._workspace(
                 engine.store.load(case.identity)
             )
-            locators = (
+            raw_spec = json.loads(
+                (workspace / "misc-spec.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            raw_spec.pop("verifier")
+            payloads = {
+                "misc-spec.json": json.dumps(
+                    raw_spec,
+                    sort_keys=True,
+                ).encode("utf-8"),
+                "transform.py": (workspace / "transform.py").read_bytes(),
+            }
+            _state, preissue = engine.preissue_managed_misc_oracle(
+                case.identity,
+                verifier_locator="verify.py",
+                verifier_id="original-condition",
+                oracle_id="operator-oracle-v1",
+            )
+            for locator in (
                 "misc-spec.json",
                 "transform.py",
                 "verify.py",
-            )
-            payloads = {
-                locator: (workspace / locator).read_bytes()
-                for locator in locators
-            }
-            for locator in locators:
+            ):
                 (workspace / locator).unlink()
             action = {
                 "kind": "evaluate_misc_transform",
                 "description": "verify the transform DAG in the original oracle",
                 "candidate_id": "C-misc",
                 "spec_artifact_path": "misc-spec.json",
+                "oracle_preissue_id": preissue["preissue_id"],
             }
             before = engine.store.load(case.identity)
             final, experiment, executor = (
@@ -585,10 +604,7 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                     case.identity,
                     action=action,
                     payloads=payloads,
-                    extra_write_locators=(
-                        "transform.py",
-                        "verify.py",
-                    ),
+                    extra_write_locators=("transform.py",),
                 )
             )
             candidate = next(
@@ -604,11 +620,11 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
             self.assertEqual(
                 len(final.workspace_publishes)
                 - len(before.workspace_publishes),
-                3,
+                2,
             )
             self.assertIn(Role.CAPTAIN, executor.roles)
             self.assertIn(Role.BUILDER, executor.roles)
-            self.assertEqual(len(sandbox.proof_calls), 4)
+            self.assertEqual(len(sandbox.proof_calls), 5)
             self.assertTrue(binding["passed"])
             self.assertFalse(binding["automatic_submission_authorized"])
             self.assertIs(

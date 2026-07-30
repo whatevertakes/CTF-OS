@@ -94,7 +94,13 @@ class MiscSandbox:
             if spec.argv[1] != "/work/oracle/verifier.py":
                 raise AssertionError(f"unexpected command: {spec.argv}")
             output = b""
-            exit_code = self.verifier_exit_code
+            exit_code = (
+                1
+                if copied["candidate/candidate.bin"].startswith(
+                    b"ctfos-managed-misc-negative-v1\x00"
+                )
+                else self.verifier_exit_code
+            )
         relative = Path("proof") / f"misc-clean-{number}"
         directory = self.work / relative
         directory.mkdir(parents=True, exist_ok=False)

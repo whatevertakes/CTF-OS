@@ -9815,6 +9815,9 @@ _CRYPTO_METAMORPHIC_BINDING_KEYS = frozenset(
         "run_ids",
     }
 )
+_CRYPTO_METAMORPHIC_MANAGED_BINDING_KEYS = frozenset(
+    {*_CRYPTO_METAMORPHIC_BINDING_KEYS, "oracle_preissue_id"}
+)
 _CRYPTO_METAMORPHIC_EVALUATION_KEYS = frozenset(
     {
         "candidate_sha256",
@@ -9958,12 +9961,25 @@ def _crypto_metamorphic_state_errors(
             continue
         label = f"Crypto candidate {candidate.id} metamorphic proof"
         try:
-            binding = _crypto_exact_mapping(
-                raw_binding,
-                _CRYPTO_METAMORPHIC_BINDING_KEYS,
-            )
-            if binding is None:
+            if (
+                type(raw_binding) is not dict
+                or frozenset(raw_binding)
+                not in {
+                    _CRYPTO_METAMORPHIC_BINDING_KEYS,
+                    _CRYPTO_METAMORPHIC_MANAGED_BINDING_KEYS,
+                }
+            ):
                 raise ModelValidationError("binding schema is not exact")
+            binding = raw_binding
+            managed_oracle = (
+                frozenset(binding)
+                == _CRYPTO_METAMORPHIC_MANAGED_BINDING_KEYS
+            )
+            oracle_authority = (
+                "managed_oracle_preissue_v1"
+                if managed_oracle
+                else "explicit_operator_input"
+            )
             evaluation = _crypto_exact_mapping(
                 binding["evaluation"],
                 _CRYPTO_METAMORPHIC_EVALUATION_KEYS,
@@ -9983,8 +9999,7 @@ def _crypto_metamorphic_state_errors(
                 binding["protocol"] != _CRYPTO_METAMORPHIC_PROTOCOL
                 or evaluation["protocol"]
                 != _CRYPTO_METAMORPHIC_PROTOCOL
-                or binding["oracle_authority"]
-                != "explicit_operator_input"
+                or binding["oracle_authority"] != oracle_authority
                 or type(binding["passed"]) is not bool
                 or type(evaluation["passed"]) is not bool
                 or binding["passed"] is not evaluation["passed"]
@@ -10021,6 +10036,30 @@ def _crypto_metamorphic_state_errors(
                 raise ModelValidationError(
                     "evaluation bindings are invalid"
                 )
+            if managed_oracle:
+                preissue_id = binding["oracle_preissue_id"]
+                history = state.extra.get("managed_oracle_preissues")
+                preissue = (
+                    history.get(preissue_id)
+                    if type(history) is dict
+                    and type(preissue_id) is str
+                    else None
+                )
+                if (
+                    not _proof_binding_identifier(preissue_id)
+                    or not isinstance(preissue, Mapping)
+                    or preissue.get("preissue_id") != preissue_id
+                    or preissue.get("kind") != "crypto"
+                    or preissue.get("status") != "consumed"
+                    or preissue.get("issuer") != "operator"
+                    or preissue.get("configuration_epoch")
+                    != state.configuration_epoch
+                    or preissue.get("source_manifest_sha256")
+                    != state.metadata.get("source_manifest_sha256")
+                ):
+                    raise ModelValidationError(
+                        "managed oracle preissue binding is invalid"
+                    )
             semantic_bytes = _crypto_compact_bytes(evaluation)
             semantic_sha256 = hashlib.sha256(semantic_bytes).hexdigest()
             if (
@@ -10295,7 +10334,7 @@ def _crypto_metamorphic_state_errors(
                 == "crypto_metamorphic_input_manifest"
             ]
             if (
-                len(proof_inputs) != 5
+                len(proof_inputs) != (6 if managed_oracle else 5)
                 or set(purposes)
                 != {
                     "solver",
@@ -10303,7 +10342,7 @@ def _crypto_metamorphic_state_errors(
                     "variant_parameters",
                     "variant_expected_output",
                 }
-                or len(manifests) != 1
+                or len(manifests) != (2 if managed_oracle else 1)
                 or purposes["solver"].sha256
                 != evaluation["solver_artifact_sha256"]
                 or purposes["original_parameters"].sha256
@@ -10326,12 +10365,86 @@ def _crypto_metamorphic_state_errors(
                     "context_visibility"
                 )
                 != "engine_private"
-                or manifests[0].extra
-                != {
-                    "context_visibility": "engine_private",
-                    "kind": "crypto_metamorphic_input_manifest",
-                    "protocol": _CRYPTO_METAMORPHIC_PROTOCOL,
-                }
+                or (
+                    {
+                        tuple(sorted(artifact.extra.items()))
+                        for artifact in manifests
+                    }
+                    != (
+                        {
+                            tuple(
+                                sorted(
+                                    {
+                                        "context_visibility": (
+                                            "engine_private"
+                                        ),
+                                        "kind": (
+                                            "crypto_metamorphic_input_manifest"
+                                        ),
+                                        "protocol": (
+                                            _CRYPTO_METAMORPHIC_PROTOCOL
+                                        ),
+                                    }.items()
+                                )
+                            ),
+                            tuple(
+                                sorted(
+                                    {
+                                        "context_visibility": (
+                                            "engine_private"
+                                        ),
+                                        "kind": (
+                                            "crypto_metamorphic_input_manifest"
+                                        ),
+                                        "protocol": (
+                                            _CRYPTO_METAMORPHIC_PROTOCOL
+                                        ),
+                                        "oracle_preissue_id": (
+                                            binding[
+                                                "oracle_preissue_id"
+                                            ]
+                                        ),
+                                    }.items()
+                                )
+                            ),
+                        }
+                        if managed_oracle
+                        else {
+                            tuple(
+                                sorted(
+                                    {
+                                        "context_visibility": (
+                                            "engine_private"
+                                        ),
+                                        "kind": (
+                                            "crypto_metamorphic_input_manifest"
+                                        ),
+                                        "protocol": (
+                                            _CRYPTO_METAMORPHIC_PROTOCOL
+                                        ),
+                                    }.items()
+                                )
+                            )
+                        }
+                    )
+                )
+                or (
+                    managed_oracle
+                    and (
+                        purposes["variant_parameters"].extra.get(
+                            "context_visibility"
+                        )
+                        != "engine_private"
+                        or purposes["variant_parameters"].extra.get(
+                            "oracle_preissue_id"
+                        )
+                        != binding["oracle_preissue_id"]
+                        or purposes["variant_expected_output"].extra.get(
+                            "oracle_preissue_id"
+                        )
+                        != binding["oracle_preissue_id"]
+                    )
+                )
             ):
                 raise ModelValidationError(
                     "proof input artifact graph is invalid"
@@ -10415,7 +10528,7 @@ def _crypto_metamorphic_state_errors(
                         and marker.extra.get("protocol")
                         == _CRYPTO_METAMORPHIC_PROTOCOL
                         and marker.extra.get("oracle_authority")
-                        == "explicit_operator_input"
+                        == oracle_authority
                         and marker.run_id == run_ids[-1]
                         and marker.artifact_ids
                         == [evaluation_artifact.id]
@@ -11768,6 +11881,14 @@ _MISC_TRANSFORM_BINDING_KEYS = frozenset(
         "source_manifest_sha256",
     }
 )
+_MISC_TRANSFORM_MANAGED_BINDING_KEYS = frozenset(
+    {
+        *_MISC_TRANSFORM_BINDING_KEYS,
+        "oracle_preissue_id",
+        "oracle_control_run_ids",
+        "oracle_negative_control_passed",
+    }
+)
 
 
 def _misc_transform_state_errors(
@@ -11820,16 +11941,27 @@ def _misc_transform_state_errors(
     for evaluation_id, (candidate, binding) in bindings.items():
         label = f"Misc evaluation {evaluation_id}"
         try:
-            if frozenset(binding) != _MISC_TRANSFORM_BINDING_KEYS:
+            binding_keys = frozenset(binding)
+            if binding_keys not in {
+                _MISC_TRANSFORM_BINDING_KEYS,
+                _MISC_TRANSFORM_MANAGED_BINDING_KEYS,
+            }:
                 raise ModelValidationError(
                     "binding has unknown or missing fields"
                 )
+            managed_oracle = (
+                binding_keys == _MISC_TRANSFORM_MANAGED_BINDING_KEYS
+            )
             evaluation = binding["evaluation"]
             run_ids = binding["run_ids"]
             if (
                 binding["protocol"] != _MISC_TRANSFORM_PROTOCOL
                 or binding["oracle_authority"]
-                != "explicit_operator_exit_status"
+                != (
+                    "managed_oracle_preissue_v1"
+                    if managed_oracle
+                    else "explicit_operator_exit_status"
+                )
                 or binding["automatic_submission_authorized"] is not False
                 or type(binding["passed"]) is not bool
                 or type(binding["evaluation_sha256"]) is not str
@@ -11857,6 +11989,62 @@ def _misc_transform_state_errors(
                 or not isinstance(evaluation, Mapping)
             ):
                 raise ModelValidationError("binding fields are inconsistent")
+            if managed_oracle:
+                preissue_id = binding["oracle_preissue_id"]
+                control_run_ids = binding["oracle_control_run_ids"]
+                control_passed = binding[
+                    "oracle_negative_control_passed"
+                ]
+                history = state.extra.get("managed_oracle_preissues")
+                preissue = (
+                    history.get(preissue_id)
+                    if type(history) is dict
+                    and type(preissue_id) is str
+                    else None
+                )
+                if (
+                    type(preissue_id) is not str
+                    or not re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}",
+                        preissue_id,
+                    )
+                    or type(control_run_ids) is not list
+                    or len(control_run_ids) != 1
+                    or any(
+                        type(run_id) is not str
+                        for run_id in control_run_ids
+                    )
+                    or type(control_passed) is not bool
+                    or not isinstance(preissue, Mapping)
+                    or preissue.get("preissue_id") != preissue_id
+                    or preissue.get("kind") != "misc"
+                    or preissue.get("status") != "consumed"
+                    or preissue.get("issuer") != "operator"
+                    or preissue.get("configuration_epoch")
+                    != state.configuration_epoch
+                    or preissue.get("source_manifest_sha256")
+                    != state.metadata.get("source_manifest_sha256")
+                ):
+                    raise ModelValidationError(
+                        "managed oracle binding is inconsistent"
+                    )
+                control_run = runs.get(control_run_ids[0])
+                if (
+                    control_run is None
+                    or control_run.extra.get("phase")
+                    != "oracle-control"
+                    or control_run.extra.get("misc_evaluation_id")
+                    != evaluation_id
+                    or control_run.extra.get("oracle_preissue_id")
+                    != preissue_id
+                    or control_run.extra.get(
+                        "negative_control_rejected"
+                    )
+                    is not control_passed
+                ):
+                    raise ModelValidationError(
+                        "managed oracle control run is inconsistent"
+                    )
             expected_evaluation_keys = frozenset(
                 {
                     "authorities",
@@ -12059,12 +12247,20 @@ def _misc_transform_state_errors(
             ]
             if (
                 len(operator_specs) != 1
-                or len(input_manifests) != 2
+                or len(input_manifests) != (3 if managed_oracle else 2)
                 or {
                     artifact.extra.get("purpose")
                     for artifact in input_manifests
                 }
-                != {"operator_spec", "payloads"}
+                != (
+                    {
+                        "operator_spec",
+                        "payloads",
+                        "preissued_oracle",
+                    }
+                    if managed_oracle
+                    else {"operator_spec", "payloads"}
+                )
             ):
                 raise ModelValidationError(
                     "operator spec or input manifests were stripped"
@@ -12088,7 +12284,15 @@ def _misc_transform_state_errors(
                     == evaluation_id
                 )
             ]
-            if marked_run_ids != run_ids:
+            expected_marked_run_ids = list(run_ids)
+            if managed_oracle:
+                transform_count = len(evaluation["transform_nodes"])
+                expected_marked_run_ids = [
+                    *run_ids[:transform_count],
+                    *binding["oracle_control_run_ids"],
+                    *run_ids[transform_count:],
+                ]
+            if marked_run_ids != expected_marked_run_ids:
                 raise ModelValidationError(
                     "evaluation run set was stripped, reordered, or extended"
                 )
@@ -12207,6 +12411,12 @@ def _misc_transform_state_errors(
             passed = binding["passed"] is True
             if passed:
                 if (
+                    (
+                        managed_oracle
+                        and binding["oracle_negative_control_passed"]
+                        is not True
+                    )
+                    or
                     candidate.status
                     is CandidateStatus.READY_TO_SUBMIT
                     or evaluation["failure_codes"]

@@ -572,9 +572,7 @@ def role_output_schema(
                             "candidate_id",
                             "solver_artifact_path",
                             "original_parameters_artifact_path",
-                            "variant_parameters_artifact_path",
-                            "variant_expected_output_artifact_path",
-                            "mutation_id",
+                            "oracle_preissue_id",
                             "runtime",
                         ],
                         "properties": {
@@ -585,13 +583,7 @@ def role_output_schema(
                             "original_parameters_artifact_path": (
                                 managed_path_schema
                             ),
-                            "variant_parameters_artifact_path": (
-                                managed_path_schema
-                            ),
-                            "variant_expected_output_artifact_path": (
-                                managed_path_schema
-                            ),
-                            "mutation_id": managed_reference_schema,
+                            "oracle_preissue_id": managed_reference_schema,
                             "runtime": {"enum": ["python", "sage"]},
                         },
                     }
@@ -637,12 +629,16 @@ def role_output_schema(
                             "description",
                             "candidate_id",
                             "spec_artifact_path",
+                            "oracle_preissue_id",
                         ],
                         "properties": {
                             "kind": {"enum": [action_kind]},
                             "description": {"type": "string"},
                             "candidate_id": managed_reference_schema,
                             "spec_artifact_path": managed_path_schema,
+                            "oracle_preissue_id": (
+                                managed_reference_schema
+                            ),
                         },
                     }
                 )
@@ -1594,9 +1590,7 @@ def validate_role_output(
                         "candidate_id",
                         "solver_artifact_path",
                         "original_parameters_artifact_path",
-                        "variant_parameters_artifact_path",
-                        "variant_expected_output_artifact_path",
-                        "mutation_id",
+                        "oracle_preissue_id",
                         "runtime",
                     },
                     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: {
@@ -1611,6 +1605,7 @@ def validate_role_output(
                         "description",
                         "candidate_id",
                         "spec_artifact_path",
+                        "oracle_preissue_id",
                     },
                 }[kind]
                 _exact_keys(item, typed_keys, path, errors)
@@ -1647,7 +1642,7 @@ def validate_role_output(
                 for field in (
                     "candidate_id",
                     "parent_experiment_id",
-                    "mutation_id",
+                    "oracle_preissue_id",
                 ):
                     if field not in typed_keys:
                         continue
