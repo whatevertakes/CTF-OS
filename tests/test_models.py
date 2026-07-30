@@ -2088,7 +2088,16 @@ class PwnDisclosureEnvelopeModelTests(unittest.TestCase):
                 _session_owned=True,
                 experiment_ids=(child_id,),
             )
-            cls.legacy_state = copy.deepcopy(completed)
+            legacy = copy.deepcopy(completed)
+            legacy_child = next(
+                item
+                for item in legacy.experiments
+                if item.id == child_id
+            )
+            legacy_child.extra["managed_contract_version"] = 1
+            legacy_child.extra.pop("pwn_disclosure", None)
+            legacy.validate()
+            cls.legacy_state = legacy
             cls.parent_id = parent_id
             cls.child_id = child_id
             cls.payload = payload
@@ -2524,6 +2533,125 @@ class PwnDisclosureEnvelopeModelTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ModelValidationError,
             "cannot promote candidate",
+        ):
+            state.validate()
+
+        state = self._v2_state(
+            PwnDisclosurePhase.AWAITING_EXPECTATION
+        )
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        capability_id = child.result[
+            "pwn_runtime_snapshot_evidence"
+        ]["capability_attestation_artifact_id"]
+        state.candidates.append(
+            FlagCandidate(
+                id="C-pwn-disclosure-capability",
+                value="CTF{diagnostic_capability_only}",
+                artifact_id=capability_id,
+            )
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "cannot promote candidate",
+        ):
+            state.validate()
+
+        state = self._v2_state(
+            PwnDisclosurePhase.AWAITING_EXPECTATION
+        )
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        parent = next(
+            item
+            for item in state.experiments
+            if item.id == self.parent_id
+        )
+        from ctf_os.engine.pwn_crash import PwnCrashRecipe
+
+        parent_recipe = PwnCrashRecipe.from_dict(
+            parent.extra["pwn_crash_recipe"]
+        )
+        capability_id = child.result[
+            "pwn_runtime_snapshot_evidence"
+        ]["capability_attestation_artifact_id"]
+        capability = next(
+            item
+            for item in state.artifacts
+            if item.id == capability_id
+        )
+        source_run = next(
+            item
+            for item in state.runs
+            if item.id == parent_recipe.payload_source_run_id
+        )
+        candidate = FlagCandidate(
+            id="C-pwn-disclosure-proof",
+            value="CTF{diagnostic_proof_only}",
+            artifact_id=capability.id,
+        )
+        state.candidates.append(candidate)
+        policy = ProofPolicySnapshot.create(
+            mode="success_distribution",
+            oracle_protocol="remote_pwn_replay_negative_control_v1",
+            clean_repetitions=0,
+            remote_repetitions=0,
+            trial_count=10,
+            negative_control_repetitions=1,
+            negative_control_timeout_seconds=30,
+            minimum_success_rate=0.7,
+            notes="synthetic isolation probe",
+        )
+        recipe = ProofRecipe.create(
+            candidate_id=candidate.id,
+            source_experiment_id=parent.id,
+            source_run_id=source_run.id,
+            argv=("python3", "solver.py"),
+            inputs=(
+                ProofRecipeInput(
+                    artifact_id=capability.id,
+                    destination="solver.py",
+                    purpose="reproducer",
+                    sha256=capability.sha256,
+                    size=capability.size,
+                    source_run_id=capability.source_run_id,
+                ),
+            ),
+            network_target_id=None,
+            network_target_generation=None,
+            network_endpoint=None,
+            configuration_epoch=state.configuration_epoch,
+            source_manifest_sha256=state.metadata[
+                "source_manifest_sha256"
+            ],
+            source_request_sha256="0" * 64,
+            image_reference=parent_recipe.image_reference,
+            policy=policy,
+        )
+        state.experiments.append(
+            Experiment(
+                id="E-pwn-disclosure-proof",
+                hypothesis_ids=[],
+                command="python3 solver.py",
+                expected_observation="diagnostic artifact proves a flag",
+                keep_if="the diagnostic artifact is accepted",
+                drop_if="the diagnostic artifact is rejected",
+                timeout_seconds=30,
+                kind=ExperimentKind.PROOF,
+                source_run_id=source_run.id,
+                artifact_ids=[capability.id],
+                proof_recipe=recipe,
+            )
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "cannot satisfy proof",
         ):
             state.validate()
 

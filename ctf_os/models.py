@@ -7526,6 +7526,7 @@ def _pwn_runtime_snapshot_state_errors(
     }
     children_by_parent: dict[str, list[str]] = {}
     claimed_artifact_ids: set[str] = set()
+    disclosure_terminal_artifact_ids: set[str] = set()
 
     for child in children.values():
         label = f"Pwn runtime snapshot experiment {child.id}"
@@ -7644,6 +7645,10 @@ def _pwn_runtime_snapshot_state_errors(
         )
         errors.extend(terminal_errors)
         claimed_artifact_ids.update(terminal_artifact_ids)
+        if child.extra.get("managed_contract_version") == 2:
+            disclosure_terminal_artifact_ids.update(
+                terminal_artifact_ids
+            )
 
     for parent_id, child_ids in children_by_parent.items():
         if len(child_ids) != 1:
@@ -7696,11 +7701,9 @@ def _pwn_runtime_snapshot_state_errors(
         for run in state.runs
         if run.extra.get("experiment_id") in disclosure_child_ids
     }
-    disclosure_snapshot_artifact_ids = {
-        artifact.id
-        for artifact in state.artifacts
-        if artifact.source_run_id in disclosure_snapshot_run_ids
-    }
+    disclosure_snapshot_artifact_ids = (
+        disclosure_terminal_artifact_ids
+    )
     for artifact in state.artifacts:
         if _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in artifact.extra:
             errors.append(

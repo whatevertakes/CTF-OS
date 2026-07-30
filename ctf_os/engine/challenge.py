@@ -89,6 +89,7 @@ from ctf_os.contracts.rev_inventory_v2 import (
     rev_inventory_v2_seed_spec_sha256,
 )
 from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_ATTEMPT_COUNT,
     PWN_CRASH_V1_CONTRACT_FINGERPRINT,
     PWN_CRASH_V1_CONTRACT_ID,
     PWN_CRASH_V1_CONTRACT_VERSION,
@@ -139,6 +140,16 @@ from ctf_os.engine.pwn_crash import (
     evaluate_pwn_crash_gate,
     normalize_pwn_crash_capability_attestation,
 )
+from ctf_os.engine.pwn_disclosure import (
+    PWN_DISCLOSURE_MAX_PAYLOAD_BYTES,
+    PWN_DISCLOSURE_MAX_STREAM_BYTES,
+    PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS,
+    PWN_DISCLOSURE_SCHEMA_VERSION,
+    PwnDisclosureResult,
+    PwnDisclosureTrustedReceiptExpectation,
+    build_pwn_disclosure_trusted_receipt_expectation,
+    evaluate_pwn_disclosure,
+)
 from ctf_os.engine.pwn_runtime_snapshot import (
     PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
     PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
@@ -149,6 +160,7 @@ from ctf_os.engine.pwn_runtime_snapshot import (
     PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
     PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
     PwnRuntimeSnapshotCapabilityAttestation,
+    PwnRuntimeSnapshotGateEvaluation,
     PwnRuntimeSnapshotReceiptMetadata,
     PwnRuntimeSnapshotRecipe,
     PwnRuntimeSnapshotRecipeError,
@@ -224,6 +236,8 @@ from ctf_os.models import (
     ProofRecipe,
     ProofRecipeInput,
     Provenance,
+    PwnDisclosurePhase,
+    PwnRuntimeSnapshotDisclosureEnvelope,
     ReceiptOutcome,
     RunOrigin,
     RunReference,
@@ -274,6 +288,7 @@ from ctf_os.sandbox.files import (
     ensure_private_directory,
     ensure_relative_directory,
     normalize_locator,
+    read_bounded_regular,
 )
 from ctf_os.stages.ingest import inventory_challenge
 from ctf_os.store import (
@@ -329,6 +344,27 @@ class WaveOutcome:
     committed_revision: int
     results: tuple[BatchResult, ...]
     candidate_values: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PwnDisclosureCanonicalInputs:
+    """Typed state and artifact bindings for one disclosure reduction."""
+
+    child_experiment_id: str
+    crash_recipe: PwnCrashRecipe
+    crash_evaluation: PwnCrashGateEvaluation
+    crash_receipts: tuple[PwnCrashReceiptMetadata, ...]
+    snapshot_recipe: PwnRuntimeSnapshotRecipe
+    snapshot_evaluation: PwnRuntimeSnapshotGateEvaluation
+    snapshot_receipt: PwnRuntimeSnapshotReceiptMetadata
+    payload_artifact: ArtifactReference
+    crash_stdout_artifacts: tuple[ArtifactReference, ...]
+    positive_crash_stderr_artifacts: tuple[
+        ArtifactReference,
+        ...,
+    ]
+    snapshot_stdout_artifact: ArtifactReference
+    snapshot_stderr_artifact: ArtifactReference
 
 
 @dataclass(frozen=True, slots=True)
@@ -9850,6 +9886,541 @@ class ChallengeEngine:
                 f"{terminal_error}"
             )
 
+    @staticmethod
+    def _pwn_disclosure_artifact(
+        state: ChallengeState,
+        *,
+        artifact_id: str,
+        sha256: str,
+        size_bytes: int,
+    ) -> ArtifactReference:
+        artifact = next(
+            (
+                item
+                for item in state.artifacts
+                if item.id == artifact_id
+            ),
+            None,
+        )
+        if (
+            artifact is None
+            or artifact.sha256 != sha256
+            or artifact.size != size_bytes
+        ):
+            raise EngineError(
+                "Pwn disclosure artifact binding is unavailable"
+            )
+        return artifact
+
+    def _pwn_disclosure_inputs_from_state(
+        self,
+        state: ChallengeState,
+        child: Experiment,
+    ) -> _PwnDisclosureCanonicalInputs:
+        """Reconstruct all typed inputs from one already-canonical state."""
+
+        if (
+            state.schema_version < STATE_SCHEMA_VERSION
+            or str(get_adapter(state.category).name) != "pwn"
+            or child.status is not ExperimentStatus.COMPLETED
+            or child.extra.get("managed_contract_version") != 2
+            or child.extra.get("engine_executor")
+            != _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+        ):
+            raise EngineError(
+                "Pwn disclosure requires one completed v2 snapshot child"
+            )
+        try:
+            PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                child.extra["pwn_disclosure"]
+            )
+            snapshot_recipe = PwnRuntimeSnapshotRecipe.from_dict(
+                child.extra["pwn_runtime_snapshot_recipe"]
+            )
+            parent = next(
+                item
+                for item in state.experiments
+                if item.id == snapshot_recipe.parent_experiment_id
+            )
+            crash_recipe = PwnCrashRecipe.from_dict(
+                parent.extra["pwn_crash_recipe"]
+            )
+            crash_evidence = parent.result["pwn_crash_evidence"]
+            crash_evaluation = PwnCrashGateEvaluation.from_dict(
+                crash_evidence["evaluation"]
+            )
+            snapshot_evidence = child.result[
+                _PWN_RUNTIME_SNAPSHOT_RESULT_KEY
+            ]
+            snapshot_evaluation = (
+                PwnRuntimeSnapshotGateEvaluation.from_dict(
+                    snapshot_evidence["evaluation"],
+                    recipe=snapshot_recipe,
+                )
+            )
+            attempts = crash_evidence["attempts"]
+            if (
+                type(attempts) is not list
+                or len(attempts) != PWN_CRASH_V1_ATTEMPT_COUNT
+            ):
+                raise ValueError("crash attempt set is not exact")
+            receipt_index = {
+                receipt.id: receipt for receipt in state.receipts
+            }
+            crash_receipts: list[PwnCrashReceiptMetadata] = []
+            crash_stdout: list[ArtifactReference] = []
+            positive_stderr: list[ArtifactReference] = []
+            for ordinal, attempt in enumerate(attempts, start=1):
+                if (
+                    type(attempt) is not dict
+                    or attempt.get("ordinal") != ordinal
+                    or type(attempt.get("receipt_id")) is not str
+                    or type(attempt.get("stdout_artifact_id"))
+                    is not str
+                ):
+                    raise ValueError(
+                        "crash attempt order is not canonical"
+                    )
+                receipt = receipt_index[attempt["receipt_id"]]
+                record = receipt.extra["pwn_crash"]
+                metadata = PwnCrashReceiptMetadata.from_dict(
+                    record["receipt"]
+                )
+                if (
+                    receipt.experiment_id != parent.id
+                    or receipt.run_id != metadata.run_id
+                    or receipt.stdout_artifact_id
+                    != metadata.stdout_artifact_id
+                    or receipt.stderr_artifact_id
+                    != metadata.stderr_artifact_id
+                    or attempt["stdout_artifact_id"]
+                    != metadata.stdout_artifact_id
+                ):
+                    raise ValueError(
+                        "crash receipt binding is inconsistent"
+                    )
+                crash_receipts.append(metadata)
+                crash_stdout.append(
+                    self._pwn_disclosure_artifact(
+                        state,
+                        artifact_id=metadata.stdout_artifact_id,
+                        sha256=metadata.stdout_artifact_sha256,
+                        size_bytes=(
+                            metadata.stdout_artifact_size_bytes
+                        ),
+                    )
+                )
+                if ordinal <= PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS:
+                    positive_stderr.append(
+                        self._pwn_disclosure_artifact(
+                            state,
+                            artifact_id=metadata.stderr_artifact_id,
+                            sha256=metadata.stderr_artifact_sha256,
+                            size_bytes=(
+                                metadata.stderr_artifact_size_bytes
+                            ),
+                        )
+                    )
+
+            snapshot_receipt_record = receipt_index[
+                snapshot_evidence["receipt_id"]
+            ]
+            snapshot_record = snapshot_receipt_record.extra[
+                "pwn_runtime_snapshot"
+            ]
+            snapshot_receipt = (
+                PwnRuntimeSnapshotReceiptMetadata.from_dict(
+                    snapshot_record["receipt"]
+                )
+            )
+            if (
+                snapshot_receipt_record.experiment_id != child.id
+                or snapshot_receipt_record.run_id
+                != snapshot_receipt.run_id
+                or snapshot_receipt_record.stdout_artifact_id
+                != snapshot_receipt.stdout_artifact_id
+                or snapshot_receipt_record.stderr_artifact_id
+                != snapshot_receipt.stderr_artifact_id
+            ):
+                raise ValueError(
+                    "snapshot receipt binding is inconsistent"
+                )
+            payload_artifact = self._pwn_disclosure_artifact(
+                state,
+                artifact_id=crash_recipe.payload_artifact_id,
+                sha256=crash_recipe.payload_sha256,
+                size_bytes=crash_recipe.payload_size_bytes,
+            )
+            snapshot_stdout = self._pwn_disclosure_artifact(
+                state,
+                artifact_id=snapshot_receipt.stdout_artifact_id,
+                sha256=snapshot_receipt.stdout_artifact_sha256,
+                size_bytes=(
+                    snapshot_receipt.stdout_artifact_size_bytes
+                ),
+            )
+            snapshot_stderr = self._pwn_disclosure_artifact(
+                state,
+                artifact_id=snapshot_receipt.stderr_artifact_id,
+                sha256=snapshot_receipt.stderr_artifact_sha256,
+                size_bytes=(
+                    snapshot_receipt.stderr_artifact_size_bytes
+                ),
+            )
+        except (
+            IndexError,
+            KeyError,
+            StopIteration,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise EngineError(
+                "Pwn disclosure canonical inputs are invalid"
+            ) from error
+        if (
+            crash_evidence.get("recipe_sha256")
+            != crash_recipe.recipe_sha256
+            or crash_evidence.get("evaluation_sha256")
+            != crash_evaluation.evidence_sha256
+            or snapshot_evidence.get("recipe_sha256")
+            != snapshot_recipe.recipe_sha256
+            or snapshot_evidence.get("evaluation_sha256")
+            != snapshot_evaluation.evidence_sha256
+            or snapshot_recipe.parent_crash_recipe_sha256
+            != crash_recipe.recipe_sha256
+            or snapshot_recipe.parent_crash_evaluation_sha256
+            != crash_evaluation.evidence_sha256
+        ):
+            raise EngineError(
+                "Pwn disclosure upstream evidence hashes are inconsistent"
+            )
+        return _PwnDisclosureCanonicalInputs(
+            child_experiment_id=child.id,
+            crash_recipe=crash_recipe,
+            crash_evaluation=crash_evaluation,
+            crash_receipts=tuple(crash_receipts),
+            snapshot_recipe=snapshot_recipe,
+            snapshot_evaluation=snapshot_evaluation,
+            snapshot_receipt=snapshot_receipt,
+            payload_artifact=payload_artifact,
+            crash_stdout_artifacts=tuple(crash_stdout),
+            positive_crash_stderr_artifacts=tuple(positive_stderr),
+            snapshot_stdout_artifact=snapshot_stdout,
+            snapshot_stderr_artifact=snapshot_stderr,
+        )
+
+    def _read_pwn_disclosure_artifact(
+        self,
+        state: ChallengeState,
+        artifact: ArtifactReference,
+        *,
+        maximum_bytes: int,
+    ) -> bytes:
+        if (
+            type(artifact.size) is not int
+            or artifact.size < 0
+            or artifact.size > maximum_bytes
+        ):
+            raise EngineError(
+                "Pwn disclosure artifact exceeds its typed bound"
+            )
+        paths = self.store.challenge_paths(state.identity)
+        try:
+            return read_bounded_regular(
+                paths.root,
+                artifact.path,
+                maximum_bytes=maximum_bytes,
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.size,
+            )
+        except (OSError, SafeFileError, ValueError) as error:
+            raise EngineError(
+                "Pwn disclosure artifact reread failed closed"
+            ) from error
+
+    def _recompute_pwn_disclosure_result(
+        self,
+        state: ChallengeState,
+        inputs: _PwnDisclosureCanonicalInputs,
+        expectation: PwnDisclosureTrustedReceiptExpectation,
+    ) -> PwnDisclosureResult:
+        """Reread exact bytes and recompute both upstream gates and result."""
+
+        payload = self._read_pwn_disclosure_artifact(
+            state,
+            inputs.payload_artifact,
+            maximum_bytes=PWN_DISCLOSURE_MAX_PAYLOAD_BYTES,
+        )
+        crash_stdout = tuple(
+            self._read_pwn_disclosure_artifact(
+                state,
+                artifact,
+                maximum_bytes=PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+            )
+            for artifact in inputs.crash_stdout_artifacts
+        )
+        positive_crash_stderr = tuple(
+            self._read_pwn_disclosure_artifact(
+                state,
+                artifact,
+                maximum_bytes=PWN_DISCLOSURE_MAX_STREAM_BYTES,
+            )
+            for artifact in inputs.positive_crash_stderr_artifacts
+        )
+        snapshot_stdout = self._read_pwn_disclosure_artifact(
+            state,
+            inputs.snapshot_stdout_artifact,
+            maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+        )
+        runtime_stderr = self._read_pwn_disclosure_artifact(
+            state,
+            inputs.snapshot_stderr_artifact,
+            maximum_bytes=PWN_DISCLOSURE_MAX_STREAM_BYTES,
+        )
+        recomputed_crash = evaluate_pwn_crash_gate(
+            inputs.crash_recipe,
+            poc_input=payload,
+            stdout_payloads=crash_stdout,
+            receipts=inputs.crash_receipts,
+        )
+        recomputed_snapshot = evaluate_pwn_runtime_snapshot_gate(
+            inputs.snapshot_recipe,
+            stdout_payload=snapshot_stdout,
+            receipt=inputs.snapshot_receipt,
+        )
+        if (
+            recomputed_crash != inputs.crash_evaluation
+            or recomputed_snapshot != inputs.snapshot_evaluation
+        ):
+            raise EngineError(
+                "Pwn disclosure upstream gate recomputation changed"
+            )
+        result = evaluate_pwn_disclosure(
+            crash_recipe=inputs.crash_recipe,
+            crash_evaluation=recomputed_crash,
+            positive_crash_receipts=tuple(
+                inputs.crash_receipts[
+                    :PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS
+                ]
+            ),
+            snapshot_recipe=inputs.snapshot_recipe,
+            snapshot_evaluation=recomputed_snapshot,
+            snapshot_receipt=inputs.snapshot_receipt,
+            trusted_receipt_expectation=expectation,
+            payload=payload,
+            positive_crash_stderr=positive_crash_stderr,
+            runtime_stderr=runtime_stderr,
+        )
+        result.canonical_bytes()
+        return result
+
+    def _commit_pwn_disclosure_expectation(
+        self,
+        identity: ChallengeIdentity,
+        current: ChallengeState,
+        child: Experiment,
+    ) -> ChallengeState:
+        inputs = self._pwn_disclosure_inputs_from_state(current, child)
+        envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            child.extra["pwn_disclosure"]
+        )
+        if envelope.phase is not PwnDisclosurePhase.AWAITING_EXPECTATION:
+            raise EngineError(
+                "Pwn disclosure expectation transition is stale"
+            )
+        expectation = build_pwn_disclosure_trusted_receipt_expectation(
+            positive_crash_receipts=tuple(
+                inputs.crash_receipts[
+                    :PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS
+                ]
+            ),
+            snapshot_receipt=inputs.snapshot_receipt,
+        )
+
+        def commit_expectation(state: ChallengeState) -> None:
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == child.id
+            )
+            rebuilt = self._pwn_disclosure_inputs_from_state(state, item)
+            observed = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                item.extra["pwn_disclosure"]
+            )
+            rebuilt_expectation = (
+                build_pwn_disclosure_trusted_receipt_expectation(
+                    positive_crash_receipts=tuple(
+                        rebuilt.crash_receipts[
+                            :PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS
+                        ]
+                    ),
+                    snapshot_receipt=rebuilt.snapshot_receipt,
+                )
+            )
+            if (
+                rebuilt != inputs
+                or observed != envelope
+                or rebuilt_expectation != expectation
+            ):
+                raise EngineError(
+                    "Pwn disclosure inputs changed before expectation commit"
+                )
+            item.extra["pwn_disclosure"] = (
+                PwnRuntimeSnapshotDisclosureEnvelope(
+                    schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                    phase=PwnDisclosurePhase.EXPECTATION_COMMITTED,
+                    expectation_source_state_revision=current.revision,
+                    trusted_receipt_expectation=expectation,
+                    trusted_receipt_expectation_sha256=(
+                        expectation.evidence_sha256
+                    ),
+                    evaluation_source_state_revision=None,
+                    result=None,
+                    result_sha256=None,
+                ).to_dict()
+            )
+
+        return self.store.update(
+            identity,
+            commit_expectation,
+            expected_revision=current.revision,
+        )
+
+    def _commit_pwn_disclosure_result(
+        self,
+        identity: ChallengeIdentity,
+        current: ChallengeState,
+        child: Experiment,
+    ) -> ChallengeState:
+        inputs = self._pwn_disclosure_inputs_from_state(current, child)
+        envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            child.extra["pwn_disclosure"]
+        )
+        expectation = envelope.trusted_receipt_expectation
+        if (
+            envelope.phase
+            is not PwnDisclosurePhase.EXPECTATION_COMMITTED
+            or type(expectation)
+            is not PwnDisclosureTrustedReceiptExpectation
+        ):
+            raise EngineError(
+                "Pwn disclosure result transition is stale"
+            )
+        result = self._recompute_pwn_disclosure_result(
+            current,
+            inputs,
+            expectation,
+        )
+
+        def verify_exact_result() -> None:
+            if (
+                self._recompute_pwn_disclosure_result(
+                    current,
+                    inputs,
+                    expectation,
+                )
+                != result
+            ):
+                raise EngineError(
+                    "Pwn disclosure result changed before state replacement"
+                )
+
+        def commit_result(state: ChallengeState) -> None:
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == child.id
+            )
+            rebuilt = self._pwn_disclosure_inputs_from_state(state, item)
+            observed = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                item.extra["pwn_disclosure"]
+            )
+            if rebuilt != inputs or observed != envelope:
+                raise EngineError(
+                    "Pwn disclosure inputs changed before result commit"
+                )
+            item.extra["pwn_disclosure"] = (
+                PwnRuntimeSnapshotDisclosureEnvelope(
+                    schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                    phase=PwnDisclosurePhase.COMPLETE,
+                    expectation_source_state_revision=(
+                        envelope.expectation_source_state_revision
+                    ),
+                    trusted_receipt_expectation=expectation,
+                    trusted_receipt_expectation_sha256=(
+                        envelope.trusted_receipt_expectation_sha256
+                    ),
+                    evaluation_source_state_revision=current.revision,
+                    result=result,
+                    result_sha256=result.evidence_sha256,
+                ).to_dict()
+            )
+
+        return self.store.update(
+            identity,
+            commit_result,
+            expected_revision=current.revision,
+            commit_guard=verify_exact_result,
+            pre_replace_guard=verify_exact_result,
+        )
+
+    def _advance_pwn_runtime_snapshot_disclosures(
+        self,
+        identity: ChallengeIdentity,
+    ) -> ChallengeState:
+        """Drain state-only disclosure phases before any unrelated commit."""
+
+        while True:
+            current = self.store.load(identity, recover=False)
+            pending: list[
+                tuple[
+                    Experiment,
+                    PwnRuntimeSnapshotDisclosureEnvelope,
+                ]
+            ] = []
+            for child in current.experiments:
+                if (
+                    child.status is not ExperimentStatus.COMPLETED
+                    or child.extra.get("managed_contract_version") != 2
+                    or child.extra.get("engine_executor")
+                    != _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                ):
+                    continue
+                envelope = (
+                    PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                        child.extra["pwn_disclosure"]
+                    )
+                )
+                if envelope.phase is not PwnDisclosurePhase.COMPLETE:
+                    pending.append((child, envelope))
+            if not pending:
+                return current
+            committed_expectations = [
+                item
+                for item in pending
+                if item[1].phase
+                is PwnDisclosurePhase.EXPECTATION_COMMITTED
+            ]
+            if len(committed_expectations) > 1:
+                raise EngineError(
+                    "multiple Pwn disclosures hold a one-revision "
+                    "expectation boundary"
+                )
+            if committed_expectations:
+                child, _envelope = committed_expectations[0]
+                self._commit_pwn_disclosure_result(
+                    identity,
+                    current,
+                    child,
+                )
+                continue
+            child, _envelope = pending[0]
+            self._commit_pwn_disclosure_expectation(
+                identity,
+                current,
+                child,
+            )
+
     def _pwn_runtime_snapshot_child_for_confirmed_crash(
         self,
         parent: Experiment,
@@ -10239,24 +10810,13 @@ class ChallengeEngine:
             running,
             self.config.runtime.flag_patterns,
         )
-        detected_snapshot_flags: list[DetectedFlag] = []
 
         def receive_snapshot_flag(detected: DetectedFlag) -> None:
-            if (
-                run_id is None
-                or not candidate_value_is_valid(detected.value)
-            ):
+            if not candidate_value_is_valid(detected.value):
                 return
-            self.store.record_candidate_intent(
-                identity,
-                value=detected.value,
-                source=detected.source,
-                source_run_id=run_id,
-                observed_at=detected.observed_at,
-                tier=flag_policy.tier_for(detected.value),
-                format_epoch=flag_policy.configuration_epoch,
-            )
-            detected_snapshot_flags.append(detected)
+            # A diagnostic disclosure has no candidate/proof authority.
+            # Still notify the operator immediately, but never create a
+            # promotable intent or canonical FlagCandidate from this stream.
             self._on_tool_flag(identity, detected)
 
         snapshot_flag_detector = FlagDetector(
@@ -10821,6 +11381,21 @@ class ChallengeEngine:
                     stdout_artifact.id,
                     stderr_artifact.id,
                 ]
+                item.extra["managed_contract_version"] = 2
+                item.extra["pwn_disclosure"] = (
+                    PwnRuntimeSnapshotDisclosureEnvelope(
+                        schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                        phase=(
+                            PwnDisclosurePhase.AWAITING_EXPECTATION
+                        ),
+                        expectation_source_state_revision=None,
+                        trusted_receipt_expectation=None,
+                        trusted_receipt_expectation_sha256=None,
+                        evaluation_source_state_revision=None,
+                        result=None,
+                        result_sha256=None,
+                    ).to_dict()
+                )
                 state.runs.append(run_reference)
                 state.receipts.append(execution_receipt)
                 state.artifacts.extend(
@@ -10830,59 +11405,16 @@ class ChallengeEngine:
                         stderr_artifact,
                     ]
                 )
-                existing_candidate_values = {
-                    candidate.value for candidate in state.candidates
-                }
-                for index, detected in enumerate(
-                    detected_snapshot_flags,
-                    start=1,
-                ):
-                    if detected.value in existing_candidate_values:
-                        continue
-                    state.candidates.append(
-                        FlagCandidate(
-                            id=_record_id(
-                                "C",
-                                run_id,
-                                f"pwn-runtime-snapshot-{index}",
-                            ),
-                            value=detected.value,
-                            status=(
-                                CandidateStatus.OBSERVED_CANDIDATE
-                            ),
-                            source_run_id=run_id,
-                            locator=detected.source,
-                            created_at=detected.observed_at,
-                            tier=flag_policy.tier_for(detected.value),
-                            format_epoch=(
-                                flag_policy.configuration_epoch
-                            ),
-                        )
-                    )
-                    existing_candidate_values.add(detected.value)
                 state.budget.spent_seconds += max(
                     0,
                     int(time.monotonic() - started),
                 )
 
-            committed_state = self.store.update(identity, finish)
+            self.store.update(identity, finish)
             committed = True
-            try:
-                self.store.clear_candidate_intents(
-                    identity,
-                    tuple(
-                        detected.value
-                        for detected in detected_snapshot_flags
-                    ),
-                )
-            except Exception as cleanup_error:
-                print(
-                    "warning: Pwn runtime snapshot candidate intent "
-                    f"cleanup failed after canonical commit: {cleanup_error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return committed_state
+            return self._advance_pwn_runtime_snapshot_disclosures(
+                identity
+            )
         finally:
             if lease is not None and not lease.released:
                 lease.release()
@@ -10891,15 +11423,50 @@ class ChallengeEngine:
             if source_staging is not None:
                 source_staging.cleanup()
             if not committed:
-                self._cleanup_uncommitted_artifacts(
-                    identity,
-                    pending_artifacts,
-                )
-                if run_id is not None:
-                    self._cleanup_uncommitted_pwn_crash_runs(
+                cleanup_is_safe = True
+                try:
+                    canonical = self.store.load(
                         identity,
-                        (run_id,),
+                        recover=False,
                     )
+                    canonical_run_ids = {
+                        run.id for run in canonical.runs
+                    }
+                    canonical_artifact_ids = {
+                        artifact.id
+                        for artifact in canonical.artifacts
+                    }
+                    if (
+                        run_id in canonical_run_ids
+                        or any(
+                            artifact.id in canonical_artifact_ids
+                            for artifact in pending_artifacts
+                        )
+                    ):
+                        cleanup_is_safe = False
+                except BaseException as inspection_error:
+                    # A state replacement may already have happened even
+                    # when a hard interruption prevented update() from
+                    # returning.  Preserve bounded files when canonical
+                    # membership cannot be proven absent.
+                    cleanup_is_safe = False
+                    print(
+                        "warning: Pwn runtime snapshot cleanup skipped "
+                        "because canonical state could not be inspected: "
+                        f"{inspection_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if cleanup_is_safe:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        pending_artifacts,
+                    )
+                    if run_id is not None:
+                        self._cleanup_uncommitted_pwn_crash_runs(
+                            identity,
+                            (run_id,),
+                        )
 
     def _execute_pwn_crash_differential(
         self,
@@ -12212,6 +12779,10 @@ class ChallengeEngine:
                     f"another session already owns {identity.key}"
                 ) from error
         state = self.store.load(identity)
+        if str(get_adapter(state.category).name) == "pwn":
+            state = self._advance_pwn_runtime_snapshot_disclosures(
+                identity
+            )
         if (
             _automated
             and state.status in _AUTOMATED_LOOP_STOP_STATUSES
@@ -12381,6 +12952,11 @@ class ChallengeEngine:
                             file=sys.stderr,
                             flush=True,
                         )
+                        # A persisted disclosure expectation is valid for
+                        # exactly the next canonical replacement.  Never let
+                        # another action commit after a post-terminal
+                        # reduction failure.
+                        return state
                 continue
             if (
                 experiment.command == _PWN_CRASH_ENGINE_COMMAND
@@ -18858,6 +19434,9 @@ class ChallengeEngine:
     ) -> ChallengeState:
         """Recover crash-left notifications and orphaned tool experiments."""
 
+        initial = self.store.load(identity, recover=False)
+        if str(get_adapter(initial.category).name) == "pwn":
+            self._advance_pwn_runtime_snapshot_disclosures(identity)
         state = self._reconcile_candidate_intents_and_notify(identity)
         pwn_recoveries: list[
             tuple[str, PwnCrashRecipe, tuple[str, ...]]
