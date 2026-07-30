@@ -42,6 +42,10 @@ AI Agent는 CTF 상위권 경쟁에서 빼기 어려운 도구가 되었습니�
 다만 13의 가동률 표는 12의 수용 판정에 반례를 제기합니다. 계약이 코드에
 존재하는 것과 운용에서 지켜지는 것은 다른 사건이며, 12는 전자만 판정했습니다.
 
+16은 10과 12 이후에 추가된 Pwn D→V/failure replay 범위의 as-built
+delta입니다. 이 좁은 범위에서는 16을 따르되, 실제 solve 성능 관측은 15를
+소급해 바꾸지 않습니다.
+
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
 12는 확정 계약을 현재 증거로 수용할 수 있는지를 기록합니다. 운영 명령은
@@ -55,6 +59,7 @@ AI Agent는 CTF 상위권 경쟁에서 빼기 어려운 도구가 되었습니�
 - [13. 실전 기록 분석](13-field-record-analysis.md) — **첫 실전 기록 관측.** ACSC forensics 1문제와 Dreamhack 4문제의 정본 상태·run·세션 로그를 계수해, 설계된 계약이 운용에서 실제로 몇 퍼센트나 가동됐는지 기록합니다 (관측일 2026-07-29)
 - [14. 관리형 풀이 엔진 수술 전 근거 동결](14-managed-engine-evidence-freeze.md) — managed 전환 전에 A–D 관측 경로, `[측정]/[해석]/[가설]`, X-22~25 중단 조건과 표본 한계를 고정합니다
 - [15. NYU CTF Bench Pwn 부분 실측 중단 기록](15-nyu-pwn-current-baseline.md) — 개선된 working tree로 고정한 Pwn 10문제 중 실제 시작한 4문제의 부분 관측, 사전검증, 엔진 병목과 사용자 중단 상태를 보존합니다. 완성된 `0/10` baseline으로 해석하지 않습니다 (관측일 2026-07-30)
+- [16. Pwn crash 실행 게이트와 실패 재투입 구현 기록](16-pwn-crash-gate-and-failure-replay.md) — engine-owned 3+3 D→V oracle, stdout/stderr commit 재검증, typed non-pass failure capsule, 1,536-byte resume와 독립 평가 metric의 현재 구현 및 아직 남은 leak/primitive/exploit 경계를 기록합니다 (구현·검증일 2026-07-30)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
@@ -66,8 +71,8 @@ AI Agent는 CTF 상위권 경쟁에서 빼기 어려운 도구가 되었습니�
 
 | 목적 | 읽을 것 |
 | --- | --- |
-| **현재 무엇이 실제로 작동하는지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "구현 상태 요약", [12. 최종 수용성 기록](12-final-acceptance.md), 저장소 [README](../README.md) |
-| **다음에 무엇을 코딩할지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "남은 작업 우선순위"와 [9. 구현 설계도](09-implementation-blueprint.md)의 "구현 단계" |
+| **현재 무엇이 실제로 작동하는지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "구현 상태 요약", [12. 최종 수용성 기록](12-final-acceptance.md), [16. Pwn crash 실행 게이트](16-pwn-crash-gate-and-failure-replay.md), 저장소 [README](../README.md) |
+| **다음에 무엇을 코딩할지 알고 싶다** | [16. Pwn crash 실행 게이트](16-pwn-crash-gate-and-failure-replay.md)의 "다음 구현 우선순위", [10. 구현 결과](10-implementation-result.md)의 "남은 작업 우선순위"와 [9. 구현 설계도](09-implementation-blueprint.md)의 "구현 단계" |
 | **왜 그것을 먼저 만드는지 알고 싶다** | [6. 엔진 설계도](06-engine-blueprint.md)의 "레버 우선순위"와 "안티-레버" 두 절. 근거 강도순으로 정렬돼 있습니다 |
 | **실제로 문제가 어떻게 풀리는지 보고 싶다** | [9. 구현 설계도](09-implementation-blueprint.md)의 부록 "실제 운용 시나리오". 카테고리별로 갈리는 지점이 표로 있습니다 |
 | **특정 카테고리를 개선하려 한다** | 해당 편의 "엔진 설계 요구사항" 절. 요구사항 ID와 CTF-OS 현황이 표로 정리돼 있습니다 |

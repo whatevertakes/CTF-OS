@@ -460,6 +460,42 @@ compact 표현을 사용합니다. 동일 fingerprint가 과거 checkpoint에 �
 나왔는지도 함께 보여 반복 실패를 구분합니다. fingerprint가 canonical
 cycle evidence와 맞지 않으면 resume context 생성은 fail-closed합니다.
 
+Pwn의 engine-owned crash gate가 `INCONCLUSIVE` 또는 `FAILED`로 끝난
+경우에도 같은 failure capsule 경로를 사용합니다. 여섯 실행의 run,
+receipt, stdout/stderr artifact ID와 typed verdict가 다음 context에
+재진입하며, 1,536바이트 compact capsule에서도 해당 판정과 적어도 하나의
+정확한 run/artifact pointer를 유지합니다. 일반 experiment의 복수 receipt는
+계속 거부하고, Pwn gate의 정확한 여섯 receipt만 결과의 attempt 순서대로
+묶습니다. terminal Pwn 결과는 원래 managed cycle의 selected action에서
+사라질 수 없고, capsule reason/status/stage도 실제 non-pass 판정과
+일치해야 합니다.
+
+### Managed Pwn D→V crash gate
+
+로컬 Pwn attack wave에는 모델의 “crash 성공” 주장을 그대로 믿지 않는 첫
+실행 게이트가 연결돼 있습니다. Builder가 exact payload artifact와 열린
+hypothesis를 `verify_pwn_crash`로 지정하면 엔진이 다음을 고정합니다.
+
+- 현재 source manifest의 실행 가능한 ELF, payload size/SHA-256, pinned
+  image digest와 capability attestation을 하나의 recipe로 결속합니다.
+- network-none clean sandbox에서 payload 3회와 엔진이 만든 빈 control
+  3회를 같은 전체 deadline 안에 one-shot으로 실행합니다.
+- payload 실행 중 같은 허용 signal이 2/3회 이상 발생하고 세 control이
+  모두 정상 종료할 때만 `CONFIRMED`입니다. 단순 exit code 139는 signal
+  crash로 세지 않으며 control crash는 성공을 막습니다.
+- 여섯 request/contract/receipt와 stdout/stderr artifact의 exact
+  ID·path·SHA-256·size를 상태에 연결합니다. 외부 evaluator는 파일을
+  bounded/no-follow로 다시 읽고 gate 판정을 독립 재계산합니다.
+- 큰 stderr를 포함한 전체 실행 stream의 flag-looking 문자열은 즉시
+  운영자에게 표시하지만 후보로만 기록하며 자동 제출하지 않습니다.
+- `CONFIRMED`일 때만 hypothesis를 확인합니다. crash 확인만으로 Fact,
+  exploit primitive, proof 또는 제출 상태를 만들지 않습니다.
+
+프로세스가 commit 전에 죽으면 다음 session boundary가 typed experiment를
+`FAILED`로 닫고, canonical state에 없는 정확한 orphan run/evidence만
+symlink를 따라가지 않고 정리합니다. nonpass gate는 failure capsule로
+다음 Captain에게 전달됩니다.
+
 ### Managed Rev executable oracle
 
 로컬 Rev 문제에는 설명문이 아니라 원본 바이너리의 stdin 판정을 사용하는
@@ -886,17 +922,26 @@ ctfos evaluate --contest 'Demo CTF' --category web --challenge 'Example'
 ```
 
 이 명령은 model/tool/proof/submission을 새로 실행하지 않습니다.
-`solve@1/3`, clean reproduction, false proof, proof 시간, 반복 명령,
-stall recovery 가용성, model usage, tool wall time, refusal, invalid
-contract와 사람이 기록한 점수를 계산하며, 근거가 없는 값은 0으로
-추측하지 않고 `unavailable` 또는 `partial`로 표시합니다.
+`solve@1/3`, clean reproduction, Pwn crash gate pass rate, false proof,
+proof 시간, 반복 명령, stall recovery 가용성, model usage, tool wall
+time, refusal, invalid contract와 사람이 기록한 점수를 계산하며, 근거가
+없는 값은 0으로 추측하지 않고 `unavailable` 또는 `partial`로 표시합니다.
+
+`pwn_crash_gate_pass_rate`는 terminal typed Pwn gate 전체를 분모로 둡니다.
+확인, 의미 오류, transport 오류, setup 실패, 독립 재검증 불가를 서로
+분리하며 payload, 여섯 stdout/stderr, capability attestation과 여섯
+request를 다시 읽어 판정을 재구성합니다. setup 실패와 unverifiable
+terminal gate도 분모에서 빠지지 않습니다.
 
 모델이 기록한 임의 progress marker의 최초 시간은
 `time_to_first_claimed_progress`로만 집계합니다. 실행 가능한 engine-owned
 primitive stage gate가 아직 없으므로 `time_to_first_primitive`는 그런
 게이트가 연결될 때까지 `unavailable`입니다. marker 문구나 임의
 `extra.engine_owned=true`는 검증 증거로 승격되지 않습니다. 이 의미 변경과
-새 metric key는 evaluation output `schema_version: 2`부터 적용됩니다.
+관련 metric key는 evaluation output `schema_version: 2`부터 적용됩니다.
+독립 재검증된 Pwn crash gate metric은 `schema_version: 3`에서
+추가됐습니다. crash D→V는 취약 동작 확인이지 exploit primitive가 아니므로
+`time_to_first_primitive`의 근거로 사용하지 않습니다.
 
 로컬 회귀 테스트:
 
@@ -910,7 +955,13 @@ wall 173.51초). deterministic remote-limiter test와 release 문서를 포함�
 최종 production/test tree `abdea5b`에서도 fresh-clone의 901개 테스트,
 capability, tool manifest, browser safety, Rev inventory/stdin runner와
 shell/source 검증이 모두 통과했다(테스트 345.999초, 측정 wall 343.54초).
-이후 변경은 이 결과를 설명하는 문서 전용 commit이다. 다른 인터프리터
+이 값은 당시 freeze의 역사적 기록이다.
+
+Pwn D→V crash gate와 failure replay code freeze `c3de503`에서는 전체
+1,010개 테스트가 218.286초에 통과했다. 같은 commit의 fresh-clone source
+gate에서도 1,010개가 210.227초에 통과했고 capability contract, tool
+manifest, browser safety, Pwn crash oracle 9개, Rev inventory 13개, Rev
+stdin runner 17개와 shell/source 검증이 모두 통과했다. 다른 인터프리터
 결과는 최종 gate에 사용하지 않는다.
 
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
@@ -1006,9 +1057,12 @@ positive 3회와 negative control 3회를 exact pinned image에서 추가 검증
   파일, non-native target과 이미지에 없는 dynamic library는 지원하지 않고
   fail-closed합니다. mutation control을 모두 거부하지 않는 의도적으로
   관대한 parser도 proof를 통과하지 못할 수 있습니다.
-- Local Pwn impact, Web multi-user impact, Crypto metamorphic variant,
-  Forensic evidence hash-chain과 Misc transform-DAG의 managed proof oracle은
-  아직 구현되지 않았으며 해당 조합은 proof 등록 단계에서 fail-closed합니다.
+- Local Pwn에는 stdin 기반 ELF D→V crash gate가 있지만 leak/`N/A`,
+  primitive, exploit chain, local stability, remote portability와 impact
+  proof는 아직 없습니다. Web multi-user impact, Crypto metamorphic
+  variant, Forensic evidence hash-chain과 Misc transform-DAG의 managed
+  proof oracle도 아직 구현되지 않았으며 해당 조합은 proof 등록 단계에서
+  fail-closed합니다.
 - image digest가 설정되지 않아도 실행은 가능하며 `doctor`가 경고합니다.
 - `work_tree_max_bytes`와 canonical artifact 합계 cap은 문제 디렉터리 전체의
   disk quota가 아닙니다. 누적 `runs/` raw, contest
