@@ -69,6 +69,9 @@ class ScaffoldBindingTests(unittest.TestCase):
         binding = build_scaffold_launch_binding(
             metadata=metadata,
             configuration_epoch=7,
+            contest_id="contest-a",
+            category="pwn",
+            challenge_id="challenge-a",
             arm=THIN_SCAFFOLD,
             model_id="gpt-5.6-sol",
             runtime_image_digest=IMAGE,
@@ -85,6 +88,9 @@ class ScaffoldBindingTests(unittest.TestCase):
             validate_scaffold_launch_record(
                 metadata=metadata,
                 configuration_epoch=7,
+                contest_id="contest-a",
+                category="pwn",
+                challenge_id="challenge-a",
                 value=record,
                 expected_arm=THIN_SCAFFOLD,
                 expected_command_contract_sha256=SHA_E,
@@ -97,6 +103,9 @@ class ScaffoldBindingTests(unittest.TestCase):
         record = build_scaffold_launch_binding(
             metadata=metadata,
             configuration_epoch=7,
+            contest_id="contest-a",
+            category="pwn",
+            challenge_id="challenge-a",
             arm=THIN_SCAFFOLD,
             model_id="gpt-5.6-sol",
             runtime_image_digest=IMAGE,
@@ -127,6 +136,23 @@ class ScaffoldBindingTests(unittest.TestCase):
             validate_scaffold_launch_record(
                 metadata=other,
                 configuration_epoch=7,
+                contest_id="contest-a",
+                category="pwn",
+                challenge_id="challenge-a",
+                value=record,
+                expected_arm=THIN_SCAFFOLD,
+                expected_command_contract_sha256=SHA_E,
+            )
+        with self.assertRaisesRegex(
+            ScaffoldBindingError,
+            "another session",
+        ):
+            validate_scaffold_launch_record(
+                metadata=metadata,
+                configuration_epoch=7,
+                contest_id="contest-a",
+                category="pwn",
+                challenge_id="challenge-b",
                 value=record,
                 expected_arm=THIN_SCAFFOLD,
                 expected_command_contract_sha256=SHA_E,
@@ -137,6 +163,9 @@ class ScaffoldBindingTests(unittest.TestCase):
         common = {
             "metadata": metadata,
             "configuration_epoch": 3,
+            "contest_id": "contest-a",
+            "category": "pwn",
+            "challenge_id": "challenge-a",
             "arm": THIN_SCAFFOLD,
             "model_id": "gpt-5.6-sol",
             "runtime_image_digest": IMAGE,

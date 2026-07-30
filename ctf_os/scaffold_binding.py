@@ -129,6 +129,9 @@ class ScaffoldLaunchBinding:
     arm: str
     benchmark_id: str
     case_id: str
+    contest_id: str
+    category: str
+    challenge_id: str
     session_id: str
     manifest_sha256: str
     source_manifest_sha256: str
@@ -144,6 +147,8 @@ class ScaffoldLaunchBinding:
             "arm": self.arm,
             "benchmark_id": self.benchmark_id,
             "case_id": self.case_id,
+            "category": self.category,
+            "challenge_id": self.challenge_id,
             "command_contract_sha256": self.command_contract_sha256,
             "configuration_epoch": self.configuration_epoch,
             "manifest_sha256": self.manifest_sha256,
@@ -154,6 +159,7 @@ class ScaffoldLaunchBinding:
             "session_id": self.session_id,
             "source_manifest_sha256": self.source_manifest_sha256,
             "tool_manifest_sha256": self.tool_manifest_sha256,
+            "contest_id": self.contest_id,
         }
 
     @property
@@ -179,6 +185,9 @@ def build_scaffold_launch_binding(
     *,
     metadata: Mapping[str, object],
     configuration_epoch: int,
+    contest_id: str,
+    category: str,
+    challenge_id: str,
     arm: str,
     model_id: str,
     runtime_image_digest: str,
@@ -229,6 +238,9 @@ def build_scaffold_launch_binding(
             metadata.get("evaluation_case_id"),
             "evaluation_case_id",
         ),
+        contest_id=_bounded_text(contest_id, "contest_id"),
+        category=_bounded_text(category, "category"),
+        challenge_id=_bounded_text(challenge_id, "challenge_id"),
         session_id=_bounded_text(
             metadata.get("evaluation_session_id"),
             "evaluation_session_id",
@@ -269,8 +281,11 @@ def parse_scaffold_launch_record(
         "benchmark_id",
         "binding_sha256",
         "case_id",
+        "category",
+        "challenge_id",
         "command_contract_sha256",
         "configuration_epoch",
+        "contest_id",
         "launched_at",
         "manifest_sha256",
         "model_config_sha256",
@@ -303,6 +318,11 @@ def parse_scaffold_launch_record(
             value["benchmark_id"], "benchmark_id"
         ),
         case_id=_bounded_text(value["case_id"], "case_id"),
+        contest_id=_bounded_text(value["contest_id"], "contest_id"),
+        category=_bounded_text(value["category"], "category"),
+        challenge_id=_bounded_text(
+            value["challenge_id"], "challenge_id"
+        ),
         session_id=_bounded_text(value["session_id"], "session_id"),
         manifest_sha256=_sha256(
             value["manifest_sha256"], "manifest_sha256"
@@ -353,6 +373,9 @@ def validate_scaffold_launch_record(
     *,
     metadata: Mapping[str, object],
     configuration_epoch: int,
+    contest_id: str,
+    category: str,
+    challenge_id: str,
     value: object,
     expected_arm: str,
     expected_command_contract_sha256: str,
@@ -363,6 +386,9 @@ def validate_scaffold_launch_record(
     expected = build_scaffold_launch_binding(
         metadata=metadata,
         configuration_epoch=configuration_epoch,
+        contest_id=contest_id,
+        category=category,
+        challenge_id=challenge_id,
         arm=expected_arm,
         model_id=binding.model_id,
         runtime_image_digest=binding.runtime_image_digest,
