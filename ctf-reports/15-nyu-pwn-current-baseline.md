@@ -98,8 +98,11 @@ pass2 manifest의 각 case에 고정돼 있다.
 - 그 19개 합계는 input 797,414, cached input 408,832, output 204,766,
   reasoning output 171,763 tokens였다.
 - 기록된 두 tool run의 합산 wall time은 1.474934초였다.
-- clean reproduction, solve@3, time-to-first-primitive, time-to-proof,
-  false-proof count는 필요한 정본 증거가 없어 계산할 수 없었다.
+- clean reproduction, solve@3, time-to-proof, false-proof count는 필요한
+  정본 증거가 없어 계산할 수 없었다. 당시 progress marker도 없어서
+  현재 이름의 `time_to_first_claimed_progress` 역시 계산할 수 없다.
+  `time_to_first_primitive`는 engine-owned executable primitive gate가
+  아직 없으므로 evaluation schema v2에서 명시적으로 unavailable이다.
 
 `feather`가 가장 멀리 진행했지만 exploit 성공 증거는 없었다. cycle 2개를
 완료하고 세 번째 captain 실행 중 사용자 요청으로 중단했다. 시작한 어떤

@@ -436,6 +436,30 @@ evaluation은 다음 context의 최우선 evidence가 되지만 다음 cycle을 
 hard barrier는 X-22를 통과하기 전에는 활성화하지 않습니다. `solve`의
 기본값 역시 canary 승격 기준을 통과하기 전까지 assisted로 유지됩니다.
 
+### Managed failure capsule
+
+계약 위반, frontier 구성 실패, invalid wave, proof recipe 또는 proof 실행
+실패는 단순한 checkpoint note로 끝나지 않습니다. 엔진이 최신 checkpoint에
+typed failure capsule을 만들고 다음 Captain context의 mandatory
+`resume_capsule`에 다시 넣습니다. capsule은 실패 stage와 machine
+`reason_code`, cycle 전후 state revision, 실패 fingerprint, 관련
+run/experiment/evidence ID, 미해결 hypothesis, 최대 세 개의 다음 판별
+experiment를 기록합니다. source가 한도를 넘으면 recovery를 중단하지 않고
+결정적으로 잘라 각 종류의 omitted count를 남깁니다. immutable capture
+내용은 별도 content hash로 보호하고, 반복 판정용 fingerprint는 서로 다른
+cycle의 동등한 실패만 묶습니다.
+
+모델 command, provider/normalization message, checkpoint note 같은 자유
+텍스트는 capsule에 복사하지 않습니다. 다음 모델에는 command SHA-256,
+오류 개수와 machine failure kind, canonical run의 `result.json` 또는
+`validation.json` exact pointer만 보입니다. experiment의 expected/keep/
+drop 문구도 재주입하지 않고 contract hash와 state pointer로 대체합니다.
+최소 4 KiB context에서도 최신
+failure capsule과 적어도 하나의 정확한 run pointer를 유지하도록 별도
+compact 표현을 사용합니다. 동일 fingerprint가 과거 checkpoint에 몇 번
+나왔는지도 함께 보여 반복 실패를 구분합니다. fingerprint가 canonical
+cycle evidence와 맞지 않으면 resume context 생성은 fail-closed합니다.
+
 ### Managed Rev executable oracle
 
 로컬 Rev 문제에는 설명문이 아니라 원본 바이너리의 stdin 판정을 사용하는
@@ -862,10 +886,17 @@ ctfos evaluate --contest 'Demo CTF' --category web --challenge 'Example'
 ```
 
 이 명령은 model/tool/proof/submission을 새로 실행하지 않습니다.
-`solve@1/3`, clean reproduction, false proof, 첫 primitive/proof 시간,
-반복 명령, stall recovery 가용성, model usage, tool wall time, refusal,
-invalid contract와 사람이 기록한 점수를 계산하며, 근거가 없는 값은 0으로
+`solve@1/3`, clean reproduction, false proof, proof 시간, 반복 명령,
+stall recovery 가용성, model usage, tool wall time, refusal, invalid
+contract와 사람이 기록한 점수를 계산하며, 근거가 없는 값은 0으로
 추측하지 않고 `unavailable` 또는 `partial`로 표시합니다.
+
+모델이 기록한 임의 progress marker의 최초 시간은
+`time_to_first_claimed_progress`로만 집계합니다. 실행 가능한 engine-owned
+primitive stage gate가 아직 없으므로 `time_to_first_primitive`는 그런
+게이트가 연결될 때까지 `unavailable`입니다. marker 문구나 임의
+`extra.engine_owned=true`는 검증 증거로 승격되지 않습니다. 이 의미 변경과
+새 metric key는 evaluation output `schema_version: 2`부터 적용됩니다.
 
 로컬 회귀 테스트:
 
