@@ -39,6 +39,7 @@ if grep -q '^160000 ' <<<"${entry}"; then
 fi
 
 required=(
+  ctf-os-image/.dockerignore
   ctf-os-image/AGENTS.md
   ctf-os-image/Dockerfile
   ctf-os-image/SOURCE.json
