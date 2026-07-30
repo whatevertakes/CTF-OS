@@ -63,6 +63,7 @@ from ctf_os.engine.pwn_ip_control import (
 )
 from ctf_os.director.resources import tool_profile
 from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION
+from ctf_os.store.atomic import canonical_json_bytes
 from ctf_os.store.upgrades import UnsupportedSchemaVersion, upgrade_state
 
 EVALUATION_SCHEMA_VERSION = 3
@@ -70,6 +71,7 @@ DEFAULT_MAX_STATES = 1024
 MAX_STATE_LIMIT = 4096
 MAX_STATE_BYTES = 16 * 1024 * 1024
 MAX_PROOF_RESULT_BYTES = 64 * 1024
+MAX_TYPED_PROOF_EVALUATION_BYTES = 8 * 1024 * 1024
 MAX_DIAGNOSTICS = 128
 MAX_DIAGNOSTIC_BYTES = 512
 MAX_COMMAND_BYTES = 64 * 1024
@@ -111,6 +113,9 @@ _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
 _PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
 _PWN_IP_CONTROL_ENGINE_EXECUTOR = "pwn_ip_control_v1"
 _PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
+_CRYPTO_METAMORPHIC_PROTOCOL = (
+    "crypto_solver_metamorphic_variant_v1"
+)
 _PWN_CRASH_FLAG_PATTERNS_ENV = "CTF_WRAP_FLAG_PATTERNS_JSON"
 _PWN_CRASH_EVIDENCE_KEYS = {
     "schema_version",
@@ -1592,6 +1597,153 @@ def _parse_proof_result(
     )
 
 
+def _parse_crypto_metamorphic_result(
+    record: _LoadedState,
+    candidate_id: str,
+) -> _ProofObservation:
+    candidate = next(
+        item
+        for item in record.state.candidates
+        if item.id == candidate_id
+    )
+    binding = candidate.extra.get("crypto_metamorphic_proof")
+    if type(binding) is not dict:
+        raise EvaluationInputError(
+            "Crypto metamorphic proof binding is not an object"
+        )
+    expected_binding_keys = {
+        "artifact_id",
+        "evaluation",
+        "evaluation_sha256",
+        "oracle_authority",
+        "passed",
+        "plan_sha256",
+        "proof_result",
+        "protocol",
+        "run_ids",
+    }
+    if (
+        set(binding) != expected_binding_keys
+        or binding.get("protocol") != _CRYPTO_METAMORPHIC_PROTOCOL
+        or binding.get("oracle_authority")
+        != "explicit_operator_input"
+    ):
+        raise EvaluationInputError(
+            "Crypto metamorphic proof binding is not exact"
+        )
+    artifact_id = binding.get("artifact_id")
+    artifact = next(
+        (
+            item
+            for item in record.state.artifacts
+            if item.id == artifact_id
+        ),
+        None,
+    )
+    if artifact is None:
+        raise EvaluationInputError(
+            "Crypto metamorphic evaluation artifact is absent"
+        )
+    payload = _read_verified_reference(
+        record.root,
+        artifact,
+        maximum_bytes=MAX_TYPED_PROOF_EVALUATION_BYTES,
+        display_name="Crypto metamorphic evaluation artifact",
+    )
+    raw_evaluation = _strict_json_bytes(
+        payload,
+        "Crypto metamorphic evaluation artifact",
+    )
+    if (
+        raw_evaluation != binding.get("evaluation")
+        or payload != canonical_json_bytes(raw_evaluation)
+    ):
+        raise EvaluationInputError(
+            "Crypto metamorphic evaluation bytes are not canonical"
+        )
+    try:
+        semantic_bytes = (
+            json.dumps(
+                raw_evaluation,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Crypto metamorphic evaluation is not commit-safe"
+        ) from error
+    evaluation_sha256 = hashlib.sha256(semantic_bytes).hexdigest()
+    if (
+        binding.get("evaluation_sha256") != evaluation_sha256
+        or artifact.extra.get("kind")
+        != "crypto_metamorphic_evaluation"
+        or artifact.extra.get("protocol")
+        != _CRYPTO_METAMORPHIC_PROTOCOL
+        or artifact.extra.get("candidate_id") != candidate_id
+        or artifact.extra.get("evaluation_sha256")
+        != evaluation_sha256
+    ):
+        raise EvaluationInputError(
+            "Crypto metamorphic evaluation commitment is inconsistent"
+        )
+
+    proof = binding.get("proof_result")
+    if type(proof) is not dict or set(proof) != _PROOF_RESULT_KEYS:
+        raise EvaluationInputError(
+            "Crypto metamorphic ProofResult schema is invalid"
+        )
+    passed = proof.get("passed")
+    successful = _nonnegative_integer(
+        proof.get("successful_attempts")
+    )
+    required = _nonnegative_integer(proof.get("required_attempts"))
+    total = _nonnegative_integer(proof.get("total_attempts"))
+    failures = proof.get("failures")
+    run_ids = proof.get("run_ids")
+    if (
+        type(passed) is not bool
+        or passed is not binding.get("passed")
+        or proof.get("candidate") != candidate.value
+        or proof.get("policy_mode") != _CRYPTO_METAMORPHIC_PROTOCOL
+        or proof.get("source_manifest_sha256")
+        != record.state.metadata.get("source_manifest_sha256")
+        or successful is None
+        or required is None
+        or total is None
+        or successful > total
+        or (passed and successful < required)
+        or type(failures) is not list
+        or not all(
+            type(value) is str
+            and len(value.encode("utf-8")) <= 4096
+            for value in failures
+        )
+        or type(run_ids) is not list
+        or run_ids != binding.get("run_ids")
+        or len(run_ids) != total
+        or not all(
+            type(value) is str
+            and value
+            and len(value.encode("utf-8")) <= 255
+            for value in run_ids
+        )
+    ):
+        raise EvaluationInputError(
+            "Crypto metamorphic ProofResult fields are invalid"
+        )
+    return _ProofObservation(
+        candidate_id=candidate_id,
+        passed=passed,
+        successful_attempts=successful,
+        total_attempts=total,
+        completed_at=artifact.created_at,
+    )
+
+
 def _proof_metrics(
     records: Sequence[_LoadedState],
     diagnostics: _Diagnostics,
@@ -1625,6 +1777,25 @@ def _proof_metrics(
                 diagnostics.add(
                     f"{record.state.identity.key}: proof result "
                     f"{artifact.id} ignored: {error}"
+                )
+                continue
+            observations.append((record, observation))
+        for candidate in record.state.candidates:
+            if "crypto_metamorphic_proof" not in candidate.extra:
+                continue
+            try:
+                observation = _parse_crypto_metamorphic_result(
+                    record,
+                    candidate.id,
+                )
+            except (
+                EvaluationInputError,
+                OSError,
+            ) as error:
+                invalid += 1
+                diagnostics.add(
+                    f"{record.state.identity.key}: Crypto metamorphic "
+                    f"proof {candidate.id} ignored: {error}"
                 )
                 continue
             observations.append((record, observation))

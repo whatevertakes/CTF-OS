@@ -43,6 +43,7 @@ from tests import test_pwn_crash_execution as pwn_execution_fixture
 from tests import (
     test_pwn_ip_control_lifecycle as pwn_ip_control_fixture,
 )
+from tests import test_crypto_engine as crypto_engine_fixture
 
 
 def _later(timestamp: str, seconds: int) -> str:
@@ -802,6 +803,76 @@ class EvaluationTests(unittest.TestCase):
                 "invalid_or_unreadable_result_artifacts"
             ],
             1,
+        )
+
+    def test_crypto_metamorphic_proof_enters_proof_metrics_only_if_reread(
+        self,
+    ) -> None:
+        fixture = crypto_engine_fixture.CryptoEngineProofTests(
+            methodName=(
+                "test_six_clean_bound_runs_are_required_before_promotion"
+            )
+        )
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        engine, _sandbox = fixture._engine()
+        completed, result = fixture._prove(engine)
+        self.assertTrue(result.passed)
+
+        metrics = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        ).metrics
+        reproduction = metrics["clean_reproduction_rate"]
+        self.assertEqual(reproduction.status, "available")
+        self.assertEqual(
+            reproduction.value["successful_attempts"],
+            6,
+        )
+        self.assertEqual(reproduction.value["total_attempts"], 6)
+        proof_pass = metrics["proof_pass_rate"]
+        self.assertEqual(proof_pass.status, "available")
+        self.assertEqual(proof_pass.value["passed_evaluations"], 1)
+        self.assertEqual(proof_pass.value["proof_evaluations"], 1)
+        self.assertEqual(proof_pass.value["rate"], 1.0)
+
+        candidate = next(
+            item
+            for item in completed.candidates
+            if item.id == "C-crypto-candidate"
+        )
+        binding = candidate.extra["crypto_metamorphic_proof"]
+        artifact = next(
+            item
+            for item in completed.artifacts
+            if item.id == binding["artifact_id"]
+        )
+        evaluation_path = (
+            engine.store.challenge_paths(fixture.identity).root
+            / artifact.path
+        )
+        original = evaluation_path.read_bytes()
+        evaluation_path.chmod(0o600)
+        evaluation_path.write_bytes(original + b"\n")
+        evaluation_path.chmod(0o400)
+
+        tampered = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        )
+        self.assertEqual(
+            tampered.metrics["proof_pass_rate"].status,
+            "unavailable",
+        )
+        self.assertTrue(
+            any(
+                "Crypto metamorphic proof" in diagnostic
+                for diagnostic in tampered.diagnostics
+            )
         )
 
     def test_invalid_proof_is_bounded_and_reported(self) -> None:
