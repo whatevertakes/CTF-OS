@@ -5307,6 +5307,20 @@ def _pwn_exploit_effect_state_marker(value: object) -> bool:
     )
 
 
+def _forensic_assertion_state_marker(value: object) -> bool:
+    """Identify records delegated to the exact Forensic graph validator."""
+
+    extra = getattr(value, "extra", None)
+    return (
+        type(extra) is dict
+        and (
+            extra.get("engine_executor")
+            == "forensic_assertion_execution_state_v1"
+            or "forensic_assertion_state" in extra
+        )
+    )
+
+
 def _pwn_crash_safe_locator(value: object) -> bool:
     if (
         type(value) is not str
@@ -13323,6 +13337,7 @@ class ChallengeState:
                     and fact.provenance is Provenance.EXECUTED
                     and not (fact.locator or "").strip()
                     and not _web_impact_state_marker(fact)
+                    and not _forensic_assertion_state_marker(fact)
                 ):
                     errors.append(
                         f"executed observation fact {fact.id} requires a locator"
@@ -14076,6 +14091,9 @@ class ChallengeState:
                             and not _pwn_exploit_effect_state_marker(
                                 experiment
                             )
+                            and not _forensic_assertion_state_marker(
+                                experiment
+                            )
                         )
                     )
                 ):
@@ -14724,6 +14742,16 @@ class ChallengeState:
             )
 
             errors.extend(web_impact_state_graph_errors(self))
+
+            # As above, the Forensic projection uses model types while its
+            # exact validator owns the authorized multi-receipt graph and
+            # raw-free executed assertion Fact.  Generic exceptions are
+            # therefore marker-gated and every marker is checked here.
+            from ctf_os.engine.forensic_assertion_state import (
+                forensic_assertion_state_graph_errors,
+            )
+
+            errors.extend(forensic_assertion_state_graph_errors(self))
         if errors:
             raise ModelValidationError("; ".join(errors))
 
