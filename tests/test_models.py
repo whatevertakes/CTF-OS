@@ -2406,6 +2406,54 @@ class PwnDisclosureEnvelopeModelTests(unittest.TestCase):
                     oversized
                 )
 
+    def test_precommit_validation_uses_explicit_next_revision_only(
+        self,
+    ) -> None:
+        expectation = self._v2_state(
+            PwnDisclosurePhase.EXPECTATION_COMMITTED
+        )
+        expectation.revision -= 1
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "consecutive canonical state replacements",
+        ):
+            expectation.validate()
+        expectation.validate(
+            _pwn_disclosure_state_revision=expectation.revision + 1
+        )
+        expectation.revision += 1
+        expectation.validate()
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "consecutive canonical state replacements",
+        ):
+            expectation.validate(
+                _pwn_disclosure_state_revision=expectation.revision + 1
+            )
+
+        complete = self._v2_state(PwnDisclosurePhase.COMPLETE)
+        complete.revision -= 1
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "consecutive canonical state replacements",
+        ):
+            complete.validate()
+        complete.validate(
+            _pwn_disclosure_state_revision=complete.revision + 1
+        )
+        complete.revision += 1
+        complete.validate()
+
+        for invalid in (True, -1, "1"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "validation revision is invalid",
+                ):
+                    complete.validate(
+                        _pwn_disclosure_state_revision=invalid
+                    )
+
     def test_rehashed_foreign_expectation_fails_state_crosslink(self) -> None:
         from ctf_os.engine.pwn_disclosure import (
             PwnDisclosureTrustedReceiptExpectation,

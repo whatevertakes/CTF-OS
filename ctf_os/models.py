@@ -7330,6 +7330,7 @@ def _pwn_runtime_snapshot_disclosure_errors(
     parent: Experiment,
     snapshot_recipe: Any,
     receipts: Mapping[str, ExecutionReceipt],
+    state_revision: int,
 ) -> list[str]:
     """Validate only persisted disclosure structure and canonical crosslinks.
 
@@ -7348,7 +7349,7 @@ def _pwn_runtime_snapshot_disclosure_errors(
         envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
             child.extra.get(_PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY)
         )
-        envelope.validate_state_revision(state.revision)
+        envelope.validate_state_revision(state_revision)
     except (ModelValidationError, TypeError, ValueError) as error:
         return [f"{label} envelope is invalid: {error}"]
 
@@ -7513,6 +7514,7 @@ def _pwn_runtime_snapshot_state_errors(
     facts: Mapping[str, Fact],
     hypotheses: Mapping[str, Hypothesis],
     candidates: Mapping[str, FlagCandidate],
+    disclosure_state_revision: int,
 ) -> list[str]:
     """Validate diagnostic child identity and its isolated lifecycle."""
 
@@ -7547,6 +7549,7 @@ def _pwn_runtime_snapshot_state_errors(
                 parent=parent,
                 snapshot_recipe=recipe,
                 receipts=receipts,
+                state_revision=disclosure_state_revision,
             )
         )
 
@@ -8735,9 +8738,23 @@ class ChallengeState:
         self,
         *,
         _allow_precommit_failure_capsules: bool = False,
+        _pwn_disclosure_state_revision: int | None = None,
     ) -> None:
         """Validate referential and state invariants before persistence."""
 
+        if _pwn_disclosure_state_revision is None:
+            disclosure_state_revision = self.revision
+        elif (
+            type(_pwn_disclosure_state_revision) is not int
+            or _pwn_disclosure_state_revision < 0
+        ):
+            raise ModelValidationError(
+                "Pwn disclosure validation revision is invalid"
+            )
+        else:
+            disclosure_state_revision = (
+                _pwn_disclosure_state_revision
+            )
         errors: list[str] = []
         for name, records in (
             ("source_inventory", self.source_inventory),
@@ -10737,6 +10754,9 @@ class ChallengeState:
                     facts=facts,
                     hypotheses=hypotheses,
                     candidates=candidates,
+                    disclosure_state_revision=(
+                        disclosure_state_revision
+                    ),
                 )
             )
             errors.extend(

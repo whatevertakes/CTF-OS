@@ -1385,7 +1385,10 @@ class StateStore:
         validate_artifacts: bool = True,
     ) -> ChallengeState:
         self.assert_mutations_allowed()
-        state.validate(_allow_precommit_failure_capsules=True)
+        state.validate(
+            _allow_precommit_failure_capsules=True,
+            _pwn_disclosure_state_revision=state.revision + 1,
+        )
         identity = _identity(state)
         paths = self.challenge_paths(identity)
         with ChallengeLock(paths.lock) as state_lock:
@@ -1500,7 +1503,10 @@ class StateStore:
         if proposed.identity != current.identity:
             raise InvalidIdentity("state identity cannot change during commit")
         # Stop oversized in-memory collections before cloning/serializing them.
-        proposed.validate(_allow_precommit_failure_capsules=True)
+        proposed.validate(
+            _allow_precommit_failure_capsules=True,
+            _pwn_disclosure_state_revision=current.revision + 1,
+        )
         committed = ChallengeState.from_dict(proposed.to_dict())
         # Ordinary writers preserve the source state protocol.  Only the
         # explicit migration transaction may change it.
