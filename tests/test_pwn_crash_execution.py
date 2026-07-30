@@ -171,12 +171,18 @@ class _PwnCrashSandbox:
             },
         }
         stdout_payload = pwn_crash_v1_canonical_json_bytes(document)
-        directory = self.work / "proof" / f"fake-{ordinal}"
-        directory.mkdir(parents=True, exist_ok=True)
+        proof_root = self.work / "proof"
+        proof_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        proof_root.chmod(0o700)
+        directory = proof_root / f"clean-{ordinal:012x}"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)
         stdout = directory / "stdout.log"
         stderr = directory / "stderr.log"
         stdout.write_bytes(stdout_payload)
         stderr.write_bytes(self.owner.stderr_payload)
+        stdout.chmod(0o400)
+        stderr.chmod(0o400)
         if self.owner.on_attempt is not None:
             self.owner.on_attempt(ordinal)
         truncated = ordinal in self.owner.truncated_ordinals
@@ -190,8 +196,12 @@ class _PwnCrashSandbox:
             stderr_summary="",
             stdout_bytes=len(stdout_payload),
             stderr_bytes=len(self.owner.stderr_payload),
-            stdout_path=f"/work/proof/fake-{ordinal}/stdout.log",
-            stderr_path=f"/work/proof/fake-{ordinal}/stderr.log",
+            stdout_path=(
+                f"/work/proof/clean-{ordinal:012x}/stdout.log"
+            ),
+            stderr_path=(
+                f"/work/proof/clean-{ordinal:012x}/stderr.log"
+            ),
             stdout_stored_bytes=len(stdout_payload),
             stderr_stored_bytes=len(self.owner.stderr_payload),
             stdout_limit_bytes=16 * 1024,
@@ -476,7 +486,20 @@ class PwnCrashExecutionTests(unittest.TestCase):
             start=1,
         ):
             self.assertEqual(spec.argv, recipe.argv_for_attempt(ordinal))
-            self.assertEqual(spec.environment, {})
+            self.assertEqual(
+                set(spec.environment),
+                {"CTF_WRAP_FLAG_PATTERNS_JSON"},
+            )
+            self.assertEqual(
+                tuple(
+                    json.loads(
+                        spec.environment[
+                            "CTF_WRAP_FLAG_PATTERNS_JSON"
+                        ]
+                    )
+                ),
+                engine.config.runtime.flag_patterns,
+            )
             self.assertIsNone(spec.network_target)
             self.assertEqual(spec.resource_request.network, 0)
             self.assertEqual(policy.authorize(None), "none")
@@ -619,6 +642,327 @@ class PwnCrashExecutionTests(unittest.TestCase):
             )
         )
         state.validate()
+
+    def test_session_recovery_removes_only_exact_hard_death_orphans(self):
+        coordinator = _SandboxCoordinator(self._confirming_statuses())
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        hard_death = SystemExit("synthetic hard process death")
+        capability_calls = 0
+
+        def capability_probe(digest):
+            nonlocal capability_calls
+            capability_calls += 1
+            if capability_calls == 2:
+                raise hard_death
+            return self._capability(digest)
+
+        engine._capability_probe = capability_probe
+        with (
+            patch.object(
+                engine,
+                "_terminalize_pwn_crash_interruption",
+                return_value=None,
+            ),
+            patch.object(
+                engine,
+                "_cleanup_uncommitted_artifacts",
+                return_value=None,
+            ),
+            patch.object(
+                engine,
+                "_cleanup_uncommitted_pwn_crash_runs",
+                return_value=None,
+            ),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self._execute(engine, experiment_id)
+        self.assertIs(raised.exception, hard_death)
+        self.assertEqual(capability_calls, 2)
+
+        crashed = engine.store.load(self.identity, recover=False)
+        experiment = next(
+            item
+            for item in crashed.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.RUNNING)
+        self.assertIsNone(experiment.result)
+        self.assertEqual(experiment.evidence_run_ids, [])
+        self.assertFalse(
+            any(
+                run.extra.get("experiment_id") == experiment_id
+                for run in crashed.runs
+            )
+        )
+
+        paths = engine.store.challenge_paths(self.identity)
+        orphan_run_roots = []
+        for request_path in sorted(paths.runs.glob("*/request.json")):
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            if (
+                request.get("kind") == "pwn_crash_gate"
+                and request.get("experiment_id") == experiment_id
+            ):
+                orphan_run_roots.append(request_path.parent)
+        self.assertEqual(len(orphan_run_roots), 6)
+        for run_root in orphan_run_roots:
+            self.assertEqual(
+                sorted(path.name for path in run_root.iterdir()),
+                ["raw", "request.json", "result.json", "validation.json"],
+            )
+
+        recipe = PwnCrashRecipe.from_dict(
+            experiment.extra["pwn_crash_recipe"]
+        )
+        evidence_root = (
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-crash-{recipe.recipe_sha256}"
+        )
+        orphan_evidence_files = sorted(
+            path
+            for path in evidence_root.iterdir()
+            if path.is_file() and not path.is_symlink()
+        )
+        self.assertEqual(len(orphan_evidence_files), 13)
+
+        canonical_run = crashed.runs[0]
+        canonical_run_root = paths.runs / canonical_run.id
+        canonical_run_root.mkdir(exist_ok=True)
+        canonical_sentinel = canonical_run_root / "canonical.keep"
+        canonical_sentinel.write_bytes(b"canonical run must survive")
+
+        unrelated_run_root = paths.runs / "unrelated-hard-death-run"
+        unrelated_run_root.mkdir()
+        unrelated_request = unrelated_run_root / "request.json"
+        unrelated_request.write_text(
+            '{"kind":"unrelated"}\n',
+            encoding="utf-8",
+        )
+        unrelated_unknown = unrelated_run_root / "unknown.keep"
+        unrelated_unknown.write_bytes(b"unrelated run must survive")
+
+        symlink_target = self.root / "hard-death-symlink-target"
+        symlink_target.mkdir()
+        symlink_target_sentinel = symlink_target / "target.keep"
+        symlink_target_sentinel.write_bytes(b"symlink target must survive")
+        hostile_run_link = paths.runs / "pwn-crash-hostile-link"
+        hostile_run_link.symlink_to(
+            symlink_target,
+            target_is_directory=True,
+        )
+
+        unknown_evidence = evidence_root / "unknown.keep"
+        unknown_evidence.write_bytes(b"unknown evidence must survive")
+        evidence_link_target = self.root / "evidence-link-target.keep"
+        evidence_link_target.write_bytes(b"evidence target must survive")
+        hostile_evidence_link = evidence_root / "99-hostile-stderr.log"
+        hostile_evidence_link.symlink_to(evidence_link_target)
+
+        recovered = engine._recover_session_boundary(self.identity)
+        recovered_experiment = next(
+            item
+            for item in recovered.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(
+            recovered_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertEqual(set(recovered_experiment.result), {"error"})
+        self.assertTrue(
+            recovered_experiment.result["error"].startswith(
+                "Pwn crash gate failed closed: "
+            )
+        )
+        self.assertFalse(
+            any(
+                item.status is ExperimentStatus.RUNNING
+                for item in recovered.experiments
+            )
+        )
+        for run_root in orphan_run_roots:
+            self.assertFalse(run_root.exists())
+        for evidence_file in orphan_evidence_files:
+            self.assertFalse(evidence_file.exists())
+
+        self.assertEqual(
+            canonical_sentinel.read_bytes(),
+            b"canonical run must survive",
+        )
+        self.assertEqual(
+            unrelated_request.read_text(encoding="utf-8"),
+            '{"kind":"unrelated"}\n',
+        )
+        self.assertEqual(
+            unrelated_unknown.read_bytes(),
+            b"unrelated run must survive",
+        )
+        self.assertTrue(hostile_run_link.is_symlink())
+        self.assertEqual(
+            symlink_target_sentinel.read_bytes(),
+            b"symlink target must survive",
+        )
+        self.assertEqual(
+            unknown_evidence.read_bytes(),
+            b"unknown evidence must survive",
+        )
+        self.assertTrue(hostile_evidence_link.is_symlink())
+        self.assertEqual(
+            evidence_link_target.read_bytes(),
+            b"evidence target must survive",
+        )
+        recovered.validate()
+
+    def test_hard_death_recovery_never_follows_exact_symlink_swaps(self):
+        coordinator = _SandboxCoordinator(self._confirming_statuses())
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        hard_death = SystemExit("synthetic symlink-swap process death")
+        capability_calls = 0
+
+        def capability_probe(digest):
+            nonlocal capability_calls
+            capability_calls += 1
+            if capability_calls == 2:
+                raise hard_death
+            return self._capability(digest)
+
+        engine._capability_probe = capability_probe
+        with (
+            patch.object(
+                engine,
+                "_terminalize_pwn_crash_interruption",
+                return_value=None,
+            ),
+            patch.object(
+                engine,
+                "_cleanup_uncommitted_artifacts",
+                return_value=None,
+            ),
+            patch.object(
+                engine,
+                "_cleanup_uncommitted_pwn_crash_runs",
+                return_value=None,
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            self._execute(engine, experiment_id)
+
+        crashed = engine.store.load(self.identity, recover=False)
+        experiment = next(
+            item
+            for item in crashed.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.RUNNING)
+        recipe = PwnCrashRecipe.from_dict(
+            experiment.extra["pwn_crash_recipe"]
+        )
+        paths = engine.store.challenge_paths(self.identity)
+        orphan_run_ids = engine._discover_pwn_crash_orphan_runs(
+            crashed,
+            experiment_id,
+            recipe,
+        )
+        self.assertEqual(len(orphan_run_ids), 6)
+        engine._write_pwn_crash_recovery_journal(
+            crashed,
+            experiment_id,
+            recipe,
+            orphan_run_ids,
+        )
+
+        victim_run_root = paths.runs / orphan_run_ids[0]
+        external_run_root = self.root / "external-pwn-run-target"
+        victim_run_root.rename(external_run_root)
+        run_payloads = {
+            name: (external_run_root / name).read_bytes()
+            for name in (
+                "request.json",
+                "result.json",
+                "validation.json",
+            )
+        }
+        raw_sentinel = external_run_root / "raw" / "raw.keep"
+        raw_sentinel.write_bytes(b"external raw must survive")
+        run_sentinel = external_run_root / "unknown.keep"
+        run_sentinel.write_bytes(b"external run must survive")
+        victim_run_root.symlink_to(
+            external_run_root,
+            target_is_directory=True,
+        )
+
+        evidence_root = (
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-crash-{recipe.recipe_sha256}"
+        )
+        external_evidence_root = self.root / "external-evidence-target"
+        evidence_root.rename(external_evidence_root)
+        evidence_payloads = {
+            path.name: path.read_bytes()
+            for path in external_evidence_root.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(len(evidence_payloads), 13)
+        evidence_sentinel = external_evidence_root / "unknown.keep"
+        evidence_sentinel.write_bytes(b"external evidence must survive")
+        evidence_root.symlink_to(
+            external_evidence_root,
+            target_is_directory=True,
+        )
+
+        with patch(
+            "ctf_os.engine.challenge.sys.stderr",
+            StringIO(),
+        ):
+            recovered = engine._recover_session_boundary(self.identity)
+
+        recovered_experiment = next(
+            item
+            for item in recovered.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(
+            recovered_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertTrue(
+            recovered_experiment.result["error"].startswith(
+                "Pwn crash gate failed closed: "
+            )
+        )
+        for name, payload in run_payloads.items():
+            external_file = external_run_root / name
+            self.assertTrue(
+                external_file.is_file(),
+                f"recovery followed run-root symlink and removed {name}",
+            )
+            self.assertEqual(external_file.read_bytes(), payload)
+        self.assertEqual(
+            raw_sentinel.read_bytes(),
+            b"external raw must survive",
+        )
+        self.assertEqual(
+            run_sentinel.read_bytes(),
+            b"external run must survive",
+        )
+        for name, payload in evidence_payloads.items():
+            external_file = external_evidence_root / name
+            self.assertTrue(
+                external_file.is_file(),
+                f"recovery followed evidence-root symlink and removed {name}",
+            )
+            self.assertEqual(external_file.read_bytes(), payload)
+        self.assertEqual(
+            evidence_sentinel.read_bytes(),
+            b"external evidence must survive",
+        )
+        recovered.validate()
 
     def _assert_drift_blocks_commit(self, drift_kind: str) -> None:
         coordinator = _SandboxCoordinator(self._confirming_statuses())
@@ -844,6 +1188,50 @@ class PwnCrashExecutionTests(unittest.TestCase):
         self.assertEqual(experiment.evidence_run_ids, [])
         state.validate()
 
+    def test_production_capability_probe_receives_gate_remaining_time(self):
+        coordinator = _SandboxCoordinator(self._confirming_statuses())
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        gate_timeout = 5
+
+        def set_timeout(state):
+            experiment = next(
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            )
+            experiment.timeout_seconds = gate_timeout
+
+        engine.store.update(self.identity, set_timeout)
+        observed_timeouts = []
+
+        def timeout_aware_probe(digest, *, timeout_seconds):
+            observed_timeouts.append(timeout_seconds)
+            return self._capability(digest)
+
+        engine._capability_probe = timeout_aware_probe
+        engine._capability_probe_accepts_timeout = True
+        state = self._execute(engine, experiment_id)
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.KEPT)
+        self.assertEqual(len(observed_timeouts), 2)
+        self.assertTrue(
+            all(
+                0 < timeout <= gate_timeout
+                for timeout in observed_timeouts
+            )
+        )
+        self.assertLessEqual(
+            observed_timeouts[-1],
+            observed_timeouts[0],
+        )
+
     def test_committed_success_survives_staging_cleanup_failure(self):
         coordinator = _SandboxCoordinator(self._confirming_statuses())
         engine, experiment_id, _artifact_path, _payload = self._fixture(
@@ -933,17 +1321,19 @@ class PwnCrashExecutionTests(unittest.TestCase):
             for item in state.experiments
             if item.id == experiment_id
         )
-        self.assertEqual(
-            callbacks,
-            [
-                (
-                    candidate_value,
-                    f"tool:{experiment.evidence_run_ids[0]}:stderr",
-                    1,
-                    ExperimentStatus.RUNNING,
-                )
-            ],
+        self.assertEqual(len(callbacks), 1)
+        observed_value, observed_source, clean_calls, observed_status = (
+            callbacks[0]
         )
+        self.assertEqual(observed_value, candidate_value)
+        self.assertTrue(
+            observed_source.startswith(
+                f"tool:{experiment.evidence_run_ids[0]}:"
+            )
+        )
+        self.assertIn("stderr", observed_source)
+        self.assertEqual(clean_calls, 1)
+        self.assertIs(observed_status, ExperimentStatus.RUNNING)
         candidate = next(
             item
             for item in state.candidates
@@ -956,9 +1346,86 @@ class PwnCrashExecutionTests(unittest.TestCase):
         )
         self.assertEqual(
             candidate.locator,
-            f"tool:{experiment.evidence_run_ids[0]}:stderr",
+            observed_source,
         )
         self.assertEqual(state.submissions, [])
+        state.validate()
+
+    def test_truncated_stderr_flag_uses_live_full_stream_detection(self):
+        candidate_value = "CTF{large_stderr_candidate}"
+        stderr_payload = (
+            candidate_value.encode("ascii")
+            + b"\n"
+            + (b"X" * (64 * 1024))
+        )
+        coordinator = _SandboxCoordinator(
+            self._confirming_statuses(),
+            stderr_payload=stderr_payload,
+        )
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        callbacks = []
+
+        def on_flag(identity, detected):
+            current = engine.store.load(identity, recover=False)
+            experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            callbacks.append(
+                (
+                    detected,
+                    coordinator.clean_calls,
+                    experiment.status,
+                )
+            )
+
+        engine._on_tool_flag = on_flag
+        state = self._execute(engine, experiment_id)
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+
+        self.assertIs(experiment.status, ExperimentStatus.KEPT)
+        self.assertEqual(len(callbacks), 1)
+        detected, clean_calls, observed_status = callbacks[0]
+        self.assertEqual(detected.value, candidate_value)
+        self.assertEqual(clean_calls, 1)
+        self.assertIs(observed_status, ExperimentStatus.RUNNING)
+        self.assertTrue(
+            detected.source.startswith(
+                f"tool:{experiment.evidence_run_ids[0]}:"
+            )
+        )
+        self.assertIn("stderr", detected.source)
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.value == candidate_value
+        )
+        self.assertEqual(
+            candidate.source_run_id,
+            experiment.evidence_run_ids[0],
+        )
+        self.assertEqual(state.submissions, [])
+        first_receipt = next(
+            item
+            for item in state.receipts
+            if item.id == experiment.evidence_receipt_ids[0]
+        )
+        stderr_artifact = next(
+            item
+            for item in state.artifacts
+            if item.id == first_receipt.stderr_artifact_id
+        )
+        self.assertTrue(
+            stderr_artifact.extra["capture_placeholder"]
+        )
+        self.assertEqual(stderr_artifact.size, 0)
         state.validate()
 
     def _assert_engine_evidence_tamper_blocks_commit(

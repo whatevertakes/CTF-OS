@@ -149,6 +149,42 @@ class CapabilityTests(unittest.TestCase):
             ],
         )
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], 30.0)
+
+    def test_probe_timeout_is_positive_finite_and_capped(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(kwargs["timeout"])
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(capability_payload()).encode(),
+                b"",
+            )
+
+        inspect_pinned_capabilities(
+            DIGEST,
+            runner=runner,
+            timeout_seconds=0.25,
+        )
+        inspect_pinned_capabilities(
+            DIGEST,
+            runner=runner,
+            timeout_seconds=300,
+        )
+        self.assertEqual(calls, [0.25, 30.0])
+        for invalid in (0, -1, True, float("inf"), float("nan")):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(
+                    CapabilityError,
+                    "positive and finite",
+                ):
+                    inspect_pinned_capabilities(
+                        DIGEST,
+                        runner=runner,
+                        timeout_seconds=invalid,
+                    )
 
     def test_old_v2_image_without_managed_attestations_fails_closed(self):
         def runner(argv, **kwargs):

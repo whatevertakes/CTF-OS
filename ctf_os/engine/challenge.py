@@ -985,6 +985,166 @@ def _durable_rmdir(path: Path) -> None:
         os.close(descriptor)
 
 
+def _durable_unlink_beneath(
+    root: Path,
+    relative: PurePosixPath,
+) -> None:
+    """Unlink one relative leaf without following any ancestor symlink."""
+
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise OSError("unsafe relative cleanup path")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        for component in relative.parts[:-1]:
+            current = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        try:
+            os.unlink(relative.parts[-1], dir_fd=current)
+        except FileNotFoundError:
+            return
+        os.fsync(current)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _durable_remove_pwn_run_directory(
+    runs_root: Path,
+    run_id: str,
+) -> None:
+    """Remove one exact fixed-topology Pwn run without following links."""
+
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", run_id) is None:
+        raise OSError("unsafe Pwn run id")
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    runs_descriptor: int | None = None
+    run_descriptor: int | None = None
+    raw_descriptor: int | None = None
+    try:
+        runs_descriptor = os.open(runs_root, directory_flags)
+        try:
+            before = os.stat(
+                run_id,
+                dir_fd=runs_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(before.st_mode):
+            raise OSError("Pwn run cleanup target is not a directory")
+        run_descriptor = os.open(
+            run_id,
+            directory_flags,
+            dir_fd=runs_descriptor,
+        )
+        opened = os.fstat(run_descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise OSError("Pwn run cleanup target changed while opening")
+        allowed = {"raw", "request.json", "result.json", "validation.json"}
+        unexpected = set(os.listdir(run_descriptor)) - allowed
+        if unexpected:
+            raise OSError(
+                "Pwn run cleanup target contains unexpected entries"
+            )
+        for name in ("validation.json", "result.json", "request.json"):
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=run_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(
+                    f"Pwn run cleanup leaf is not regular: {name}"
+                )
+            os.unlink(name, dir_fd=run_descriptor)
+        try:
+            raw_before = os.stat(
+                "raw",
+                dir_fd=run_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raw_before = None
+        if raw_before is not None:
+            if not stat.S_ISDIR(raw_before.st_mode):
+                raise OSError(
+                    "Pwn run cleanup raw target is not a directory"
+                )
+            raw_descriptor = os.open(
+                "raw",
+                directory_flags,
+                dir_fd=run_descriptor,
+            )
+            raw_opened = os.fstat(raw_descriptor)
+            if (
+                (raw_opened.st_dev, raw_opened.st_ino)
+                != (raw_before.st_dev, raw_before.st_ino)
+                or os.listdir(raw_descriptor)
+            ):
+                raise OSError(
+                    "Pwn run cleanup raw directory changed or is not empty"
+                )
+            os.close(raw_descriptor)
+            raw_descriptor = None
+            os.rmdir("raw", dir_fd=run_descriptor)
+        if os.listdir(run_descriptor):
+            raise OSError(
+                "Pwn run cleanup target is not empty after exact cleanup"
+            )
+        os.fsync(run_descriptor)
+        after = os.stat(
+            run_id,
+            dir_fd=runs_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or (after.st_dev, after.st_ino)
+            != (before.st_dev, before.st_ino)
+        ):
+            raise OSError("Pwn run cleanup target changed before removal")
+        os.close(run_descriptor)
+        run_descriptor = None
+        os.rmdir(run_id, dir_fd=runs_descriptor)
+        os.fsync(runs_descriptor)
+    finally:
+        for descriptor in (
+            raw_descriptor,
+            run_descriptor,
+            runs_descriptor,
+        ):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def _record_id(kind: str, run_id: str, local: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "-", local).strip("-")
     return f"{kind}-{run_id}-{normalized or uuid.uuid4().hex[:8]}"
@@ -1036,6 +1196,8 @@ _REV_STDIN_SEMANTIC_FAILURE_CODES = frozenset(
 _PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
 _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
 _PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_CRASH_RECOVERY_JOURNAL_SCHEMA_VERSION = 1
+_PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES = 64 * 1024
 _PWN_CRASH_REQUEST_KEYS = frozenset(
     {
         "schema_version",
@@ -1447,6 +1609,9 @@ class ChallengeEngine:
         self.live_builder = live_builder or LiveCommandBuilder(models=catalog)
         self._sandbox_factory = sandbox_factory
         self._capability_probe = capability_probe
+        self._capability_probe_accepts_timeout = (
+            capability_probe is inspect_pinned_capabilities
+        )
         limits = ResourceLimits(
             cpu=self.config.resources.tool_cpu_budget,
             memory_mib=self.config.resources.tool_memory_gib * 1024,
@@ -8275,6 +8440,44 @@ class ChallengeEngine:
                 "Pwn crash stream could not be snapshotted safely"
             ) from error
 
+    def _probe_pwn_crash_capability(
+        self,
+        recipe: PwnCrashRecipe,
+        *,
+        deadline_monotonic_seconds: float,
+        operation: str,
+    ) -> PwnCrashCapabilityAttestation:
+        """Probe the pinned image without extending the gate wall deadline."""
+
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            operation,
+        )
+        remaining = deadline_monotonic_seconds - time.monotonic()
+        if remaining <= 0:
+            raise _HardDeadlineExpired(
+                f"challenge wall-clock budget expired before {operation}"
+            )
+        if self._capability_probe_accepts_timeout:
+            report = self._capability_probe(
+                recipe.image_digest,
+                timeout_seconds=min(30.0, remaining),
+            )
+        else:
+            # Injected probes are a trusted test/integration boundary. The
+            # production probe above receives the immutable remaining budget.
+            report = self._capability_probe(recipe.image_digest)
+        attestation = normalize_pwn_crash_capability_attestation(
+            dict(report),
+            image_digest=recipe.image_digest,
+            recipe_sha256=recipe.recipe_sha256,
+        )
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            operation,
+        )
+        return attestation
+
     def _require_pwn_crash_external_pins(
         self,
         state: ChallengeState,
@@ -8313,12 +8516,14 @@ class ChallengeEngine:
             )
         if probe_capability:
             try:
-                live_capability = (
-                    normalize_pwn_crash_capability_attestation(
-                        dict(self._capability_probe(recipe.image_digest)),
-                        image_digest=recipe.image_digest,
-                        recipe_sha256=recipe.recipe_sha256,
-                    )
+                live_capability = self._probe_pwn_crash_capability(
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        deadline_monotonic_seconds
+                    ),
+                    operation=(
+                        "Pwn crash capability re-probe before commit"
+                    ),
                 )
             except Exception as error:
                 raise EngineError(
@@ -8328,10 +8533,6 @@ class ChallengeEngine:
                 raise EngineError(
                     "Pwn crash capability attestation changed before commit"
                 )
-            self._require_before_hard_deadline(
-                deadline_monotonic_seconds,
-                "Pwn crash capability re-probe",
-            )
         item = next(
             (
                 value
@@ -8625,14 +8826,10 @@ class ChallengeEngine:
                 )
                 continue
             try:
-                for path in (
-                    run_paths.validation,
-                    run_paths.result,
-                    run_paths.request,
-                ):
-                    _durable_unlink(path)
-                _durable_rmdir(run_paths.raw)
-                _durable_rmdir(run_paths.root)
+                _durable_remove_pwn_run_directory(
+                    challenge_paths.runs,
+                    run_id,
+                )
             except OSError as cleanup_error:
                 cleanup_errors.append(f"{run_id}: {cleanup_error}")
         if cleanup_errors:
@@ -8643,6 +8840,284 @@ class ChallengeEngine:
             if cause is not None:
                 raise error from cause
             raise error
+
+    def _pwn_crash_recovery_journal_path(
+        self,
+        identity: ChallengeIdentity,
+        recipe_sha256: str,
+    ) -> Path:
+        if re.fullmatch(r"[0-9a-f]{64}", recipe_sha256) is None:
+            raise EngineError("Pwn crash recovery recipe hash is invalid")
+        paths = self.store.challenge_paths(identity)
+        root = ensure_private_directory(
+            paths.runtime / "pwn-crash-recovery"
+        )
+        return root / f"{recipe_sha256}.json"
+
+    def _write_pwn_crash_recovery_journal(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+        recipe: PwnCrashRecipe,
+        run_ids: Sequence[str],
+    ) -> Path:
+        unique_ids = list(dict.fromkeys(run_ids))
+        if (
+            len(unique_ids) != len(run_ids)
+            or len(unique_ids) > 6
+            or any(
+                not isinstance(run_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", run_id) is None
+                for run_id in unique_ids
+            )
+        ):
+            raise EngineError(
+                "Pwn crash recovery journal run set is invalid"
+            )
+        journal = self._pwn_crash_recovery_journal_path(
+            state.identity,
+            recipe.recipe_sha256,
+        )
+        atomic_write_json(
+            journal,
+            {
+                "schema_version": (
+                    _PWN_CRASH_RECOVERY_JOURNAL_SCHEMA_VERSION
+                ),
+                "engine_executor": _PWN_CRASH_ENGINE_EXECUTOR,
+                "experiment_id": experiment_id,
+                "recipe_sha256": recipe.recipe_sha256,
+                "configuration_epoch": recipe.configuration_epoch,
+                "run_ids": unique_ids,
+            },
+            mode=0o600,
+        )
+        return journal
+
+    def _read_pwn_crash_recovery_journal(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+        recipe: PwnCrashRecipe,
+    ) -> tuple[str, ...]:
+        journal = self._pwn_crash_recovery_journal_path(
+            state.identity,
+            recipe.recipe_sha256,
+        )
+        try:
+            metadata = journal.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return ()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EngineError(
+                "Pwn crash recovery journal is not a regular file"
+            )
+        paths = self.store.challenge_paths(state.identity)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".pwn-crash-recovery-read-",
+                dir=paths.runtime,
+            ) as temporary_name:
+                snapshot = copy_bounded_regular(
+                    paths.root,
+                    journal.relative_to(paths.root).as_posix(),
+                    Path(temporary_name) / "journal.json",
+                    maximum_bytes=(
+                        _PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES
+                    ),
+                    mode=0o400,
+                )
+                value = strict_json_loads(
+                    snapshot.path.read_bytes(),
+                    max_bytes=_PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES,
+                )
+        except (
+            OSError,
+            SafeFileError,
+            StrictJSONError,
+            ValueError,
+        ) as error:
+            raise EngineError(
+                "Pwn crash recovery journal cannot be read safely"
+            ) from error
+        expected_keys = {
+            "schema_version",
+            "engine_executor",
+            "experiment_id",
+            "recipe_sha256",
+            "configuration_epoch",
+            "run_ids",
+        }
+        run_ids = value.get("run_ids") if type(value) is dict else None
+        if (
+            type(value) is not dict
+            or set(value) != expected_keys
+            or value.get("schema_version")
+            != _PWN_CRASH_RECOVERY_JOURNAL_SCHEMA_VERSION
+            or value.get("engine_executor")
+            != _PWN_CRASH_ENGINE_EXECUTOR
+            or value.get("experiment_id") != experiment_id
+            or value.get("recipe_sha256") != recipe.recipe_sha256
+            or value.get("configuration_epoch")
+            != recipe.configuration_epoch
+            or type(run_ids) is not list
+            or len(run_ids) > 6
+            or len(set(run_ids)) != len(run_ids)
+            or any(
+                type(run_id) is not str
+                or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", run_id) is None
+                for run_id in run_ids
+            )
+        ):
+            raise EngineError(
+                "Pwn crash recovery journal schema is invalid"
+            )
+        return tuple(run_ids)
+
+    def _discover_pwn_crash_orphan_runs(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+        recipe: PwnCrashRecipe,
+    ) -> tuple[str, ...]:
+        """Find at most six exact issued requests without trusting names."""
+
+        paths = self.store.challenge_paths(state.identity)
+        found: dict[int, str] = {}
+        scanned = 0
+        try:
+            entries = os.scandir(paths.runs)
+        except FileNotFoundError:
+            return ()
+        with entries, tempfile.TemporaryDirectory(
+            prefix=".pwn-crash-recovery-scan-",
+            dir=paths.runtime,
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            for entry in entries:
+                scanned += 1
+                if scanned > 10_000:
+                    raise EngineError(
+                        "Pwn crash recovery run scan exceeds its bound"
+                    )
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    request_locator = (
+                        PurePosixPath("runs")
+                        / entry.name
+                        / "request.json"
+                    ).as_posix()
+                    snapshot = copy_bounded_regular(
+                        paths.root,
+                        request_locator,
+                        temporary / f"{scanned:05d}.json",
+                        maximum_bytes=256 * 1024,
+                        mode=0o400,
+                    )
+                    value = strict_json_loads(
+                        snapshot.path.read_bytes(),
+                        max_bytes=256 * 1024,
+                    )
+                except (
+                    OSError,
+                    SafeFileError,
+                    StrictJSONError,
+                    ValueError,
+                ):
+                    continue
+                contract = (
+                    value.get("execution_contract")
+                    if type(value) is dict
+                    else None
+                )
+                attempt = (
+                    contract.get("attempt")
+                    if type(contract) is dict
+                    else None
+                )
+                ordinal = (
+                    attempt.get("ordinal")
+                    if type(attempt) is dict
+                    else None
+                )
+                if (
+                    type(value) is not dict
+                    or value.get("schema_version")
+                    != RUN_ENVELOPE_SCHEMA_VERSION
+                    or value.get("contest_id") != state.contest_id
+                    or value.get("category") != state.category
+                    or value.get("challenge_id") != state.challenge_id
+                    or value.get("run_id") != entry.name
+                    or value.get("kind") != "pwn_crash_gate"
+                    or value.get("experiment_id") != experiment_id
+                    or type(contract) is not dict
+                    or contract.get("recipe_sha256")
+                    != recipe.recipe_sha256
+                    or type(ordinal) is not int
+                    or not 1 <= ordinal <= 6
+                    or ordinal in found
+                ):
+                    continue
+                found[ordinal] = entry.name
+        return tuple(found[ordinal] for ordinal in sorted(found))
+
+    def _cleanup_pwn_crash_recovery_files(
+        self,
+        state: ChallengeState,
+        experiment_id: str,
+        recipe: PwnCrashRecipe,
+        run_ids: Sequence[str],
+    ) -> None:
+        """Delete exact uncommitted run/evidence files, never unknown entries."""
+
+        paths = self.store.challenge_paths(state.identity)
+        evidence_root = (
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-crash-{recipe.recipe_sha256}"
+        )
+        artifacts = [
+            ArtifactReference(
+                id=_record_id(
+                    "A",
+                    experiment_id,
+                    "pwn-crash-capability",
+                ),
+                path=(
+                    evidence_root / "capability-attestation.json"
+                ).relative_to(paths.root).as_posix(),
+                sha256="0" * 64,
+                source_run_id=None,
+            )
+        ]
+        for ordinal, run_id in enumerate(run_ids, start=1):
+            for stream in ("stdout", "stderr"):
+                artifacts.append(
+                    ArtifactReference(
+                        id=_record_id("A", run_id, stream),
+                        path=(
+                            evidence_root
+                            / f"{ordinal:02d}-{run_id}-{stream}.log"
+                        ).relative_to(paths.root).as_posix(),
+                        sha256="0" * 64,
+                        source_run_id=run_id,
+                    )
+                )
+        self._cleanup_uncommitted_artifacts(
+            state.identity,
+            artifacts,
+        )
+        self._cleanup_uncommitted_pwn_crash_runs(
+            state.identity,
+            run_ids,
+        )
+        _durable_unlink(
+            self._pwn_crash_recovery_journal_path(
+                state.identity,
+                recipe.recipe_sha256,
+            )
+        )
 
     def _terminalize_pwn_crash_interruption(
         self,
@@ -8770,6 +9245,13 @@ class ChallengeEngine:
             running,
             self.config.runtime.flag_patterns,
         )
+        pwn_flag_environment = {
+            FLAG_PATTERNS_ENV: json.dumps(
+                flag_policy.patterns,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        }
         detected_pwn_flags: list[tuple[DetectedFlag, str]] = []
         active_pwn_run_id: str | None = None
 
@@ -8802,11 +9284,20 @@ class ChallengeEngine:
         committed = False
         committed_state: ChallengeState | None = None
         active_error: BaseException | None = None
+        recovery_journal_path: Path | None = None
         pending_artifacts: list[ArtifactReference] = []
         planned_run_ids: list[str] = []
         attempts: list[_PwnCrashAttemptEvidence] = []
         started_gate = time.monotonic()
         try:
+            recovery_journal_path = (
+                self._write_pwn_crash_recovery_journal(
+                    running,
+                    experiment_id,
+                    recipe,
+                    (),
+                )
+            )
             self._require_before_hard_deadline(
                 gate_deadline_monotonic,
                 "Pwn crash source snapshot",
@@ -8850,25 +9341,17 @@ class ChallengeEngine:
                 / f"pwn-crash-{recipe.recipe_sha256}"
             )
             try:
-                self._require_before_hard_deadline(
-                    gate_deadline_monotonic,
-                    "Pwn crash capability probe",
-                )
-                capability_attestation = (
-                    normalize_pwn_crash_capability_attestation(
-                        dict(self._capability_probe(recipe.image_digest)),
-                        image_digest=recipe.image_digest,
-                        recipe_sha256=recipe.recipe_sha256,
-                    )
+                capability_attestation = self._probe_pwn_crash_capability(
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        gate_deadline_monotonic
+                    ),
+                    operation="Pwn crash initial capability probe",
                 )
             except Exception as error:
                 raise EngineError(
                     "Pwn crash pinned-image capability probe failed"
                 ) from error
-            self._require_before_hard_deadline(
-                gate_deadline_monotonic,
-                "Pwn crash capability probe",
-            )
             capability_artifact_id = _record_id(
                 "A",
                 experiment_id,
@@ -8985,7 +9468,9 @@ class ChallengeEngine:
                         "method": PWN_CRASH_SANDBOX_METHOD,
                         "one_shot": PWN_CRASH_ONE_SHOT,
                         "outer_timeout_seconds": command_timeout,
-                        "environment": {},
+                        "environment": copy.deepcopy(
+                            pwn_flag_environment
+                        ),
                         "resource_request": request.as_dict(),
                         "image": {
                             "reference": recipe.image_reference,
@@ -9015,6 +9500,14 @@ class ChallengeEngine:
                     _pwn_crash_canonical_bytes(execution_contract)
                 ).hexdigest()
                 planned_run_ids.append(run_id)
+                recovery_journal_path = (
+                    self._write_pwn_crash_recovery_journal(
+                        latest,
+                        experiment_id,
+                        recipe,
+                        planned_run_ids,
+                    )
+                )
                 run_paths = self.store.create_run(
                     identity,
                     run_id=run_id,
@@ -9079,18 +9572,39 @@ class ChallengeEngine:
                                 NetworkPolicy.deny_all()
                             ),
                         )
-                        result = client.run_clean_proof(
-                            CommandSpec.create(
-                                argv,
-                                timeout_seconds=command_timeout,
-                                deadline_monotonic_seconds=command_deadline,
-                                environment={},
-                                network_target=None,
-                                resource_request=request,
-                            ),
-                            proof_inputs=(proof_input,),
-                        )
+                        active_pwn_run_id = run_id
+                        try:
+                            with FlagLogTailer(
+                                workspace,
+                                pwn_flag_detector,
+                                source_prefix=f"tool:{run_id}",
+                                max_bytes=(
+                                    self.config.runtime
+                                    .flag_scan_max_bytes
+                                ),
+                                proof=True,
+                            ) as flag_tailer:
+                                flag_tailer.start()
+                                result = client.run_clean_proof(
+                                    CommandSpec.create(
+                                        argv,
+                                        timeout_seconds=command_timeout,
+                                        deadline_monotonic_seconds=(
+                                            command_deadline
+                                        ),
+                                        environment=(
+                                            pwn_flag_environment
+                                        ),
+                                        network_target=None,
+                                        resource_request=request,
+                                    ),
+                                    proof_inputs=(proof_input,),
+                                )
+                        finally:
+                            active_pwn_run_id = None
                 except _HardDeadlineExpired:
+                    raise
+                except FlagNotificationError:
                     raise
                 except Exception:
                     orchestration_error = "sandbox_error"
@@ -9690,6 +10204,13 @@ class ChallengeEngine:
                     staging.cleanup()
                 except BaseException as cleanup_error:
                     cleanup_errors.append((label, cleanup_error))
+            if recovery_journal_path is not None:
+                try:
+                    _durable_unlink(recovery_journal_path)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(
+                        ("recovery journal", cleanup_error)
+                    )
             if cleanup_errors:
                 if active_error is not None:
                     for label, cleanup_error in cleanup_errors:
@@ -12516,7 +13037,7 @@ class ChallengeEngine:
                 )
                 continue
             try:
-                _durable_unlink(root.joinpath(*relative.parts))
+                _durable_unlink_beneath(root, relative)
             except OSError as cleanup_error:
                 cleanup_errors.append(f"{artifact.id}: {cleanup_error}")
         if cleanup_errors:
@@ -12587,7 +13108,7 @@ class ChallengeEngine:
                 )
                 continue
             try:
-                _durable_unlink(paths.root.joinpath(*relative.parts))
+                _durable_unlink_beneath(paths.root, relative)
             except OSError as cleanup_error:
                 cleanup_errors.append(
                     f"{relative.as_posix()}: {cleanup_error}"
@@ -16413,6 +16934,54 @@ class ChallengeEngine:
         """Recover crash-left notifications and orphaned tool experiments."""
 
         state = self._reconcile_candidate_intents_and_notify(identity)
+        pwn_recoveries: list[
+            tuple[str, PwnCrashRecipe, tuple[str, ...]]
+        ] = []
+        for experiment in state.experiments:
+            if (
+                experiment.status is not ExperimentStatus.RUNNING
+                or (
+                    experiment.command != _PWN_CRASH_ENGINE_COMMAND
+                    and experiment.extra.get("engine_executor")
+                    != _PWN_CRASH_ENGINE_EXECUTOR
+                )
+            ):
+                continue
+            try:
+                recipe = PwnCrashRecipe.from_dict(
+                    experiment.extra.get("pwn_crash_recipe")
+                )
+                journal_ids = (
+                    self._read_pwn_crash_recovery_journal(
+                        state,
+                        experiment.id,
+                        recipe,
+                    )
+                )
+                discovered_ids = (
+                    self._discover_pwn_crash_orphan_runs(
+                        state,
+                        experiment.id,
+                        recipe,
+                    )
+                )
+                run_ids = tuple(
+                    dict.fromkeys([*journal_ids, *discovered_ids])
+                )
+                if len(run_ids) > 6:
+                    raise EngineError(
+                        "Pwn crash recovery found more than six runs"
+                    )
+                pwn_recoveries.append(
+                    (experiment.id, recipe, run_ids)
+                )
+            except Exception as recovery_error:
+                print(
+                    "warning: Pwn crash orphan discovery failed; "
+                    f"typed state recovery will continue: {recovery_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if not any(
             experiment.status is ExperimentStatus.RUNNING
             for experiment in state.experiments
@@ -16516,6 +17085,21 @@ class ChallengeEngine:
             apply,
             validate_artifacts=False,
         )
+        for experiment_id, recipe, run_ids in pwn_recoveries:
+            try:
+                self._cleanup_pwn_crash_recovery_files(
+                    recovered,
+                    experiment_id,
+                    recipe,
+                    run_ids,
+                )
+            except Exception as cleanup_error:
+                print(
+                    "warning: recovered Pwn crash orphan cleanup failed: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return self._synchronize_rev_adapter_seed_plan(recovered)
 
     def _handle_tool_postprocess_interruption(

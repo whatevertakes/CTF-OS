@@ -8,6 +8,7 @@ the smaller v2 capability manifest emitted by ``ctf-capabilities``.
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from collections.abc import Callable
@@ -150,10 +151,21 @@ def inspect_pinned_capabilities(
     runner: Runner = subprocess.run,
     docker: str = "docker",
     required: frozenset[str] = REQUIRED_MANAGED_CAPABILITIES,
+    timeout_seconds: int | float = 30,
 ) -> dict[str, Any]:
     """Probe one exact local image with network and filesystem writes denied."""
 
     digest = validate_image_digest(image_digest)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        raise CapabilityError(
+            "image capability timeout must be positive and finite"
+        )
+    timeout = min(30.0, float(timeout_seconds))
     command = [
         docker,
         "run",
@@ -174,7 +186,7 @@ def inspect_pinned_capabilities(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             check=False,
-            timeout=30,
+            timeout=timeout,
         )
     except FileNotFoundError as error:
         raise CapabilityError("Docker executable is unavailable") from error

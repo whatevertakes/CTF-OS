@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -4908,6 +4909,7 @@ def _rev_inventory_state_errors(
 _PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
 _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
 _PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_CRASH_FLAG_PATTERNS_ENV = "CTF_WRAP_FLAG_PATTERNS_JSON"
 _PWN_CRASH_RESULT_KEY = "pwn_crash_evidence"
 _PWN_CRASH_REQUEST_KEYS = frozenset(
     {
@@ -5354,6 +5356,49 @@ def _pwn_crash_execution_contract_errors(
 
     gate = value.get("gate")
     sandbox = value.get("sandbox")
+    environment = (
+        sandbox.get("environment")
+        if type(sandbox) is dict
+        else None
+    )
+    patterns_json = (
+        environment.get(_PWN_CRASH_FLAG_PATTERNS_ENV)
+        if type(environment) is dict
+        else None
+    )
+    try:
+        patterns = (
+            json.loads(patterns_json)
+            if type(patterns_json) is str
+            and len(patterns_json.encode("utf-8")) <= 64 * 1024
+            else None
+        )
+        patterns_valid = (
+            type(patterns) is list
+            and 1 <= len(patterns) <= 64
+            and all(
+                type(pattern) is str
+                and 1 <= len(pattern.encode("utf-8")) <= 4096
+                for pattern in patterns
+            )
+            and json.dumps(
+                patterns,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            == patterns_json
+        )
+        if patterns_valid:
+            for pattern in patterns:
+                re.compile(pattern)
+    except (RecursionError, TypeError, UnicodeError, ValueError, re.error):
+        patterns_valid = False
+    if (
+        type(environment) is not dict
+        or set(environment) != {_PWN_CRASH_FLAG_PATTERNS_ENV}
+        or not patterns_valid
+    ):
+        return [f"{label} flag scan environment is invalid"]
     gate_deadline = (
         gate.get("deadline_epoch_seconds")
         if type(gate) is dict
@@ -5428,7 +5473,7 @@ def _pwn_crash_execution_contract_errors(
                 "method": PWN_CRASH_SANDBOX_METHOD,
                 "one_shot": PWN_CRASH_ONE_SHOT,
                 "outer_timeout_seconds": outer_timeout,
-                "environment": {},
+                "environment": dict(environment),
                 "resource_request": tool_profile(
                     experiment.resource_class,
                     needs_kvm=False,
@@ -5490,6 +5535,7 @@ def _pwn_crash_attempt_graph_errors(
     seen_requests: set[str] = set()
     seen_execution_contracts: set[str] = set()
     shared_gate_binding: Mapping[str, Any] | None = None
+    shared_flag_environment: Mapping[str, Any] | None = None
 
     try:
         from ctf_os.engine.pwn_crash import (  # local: avoids cycle
@@ -5641,6 +5687,25 @@ def _pwn_crash_attempt_graph_errors(
             elif current_gate_binding != shared_gate_binding:
                 errors.append(
                     f"{attempt_label} changed the shared gate deadline"
+                )
+        current_sandbox = (
+            execution_contract.get("sandbox")
+            if type(execution_contract) is dict
+            else None
+        )
+        current_flag_environment = (
+            current_sandbox.get("environment")
+            if type(current_sandbox) is dict
+            else None
+        )
+        if type(current_flag_environment) is dict:
+            if shared_flag_environment is None:
+                shared_flag_environment = dict(
+                    current_flag_environment
+                )
+            elif current_flag_environment != shared_flag_environment:
+                errors.append(
+                    f"{attempt_label} changed the shared flag environment"
                 )
 
         if (
