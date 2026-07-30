@@ -3027,6 +3027,189 @@ class ManagedWave:
         )
 
 
+_FAILURE_CAPSULE_OMITTED_COUNT_FIELDS = (
+    "run_ids",
+    "failed_experiment_ids",
+    "fact_ids",
+    "artifact_ids",
+    "receipt_ids",
+    "unresolved_hypothesis_ids",
+    "next_experiment_ids",
+)
+_FAILURE_CAPSULE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "reason_code",
+        "stage",
+        "state_revision_before",
+        "state_revision_after",
+        "fingerprint_sha256",
+        "content_sha256",
+        "run_ids",
+        "failed_experiment_ids",
+        "fact_ids",
+        "artifact_ids",
+        "receipt_ids",
+        "unresolved_hypothesis_ids",
+        "next_experiment_ids",
+        "omitted_counts",
+    }
+)
+
+
+def _empty_failure_capsule_omitted_counts() -> dict[str, int]:
+    return {
+        field_name: 0
+        for field_name in _FAILURE_CAPSULE_OMITTED_COUNT_FIELDS
+    }
+
+
+@dataclass
+class FailureCapsule:
+    reason_code: str
+    stage: str
+    state_revision_before: int
+    state_revision_after: int
+    fingerprint_sha256: str
+    content_sha256: str
+    run_ids: list[str]
+    failed_experiment_ids: list[str]
+    fact_ids: list[str]
+    artifact_ids: list[str]
+    receipt_ids: list[str]
+    unresolved_hypothesis_ids: list[str]
+    next_experiment_ids: list[str]
+    omitted_counts: dict[str, int] = field(
+        default_factory=_empty_failure_capsule_omitted_counts
+    )
+    schema_version: int = 1
+
+    def content_payload(self) -> dict[str, Any]:
+        """Canonical immutable capture protected by content_sha256."""
+
+        return {
+            "artifact_ids": list(self.artifact_ids),
+            "failed_experiment_ids": list(self.failed_experiment_ids),
+            "fact_ids": list(self.fact_ids),
+            "fingerprint_sha256": self.fingerprint_sha256,
+            "next_experiment_ids": list(self.next_experiment_ids),
+            "omitted_counts": {
+                key: self.omitted_counts[key]
+                for key in _FAILURE_CAPSULE_OMITTED_COUNT_FIELDS
+            },
+            "reason_code": self.reason_code,
+            "receipt_ids": list(self.receipt_ids),
+            "run_ids": list(self.run_ids),
+            "schema_version": self.schema_version,
+            "stage": self.stage,
+            "state_revision_after": self.state_revision_after,
+            "state_revision_before": self.state_revision_before,
+            "unresolved_hypothesis_ids": list(
+                self.unresolved_hypothesis_ids
+            ),
+        }
+
+    def computed_content_sha256(self) -> str:
+        encoded = json.dumps(
+            self.content_payload(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "reason_code": self.reason_code,
+            "stage": self.stage,
+            "state_revision_before": self.state_revision_before,
+            "state_revision_after": self.state_revision_after,
+            "fingerprint_sha256": self.fingerprint_sha256,
+            "content_sha256": self.content_sha256,
+            "run_ids": list(self.run_ids),
+            "failed_experiment_ids": list(self.failed_experiment_ids),
+            "fact_ids": list(self.fact_ids),
+            "artifact_ids": list(self.artifact_ids),
+            "receipt_ids": list(self.receipt_ids),
+            "unresolved_hypothesis_ids": list(
+                self.unresolved_hypothesis_ids
+            ),
+            "next_experiment_ids": list(self.next_experiment_ids),
+            "omitted_counts": dict(self.omitted_counts),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "FailureCapsule":
+        if set(data) != _FAILURE_CAPSULE_FIELDS:
+            raise ModelValidationError(
+                "failure capsule has a non-canonical schema"
+            )
+        string_fields = (
+            "reason_code",
+            "stage",
+            "fingerprint_sha256",
+            "content_sha256",
+        )
+        revision_fields = (
+            "schema_version",
+            "state_revision_before",
+            "state_revision_after",
+        )
+        repeated_fields = (
+            "run_ids",
+            "failed_experiment_ids",
+            "fact_ids",
+            "artifact_ids",
+            "receipt_ids",
+            "unresolved_hypothesis_ids",
+            "next_experiment_ids",
+        )
+        omitted_counts = data.get("omitted_counts")
+        if (
+            any(type(data.get(name)) is not str for name in string_fields)
+            or any(type(data.get(name)) is not int for name in revision_fields)
+            or any(
+                type(data.get(name)) is not list
+                or any(
+                    type(item) is not str
+                    for item in data.get(name, ())
+                )
+                for name in repeated_fields
+            )
+            or type(omitted_counts) is not dict
+            or set(omitted_counts)
+            != set(_FAILURE_CAPSULE_OMITTED_COUNT_FIELDS)
+            or any(
+                type(value) is not int or value < 0
+                for value in omitted_counts.values()
+            )
+        ):
+            raise ModelValidationError(
+                "failure capsule contains a non-canonical type"
+            )
+        return cls(
+            reason_code=data["reason_code"],
+            stage=data["stage"],
+            state_revision_before=data["state_revision_before"],
+            state_revision_after=data["state_revision_after"],
+            fingerprint_sha256=data["fingerprint_sha256"],
+            content_sha256=data["content_sha256"],
+            run_ids=list(data["run_ids"]),
+            failed_experiment_ids=list(data["failed_experiment_ids"]),
+            fact_ids=list(data["fact_ids"]),
+            artifact_ids=list(data["artifact_ids"]),
+            receipt_ids=list(data["receipt_ids"]),
+            unresolved_hypothesis_ids=list(
+                data["unresolved_hypothesis_ids"]
+            ),
+            next_experiment_ids=list(data["next_experiment_ids"]),
+            omitted_counts=dict(omitted_counts),
+            schema_version=data["schema_version"],
+        )
+
+
 @dataclass
 class Checkpoint:
     id: str
@@ -3042,26 +3225,47 @@ class Checkpoint:
     note: str | None = None
     created_at: str = field(default_factory=utc_now)
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
+    failure_capsule: FailureCapsule | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return _with_extra(
-            self.extra,
-            id=self.id,
-            session_id=self.session_id,
-            cycle_id=self.cycle_id,
-            active_goal_id=self.active_goal_id,
-            open_hypothesis_ids=list(self.open_hypothesis_ids),
-            observation_fact_ids=list(self.observation_fact_ids),
-            next_actions=list(self.next_actions),
-            do_not_repeat=list(self.do_not_repeat),
-            artifact_ids=list(self.artifact_ids),
-            receipt_ids=list(self.receipt_ids),
-            note=self.note,
-            created_at=self.created_at,
-        )
+        canonical = {
+            "id": self.id,
+            "session_id": self.session_id,
+            "cycle_id": self.cycle_id,
+            "active_goal_id": self.active_goal_id,
+            "open_hypothesis_ids": list(self.open_hypothesis_ids),
+            "observation_fact_ids": list(self.observation_fact_ids),
+            "next_actions": list(self.next_actions),
+            "do_not_repeat": list(self.do_not_repeat),
+            "artifact_ids": list(self.artifact_ids),
+            "receipt_ids": list(self.receipt_ids),
+            "note": self.note,
+            "created_at": self.created_at,
+        }
+        extra = dict(self.extra)
+        if self.failure_capsule is not None:
+            canonical["failure_capsule"] = self.failure_capsule.to_dict()
+            extra.pop("failure_capsule", None)
+        return _with_extra(extra, **canonical)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Checkpoint":
+        raw_failure_capsule = data.get("failure_capsule")
+        typed_failure_capsule = (
+            isinstance(raw_failure_capsule, Mapping)
+            and bool(
+                set(raw_failure_capsule).intersection(
+                    _FAILURE_CAPSULE_FIELDS
+                )
+            )
+        )
+        if (
+            raw_failure_capsule is not None
+            and not isinstance(raw_failure_capsule, Mapping)
+        ):
+            raise ModelValidationError(
+                "checkpoint failure_capsule must be a canonical object or null"
+            )
         known = {
             "id",
             "session_id",
@@ -3075,6 +3279,7 @@ class Checkpoint:
             "receipt_ids",
             "note",
             "created_at",
+            "failure_capsule",
         }
 
         def strings(name: str) -> list[str]:
@@ -3108,7 +3313,20 @@ class Checkpoint:
             receipt_ids=strings("receipt_ids"),
             note=str(data["note"]) if data.get("note") is not None else None,
             created_at=str(data.get("created_at", utc_now())),
-            extra=_extra(data, known),
+            extra=_extra(
+                data,
+                (
+                    known
+                    if typed_failure_capsule
+                    or raw_failure_capsule is None
+                    else known - {"failure_capsule"}
+                ),
+            ),
+            failure_capsule=(
+                FailureCapsule.from_dict(raw_failure_capsule)
+                if typed_failure_capsule
+                else None
+            ),
         )
 
 
@@ -5625,7 +5843,11 @@ class ChallengeState:
         )
         return state
 
-    def validate(self) -> None:
+    def validate(
+        self,
+        *,
+        _allow_precommit_failure_capsules: bool = False,
+    ) -> None:
         """Validate referential and state invariants before persistence."""
 
         errors: list[str] = []
@@ -7174,6 +7396,31 @@ class ChallengeState:
                         f"{cycle.checkpoint_id}"
                     )
 
+            def failure_capsule_machine_token(value: object) -> bool:
+                return (
+                    type(value) is str
+                    and 1 <= len(value) <= 64
+                    and "a" <= value[0] <= "z"
+                    and all(
+                        ("a" <= character <= "z")
+                        or character in "0123456789_"
+                        for character in value
+                    )
+                )
+
+            failure_capsule_id_limits = {
+                "run_ids": 16,
+                "failed_experiment_ids": 16,
+                "fact_ids": 32,
+                "artifact_ids": 32,
+                "receipt_ids": 32,
+                "unresolved_hypothesis_ids": 32,
+                "next_experiment_ids": 3,
+            }
+            failure_capsule_bindings: dict[
+                tuple[str, str],
+                str,
+            ] = {}
             for checkpoint in self.checkpoints:
                 if (
                     checkpoint.active_goal_id is not None
@@ -7207,6 +7454,209 @@ class ChallengeState:
                             f"checkpoint {checkpoint.id} references unknown "
                             f"receipt {receipt_id}"
                         )
+                capsule = checkpoint.failure_capsule
+                if capsule is None:
+                    continue
+                if not isinstance(capsule, FailureCapsule):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule must be "
+                        "canonical"
+                    )
+                    continue
+                if (
+                    checkpoint.session_id is None
+                    or checkpoint.cycle_id is None
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule requires "
+                        "session_id and cycle_id"
+                    )
+                else:
+                    session = sessions.get(checkpoint.session_id)
+                    cycle = cycles.get(checkpoint.cycle_id)
+                    if session is None:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"references unknown session "
+                            f"{checkpoint.session_id}"
+                        )
+                    if cycle is None:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"references unknown cycle {checkpoint.cycle_id}"
+                        )
+                    else:
+                        if cycle.session_id != checkpoint.session_id:
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                "cycle does not bind its session"
+                            )
+                        if cycle.checkpoint_id != checkpoint.id:
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                "is not the cycle checkpoint"
+                            )
+                    binding = (
+                        checkpoint.session_id,
+                        checkpoint.cycle_id,
+                    )
+                    prior_checkpoint_id = failure_capsule_bindings.get(
+                        binding
+                    )
+                    if prior_checkpoint_id is not None:
+                        errors.append(
+                            f"failure capsule checkpoints "
+                            f"{prior_checkpoint_id} and {checkpoint.id} share "
+                            "a session/cycle binding"
+                        )
+                    else:
+                        failure_capsule_bindings[binding] = checkpoint.id
+                if (
+                    type(capsule.schema_version) is not int
+                    or capsule.schema_version != 1
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule "
+                        "schema_version must be 1"
+                    )
+                for label, value in (
+                    ("reason_code", capsule.reason_code),
+                    ("stage", capsule.stage),
+                ):
+                    if not failure_capsule_machine_token(value):
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"{label} is not a machine token"
+                        )
+                if not _proof_binding_sha256(
+                    capsule.fingerprint_sha256
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule has an "
+                        "invalid fingerprint_sha256"
+                    )
+                if not _proof_binding_sha256(capsule.content_sha256):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule has an "
+                        "invalid content_sha256"
+                    )
+                if (
+                    type(capsule.state_revision_before) is not int
+                    or type(capsule.state_revision_after) is not int
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule "
+                        "revisions must be non-boolean integers"
+                    )
+                elif not (
+                    0
+                    <= capsule.state_revision_before
+                    <= capsule.state_revision_after
+                    <= self.revision
+                    + (1 if _allow_precommit_failure_capsules else 0)
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule has an "
+                        "invalid revision range"
+                    )
+                omitted_counts_are_canonical = (
+                    isinstance(capsule.omitted_counts, dict)
+                    and set(capsule.omitted_counts)
+                    == set(_FAILURE_CAPSULE_OMITTED_COUNT_FIELDS)
+                    and all(
+                        type(value) is int and value >= 0
+                        for value in capsule.omitted_counts.values()
+                    )
+                )
+                if not omitted_counts_are_canonical:
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule "
+                        "omitted_counts is not canonical"
+                    )
+                elif (
+                    _proof_binding_sha256(capsule.content_sha256)
+                    and capsule.content_sha256
+                    != capsule.computed_content_sha256()
+                ):
+                    errors.append(
+                        f"checkpoint {checkpoint.id} failure capsule "
+                        "content_sha256 does not match its capture"
+                    )
+                valid_capsule_ids: dict[str, list[str]] = {}
+                for field_name, limit in failure_capsule_id_limits.items():
+                    values = getattr(capsule, field_name)
+                    valid_values: list[str] = []
+                    valid_capsule_ids[field_name] = valid_values
+                    if not isinstance(values, list):
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"{field_name} must be an array"
+                        )
+                        continue
+                    if len(values) > limit:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"{field_name} exceeds {limit} items"
+                        )
+                    seen_ids: set[str] = set()
+                    for value in values:
+                        if type(value) is not str or not value.strip():
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                f"{field_name} contains an empty or non-string "
+                                "id"
+                            )
+                            continue
+                        valid_values.append(value)
+                        if value in seen_ids:
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                f"{field_name} contains duplicate id {value}"
+                            )
+                        seen_ids.add(value)
+
+                for run_id in valid_capsule_ids["run_ids"]:
+                    run = runs.get(run_id)
+                    if run is None:
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule "
+                            f"references unknown run {run_id}"
+                        )
+                    elif (
+                        run.session_id != checkpoint.session_id
+                        or run.cycle_id != checkpoint.cycle_id
+                    ):
+                        errors.append(
+                            f"checkpoint {checkpoint.id} failure capsule run "
+                            f"{run_id} does not bind its session and cycle"
+                        )
+                for field_name in (
+                    "failed_experiment_ids",
+                    "next_experiment_ids",
+                ):
+                    for experiment_id in valid_capsule_ids[field_name]:
+                        if experiment_id not in experiments:
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                f"references unknown experiment "
+                                f"{experiment_id}"
+                            )
+                for field_name, records, label in (
+                    ("fact_ids", facts, "fact"),
+                    ("artifact_ids", artifacts, "artifact"),
+                    ("receipt_ids", receipts, "receipt"),
+                    (
+                        "unresolved_hypothesis_ids",
+                        hypotheses,
+                        "hypothesis",
+                    ),
+                ):
+                    for record_id in valid_capsule_ids[field_name]:
+                        if record_id not in records:
+                            errors.append(
+                                f"checkpoint {checkpoint.id} failure capsule "
+                                f"references unknown {label} {record_id}"
+                            )
 
             if self.primary_target_id is not None:
                 primary = targets.get(self.primary_target_id)
@@ -7386,6 +7836,7 @@ __all__ = [
     "ExperimentStatus",
     "Fact",
     "FactKind",
+    "FailureCapsule",
     "FlagCandidate",
     "Falsifier",
     "Goal",

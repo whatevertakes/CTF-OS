@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 import ctf_os.engine.challenge as challenge_module
+import ctf_os.managed as managed_module
 import ctf_os.migration as migration_module
 from ctf_os.adapters import get_adapter
 from ctf_os.codex import (
@@ -53,7 +54,7 @@ from ctf_os.storage import (
     restore_quarantine,
     storage_plan,
 )
-from ctf_os.store import MigrationInProgress
+from ctf_os.store import MigrationInProgress, RevisionConflict
 from ctf_os.store.atomic import (
     StrictJSONError,
     atomic_write_json,
@@ -2515,6 +2516,17 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertEqual(len(state.waves), 0)
         self.assertEqual(len(state.hypotheses), 2)
         self.assertEqual(len(state.checkpoints), 1)
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "frontier_routing_invalid")
+        self.assertEqual(capsule.stage, "captain")
+        self.assertEqual(capsule.state_revision_after, state.revision)
+        self.assertLessEqual(
+            capsule.state_revision_before,
+            capsule.state_revision_after,
+        )
+        self.assertEqual(len(capsule.fingerprint_sha256), 64)
         self.assertIn(
             "only 2 distinct complete active hypotheses",
             state.checkpoints[-1].note,
@@ -2540,11 +2552,17 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
         self.assertIsNotNone(state.active_managed_session_id)
         self.assertEqual(len(state.checkpoints), 1)
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "analysis_wave_invalid")
+        self.assertEqual(capsule.stage, "attack")
+        self.assertEqual(capsule.state_revision_after, state.revision)
         self.assertIn(
             "analysis wave was invalid",
             state.checkpoints[-1].note,
         )
-        self.assertIn(
+        self.assertNotIn(
             "cannot snapshot reported artifact",
             state.checkpoints[-1].note,
         )
@@ -2584,6 +2602,219 @@ class ManagedV2Tests(unittest.TestCase):
             "KCTF{provisional_wave}",
             {candidate.value for candidate in state.candidates},
         )
+
+    def test_failure_capsule_reenters_next_cycle_without_raw_failure_text(
+        self,
+    ):
+        executor = ProbeRoleExecutor(invalid_role=Role.FALSIFIER)
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        raw_contract = "RAW-CONTRACT-CANARY"
+        raw_normalization = "RAW-NORMALIZATION-CANARY"
+        raw_failure = "RAW-FAILURE-CANARY"
+        operator_canary = "RAW-OPERATOR-NOTE-CANARY"
+        original_checkpoint_invalid = (
+            orchestrator._checkpoint_invalid_cycle
+        )
+        injected = False
+
+        def checkpoint_with_raw_diagnostics(
+            identity,
+            session_id,
+            cycle_id,
+            *,
+            reason_code,
+            reason,
+            note,
+        ):
+            nonlocal injected
+            if not injected:
+                current = engine.store.load(identity)
+
+                def add_raw_diagnostics(state):
+                    failed_run = next(
+                        run
+                        for run in state.runs
+                        if run.cycle_id == cycle_id
+                        and run.role == Role.FALSIFIER.value
+                    )
+                    failed_run.extra["contract_errors"] = [
+                        raw_contract
+                    ]
+                    failed_run.extra[
+                        "normalization_error"
+                    ] = raw_normalization
+                    failed_run.extra["failures"] = [
+                        {
+                            "kind": "synthetic_failure",
+                            "message": raw_failure,
+                            "retryable": False,
+                        }
+                    ]
+
+                engine.store.update(
+                    identity,
+                    add_raw_diagnostics,
+                    expected_revision=current.revision,
+                )
+                injected = True
+            return original_checkpoint_invalid(
+                identity,
+                session_id,
+                cycle_id,
+                reason_code=reason_code,
+                reason=reason,
+                note=note,
+            )
+
+        with mock.patch.object(
+            orchestrator,
+            "_checkpoint_invalid_cycle",
+            side_effect=checkpoint_with_raw_diagnostics,
+        ):
+            first = orchestrator.run_cycle(
+                self.identity,
+                note=operator_canary,
+            )
+
+        capsule = first.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "analysis_wave_invalid")
+        self.assertEqual(capsule.stage, "attack")
+        self.assertEqual(capsule.state_revision_after, first.revision)
+        failed_run = next(
+            run
+            for run in first.runs
+            if run.id in capsule.run_ids
+            and run.role == Role.FALSIFIER.value
+        )
+        self.assertIsNotNone(failed_run.validation_path)
+        self.assertNotIn(raw_contract, first.checkpoints[-1].note or "")
+        self.assertNotIn(
+            raw_normalization,
+            first.checkpoints[-1].note or "",
+        )
+        self.assertNotIn(raw_failure, first.checkpoints[-1].note or "")
+        self.assertIn(operator_canary, first.checkpoints[-1].note or "")
+
+        executor.invalid_role = None
+        orchestrator.run_cycle(self.identity)
+        captain_prompts = [
+            prompt
+            for role, prompt in executor.prompts
+            if role is Role.CAPTAIN
+        ]
+        self.assertGreaterEqual(len(captain_prompts), 2)
+        next_prompt = captain_prompts[-1]
+        self.assertIn(capsule.reason_code, next_prompt)
+        self.assertIn(capsule.fingerprint_sha256, next_prompt)
+        self.assertIn(str(failed_run.validation_path), next_prompt)
+        for canary in (
+            raw_contract,
+            raw_normalization,
+            raw_failure,
+            operator_canary,
+        ):
+            self.assertNotIn(canary, next_prompt)
+
+    def test_failure_checkpoint_rejects_intervening_state_update(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        before, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        real_builder = managed_module.build_failure_capsule
+
+        def build_after_intervening_update(current, **kwargs):
+            capsule = real_builder(current, **kwargs)
+            engine.store.update(
+                self.identity,
+                lambda _state: None,
+                expected_revision=current.revision,
+            )
+            return capsule
+
+        with mock.patch(
+            "ctf_os.managed.build_failure_capsule",
+            side_effect=build_after_intervening_update,
+        ):
+            with self.assertRaises(RevisionConflict):
+                orchestrator._checkpoint(
+                    self.identity,
+                    session_id,
+                    cycle.id,
+                    note="race regression",
+                    failure_reason_code="captain_contract_invalid",
+                    failure_stage="captain",
+                )
+
+        after = engine.store.load(self.identity)
+        self.assertEqual(after.revision, before.revision + 1)
+        self.assertEqual(after.checkpoints, [])
+        self.assertIsNone(
+            next(
+                item for item in after.cycles if item.id == cycle.id
+            ).checkpoint_id
+        )
+
+    def test_failure_checkpoint_rejects_mismatched_capsule_revision(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            None,
+        )
+        before, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        real_builder = managed_module.build_failure_capsule
+
+        def build_with_stale_revision(current, **kwargs):
+            capsule = real_builder(current, **kwargs)
+            return replace(
+                capsule,
+                state_revision_after=current.revision,
+            )
+
+        with mock.patch(
+            "ctf_os.managed.build_failure_capsule",
+            side_effect=build_with_stale_revision,
+        ):
+            with self.assertRaisesRegex(
+                ManagedError,
+                "does not bind the pending checkpoint revision",
+            ):
+                orchestrator._checkpoint(
+                    self.identity,
+                    session_id,
+                    cycle.id,
+                    note="stale capsule regression",
+                    failure_reason_code="captain_contract_invalid",
+                    failure_stage="captain",
+                )
+
+        after = engine.store.load(self.identity)
+        self.assertEqual(after.revision, before.revision)
+        self.assertEqual(after.checkpoints, [])
 
     def test_managed_source_artifact_reference_does_not_invalidate_wave(
         self,

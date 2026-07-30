@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
+from ctf_os.engine.failure_capsule import (
+    experiment_command_sha256,
+    safe_run_diagnostics,
+    validate_failure_capsule,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     ArtifactReference,
@@ -32,6 +37,7 @@ from ctf_os.store.atomic import canonical_json_record
 RESUME_CAPSULE_SCHEMA_VERSION = 1
 MAX_RESUME_CAPSULE_BYTES = 12 * 1024
 MIN_RESUME_CAPSULE_BYTES = 1536
+MAX_FAILURE_HISTORY_CHECKPOINTS = 64
 
 _PENDING_STATUSES = frozenset(
     {
@@ -160,6 +166,64 @@ def _bounded_ids(
     return unique[:maximum], max(0, len(unique) - maximum)
 
 
+def _bounded_id_digest(
+    values: list[str],
+    *,
+    maximum: int,
+    source_omitted: int = 0,
+) -> dict[str, object]:
+    included, omitted = _bounded_ids(values, maximum=maximum)
+    result: dict[str, object] = {
+        "ids": included,
+        "total": len(list(dict.fromkeys(values))) + source_omitted,
+    }
+    total_omitted = omitted + source_omitted
+    if total_omitted:
+        result["omitted"] = total_omitted
+    return result
+
+
+def _exact_run_pointer(
+    value: str | None,
+    *,
+    run_id: str,
+    label: str,
+) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or "\x00" in value
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise ModelValidationError(
+            f"failure capsule run {label} is not a canonical path"
+        )
+    pure = PurePosixPath(value)
+    expected = (
+        PurePosixPath("runs")
+        / run_id
+        / (
+            "result.json"
+            if label == "result_path"
+            else "validation.json"
+        )
+    )
+    if (
+        pure.is_absolute()
+        or value != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or pure != expected
+        or len(canonical_json_record(value).encode("ascii")) > 512
+    ):
+        raise ModelValidationError(
+            f"failure capsule run {label} is not a bounded canonical path"
+        )
+    return value
+
+
 def _recent_key(record: Any) -> tuple[str, str]:
     return str(getattr(record, "created_at", "")), str(
         getattr(record, "id", "")
@@ -174,6 +238,20 @@ def _command_sha256(experiment: Experiment) -> str:
             f"experiment {experiment.id} command is not valid UTF-8"
         ) from error
     return hashlib.sha256(payload).hexdigest()
+
+
+def _experiment_contract_sha256(experiment: Experiment) -> str:
+    """Hash model-authored conditions without replaying their free text."""
+
+    return hashlib.sha256(
+        canonical_json_record(
+            {
+                "drop_if": experiment.drop_if,
+                "expected_observation": experiment.expected_observation,
+                "keep_if": experiment.keep_if,
+            }
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _receipt_maps(
@@ -372,16 +450,16 @@ def _experiment_digest(
     )
     return {
         "command_sha256": _command_sha256(experiment),
-        "drop_if": _bounded(experiment.drop_if),
+        "contract_sha256": _experiment_contract_sha256(experiment),
         "evaluated_at": _bounded(experiment.evaluated_at, 64),
-        "evaluation_reason": _bounded(experiment.evaluation_reason),
-        "expected": _bounded(experiment.expected_observation),
+        "evaluation_reason_available": bool(
+            (experiment.evaluation_reason or "").strip()
+        ),
         "fact_ids": fact_ids,
         "fact_ids_omitted": fact_ids_omitted,
         "hypothesis_ids": hypothesis_ids,
         "hypothesis_ids_omitted": hypothesis_ids_omitted,
         "id": experiment.id,
-        "keep_if": _bounded(experiment.keep_if),
         "kind": experiment.kind.value,
         "receipt": receipt_record,
         # Existence alone is not a causal experiment/run binding.  A run is
@@ -473,11 +551,345 @@ def _fact_digest(
     return digest
 
 
-def _checkpoint_digest(state: ChallengeState) -> dict[str, object] | None:
+def _failure_run_priority(run: RunReference) -> tuple[int, str, str]:
+    return (
+        0
+        if run.status
+        in {
+            RunStatus.INVALID,
+            RunStatus.FAILED,
+            RunStatus.TIMED_OUT,
+            RunStatus.CANCELLED,
+            RunStatus.INTERRUPTED,
+        }
+        else 1
+        if run.role == "captain"
+        else 2,
+        run.created_at,
+        run.id,
+    )
+
+
+def _failure_occurrence_summary(
+    state: ChallengeState,
+    checkpoint: Any,
+) -> tuple[int, int]:
+    capsule = checkpoint.failure_capsule
+    window = state.checkpoints[-MAX_FAILURE_HISTORY_CHECKPOINTS:]
+    cycle_bindings: set[tuple[str, str]] = set()
+    for item in window:
+        prior = getattr(item, "failure_capsule", None)
+        if (
+            prior is None
+            or prior.fingerprint_sha256 != capsule.fingerprint_sha256
+        ):
+            continue
+        if item.session_id is None or item.cycle_id is None:
+            raise ModelValidationError(
+                "historical failure capsule requires a session and cycle"
+            )
+        if item is not checkpoint:
+            validate_failure_capsule(
+                state,
+                prior,
+                session_id=item.session_id,
+                cycle_id=item.cycle_id,
+            )
+        cycle_bindings.add((item.session_id, item.cycle_id))
+    return (
+        len(cycle_bindings),
+        max(0, len(state.checkpoints) - len(window)),
+    )
+
+
+def _failure_capsule_digest(
+    state: ChallengeState,
+    checkpoint: Any,
+    *,
+    compact: bool = False,
+) -> dict[str, object] | None:
+    capsule = getattr(checkpoint, "failure_capsule", None)
+    if capsule is None:
+        return None
+    if checkpoint.session_id is None or checkpoint.cycle_id is None:
+        raise ModelValidationError(
+            "checkpoint failure capsule requires a session and cycle"
+        )
+    runs, failed_experiments, next_experiments = (
+        validate_failure_capsule(
+            state,
+            capsule,
+            session_id=checkpoint.session_id,
+            cycle_id=checkpoint.cycle_id,
+        )
+    )
+    occurrence_count, occurrence_history_omitted = (
+        _failure_occurrence_summary(
+            state,
+            checkpoint,
+        )
+    )
+    next_experiments_stale = (
+        len(capsule.next_experiment_ids) - len(next_experiments)
+    )
+    active_hypothesis_ids = {
+        item.id
+        for item in state.hypotheses
+        if item.status in ACTIVE_HYPOTHESIS_STATUSES
+    }
+    active_unresolved_hypothesis_ids = [
+        item_id
+        for item_id in capsule.unresolved_hypothesis_ids
+        if item_id in active_hypothesis_ids
+    ]
+    unresolved_hypotheses_stale = (
+        len(capsule.unresolved_hypothesis_ids)
+        - len(active_unresolved_hypothesis_ids)
+    )
+
+    # One exact result/validation pointer keeps the failure digest inside the
+    # mandatory 1536-byte resume floor. Prefer a negative run; a Captain-only
+    # frontier rejection naturally selects its completed Captain run. The
+    # fingerprint and run_count still cover the complete cycle slice.
+    pointer_runs = [
+        run
+        for run in sorted(runs, key=_failure_run_priority)
+        if run.result_path is not None or run.validation_path is not None
+    ][:1]
+    if not pointer_runs:
+        raise ModelValidationError(
+            "failure capsule has no exact run result or validation pointer"
+        )
+    run_records = []
+    for run in pointer_runs:
+        diagnostics = safe_run_diagnostics(run)
+        if compact:
+            machine_kinds = diagnostics["machine_failure_kinds"]
+            compact_kind_limit = 2
+            diagnostics = {
+                "contract_errors": diagnostics[
+                    "contract_error_count"
+                ],
+                "failure_kinds": [
+                    item["kind"]
+                    for item in machine_kinds[:compact_kind_limit]
+                ],
+                "failure_kinds_omitted": (
+                    int(diagnostics["machine_failure_kinds_omitted"])
+                    + max(0, len(machine_kinds) - compact_kind_limit)
+                ),
+                "failure_records_over_soft_limit": diagnostics[
+                    "machine_failure_records_over_soft_limit"
+                ],
+                "malformed_fields": diagnostics[
+                    "malformed_failure_field_count"
+                ],
+                "normalization_error": diagnostics[
+                    "normalization_error_present"
+                ],
+                "retryable_count": diagnostics[
+                    "machine_failure_retryable_count"
+                ],
+            }
+        result_path = _exact_run_pointer(
+            run.result_path,
+            run_id=run.id,
+            label="result_path",
+        )
+        validation_path = _exact_run_pointer(
+            run.validation_path,
+            run_id=run.id,
+            label="validation_path",
+        )
+        run_record = {
+            "diagnostics": diagnostics,
+            "id": run.id,
+            "role": run.role,
+            "status": run.status.value,
+        }
+        if result_path is not None and (
+            not compact or validation_path is None
+        ):
+            run_record["result_path"] = result_path
+        if validation_path is not None:
+            run_record["validation_path"] = validation_path
+        run_records.append(run_record)
+    failed_records = [
+        {
+            "command_sha256": experiment_command_sha256(experiment),
+            "id": experiment.id,
+            "kind": experiment.kind.value,
+        }
+        for experiment in failed_experiments[:1]
+    ]
+    next_records = [
+        (
+            {"id": experiment.id}
+            if compact
+            else {
+                "command_sha256": experiment_command_sha256(experiment),
+                "id": experiment.id,
+                "kind": experiment.kind.value,
+            }
+        )
+        for experiment in next_experiments
+    ]
+    if compact:
+        run_count = (
+            len(capsule.run_ids)
+            + capsule.omitted_counts["run_ids"]
+        )
+        failed_experiment_count = (
+            len(capsule.failed_experiment_ids)
+            + capsule.omitted_counts["failed_experiment_ids"]
+        )
+        digest = {
+            "evidence_counts": {
+                "artifacts": len(capsule.artifact_ids)
+                + capsule.omitted_counts["artifact_ids"],
+                "facts": len(capsule.fact_ids)
+                + capsule.omitted_counts["fact_ids"],
+                "receipts": len(capsule.receipt_ids)
+                + capsule.omitted_counts["receipt_ids"],
+            },
+            "failed_experiment_ids": list(
+                capsule.failed_experiment_ids[:1]
+            ),
+            "failed_experiments_omitted": max(
+                0, failed_experiment_count - len(failed_records)
+            ),
+            "fingerprint_sha256": capsule.fingerprint_sha256,
+            "next_experiments": next_records,
+            "occurrence_count": occurrence_count,
+            "reason_code": capsule.reason_code,
+            "revisions": [
+                capsule.state_revision_before,
+                capsule.state_revision_after,
+            ],
+            "run_count": run_count,
+            "runs": run_records,
+            "runs_omitted": run_count - len(run_records),
+            "schema_version": capsule.schema_version,
+            "stage": capsule.stage,
+            "unresolved_hypothesis_ids": list(
+                active_unresolved_hypothesis_ids[:2]
+            ),
+            "unresolved_hypotheses_omitted": max(
+                0,
+                len(active_unresolved_hypothesis_ids)
+                - 2
+                + capsule.omitted_counts[
+                    "unresolved_hypothesis_ids"
+                ],
+            ),
+        }
+        if next_experiments_stale:
+            digest["next_experiments_stale"] = next_experiments_stale
+        if capsule.omitted_counts["next_experiment_ids"]:
+            digest["next_experiments_omitted"] = (
+                capsule.omitted_counts["next_experiment_ids"]
+            )
+        if unresolved_hypotheses_stale:
+            digest["unresolved_hypotheses_stale"] = (
+                unresolved_hypotheses_stale
+            )
+        if occurrence_history_omitted:
+            digest["occurrence_history_omitted"] = (
+                occurrence_history_omitted
+            )
+        return digest
+    digest = {
+        "evidence_id_deltas": {
+            "artifacts": _bounded_id_digest(
+                list(capsule.artifact_ids),
+                maximum=2,
+                source_omitted=capsule.omitted_counts["artifact_ids"],
+            ),
+            "facts": _bounded_id_digest(
+                list(capsule.fact_ids),
+                maximum=2,
+                source_omitted=capsule.omitted_counts["fact_ids"],
+            ),
+            "receipts": _bounded_id_digest(
+                list(capsule.receipt_ids),
+                maximum=2,
+                source_omitted=capsule.omitted_counts["receipt_ids"],
+            ),
+        },
+        "failed_experiment_count": (
+            len(capsule.failed_experiment_ids)
+            + capsule.omitted_counts["failed_experiment_ids"]
+        ),
+        "failed_experiments": failed_records,
+        "failed_experiments_omitted": (
+            len(capsule.failed_experiment_ids)
+            + capsule.omitted_counts["failed_experiment_ids"]
+            - len(failed_records)
+        ),
+        "fingerprint_sha256": capsule.fingerprint_sha256,
+        "next_experiments": next_records,
+        "occurrence_count": occurrence_count,
+        "reason_code": capsule.reason_code,
+        "run_count": (
+            len(capsule.run_ids)
+            + capsule.omitted_counts["run_ids"]
+        ),
+        "runs": run_records,
+        "runs_omitted": (
+            len(capsule.run_ids)
+            + capsule.omitted_counts["run_ids"]
+            - len(run_records)
+        ),
+        "schema_version": capsule.schema_version,
+        "stage": capsule.stage,
+        "state_revision_after": capsule.state_revision_after,
+        "state_revision_before": capsule.state_revision_before,
+        "unresolved_hypotheses": _bounded_id_digest(
+            active_unresolved_hypothesis_ids,
+            maximum=3,
+            source_omitted=capsule.omitted_counts[
+                "unresolved_hypothesis_ids"
+            ],
+        ),
+    }
+    if next_experiments_stale:
+        digest["next_experiments_stale"] = next_experiments_stale
+    if capsule.omitted_counts["next_experiment_ids"]:
+        digest["next_experiments_omitted"] = (
+            capsule.omitted_counts["next_experiment_ids"]
+        )
+    if unresolved_hypotheses_stale:
+        digest["unresolved_hypotheses_stale"] = (
+            unresolved_hypotheses_stale
+        )
+    if occurrence_history_omitted:
+        digest["occurrence_history_omitted"] = occurrence_history_omitted
+    return digest
+
+
+def _checkpoint_digest(
+    state: ChallengeState,
+    *,
+    compact_failure: bool = False,
+) -> dict[str, object] | None:
     if not state.checkpoints:
         return None
     checkpoint = state.checkpoints[-1]
-    return {
+    failure_capsule = _failure_capsule_digest(
+        state,
+        checkpoint,
+        compact=compact_failure,
+    )
+    if compact_failure and failure_capsule is not None:
+        # The active goal and evidence indexes are already represented by
+        # mandatory top-level/context records.  Under byte pressure retain
+        # only the checkpoint binding and the failure evidence itself.
+        return {
+            "cycle_id": checkpoint.cycle_id,
+            "failure_capsule": failure_capsule,
+            "id": checkpoint.id,
+        }
+    digest = {
         "active_goal_id": checkpoint.active_goal_id,
         "artifact_count": len(checkpoint.artifact_ids),
         "cycle_id": checkpoint.cycle_id,
@@ -492,6 +904,9 @@ def _checkpoint_digest(state: ChallengeState) -> dict[str, object] | None:
         "note_available": bool((checkpoint.note or "").strip()),
         "receipt_count": len(checkpoint.receipt_ids),
     }
+    if failure_capsule is not None:
+        digest["failure_capsule"] = failure_capsule
+    return digest
 
 
 def _pending_priority(
@@ -652,6 +1067,7 @@ def render_resume_capsule(
         for item in selected_confirmed_facts
     ]
     confirmed_is_compact = [False] * len(selected_confirmed)
+    compact_failure = False
 
     def payload() -> dict[str, object]:
         included = {
@@ -670,7 +1086,10 @@ def render_resume_capsule(
         return {
             "canonical_state": str(state_path),
             "challenge_id": state.challenge_id,
-            "checkpoint": _checkpoint_digest(state),
+            "checkpoint": _checkpoint_digest(
+                state,
+                compact_failure=compact_failure,
+            ),
             "confirmed": selected_confirmed,
             "counts": counts,
             "kind": "resume_capsule",
@@ -691,9 +1110,10 @@ def render_resume_capsule(
         return canonical_json_record(payload()) + "\n"
 
     text = render()
-    # Keep at least one independently chained fact ahead of backlog under
-    # byte pressure.  Facts first lose optional prose and relationship
-    # annotations; only then may older fact pointers be omitted.
+    # Keep at least one independently chained fact ahead of ordinary backlog.
+    # A mandatory failure capsule may finally displace that fact after both
+    # records have been compacted; the exact canonical state remains pointed
+    # to by this record.
     while len(text.encode("ascii")) > policy.max_bytes:
         if selected_negative:
             selected_negative.pop()
@@ -715,6 +1135,20 @@ def render_resume_capsule(
             confirmed_is_compact.pop()
         elif selected_pending:
             selected_pending.pop()
+        elif (
+            state.checkpoints
+            and state.checkpoints[-1].failure_capsule is not None
+            and not compact_failure
+        ):
+            compact_failure = True
+        elif (
+            state.checkpoints
+            and state.checkpoints[-1].failure_capsule is not None
+            and selected_confirmed
+        ):
+            selected_confirmed.pop()
+            compact_confirmed.pop()
+            confirmed_is_compact.pop()
         else:
             raise ValueError(
                 "resume capsule policy is too small for its mandatory "

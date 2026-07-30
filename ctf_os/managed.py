@@ -7,7 +7,6 @@ never falls back to assisted solving after a managed failure.
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +25,7 @@ from ctf_os.engine.challenge import (
     EngineError,
     SessionAlreadyRunning,
 )
+from ctf_os.engine.failure_capsule import build_failure_capsule
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     BudgetMode,
@@ -116,6 +116,22 @@ class PreflightReport:
 def _stable_id(prefix: str, *parts: object) -> str:
     payload = "\0".join(str(part) for part in parts)
     return f"{prefix}-{uuid.uuid5(uuid.NAMESPACE_URL, payload).hex[:24]}"
+
+
+def _bounded_checkpoint_note(*parts: str | None) -> str:
+    text = "\n".join(
+        item.strip()
+        for item in parts
+        if item is not None and item.strip()
+    )
+    encoded = text.encode("utf-8")
+    if len(encoded) <= 4096:
+        return text
+    suffix = "…".encode("utf-8")
+    return (
+        encoded[: 4096 - len(suffix)].decode("utf-8", errors="ignore")
+        + suffix.decode("utf-8")
+    )
 
 
 class ManagedOrchestrator:
@@ -826,10 +842,38 @@ class ManagedOrchestrator:
         cycle_id: str,
         *,
         note: str | None,
+        failure_reason_code: str | None = None,
+        failure_stage: str | None = None,
     ) -> ChallengeState:
         current = self.engine.store.load(identity)
         session = self._require_epoch(current, session_id)
         cycle = next(item for item in current.cycles if item.id == cycle_id)
+        if (failure_reason_code is None) != (failure_stage is None):
+            raise ManagedError(
+                "failure checkpoint requires both reason_code and stage"
+            )
+        failure_capsule = (
+            build_failure_capsule(
+                current,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                reason_code=failure_reason_code,
+                stage=failure_stage,
+                state_revision_after=current.revision + 1,
+            )
+            if failure_reason_code is not None
+            and failure_stage is not None
+            else None
+        )
+        if (
+            failure_capsule is not None
+            and failure_capsule.state_revision_after
+            != current.revision + 1
+        ):
+            raise ManagedError(
+                "failure capsule does not bind the pending checkpoint "
+                "revision"
+            )
         checkpoint_id = _stable_id(
             "CP", identity.key, session_id, cycle_id
         )
@@ -892,6 +936,7 @@ class ManagedOrchestrator:
             artifact_ids=artifact_ids,
             receipt_ids=receipt_ids,
             note=note,
+            failure_capsule=failure_capsule,
         )
 
         def apply(state: ChallengeState) -> None:
@@ -1326,54 +1371,15 @@ class ManagedOrchestrator:
         session_id: str,
         cycle_id: str,
         *,
+        reason_code: str,
         reason: str,
         note: str | None,
     ) -> ChallengeState:
         """Preserve a failed model attempt and let the next cycle repair it."""
 
-        current = self.engine.store.load(identity)
-        cycle_runs = [
-            run
-            for run in current.runs
-            if run.session_id == session_id and run.cycle_id == cycle_id
-        ]
-        diagnostics: list[dict[str, object]] = []
-        for run in cycle_runs:
-            if (
-                run.status is RunStatus.COMPLETED
-                and not run.extra.get("contract_errors")
-                and not run.extra.get("normalization_error")
-            ):
-                continue
-            diagnostics.append(
-                {
-                    "run_id": run.id,
-                    "role": run.role,
-                    "status": run.status.value,
-                    "contract_errors": run.extra.get("contract_errors", []),
-                    "normalization_error": run.extra.get(
-                        "normalization_error"
-                    ),
-                    "failures": run.extra.get("failures", []),
-                    "validation_path": run.validation_path,
-                }
-            )
-        diagnostic_text = json.dumps(
-            {
-                "managed_cycle_repair": reason,
-                "runs": diagnostics,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        checkpoint_note = "\n".join(
-            part
-            for part in (
-                note.strip() if note and note.strip() else None,
-                diagnostic_text[:4096],
-            )
-            if part
+        checkpoint_note = _bounded_checkpoint_note(
+            f"{reason_code}: {reason}",
+            note,
         )
         self._mark_action_selection(
             identity,
@@ -1381,11 +1387,26 @@ class ManagedOrchestrator:
             cycle_id,
             (),
         )
+        current = self.engine.store.load(identity)
+        cycle = next(
+            item for item in current.cycles if item.id == cycle_id
+        )
+        if cycle.wave_id is None:
+            stage = "captain"
+        else:
+            wave = next(
+                item
+                for item in current.waves
+                if item.id == cycle.wave_id
+            )
+            stage = wave.kind.value
         state = self._checkpoint(
             identity,
             session_id,
             cycle_id,
             note=checkpoint_note,
+            failure_reason_code=reason_code,
+            failure_stage=stage,
         )
         if state.status in _STOP_STATUSES:
             target = (
@@ -1467,6 +1488,7 @@ class ManagedOrchestrator:
                     identity,
                     selected_session,
                     cycle.id,
+                    reason_code="captain_contract_invalid",
                     reason="Captain result was not contract-valid",
                     note=note,
                 )
@@ -1498,6 +1520,7 @@ class ManagedOrchestrator:
                     identity,
                     selected_session,
                     cycle.id,
+                    reason_code="frontier_routing_invalid",
                     reason=frontier_issue,
                     note=note,
                 )
@@ -1539,6 +1562,7 @@ class ManagedOrchestrator:
                     identity,
                     selected_session,
                     cycle.id,
+                    reason_code="analysis_wave_invalid",
                     reason=(
                         "analysis wave was invalid; provisional results were "
                         "preserved"
@@ -1555,6 +1579,7 @@ class ManagedOrchestrator:
                     identity,
                     selected_session,
                     cycle.id,
+                    reason_code="proof_recipe_invalid",
                     reason=(
                         "proof wave did not produce exactly one valid "
                         "engine-bound replay recipe"
@@ -1582,6 +1607,7 @@ class ManagedOrchestrator:
                         identity,
                         selected_session,
                         cycle.id,
+                        reason_code="managed_proof_execution_invalid",
                         reason=(
                             "managed proof recipe was stale, unsupported, "
                             "or did not complete its replay"

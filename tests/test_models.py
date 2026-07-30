@@ -28,6 +28,7 @@ from ctf_os.models import (
     MAX_REPEATED_FIELD_ITEMS,
     ArtifactReference,
     CandidateStatus,
+    Checkpoint,
     ChallengeIdentity,
     ChallengeStatus,
     Experiment,
@@ -35,12 +36,14 @@ from ctf_os.models import (
     ExperimentStatus,
     ExecutionReceipt,
     Fact,
+    FailureCapsule,
     Falsifier,
     FlagCandidate,
     Goal,
     GoalStatus,
     Hypothesis,
     HypothesisStatus,
+    ManagedCycle,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
     ModelValidationError,
     ProofPolicySnapshot,
@@ -52,6 +55,9 @@ from ctf_os.models import (
     RunReference,
     RunOrigin,
     RunStatus,
+    SessionMode,
+    SessionStatus,
+    SolveSession,
     SubmissionReference,
     SubmissionStatus,
     new_challenge_state,
@@ -453,7 +459,558 @@ def _duplicate_passing_rev_candidate(state):
     return original_candidate, second_candidate
 
 
+def _failure_capsule_state():
+    state = new_challenge_state(
+        ChallengeIdentity("Demo", "misc", "FailureCapsule"),
+        schema_version=2,
+    )
+    state.revision = 5
+    state.sessions.append(
+        SolveSession(
+            id="S-failed",
+            mode=SessionMode.MANAGED,
+            status=SessionStatus.COMPLETED,
+            configuration_epoch=0,
+            start_revision=3,
+            end_revision=5,
+            run_ids=["R-failed", "R-evidence"],
+        )
+    )
+    state.cycles.append(
+        ManagedCycle(
+            id="C-failed",
+            session_id="S-failed",
+            ordinal=1,
+            phase="failed",
+            configuration_epoch=0,
+            checkpoint_id="CP-failed",
+        )
+    )
+    state.runs.extend(
+        (
+            RunReference(
+                id="R-failed",
+                base_revision=4,
+                status=RunStatus.FAILED,
+                session_id="S-failed",
+                cycle_id="C-failed",
+            ),
+            RunReference(
+                id="R-evidence",
+                base_revision=3,
+                status=RunStatus.COMPLETED,
+                session_id="S-failed",
+                cycle_id="C-failed",
+            ),
+        )
+    )
+    state.artifacts.append(
+        ArtifactReference(
+            id="A-evidence",
+            path="artifacts/evidence.log",
+            sha256="a" * 64,
+            source_run_id="R-evidence",
+        )
+    )
+    state.facts.append(
+        Fact(
+            id="F-evidence",
+            challenge_id="FailureCapsule",
+            statement="the original oracle accepted the control input",
+            provenance=Provenance.EXECUTED,
+            source_run_id="R-evidence",
+            artifact_id="A-evidence",
+            locator="artifacts/evidence.log:1",
+        )
+    )
+    state.hypotheses.append(
+        Hypothesis(
+            id="H-resolved",
+            statement="the control path is reachable",
+            falsifier=Falsifier("the original oracle rejects the input"),
+            status=HypothesisStatus.CONFIRMED,
+            evidence_fact_ids=["F-evidence"],
+            evidence_artifact_ids=["A-evidence"],
+            evidence_run_ids=["R-evidence"],
+        )
+    )
+    state.experiments.extend(
+        (
+            Experiment(
+                id="E-failed",
+                hypothesis_ids=[],
+                command="false",
+                expected_observation="the probe exits successfully",
+                keep_if="exit status is zero",
+                drop_if="exit status is non-zero",
+                timeout_seconds=10,
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.FAILED,
+            ),
+            Experiment(
+                id="E-next",
+                hypothesis_ids=[],
+                command="true",
+                expected_observation="the alternate probe exits successfully",
+                keep_if="exit status is zero",
+                drop_if="exit status is non-zero",
+                timeout_seconds=10,
+                kind=ExperimentKind.PROBE,
+            ),
+        )
+    )
+    state.receipts.append(
+        ExecutionReceipt(
+            id="RC-failed",
+            experiment_id="E-failed",
+            run_id="R-failed",
+            outcome=ReceiptOutcome.FAILED,
+            exit_code=1,
+        )
+    )
+    failure_capsule = FailureCapsule(
+        reason_code="contract_invalid",
+        stage="exploration",
+        state_revision_before=4,
+        state_revision_after=5,
+        fingerprint_sha256="f" * 64,
+        content_sha256="0" * 64,
+        run_ids=["R-failed"],
+        failed_experiment_ids=["E-failed"],
+        fact_ids=["F-evidence"],
+        artifact_ids=["A-evidence"],
+        receipt_ids=["RC-failed"],
+        unresolved_hypothesis_ids=["H-resolved"],
+        next_experiment_ids=["E-next"],
+    )
+    failure_capsule.content_sha256 = (
+        failure_capsule.computed_content_sha256()
+    )
+    state.checkpoints.append(
+        Checkpoint(
+            id="CP-failed",
+            session_id="S-failed",
+            cycle_id="C-failed",
+            active_goal_id=None,
+            created_at="2026-01-01T00:00:00Z",
+            failure_capsule=failure_capsule,
+        )
+    )
+    state.validate()
+    return state
+
+
 class ModelTests(unittest.TestCase):
+    def test_failure_capsule_round_trips_with_committed_revision(
+        self,
+    ) -> None:
+        state = _failure_capsule_state()
+
+        payload = state.to_dict()
+        capsule_payload = payload["checkpoints"][0]["failure_capsule"]
+        self.assertEqual(
+            set(capsule_payload),
+            {
+                "schema_version",
+                "reason_code",
+                "stage",
+                "state_revision_before",
+                "state_revision_after",
+                "fingerprint_sha256",
+                "content_sha256",
+                "run_ids",
+                "failed_experiment_ids",
+                "fact_ids",
+                "artifact_ids",
+                "receipt_ids",
+                "unresolved_hypothesis_ids",
+                "next_experiment_ids",
+                "omitted_counts",
+            },
+        )
+        self.assertEqual(capsule_payload["state_revision_after"], 5)
+        self.assertEqual(
+            capsule_payload["omitted_counts"],
+            {
+                "run_ids": 0,
+                "failed_experiment_ids": 0,
+                "fact_ids": 0,
+                "artifact_ids": 0,
+                "receipt_ids": 0,
+                "unresolved_hypothesis_ids": 0,
+                "next_experiment_ids": 0,
+            },
+        )
+
+        restored = type(state).from_dict(payload)
+        restored.validate()
+        self.assertEqual(restored.to_dict(), payload)
+        self.assertIs(
+            restored.hypotheses[0].status,
+            HypothesisStatus.CONFIRMED,
+        )
+
+    def test_failure_capsule_future_revision_is_precommit_only(
+        self,
+    ) -> None:
+        state = _failure_capsule_state()
+        state.revision = 4
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid revision range",
+        ):
+            state.validate()
+
+        state.validate(_allow_precommit_failure_capsules=True)
+
+    def test_failure_capsule_content_tamper_fails_state_validation(
+        self,
+    ) -> None:
+        state = _failure_capsule_state()
+        capsule = state.checkpoints[0].failure_capsule
+        assert capsule is not None
+        capsule.next_experiment_ids.clear()
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "content_sha256 does not match its capture",
+        ):
+            state.validate()
+
+    def test_failure_capsule_requires_canonical_cycle_binding(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "missing session",
+                lambda state: setattr(
+                    state.checkpoints[0], "session_id", None
+                ),
+                "requires session_id and cycle_id",
+            ),
+            (
+                "missing cycle",
+                lambda state: setattr(
+                    state.checkpoints[0], "cycle_id", None
+                ),
+                "requires session_id and cycle_id",
+            ),
+            (
+                "unknown session",
+                lambda state: setattr(
+                    state.checkpoints[0], "session_id", "S-missing"
+                ),
+                "references unknown session",
+            ),
+            (
+                "unknown cycle",
+                lambda state: setattr(
+                    state.checkpoints[0], "cycle_id", "C-missing"
+                ),
+                "references unknown cycle",
+            ),
+            (
+                "cycle session mismatch",
+                lambda state: setattr(
+                    state.cycles[0], "session_id", "S-missing"
+                ),
+                "cycle does not bind its session",
+            ),
+            (
+                "cycle checkpoint mismatch",
+                lambda state: setattr(
+                    state.cycles[0], "checkpoint_id", None
+                ),
+                "is not the cycle checkpoint",
+            ),
+        )
+        for label, mutate, error in cases:
+            state = _failure_capsule_state()
+            mutate(state)
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ModelValidationError, error):
+                    state.validate()
+
+    def test_failure_capsules_cannot_share_cycle_binding(self) -> None:
+        state = _failure_capsule_state()
+        duplicate = copy.deepcopy(state.checkpoints[0])
+        duplicate.id = "CP-duplicate"
+        state.checkpoints.append(duplicate)
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "share a session/cycle binding",
+        ):
+            state.validate()
+
+    def test_checkpoint_preserves_legacy_failure_capsule_extension(
+        self,
+    ) -> None:
+        checkpoint = Checkpoint(
+            id="CP-legacy",
+            session_id=None,
+            cycle_id=None,
+            active_goal_id=None,
+            note="legacy note",
+            created_at="2026-01-01T00:00:00Z",
+            extra={"failure_capsule": {"legacy": "shadow"}},
+        )
+        payload = checkpoint.to_dict()
+        self.assertEqual(
+            payload["failure_capsule"],
+            {"legacy": "shadow"},
+        )
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        restored = Checkpoint.from_dict(json.loads(encoded))
+        self.assertIsNone(restored.failure_capsule)
+        self.assertEqual(
+            restored.extra["failure_capsule"],
+            {"legacy": "shadow"},
+        )
+        self.assertEqual(
+            json.dumps(
+                restored.to_dict(),
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoded,
+        )
+
+        explicit_null = dict(payload, failure_capsule=None)
+        restored_null = Checkpoint.from_dict(explicit_null)
+        self.assertIsNone(restored_null.failure_capsule)
+        self.assertNotIn("failure_capsule", restored_null.to_dict())
+
+    def test_failure_capsule_from_dict_rejects_noncanonical_shape(
+        self,
+    ) -> None:
+        canonical = (
+            _failure_capsule_state()
+            .checkpoints[0]
+            .failure_capsule.to_dict()
+        )
+        malformed = []
+        missing = dict(canonical)
+        missing.pop("stage")
+        malformed.append(missing)
+        extra = dict(canonical, extension=True)
+        malformed.append(extra)
+        wrong_array = dict(canonical, run_ids=("R-failed",))
+        malformed.append(wrong_array)
+        wrong_item = dict(canonical, run_ids=[1])
+        malformed.append(wrong_item)
+        wrong_revision = dict(canonical, state_revision_before=True)
+        malformed.append(wrong_revision)
+        missing_omitted_count = copy.deepcopy(canonical)
+        missing_omitted_count["omitted_counts"].pop("run_ids")
+        malformed.append(missing_omitted_count)
+        extra_omitted_count = copy.deepcopy(canonical)
+        extra_omitted_count["omitted_counts"]["unexpected_ids"] = 0
+        malformed.append(extra_omitted_count)
+        negative_omitted_count = copy.deepcopy(canonical)
+        negative_omitted_count["omitted_counts"]["run_ids"] = -1
+        malformed.append(negative_omitted_count)
+        boolean_omitted_count = copy.deepcopy(canonical)
+        boolean_omitted_count["omitted_counts"]["run_ids"] = True
+        malformed.append(boolean_omitted_count)
+
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ModelValidationError):
+                    FailureCapsule.from_dict(payload)
+
+        checkpoint_payload = (
+            _failure_capsule_state().checkpoints[0].to_dict()
+        )
+        checkpoint_payload["failure_capsule"] = []
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "canonical object or null",
+        ):
+            Checkpoint.from_dict(checkpoint_payload)
+
+        stripped_typed = (
+            _failure_capsule_state().checkpoints[0].to_dict()
+        )
+        stripped_payload = stripped_typed["failure_capsule"]
+        for key in (
+            "schema_version",
+            "fingerprint_sha256",
+            "content_sha256",
+        ):
+            stripped_payload.pop(key)
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "non-canonical schema",
+        ):
+            Checkpoint.from_dict(stripped_typed)
+
+    def test_failure_capsule_rejects_invalid_values_and_bounds(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "schema",
+                lambda capsule: setattr(capsule, "schema_version", 2),
+                "schema_version",
+            ),
+            (
+                "reason",
+                lambda capsule: setattr(
+                    capsule, "reason_code", "Contract-Invalid"
+                ),
+                "machine token",
+            ),
+            (
+                "stage",
+                lambda capsule: setattr(capsule, "stage", "_exploration"),
+                "machine token",
+            ),
+            (
+                "fingerprint",
+                lambda capsule: setattr(
+                    capsule, "fingerprint_sha256", "F" * 64
+                ),
+                "fingerprint_sha256",
+            ),
+            (
+                "content hash",
+                lambda capsule: setattr(
+                    capsule, "content_sha256", "E" * 64
+                ),
+                "content_sha256",
+            ),
+            (
+                "boolean revision",
+                lambda capsule: setattr(
+                    capsule, "state_revision_before", True
+                ),
+                "non-boolean integers",
+            ),
+            (
+                "reverse revision",
+                lambda capsule: setattr(
+                    capsule, "state_revision_before", 6
+                ),
+                "revision range",
+            ),
+            (
+                "future revision",
+                lambda capsule: setattr(
+                    capsule, "state_revision_after", 6
+                ),
+                "revision range",
+            ),
+            (
+                "empty id",
+                lambda capsule: capsule.run_ids.append(""),
+                "empty or non-string",
+            ),
+            (
+                "duplicate id",
+                lambda capsule: capsule.run_ids.append("R-failed"),
+                "duplicate id",
+            ),
+            (
+                "omitted count fields",
+                lambda capsule: capsule.omitted_counts.pop("run_ids"),
+                "omitted_counts",
+            ),
+            (
+                "negative omitted count",
+                lambda capsule: capsule.omitted_counts.__setitem__(
+                    "run_ids", -1
+                ),
+                "omitted_counts",
+            ),
+            (
+                "boolean omitted count",
+                lambda capsule: capsule.omitted_counts.__setitem__(
+                    "run_ids", True
+                ),
+                "omitted_counts",
+            ),
+        )
+        for label, mutate, error in cases:
+            state = _failure_capsule_state()
+            capsule = state.checkpoints[0].failure_capsule
+            assert capsule is not None
+            mutate(capsule)
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(ModelValidationError, error):
+                    state.validate()
+
+        for field_name, limit in (
+            ("run_ids", 16),
+            ("failed_experiment_ids", 16),
+            ("fact_ids", 32),
+            ("artifact_ids", 32),
+            ("receipt_ids", 32),
+            ("unresolved_hypothesis_ids", 32),
+            ("next_experiment_ids", 3),
+        ):
+            state = _failure_capsule_state()
+            capsule = state.checkpoints[0].failure_capsule
+            assert capsule is not None
+            setattr(
+                capsule,
+                field_name,
+                [f"missing-{index}" for index in range(limit + 1)],
+            )
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    rf"{field_name} exceeds {limit} items",
+                ):
+                    state.validate()
+
+    def test_failure_capsule_rejects_invalid_crosslinks(self) -> None:
+        cases = (
+            ("run_ids", "R-missing", "unknown run"),
+            (
+                "failed_experiment_ids",
+                "E-missing-failed",
+                "unknown experiment",
+            ),
+            ("fact_ids", "F-missing", "unknown fact"),
+            ("artifact_ids", "A-missing", "unknown artifact"),
+            ("receipt_ids", "RC-missing", "unknown receipt"),
+            (
+                "unresolved_hypothesis_ids",
+                "H-missing",
+                "unknown hypothesis",
+            ),
+            (
+                "next_experiment_ids",
+                "E-missing-next",
+                "unknown experiment",
+            ),
+        )
+        for field_name, missing_id, error in cases:
+            state = _failure_capsule_state()
+            capsule = state.checkpoints[0].failure_capsule
+            assert capsule is not None
+            getattr(capsule, field_name).append(missing_id)
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(ModelValidationError, error):
+                    state.validate()
+
+        state = _failure_capsule_state()
+        state.runs[0].session_id = "S-other"
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "does not bind its session and cycle",
+        ):
+            state.validate()
+
     def test_persisted_rev_proof_rejects_hash_and_run_slice_tamper(
         self,
     ) -> None:
