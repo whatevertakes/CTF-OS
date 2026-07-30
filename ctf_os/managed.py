@@ -15,12 +15,21 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
+from ctf_os.adapters import get_adapter
 from ctf_os.capabilities import (
     CapabilityError,
     inspect_pinned_capabilities,
 )
 from ctf_os.codex import Role
-from ctf_os.codex.contracts import MANAGED_PWN_CRASH_ACTION_KIND
+from ctf_os.codex.contracts import (
+    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
+    MANAGED_MISC_TRANSFORM_ACTION_KIND,
+    MANAGED_PWN_CRASH_ACTION_KIND,
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_TYPED_GATE_ACTION_KINDS,
+    MANAGED_WEB_IMPACT_ACTION_KIND,
+)
 from ctf_os.contracts.managed_rejection_v1 import (
     MANAGED_REJECTION_V1_MAX_ATTEMPT,
     MANAGED_REJECTION_V1_MAX_ISSUES,
@@ -105,7 +114,94 @@ _TERMINAL_RUN_STATUSES = frozenset(
 )
 _PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
 _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_MANAGED_TYPED_GATE_ENGINE_COMMAND = "ctfos-engine:typed-gate-v1"
+_MANAGED_TYPED_GATE_ENGINE_EXECUTOR = "managed_typed_gate_v1"
 _MAX_MANAGED_REJECTED_ACTIONS = 64
+_MAX_MANAGED_TYPED_GATE_PATHS = 4
+_MANAGED_TYPED_GATE_CATEGORIES = {
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: "pwn",
+    MANAGED_WEB_IMPACT_ACTION_KIND: "web",
+    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: "crypto",
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: "forensics",
+    MANAGED_MISC_TRANSFORM_ACTION_KIND: "misc",
+}
+_MANAGED_TYPED_GATE_PATH_FIELDS = {
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: (
+        "payload_artifact_path",
+    ),
+    MANAGED_WEB_IMPACT_ACTION_KIND: (
+        "operator_spec_artifact_path",
+        "driver_artifact_path",
+    ),
+    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: (
+        "solver_artifact_path",
+        "original_parameters_artifact_path",
+        "variant_parameters_artifact_path",
+        "variant_expected_output_artifact_path",
+    ),
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: (
+        "operator_spec_artifact_path",
+    ),
+    MANAGED_MISC_TRANSFORM_ACTION_KIND: (
+        "spec_artifact_path",
+    ),
+}
+_MANAGED_TYPED_GATE_KEYS = {
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "parent_experiment_id",
+            "payload_artifact_path",
+            "timeout_seconds",
+        }
+    ),
+    MANAGED_WEB_IMPACT_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "operator_spec_artifact_path",
+            "driver_artifact_path",
+            "hypothesis_ids",
+            "timeout_seconds",
+        }
+    ),
+    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "candidate_id",
+            "solver_artifact_path",
+            "original_parameters_artifact_path",
+            "variant_parameters_artifact_path",
+            "variant_expected_output_artifact_path",
+            "mutation_id",
+            "runtime",
+        }
+    ),
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "operator_spec_artifact_path",
+            "hypothesis_ids",
+            "timeout_seconds",
+        }
+    ),
+    MANAGED_MISC_TRANSFORM_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "candidate_id",
+            "spec_artifact_path",
+        }
+    ),
+}
+_MANAGED_TYPED_GATE_TIMEOUT_LIMITS = {
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
+    MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
+}
 
 
 class ManagedError(EngineError):
@@ -149,6 +245,12 @@ class BuilderPublishRejection:
 class BuilderPublishOutcome:
     published_count: int
     rejection: BuilderPublishRejection | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedTypedGateRegistrationOutcome:
+    experiment_ids: tuple[str, ...] = ()
+    rejection_code: str | None = None
 
 
 def _managed_rejection_issue_sort_key(
@@ -289,6 +391,72 @@ def _safe_managed_artifact_locator(value: object) -> str | None:
     ):
         return None
     return value
+
+
+def _managed_typed_gate_action_shape_error(
+    action: object,
+) -> str | None:
+    """Validate the exact non-semantic shape before any workspace publish."""
+
+    if not isinstance(action, Mapping):
+        return "typed_gate_action_invalid"
+    kind = action.get("kind")
+    if (
+        type(kind) is not str
+        or kind not in MANAGED_TYPED_GATE_ACTION_KINDS
+        or set(action) != _MANAGED_TYPED_GATE_KEYS[kind]
+        or type(action.get("description")) is not str
+    ):
+        return "typed_gate_action_invalid"
+    locators = [
+        _safe_managed_artifact_locator(action.get(field))
+        for field in _MANAGED_TYPED_GATE_PATH_FIELDS[kind]
+    ]
+    if (
+        any(locator is None for locator in locators)
+        or len(set(locators)) != len(locators)
+    ):
+        return "typed_gate_path_invalid"
+    hypothesis_ids = action.get("hypothesis_ids", [])
+    if (
+        type(hypothesis_ids) is not list
+        or len(hypothesis_ids) > 64
+        or any(
+            type(item) is not str
+            or not item
+            or len(item) > 256
+            for item in hypothesis_ids
+        )
+        or len(set(hypothesis_ids)) != len(hypothesis_ids)
+    ):
+        return "typed_gate_hypothesis_invalid"
+    maximum = _MANAGED_TYPED_GATE_TIMEOUT_LIMITS.get(kind)
+    if maximum is not None:
+        timeout = action.get("timeout_seconds")
+        if (
+            type(timeout) is not int
+            or not 1 <= timeout <= maximum
+        ):
+            return "typed_gate_timeout_invalid"
+    for field in (
+        "candidate_id",
+        "parent_experiment_id",
+        "mutation_id",
+    ):
+        if field in action:
+            value = action.get(field)
+            if (
+                type(value) is not str
+                or not value
+                or len(value) > 256
+            ):
+                return "typed_gate_reference_invalid"
+    if (
+        kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND
+        and action.get("runtime") not in {"python", "sage"}
+    ):
+        return "typed_gate_action_invalid"
+    return None
 
 
 class ManagedOrchestrator:
@@ -963,6 +1131,19 @@ class ManagedOrchestrator:
             if item.status is ExperimentStatus.REGISTERED
             and item.source_run_id in role_order
         ]
+        typed_gates = [
+            item
+            for item in candidates
+            if item.extra.get("engine_executor")
+            == _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+        ]
+        if typed_gates:
+            typed_gates.sort(key=lambda item: item.id)
+            if len(typed_gates) != 1:
+                raise ManagedError(
+                    "managed wave must contain at most one typed category gate"
+                )
+            return (typed_gates[0].id,)
         if wave.kind is WaveKind.PROOF:
             reproducer_run_id = wave.role_run_ids.get("reproducer")
             proof_recipes = [
@@ -1077,15 +1258,393 @@ class ManagedOrchestrator:
             expected_revision=current.revision,
         )
 
+    @staticmethod
+    def _bounded_typed_gate_reason(value: object) -> str:
+        raw = str(value).strip().casefold()
+        normalized = "".join(
+            character
+            if character.isascii() and (
+                character.isalnum() or character in {"_", "-"}
+            )
+            else "_"
+            for character in raw
+        ).strip("_")
+        return (normalized or "unspecified")[:128]
+
+    def _execute_typed_gate_experiment(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+    ) -> ChallengeState:
+        """Execute one canonical typed gate and reduce only its real result."""
+
+        current = self.engine.store.load(identity)
+        experiment = next(
+            (
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if (
+            experiment is None
+            or experiment.status is not ExperimentStatus.REGISTERED
+            or experiment.extra.get("engine_executor")
+            != _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+        ):
+            raise ManagedError(
+                "managed typed gate is not a registered canonical experiment"
+            )
+        prior_artifact_ids = {item.id for item in current.artifacts}
+        prior_run_ids = {item.id for item in current.runs}
+        request = experiment.extra.get("managed_typed_gate_request")
+        if type(request) is not dict:
+            raise ManagedError("managed typed gate request is unavailable")
+        kind = request.get("action_kind")
+        if (
+            type(kind) is not str
+            or kind not in MANAGED_TYPED_GATE_ACTION_KINDS
+            or request.get("configuration_epoch")
+            != current.configuration_epoch
+            or experiment.extra.get("configuration_epoch")
+            != current.configuration_epoch
+        ):
+            raise ManagedError("managed typed gate request is stale")
+        source_run_id = request.get("source_builder_run_id")
+        source_run = next(
+            (
+                item
+                for item in current.runs
+                if item.id == source_run_id
+            ),
+            None,
+        )
+        if (
+            source_run is None
+            or source_run.role != Role.BUILDER.value
+            or source_run.origin is not RunOrigin.MANAGED_MODEL
+            or source_run.status is not RunStatus.COMPLETED
+            or source_run.extra.get("semantic_merge") is not True
+            or experiment.source_run_id != source_run.id
+        ):
+            raise ManagedError(
+                "managed typed gate lost its Builder run binding"
+            )
+        bindings = request.get("artifact_bindings")
+        if (
+            type(bindings) is not dict
+            or set(bindings)
+            != set(_MANAGED_TYPED_GATE_PATH_FIELDS[kind])
+            or not 1 <= len(bindings) <= _MAX_MANAGED_TYPED_GATE_PATHS
+        ):
+            raise ManagedError(
+                "managed typed gate artifact bindings are invalid"
+            )
+        artifact_index = {item.id: item for item in current.artifacts}
+        publish_index = {
+            item.id: item for item in current.workspace_publishes
+        }
+        locators: dict[str, str] = {}
+        for field in _MANAGED_TYPED_GATE_PATH_FIELDS[kind]:
+            binding = bindings.get(field)
+            if type(binding) is not dict or set(binding) != {
+                "artifact_id",
+                "locator",
+                "sha256",
+                "size_bytes",
+                "workspace_publish_id",
+            }:
+                raise ManagedError(
+                    "managed typed gate artifact binding changed"
+                )
+            artifact = artifact_index.get(binding.get("artifact_id"))
+            publish = publish_index.get(
+                binding.get("workspace_publish_id")
+            )
+            locator = _safe_managed_artifact_locator(
+                binding.get("locator")
+            )
+            if (
+                artifact is None
+                or publish is None
+                or locator is None
+                or artifact.id not in experiment.artifact_ids
+                or artifact.source_run_id != source_run.id
+                or artifact.extra.get("reported_locator") != locator
+                or artifact.sha256 != binding.get("sha256")
+                or artifact.size != binding.get("size_bytes")
+                or publish.run_id != source_run.id
+                or publish.destination != locator
+                or publish.sha256 != artifact.sha256
+                or publish.status != "published"
+                or publish.extra.get("size") != artifact.size
+                or canonical_workspace_hash(
+                    self.engine,
+                    identity,
+                    locator,
+                )
+                != artifact.sha256
+            ):
+                raise ManagedError(
+                    "managed typed gate workspace binding changed"
+                )
+            locators[field] = locator
+
+        def mark_running(state: ChallengeState) -> None:
+            target = next(
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            )
+            if (
+                target.status is not ExperimentStatus.REGISTERED
+                or target.extra.get("managed_typed_gate_request")
+                != request
+            ):
+                raise ManagedError(
+                    "managed typed gate changed before execution"
+                )
+            target.status = ExperimentStatus.RUNNING
+            target.extra["started_at"] = utc_now()
+
+        self.engine.store.update(
+            identity,
+            mark_running,
+            expected_revision=current.revision,
+        )
+
+        passed = False
+        reason_codes: tuple[str, ...] = ()
+        evaluation_sha256: str | None = None
+        execution_error: Exception | None = None
+        try:
+            if kind == MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND:
+                _state, evaluation = self.engine.prove_pwn_exploit_effect(
+                    identity,
+                    parent_experiment_id=str(
+                        request["parent_experiment_id"]
+                    ),
+                    payload_locator=locators["payload_artifact_path"],
+                    timeout_seconds=int(request["timeout_seconds"]),
+                    _session_owned=True,
+                )
+                passed = bool(evaluation.exploit_effect_proven)
+                reason_codes = (str(evaluation.reason_code),)
+                evaluation_sha256 = str(evaluation.evidence_sha256)
+            elif kind == MANAGED_WEB_IMPACT_ACTION_KIND:
+                _state, evaluation = self.engine.prove_web_impact(
+                    identity,
+                    operator_spec_locator=locators[
+                        "operator_spec_artifact_path"
+                    ],
+                    driver_locator=locators["driver_artifact_path"],
+                    hypothesis_ids=tuple(request["hypothesis_ids"]),
+                    timeout_seconds=int(request["timeout_seconds"]),
+                    _session_owned=True,
+                )
+                passed = bool(evaluation.confirmed)
+                reason_codes = tuple(evaluation.reason_codes)
+                evaluation_sha256 = str(evaluation.sha256)
+            elif kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND:
+                _state, evaluation = (
+                    self.engine.prove_crypto_metamorphic_candidate(
+                        identity,
+                        str(request["candidate_id"]),
+                        solver_locator=locators[
+                            "solver_artifact_path"
+                        ],
+                        original_parameters_locator=locators[
+                            "original_parameters_artifact_path"
+                        ],
+                        variant_parameters_locator=locators[
+                            "variant_parameters_artifact_path"
+                        ],
+                        variant_expected_output_locator=locators[
+                            "variant_expected_output_artifact_path"
+                        ],
+                        mutation_id=str(request["mutation_id"]),
+                        runtime=str(request["runtime"]),
+                        _session_owned=True,
+                    )
+                )
+                passed = bool(evaluation.passed)
+                reason_codes = tuple(evaluation.failures)
+                evaluation_sha256 = None
+            elif kind == MANAGED_FORENSIC_ASSERTION_ACTION_KIND:
+                _state, evaluation = self.engine.prove_forensic_assertion(
+                    identity,
+                    operator_spec_locator=locators[
+                        "operator_spec_artifact_path"
+                    ],
+                    hypothesis_ids=tuple(request["hypothesis_ids"]),
+                    timeout_seconds=int(request["timeout_seconds"]),
+                    _session_owned=True,
+                )
+                passed = bool(evaluation.confirmed)
+                reason_codes = tuple(evaluation.reason_codes)
+                evaluation_sha256 = str(evaluation.sha256)
+            elif kind == MANAGED_MISC_TRANSFORM_ACTION_KIND:
+                _state, evaluation = (
+                    self.engine.evaluate_misc_transform_candidate(
+                        identity,
+                        str(request["candidate_id"]),
+                        spec_locator=locators["spec_artifact_path"],
+                        _session_owned=True,
+                    )
+                )
+                passed = bool(evaluation.passed)
+                reason_codes = tuple(evaluation.failure_codes)
+                evaluation_sha256 = str(evaluation.sha256)
+            else:  # pragma: no cover - guarded by the exact kind check.
+                raise ManagedError("unsupported managed typed gate")
+        except Exception as error:
+            execution_error = error
+            reason_codes = ("typed_gate_execution_error",)
+
+        bounded_reasons = tuple(
+            dict.fromkeys(
+                self._bounded_typed_gate_reason(item)
+                for item in reason_codes[:16]
+            )
+        )
+        if not bounded_reasons and not passed:
+            bounded_reasons = ("typed_gate_nonpass",)
+        terminal = self.engine.store.load(identity)
+        evidence_artifact_ids = tuple(
+            item.id
+            for item in terminal.artifacts
+            if item.id not in prior_artifact_ids
+        )
+        evidence_run_ids = tuple(
+            item.id
+            for item in terminal.runs
+            if item.id not in prior_run_ids
+        )
+
+        def mark_terminal(state: ChallengeState) -> None:
+            target = next(
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            )
+            if (
+                target.status is not ExperimentStatus.RUNNING
+                or target.extra.get("managed_typed_gate_request")
+                != request
+            ):
+                raise ManagedError(
+                    "managed typed gate changed during execution"
+                )
+            target.status = (
+                ExperimentStatus.COMPLETED
+                if passed
+                else ExperimentStatus.FAILED
+            )
+            target.artifact_ids = list(
+                dict.fromkeys(
+                    (*target.artifact_ids, *evidence_artifact_ids)
+                )
+            )
+            target.result = {
+                "schema_version": 1,
+                "action_kind": kind,
+                "authority": "engine_deterministic_gate",
+                "passed": passed,
+                "reason_codes": list(bounded_reasons),
+                "evaluation_sha256": evaluation_sha256,
+                "evidence_artifact_ids": list(evidence_artifact_ids),
+                "evidence_run_ids": list(evidence_run_ids),
+                "execution_error_type": (
+                    type(execution_error).__name__[:128]
+                    if execution_error is not None
+                    else None
+                ),
+            }
+            target.extra["completed_at"] = utc_now()
+
+        return self.engine.store.update(
+            identity,
+            mark_terminal,
+            expected_revision=terminal.revision,
+        )
+
+    def _terminalize_typed_gate_dispatch_rejection(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        error: Exception,
+    ) -> ChallengeState:
+        """Make a pre-dispatch rejection capsule-safe without raw text."""
+
+        current = self.engine.store.load(identity)
+
+        def apply(state: ChallengeState) -> None:
+            target = next(
+                (
+                    item
+                    for item in state.experiments
+                    if item.id == experiment_id
+                ),
+                None,
+            )
+            if (
+                target is None
+                or target.extra.get("engine_executor")
+                != _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+                or target.status
+                not in {
+                    ExperimentStatus.REGISTERED,
+                    ExperimentStatus.RUNNING,
+                }
+            ):
+                raise ManagedError(
+                    "typed gate dispatch rejection lost its experiment"
+                )
+            target.status = ExperimentStatus.FAILED
+            target.result = {
+                "schema_version": 1,
+                "action_kind": target.extra.get("managed_action_kind"),
+                "authority": "engine_deterministic_gate",
+                "passed": False,
+                "reason_codes": ["typed_gate_dispatch_rejected"],
+                "evaluation_sha256": None,
+                "evidence_artifact_ids": [],
+                "evidence_run_ids": [],
+                "execution_error_type": type(error).__name__[:128],
+            }
+            target.extra["completed_at"] = utc_now()
+
+        return self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+
     def _apply_builder_publishes(
         self,
         identity: ChallengeIdentity,
         wave: ManagedWave,
         results: Sequence[Any],
     ) -> BuilderPublishOutcome:
-        """Promote only explicit Builder ``write_artifact`` proposals."""
+        """Promote explicit writes and one shape-valid typed-gate input set."""
 
         proposals: list[tuple[str, str, int, int]] = []
+        proposed_paths: set[tuple[str, str]] = set()
+        state = self.engine.store.load(identity)
+        adapter_name = get_adapter(state.category).name
+        typed_action_count = sum(
+            1
+            for result in results
+            for action in (
+                result.output.get("actions", [])
+                if isinstance(result.output, Mapping)
+                and isinstance(result.output.get("actions"), list)
+                else ()
+            )
+            if isinstance(action, Mapping)
+            and action.get("kind") in MANAGED_TYPED_GATE_ACTION_KINDS
+        )
         for result in results:
             if result.invocation.role is not Role.BUILDER:
                 continue
@@ -1099,16 +1658,39 @@ class ManagedOrchestrator:
                 continue
             proposal_ordinal = 0
             for action in actions:
-                if (
-                    isinstance(action, Mapping)
-                    and action.get("kind") == "write_artifact"
-                    and isinstance(action.get("artifact_path"), str)
+                if not isinstance(action, Mapping):
+                    continue
+                kind = action.get("kind")
+                relative_paths: tuple[object, ...] = ()
+                if kind == "write_artifact":
+                    relative_paths = (action.get("artifact_path"),)
+                elif (
+                    typed_action_count == 1
+                    and kind in MANAGED_TYPED_GATE_ACTION_KINDS
+                    and _managed_typed_gate_action_shape_error(action)
+                    is None
+                    and _MANAGED_TYPED_GATE_CATEGORIES.get(str(kind))
+                    == adapter_name
+                    and wave.kind is WaveKind.ATTACK
                 ):
+                    relative_paths = tuple(
+                        action.get(field)
+                        for field in _MANAGED_TYPED_GATE_PATH_FIELDS[
+                            str(kind)
+                        ]
+                    )
+                for relative in relative_paths:
+                    if not isinstance(relative, str):
+                        continue
                     proposal_ordinal += 1
+                    key = (result.invocation.run_id, relative)
+                    if key in proposed_paths:
+                        continue
+                    proposed_paths.add(key)
                     proposals.append(
                         (
                             result.invocation.run_id,
-                            action["artifact_path"],
+                            relative,
                             proposal_ordinal,
                             max(
                                 1,
@@ -1527,6 +2109,430 @@ class ManagedOrchestrator:
             expected_revision=current.revision,
         )
 
+    def _register_typed_gate_actions(
+        self,
+        identity: ChallengeIdentity,
+        wave: ManagedWave,
+        results: Sequence[Any],
+    ) -> ManagedTypedGateRegistrationOutcome:
+        """Bind one Builder-authored category gate to canonical inputs.
+
+        The model supplies only relative paths and canonical record ids.  This
+        reducer accepts a path only when the current Builder both reported the
+        bounded artifact and atomically published the exact same bytes.  The
+        durable request contains no model verdict; execution is deferred to
+        the engine-owned dispatcher.
+        """
+
+        proposals: list[tuple[Any, int, Mapping[str, Any]]] = []
+        for result in results:
+            output = result.output
+            actions = (
+                output.get("actions")
+                if isinstance(output, Mapping)
+                else None
+            )
+            if not isinstance(actions, list):
+                continue
+            for index, action in enumerate(actions, start=1):
+                if (
+                    isinstance(action, Mapping)
+                    and action.get("kind")
+                    in MANAGED_TYPED_GATE_ACTION_KINDS
+                ):
+                    proposals.append((result, index, action))
+        if not proposals:
+            return ManagedTypedGateRegistrationOutcome()
+
+        current = self.engine.store.load(identity)
+        rejection_codes: list[str] = []
+        registered_ids: list[str] = []
+
+        def apply(state: ChallengeState) -> None:
+            self._require_epoch(state, wave.session_id)
+            canonical_wave = next(
+                (item for item in state.waves if item.id == wave.id),
+                None,
+            )
+            if canonical_wave is None:
+                raise ManagedError(
+                    f"unknown managed wave for typed gate: {wave.id}"
+                )
+
+            def reject(
+                run: RunReference | None,
+                index: int,
+                code: str,
+            ) -> None:
+                rejection_codes.append(code)
+                if run is None:
+                    return
+                bucket = run.extra.setdefault("rejected_actions", [])
+                if not isinstance(bucket, list):
+                    return
+                entry = {
+                    "action": str(index),
+                    "reason": code,
+                }
+                if (
+                    entry not in bucket
+                    and len(bucket) < _MAX_MANAGED_REJECTED_ACTIONS
+                ):
+                    bucket.append(entry)
+
+            if len(proposals) != 1:
+                for result, index, _action in proposals[
+                    :_MAX_MANAGED_REJECTED_ACTIONS
+                ]:
+                    reject(
+                        next(
+                            (
+                                item
+                                for item in state.runs
+                                if item.id == result.invocation.run_id
+                            ),
+                            None,
+                        ),
+                        index,
+                        "typed_gate_multiple_actions",
+                    )
+                return
+
+            result, index, action = proposals[0]
+            invocation = result.invocation
+            run = next(
+                (
+                    item
+                    for item in state.runs
+                    if item.id == invocation.run_id
+                ),
+                None,
+            )
+            if run is None:
+                reject(None, index, "typed_gate_unknown_run")
+                return
+            kind = action.get("kind")
+            if not isinstance(kind, str):
+                reject(run, index, "typed_gate_action_invalid")
+                return
+            expected_category = _MANAGED_TYPED_GATE_CATEGORIES.get(kind)
+            if (
+                expected_category is None
+                or get_adapter(state.category).name != expected_category
+            ):
+                reject(run, index, "typed_gate_wrong_category")
+                return
+            if canonical_wave.kind is not WaveKind.ATTACK:
+                reject(run, index, "typed_gate_wrong_wave")
+                return
+            if (
+                invocation.role is not Role.BUILDER
+                or canonical_wave.role_run_ids.get(Role.BUILDER.value)
+                != invocation.run_id
+                or run.role != Role.BUILDER.value
+            ):
+                reject(run, index, "typed_gate_wrong_role")
+                return
+            if invocation.contract_version != 2:
+                reject(run, index, "typed_gate_wrong_contract")
+                return
+            if (
+                run.origin is not RunOrigin.MANAGED_MODEL
+                or run.wave_id != canonical_wave.id
+                or run.session_id != canonical_wave.session_id
+                or run.cycle_id != canonical_wave.cycle_id
+                or run.configuration_epoch != state.configuration_epoch
+                or run.status is not RunStatus.COMPLETED
+                or run.extra.get("semantic_merge") is not True
+            ):
+                reject(run, index, "typed_gate_stale_run")
+                return
+
+            shape_error = _managed_typed_gate_action_shape_error(action)
+            if shape_error is not None:
+                reject(run, index, shape_error)
+                return
+
+            artifact_bindings: dict[str, dict[str, object]] = {}
+            locators: set[str] = set()
+            for field in _MANAGED_TYPED_GATE_PATH_FIELDS[kind]:
+                locator = _safe_managed_artifact_locator(action.get(field))
+                if locator is None or locator in locators:
+                    reject(run, index, "typed_gate_path_invalid")
+                    return
+                locators.add(locator)
+                matches = [
+                    artifact
+                    for artifact in state.artifacts
+                    if artifact.source_run_id == invocation.run_id
+                    and artifact.extra.get("reported_locator") == locator
+                ]
+                publishes = [
+                    publish
+                    for publish in state.workspace_publishes
+                    if publish.run_id == invocation.run_id
+                    and publish.destination == locator
+                    and publish.status == "published"
+                ]
+                if len(matches) != 1 or len(publishes) != 1:
+                    reject(run, index, "typed_gate_artifact_unbound")
+                    return
+                artifact = matches[0]
+                publish = publishes[0]
+                if (
+                    type(artifact.size) is not int
+                    or artifact.size <= 0
+                    or artifact.size > self.engine.store.max_artifact_bytes
+                    or artifact.sha256 != publish.sha256
+                    or publish.extra.get("size") != artifact.size
+                    or canonical_workspace_hash(
+                        self.engine,
+                        identity,
+                        locator,
+                    )
+                    != artifact.sha256
+                ):
+                    reject(
+                        run,
+                        index,
+                        "typed_gate_workspace_binding_changed",
+                    )
+                    return
+                artifact_bindings[field] = {
+                    "artifact_id": artifact.id,
+                    "locator": locator,
+                    "sha256": artifact.sha256,
+                    "size_bytes": artifact.size,
+                    "workspace_publish_id": publish.id,
+                }
+
+            local_hypothesis_ids = {
+                str(item.get("id"))
+                for item in (
+                    result.output.get("hypotheses", [])
+                    if isinstance(result.output, Mapping)
+                    else []
+                )
+                if isinstance(item, Mapping)
+                and isinstance(item.get("id"), str)
+            }
+            requested_hypotheses = action.get("hypothesis_ids", [])
+            if (
+                type(requested_hypotheses) is not list
+                or len(requested_hypotheses) > 64
+                or any(type(item) is not str for item in requested_hypotheses)
+                or len(set(requested_hypotheses))
+                != len(requested_hypotheses)
+            ):
+                reject(run, index, "typed_gate_hypothesis_invalid")
+                return
+            resolved_hypotheses: list[str] = []
+            active_hypotheses = {
+                item.id: item
+                for item in state.hypotheses
+                if item.status in ACTIVE_HYPOTHESIS_STATUSES
+            }
+            for requested in requested_hypotheses:
+                candidates = {
+                    hypothesis_id
+                    for hypothesis_id, hypothesis in active_hypotheses.items()
+                    if (
+                        hypothesis_id == requested
+                        or (
+                            requested in local_hypothesis_ids
+                            and hypothesis_id
+                            == f"H-{invocation.run_id}-{requested}"
+                            and hypothesis.source_run_id == invocation.run_id
+                        )
+                    )
+                }
+                if len(candidates) != 1:
+                    reject(run, index, "typed_gate_hypothesis_invalid")
+                    return
+                resolved_hypotheses.append(next(iter(candidates)))
+
+            reference: dict[str, object] = {}
+            if kind == MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND:
+                parent_id = action.get("parent_experiment_id")
+                if (
+                    type(parent_id) is not str
+                    or not any(
+                        item.id == parent_id for item in state.experiments
+                    )
+                ):
+                    reject(run, index, "typed_gate_reference_invalid")
+                    return
+                timeout = action.get("timeout_seconds")
+                if (
+                    type(timeout) is not int
+                    or not 1 <= timeout <= 3600
+                ):
+                    reject(run, index, "typed_gate_timeout_invalid")
+                    return
+                reference = {
+                    "parent_experiment_id": parent_id,
+                    "timeout_seconds": self.engine._budget_command_timeout(
+                        state,
+                        timeout,
+                    ),
+                }
+            elif kind in {
+                MANAGED_WEB_IMPACT_ACTION_KIND,
+                MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
+            }:
+                timeout = action.get("timeout_seconds")
+                if (
+                    type(timeout) is not int
+                    or not 1 <= timeout <= 86_400
+                ):
+                    reject(run, index, "typed_gate_timeout_invalid")
+                    return
+                reference = {
+                    "hypothesis_ids": list(resolved_hypotheses),
+                    "timeout_seconds": self.engine._budget_command_timeout(
+                        state,
+                        timeout,
+                    ),
+                }
+            elif kind in {
+                MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
+                MANAGED_MISC_TRANSFORM_ACTION_KIND,
+            }:
+                candidate_id = action.get("candidate_id")
+                candidate = next(
+                    (
+                        item
+                        for item in state.candidates
+                        if item.id == candidate_id
+                        and item.source_run_id != invocation.run_id
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    reject(run, index, "typed_gate_reference_invalid")
+                    return
+                reference = {"candidate_id": candidate.id}
+                if kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND:
+                    mutation_id = action.get("mutation_id")
+                    runtime = action.get("runtime")
+                    if (
+                        type(mutation_id) is not str
+                        or not mutation_id
+                        or len(mutation_id) > 256
+                        or runtime not in {"python", "sage"}
+                    ):
+                        reject(run, index, "typed_gate_action_invalid")
+                        return
+                    reference.update(
+                        {
+                            "mutation_id": mutation_id,
+                            "runtime": runtime,
+                        }
+                    )
+
+            request = {
+                "schema_version": 1,
+                "action_kind": kind,
+                "configuration_epoch": state.configuration_epoch,
+                "source_builder_run_id": invocation.run_id,
+                "artifact_bindings": artifact_bindings,
+                **reference,
+            }
+            experiment_id = _stable_id(
+                "E",
+                identity.key,
+                canonical_wave.id,
+                invocation.run_id,
+                index,
+                "typed-gate-v1",
+            )
+            existing = next(
+                (
+                    item
+                    for item in state.experiments
+                    if item.id == experiment_id
+                ),
+                None,
+            )
+            artifact_ids = [
+                str(binding["artifact_id"])
+                for binding in artifact_bindings.values()
+            ]
+            command = f"{_MANAGED_TYPED_GATE_ENGINE_COMMAND}:{kind}"
+            if existing is not None:
+                if (
+                    existing.command != command
+                    or existing.hypothesis_ids != resolved_hypotheses
+                    or existing.artifact_ids != artifact_ids
+                    or existing.extra.get("managed_typed_gate_request")
+                    != request
+                ):
+                    raise ManagedError(
+                        "managed typed gate idempotency collision: "
+                        f"{experiment_id}"
+                    )
+                registered_ids.append(existing.id)
+                return
+            state.experiments.append(
+                Experiment(
+                    id=experiment_id,
+                    hypothesis_ids=resolved_hypotheses,
+                    command=command,
+                    expected_observation=(
+                        "the engine-owned category gate returns its exact "
+                        "deterministic passing verdict"
+                    ),
+                    keep_if=(
+                        "the engine-owned typed gate result passes without "
+                        "granting automatic submission authority"
+                    ),
+                    drop_if=(
+                        "the typed gate rejects, fails, or reports a "
+                        "non-passing deterministic verdict"
+                    ),
+                    timeout_seconds=int(
+                        reference.get(
+                            "timeout_seconds",
+                            self.engine._budget_command_timeout(
+                                state,
+                                self.engine.config.runtime.command_timeout_s,
+                            ),
+                        )
+                    ),
+                    resource_class="standard",
+                    kind=(
+                        ExperimentKind.STRATEGIC
+                        if resolved_hypotheses
+                        else ExperimentKind.PROBE
+                    ),
+                    status=ExperimentStatus.REGISTERED,
+                    source_run_id=invocation.run_id,
+                    artifact_ids=artifact_ids,
+                    extra={
+                        "managed_contract_version": 2,
+                        "managed_action_kind": kind,
+                        "engine_executor": (
+                            _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+                        ),
+                        "configuration_epoch": state.configuration_epoch,
+                        "managed_typed_gate_request": request,
+                    },
+                )
+            )
+            registered_ids.append(experiment_id)
+
+        self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+        return ManagedTypedGateRegistrationOutcome(
+            experiment_ids=tuple(registered_ids),
+            rejection_code=(
+                rejection_codes[0] if rejection_codes else None
+            ),
+        )
+
     def _checkpoint(
         self,
         identity: ChallengeIdentity,
@@ -1694,6 +2700,36 @@ class ManagedOrchestrator:
                 "selected managed experiments disappeared: "
                 + ", ".join(missing)
             )
+        typed_gate_experiments = [
+            item
+            for item in experiments.values()
+            if item.extra.get("engine_executor")
+            == _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+        ]
+        if typed_gate_experiments:
+            if len(selected) != 1 or len(typed_gate_experiments) != 1:
+                raise ManagedError(
+                    "managed typed gate dispatch requires exactly one "
+                    "canonical experiment"
+                )
+            try:
+                completed = self._execute_typed_gate_experiment(
+                    identity,
+                    typed_gate_experiments[0].id,
+                )
+            except Exception as error:
+                completed = (
+                    self._terminalize_typed_gate_dispatch_rejection(
+                        identity,
+                        typed_gate_experiments[0].id,
+                        error,
+                    )
+                )
+            return (
+                self.engine._record_stall_if_needed(completed)
+                if record_stall
+                else completed
+            )
         proof_experiments = [
             item
             for item in experiments.values()
@@ -1799,6 +2835,22 @@ class ManagedOrchestrator:
 
         return selected_pwn_crash_failure_reason(state, selected)
 
+    @staticmethod
+    def _selected_typed_gate_failure_reason(
+        state: ChallengeState,
+        selected: Sequence[str],
+    ) -> str | None:
+        selected_ids = set(selected)
+        for experiment in state.experiments:
+            if (
+                experiment.id in selected_ids
+                and experiment.extra.get("engine_executor")
+                == _MANAGED_TYPED_GATE_ENGINE_EXECUTOR
+                and experiment.status is not ExperimentStatus.COMPLETED
+            ):
+                return "managed_typed_gate_nonpass"
+        return None
+
     def _checkpoint_selected_actions(
         self,
         identity: ChallengeIdentity,
@@ -1816,6 +2868,11 @@ class ManagedOrchestrator:
             latest,
             selected,
         )
+        if failure_reason is None:
+            failure_reason = self._selected_typed_gate_failure_reason(
+                latest,
+                selected,
+            )
         return self._checkpoint(
             identity,
             session_id,
@@ -2353,6 +3410,20 @@ class ManagedOrchestrator:
                 wave,
                 outcome.results,
             )
+            typed_gate_outcome = self._register_typed_gate_actions(
+                identity,
+                wave,
+                outcome.results,
+            )
+            if typed_gate_outcome.rejection_code is not None:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason_code="managed_typed_gate_action_rejected",
+                    reason=typed_gate_outcome.rejection_code,
+                    note=note,
+                )
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
             try:

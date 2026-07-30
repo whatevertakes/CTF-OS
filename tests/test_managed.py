@@ -26,6 +26,7 @@ from ctf_os.config import load_config
 from ctf_os.engine.challenge import (
     ChallengeEngine,
     EngineError,
+    SessionAlreadyRunning,
     _proof_argv_contains_credential_material,
 )
 from ctf_os.engine.context_pack import build_context_pack
@@ -63,7 +64,11 @@ from ctf_os.storage import (
     restore_quarantine,
     storage_plan,
 )
-from ctf_os.store import MigrationInProgress, RevisionConflict
+from ctf_os.store import (
+    ChallengeLock,
+    MigrationInProgress,
+    RevisionConflict,
+)
 from ctf_os.store.atomic import (
     StrictJSONError,
     atomic_write_json,
@@ -5150,6 +5155,896 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertEqual(
             list((paths.runtime / "closure-intents").glob("*.json")),
             [],
+        )
+
+
+class ManagedTypedGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def engine(self, executor=None) -> ChallengeEngine:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=IMAGE_DIGEST,
+            ),
+        )
+        return ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=executor or ProbeRoleExecutor(),
+                limiter=FifoModelCallLimiter(1),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+
+    @staticmethod
+    def capability(_digest: str):
+        return {
+            "ok": True,
+            "schema_version": 2,
+            "capabilities": {},
+        }
+
+    def fixture(
+        self,
+        *,
+        suffix: str,
+        category: str,
+        action: dict[str, object],
+        role: Role = Role.BUILDER,
+        wave_name: str = "attack",
+        report_all_paths: bool = True,
+    ):
+        identity = ChallengeIdentity(
+            "Managed Typed Gates",
+            category,
+            suffix,
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"typed-gate-fixture")
+        engine = self.engine()
+        engine.add_challenge(
+            identity,
+            prompt="exercise exactly one managed typed gate",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        if "candidate_id" in action:
+            engine.record_candidate(
+                identity,
+                f"KCTF{{{suffix}}}",
+                print_immediately=False,
+            )
+            action["candidate_id"] = engine.store.load(
+                identity
+            ).candidates[-1].id
+        if "parent_experiment_id" in action:
+            _state, parent_id = engine.register_experiment(
+                identity,
+                command=("true",),
+                expected_observation="primitive exists",
+                keep_if="primitive is confirmed",
+                drop_if="primitive is absent",
+            )
+            action["parent_experiment_id"] = parent_id
+
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(identity, None)
+        _state, cycle = orchestrator._reserve_cycle(identity, session_id)
+        _state, wave, role_runs = orchestrator._reserve_wave(
+            identity,
+            session_id,
+            cycle.id,
+            wave_name,
+        )
+        run_id = (
+            role_runs[role]
+            if role in role_runs
+            else next(iter(role_runs.values()))
+        )
+        path_fields = tuple(
+            field
+            for field in action
+            if field.endswith("_artifact_path")
+        )
+        run_workspace = (
+            engine.store.run_paths(identity, run_id=run_id).root
+            / "workspace"
+        )
+        run_workspace.mkdir(parents=True)
+        snapshots = (
+            engine.store.challenge_paths(identity).artifacts / "snapshots"
+        )
+        snapshots.mkdir(parents=True, exist_ok=True)
+        artifact_records: list[
+            tuple[str, str, bytes, str]
+        ] = []
+        for ordinal, field in enumerate(path_fields, start=1):
+            locator = str(action[field])
+            payload = (
+                f"{field}:{suffix}:{ordinal}\n".encode("ascii")
+            )
+            staged = run_workspace / locator
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(payload)
+            artifact_id = f"A-{run_id}-typed-{ordinal}"
+            snapshot_relative = (
+                f"artifacts/snapshots/{artifact_id}.bin"
+            )
+            snapshot = (
+                engine.store.challenge_paths(identity).root
+                / snapshot_relative
+            )
+            snapshot.write_bytes(payload)
+            snapshot.chmod(0o400)
+            artifact_records.append(
+                (artifact_id, snapshot_relative, payload, locator)
+            )
+
+        local_hypothesis_ids = list(action.get("hypothesis_ids", []))
+        canonical_hypotheses = [
+            f"H-{run_id}-{item}" for item in local_hypothesis_ids
+        ]
+
+        def seed(state):
+            run = next(item for item in state.runs if item.id == run_id)
+            run.status = RunStatus.COMPLETED
+            run.result_path = f"runs/{run_id}/result.json"
+            run.validation_path = f"runs/{run_id}/validation.json"
+            run.extra["semantic_merge"] = True
+            for hypothesis_id, local_id in zip(
+                canonical_hypotheses,
+                local_hypothesis_ids,
+                strict=True,
+            ):
+                state.hypotheses.append(
+                    Hypothesis(
+                        id=hypothesis_id,
+                        statement="the typed gate claim is testable",
+                        falsifier=Falsifier(
+                            "the deterministic gate rejects it"
+                        ),
+                        source_run_id=run_id,
+                        extra={
+                            "unknowns": ["deterministic verdict"],
+                            "experiment": "run the typed gate",
+                            "success_oracle": "engine gate passes",
+                            "managed_contract_version": 2,
+                        },
+                    )
+                )
+            for ordinal, (
+                artifact_id,
+                snapshot_relative,
+                payload,
+                locator,
+            ) in enumerate(artifact_records, start=1):
+                if not report_all_paths and ordinal == len(
+                    artifact_records
+                ):
+                    continue
+                state.artifacts.append(
+                    ArtifactReference(
+                        id=artifact_id,
+                        path=snapshot_relative,
+                        sha256=hashlib.sha256(payload).hexdigest(),
+                        source_run_id=run_id,
+                        size=len(payload),
+                        extra={
+                            "reported_locator": locator,
+                            "purpose": "managed typed gate input",
+                        },
+                    )
+                )
+
+        engine.store.update(identity, seed)
+        result = mock.Mock(
+            invocation=mock.Mock(
+                role=role,
+                run_id=run_id,
+                contract_version=2,
+            ),
+            output={
+                "hypotheses": [
+                    {"id": item} for item in local_hypothesis_ids
+                ],
+                "actions": [action],
+            },
+            attempts=(mock.Mock(),),
+        )
+        publish = orchestrator._apply_builder_publishes(
+            identity,
+            wave,
+            (result,),
+        )
+        registration = orchestrator._register_typed_gate_actions(
+            identity,
+            wave,
+            (result,),
+        )
+        return (
+            engine,
+            orchestrator,
+            identity,
+            session_id,
+            cycle,
+            wave,
+            result,
+            publish,
+            registration,
+        )
+
+    def test_all_typed_gates_bind_current_builder_artifacts(self):
+        cases = (
+            (
+                "pwn",
+                {
+                    "kind": "prove_pwn_exploit_effect",
+                    "description": "prove effect",
+                    "parent_experiment_id": "placeholder",
+                    "payload_artifact_path": "pwn/exploit.bin",
+                    "timeout_seconds": 300,
+                },
+            ),
+            (
+                "web",
+                {
+                    "kind": "prove_web_impact",
+                    "description": "prove impact",
+                    "operator_spec_artifact_path": "web/spec.json",
+                    "driver_artifact_path": "web/driver.json",
+                    "hypothesis_ids": ["local-web"],
+                    "timeout_seconds": 900,
+                },
+            ),
+            (
+                "crypto",
+                {
+                    "kind": "prove_crypto_metamorphic",
+                    "description": "prove metamorphic solver",
+                    "candidate_id": "placeholder",
+                    "solver_artifact_path": "crypto/solver.py",
+                    "original_parameters_artifact_path": (
+                        "crypto/original.json"
+                    ),
+                    "variant_parameters_artifact_path": (
+                        "crypto/variant.json"
+                    ),
+                    "variant_expected_output_artifact_path": (
+                        "crypto/expected.bin"
+                    ),
+                    "mutation_id": "variant-1",
+                    "runtime": "python",
+                },
+            ),
+            (
+                "forensics",
+                {
+                    "kind": "prove_forensic_assertion",
+                    "description": "corroborate assertion",
+                    "operator_spec_artifact_path": "forensic/spec.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 900,
+                },
+            ),
+            (
+                "misc",
+                {
+                    "kind": "evaluate_misc_transform",
+                    "description": "evaluate DAG",
+                    "candidate_id": "placeholder",
+                    "spec_artifact_path": "misc/spec.json",
+                },
+            ),
+        )
+        for ordinal, (category, action) in enumerate(cases, start=1):
+            with self.subTest(category=category):
+                (
+                    engine,
+                    _orchestrator,
+                    identity,
+                    _session_id,
+                    _cycle,
+                    _wave,
+                    result,
+                    publish,
+                    registration,
+                ) = self.fixture(
+                    suffix=f"valid-{ordinal}",
+                    category=category,
+                    action=copy.deepcopy(action),
+                )
+                self.assertIsNone(registration.rejection_code)
+                self.assertEqual(len(registration.experiment_ids), 1)
+                self.assertEqual(
+                    publish.published_count,
+                    sum(
+                        field.endswith("_artifact_path")
+                        for field in result.output["actions"][0]
+                    ),
+                )
+                state = engine.store.load(identity)
+                experiment = next(
+                    item
+                    for item in state.experiments
+                    if item.id == registration.experiment_ids[0]
+                )
+                request = experiment.extra[
+                    "managed_typed_gate_request"
+                ]
+                self.assertEqual(
+                    request["action_kind"],
+                    action["kind"],
+                )
+                self.assertEqual(
+                    request["source_builder_run_id"],
+                    result.invocation.run_id,
+                )
+                self.assertEqual(
+                    set(request["artifact_bindings"]),
+                    {
+                        field
+                        for field in action
+                        if field.endswith("_artifact_path")
+                    },
+                )
+                self.assertTrue(experiment.artifact_ids)
+                self.assertEqual(
+                    experiment.extra["engine_executor"],
+                    "managed_typed_gate_v1",
+                )
+
+    def test_crypto_and_misc_private_dispatch_reuse_session_lock(self):
+        cases = (
+            ("crypto", "prove_crypto_metamorphic_candidate"),
+            ("misc", "evaluate_misc_transform_candidate"),
+        )
+        for ordinal, (category, method_name) in enumerate(cases, start=1):
+            with self.subTest(category=category):
+                identity = ChallengeIdentity(
+                    "Managed Typed Gates",
+                    category,
+                    f"lock-owned-{ordinal}",
+                )
+                incoming = (
+                    self.root
+                    / "incoming"
+                    / identity.contest_id
+                    / identity.category
+                    / identity.challenge_id
+                )
+                incoming.mkdir(parents=True)
+                (incoming / "challenge.bin").write_bytes(b"lock-owned")
+                engine = self.engine()
+                engine.add_challenge(
+                    identity,
+                    prompt="test private lock reuse",
+                    state_schema_version=STATE_SCHEMA_VERSION,
+                )
+                lock = ChallengeLock(
+                    engine.store.challenge_paths(identity).runtime
+                    / "session.lock",
+                    timeout=0,
+                ).acquire()
+                try:
+                    method = getattr(engine, method_name)
+                    if category == "crypto":
+                        kwargs = {
+                            "solver_locator": "missing-solver.py",
+                            "original_parameters_locator": "missing-o.json",
+                            "variant_parameters_locator": "missing-v.json",
+                            "variant_expected_output_locator": (
+                                "missing-e.bin"
+                            ),
+                            "mutation_id": "variant-1",
+                        }
+                    else:
+                        kwargs = {"spec_locator": "missing-spec.json"}
+                    with self.assertRaises(SessionAlreadyRunning):
+                        method(identity, "C-missing", **kwargs)
+                    with self.assertRaises(EngineError) as raised:
+                        method(
+                            identity,
+                            "C-missing",
+                            _session_owned=True,
+                            **kwargs,
+                        )
+                    self.assertNotIsInstance(
+                        raised.exception,
+                        SessionAlreadyRunning,
+                    )
+                    self.assertIn("unknown candidate", str(raised.exception))
+                finally:
+                    lock.release()
+
+    def test_typed_gate_rejects_hostile_context_and_action_mutations(self):
+        cases = (
+            {
+                "suffix": "wrong-category",
+                "category": "rev",
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "wrong category",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 10,
+                },
+                "reason": "typed_gate_wrong_category",
+            },
+            {
+                "suffix": "wrong-role",
+                "category": "web",
+                "role": Role.FALSIFIER,
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "wrong role",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 10,
+                },
+                "reason": "typed_gate_wrong_role",
+            },
+            {
+                "suffix": "wrong-wave",
+                "category": "web",
+                "wave_name": "discovery",
+                "role": Role.SPECIALIST,
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "wrong wave",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 10,
+                },
+                "reason": "typed_gate_wrong_wave",
+            },
+            {
+                "suffix": "unreported-path",
+                "category": "web",
+                "report_all_paths": False,
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "missing report",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 10,
+                },
+                "reason": "typed_gate_artifact_unbound",
+            },
+            {
+                "suffix": "bool-timeout",
+                "category": "web",
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "bool timeout",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": True,
+                },
+                "reason": "typed_gate_timeout_invalid",
+            },
+            {
+                "suffix": "extra-verdict",
+                "category": "web",
+                "action": {
+                    "kind": "prove_web_impact",
+                    "description": "self report",
+                    "operator_spec_artifact_path": "spec.json",
+                    "driver_artifact_path": "driver.json",
+                    "hypothesis_ids": [],
+                    "timeout_seconds": 10,
+                    "verdict": "CONFIRMED",
+                },
+                "reason": "typed_gate_action_invalid",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["suffix"]):
+                fixture = self.fixture(
+                    suffix=str(case["suffix"]),
+                    category=str(case["category"]),
+                    action=copy.deepcopy(case["action"]),
+                    role=case.get("role", Role.BUILDER),
+                    wave_name=str(case.get("wave_name", "attack")),
+                    report_all_paths=bool(
+                        case.get("report_all_paths", True)
+                    ),
+                )
+                registration = fixture[-1]
+                self.assertEqual(
+                    registration.rejection_code,
+                    case["reason"],
+                )
+                self.assertEqual(registration.experiment_ids, ())
+
+    def test_deterministic_result_alone_terminalizes_and_capsules_gate(self):
+        action = {
+            "kind": "prove_forensic_assertion",
+            "description": "corroborate assertion",
+            "operator_spec_artifact_path": "forensic/spec.json",
+            "hypothesis_ids": [],
+            "timeout_seconds": 900,
+        }
+        (
+            engine,
+            orchestrator,
+            identity,
+            session_id,
+            cycle,
+            wave,
+            _result,
+            _publish,
+            registration,
+        ) = self.fixture(
+            suffix="deterministic-nonpass",
+            category="forensics",
+            action=action,
+        )
+        experiment_id = registration.experiment_ids[0]
+        orchestrator._mark_action_selection(
+            identity,
+            session_id,
+            cycle.id,
+            (experiment_id,),
+        )
+        evaluation = mock.Mock(
+            confirmed=False,
+            reason_codes=("corroboration_failed",),
+            sha256="c" * 64,
+        )
+        with mock.patch.object(
+            engine,
+            "prove_forensic_assertion",
+            return_value=(engine.store.load(identity), evaluation),
+        ) as prove:
+            state = orchestrator._execute_selected_actions(
+                identity,
+                (experiment_id,),
+                record_stall=False,
+            )
+        prove.assert_called_once_with(
+            identity,
+            operator_spec_locator="forensic/spec.json",
+            hypothesis_ids=(),
+            timeout_seconds=900,
+            _session_owned=True,
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertFalse(experiment.result["passed"])
+        self.assertEqual(
+            experiment.result["authority"],
+            "engine_deterministic_gate",
+        )
+        checkpointed = orchestrator._checkpoint_selected_actions(
+            identity,
+            session_id,
+            cycle.id,
+            wave,
+            (experiment_id,),
+            note=None,
+        )
+        capsule = checkpointed.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        self.assertEqual(
+            capsule.reason_code,
+            "managed_typed_gate_nonpass",
+        )
+        self.assertIn(experiment_id, capsule.failed_experiment_ids)
+
+    def test_gate_exception_is_bounded_and_never_uses_model_verdict(self):
+        action = {
+            "kind": "evaluate_misc_transform",
+            "description": "evaluate DAG",
+            "candidate_id": "placeholder",
+            "spec_artifact_path": "misc/spec.json",
+        }
+        (
+            engine,
+            orchestrator,
+            identity,
+            _session_id,
+            _cycle,
+            _wave,
+            _result,
+            _publish,
+            registration,
+        ) = self.fixture(
+            suffix="execution-error",
+            category="misc",
+            action=action,
+        )
+        experiment_id = registration.experiment_ids[0]
+        secret = "must-not-enter-state"
+        with mock.patch.object(
+            engine,
+            "evaluate_misc_transform_candidate",
+            side_effect=EngineError(secret),
+        ):
+            state = orchestrator._execute_typed_gate_experiment(
+                identity,
+                experiment_id,
+            )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertNotIn(secret, json.dumps(experiment.result))
+        self.assertEqual(
+            experiment.result["reason_codes"],
+            ["typed_gate_execution_error"],
+        )
+
+    def test_post_registration_workspace_mutation_fails_into_capsule(self):
+        action = {
+            "kind": "prove_web_impact",
+            "description": "prove impact",
+            "operator_spec_artifact_path": "web/spec.json",
+            "driver_artifact_path": "web/driver.json",
+            "hypothesis_ids": [],
+            "timeout_seconds": 60,
+        }
+        (
+            engine,
+            orchestrator,
+            identity,
+            session_id,
+            cycle,
+            wave,
+            _result,
+            _publish,
+            registration,
+        ) = self.fixture(
+            suffix="workspace-mutated",
+            category="web",
+            action=action,
+        )
+        experiment_id = registration.experiment_ids[0]
+        workspace = (
+            engine.store.challenge_paths(identity).artifacts / "workspace"
+        )
+        (workspace / "web" / "driver.json").write_bytes(
+            b"hostile replacement\n"
+        )
+        orchestrator._mark_action_selection(
+            identity,
+            session_id,
+            cycle.id,
+            (experiment_id,),
+        )
+        with mock.patch.object(
+            engine,
+            "prove_web_impact",
+        ) as prove:
+            state = orchestrator._execute_selected_actions(
+                identity,
+                (experiment_id,),
+                record_stall=False,
+            )
+        prove.assert_not_called()
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertEqual(
+            experiment.result["reason_codes"],
+            ["typed_gate_dispatch_rejected"],
+        )
+        checkpointed = orchestrator._checkpoint_selected_actions(
+            identity,
+            session_id,
+            cycle.id,
+            wave,
+            (experiment_id,),
+            note=None,
+        )
+        self.assertEqual(
+            checkpointed.checkpoints[-1].failure_capsule.reason_code,
+            "managed_typed_gate_nonpass",
+        )
+
+    def test_run_cycle_dispatches_builder_gate_and_reinjects_failure(self):
+        class TypedForensicExecutor:
+            def __init__(self) -> None:
+                self.prompts: list[tuple[Role, str]] = []
+
+            def run(
+                self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del timeout, on_stdout_line
+                role = _role_for(command)
+                self.prompts.append((role, command.stdin))
+                payload = _payload(role)
+                payload["schema_version"] = 2
+                payload["hypotheses"] = []
+                payload["actions"] = [
+                    {
+                        "kind": "none",
+                        "description": "no engine action",
+                        "command": None,
+                        "artifact_path": None,
+                        "hypothesis_ids": [],
+                        "expected_observation": "",
+                        "keep_if": "",
+                        "drop_if": "",
+                        "timeout_seconds": 1,
+                        "resource_class": "light",
+                        "network_target_id": None,
+                        "network_target_generation": None,
+                    }
+                ]
+                if role is Role.CAPTAIN:
+                    payload["decision"] = {
+                        "next_stage": "attack",
+                        "reason": "exercise the typed forensic gate",
+                    }
+                    payload["hypotheses"] = [
+                        {
+                            "id": f"hyp-{ordinal}",
+                            "claim": f"forensic claim {ordinal}",
+                            "evidence": ["obs-1"],
+                            "unknowns": ["independent corroboration"],
+                            "experiment": "run exact typed gate",
+                            "success_oracle": "engine confirms",
+                            "falsifier": "engine rejects",
+                        }
+                        for ordinal in range(1, 4)
+                    ]
+                elif role is Role.BUILDER:
+                    spec = Path(cwd) / "forensic" / "spec.json"
+                    spec.parent.mkdir(parents=True, exist_ok=True)
+                    spec_payload = b'{"strict":"bounded"}\n'
+                    spec.write_bytes(spec_payload)
+                    payload["artifacts"] = [
+                        {
+                            "path": "forensic/spec.json",
+                            "sha256": hashlib.sha256(
+                                spec_payload
+                            ).hexdigest(),
+                            "purpose": "typed assertion specification",
+                        }
+                    ]
+                    payload["actions"] = [
+                        {
+                            "kind": "prove_forensic_assertion",
+                            "description": "run independent corroboration",
+                            "operator_spec_artifact_path": (
+                                "forensic/spec.json"
+                            ),
+                            "hypothesis_ids": [],
+                            "timeout_seconds": 30,
+                        }
+                    ]
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        identity = ChallengeIdentity(
+            "Managed Typed Gates",
+            "forensics",
+            "full-cycle",
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "evidence.bin").write_bytes(b"forensic evidence")
+        executor = TypedForensicExecutor()
+        engine = self.engine(executor)
+        engine.add_challenge(
+            identity,
+            prompt="corroborate one forensic assertion",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        evaluation = mock.Mock(
+            confirmed=False,
+            reason_codes=("corroboration_failed",),
+            sha256="d" * 64,
+        )
+        with (
+            mock.patch.object(
+                engine,
+                "synchronize_managed_adapter_seed_plan",
+                side_effect=lambda selected, session: engine.store.load(
+                    selected
+                ),
+            ),
+            mock.patch.object(
+                engine,
+                "prove_forensic_assertion",
+                return_value=(engine.store.load(identity), evaluation),
+            ) as prove,
+        ):
+            state = orchestrator.run_cycle(identity)
+            first_capsule = state.checkpoints[-1].failure_capsule
+            self.assertIsNotNone(first_capsule)
+            state = orchestrator.run_cycle(identity)
+
+        self.assertEqual(prove.call_count, 2)
+        self.assertEqual(
+            prove.call_args.kwargs["operator_spec_locator"],
+            "forensic/spec.json",
+        )
+        self.assertTrue(prove.call_args.kwargs["_session_owned"])
+        typed = [
+            item
+            for item in state.experiments
+            if item.extra.get("engine_executor")
+            == "managed_typed_gate_v1"
+        ]
+        self.assertEqual(len(typed), 2)
+        self.assertTrue(
+            all(
+                item.status is ExperimentStatus.FAILED
+                for item in typed
+            )
+        )
+        capsule = first_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(
+            capsule.reason_code,
+            "managed_typed_gate_nonpass",
+        )
+        captain_prompts = [
+            prompt
+            for role, prompt in executor.prompts
+            if role is Role.CAPTAIN
+        ]
+        self.assertGreaterEqual(len(captain_prompts), 2)
+        self.assertIn(
+            capsule.reason_code,
+            captain_prompts[-1],
+        )
+        self.assertIn(
+            capsule.fingerprint_sha256,
+            captain_prompts[-1],
         )
 
 

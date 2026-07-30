@@ -589,6 +589,137 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("unexpected keys", "\n".join(result.errors))
 
+    def test_managed_typed_category_gates_are_exact_builder_contracts(
+        self,
+    ) -> None:
+        actions = {
+            "prove_pwn_exploit_effect": {
+                "kind": "prove_pwn_exploit_effect",
+                "description": "Replay the proved control primitive.",
+                "parent_experiment_id": "E-ip-control",
+                "payload_artifact_path": "exploit.bin",
+                "timeout_seconds": 300,
+            },
+            "prove_web_impact": {
+                "kind": "prove_web_impact",
+                "description": "Run the exact multi-session impact plan.",
+                "operator_spec_artifact_path": "web/spec.json",
+                "driver_artifact_path": "web/driver.json",
+                "hypothesis_ids": ["H-web"],
+                "timeout_seconds": 900,
+            },
+            "prove_crypto_metamorphic": {
+                "kind": "prove_crypto_metamorphic",
+                "description": "Run the original and mutated parameters.",
+                "candidate_id": "C-crypto",
+                "solver_artifact_path": "crypto/solver.py",
+                "original_parameters_artifact_path": "crypto/original.json",
+                "variant_parameters_artifact_path": "crypto/variant.json",
+                "variant_expected_output_artifact_path": (
+                    "crypto/expected.bin"
+                ),
+                "mutation_id": "variant-1",
+                "runtime": "python",
+            },
+            "prove_forensic_assertion": {
+                "kind": "prove_forensic_assertion",
+                "description": "Corroborate the assertion independently.",
+                "operator_spec_artifact_path": "forensic/spec.json",
+                "hypothesis_ids": [],
+                "timeout_seconds": 900,
+            },
+            "evaluate_misc_transform": {
+                "kind": "evaluate_misc_transform",
+                "description": "Execute and reverse-check the transform DAG.",
+                "candidate_id": "C-misc",
+                "spec_artifact_path": "misc/spec.json",
+            },
+        }
+        schema = role_output_schema(
+            Role.BUILDER,
+            contract_version=2,
+        )
+        variants = {
+            item["properties"]["kind"]["enum"][0]: item
+            for item in schema["properties"]["actions"]["items"]["anyOf"]
+        }
+        for kind, action in actions.items():
+            with self.subTest(kind=kind):
+                payload = valid_payload(Role.BUILDER)
+                payload["schema_version"] = 2
+                payload["hypotheses"] = []
+                payload["actions"] = [copy.deepcopy(action)]
+                result = validate_role_output(
+                    payload,
+                    Role.BUILDER,
+                    contract_version=2,
+                )
+                self.assertTrue(result.valid, result.errors)
+                self.assertEqual(
+                    set(variants[kind]["properties"]),
+                    set(action),
+                )
+
+                wrong_role = copy.deepcopy(payload)
+                wrong_role["role"] = Role.REPRODUCER.value
+                result = validate_role_output(
+                    wrong_role,
+                    Role.REPRODUCER,
+                    contract_version=2,
+                )
+                self.assertFalse(result.valid)
+                self.assertIn(
+                    "restricted to the v2 builder",
+                    "\n".join(result.errors),
+                )
+
+                mutated = copy.deepcopy(payload)
+                mutated["actions"][0]["verdict"] = "passed"
+                result = validate_role_output(
+                    mutated,
+                    Role.BUILDER,
+                    contract_version=2,
+                )
+                self.assertFalse(result.valid)
+                self.assertIn(
+                    "unexpected keys",
+                    "\n".join(result.errors),
+                )
+
+        escaped = valid_payload(Role.BUILDER)
+        escaped["schema_version"] = 2
+        escaped["hypotheses"] = []
+        escaped["actions"] = [copy.deepcopy(actions["prove_web_impact"])]
+        escaped["actions"][0]["driver_artifact_path"] = "../driver.json"
+        result = validate_role_output(
+            escaped,
+            Role.BUILDER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "expected safe relative path",
+            "\n".join(result.errors),
+        )
+
+        bad_timeout = valid_payload(Role.BUILDER)
+        bad_timeout["schema_version"] = 2
+        bad_timeout["hypotheses"] = []
+        bad_timeout["actions"] = [
+            copy.deepcopy(actions["prove_pwn_exploit_effect"])
+        ]
+        bad_timeout["actions"][0]["timeout_seconds"] = True
+        result = validate_role_output(
+            bad_timeout,
+            Role.BUILDER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "timeout_seconds",
+            "\n".join(result.errors),
+        )
+
     def test_contract_rejects_extra_keys_wrong_decision_and_readonly_write(self) -> None:
         payload = valid_payload(Role.FALSIFIER)
         payload["extra"] = True

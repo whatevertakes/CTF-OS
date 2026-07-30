@@ -171,6 +171,18 @@ NEXT_STAGE_VALUES = ("discover", "attack", "proof", "pause", "complete", "needs_
 ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", "none")
 MANAGED_PROOF_ACTION_KIND = "prove_candidate"
 MANAGED_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND = "prove_pwn_exploit_effect"
+MANAGED_WEB_IMPACT_ACTION_KIND = "prove_web_impact"
+MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND = "prove_crypto_metamorphic"
+MANAGED_FORENSIC_ASSERTION_ACTION_KIND = "prove_forensic_assertion"
+MANAGED_MISC_TRANSFORM_ACTION_KIND = "evaluate_misc_transform"
+MANAGED_TYPED_GATE_ACTION_KINDS = (
+    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_WEB_IMPACT_ACTION_KIND,
+    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
+    MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
+    MANAGED_MISC_TRANSFORM_ACTION_KIND,
+)
 PROOF_INPUT_PURPOSE_VALUES = (
     "reproducer",
     "fixture",
@@ -209,7 +221,11 @@ def role_output_schema(
     if contract_version == 2 and role is Role.REPRODUCER:
         action_kinds = (*action_kinds, MANAGED_PROOF_ACTION_KIND)
     if contract_version == 2 and role is Role.BUILDER:
-        action_kinds = (*action_kinds, MANAGED_PWN_CRASH_ACTION_KIND)
+        action_kinds = (
+            *action_kinds,
+            MANAGED_PWN_CRASH_ACTION_KIND,
+            *MANAGED_TYPED_GATE_ACTION_KINDS,
+        )
     decision_schema: dict[str, Any]
     if role is Role.CAPTAIN:
         decision_schema = {
@@ -320,6 +336,21 @@ def role_output_schema(
             )
         )
         action_variants: list[dict[str, Any]] = []
+        managed_path_schema = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+        }
+        managed_reference_schema = {
+            "type": "string",
+            "pattern": r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$",
+        }
+        managed_hypothesis_ids_schema = {
+            "type": "array",
+            "maxItems": 64,
+            "uniqueItems": True,
+            "items": managed_reference_schema,
+        }
         for action_kind in action_kinds:
             if action_kind == MANAGED_PWN_CRASH_ACTION_KIND:
                 action_variants.append(
@@ -350,6 +381,152 @@ def role_output_schema(
                                     r"[A-Za-z0-9_.:-]{0,255}$"
                                 ),
                             },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "parent_experiment_id",
+                            "payload_artifact_path",
+                            "timeout_seconds",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "parent_experiment_id": (
+                                managed_reference_schema
+                            ),
+                            "payload_artifact_path": managed_path_schema,
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 3600,
+                            },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_WEB_IMPACT_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "operator_spec_artifact_path",
+                            "driver_artifact_path",
+                            "hypothesis_ids",
+                            "timeout_seconds",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "operator_spec_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "driver_artifact_path": managed_path_schema,
+                            "hypothesis_ids": (
+                                managed_hypothesis_ids_schema
+                            ),
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 86_400,
+                            },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "candidate_id",
+                            "solver_artifact_path",
+                            "original_parameters_artifact_path",
+                            "variant_parameters_artifact_path",
+                            "variant_expected_output_artifact_path",
+                            "mutation_id",
+                            "runtime",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "candidate_id": managed_reference_schema,
+                            "solver_artifact_path": managed_path_schema,
+                            "original_parameters_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "variant_parameters_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "variant_expected_output_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "mutation_id": managed_reference_schema,
+                            "runtime": {"enum": ["python", "sage"]},
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_FORENSIC_ASSERTION_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "operator_spec_artifact_path",
+                            "hypothesis_ids",
+                            "timeout_seconds",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "operator_spec_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "hypothesis_ids": (
+                                managed_hypothesis_ids_schema
+                            ),
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 86_400,
+                            },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_MISC_TRANSFORM_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "candidate_id",
+                            "spec_artifact_path",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "description": {"type": "string"},
+                            "candidate_id": managed_reference_schema,
+                            "spec_artifact_path": managed_path_schema,
                         },
                     }
                 )
@@ -1170,6 +1347,127 @@ def validate_role_output(
                                 f"{input_path}.purpose: invalid purpose"
                             )
                 continue
+            if kind in MANAGED_TYPED_GATE_ACTION_KINDS:
+                typed_keys = {
+                    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "parent_experiment_id",
+                        "payload_artifact_path",
+                        "timeout_seconds",
+                    },
+                    MANAGED_WEB_IMPACT_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "operator_spec_artifact_path",
+                        "driver_artifact_path",
+                        "hypothesis_ids",
+                        "timeout_seconds",
+                    },
+                    MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "candidate_id",
+                        "solver_artifact_path",
+                        "original_parameters_artifact_path",
+                        "variant_parameters_artifact_path",
+                        "variant_expected_output_artifact_path",
+                        "mutation_id",
+                        "runtime",
+                    },
+                    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "operator_spec_artifact_path",
+                        "hypothesis_ids",
+                        "timeout_seconds",
+                    },
+                    MANAGED_MISC_TRANSFORM_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "candidate_id",
+                        "spec_artifact_path",
+                    },
+                }[kind]
+                _exact_keys(item, typed_keys, path, errors)
+                if contract_version != 2 or role is not Role.BUILDER:
+                    errors.append(
+                        f"{path}.kind: {kind} is restricted to the v2 builder"
+                    )
+                if not isinstance(item.get("description"), str):
+                    errors.append(f"{path}.description: expected string")
+                path_fields = {
+                    field
+                    for field in typed_keys
+                    if field.endswith("_artifact_path")
+                }
+                path_values: list[str] = []
+                for field in sorted(path_fields):
+                    artifact_path = item.get(field)
+                    if (
+                        not isinstance(artifact_path, str)
+                        or not _valid_relative_path(artifact_path)
+                    ):
+                        errors.append(
+                            f"{path}.{field}: expected safe relative path"
+                        )
+                    else:
+                        path_values.append(artifact_path)
+                if len(path_values) != len(set(path_values)):
+                    errors.append(
+                        f"{path}: typed gate artifact paths must be unique"
+                    )
+                for field in (
+                    "candidate_id",
+                    "parent_experiment_id",
+                    "mutation_id",
+                ):
+                    if field not in typed_keys:
+                        continue
+                    reference = item.get(field)
+                    if (
+                        not isinstance(reference, str)
+                        or not _REFERENCE_ID_RE.fullmatch(reference)
+                    ):
+                        errors.append(f"{path}.{field}: invalid id")
+                if "hypothesis_ids" in typed_keys:
+                    hypothesis_ids = item.get("hypothesis_ids")
+                    if (
+                        not _is_string_list(hypothesis_ids)
+                        or len(hypothesis_ids) > 64
+                        or len(hypothesis_ids)
+                        != len(set(hypothesis_ids))
+                        or any(
+                            not _REFERENCE_ID_RE.fullmatch(hypothesis_id)
+                            for hypothesis_id in hypothesis_ids
+                        )
+                    ):
+                        errors.append(
+                            f"{path}.hypothesis_ids: invalid or duplicate id"
+                        )
+                timeout_limits = {
+                    MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
+                    MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
+                    MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
+                }
+                if kind in timeout_limits:
+                    timeout_seconds = item.get("timeout_seconds")
+                    maximum = timeout_limits[kind]
+                    if (
+                        isinstance(timeout_seconds, bool)
+                        or not isinstance(timeout_seconds, int)
+                        or not 1 <= timeout_seconds <= maximum
+                    ):
+                        errors.append(
+                            f"{path}.timeout_seconds: expected integer "
+                            f"from 1 to {maximum}"
+                        )
+                if (
+                    kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND
+                    and item.get("runtime") not in {"python", "sage"}
+                ):
+                    errors.append(f"{path}.runtime: invalid runtime")
+                continue
             _exact_keys(item, keys, path, errors)
             if kind not in ACTION_KIND_VALUES:
                 errors.append(f"{path}.kind: invalid kind")
@@ -1484,6 +1782,18 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "reported non-empty PoC artifact and one active hypothesis. "
                 "Do not supply a command, target, signal, or verdict; the "
                 "engine owns differential execution and classification."
+                if role is Role.BUILDER
+                else ""
+            ),
+            (
+                "Typed category gates are available only to the managed "
+                "Builder. Create and report every referenced relative "
+                "artifact in this run workspace, then name its exact path. "
+                "Supply only canonical candidate, experiment, and hypothesis "
+                "IDs already present in state or proposed by this run. Never "
+                "supply a verdict: the engine alone executes and reduces the "
+                "Pwn effect, Web impact, Crypto metamorphic, Forensic "
+                "assertion, or Misc DAG gate."
                 if role is Role.BUILDER
                 else ""
             ),

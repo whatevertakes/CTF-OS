@@ -22191,6 +22191,7 @@ class ChallengeEngine:
         candidate_id: str,
         *,
         spec_locator: str,
+        _session_owned: bool = False,
     ) -> tuple[ChallengeState, object]:
         """Execute one operator-declared Misc DAG and original-condition oracle.
 
@@ -22202,22 +22203,25 @@ class ChallengeEngine:
         """
 
         paths = self.store.challenge_paths(identity)
-        try:
-            session_lock = ChallengeLock(
-                paths.runtime / "session.lock",
-                timeout=0,
-            ).acquire()
-        except LockTimeout as error:
-            raise SessionAlreadyRunning(
-                f"another session already owns {identity.key}"
-            ) from error
+        session_lock: ChallengeLock | None = None
+        if not _session_owned:
+            try:
+                session_lock = ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
 
         preparations: list[_ProofInputPreparation] = []
         source_staging: tempfile.TemporaryDirectory[str] | None = None
         committed_inputs = False
         cleanup_error: BaseException | None = None
         try:
-            self._recover_session_boundary(identity)
+            if not _session_owned:
+                self._recover_session_boundary(identity)
             state = self.refresh_ingest(identity)
             if get_adapter(state.category).name != "misc":
                 raise EngineError(
@@ -23806,15 +23810,17 @@ class ChallengeEngine:
                     except BaseException as error:
                         if cleanup_error is None:
                             cleanup_error = error
-            try:
-                session_lock.release()
-            except BaseException as error:
-                if cleanup_error is None:
-                    cleanup_error = error
-                elif active_error is not None:
-                    active_error.add_note(
-                        f"Misc proof lock cleanup also failed: {error}"
-                    )
+            if session_lock is not None:
+                try:
+                    session_lock.release()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Misc proof lock cleanup also failed: "
+                            f"{error}"
+                        )
             if cleanup_error is not None:
                 if active_error is not None and not isinstance(
                     active_error,
@@ -23916,16 +23922,18 @@ class ChallengeEngine:
         variant_expected_output_locator: str,
         mutation_id: str,
         runtime: str = "python",
+        _session_owned: bool = False,
     ) -> tuple[ChallengeState, ProofResult]:
         """Run one pinned Crypto solver in the mandatory clean 3+3 matrix.
 
         This is an explicit, local operator hot path: the operator is the
         authority supplying the changed parameters and their independently
-        expected output.  Managed models cannot invoke it while a session owns
-        the challenge lock.  It never selects a challenge, enables a target,
-        or submits a candidate.  The solver receives exactly one canonical
-        JSON file path and must write the exact result bytes to stdout without
-        diagnostics.  Stderr remains preserved as bounded evidence.
+        expected output.  A managed caller may use the private lock-owned path
+        only after its Builder action is bound to canonical workspace
+        artifacts.  It never selects a challenge, enables a target, or submits
+        a candidate.  The solver receives exactly one canonical JSON file path
+        and must write the exact result bytes to stdout without diagnostics.
+        Stderr remains preserved as bounded evidence.
         """
 
         if runtime not in {"python", "sage"}:
@@ -23940,22 +23948,25 @@ class ChallengeEngine:
             raise EngineError("Crypto proof locators must be unique")
 
         paths = self.store.challenge_paths(identity)
-        try:
-            session_lock = ChallengeLock(
-                paths.runtime / "session.lock",
-                timeout=0,
-            ).acquire()
-        except LockTimeout as error:
-            raise SessionAlreadyRunning(
-                f"another session already owns {identity.key}"
-            ) from error
+        session_lock: ChallengeLock | None = None
+        if not _session_owned:
+            try:
+                session_lock = ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
 
         preparation: _ProofInputPreparation | None = None
         input_artifacts: tuple[ArtifactReference, ...] = ()
         evaluation_artifact: ArtifactReference | None = None
         finalized = False
         try:
-            self._recover_session_boundary(identity)
+            if not _session_owned:
+                self._recover_session_boundary(identity)
             state = self.refresh_ingest(identity)
             if get_adapter(state.category).name != "crypto":
                 raise EngineError(
@@ -24863,15 +24874,17 @@ class ChallengeEngine:
                             "Crypto proof input cleanup also failed: "
                             f"{error}"
                         )
-            try:
-                session_lock.release()
-            except BaseException as error:
-                if cleanup_error is None:
-                    cleanup_error = error
-                elif active_error is not None:
-                    active_error.add_note(
-                        f"Crypto proof lock cleanup also failed: {error}"
-                    )
+            if session_lock is not None:
+                try:
+                    session_lock.release()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Crypto proof lock cleanup also failed: "
+                            f"{error}"
+                        )
             if cleanup_error is not None:
                 if (
                     active_error is not None
