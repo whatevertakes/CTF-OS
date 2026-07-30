@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "protocol": "managed_category_hotpath_evidence_v1",
+  "release_image_digest": "sha256:62bc44f2b84ccaa86cb5321ff700b73c42edd8b901c21cd61cfb3036bd985886",
+  "managed_contract": {
+    "captain_route": "attack",
+    "action_source_role": "builder",
+    "contract_version": 2,
+    "wave_kind": "attack",
+    "engine_executor": "managed_typed_gate_v1",
+    "artifact_binding": [
+      "artifact_id",
+      "locator",
+      "sha256",
+      "size_bytes",
+      "workspace_publish_id"
+    ],
+    "network_default": "none",
+    "automatic_submission_authorized": false
+  },
+  "categories": [
+    {
+      "category": "crypto",
+      "action_kind": "prove_crypto_metamorphic",
+      "artifact_path_fields": [
+        "solver_artifact_path",
+        "original_parameters_artifact_path",
+        "variant_parameters_artifact_path",
+        "variant_expected_output_artifact_path"
+      ],
+      "public_oracle": "ChallengeEngine.prove_crypto_metamorphic_candidate",
+      "expected_oracle_runs": 6,
+      "state_authority": [
+        "candidate",
+        "proof",
+        "progress"
+      ],
+      "unit_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_crypto_builder_action_reaches_six_run_metamorphic_proof",
+      "hostile_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_post_registration_crypto_solver_mutation_is_rejected",
+      "docker_script": "scripts/check-crypto-misc-docker-hotpaths.py"
+    },
+    {
+      "category": "forensics",
+      "action_kind": "prove_forensic_assertion",
+      "artifact_path_fields": [
+        "operator_spec_artifact_path"
+      ],
+      "public_oracle": "ChallengeEngine.prove_forensic_assertion",
+      "expected_oracle_runs": 2,
+      "state_authority": [
+        "fact",
+        "progress"
+      ],
+      "unit_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_forensic_builder_action_reaches_two_tool_fact_progress_gate",
+      "hostile_test": "tests.test_forensic_assertion_hotpath.ForensicAssertionHotPathTests.test_corrupt_observation_is_retained_but_rejected_without_fact",
+      "docker_script": "scripts/check-forensic-assertion-hotpath-docker.py"
+    },
+    {
+      "category": "misc",
+      "action_kind": "evaluate_misc_transform",
+      "artifact_path_fields": [
+        "spec_artifact_path"
+      ],
+      "public_oracle": "ChallengeEngine.evaluate_misc_transform_candidate",
+      "expected_oracle_runs": 4,
+      "state_authority": [
+        "candidate_observation",
+        "fact",
+        "progress"
+      ],
+      "unit_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_misc_builder_action_reaches_dag_and_original_oracle",
+      "hostile_test": "tests.test_misc_engine.MiscEngineTests.test_final_pre_replace_guard_rejects_incoming_toctou",
+      "docker_script": "scripts/check-crypto-misc-docker-hotpaths.py"
+    }
+  ]
+}
