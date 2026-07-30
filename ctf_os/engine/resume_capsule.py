@@ -426,8 +426,8 @@ def _pwn_disclosure_projection(
     result = envelope.result
     pointers: list[dict[str, object]] = []
     for label, key in (
-        ("stdout", "stdout_artifact_id"),
         ("stderr", "stderr_artifact_id"),
+        ("stdout", "stdout_artifact_id"),
         ("capability", "capability_attestation_artifact_id"),
     ):
         artifact_id = evidence.get(key)

@@ -529,8 +529,20 @@ class PwnRuntimeSnapshotStateValidationTests(unittest.TestCase):
             commitments[-1]["replay_value_sha256"],
             list(candidates[-1].replay_value_sha256),
         )
-        self.assertNotIn("mapped_range", commitments[-1])
-        self.assertNotIn("payload_derived", commitments[-1])
+        self.assertEqual(
+            commitments[-1]["mapped_range"],
+            {
+                "line_index": 1,
+                "line_sha256": "a" * 64,
+            },
+        )
+        self.assertFalse(commitments[-1]["payload_derived"])
+        self.assertEqual(
+            commitments[-1]["distinct_value_count"],
+            4,
+        )
+        self.assertNotIn("start", commitments[-1]["mapped_range"])
+        self.assertNotIn("end", commitments[-1]["mapped_range"])
 
     def test_v2_context_redacts_both_incomplete_disclosure_phases(
         self,
@@ -721,20 +733,20 @@ class PwnRuntimeSnapshotStateValidationTests(unittest.TestCase):
         )
         disclosure = json.loads(capsule.text)["pwn_disclosure"]
         self.assertTrue(disclosure["diagnostic_only"])
-        stdout_id = self.evidence(state)["stdout_artifact_id"]
-        stdout = next(
+        stderr_id = self.evidence(state)["stderr_artifact_id"]
+        stderr = next(
             item
             for item in state.artifacts
-            if item.id == stdout_id
+            if item.id == stderr_id
         )
         self.assertEqual(
             disclosure["artifact_pointer"],
             {
-                "artifact_id": stdout.id,
-                "label": "stdout",
-                "path": stdout.path,
-                "sha256": stdout.sha256,
-                "size": stdout.size,
+                "artifact_id": stderr.id,
+                "label": "stderr",
+                "path": stderr.path,
+                "sha256": stderr.sha256,
+                "size": stderr.size,
             },
         )
         self.assertTrue(

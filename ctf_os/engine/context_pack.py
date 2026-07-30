@@ -195,9 +195,18 @@ def _pwn_runtime_snapshot_context_records(
                             "byte_offset": candidate_value[
                                 "byte_offset"
                             ],
+                            "distinct_value_count": candidate_value[
+                                "distinct_value_count"
+                            ],
                             "hex_width": candidate_value["hex_width"],
                             "final_value_sha256": candidate_value[
                                 "final_value_sha256"
+                            ],
+                            "mapped_range": candidate_value[
+                                "mapped_range"
+                            ],
+                            "payload_derived": candidate_value[
+                                "payload_derived"
                             ],
                             "replay_value_sha256": candidate_value[
                                 "replay_value_sha256"
