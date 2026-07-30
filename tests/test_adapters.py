@@ -45,6 +45,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(baseline.resource_class, "light")
         self.assertNotIn(primary, argv[2])
         self.assertIn("/usr/bin/timeout --signal=TERM 3", argv[2])
+        self.assertIn("ulimit -f 128", argv[2])
+        self.assertIn("/usr/bin/head -c 65536", argv[2])
         CommandSpec.create(argv)
         ensure_foreground_command(argv)
 
