@@ -768,6 +768,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode", choices=("managed", "assisted"), default="assisted"
     )
     solve.add_argument("--max-cycles", type=int, default=8)
+    solve.add_argument(
+        "--thread-continuity",
+        "--thread-continuity-policy",
+        dest="thread_continuity",
+        choices=("fresh", "captain_lane", "role_lane"),
+        default="fresh",
+        help=(
+            "managed session model-thread policy; pinned before the first "
+            "cycle (default: fresh)"
+        ),
+    )
 
     preflight = commands.add_parser(
         "preflight", help="managed solve prerequisites"
@@ -780,6 +791,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _identity_values(managed_cycle)
     managed_cycle.add_argument("--session-id")
+    managed_cycle.add_argument(
+        "--thread-continuity",
+        "--thread-continuity-policy",
+        dest="thread_continuity",
+        choices=("fresh", "captain_lane", "role_lane"),
+        default="fresh",
+    )
     note_group = managed_cycle.add_mutually_exclusive_group()
     note_group.add_argument("--note")
     note_group.add_argument("--note-file", type=Path)
@@ -795,6 +813,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-tools", action="store_true")
     run.add_argument(
         "--mode", choices=("managed", "legacy"), default="legacy"
+    )
+    run.add_argument(
+        "--thread-continuity",
+        "--thread-continuity-policy",
+        dest="thread_continuity",
+        choices=("fresh", "captain_lane", "role_lane"),
+        default="fresh",
     )
 
     session = commands.add_parser("session", help="managed session control")
@@ -1718,12 +1743,18 @@ def main(
                 state = managed.run_cycles(
                     identity,
                     max_cycles=args.max_cycles,
+                    thread_continuity_policy=args.thread_continuity,
                 )
                 print(
                     f"Managed 종료: {identity.key} {state.status.value} "
                     f"rev={state.revision}"
                 )
                 return 0
+
+            if args.thread_continuity != "fresh":
+                raise CLIError(
+                    "--thread-continuity is available only in managed mode"
+                )
 
             def announce_live_session(_prepared: object) -> None:
                 print(
@@ -1762,6 +1793,7 @@ def main(
                 _identity(args),
                 session_id=args.session_id,
                 note=note,
+                thread_continuity_policy=args.thread_continuity,
             )
             if args.json:
                 _print_json(state.to_dict())
@@ -1785,8 +1817,13 @@ def main(
                 state = ManagedOrchestrator(engine).run_cycles(
                     identity,
                     max_cycles=args.max_cycles,
+                    thread_continuity_policy=args.thread_continuity,
                 )
             else:
+                if args.thread_continuity != "fresh":
+                    raise CLIError(
+                        "--thread-continuity is available only in managed mode"
+                    )
                 state = engine.run_challenge(
                     identity,
                     prompt=prompt if prompt else None,

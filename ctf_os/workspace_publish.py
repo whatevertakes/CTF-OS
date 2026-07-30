@@ -10,6 +10,12 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.managed_continuity import (
+    THREAD_CONTINUITY_RUN_KEY,
+    lane_path_identity_sha256,
+    lane_relative_path,
+    run_audit_errors,
+)
 from ctf_os.models import (
     ChallengeIdentity,
     RunOrigin,
@@ -290,7 +296,30 @@ def _publish_builder_file_locked(
             "artifact_source_unsafe"
         ) from error
     destination_relative = _safe_relative(destination)
-    source_root = paths.runs / run_id / "workspace"
+    continuity_audit = run.extra.get(THREAD_CONTINUITY_RUN_KEY)
+    continuity_issues = (
+        run_audit_errors(continuity_audit)
+        if continuity_audit is not None
+        else ()
+    )
+    if continuity_issues:
+        raise EngineError("Builder continuity audit is invalid")
+    if (
+        isinstance(continuity_audit, dict)
+        and continuity_audit.get("stable_lane") is True
+    ):
+        lane_id = continuity_audit.get("lane_identity_sha256")
+        if (
+            type(lane_id) is not str
+            or continuity_audit.get("lane_path_identity_sha256")
+            != lane_path_identity_sha256(lane_id)
+        ):
+            raise EngineError(
+                "Builder continuity lane path binding is invalid"
+            )
+        source_root = paths.root / lane_relative_path(lane_id)
+    else:
+        source_root = paths.runs / run_id / "workspace"
     source_descriptor = _open_builder_stage(
         source_root,
         source_relative,

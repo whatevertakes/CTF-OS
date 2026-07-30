@@ -114,6 +114,17 @@ from ctf_os.director.resources import (
 )
 from ctf_os.engine.context_archive import archive_context_pack
 from ctf_os.engine.context_pack import build_context_pack
+from ctf_os.managed_continuity import (
+    THREAD_CONTINUITY_CONTRACT_VERSION,
+    THREAD_CONTINUITY_RUN_KEY,
+    THREAD_CONTINUITY_SESSION_KEY,
+    lane_path_identity_sha256,
+    lane_relative_path,
+    run_audit_errors,
+    session_metadata_errors,
+    thread_id_sha256,
+    valid_thread_id,
+)
 from ctf_os.engine.crypto_metamorphic import (
     CRYPTO_METAMORPHIC_MAX_RESULT_BYTES,
     CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
@@ -3596,6 +3607,24 @@ class ChallengeEngine:
         run_paths = self.store.run_paths(identity, run_id=reserved.id)
         challenge_root = self.store.challenge_paths(identity).root
         status = self._batch_result_run_status(result)
+        produced_thread_digest: str | None = None
+        thread_secret_pointer: str | None = None
+        if valid_thread_id(result.thread_id):
+            assert type(result.thread_id) is str
+            produced_thread_digest = thread_id_sha256(result.thread_id)
+            thread_secret_path = run_paths.root / "thread-secret.json"
+            atomic_write_json(
+                thread_secret_path,
+                {
+                    "schema_version": 1,
+                    "run_id": reserved.id,
+                    "thread_id": result.thread_id,
+                    "thread_id_sha256": produced_thread_digest,
+                },
+            )
+            thread_secret_pointer = thread_secret_path.relative_to(
+                challenge_root
+            ).as_posix()
         attempt_pointer: str | None = None
         if result.attempts:
             try:
@@ -3671,6 +3700,7 @@ class ChallengeEngine:
             run.context_hash = self._request_context_hash(
                 run_paths.request
             )
+            run.extra.pop("thread_id", None)
             run.extra.update(
                 {
                     "context_path": self._request_context_path(
@@ -3689,7 +3719,8 @@ class ChallengeEngine:
                             result.usage.reasoning_output_tokens
                         ),
                     },
-                    "thread_id": result.thread_id,
+                    "produced_thread_id_sha256": produced_thread_digest,
+                    "thread_secret_path": thread_secret_pointer,
                     "contract_valid": result.validation.valid,
                     "provisional_managed_terminal": True,
                     "semantic_merge": False,
@@ -6248,6 +6279,219 @@ class ChallengeEngine:
             )
             self._printed_flags.add(print_key)
 
+    def _validated_managed_continuity_audit(
+        self,
+        state: ChallengeState,
+        role: Role,
+        run_id: str,
+        resume_thread_id: str | None,
+    ) -> dict[str, Any]:
+        run = next(
+            (item for item in state.runs if item.id == run_id),
+            None,
+        )
+        if (
+            run is None
+            or run.origin is not RunOrigin.MANAGED_MODEL
+            or run.status is not RunStatus.CREATED
+            or run.session_id != state.active_managed_session_id
+            or run.configuration_epoch != state.configuration_epoch
+            or run.role != role.value
+            or run.model != self._model_for_role(role)
+        ):
+            raise EngineError(
+                "managed thread continuity requires the exact current "
+                "reserved run"
+            )
+        audit = run.extra.get(THREAD_CONTINUITY_RUN_KEY)
+        issues = run_audit_errors(audit)
+        if issues:
+            raise EngineError(
+                "managed thread continuity audit is invalid: "
+                + "; ".join(issues)
+            )
+        assert type(audit) is dict
+        session = next(
+            (
+                item
+                for item in state.sessions
+                if item.id == run.session_id
+            ),
+            None,
+        )
+        if session is None:
+            raise EngineError(
+                "managed thread continuity session is unavailable"
+            )
+        session_metadata = session.extra.get(
+            THREAD_CONTINUITY_SESSION_KEY
+        )
+        metadata_issues = session_metadata_errors(session_metadata)
+        if metadata_issues:
+            raise EngineError(
+                "managed thread continuity session metadata is invalid: "
+                + "; ".join(metadata_issues)
+            )
+        assert type(session_metadata) is dict
+        for key in (
+            "policy",
+            "configuration_epoch",
+            "configuration_fingerprint_sha256",
+            "contract_version",
+            "source_manifest_sha256",
+            "source_generation",
+            "target_id",
+            "target_generation",
+        ):
+            if audit.get(key) != session_metadata.get(key):
+                raise EngineError(
+                    "managed thread continuity audit/session binding changed"
+                )
+        if (
+            audit.get("logical_role") != role.value
+            or audit.get("model") != self._model_for_role(role)
+            or run.extra.get("contract_version")
+            != THREAD_CONTINUITY_CONTRACT_VERSION
+        ):
+            raise EngineError(
+                "managed thread continuity role/model/contract binding changed"
+            )
+        if audit["decision"] == "fresh":
+            if resume_thread_id is not None:
+                raise EngineError(
+                    "fresh managed continuity decision received a raw "
+                    "resume thread"
+                )
+        else:
+            if (
+                not valid_thread_id(resume_thread_id)
+                or thread_id_sha256(resume_thread_id)
+                != audit["thread_id_sha256"]
+            ):
+                raise EngineError(
+                    "managed resume thread does not match its raw-free audit"
+                )
+            source_run = next(
+                (
+                    item
+                    for item in state.runs
+                    if item.id == audit["source_run_id"]
+                ),
+                None,
+            )
+            if (
+                source_run is None
+                or source_run.status is not RunStatus.COMPLETED
+                or source_run.origin is not RunOrigin.MANAGED_MODEL
+                or source_run.session_id != run.session_id
+                or source_run.configuration_epoch
+                != run.configuration_epoch
+                or source_run.role != run.role
+                or source_run.model != run.model
+                or source_run.extra.get("contract_version")
+                != THREAD_CONTINUITY_CONTRACT_VERSION
+                or source_run.extra.get("produced_thread_id_sha256")
+                != audit["thread_id_sha256"]
+            ):
+                raise EngineError(
+                    "managed resume source is outside the exact prior lane"
+                )
+            source_audit = source_run.extra.get(
+                THREAD_CONTINUITY_RUN_KEY
+            )
+            if (
+                run_audit_errors(source_audit)
+                or not isinstance(source_audit, Mapping)
+                or source_audit.get("lane_identity_sha256")
+                != audit.get("lane_identity_sha256")
+                or source_audit.get("workspace_owner_run_id")
+                != audit.get("workspace_owner_run_id")
+            ):
+                raise EngineError(
+                    "managed resume source workspace lane changed"
+                )
+        return audit
+
+    def _managed_continuity_workspace(
+        self,
+        state: ChallengeState,
+        run_id: str,
+        audit: Mapping[str, Any],
+    ) -> Path:
+        run_paths = self.store.run_paths(state.identity, run_id=run_id)
+        if audit.get("stable_lane") is not True:
+            workspace = run_paths.root / "workspace"
+            workspace.mkdir(mode=0o700)
+            return workspace
+
+        lane_id = audit.get("lane_identity_sha256")
+        path_hash = audit.get("lane_path_identity_sha256")
+        if (
+            type(lane_id) is not str
+            or path_hash != lane_path_identity_sha256(lane_id)
+        ):
+            raise EngineError(
+                "managed continuity lane path identity is invalid"
+            )
+        challenge_paths = self.store.challenge_paths(state.identity)
+        relative = lane_relative_path(lane_id)
+        lane_workspace = challenge_paths.root / relative
+        lane_root = lane_workspace.parent
+        lanes_root = challenge_paths.runtime / "managed-thread-lanes"
+        lanes_root.mkdir(mode=0o700, exist_ok=True)
+        if lanes_root.is_symlink():
+            raise EngineError("managed continuity lanes root is a symlink")
+        lane_root.mkdir(mode=0o700, exist_ok=True)
+        if lane_root.is_symlink():
+            raise EngineError("managed continuity lane root is a symlink")
+        lane_manifest = {
+            "schema_version": 1,
+            "lane_identity_sha256": lane_id,
+            "lane_path_identity_sha256": path_hash,
+            "session_id": audit["session_id"],
+            "configuration_epoch": audit["configuration_epoch"],
+            "configuration_fingerprint_sha256": audit[
+                "configuration_fingerprint_sha256"
+            ],
+            "contract_version": audit["contract_version"],
+            "logical_role": audit["logical_role"],
+            "model": audit["model"],
+            "workspace_lane": audit["workspace_lane"],
+            "workspace_owner_run_id": audit["workspace_owner_run_id"],
+            "source_manifest_sha256": audit["source_manifest_sha256"],
+            "source_generation": audit["source_generation"],
+            "target_id": audit["target_id"],
+            "target_generation": audit["target_generation"],
+        }
+        manifest_path = lane_root / "lane.json"
+        if manifest_path.exists():
+            try:
+                existing = read_json(manifest_path)
+            except (OSError, ValueError) as error:
+                raise EngineError(
+                    "managed continuity lane manifest is unreadable"
+                ) from error
+            if existing != lane_manifest:
+                raise EngineError(
+                    "managed continuity lane manifest binding changed"
+                )
+        else:
+            atomic_write_json(manifest_path, lane_manifest)
+        lane_workspace.mkdir(mode=0o700, exist_ok=True)
+        if lane_workspace.is_symlink():
+            raise EngineError(
+                "managed continuity workspace is a symlink"
+            )
+        try:
+            lane_workspace.resolve(strict=True).relative_to(
+                lanes_root.resolve(strict=True)
+            )
+        except (FileNotFoundError, ValueError) as error:
+            raise EngineError(
+                "managed continuity workspace escapes its challenge"
+            ) from error
+        return lane_workspace
+
     def _make_invocation(
         self,
         state: ChallengeState,
@@ -6259,6 +6503,7 @@ class ChallengeEngine:
         deadline_epoch_seconds: float,
         run_id: str | None = None,
         managed_workspace: bool = False,
+        resume_thread_id: str | None = None,
     ) -> BatchInvocation:
         self._require_model_work_allowed(state)
         run_id = run_id or _run_id(f"{prefix}-{role.value}")
@@ -6272,18 +6517,34 @@ class ChallengeEngine:
             if role is Role.CAPTAIN
             else self.config.models.worker_effort
         )
+        continuity_audit: dict[str, Any] | None = None
+        if managed_workspace and run_id is not None:
+            continuity_audit = self._validated_managed_continuity_audit(
+                state,
+                role,
+                run_id,
+                resume_thread_id,
+            )
+        elif resume_thread_id is not None:
+            raise EngineError(
+                "Batch thread continuity is available only to a managed "
+                "reserved run"
+            )
+        request = {
+            "kind": "model",
+            "role": role.value,
+            "model": self._model_for_role(role),
+            "reasoning_effort": reasoning_effort.value,
+            "state_revision": state.revision,
+            "configuration_epoch": state.configuration_epoch,
+            "contract_version": contract_version,
+        }
+        if continuity_audit is not None:
+            request[THREAD_CONTINUITY_RUN_KEY] = continuity_audit
         paths = self.store.create_run(
             state.identity,
             run_id=run_id,
-            request={
-                "kind": "model",
-                "role": role.value,
-                "model": self._model_for_role(role),
-                "reasoning_effort": reasoning_effort.value,
-                "state_revision": state.revision,
-                "configuration_epoch": state.configuration_epoch,
-                "contract_version": contract_version,
-            },
+            request=request,
             base_revision=state.revision,
         )
         context = build_context_pack(
@@ -6334,8 +6595,15 @@ class ChallengeEngine:
             )
         )
         if managed_workspace:
-            working_directory = paths.root / "workspace"
-            working_directory.mkdir(mode=0o700)
+            if continuity_audit is None:
+                raise EngineError(
+                    "managed workspace requires a continuity audit"
+                )
+            working_directory = self._managed_continuity_workspace(
+                state,
+                run_id,
+                continuity_audit,
+            )
         else:
             working_directory = self._role_workspace(state, role)
         return BatchInvocation(
@@ -6350,6 +6618,7 @@ class ChallengeEngine:
             deadline_epoch_seconds=deadline_epoch_seconds,
             deadline_monotonic_seconds=deadline_monotonic_seconds,
             contract_version=contract_version,
+            resume_thread_id=resume_thread_id,
         )
 
     def run_role(
@@ -6363,6 +6632,7 @@ class ChallengeEngine:
         _automated: bool = False,
         _reserved_run_id: str | None = None,
         _managed_workspace: bool = False,
+        _resume_thread_id: str | None = None,
     ) -> BatchResult:
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -6382,6 +6652,7 @@ class ChallengeEngine:
                         _automated=_automated,
                         _reserved_run_id=_reserved_run_id,
                         _managed_workspace=_managed_workspace,
+                        _resume_thread_id=_resume_thread_id,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -6409,6 +6680,7 @@ class ChallengeEngine:
             deadline_epoch_seconds=deadline_epoch_seconds,
             run_id=_reserved_run_id,
             managed_workspace=_managed_workspace,
+            resume_thread_id=_resume_thread_id,
         )
         def before_provider_start() -> None:
             self._before_provider_start(
@@ -6460,6 +6732,7 @@ class ChallengeEngine:
         _reserved_run_ids: Mapping[Role, str] | None = None,
         _semantic_barrier: bool = False,
         _managed_workspace: bool = False,
+        _resume_thread_ids: Mapping[Role, str | None] | None = None,
     ) -> WaveOutcome:
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -6478,6 +6751,7 @@ class ChallengeEngine:
                         _reserved_run_ids=_reserved_run_ids,
                         _semantic_barrier=_semantic_barrier,
                         _managed_workspace=_managed_workspace,
+                        _resume_thread_ids=_resume_thread_ids,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -6522,6 +6796,11 @@ class ChallengeEngine:
                     else None
                 ),
                 managed_workspace=_managed_workspace,
+                resume_thread_id=(
+                    _resume_thread_ids.get(role)
+                    if _resume_thread_ids is not None
+                    else None
+                ),
             )
             for role in roles
         )
@@ -6695,13 +6974,33 @@ class ChallengeEngine:
         )
         source_root = paths.root
         if managed_stage:
-            expected_workspace = (
-                self.store.run_paths(
-                    state.identity,
-                    run_id=result.invocation.run_id,
-                ).root
-                / "workspace"
-            ).resolve(strict=True)
+            continuity_audit = reserved_run.extra.get(
+                THREAD_CONTINUITY_RUN_KEY
+            )
+            if run_audit_errors(continuity_audit):
+                raise WorkerResultValidationError(
+                    "managed model continuity audit is invalid"
+                )
+            assert type(continuity_audit) is dict
+            if continuity_audit.get("stable_lane") is True:
+                lane_id = continuity_audit.get(
+                    "lane_identity_sha256"
+                )
+                if type(lane_id) is not str:
+                    raise WorkerResultValidationError(
+                        "managed model lane identity is invalid"
+                    )
+                expected_workspace = (
+                    paths.root / lane_relative_path(lane_id)
+                ).resolve(strict=True)
+            else:
+                expected_workspace = (
+                    self.store.run_paths(
+                        state.identity,
+                        run_id=result.invocation.run_id,
+                    ).root
+                    / "workspace"
+                ).resolve(strict=True)
             if (
                 result.invocation.working_directory.resolve(strict=True)
                 != expected_workspace
@@ -7395,6 +7694,18 @@ class ChallengeEngine:
                         "configuration_epoch"
                     ]
                     completed_run.created_at = preserved["created_at"]
+                    if (
+                        existing_run.origin is RunOrigin.MANAGED_MODEL
+                    ):
+                        completed_run.extra.pop("thread_id", None)
+                        completed_run.extra[
+                            "produced_thread_id_sha256"
+                        ] = existing_run.extra.get(
+                            "produced_thread_id_sha256"
+                        )
+                        completed_run.extra["thread_secret_path"] = (
+                            existing_run.extra.get("thread_secret_path")
+                        )
                     completed_run.extra = {
                         **existing_run.extra,
                         **completed_run.extra,
@@ -7404,6 +7715,10 @@ class ChallengeEngine:
                             and not stale_managed_run
                         ),
                     }
+                    if (
+                        existing_run.origin is RunOrigin.MANAGED_MODEL
+                    ):
+                        completed_run.extra.pop("thread_id", None)
                     state.runs[state.runs.index(existing_run)] = completed_run
                     run_record = completed_run
 

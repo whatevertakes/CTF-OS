@@ -56,6 +56,23 @@ from ctf_os.engine.failure_capsule import (
     build_failure_capsule,
     selected_pwn_crash_failure_reason,
 )
+from ctf_os.managed_continuity import (
+    ManagedContinuityContractError,
+    THREAD_CONTINUITY_ALWAYS_FRESH_ROLES,
+    THREAD_CONTINUITY_CONTRACT_VERSION,
+    THREAD_CONTINUITY_ELIGIBLE_ROLES,
+    THREAD_CONTINUITY_RUN_KEY,
+    THREAD_CONTINUITY_SESSION_KEY,
+    build_lane_identity,
+    build_run_audit,
+    build_session_metadata,
+    run_audit_errors,
+    session_metadata_errors,
+    source_generation,
+    thread_id_sha256,
+    valid_thread_id,
+    validate_thread_continuity_policy,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     BudgetMode,
@@ -787,12 +804,402 @@ class ManagedOrchestrator:
             raise ManagedError(f"unknown managed session: {session_id}")
         return session
 
+    @staticmethod
+    def _selected_target_binding(
+        state: ChallengeState,
+    ) -> tuple[str | None, int | None]:
+        if state.primary_target_id is None:
+            return None, None
+        target = next(
+            (
+                item
+                for item in state.targets
+                if item.id == state.primary_target_id
+            ),
+            None,
+        )
+        if target is None:
+            return None, None
+        return target.id, target.generation
+
+    def _expected_continuity_metadata(
+        self,
+        state: ChallengeState,
+        policy: str,
+    ) -> dict[str, Any]:
+        try:
+            selected_policy = validate_thread_continuity_policy(policy)
+        except ManagedContinuityContractError as error:
+            raise ManagedError(str(error)) from error
+        target_id, target_generation = self._selected_target_binding(state)
+        manifest = state.metadata.get("source_manifest_sha256")
+        manifest_value = manifest if type(manifest) is str else None
+        generation = source_generation(
+            manifest_value,
+            state.metadata.get("source_manifest_history"),
+        )
+        return build_session_metadata(
+            policy=selected_policy,
+            configuration_epoch=state.configuration_epoch,
+            source_manifest_sha256=manifest_value,
+            source_generation=generation,
+            target_id=target_id,
+            target_generation=target_generation,
+            runtime_image_digest=self.engine.config.runtime.image_digest,
+            captain_effort=self.engine.config.models.captain_effort,
+            worker_effort=self.engine.config.models.worker_effort,
+            models={
+                role.value: self.engine._model_for_role(role)
+                for role in Role
+            },
+        )
+
+    @staticmethod
+    def _continuity_metadata(
+        session: SolveSession,
+    ) -> dict[str, Any]:
+        value = session.extra.get(THREAD_CONTINUITY_SESSION_KEY)
+        issues = session_metadata_errors(value)
+        if issues:
+            raise ManagedError(
+                "managed thread continuity session metadata is invalid: "
+                + "; ".join(issues)
+            )
+        assert type(value) is dict
+        return value
+
+    @staticmethod
+    def _continuity_fresh_reason(
+        policy: str,
+        role: Role,
+        wave_kind: WaveKind | None,
+    ) -> tuple[str, bool]:
+        if wave_kind is WaveKind.PROOF:
+            return "proof_wave_forced_fresh", False
+        if policy == "fresh":
+            return "policy_fresh", False
+        if role.value in THREAD_CONTINUITY_ALWAYS_FRESH_ROLES:
+            return (
+                "captain_lane_non_captain"
+                if policy == "captain_lane"
+                else "role_lane_ineligible_role"
+            ), False
+        if policy == "captain_lane" and role is not Role.CAPTAIN:
+            return "captain_lane_non_captain", False
+        if (
+            policy == "role_lane"
+            and role.value not in THREAD_CONTINUITY_ELIGIBLE_ROLES
+        ):
+            return "role_lane_ineligible_role", False
+        return "", True
+
+    def _read_thread_secret(
+        self,
+        identity: ChallengeIdentity,
+        run: RunReference,
+    ) -> tuple[str | None, str]:
+        expected_path = (
+            self.engine.store.run_paths(identity, run_id=run.id).root
+            / "thread-secret.json"
+        )
+        challenge_root = self.engine.store.challenge_paths(identity).root
+        expected_pointer = expected_path.relative_to(
+            challenge_root
+        ).as_posix()
+        if run.extra.get("thread_secret_path") != expected_pointer:
+            return None, "prior_thread_missing"
+        try:
+            payload = read_json(expected_path)
+        except (OSError, ValueError):
+            return None, "prior_thread_missing"
+        if (
+            type(payload) is not dict
+            or set(payload)
+            != {
+                "schema_version",
+                "run_id",
+                "thread_id",
+                "thread_id_sha256",
+            }
+            or payload.get("schema_version") != 1
+            or payload.get("run_id") != run.id
+        ):
+            return None, "prior_thread_invalid"
+        thread_id = payload.get("thread_id")
+        if not valid_thread_id(thread_id):
+            return None, "prior_thread_invalid"
+        digest = thread_id_sha256(thread_id)
+        if (
+            payload.get("thread_id_sha256") != digest
+            or run.extra.get("produced_thread_id_sha256") != digest
+        ):
+            return None, "prior_thread_hash_mismatch"
+        return thread_id, ""
+
+    def _build_continuity_audit(
+        self,
+        state: ChallengeState,
+        session: SolveSession,
+        *,
+        identity: ChallengeIdentity,
+        run_id: str,
+        role: Role,
+        wave_kind: WaveKind | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        metadata = self._continuity_metadata(session)
+        policy = str(metadata["policy"])
+        reason, eligible = self._continuity_fresh_reason(
+            policy,
+            role,
+            wave_kind,
+        )
+        model = self.engine._model_for_role(role)
+        lane_identity: str | None = None
+        if eligible:
+            lane_identity = build_lane_identity(
+                session_id=session.id,
+                configuration_fingerprint_sha256=str(
+                    metadata["configuration_fingerprint_sha256"]
+                ),
+                configuration_epoch=state.configuration_epoch,
+                role=role.value,
+                model=model,
+                source_manifest_sha256=(
+                    metadata["source_manifest_sha256"]
+                    if type(metadata["source_manifest_sha256"]) is str
+                    else None
+                ),
+                source_generation=int(metadata["source_generation"]),
+                target_id=(
+                    metadata["target_id"]
+                    if type(metadata["target_id"]) is str
+                    else None
+                ),
+                target_generation=(
+                    metadata["target_generation"]
+                    if type(metadata["target_generation"]) is int
+                    else None
+                ),
+            )
+        if not eligible:
+            return (
+                build_run_audit(
+                    session_metadata=metadata,
+                    session_id=session.id,
+                    role=role.value,
+                    model=model,
+                    decision="fresh",
+                    reason=reason,
+                    source_run_id=None,
+                    source_thread_id_sha256=None,
+                    stable_lane=False,
+                    lane_identity_sha256=None,
+                    workspace_owner_run_id=None,
+                ),
+                None,
+            )
+
+        run_index = {item.id: item for item in state.runs}
+        prior: RunReference | None = None
+        for prior_run_id in reversed(session.run_ids):
+            candidate = run_index.get(prior_run_id)
+            if (
+                candidate is not None
+                and candidate.origin is RunOrigin.MANAGED_MODEL
+                and candidate.role == role.value
+            ):
+                prior = candidate
+                break
+        if prior is None:
+            return (
+                build_run_audit(
+                    session_metadata=metadata,
+                    session_id=session.id,
+                    role=role.value,
+                    model=model,
+                    decision="fresh",
+                    reason="no_prior_lane_run",
+                    source_run_id=None,
+                    source_thread_id_sha256=None,
+                    stable_lane=True,
+                    lane_identity_sha256=lane_identity,
+                    workspace_owner_run_id=run_id,
+                ),
+                None,
+            )
+
+        mismatch_reason: str | None = None
+        if prior.status is not RunStatus.COMPLETED:
+            mismatch_reason = "prior_lane_not_completed"
+        elif prior.session_id != session.id:
+            mismatch_reason = "prior_session_mismatch"
+        elif prior.configuration_epoch != state.configuration_epoch:
+            mismatch_reason = "prior_configuration_mismatch"
+        elif prior.model != model:
+            mismatch_reason = "prior_model_mismatch"
+        elif (
+            prior.extra.get("contract_version")
+            != THREAD_CONTINUITY_CONTRACT_VERSION
+        ):
+            mismatch_reason = "prior_contract_mismatch"
+        elif prior.role != role.value:
+            mismatch_reason = "prior_role_mismatch"
+        prior_audit = prior.extra.get(THREAD_CONTINUITY_RUN_KEY)
+        if mismatch_reason is None:
+            prior_issues = run_audit_errors(prior_audit)
+            if prior_issues:
+                mismatch_reason = "prior_workspace_mismatch"
+        if mismatch_reason is None:
+            assert type(prior_audit) is dict
+            expected_pairs = (
+                ("session_id", session.id, "prior_session_mismatch"),
+                (
+                    "configuration_epoch",
+                    state.configuration_epoch,
+                    "prior_configuration_mismatch",
+                ),
+                (
+                    "configuration_fingerprint_sha256",
+                    metadata["configuration_fingerprint_sha256"],
+                    "prior_configuration_mismatch",
+                ),
+                (
+                    "contract_version",
+                    THREAD_CONTINUITY_CONTRACT_VERSION,
+                    "prior_contract_mismatch",
+                ),
+                ("logical_role", role.value, "prior_role_mismatch"),
+                ("model", model, "prior_model_mismatch"),
+                (
+                    "lane_identity_sha256",
+                    lane_identity,
+                    "prior_workspace_mismatch",
+                ),
+                (
+                    "source_manifest_sha256",
+                    metadata["source_manifest_sha256"],
+                    "prior_source_mismatch",
+                ),
+                (
+                    "source_generation",
+                    metadata["source_generation"],
+                    "prior_source_mismatch",
+                ),
+                ("target_id", metadata["target_id"], "prior_target_mismatch"),
+                (
+                    "target_generation",
+                    metadata["target_generation"],
+                    "prior_target_mismatch",
+                ),
+            )
+            for key, expected, issue in expected_pairs:
+                if prior_audit.get(key) != expected:
+                    mismatch_reason = issue
+                    break
+            if prior_audit.get("stable_lane") is not True:
+                mismatch_reason = "prior_workspace_mismatch"
+        resume_thread: str | None = None
+        if mismatch_reason is None:
+            resume_thread, mismatch_reason = self._read_thread_secret(
+                identity,
+                prior,
+            )
+            mismatch_reason = mismatch_reason or None
+        if mismatch_reason is not None:
+            return (
+                build_run_audit(
+                    session_metadata=metadata,
+                    session_id=session.id,
+                    role=role.value,
+                    model=model,
+                    decision="fresh",
+                    reason=mismatch_reason,
+                    source_run_id=None,
+                    source_thread_id_sha256=None,
+                    stable_lane=False,
+                    lane_identity_sha256=None,
+                    workspace_owner_run_id=None,
+                ),
+                None,
+            )
+        assert resume_thread is not None
+        assert type(prior_audit) is dict
+        return (
+            build_run_audit(
+                session_metadata=metadata,
+                session_id=session.id,
+                role=role.value,
+                model=model,
+                decision="resume",
+                reason="resume_previous_completed_lane",
+                source_run_id=prior.id,
+                source_thread_id_sha256=thread_id_sha256(resume_thread),
+                stable_lane=True,
+                lane_identity_sha256=lane_identity,
+                workspace_owner_run_id=str(
+                    prior_audit["workspace_owner_run_id"]
+                ),
+            ),
+            resume_thread,
+        )
+
+    def _resume_thread_for_reserved_run(
+        self,
+        identity: ChallengeIdentity,
+        run_id: str,
+    ) -> str | None:
+        state = self.engine.store.load(identity)
+        run = next(
+            (item for item in state.runs if item.id == run_id),
+            None,
+        )
+        if run is None or run.status is not RunStatus.CREATED:
+            raise ManagedError(
+                f"managed continuity run is not reserved: {run_id}"
+            )
+        audit = run.extra.get(THREAD_CONTINUITY_RUN_KEY)
+        issues = run_audit_errors(audit)
+        if issues:
+            raise ManagedError(
+                "managed continuity run audit is invalid: "
+                + "; ".join(issues)
+            )
+        assert type(audit) is dict
+        if audit["decision"] == "fresh":
+            return None
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == audit["source_run_id"]
+            ),
+            None,
+        )
+        if source_run is None:
+            raise ManagedError("managed continuity source run disappeared")
+        thread_id, reason = self._read_thread_secret(identity, source_run)
+        if (
+            thread_id is None
+            or reason
+            or thread_id_sha256(thread_id) != audit["thread_id_sha256"]
+        ):
+            raise ManagedError(
+                "managed continuity source thread changed after reservation"
+            )
+        return thread_id
+
     def _reserve_session(
         self,
         identity: ChallengeIdentity,
         session_id: str | None,
+        *,
+        thread_continuity_policy: str = "fresh",
     ) -> tuple[ChallengeState, str]:
         current = self.engine.store.load(identity)
+        expected_continuity = self._expected_continuity_metadata(
+            current,
+            thread_continuity_policy,
+        )
         selected = (
             session_id
             or current.active_managed_session_id
@@ -821,6 +1228,9 @@ class ManagedOrchestrator:
                     evaluation_policy="observe",
                     started_at=utc_now(),
                 )
+                session.extra[THREAD_CONTINUITY_SESSION_KEY] = (
+                    expected_continuity
+                )
                 state.sessions.append(session)
             elif (
                 session.mode is not SessionMode.MANAGED
@@ -836,6 +1246,27 @@ class ManagedOrchestrator:
             elif session.configuration_epoch != state.configuration_epoch:
                 raise ManagedError(
                     "session configuration epoch is stale; start a new session"
+                )
+            existing_continuity = session.extra.get(
+                THREAD_CONTINUITY_SESSION_KEY
+            )
+            if existing_continuity is None:
+                if session.run_ids or session.wave_ids:
+                    raise ManagedError(
+                        "thread continuity metadata must be pinned before "
+                        "managed session work starts; start a new session"
+                    )
+                session.extra[THREAD_CONTINUITY_SESSION_KEY] = (
+                    expected_continuity
+                )
+            elif session_metadata_errors(existing_continuity):
+                raise ManagedError(
+                    "managed thread continuity metadata is invalid"
+                )
+            elif existing_continuity != expected_continuity:
+                raise ManagedError(
+                    "managed thread continuity policy/configuration is pinned "
+                    "for the session; start a new session"
                 )
             session.status = SessionStatus.RUNNING
             session.started_at = session.started_at or utc_now()
@@ -888,6 +1319,15 @@ class ManagedOrchestrator:
             "captain",
             current.configuration_epoch,
         )
+        current_session = self._session(current, session_id)
+        continuity_audit, _resume_thread = self._build_continuity_audit(
+            current,
+            current_session,
+            identity=identity,
+            run_id=run_id,
+            role=Role.CAPTAIN,
+            wave_kind=None,
+        )
 
         def apply(state: ChallengeState) -> None:
             session = self._require_epoch(state, session_id)
@@ -918,6 +1358,12 @@ class ManagedOrchestrator:
                     session_id=session_id,
                     cycle_id=cycle_id,
                     configuration_epoch=state.configuration_epoch,
+                    extra={
+                        "contract_version": (
+                            THREAD_CONTINUITY_CONTRACT_VERSION
+                        ),
+                        THREAD_CONTINUITY_RUN_KEY: continuity_audit,
+                    },
                 )
             )
             session.run_ids.append(run_id)
@@ -990,6 +1436,18 @@ class ManagedOrchestrator:
             )
             for role in roles
         }
+        current_session = self._session(current, session_id)
+        continuity_audits = {
+            role: self._build_continuity_audit(
+                current,
+                current_session,
+                identity=identity,
+                run_id=role_runs[role],
+                role=role,
+                wave_kind=kind,
+            )[0]
+            for role in roles
+        }
 
         def apply(state: ChallengeState) -> None:
             session = self._require_epoch(state, session_id)
@@ -1039,6 +1497,14 @@ class ManagedOrchestrator:
                         cycle_id=cycle_id,
                         wave_id=wave_id,
                         configuration_epoch=state.configuration_epoch,
+                        extra={
+                            "contract_version": (
+                                THREAD_CONTINUITY_CONTRACT_VERSION
+                            ),
+                            THREAD_CONTINUITY_RUN_KEY: (
+                                continuity_audits[role]
+                            ),
+                        },
                     )
                 )
                 session.run_ids.append(run_id)
@@ -3244,13 +3710,18 @@ class ManagedOrchestrator:
         *,
         session_id: str | None,
         note: str | None,
+        thread_continuity_policy: str,
     ) -> ChallengeState:
         self.engine._recover_session_boundary(identity)
         reconcile_workspace_publishes(self.engine, identity)
         self.reconcile(identity)
         self._retire_stale_registered_managed_remote_actions(identity)
         self.require_preflight(identity, session_id=session_id)
-        state, selected_session = self._reserve_session(identity, session_id)
+        state, selected_session = self._reserve_session(
+            identity,
+            session_id,
+            thread_continuity_policy=thread_continuity_policy,
+        )
         try:
             state = self.engine.synchronize_managed_adapter_seed_plan(
                 identity,
@@ -3289,6 +3760,10 @@ class ManagedOrchestrator:
                 identity,
                 session_id=selected_session,
             )
+            captain_resume_thread = self._resume_thread_for_reserved_run(
+                identity,
+                cycle.captain_run_id,
+            )
             captain = self.engine.run_role(
                 identity,
                 Role.CAPTAIN,
@@ -3302,6 +3777,7 @@ class ManagedOrchestrator:
                 _automated=True,
                 _reserved_run_id=cycle.captain_run_id,
                 _managed_workspace=True,
+                _resume_thread_id=captain_resume_thread,
             )
             if not captain.completed or not captain.validation.valid:
                 return self._checkpoint_invalid_cycle(
@@ -3355,6 +3831,13 @@ class ManagedOrchestrator:
                 identity,
                 session_id=selected_session,
             )
+            wave_resume_threads = {
+                role: self._resume_thread_for_reserved_run(
+                    identity,
+                    run_id,
+                )
+                for role, run_id in role_runs.items()
+            }
             outcome = self.engine.run_wave(
                 identity,
                 wave_name,
@@ -3363,6 +3846,7 @@ class ManagedOrchestrator:
                 _reserved_run_ids=role_runs,
                 _semantic_barrier=True,
                 _managed_workspace=True,
+                _resume_thread_ids=wave_resume_threads,
             )
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
@@ -3525,6 +4009,7 @@ class ManagedOrchestrator:
         *,
         session_id: str | None = None,
         note: str | None = None,
+        thread_continuity_policy: str = "fresh",
     ) -> ChallengeState:
         paths = self.engine.store.challenge_paths(identity)
         lock = ChallengeLock(paths.runtime / "session.lock", timeout=0)
@@ -3540,6 +4025,7 @@ class ManagedOrchestrator:
                 identity,
                 session_id=session_id,
                 note=note,
+                thread_continuity_policy=thread_continuity_policy,
             )
         finally:
             lock.release()
@@ -3551,6 +4037,7 @@ class ManagedOrchestrator:
         max_cycles: int,
         session_id: str | None = None,
         note: str | None = None,
+        thread_continuity_policy: str = "fresh",
     ) -> ChallengeState:
         if max_cycles < 1:
             raise ManagedError("max_cycles must be positive")
@@ -3570,6 +4057,7 @@ class ManagedOrchestrator:
                     identity,
                     session_id=selected_session,
                     note=note,
+                    thread_continuity_policy=thread_continuity_policy,
                 )
                 selected_session = state.active_managed_session_id
                 if state.status in _STOP_STATUSES:

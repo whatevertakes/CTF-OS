@@ -69,6 +69,13 @@ from ctf_os.contracts.rev_inventory_v2 import (
     rev_inventory_v2_seed_command,
     validate_rev_inventory_v2_result_mapping,
 )
+from ctf_os.managed_continuity import (
+    THREAD_CONTINUITY_CONTRACT_VERSION,
+    THREAD_CONTINUITY_RUN_KEY,
+    THREAD_CONTINUITY_SESSION_KEY,
+    run_audit_errors,
+    session_metadata_errors,
+)
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
 # Compatibility alias for callers that still construct or inspect v1 state.
@@ -14058,6 +14065,195 @@ class ChallengeState:
                         f"terminal managed run {run.id} requires result and "
                         "validation paths"
                     )
+                continuity_audit = run.extra.get(
+                    THREAD_CONTINUITY_RUN_KEY
+                )
+                bound_session = (
+                    sessions.get(run.session_id)
+                    if run.session_id is not None
+                    else None
+                )
+                session_continuity = (
+                    bound_session.extra.get(
+                        THREAD_CONTINUITY_SESSION_KEY
+                    )
+                    if bound_session is not None
+                    else None
+                )
+                if continuity_audit is not None:
+                    audit_issues = run_audit_errors(
+                        continuity_audit
+                    )
+                    if audit_issues:
+                        errors.append(
+                            f"run {run.id} has invalid managed thread "
+                            "continuity audit: "
+                            + "; ".join(audit_issues)
+                        )
+                    elif not isinstance(
+                        continuity_audit,
+                        Mapping,
+                    ):
+                        errors.append(
+                            f"run {run.id} continuity audit is invalid"
+                        )
+                    else:
+                        if (
+                            run.origin is not RunOrigin.MANAGED_MODEL
+                            or bound_session is None
+                            or session_continuity is None
+                            or continuity_audit.get("session_id")
+                            != run.session_id
+                            or continuity_audit.get(
+                                "configuration_epoch"
+                            )
+                            != run.configuration_epoch
+                            or continuity_audit.get("logical_role")
+                            != run.role
+                            or continuity_audit.get("model") != run.model
+                            or continuity_audit.get(
+                                "contract_version"
+                            )
+                            != run.extra.get("contract_version")
+                        ):
+                            errors.append(
+                                f"run {run.id} continuity audit is not bound "
+                                "to its managed run"
+                            )
+                        elif isinstance(
+                            session_continuity,
+                            Mapping,
+                        ):
+                            for key in (
+                                "policy",
+                                "configuration_epoch",
+                                "configuration_fingerprint_sha256",
+                                "contract_version",
+                                "source_manifest_sha256",
+                                "source_generation",
+                                "target_id",
+                                "target_generation",
+                            ):
+                                if continuity_audit.get(
+                                    key
+                                ) != session_continuity.get(key):
+                                    errors.append(
+                                        f"run {run.id} continuity audit "
+                                        "does not match its session"
+                                    )
+                                    break
+                        if (
+                            continuity_audit.get("decision")
+                            == "resume"
+                        ):
+                            source_run = runs.get(
+                                continuity_audit.get("source_run_id")
+                            )
+                            source_audit = (
+                                source_run.extra.get(
+                                    THREAD_CONTINUITY_RUN_KEY
+                                )
+                                if source_run is not None
+                                else None
+                            )
+                            if (
+                                source_run is None
+                                or source_run.status
+                                is not RunStatus.COMPLETED
+                                or source_run.origin
+                                is not RunOrigin.MANAGED_MODEL
+                                or source_run.session_id != run.session_id
+                                or source_run.configuration_epoch
+                                != run.configuration_epoch
+                                or source_run.role != run.role
+                                or source_run.model != run.model
+                                or source_run.extra.get(
+                                    "contract_version"
+                                )
+                                != THREAD_CONTINUITY_CONTRACT_VERSION
+                                or source_run.extra.get(
+                                    "produced_thread_id_sha256"
+                                )
+                                != continuity_audit.get(
+                                    "thread_id_sha256"
+                                )
+                                or run_audit_errors(source_audit)
+                                or not isinstance(
+                                    source_audit,
+                                    Mapping,
+                                )
+                                or source_audit.get(
+                                    "lane_identity_sha256"
+                                )
+                                != continuity_audit.get(
+                                    "lane_identity_sha256"
+                                )
+                                or source_audit.get(
+                                    "workspace_owner_run_id"
+                                )
+                                != continuity_audit.get(
+                                    "workspace_owner_run_id"
+                                )
+                            ):
+                                errors.append(
+                                    f"run {run.id} continuity resume source "
+                                    "is invalid"
+                                )
+                        if (
+                            run.wave_id in waves
+                            and waves[run.wave_id].kind
+                            is WaveKind.PROOF
+                            and (
+                                continuity_audit.get("decision")
+                                != "fresh"
+                                or continuity_audit.get("reason")
+                                != "proof_wave_forced_fresh"
+                                or continuity_audit.get("stable_lane")
+                                is not False
+                            )
+                        ):
+                            errors.append(
+                                f"proof run {run.id} must use a fresh "
+                                "isolated model thread"
+                            )
+                    if "thread_id" in run.extra:
+                        errors.append(
+                            f"managed continuity run {run.id} exposes a raw "
+                            "provider thread id in canonical state"
+                        )
+                    produced_digest = run.extra.get(
+                        "produced_thread_id_sha256"
+                    )
+                    secret_path = run.extra.get("thread_secret_path")
+                    if (produced_digest is None) != (
+                        secret_path is None
+                    ):
+                        errors.append(
+                            f"run {run.id} thread secret pointer/hash are "
+                            "incomplete"
+                        )
+                    elif produced_digest is not None and (
+                        type(produced_digest) is not str
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            produced_digest,
+                        )
+                        is None
+                        or secret_path
+                        != f"runs/{run.id}/thread-secret.json"
+                    ):
+                        errors.append(
+                            f"run {run.id} thread secret pointer/hash are "
+                            "invalid"
+                        )
+                elif (
+                    run.origin is RunOrigin.MANAGED_MODEL
+                    and session_continuity is not None
+                ):
+                    errors.append(
+                        f"managed run {run.id} requires a thread continuity "
+                        "audit"
+                    )
 
             expected_run_status = {
                 ReceiptOutcome.SUCCEEDED: RunStatus.COMPLETED,
@@ -14177,6 +14373,34 @@ class ChallengeState:
                     errors.append(
                         f"terminal session {session.id} requires end_revision"
                     )
+                continuity_metadata = session.extra.get(
+                    THREAD_CONTINUITY_SESSION_KEY
+                )
+                if continuity_metadata is not None:
+                    metadata_issues = session_metadata_errors(
+                        continuity_metadata
+                    )
+                    if metadata_issues:
+                        errors.append(
+                            f"session {session.id} has invalid managed thread "
+                            "continuity metadata: "
+                            + "; ".join(metadata_issues)
+                        )
+                    elif (
+                        not isinstance(
+                            continuity_metadata,
+                            Mapping,
+                        )
+                        or session.mode is not SessionMode.MANAGED
+                        or continuity_metadata.get(
+                            "configuration_epoch"
+                        )
+                        != session.configuration_epoch
+                    ):
+                        errors.append(
+                            f"session {session.id} thread continuity "
+                            "metadata is not bound to the session"
+                        )
 
             if self.active_managed_session_id is not None:
                 active_session = sessions.get(self.active_managed_session_id)
