@@ -13,3 +13,8 @@ ctfos-live-mcp = "ctf_os.live_mcp:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "requests==2.34.2",
+]

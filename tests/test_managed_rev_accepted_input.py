@@ -35,7 +35,7 @@ from tests.test_rev_acceptance import (
 
 IMAGE_DIGEST = (
     "sha256:"
-    "62bc44f2b84ccaa86cb5321ff700b73c42edd8b901c21cd61cfb3036bd985886"
+    "82ef8c155a8bbe9cfe33ce1a475425c77097b6fcefc32b678da1b14bf9c8339a"
 )
 
 
