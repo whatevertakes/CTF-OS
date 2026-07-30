@@ -181,6 +181,10 @@ class MiscEngineTests(unittest.TestCase):
                     fail_on_call=fail_on_call,
                 )
                 holder["sandbox"] = sandbox
+            else:
+                # Managed oracle proofs deliberately switch from the Builder
+                # workspace to an engine-private proof source root.
+                sandbox.work = work
             return sandbox
 
         engine = ChallengeEngine(

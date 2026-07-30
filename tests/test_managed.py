@@ -5203,6 +5203,7 @@ class ManagedTypedGateTests(unittest.TestCase):
         role: Role = Role.BUILDER,
         wave_name: str = "attack",
         report_all_paths: bool = True,
+        builder_predates_preissue: bool = False,
     ):
         identity = ChallengeIdentity(
             "Managed Typed Gates",
@@ -5243,39 +5244,38 @@ class ManagedTypedGateTests(unittest.TestCase):
             )
             action["parent_experiment_id"] = parent_id
         if "oracle_preissue_id" in action:
-            state = engine.store.load(identity)
-            workspace = engine._workspace(state)
-            if category == "crypto":
-                (workspace / "operator-variant.json").write_text(
-                    '{"variant":1}\n',
-                    encoding="utf-8",
-                )
-                (workspace / "operator-expected.bin").write_bytes(
-                    b"operator-expected\n"
-                )
-                _state, record = (
-                    engine.preissue_managed_crypto_oracle(
-                        identity,
-                        variant_parameters_locator=(
-                            "operator-variant.json"
-                        ),
-                        variant_expected_output_locator=(
-                            "operator-expected.bin"
-                        ),
-                        mutation_id="operator-variant-1",
+            with tempfile.TemporaryDirectory() as operator_temp:
+                operator_root = Path(operator_temp)
+                if category == "crypto":
+                    variant = operator_root / "variant.json"
+                    expected = operator_root / "expected.bin"
+                    variant.write_text(
+                        '{"variant":1}\n',
+                        encoding="utf-8",
                     )
-                )
-            else:
-                (workspace / "operator-verifier.py").write_text(
-                    "raise SystemExit(1)\n",
-                    encoding="utf-8",
-                )
-                _state, record = engine.preissue_managed_misc_oracle(
-                    identity,
-                    verifier_locator="operator-verifier.py",
-                    verifier_id="operator-verifier-v1",
-                    oracle_id="operator-oracle-v1",
-                )
+                    expected.write_bytes(b"operator-expected\n")
+                    _state, record = (
+                        engine.preissue_managed_crypto_oracle(
+                            identity,
+                            variant_parameters_path=variant,
+                            variant_expected_output_path=expected,
+                            mutation_id="operator-variant-1",
+                        )
+                    )
+                else:
+                    verifier = operator_root / "verifier.py"
+                    verifier.write_text(
+                        "raise SystemExit(1)\n",
+                        encoding="utf-8",
+                    )
+                    _state, record = (
+                        engine.preissue_managed_misc_oracle(
+                            identity,
+                            verifier_path=verifier,
+                            verifier_id="operator-verifier-v1",
+                            oracle_id="operator-oracle-v1",
+                        )
+                    )
             action["oracle_preissue_id"] = record["preissue_id"]
 
         orchestrator = ManagedOrchestrator(
@@ -5341,6 +5341,17 @@ class ManagedTypedGateTests(unittest.TestCase):
 
         def seed(state):
             run = next(item for item in state.runs if item.id == run_id)
+            if builder_predates_preissue:
+                preissue_id = action.get("oracle_preissue_id")
+                history = state.extra.get("managed_oracle_preissues", {})
+                preissue = (
+                    history.get(preissue_id)
+                    if isinstance(history, dict)
+                    else None
+                )
+                if not isinstance(preissue, dict):
+                    raise AssertionError("test preissue is unavailable")
+                run.base_revision = int(preissue["issue_revision"]) - 1
             run.status = RunStatus.COMPLETED
             run.result_path = f"runs/{run_id}/result.json"
             run.validation_path = f"runs/{run_id}/validation.json"
@@ -5425,6 +5436,38 @@ class ManagedTypedGateTests(unittest.TestCase):
             result,
             publish,
             registration,
+        )
+
+    def test_oracle_preissue_must_predate_builder_registration(self):
+        action = {
+            "kind": "prove_crypto_metamorphic",
+            "description": "reject a late hidden oracle",
+            "candidate_id": "placeholder",
+            "solver_artifact_path": "crypto/solver.py",
+            "original_parameters_artifact_path": "crypto/original.json",
+            "oracle_preissue_id": "placeholder",
+            "runtime": "python",
+        }
+        (
+            _engine,
+            _orchestrator,
+            _identity,
+            _session_id,
+            _cycle,
+            _wave,
+            _result,
+            _publish,
+            registration,
+        ) = self.fixture(
+            suffix="late-oracle",
+            category="crypto",
+            action=action,
+            builder_predates_preissue=True,
+        )
+        self.assertEqual(registration.experiment_ids, ())
+        self.assertEqual(
+            registration.rejection_code,
+            "typed_gate_oracle_preissue_invalid",
         )
 
     def test_all_typed_gates_bind_current_builder_artifacts(self):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,6 +29,46 @@ def _capability(_digest: str) -> dict[str, object]:
         "schema_version": 2,
         "capabilities": {},
     }
+
+
+def _preissue_crypto(
+    engine,
+    identity,
+    *,
+    variant: bytes,
+    expected: bytes,
+) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as operator_temp:
+        root = Path(operator_temp)
+        variant_path = root / "variant.json"
+        expected_path = root / "expected.bin"
+        variant_path.write_bytes(variant)
+        expected_path.write_bytes(expected)
+        _state, record = engine.preissue_managed_crypto_oracle(
+            identity,
+            variant_parameters_path=variant_path,
+            variant_expected_output_path=expected_path,
+            mutation_id="managed-rsa-variant",
+        )
+    return dict(record)
+
+
+def _preissue_misc(
+    engine,
+    identity,
+    *,
+    verifier: bytes,
+) -> dict[str, object]:
+    with tempfile.TemporaryDirectory() as operator_temp:
+        verifier_path = Path(operator_temp) / "verifier.py"
+        verifier_path.write_bytes(verifier)
+        _state, record = engine.preissue_managed_misc_oracle(
+            identity,
+            verifier_path=verifier_path,
+            verifier_id="original-condition",
+            oracle_id="operator-oracle-v1",
+        )
+    return dict(record)
 
 
 class _TypedActionExecutor:
@@ -388,11 +430,11 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                 locator: (workspace / locator).read_bytes()
                 for locator in locators
             }
-            _state, preissue = engine.preissue_managed_crypto_oracle(
+            preissue = _preissue_crypto(
+                engine,
                 case.identity,
-                variant_parameters_locator="variant.json",
-                variant_expected_output_locator="variant.out",
-                mutation_id="managed-rsa-variant",
+                variant=(workspace / "variant.json").read_bytes(),
+                expected=(workspace / "variant.out").read_bytes(),
             )
             for locator in (*locators, "variant.json", "variant.out"):
                 (workspace / locator).unlink()
@@ -478,11 +520,11 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                 locator: (workspace / locator).read_bytes()
                 for locator in locators
             }
-            _state, preissue = engine.preissue_managed_crypto_oracle(
+            preissue = _preissue_crypto(
+                engine,
                 case.identity,
-                variant_parameters_locator="variant.json",
-                variant_expected_output_locator="variant.out",
-                mutation_id="managed-rsa-variant",
+                variant=(workspace / "variant.json").read_bytes(),
+                expected=(workspace / "variant.out").read_bytes(),
             )
             for locator in (*locators, "variant.json", "variant.out"):
                 (workspace / locator).unlink()
@@ -578,11 +620,10 @@ class ManagedCategoryHotPathTests(unittest.TestCase):
                 ).encode("utf-8"),
                 "transform.py": (workspace / "transform.py").read_bytes(),
             }
-            _state, preissue = engine.preissue_managed_misc_oracle(
+            preissue = _preissue_misc(
+                engine,
                 case.identity,
-                verifier_locator="verify.py",
-                verifier_id="original-condition",
-                oracle_id="operator-oracle-v1",
+                verifier=(workspace / "verify.py").read_bytes(),
             )
             for locator in (
                 "misc-spec.json",

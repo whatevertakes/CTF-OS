@@ -2242,8 +2242,8 @@ def main(
         }:
             state, record = engine.preissue_managed_crypto_oracle(
                 _identity(args),
-                variant_parameters_locator=args.variant_parameters,
-                variant_expected_output_locator=(
+                variant_parameters_path=args.variant_parameters,
+                variant_expected_output_path=(
                     args.variant_expected_output
                 ),
                 mutation_id=args.mutation_id,
@@ -2262,7 +2262,7 @@ def main(
         }:
             state, record = engine.preissue_managed_misc_oracle(
                 _identity(args),
-                verifier_locator=args.verifier,
+                verifier_path=args.verifier,
                 verifier_id=args.verifier_id,
                 oracle_id=args.oracle_id,
             )

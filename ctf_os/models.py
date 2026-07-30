@@ -10266,6 +10266,11 @@ def _crypto_metamorphic_state_errors(
                         artifact.extra.get("attempt_ordinal") != ordinal
                         or artifact.extra.get("plan_sha256")
                         != binding["plan_sha256"]
+                        or (
+                            managed_oracle
+                            and artifact.extra.get("context_visibility")
+                            != "engine_private"
+                        )
                         for artifact in linked_streams
                     )
                 ):
@@ -11886,6 +11891,7 @@ _MISC_TRANSFORM_MANAGED_BINDING_KEYS = frozenset(
         *_MISC_TRANSFORM_BINDING_KEYS,
         "oracle_preissue_id",
         "oracle_control_run_ids",
+        "oracle_control_status",
         "oracle_negative_control_passed",
     }
 )
@@ -11992,6 +11998,7 @@ def _misc_transform_state_errors(
             if managed_oracle:
                 preissue_id = binding["oracle_preissue_id"]
                 control_run_ids = binding["oracle_control_run_ids"]
+                control_status = binding["oracle_control_status"]
                 control_passed = binding[
                     "oracle_negative_control_passed"
                 ]
@@ -12009,11 +12016,13 @@ def _misc_transform_state_errors(
                         preissue_id,
                     )
                     or type(control_run_ids) is not list
-                    or len(control_run_ids) != 1
+                    or len(control_run_ids) not in {0, 1}
                     or any(
                         type(run_id) is not str
                         for run_id in control_run_ids
                     )
+                    or control_status
+                    not in {"not_run", "passed", "failed"}
                     or type(control_passed) is not bool
                     or not isinstance(preissue, Mapping)
                     or preissue.get("preissue_id") != preissue_id
@@ -12028,23 +12037,76 @@ def _misc_transform_state_errors(
                     raise ModelValidationError(
                         "managed oracle binding is inconsistent"
                     )
-                control_run = runs.get(control_run_ids[0])
                 if (
-                    control_run is None
-                    or control_run.extra.get("phase")
-                    != "oracle-control"
-                    or control_run.extra.get("misc_evaluation_id")
-                    != evaluation_id
-                    or control_run.extra.get("oracle_preissue_id")
-                    != preissue_id
-                    or control_run.extra.get(
-                        "negative_control_rejected"
+                    (
+                        control_status == "not_run"
+                        and (
+                            control_run_ids
+                            or control_passed
+                            or binding["passed"]
+                        )
                     )
-                    is not control_passed
+                    or (
+                        control_status == "passed"
+                        and (
+                            len(control_run_ids) != 1
+                            or control_passed is not True
+                        )
+                    )
+                    or (
+                        control_status == "failed"
+                        and (
+                            len(control_run_ids) != 1
+                            or control_passed is not False
+                            or binding["passed"]
+                        )
+                    )
                 ):
                     raise ModelValidationError(
-                        "managed oracle control run is inconsistent"
+                        "managed oracle control status is inconsistent"
                     )
+                if control_run_ids:
+                    control_run = runs.get(control_run_ids[0])
+                    control_streams = [
+                        artifact
+                        for artifact in artifacts.values()
+                        if (
+                            artifact.source_run_id == control_run_ids[0]
+                            and artifact.extra.get("kind")
+                            == "misc_transform_stream"
+                            and artifact.extra.get("phase")
+                            == "oracle-control"
+                            and artifact.extra.get("misc_evaluation_id")
+                            == evaluation_id
+                        )
+                    ]
+                    if (
+                        control_run is None
+                        or control_run.extra.get("phase")
+                        != "oracle-control"
+                        or control_run.extra.get("misc_evaluation_id")
+                        != evaluation_id
+                        or control_run.extra.get("oracle_preissue_id")
+                        != preissue_id
+                        or control_run.extra.get(
+                            "negative_control_rejected"
+                        )
+                        is not control_passed
+                        or len(control_streams) != 2
+                        or {
+                            artifact.extra.get("stream")
+                            for artifact in control_streams
+                        }
+                        != {"stdout", "stderr"}
+                        or any(
+                            artifact.extra.get("context_visibility")
+                            != "engine_private"
+                            for artifact in control_streams
+                        )
+                    ):
+                        raise ModelValidationError(
+                            "managed oracle control run is inconsistent"
+                        )
             expected_evaluation_keys = frozenset(
                 {
                     "authorities",
@@ -12085,6 +12147,18 @@ def _misc_transform_state_errors(
                 }
             ):
                 raise ModelValidationError("evaluation fields are inconsistent")
+            if (
+                managed_oracle
+                and binding["oracle_control_status"]
+                in {"not_run", "failed"}
+                and (
+                    binding["passed"]
+                    or not evaluation["failure_codes"]
+                )
+            ):
+                raise ModelValidationError(
+                    "managed oracle control failure lacks a failed evaluation"
+                )
             encoded = misc_transform_canonical_json_bytes(evaluation)
             if (
                 len(encoded) > MISC_TRANSFORM_MAX_EVIDENCE_BYTES
@@ -12296,7 +12370,10 @@ def _misc_transform_state_errors(
                 raise ModelValidationError(
                     "evaluation run set was stripped, reordered, or extended"
                 )
-            for run_id, record in zip(run_ids, records, strict=True):
+            transform_record_count = len(evaluation["transform_nodes"])
+            for record_index, (run_id, record) in enumerate(
+                zip(run_ids, records, strict=True)
+            ):
                 if run_id not in runs or not isinstance(record, Mapping):
                     raise ModelValidationError(
                         "evaluation references an unknown run or record"
@@ -12348,6 +12425,12 @@ def _misc_transform_state_errors(
                         != evaluation_id
                         or artifact.extra.get("plan_sha256")
                         != binding["plan_sha256"]
+                        or (
+                            managed_oracle
+                            and record_index >= transform_record_count
+                            and artifact.extra.get("context_visibility")
+                            != "engine_private"
+                        )
                     ):
                         raise ModelValidationError(
                             "stream artifact was stripped or rebound"

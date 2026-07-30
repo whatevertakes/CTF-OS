@@ -1452,6 +1452,9 @@ _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = (
 )
 _MANAGED_ADAPTER_SEED_CONTRACT_VERSION = 1
 _MANAGED_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = True
+_MANAGED_ORACLE_PROOF_WORKSPACE_DIRECTORY = (
+    "engine-private-managed-oracle-proof"
+)
 _REV_SOURCE_SNAPSHOT_FILE_MODE = REV_INVENTORY_V2_SNAPSHOT_FILE_MODE
 _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = (
     REV_INVENTORY_V2_SNAPSHOT_DIRECTORY_MODE
@@ -21043,6 +21046,7 @@ class ChallengeEngine:
         ]
         | None = None,
         recipe_sha256: str | None = None,
+        staging_workspace: Path | None = None,
         pending_handoff: list[_ProofInputPreparation] | None = None,
     ) -> _ProofInputPreparation:
         input_count = (
@@ -21064,12 +21068,37 @@ class ChallengeEngine:
                 "proof input destinations must match the input locator count"
             )
         workspace = self._workspace(state)
+        staging_workspace = (
+            workspace if staging_workspace is None else staging_workspace
+        )
+        if staging_workspace != workspace:
+            paths = self.store.challenge_paths(state.identity)
+            private_root = (
+                paths.runtime / _MANAGED_ORACLE_PROOF_WORKSPACE_DIRECTORY
+            ).resolve()
+            try:
+                resolved_staging_workspace = staging_workspace.resolve(
+                    strict=True
+                )
+            except OSError as error:
+                raise EngineError(
+                    "managed oracle proof staging workspace is unavailable"
+                ) from error
+            if (
+                not resolved_staging_workspace.is_dir()
+                or private_root not in resolved_staging_workspace.parents
+            ):
+                raise EngineError(
+                    "alternate proof staging must use the engine-private "
+                    "managed oracle workspace"
+                )
+            staging_workspace = resolved_staging_workspace
         input_directory = ensure_private_directory(
             result_directory / "inputs"
         )
         staging = tempfile.TemporaryDirectory(
             prefix=".ctfos-proof-inputs-",
-            dir=workspace,
+            dir=staging_workspace,
         )
         staging_root = Path(staging.name)
         paths = self.store.challenge_paths(state.identity)
@@ -21210,7 +21239,7 @@ class ChallengeEngine:
                 prepared.append(
                     ProofInput(
                         source_locator=staged.path.relative_to(
-                            workspace
+                            staging_workspace
                         ).as_posix(),
                         destination_locator=destination,
                         sha256=snapshot.sha256,
@@ -21265,12 +21294,34 @@ class ChallengeEngine:
                 preparation_error.add_note(str(cleanup_failure))
             raise
 
+    def _open_managed_oracle_proof_workspace(
+        self,
+        state: ChallengeState,
+    ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        """Create a sandbox source root that no Builder workspace can mount."""
+
+        paths = self.store.challenge_paths(state.identity)
+        private_root = ensure_private_directory(
+            paths.runtime / _MANAGED_ORACLE_PROOF_WORKSPACE_DIRECTORY
+        )
+        temporary = tempfile.TemporaryDirectory(
+            prefix="evaluation-",
+            dir=private_root,
+        )
+        workspace = Path(temporary.name).resolve(strict=True)
+        if private_root.resolve() not in workspace.parents:
+            temporary.cleanup()
+            raise EngineError(
+                "managed oracle proof workspace escaped its private root"
+            )
+        return temporary, workspace
+
     def preissue_managed_crypto_oracle(
         self,
         identity: ChallengeIdentity,
         *,
-        variant_parameters_locator: str,
-        variant_expected_output_locator: str,
+        variant_parameters_path: str | Path,
+        variant_expected_output_path: str | Path,
         mutation_id: str,
     ) -> tuple[ChallengeState, Mapping[str, object]]:
         """Snapshot an operator-only Crypto variant before a Builder runs."""
@@ -21278,9 +21329,9 @@ class ChallengeEngine:
         return self._preissue_managed_oracle(
             identity,
             kind=MANAGED_ORACLE_PREISSUE_CRYPTO,
-            input_locators=(
-                variant_parameters_locator,
-                variant_expected_output_locator,
+            input_paths=(
+                variant_parameters_path,
+                variant_expected_output_path,
             ),
             input_purposes=(
                 "variant_parameters",
@@ -21293,7 +21344,7 @@ class ChallengeEngine:
         self,
         identity: ChallengeIdentity,
         *,
-        verifier_locator: str,
+        verifier_path: str | Path,
         verifier_id: str,
         oracle_id: str,
     ) -> tuple[ChallengeState, Mapping[str, object]]:
@@ -21302,7 +21353,7 @@ class ChallengeEngine:
         return self._preissue_managed_oracle(
             identity,
             kind=MANAGED_ORACLE_PREISSUE_MISC,
-            input_locators=(verifier_locator,),
+            input_paths=(verifier_path,),
             input_purposes=("verifier_tool",),
             metadata={
                 "verifier_id": verifier_id,
@@ -21315,15 +21366,16 @@ class ChallengeEngine:
         identity: ChallengeIdentity,
         *,
         kind: str,
-        input_locators: Sequence[str],
+        input_paths: Sequence[str | Path],
         input_purposes: Sequence[str],
         metadata: Mapping[str, str],
     ) -> tuple[ChallengeState, Mapping[str, object]]:
         """Create one bounded private oracle bundle under operator authority."""
 
         if (
-            len(input_locators) != len(input_purposes)
-            or len(set(input_locators)) != len(input_locators)
+            len(input_paths) != len(input_purposes)
+            or len({os.fspath(item) for item in input_paths})
+            != len(input_paths)
         ):
             raise EngineError(
                 "managed oracle inputs must be unique and purpose-complete"
@@ -21407,10 +21459,10 @@ class ChallengeEngine:
                 / MANAGED_ORACLE_PREISSUE_PROTOCOL
                 / preissue_id
             )
-            client = self.sandbox(state)
             inputs: list[ManagedOraclePreissueInput] = []
-            for ordinal, (locator, purpose) in enumerate(
-                zip(input_locators, input_purposes, strict=True),
+            canonical_root = paths.root.resolve()
+            for ordinal, (source_value, purpose) in enumerate(
+                zip(input_paths, input_purposes, strict=True),
                 start=1,
             ):
                 artifact_id = _record_id(
@@ -21418,12 +21470,40 @@ class ChallengeEngine:
                     preissue_id,
                     f"oracle-input-{ordinal:02d}",
                 )
-                snapshot = self._snapshot_workspace_file(
-                    state,
-                    client,
-                    locator,
-                    directory / f"input-{ordinal:02d}.bin",
-                )
+                source_path = Path(source_value)
+                if not source_path.is_absolute():
+                    source_path = Path.cwd() / source_path
+                try:
+                    source_lstat = source_path.lstat()
+                    resolved_source = source_path.resolve(strict=True)
+                except (OSError, RuntimeError) as error:
+                    raise EngineError(
+                        "managed oracle operator source is unavailable"
+                    ) from error
+                if (
+                    not stat.S_ISREG(source_lstat.st_mode)
+                    or resolved_source.is_relative_to(canonical_root)
+                ):
+                    raise EngineError(
+                        "managed oracle source must be an operator-only "
+                        "regular host file outside the challenge root"
+                    )
+                try:
+                    snapshot = copy_bounded_regular(
+                        resolved_source.parent,
+                        resolved_source.name,
+                        directory / f"input-{ordinal:02d}.bin",
+                        maximum_bytes=min(
+                            DEFAULT_SNAPSHOT_MAX_BYTES,
+                            self.store.max_artifact_bytes,
+                        ),
+                        mode=0o400,
+                    )
+                except (OSError, SafeFileError, ValueError) as error:
+                    raise EngineError(
+                        "managed oracle operator source could not be "
+                        "snapshotted"
+                    ) from error
                 if snapshot.size_bytes < 1:
                     raise EngineError(
                         "managed oracle inputs must be non-empty"
@@ -21828,13 +21908,20 @@ class ChallengeEngine:
                 MANAGED_ORACLE_PREISSUE_STATE_KEY
             ] = next_history
 
-        self.store.update(
-            identity,
-            consume,
-            expected_revision=state.revision,
-            commit_guard=verify_private_bundle,
-            pre_replace_guard=verify_private_bundle,
-        )
+        try:
+            self.store.update(
+                identity,
+                consume,
+                expected_revision=state.revision,
+                commit_guard=verify_private_bundle,
+                pre_replace_guard=verify_private_bundle,
+            )
+        except Exception as error:
+            if isinstance(error, EngineError):
+                raise
+            raise EngineError(
+                "managed oracle private bundle changed before consume"
+            ) from error
         return _ManagedOraclePreissueResolution(
             manifest=manifest,
             bindings=tuple(bindings),
@@ -23896,6 +23983,9 @@ class ChallengeEngine:
 
         preparations: list[_ProofInputPreparation] = []
         source_staging: tempfile.TemporaryDirectory[str] | None = None
+        private_proof_workspace: (
+            tempfile.TemporaryDirectory[str] | None
+        ) = None
         committed_inputs = False
         cleanup_error: BaseException | None = None
         try:
@@ -23956,7 +24046,14 @@ class ChallengeEngine:
                     "Misc transform evaluation requires a digest-pinned image"
                 )
             configuration_epoch = state.configuration_epoch
-            client = self.sandbox(state)
+            workspace_client = self.sandbox(state)
+            client = workspace_client
+            proof_staging_workspace: Path | None = None
+            if _session_owned:
+                (
+                    private_proof_workspace,
+                    proof_staging_workspace,
+                ) = self._open_managed_oracle_proof_workspace(state)
             evaluation_id = _run_id("misc-transform")
             result_directory = (
                 paths.proof / candidate_id / evaluation_id
@@ -23980,11 +24077,12 @@ class ChallengeEngine:
 
             spec_preparation = self._prepare_proof_inputs(
                 state,
-                client,
+                workspace_client,
                 (spec_locator,),
                 result_directory / "spec",
                 f"{evaluation_id}-spec",
                 input_destinations=("engine/spec.json",),
+                staging_workspace=proof_staging_workspace,
                 pending_handoff=preparations,
             )
             spec_entry = spec_preparation.manifest["inputs"][0]
@@ -24100,11 +24198,12 @@ class ChallengeEngine:
             )
             payload_preparation = self._prepare_proof_inputs(
                 state,
-                client,
+                workspace_client,
                 all_locators,
                 result_directory / "payloads",
                 f"{evaluation_id}-payloads",
                 input_destinations=destinations,
+                staging_workspace=proof_staging_workspace,
                 pending_handoff=preparations,
             )
             entries = list(payload_preparation.manifest["inputs"])
@@ -24112,14 +24211,21 @@ class ChallengeEngine:
             if preissue_resolution is not None:
                 oracle_preparation = self._prepare_proof_inputs(
                     state,
-                    client,
+                    workspace_client,
                     (),
                     result_directory / "preissued-oracle",
                     f"{evaluation_id}-preissued-oracle",
                     canonical_bindings=preissue_resolution.bindings,
+                    staging_workspace=proof_staging_workspace,
                     pending_handoff=preparations,
                 )
                 entries.extend(oracle_preparation.manifest["inputs"])
+            if proof_staging_workspace is not None:
+                client = self.sandbox(
+                    state,
+                    workspace_override=proof_staging_workspace,
+                    network_policy_override=NetworkPolicy.deny_all(),
+                )
             source_count = len(execution_spec.sources)
             step_count = len(execution_spec.steps)
             if len(entries) != source_count + step_count + 1:
@@ -24636,12 +24742,14 @@ class ChallengeEngine:
                         client,
                         result.stdout_path.removeprefix("/work/").lstrip("/"),
                         directory / "stdout.log",
+                        workspace_root=proof_staging_workspace,
                     )
                     stderr = self._snapshot_workspace_file(
                         current,
                         client,
                         result.stderr_path.removeprefix("/work/").lstrip("/"),
                         directory / "stderr.log",
+                        workspace_root=proof_staging_workspace,
                     )
                     output = (
                         self._snapshot_workspace_file(
@@ -24651,6 +24759,7 @@ class ChallengeEngine:
                                 "/work/"
                             ).lstrip("/"),
                             directory / "output.bin",
+                            workspace_root=proof_staging_workspace,
                         )
                         if include_output
                         else None
@@ -24692,6 +24801,12 @@ class ChallengeEngine:
                             "protocol": MISC_TRANSFORM_PROTOCOL,
                             "misc_evaluation_id": evaluation_id,
                             "plan_sha256": plan.sha256,
+                            "context_visibility": (
+                                "engine_private"
+                                if _session_owned
+                                and phase in {"oracle-control", "reverse"}
+                                else "model_visible"
+                            ),
                         },
                     ),
                     ArtifactReference(
@@ -24708,6 +24823,12 @@ class ChallengeEngine:
                             "protocol": MISC_TRANSFORM_PROTOCOL,
                             "misc_evaluation_id": evaluation_id,
                             "plan_sha256": plan.sha256,
+                            "context_visibility": (
+                                "engine_private"
+                                if _session_owned
+                                and phase in {"oracle-control", "reverse"}
+                                else "model_visible"
+                            ),
                         },
                     ),
                 ]
@@ -25006,14 +25127,18 @@ class ChallengeEngine:
             terminal = known_inputs.get(plan.terminal_step_id)
             oracle_control_run_ids: list[str] = []
             managed_oracle_control_passed = not _session_owned
+            managed_oracle_control_status = (
+                "not_run" if _session_owned else "not_applicable"
+            )
             if (
                 _session_owned
                 and not stop_transform
                 and terminal is not None
             ):
-                if source_staging_root is None:
+                if proof_staging_workspace is None:
                     raise EngineError(
-                        "Misc managed oracle control staging is unavailable"
+                        "Misc managed oracle private control staging is "
+                        "unavailable"
                     )
                 negative_payload = (
                     b"ctfos-managed-misc-negative-v1\x00"
@@ -25023,14 +25148,17 @@ class ChallengeEngine:
                 )
                 if negative_payload == candidate.value.encode("utf-8"):
                     negative_payload += b"\x00"
-                negative_path = source_staging_root / "negative-candidate.bin"
+                negative_root = ensure_private_directory(
+                    proof_staging_workspace / "engine-control"
+                )
+                negative_path = negative_root / "negative-candidate.bin"
                 atomic_write_bytes(
                     negative_path,
                     negative_payload,
                     mode=0o400,
                 )
                 negative_locator = negative_path.relative_to(
-                    self._workspace(state)
+                    proof_staging_workspace
                 ).as_posix()
                 verifier_input = ProofInput(
                     source_locator=verifier_tool_input.source_locator,
@@ -25118,6 +25246,11 @@ class ChallengeEngine:
                     and control_result.stderr_capture_complete is True
                     and control_result.stdout_truncated is False
                     and control_result.stderr_truncated is False
+                )
+                managed_oracle_control_status = (
+                    "passed"
+                    if managed_oracle_control_passed
+                    else "failed"
                 )
                 self.store.write_run_result(
                     identity,
@@ -25701,6 +25834,9 @@ class ChallengeEngine:
                             "oracle_negative_control_passed": (
                                 managed_oracle_control_passed
                             ),
+                            "oracle_control_status": (
+                                managed_oracle_control_status
+                            ),
                         }
                         if _session_owned
                         else {}
@@ -25815,6 +25951,17 @@ class ChallengeEngine:
                     elif active_error is not None:
                         active_error.add_note(
                             f"Misc proof staging cleanup also failed: {error}"
+                        )
+            if private_proof_workspace is not None:
+                try:
+                    private_proof_workspace.cleanup()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Misc engine-private proof workspace cleanup also "
+                            f"failed: {error}"
                         )
             if not committed_inputs:
                 companions = tuple(
@@ -26143,6 +26290,9 @@ class ChallengeEngine:
                 ) from error
 
         preparations: list[_ProofInputPreparation] = []
+        private_proof_workspace: (
+            tempfile.TemporaryDirectory[str] | None
+        ) = None
         input_artifacts: tuple[ArtifactReference, ...] = ()
         evaluation_artifact: ArtifactReference | None = None
         finalized = False
@@ -26206,7 +26356,14 @@ class ChallengeEngine:
                     "Crypto metamorphic proof requires a digest-pinned image"
                 )
             configuration_epoch = state.configuration_epoch
-            client = self.sandbox(state)
+            workspace_client = self.sandbox(state)
+            client = workspace_client
+            proof_staging_workspace: Path | None = None
+            if _session_owned:
+                (
+                    private_proof_workspace,
+                    proof_staging_workspace,
+                ) = self._open_managed_oracle_proof_workspace(state)
             evaluation_id = _run_id("crypto-metamorphic")
             result_directory = (
                 paths.proof / candidate_id / evaluation_id
@@ -26232,7 +26389,7 @@ class ChallengeEngine:
                 ]
             preparation = self._prepare_proof_inputs(
                 state,
-                client,
+                workspace_client,
                 locators,
                 result_directory,
                 f"{evaluation_id}-builder"
@@ -26250,6 +26407,7 @@ class ChallengeEngine:
                         )
                     ),
                 ),
+                staging_workspace=proof_staging_workspace,
                 pending_handoff=preparations,
             )
             prepared_inputs = list(preparation.prepared_inputs)
@@ -26276,11 +26434,12 @@ class ChallengeEngine:
             if preissue_resolution is not None:
                 oracle_preparation = self._prepare_proof_inputs(
                     state,
-                    client,
+                    workspace_client,
                     (),
                     result_directory / "preissued-oracle",
                     f"{evaluation_id}-preissued-oracle",
                     canonical_bindings=preissue_resolution.bindings,
+                    staging_workspace=proof_staging_workspace,
                     pending_handoff=preparations,
                 )
                 entries.extend(oracle_preparation.manifest["inputs"])
@@ -26308,6 +26467,12 @@ class ChallengeEngine:
                             "context_visibility": "engine_private",
                         },
                     )
+                )
+            if proof_staging_workspace is not None:
+                client = self.sandbox(
+                    state,
+                    workspace_override=proof_staging_workspace,
+                    network_policy_override=NetworkPolicy.deny_all(),
                 )
             if not isinstance(entries, list) or len(entries) != 4:
                 raise EngineError(
@@ -26747,6 +26912,7 @@ class ChallengeEngine:
                             client,
                             relative_locator,
                             evidence_directory / f"{stream}.log",
+                            workspace_root=proof_staging_workspace,
                         )
                         stream_snapshots[stream] = snapshot
                         stream_artifacts.append(
@@ -26766,6 +26932,11 @@ class ChallengeEngine:
                                     ),
                                     "attempt_ordinal": planned.ordinal,
                                     "plan_sha256": plan.sha256,
+                                    "context_visibility": (
+                                        "engine_private"
+                                        if _session_owned
+                                        else "model_visible"
+                                    ),
                                 },
                             )
                         )
@@ -27135,6 +27306,17 @@ class ChallengeEngine:
                         active_error.add_note(
                             "Crypto proof staging cleanup also failed: "
                             f"{error}"
+                        )
+            if private_proof_workspace is not None:
+                try:
+                    private_proof_workspace.cleanup()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Crypto engine-private proof workspace cleanup also "
+                            f"failed: {error}"
                         )
             pending_final_artifacts = (
                 *input_artifacts,
