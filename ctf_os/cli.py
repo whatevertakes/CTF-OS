@@ -278,6 +278,20 @@ def _prompt(args: argparse.Namespace) -> str | None:
     return inline
 
 
+def _effective_thread_continuity(args: argparse.Namespace) -> str:
+    """Resolve CLI-only continuity defaults without changing the API default."""
+
+    selected = args.thread_continuity
+    if selected is not None:
+        return selected
+    if (
+        args.command == "managed-cycle"
+        or getattr(args, "mode", None) == "managed"
+    ):
+        return "captain_lane"
+    return "fresh"
+
+
 def _identity(args: argparse.Namespace) -> ChallengeIdentity:
     return ChallengeIdentity(args.contest, args.category, args.challenge)
 
@@ -780,10 +794,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--thread-continuity-policy",
         dest="thread_continuity",
         choices=("fresh", "captain_lane", "role_lane"),
-        default="fresh",
+        default=None,
         help=(
             "managed session model-thread policy; pinned before the first "
-            "cycle (default: fresh)"
+            "cycle (omitted: captain_lane in managed mode, fresh otherwise)"
         ),
     )
 
@@ -803,7 +817,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--thread-continuity-policy",
         dest="thread_continuity",
         choices=("fresh", "captain_lane", "role_lane"),
-        default="fresh",
+        default=None,
+        help="model-thread policy (omitted: captain_lane)",
     )
     note_group = managed_cycle.add_mutually_exclusive_group()
     note_group.add_argument("--note")
@@ -826,7 +841,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--thread-continuity-policy",
         dest="thread_continuity",
         choices=("fresh", "captain_lane", "role_lane"),
-        default="fresh",
+        default=None,
+        help=(
+            "managed model-thread policy "
+            "(omitted: captain_lane in managed mode, fresh otherwise)"
+        ),
     )
 
     session = commands.add_parser("session", help="managed session control")
@@ -1777,6 +1796,7 @@ def main(
         if args.command == "solve":
             identity = _identity(args)
             prompt = _prompt(args)
+            thread_continuity = _effective_thread_continuity(args)
             paths = engine.store.challenge_paths(identity)
             state = (
                 engine.store.load(identity)
@@ -1809,7 +1829,7 @@ def main(
                 state = managed.run_cycles(
                     identity,
                     max_cycles=args.max_cycles,
-                    thread_continuity_policy=args.thread_continuity,
+                    thread_continuity_policy=thread_continuity,
                 )
                 print(
                     f"Managed 종료: {identity.key} {state.status.value} "
@@ -1817,7 +1837,7 @@ def main(
                 )
                 return 0
 
-            if args.thread_continuity != "fresh":
+            if thread_continuity != "fresh":
                 raise CLIError(
                     "--thread-continuity is available only in managed mode"
                 )
@@ -1871,6 +1891,7 @@ def main(
             return 0 if report.ok else 2
 
         if args.command == "managed-cycle":
+            thread_continuity = _effective_thread_continuity(args)
             note = (
                 _read_bounded_text(args.note_file)
                 if args.note_file is not None
@@ -1880,7 +1901,7 @@ def main(
                 _identity(args),
                 session_id=args.session_id,
                 note=note,
-                thread_continuity_policy=args.thread_continuity,
+                thread_continuity_policy=thread_continuity,
             )
             if args.json:
                 _print_json(state.to_dict())
@@ -1894,6 +1915,7 @@ def main(
         if args.command == "run-challenge":
             identity = _identity(args)
             prompt = _prompt(args)
+            thread_continuity = _effective_thread_continuity(args)
             if args.mode == "managed":
                 if args.no_tools:
                     raise CLIError(
@@ -1904,10 +1926,10 @@ def main(
                 state = ManagedOrchestrator(engine).run_cycles(
                     identity,
                     max_cycles=args.max_cycles,
-                    thread_continuity_policy=args.thread_continuity,
+                    thread_continuity_policy=thread_continuity,
                 )
             else:
-                if args.thread_continuity != "fresh":
+                if thread_continuity != "fresh":
                     raise CLIError(
                         "--thread-continuity is available only in managed mode"
                     )

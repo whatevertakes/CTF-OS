@@ -431,6 +431,22 @@ ctfos managed-cycle 'Demo CTF' web 'Example' --note '첫 cycle'
 ctfos solve 'Demo CTF' web 'Example' --mode managed --max-cycles 8
 ```
 
+### Managed thread continuity
+
+`ctfos solve --mode managed`, `ctfos run-challenge --mode managed`,
+`ctfos managed-cycle`에서 `--thread-continuity`를 생략하면 CLI의 effective
+기본값은 `captain_lane`입니다. 이 정책은 완료된 이전 Captain run의
+Captain lane만 resume합니다. Captain이 아닌 proof/explorer/builder/verifier
+lane은 매번 fresh thread를 사용하므로 독립 검증은 그대로 유지됩니다.
+
+모든 lane을 새로 시작하려면 `--thread-continuity=fresh`를 명시합니다.
+assisted, thin, legacy 모드는 옵션을 생략했을 때 계속 `fresh`이며, 이
+모드에서 명시한 non-fresh 정책은 거부됩니다. 이 기본값 변경은 CLI에만
+적용됩니다. `ManagedOrchestrator.run_cycle()`과 `run_cycles()`를 직접
+호출하는 programmatic API의 기본값은 계속 `fresh`입니다. Codex request
+compression과 remote compaction은 thread 정책과 무관하게 이미 항상
+활성화되어 있으므로 별도 continuity 옵션이 필요하지 않습니다.
+
 provider 상한은 호출 시작만 대기시키며 예약된 논리 Run 세 개를 줄이지
 않습니다. Managed role contract v2는 command마다 열린 가설 ID,
 `expected_observation`, `keep_if`, `drop_if`, timeout/resource class와 원격

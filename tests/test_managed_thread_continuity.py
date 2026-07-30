@@ -649,12 +649,58 @@ class ManagedThreadContinuityTests(unittest.TestCase):
                 captain.id,
             )
 
-    def test_cli_defaults_fresh_and_routes_explicit_policy(self) -> None:
+    def test_cli_parser_resolves_mode_specific_continuity_defaults(
+        self,
+    ) -> None:
         parser = cli.build_parser()
-        default = parser.parse_args(
-            ["solve", "contest", "rev", "task", "--mode", "managed"]
+        cases = (
+            (
+                "managed solve",
+                ["solve", "contest", "rev", "task", "--mode", "managed"],
+                "captain_lane",
+            ),
+            (
+                "managed batch",
+                [
+                    "run-challenge",
+                    "contest",
+                    "rev",
+                    "task",
+                    "--mode",
+                    "managed",
+                ],
+                "captain_lane",
+            ),
+            (
+                "managed cycle",
+                ["managed-cycle", "contest", "rev", "task"],
+                "captain_lane",
+            ),
+            (
+                "assisted solve",
+                ["solve", "contest", "rev", "task"],
+                "fresh",
+            ),
+            (
+                "thin solve",
+                ["solve", "contest", "rev", "task", "--mode", "thin"],
+                "fresh",
+            ),
+            (
+                "legacy batch",
+                ["run-challenge", "contest", "rev", "task"],
+                "fresh",
+            ),
         )
-        self.assertEqual(default.thread_continuity, "fresh")
+        for label, arguments, expected in cases:
+            with self.subTest(label=label):
+                parsed = parser.parse_args(arguments)
+                self.assertIsNone(parsed.thread_continuity)
+                self.assertEqual(
+                    cli._effective_thread_continuity(parsed),
+                    expected,
+                )
+
         explicit = parser.parse_args(
             [
                 "solve",
@@ -668,7 +714,12 @@ class ManagedThreadContinuityTests(unittest.TestCase):
             ]
         )
         self.assertEqual(explicit.thread_continuity, "captain_lane")
+        self.assertEqual(
+            cli._effective_thread_continuity(explicit),
+            "captain_lane",
+        )
 
+    def test_cli_routes_effective_managed_continuity_policy(self) -> None:
         engine = ChallengeEngine(self.root)
         engine.add_challenge(
             self.identity,
@@ -676,19 +727,49 @@ class ManagedThreadContinuityTests(unittest.TestCase):
             state_schema_version=STATE_SCHEMA_VERSION,
         )
         state = engine.store.load(self.identity)
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with (
-            mock.patch.object(
-                ManagedOrchestrator,
+        cases = (
+            (
+                "solve default",
                 "run_cycles",
-                autospec=True,
-                return_value=state,
-            ) as run_cycles,
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
-        ):
-            status = cli.main(
+                [
+                    "solve",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                    "--mode",
+                    "managed",
+                    "--max-cycles=1",
+                ],
+                "captain_lane",
+            ),
+            (
+                "batch default",
+                "run_cycles",
+                [
+                    "run-challenge",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                    "--mode",
+                    "managed",
+                    "--max-cycles=1",
+                ],
+                "captain_lane",
+            ),
+            (
+                "cycle default",
+                "run_cycle",
+                [
+                    "managed-cycle",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                ],
+                "captain_lane",
+            ),
+            (
+                "explicit role lane",
+                "run_cycles",
                 [
                     "solve",
                     self.identity.contest_id,
@@ -699,18 +780,59 @@ class ManagedThreadContinuityTests(unittest.TestCase):
                     "--thread-continuity=role_lane",
                     "--max-cycles=1",
                 ],
-                root=self.root,
-            )
-        self.assertEqual(status, 0, stderr.getvalue())
-        self.assertEqual(
-            run_cycles.call_args.kwargs["thread_continuity_policy"],
-            "role_lane",
+                "role_lane",
+            ),
+            (
+                "explicit fresh",
+                "run_cycles",
+                [
+                    "run-challenge",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                    "--mode",
+                    "managed",
+                    "--thread-continuity=fresh",
+                    "--max-cycles=1",
+                ],
+                "fresh",
+            ),
         )
+        for label, method_name, arguments, expected in cases:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    ManagedOrchestrator,
+                    method_name,
+                    autospec=True,
+                    return_value=state,
+                ) as run_managed,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = cli.main(arguments, root=self.root)
+                self.assertEqual(status, 0, stderr.getvalue())
+                self.assertEqual(
+                    run_managed.call_args.kwargs[
+                        "thread_continuity_policy"
+                    ],
+                    expected,
+                )
 
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            status = cli.main(
+    def test_cli_rejects_explicit_nonfresh_policy_outside_managed(
+        self,
+    ) -> None:
+        engine = ChallengeEngine(self.root)
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        cases = (
+            (
+                "assisted",
                 [
                     "solve",
                     self.identity.contest_id,
@@ -718,12 +840,45 @@ class ManagedThreadContinuityTests(unittest.TestCase):
                     self.identity.challenge_id,
                     "--mode",
                     "assisted",
+                    "--thread-continuity=captain_lane",
+                ],
+            ),
+            (
+                "thin",
+                [
+                    "solve",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                    "--mode",
+                    "thin",
                     "--thread-continuity=role_lane",
                 ],
-                root=self.root,
-            )
-        self.assertNotEqual(status, 0)
-        self.assertIn("only in managed mode", stderr.getvalue())
+            ),
+            (
+                "legacy",
+                [
+                    "run-challenge",
+                    self.identity.contest_id,
+                    self.identity.category,
+                    self.identity.challenge_id,
+                    "--mode",
+                    "legacy",
+                    "--thread-continuity=captain_lane",
+                ],
+            ),
+        )
+        for label, arguments in cases:
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                self.subTest(label=label),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = cli.main(arguments, root=self.root)
+                self.assertNotEqual(status, 0)
+                self.assertIn("only in managed mode", stderr.getvalue())
 
 
 if __name__ == "__main__":
