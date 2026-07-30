@@ -8,7 +8,7 @@ import math
 import os
 import secrets
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 
 _TEMPORARY_NAME_ATTEMPTS = 16
@@ -229,12 +229,15 @@ def atomic_write_bytes(
     payload: bytes,
     *,
     mode: int = 0o600,
+    pre_replace_guard: Callable[[], None] | None = None,
 ) -> None:
     """Write *payload* and atomically replace *path*.
 
-    The temporary file is created beside the destination, flushed, fsynced, and
-    then installed with ``os.replace``.  The parent directory is fsynced too so
-    the rename survives a host crash rather than only a process crash.
+    The temporary file is created beside the destination, flushed, fsynced,
+    optionally guarded, and then installed with ``os.replace``.  The guard
+    runs after the durable temporary payload exists and immediately before the
+    replace.  The parent directory is fsynced too so the rename survives a host
+    crash rather than only a process crash.
     """
 
     path = Path(path)
@@ -265,6 +268,8 @@ def atomic_write_bytes(
                 remaining = remaining[written:]
             stream.flush()
             os.fsync(stream.fileno())
+            if pre_replace_guard is not None:
+                pre_replace_guard()
             os.replace(temporary_path, path)
             installed = True
             _fsync_directory(path.parent)

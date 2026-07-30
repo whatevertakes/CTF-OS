@@ -197,6 +197,65 @@ class AtomicWriteTests(unittest.TestCase):
                 [],
             )
 
+    def test_pre_replace_guard_is_last_and_rejection_is_atomic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "state.json"
+            destination.write_bytes(b"old")
+            operations: list[str] = []
+            real_replace = atomic_module.os.replace
+
+            def reject_replace() -> None:
+                operations.append("guard")
+                self.assertEqual(destination.read_bytes(), b"old")
+                self.assertEqual(
+                    len(
+                        list(
+                            destination.parent.glob(
+                                f".{destination.name}.*.tmp"
+                            )
+                        )
+                    ),
+                    1,
+                )
+                raise RuntimeError("synthetic pre-replace rejection")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic pre-replace rejection",
+            ):
+                atomic_write_bytes(
+                    destination,
+                    b"rejected",
+                    pre_replace_guard=reject_replace,
+                )
+            self.assertEqual(destination.read_bytes(), b"old")
+            self.assertEqual(
+                list(destination.parent.glob(f".{destination.name}.*.tmp")),
+                [],
+            )
+
+            def allow_replace() -> None:
+                operations.append("guard")
+
+            def observe_replace(source, target) -> None:
+                operations.append("replace")
+                real_replace(source, target)
+
+            with mock.patch.object(
+                atomic_module.os,
+                "replace",
+                side_effect=observe_replace,
+            ):
+                atomic_write_bytes(
+                    destination,
+                    b"accepted",
+                    pre_replace_guard=allow_replace,
+                )
+            self.assertEqual(operations, ["guard", "guard", "replace"])
+            self.assertEqual(destination.read_bytes(), b"accepted")
+
     def test_zero_progress_json_line_append_fails_and_next_append_works(
         self,
     ) -> None:
@@ -521,6 +580,45 @@ class StateStoreTests(unittest.TestCase):
         unchanged = self.store.load(self.identity)
         self.assertEqual(unchanged.revision, initial.revision)
         self.assertEqual(unchanged.artifacts, [])
+
+    def test_update_pre_replace_guard_is_after_commit_guard_and_atomic(
+        self,
+    ) -> None:
+        initial = self.create()
+        paths = self.store.challenge_paths(self.identity)
+        canonical = paths.state.read_bytes()
+        operations: list[str] = []
+
+        def mutate(current):
+            current.description = "must not commit"
+
+        def commit_guard() -> None:
+            operations.append("commit_guard")
+
+        def reject_pre_replace() -> None:
+            operations.append("pre_replace_guard")
+            self.assertEqual(paths.state.read_bytes(), canonical)
+            raise RuntimeError("synthetic final state rejection")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "synthetic final state rejection",
+        ):
+            self.store.update(
+                self.identity,
+                mutate,
+                commit_guard=commit_guard,
+                pre_replace_guard=reject_pre_replace,
+            )
+
+        self.assertEqual(
+            operations,
+            ["commit_guard", "pre_replace_guard"],
+        )
+        self.assertEqual(paths.state.read_bytes(), canonical)
+        unchanged = self.store.load(self.identity)
+        self.assertEqual(unchanged.revision, initial.revision)
+        self.assertEqual(unchanged.description, initial.description)
 
     def test_oversized_state_read_recovers_only_from_a_bounded_previous(
         self,
