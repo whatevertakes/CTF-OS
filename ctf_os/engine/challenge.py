@@ -124,6 +124,17 @@ from ctf_os.engine.flags import (
     FlagLogTailer,
     print_flag_candidate,
 )
+from ctf_os.engine.forensic_index import (
+    FORENSIC_INDEX_MAX_BYTES,
+    FORENSIC_INDEX_MAX_FILES,
+    FORENSIC_INDEX_MAX_PREFIX_BYTES,
+)
+from ctf_os.engine.forensic_index_execution import (
+    FORENSIC_INDEX_EXECUTION_PROTOCOL,
+    FORENSIC_INDEX_REQUEST_MAX_BYTES,
+    ForensicIndexExecutionEvaluation,
+    evaluate_forensic_index_execution,
+)
 from ctf_os.engine.misc_execution import (
     MISC_EXECUTION_MAX_SPEC_BYTES,
     MISC_EXECUTION_RUNTIME,
@@ -331,6 +342,7 @@ from ctf_os.sandbox.files import (
     ensure_relative_directory,
     normalize_locator,
     read_bounded_regular,
+    read_regular_prefix,
 )
 from ctf_os.stages.ingest import inventory_challenge
 from ctf_os.store import (
@@ -348,6 +360,7 @@ from ctf_os.store.atomic import (
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
+    canonical_json_bytes,
     read_json,
     strict_json_loads,
 )
@@ -5096,6 +5109,125 @@ class ChallengeEngine:
             == _REV_INVENTORY_TEMPLATE_ID
             and experiment.extra.get("partial_oracle")
             == expected_oracle
+        )
+
+    @staticmethod
+    def _is_forensic_index_experiment(
+        state: ChallengeState,
+        experiment: Experiment,
+    ) -> bool:
+        """Recognize only the current engine-authored Forensic index seed."""
+
+        return (
+            state.schema_version >= STATE_SCHEMA_VERSION
+            and get_adapter(state.category).name == "forensics"
+            and experiment.extra.get("adapter_seed") is True
+            and experiment.extra.get("adapter_name") == "forensics"
+            and experiment.extra.get("adapter_seed_contract_version") == 1
+            and experiment.extra.get("adapter_seed_order") == 0
+            and experiment.extra.get("adapter_spec_template_id")
+            == "file_inventory"
+            and experiment.extra.get("requires_explicit_execution") is True
+            and experiment.extra.get("partial_oracle") is None
+        )
+
+    def _evaluate_forensic_index_run(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+        *,
+        issued_run_request: Mapping[str, object],
+        run: RunReference,
+        receipt: ExecutionReceipt,
+        stdout_artifact: ArtifactReference,
+    ) -> ForensicIndexExecutionEvaluation | None:
+        """Re-read and verify one exact sandboxed Forensic index transport."""
+
+        if not self._is_forensic_index_experiment(state, experiment):
+            return None
+        manifest = state.metadata.get("source_manifest_sha256")
+        image_digest = self.config.runtime.image_digest
+        if (
+            type(manifest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", manifest) is None
+            or type(image_digest) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest) is None
+        ):
+            raise EngineError(
+                "Forensic index requires current source and image pins"
+            )
+        paths = self.store.challenge_paths(state.identity)
+        try:
+            expected_request = canonical_json_bytes(
+                dict(issued_run_request)
+            )
+            request_payload = read_bounded_regular(
+                paths.root,
+                run.request_path,
+                maximum_bytes=FORENSIC_INDEX_REQUEST_MAX_BYTES,
+                expected_sha256=hashlib.sha256(
+                    expected_request
+                ).hexdigest(),
+                expected_size=len(expected_request),
+            )
+            stdout_payload = read_bounded_regular(
+                paths.root,
+                stdout_artifact.path,
+                maximum_bytes=FORENSIC_INDEX_MAX_BYTES,
+                expected_sha256=stdout_artifact.sha256,
+                expected_size=int(stdout_artifact.size or 0),
+            )
+            current_inventory = inventory_challenge(
+                self.challenge_input(state.identity),
+                max_files=FORENSIC_INDEX_MAX_FILES,
+                max_total_bytes=128 * 1024**3,
+            )
+            current_sources = tuple(
+                SourceFile(
+                    path=item.path,
+                    sha256=item.sha256,
+                    size=item.size,
+                    kind="file",
+                )
+                for item in current_inventory.files
+            )
+            current_prefixes = {
+                item.path: read_regular_prefix(
+                    self.challenge_input(state.identity),
+                    item.path,
+                    maximum_prefix_bytes=FORENSIC_INDEX_MAX_PREFIX_BYTES,
+                    expected_size=item.size,
+                )
+                for item in current_inventory.files
+            }
+        except (
+            OSError,
+            SafeFileError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            raise EngineError(
+                "Forensic index evidence could not be independently re-read"
+            ) from error
+        return evaluate_forensic_index_execution(
+            identity=state.identity,
+            configuration_epoch=state.configuration_epoch,
+            expected_source_manifest_sha256=manifest,
+            current_source_manifest_sha256=(
+                current_inventory.manifest_sha256
+            ),
+            expected_source_inventory=state.source_inventory,
+            current_source_inventory=current_sources,
+            current_prefix_payloads=current_prefixes,
+            expected_image_name=self.config.runtime.image,
+            expected_image_digest=image_digest,
+            issued_request=dict(issued_run_request),
+            request_payload=request_payload,
+            run=run,
+            receipt=receipt,
+            stdout_artifact=stdout_artifact,
+            stdout_payload=stdout_payload,
         )
 
     def _evaluate_rev_inventory_run(
@@ -15049,6 +15181,190 @@ class ChallengeEngine:
                         stdout_evidence=receipt_stream_evidence.get("stdout"),
                     )
                 )
+            forensic_index_outcome: (
+                ForensicIndexExecutionEvaluation | None
+            ) = None
+            forensic_evaluation_artifact: (
+                ArtifactReference | None
+            ) = None
+            forensic_run_created_at = utc_now()
+
+            def build_forensic_run(
+                current: ChallengeState,
+                evaluation_payload: Mapping[str, object] | None = None,
+            ) -> RunReference:
+                extra: dict[str, Any] = {
+                    "experiment_id": experiment.id,
+                    "wall_seconds": elapsed,
+                    **copy.deepcopy(seed_run_metadata),
+                }
+                if evaluation_payload is not None:
+                    extra["forensic_index_execution"] = copy.deepcopy(
+                        dict(evaluation_payload)
+                    )
+                return RunReference(
+                    id=engine_run_id,
+                    base_revision=run_base_revision,
+                    status=(
+                        RunStatus.COMPLETED
+                        if result.exit_code == 0 and not result.timed_out
+                        else RunStatus.TIMED_OUT
+                        if result.timed_out
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        self.store.challenge_paths(identity).root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        self.store.challenge_paths(identity).root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        self.store.challenge_paths(identity).root
+                    ).as_posix(),
+                    role="tool",
+                    origin=(
+                        RunOrigin.MANAGED_TOOL
+                        if current.active_managed_session_id is not None
+                        else RunOrigin.OPERATOR_TOOL
+                    ),
+                    session_id=current.active_managed_session_id,
+                    configuration_epoch=current.configuration_epoch,
+                    created_at=forensic_run_created_at,
+                    extra=extra,
+                )
+
+            def build_forensic_receipt(
+                evaluation_payload: Mapping[str, object] | None = None,
+            ) -> ExecutionReceipt:
+                stderr_artifact = next(
+                    (
+                        artifact
+                        for artifact in artifact_records
+                        if artifact.extra.get("stream") == "stderr"
+                    ),
+                    None,
+                )
+                extra: dict[str, Any] = {
+                    "line_count_basis": "transport_summary_tail",
+                    "stream_evidence": copy.deepcopy(
+                        receipt_stream_evidence
+                    ),
+                }
+                if evaluation_payload is not None:
+                    extra["forensic_index_execution"] = copy.deepcopy(
+                        dict(evaluation_payload)
+                    )
+                return ExecutionReceipt(
+                    id=_record_id("RCPT", engine_run_id, "result"),
+                    experiment_id=experiment.id,
+                    run_id=engine_run_id,
+                    outcome=(
+                        ReceiptOutcome.SUCCEEDED
+                        if result.exit_code == 0 and not result.timed_out
+                        else ReceiptOutcome.TIMED_OUT
+                        if result.timed_out
+                        else ReceiptOutcome.FAILED
+                    ),
+                    exit_code=result.exit_code,
+                    wall_seconds=elapsed,
+                    stdout_artifact_id=stdout_artifact.id,
+                    stderr_artifact_id=(
+                        stderr_artifact.id
+                        if stderr_artifact is not None
+                        else None
+                    ),
+                    stdout_bytes=result.stdout_bytes,
+                    stderr_bytes=result.stderr_bytes,
+                    stdout_lines=(
+                        result.stdout_summary.count("\n")
+                        + bool(result.stdout_summary)
+                    ),
+                    stderr_lines=(
+                        result.stderr_summary.count("\n")
+                        + bool(result.stderr_summary)
+                    ),
+                    preview=receipt_preview,
+                    extra=extra,
+                )
+
+            if (
+                not artifact_notification_failed
+                and self._is_forensic_index_experiment(
+                    running,
+                    experiment,
+                )
+            ):
+                assert stdout_artifact is not None
+                forensic_index_outcome = (
+                    self._evaluate_forensic_index_run(
+                        running,
+                        experiment,
+                        issued_run_request=issued_run_request,
+                        run=build_forensic_run(running),
+                        receipt=build_forensic_receipt(),
+                        stdout_artifact=stdout_artifact,
+                    )
+                )
+                if forensic_index_outcome is None:
+                    raise EngineError(
+                        "Forensic index evaluator did not recognize its seed"
+                    )
+                forensic_artifact_id = _record_id(
+                    "A",
+                    engine_run_id,
+                    "forensic-index-evaluation",
+                )
+                forensic_path = (
+                    self.store.challenge_paths(identity).artifacts
+                    / "snapshots"
+                    / f"{forensic_artifact_id}.json"
+                )
+                pending_forensic_artifact = ArtifactReference(
+                    id=forensic_artifact_id,
+                    path=forensic_path.relative_to(
+                        self.store.challenge_paths(identity).root
+                    ).as_posix(),
+                    sha256="0" * 64,
+                    source_run_id=engine_run_id,
+                )
+                artifact_records.append(pending_forensic_artifact)
+                try:
+                    atomic_write_bytes(
+                        forensic_path,
+                        forensic_index_outcome.canonical_bytes,
+                        mode=0o400,
+                    )
+                except BaseException as error:
+                    self._handle_tool_postprocess_interruption(
+                        identity,
+                        experiment.id,
+                        run_id=engine_run_id,
+                        base_revision=run_base_revision,
+                        artifacts=artifact_records,
+                        error=error,
+                        _live_only=_live_only,
+                    )
+                    raise
+                forensic_evaluation_artifact = ArtifactReference(
+                    id=forensic_artifact_id,
+                    path=forensic_path.relative_to(
+                        self.store.challenge_paths(identity).root
+                    ).as_posix(),
+                    sha256=forensic_index_outcome.sha256,
+                    source_run_id=engine_run_id,
+                    size=len(forensic_index_outcome.canonical_bytes),
+                    extra={
+                        "kind": "forensic_index_execution_evaluation",
+                        "protocol": FORENSIC_INDEX_EXECUTION_PROTOCOL,
+                        "experiment_id": experiment.id,
+                        "run_id": engine_run_id,
+                        "evaluation_sha256": (
+                            forensic_index_outcome.sha256
+                        ),
+                        "context_visibility": "model_visible",
+                    },
+                )
+                artifact_records[-1] = forensic_evaluation_artifact
             if not artifact_notification_failed:
                 try:
                     result_payload: dict[str, Any] = {
@@ -15078,6 +15394,16 @@ class ChallengeEngine:
                         validation_payload["partial_oracle"] = (
                             copy.deepcopy(oracle_payload)
                         )
+                    if forensic_index_outcome is not None:
+                        forensic_payload = (
+                            forensic_index_outcome.to_dict()
+                        )
+                        result_payload[
+                            "forensic_index_execution"
+                        ] = copy.deepcopy(forensic_payload)
+                        validation_payload[
+                            "forensic_index_execution"
+                        ] = copy.deepcopy(forensic_payload)
                     self.store.write_run_result(
                         identity,
                         None,
@@ -15152,6 +15478,19 @@ class ChallengeEngine:
                 "rev-inventory",
             )
             receipt_id = _record_id("RCPT", engine_run_id, "result")
+            forensic_index_fact_id = _record_id(
+                "F",
+                engine_run_id,
+                "forensic-index",
+            )
+            forensic_index_progress_id = _record_id(
+                "P",
+                engine_run_id,
+                "forensic-index",
+            )
+            forensic_guard_state: list[ChallengeState] = []
+            forensic_guard_run: list[RunReference] = []
+            forensic_guard_receipt: list[ExecutionReceipt] = []
 
             def finish(current: ChallengeState) -> None:
                 if result.exit_code == 0 and not result.timed_out:
@@ -15239,6 +15578,43 @@ class ChallengeEngine:
                                 )
                             )
                         )
+                effective_forensic_outcome = forensic_index_outcome
+                forensic_payload: dict[str, object] | None = None
+                committed_forensic_run: RunReference | None = None
+                committed_forensic_receipt: (
+                    ExecutionReceipt | None
+                ) = None
+                if effective_forensic_outcome is not None:
+                    forensic_payload = (
+                        effective_forensic_outcome.to_dict()
+                    )
+                    committed_forensic_run = build_forensic_run(
+                        current,
+                        forensic_payload,
+                    )
+                    committed_forensic_receipt = (
+                        build_forensic_receipt(forensic_payload)
+                    )
+                    commit_outcome = (
+                        self._evaluate_forensic_index_run(
+                            current,
+                            item,
+                            issued_run_request=issued_run_request,
+                            run=committed_forensic_run,
+                            receipt=committed_forensic_receipt,
+                            stdout_artifact=stdout_artifact,
+                        )
+                    )
+                    if (
+                        commit_outcome is None
+                        or commit_outcome.canonical_bytes
+                        != effective_forensic_outcome.canonical_bytes
+                        or commit_outcome.sha256
+                        != effective_forensic_outcome.sha256
+                    ):
+                        raise EngineError(
+                            "Forensic index binding changed before commit"
+                        )
                 oracle_result = (
                     effective_oracle_outcome.result
                     if effective_oracle_outcome is not None
@@ -15255,7 +15631,13 @@ class ChallengeEngine:
                         RevInventoryV2Verdict.NOT_APPLICABLE,
                     }
                 )
-                if effective_oracle_outcome is not None:
+                if effective_forensic_outcome is not None:
+                    item.status = (
+                        ExperimentStatus.COMPLETED
+                        if effective_forensic_outcome.confirmed
+                        else ExperimentStatus.FAILED
+                    )
+                elif effective_oracle_outcome is not None:
                     if (
                         oracle_result is not None
                         and oracle_result.verdict
@@ -15372,6 +15754,40 @@ class ChallengeEngine:
                             effective_oracle_outcome.evaluated_at
                             or utc_now()
                         )
+                if effective_forensic_outcome is not None:
+                    assert forensic_payload is not None
+                    assert forensic_evaluation_artifact is not None
+                    item_result[
+                        "forensic_index_execution"
+                    ] = copy.deepcopy(forensic_payload)
+                    item_result[
+                        "forensic_index_evaluation_artifact_id"
+                    ] = forensic_evaluation_artifact.id
+                    item.evidence_run_ids = list(
+                        dict.fromkeys(
+                            [*item.evidence_run_ids, engine_run_id]
+                        )
+                    )
+                    item.evidence_receipt_ids = list(
+                        dict.fromkeys(
+                            [*item.evidence_receipt_ids, receipt_id]
+                        )
+                    )
+                    if effective_forensic_outcome.confirmed:
+                        item.evidence_fact_ids = list(
+                            dict.fromkeys(
+                                [
+                                    *item.evidence_fact_ids,
+                                    forensic_index_fact_id,
+                                ]
+                            )
+                        )
+                    item.evaluated_at = utc_now()
+                    item.evaluation_reason = (
+                        "forensic_index:"
+                        f"{effective_forensic_outcome.verdict.value}:"
+                        f"{effective_forensic_outcome.reason_code}"
+                    )[:512]
                 item.result = item_result
                 item.artifact_ids = list(
                     dict.fromkeys(
@@ -15393,48 +15809,60 @@ class ChallengeEngine:
                     run_extra["partial_oracle_result"] = copy.deepcopy(
                         effective_oracle_outcome.to_dict()
                     )
-                current.runs.append(
-                    RunReference(
-                        id=engine_run_id,
-                        base_revision=run_base_revision,
-                        status=(
-                            RunStatus.COMPLETED
-                            if succeeded
-                            else RunStatus.TIMED_OUT
-                            if result.timed_out
-                            else RunStatus.FAILED
-                        ),
-                        request_path=str(
-                            run_paths.request.relative_to(
-                                self.store.challenge_paths(identity).root
-                            )
-                        ),
-                        result_path=str(
-                            run_paths.result.relative_to(
-                                self.store.challenge_paths(identity).root
-                            )
-                        ),
-                        validation_path=str(
-                            run_paths.validation.relative_to(
-                                self.store.challenge_paths(identity).root
-                            )
-                        ),
-                        role="tool",
-                        origin=(
-                            RunOrigin.MANAGED_TOOL
-                            if current.active_managed_session_id is not None
-                            else RunOrigin.OPERATOR_TOOL
-                        ),
-                        session_id=current.active_managed_session_id,
-                        configuration_epoch=(
-                            current.configuration_epoch
-                            if current.schema_version >= STATE_SCHEMA_VERSION
-                            else None
-                        ),
-                        created_at=utc_now(),
-                        extra=run_extra,
+                if effective_forensic_outcome is not None:
+                    assert committed_forensic_run is not None
+                    current.runs.append(committed_forensic_run)
+                else:
+                    current.runs.append(
+                        RunReference(
+                            id=engine_run_id,
+                            base_revision=run_base_revision,
+                            status=(
+                                RunStatus.COMPLETED
+                                if succeeded
+                                else RunStatus.TIMED_OUT
+                                if result.timed_out
+                                else RunStatus.FAILED
+                            ),
+                            request_path=str(
+                                run_paths.request.relative_to(
+                                    self.store.challenge_paths(
+                                        identity
+                                    ).root
+                                )
+                            ),
+                            result_path=str(
+                                run_paths.result.relative_to(
+                                    self.store.challenge_paths(
+                                        identity
+                                    ).root
+                                )
+                            ),
+                            validation_path=str(
+                                run_paths.validation.relative_to(
+                                    self.store.challenge_paths(
+                                        identity
+                                    ).root
+                                )
+                            ),
+                            role="tool",
+                            origin=(
+                                RunOrigin.MANAGED_TOOL
+                                if current.active_managed_session_id
+                                is not None
+                                else RunOrigin.OPERATOR_TOOL
+                            ),
+                            session_id=current.active_managed_session_id,
+                            configuration_epoch=(
+                                current.configuration_epoch
+                                if current.schema_version
+                                >= STATE_SCHEMA_VERSION
+                                else None
+                            ),
+                            created_at=utc_now(),
+                            extra=run_extra,
+                        )
                     )
-                )
                 current.artifacts.extend(artifact_records)
                 if current.schema_version >= STATE_SCHEMA_VERSION:
                     stderr_artifact = next(
@@ -15457,40 +15885,46 @@ class ChallengeEngine:
                                 effective_oracle_outcome.to_dict()
                             )
                         )
-                    current.receipts.append(
-                        ExecutionReceipt(
-                            id=receipt_id,
-                            experiment_id=item.id,
-                            run_id=engine_run_id,
-                            outcome=(
-                                ReceiptOutcome.SUCCEEDED
-                                if succeeded
-                                else ReceiptOutcome.TIMED_OUT
-                                if result.timed_out
-                                else ReceiptOutcome.FAILED
-                            ),
-                            exit_code=result.exit_code,
-                            wall_seconds=elapsed,
-                            stdout_artifact_id=stdout_artifact.id,
-                            stderr_artifact_id=(
-                                stderr_artifact.id
-                                if stderr_artifact is not None
-                                else None
-                            ),
-                            stdout_bytes=result.stdout_bytes,
-                            stderr_bytes=result.stderr_bytes,
-                            stdout_lines=(
-                                result.stdout_summary.count("\n")
-                                + bool(result.stdout_summary)
-                            ),
-                            stderr_lines=(
-                                result.stderr_summary.count("\n")
-                                + bool(result.stderr_summary)
-                            ),
-                            preview=receipt_preview,
-                            extra=receipt_extra,
+                    if effective_forensic_outcome is not None:
+                        assert committed_forensic_receipt is not None
+                        current.receipts.append(
+                            committed_forensic_receipt
                         )
-                    )
+                    else:
+                        current.receipts.append(
+                            ExecutionReceipt(
+                                id=receipt_id,
+                                experiment_id=item.id,
+                                run_id=engine_run_id,
+                                outcome=(
+                                    ReceiptOutcome.SUCCEEDED
+                                    if succeeded
+                                    else ReceiptOutcome.TIMED_OUT
+                                    if result.timed_out
+                                    else ReceiptOutcome.FAILED
+                                ),
+                                exit_code=result.exit_code,
+                                wall_seconds=elapsed,
+                                stdout_artifact_id=stdout_artifact.id,
+                                stderr_artifact_id=(
+                                    stderr_artifact.id
+                                    if stderr_artifact is not None
+                                    else None
+                                ),
+                                stdout_bytes=result.stdout_bytes,
+                                stderr_bytes=result.stderr_bytes,
+                                stdout_lines=(
+                                    result.stdout_summary.count("\n")
+                                    + bool(result.stdout_summary)
+                                ),
+                                stderr_lines=(
+                                    result.stderr_summary.count("\n")
+                                    + bool(result.stderr_summary)
+                                ),
+                                preview=receipt_preview,
+                                extra=receipt_extra,
+                            )
+                        )
                     if oracle_fact_allowed:
                         assert effective_oracle_outcome is not None
                         current.facts.append(
@@ -15514,6 +15948,67 @@ class ChallengeEngine:
                                     ),
                                     "receipt_id": receipt_id,
                                 },
+                            )
+                        )
+                    if (
+                        effective_forensic_outcome is not None
+                        and effective_forensic_outcome.confirmed
+                    ):
+                        reduction = (
+                            effective_forensic_outcome
+                            .reduction_projection()
+                        )
+                        fact_payload = reduction["executed_fact"]
+                        progress_payload = reduction["progress"]
+                        if (
+                            not isinstance(fact_payload, Mapping)
+                            or not isinstance(
+                                progress_payload,
+                                Mapping,
+                            )
+                            or reduction["candidate"] is not None
+                            or reduction["proof"] is not None
+                            or reduction["impact"] is not None
+                            or reduction["automatic_submission"] is not False
+                        ):
+                            raise EngineError(
+                                "Forensic index reduction widened authority"
+                            )
+                        current.facts.append(
+                            Fact(
+                                id=forensic_index_fact_id,
+                                statement=str(
+                                    fact_payload["statement"]
+                                ),
+                                provenance=Provenance.EXECUTED,
+                                challenge_id=current.challenge_id,
+                                source_run_id=str(
+                                    fact_payload["source_run_id"]
+                                ),
+                                artifact_id=str(
+                                    fact_payload["artifact_id"]
+                                ),
+                                locator=str(fact_payload["locator"]),
+                                extra=copy.deepcopy(
+                                    dict(fact_payload["extra"])
+                                ),
+                            )
+                        )
+                        current.progress_markers.append(
+                            ProgressMarker(
+                                id=forensic_index_progress_id,
+                                statement=str(
+                                    progress_payload["statement"]
+                                ),
+                                run_id=str(
+                                    progress_payload["run_id"]
+                                ),
+                                artifact_ids=list(
+                                    progress_payload["artifact_ids"]
+                                ),
+                                extra=copy.deepcopy(
+                                    dict(progress_payload["extra"])
+                                ),
                             )
                         )
                 else:
@@ -15575,25 +16070,89 @@ class ChallengeEngine:
                     0,
                     int(accounted_elapsed),
                 )
+                if effective_forensic_outcome is not None:
+                    assert committed_forensic_run is not None
+                    assert committed_forensic_receipt is not None
+                    forensic_guard_state[:] = [current]
+                    forensic_guard_run[:] = [committed_forensic_run]
+                    forensic_guard_receipt[:] = [
+                        committed_forensic_receipt
+                    ]
 
-            canonical_deadline_guard = (
-                lambda: self._require_before_hard_deadline(
-                    command_deadline_monotonic,
-                    (
-                        "Rev inventory canonical state commit"
-                        if rev_inventory_oracle_outcome is not None
-                        else "tool canonical state commit"
+            def canonical_tool_guard() -> None:
+                if result.exit_code == 0 and not result.timed_out:
+                    self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        (
+                            "Rev inventory canonical state commit"
+                            if rev_inventory_oracle_outcome is not None
+                            else "Forensic index canonical state commit"
+                            if forensic_index_outcome is not None
+                            else "tool canonical state commit"
+                        ),
+                    )
+                if forensic_index_outcome is None:
+                    return
+                if (
+                    len(forensic_guard_state) != 1
+                    or len(forensic_guard_run) != 1
+                    or len(forensic_guard_receipt) != 1
+                    or forensic_evaluation_artifact is None
+                ):
+                    raise EngineError(
+                        "Forensic index commit bindings are unavailable"
+                    )
+                guarded = self._evaluate_forensic_index_run(
+                    forensic_guard_state[0],
+                    next(
+                        item
+                        for item in forensic_guard_state[0].experiments
+                        if item.id == experiment.id
                     ),
+                    issued_run_request=issued_run_request,
+                    run=forensic_guard_run[0],
+                    receipt=forensic_guard_receipt[0],
+                    stdout_artifact=stdout_artifact,
                 )
-                if result.exit_code == 0 and not result.timed_out
-                else None
-            )
+                if (
+                    guarded is None
+                    or guarded.canonical_bytes
+                    != forensic_index_outcome.canonical_bytes
+                    or guarded.sha256 != forensic_index_outcome.sha256
+                ):
+                    raise EngineError(
+                        "Forensic index changed before canonical replacement"
+                    )
+                try:
+                    payload = read_bounded_regular(
+                        self.store.challenge_paths(identity).root,
+                        forensic_evaluation_artifact.path,
+                        maximum_bytes=max(
+                            int(forensic_evaluation_artifact.size or 0),
+                            1,
+                        ),
+                        expected_sha256=(
+                            forensic_evaluation_artifact.sha256
+                        ),
+                        expected_size=int(
+                            forensic_evaluation_artifact.size or 0
+                        ),
+                    )
+                except (OSError, SafeFileError, ValueError) as error:
+                    raise EngineError(
+                        "Forensic evaluation artifact changed before commit"
+                    ) from error
+                if payload != forensic_index_outcome.canonical_bytes:
+                    raise EngineError(
+                        "Forensic evaluation bytes changed before commit"
+                    )
+
             try:
                 state = self.store.update(
                     identity,
                     finish,
-                    commit_guard=canonical_deadline_guard,
-                    pre_replace_guard=canonical_deadline_guard,
+                    commit_guard=canonical_tool_guard,
+                    pre_replace_guard=canonical_tool_guard,
                 )
             except _HardDeadlineExpired as deadline_error:
                 try:
