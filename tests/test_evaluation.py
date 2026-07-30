@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -28,6 +31,7 @@ from ctf_os.models import (
 )
 from ctf_os.store import StateStore, sha256_file
 from ctf_os.store.atomic import atomic_write_bytes, atomic_write_json
+from tests import test_pwn_crash_execution as pwn_execution_fixture
 
 
 def _later(timestamp: str, seconds: int) -> str:
@@ -52,6 +56,55 @@ class EvaluationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def _create_pwn_crash_gate(
+        self,
+        challenge_id: str,
+        *,
+        execute: bool = True,
+        statuses=None,
+        truncated_ordinals=(),
+    ):
+        helper = pwn_execution_fixture.PwnCrashExecutionTests()
+        helper.root = self.root
+        helper.identity = ChallengeIdentity(
+            "Managed CTF",
+            "pwn",
+            challenge_id,
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / helper.identity.contest_id
+            / helper.identity.category
+            / helper.identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        helper.binary_path = incoming / "challenge"
+        helper.binary_path.write_bytes(
+            pwn_execution_fixture._elf64_executable()
+        )
+        helper.binary_path.chmod(0o500)
+        coordinator = pwn_execution_fixture._SandboxCoordinator(
+            statuses or helper._confirming_statuses(),
+            truncated_ordinals=truncated_ordinals,
+        )
+        engine, experiment_id, payload_path, _payload = helper._fixture(
+            coordinator
+        )
+        state = (
+            helper._execute(engine, experiment_id)
+            if execute
+            else engine.store.load(helper.identity)
+        )
+        return (
+            helper,
+            coordinator,
+            engine,
+            state,
+            experiment_id,
+            payload_path,
+        )
 
     def _create_attempt(
         self,
@@ -880,6 +933,448 @@ class EvaluationTests(unittest.TestCase):
             report.metrics["solve@1"].reason,
         )
 
+    def test_pwn_crash_gate_metric_revalidates_complete_evidence(self) -> None:
+        (
+            helper,
+            _coordinator,
+            _engine,
+            _state,
+            _experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate("metric-confirmed")
+
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "available")
+        self.assertEqual(metric.sample_size, 1)
+        self.assertEqual(
+            metric.value,
+            {
+                "confirmed": 1,
+                "inconclusive": 0,
+                "semantic_error": 0,
+                "transport_error": 0,
+                "setup_failed": 0,
+                "unverifiable": 0,
+                "terminal_attempts": 1,
+                "incomplete": 0,
+                "rate": 1.0,
+            },
+        )
+        self.assertIn(
+            "six issued run requests",
+            report.to_dict()["methodology"][
+                "pwn_crash_gate_pass_rate"
+            ],
+        )
+
+    def test_pwn_crash_setup_failure_stays_in_denominator(self) -> None:
+        (
+            helper,
+            _coordinator,
+            engine,
+            _state,
+            experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate(
+            "metric-setup-failed",
+            execute=False,
+        )
+
+        def fail_before_execution(state) -> None:
+            experiment = next(
+                item
+                for item in state.experiments
+                if item.id == experiment_id
+            )
+            experiment.status = ExperimentStatus.FAILED
+            experiment.result = {
+                "error": (
+                    "Pwn crash gate failed closed: synthetic setup failure"
+                )
+            }
+
+        engine.store.update(helper.identity, fail_before_execution)
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "partial")
+        self.assertEqual(metric.sample_size, 1)
+        self.assertEqual(metric.value["setup_failed"], 1)
+        self.assertEqual(metric.value["terminal_attempts"], 1)
+        self.assertEqual(metric.value["rate"], 0.0)
+
+    def test_pwn_crash_valid_nonpass_outcomes_have_distinct_counts(
+        self,
+    ) -> None:
+        inconclusive_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        for challenge_id, expected, options in (
+            (
+                "metric-inconclusive",
+                "inconclusive",
+                {"statuses": inconclusive_statuses},
+            ),
+            (
+                "metric-transport-error",
+                "transport_error",
+                {"truncated_ordinals": (2,)},
+            ),
+        ):
+            with self.subTest(outcome=expected):
+                (
+                    helper,
+                    _coordinator,
+                    _engine,
+                    _state,
+                    _experiment_id,
+                    _payload_path,
+                ) = self._create_pwn_crash_gate(
+                    challenge_id,
+                    **options,
+                )
+                report = evaluate_workspace(
+                    self.root,
+                    contest_id=helper.identity.contest_id,
+                    category=helper.identity.category,
+                    challenge_id=helper.identity.challenge_id,
+                )
+                metric = report.metrics["pwn_crash_gate_pass_rate"]
+                self.assertEqual(metric.status, "available")
+                self.assertEqual(metric.sample_size, 1)
+                self.assertEqual(metric.value[expected], 1)
+                self.assertEqual(metric.value["rate"], 0.0)
+
+    def test_pwn_crash_semantic_error_is_not_transport_error(self) -> None:
+        semantic_error_statuses = (
+            ("bogus", None, None),
+            ("signaled", None, 11),
+            ("signaled", None, 11),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        (
+            helper,
+            _coordinator,
+            _engine,
+            state,
+            experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate(
+            "metric-semantic-error",
+            statuses=semantic_error_statuses,
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        stored = experiment.result["pwn_crash_evidence"]["evaluation"]
+        self.assertEqual(stored["verdict"], "ERROR")
+        self.assertIsNotNone(stored["semantic_evaluation"])
+        self.assertIsNone(stored["transport_error"])
+
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "available")
+        self.assertEqual(metric.sample_size, 1)
+        self.assertEqual(metric.value["semantic_error"], 1)
+        self.assertEqual(metric.value["transport_error"], 0)
+        self.assertEqual(metric.value["terminal_attempts"], 1)
+        self.assertEqual(metric.value["rate"], 0.0)
+
+    def test_pwn_crash_fifo_artifact_is_bounded_unverifiable(self) -> None:
+        (
+            helper,
+            _coordinator,
+            engine,
+            state,
+            experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate("metric-fifo-artifact")
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        first_attempt = experiment.result["pwn_crash_evidence"][
+            "attempts"
+        ][0]
+        stdout_artifact = next(
+            item
+            for item in state.artifacts
+            if item.id == first_attempt["stdout_artifact_id"]
+        )
+        target = (
+            engine.store.challenge_paths(helper.identity).root
+            / stdout_artifact.path
+        )
+        target.unlink()
+        os.mkfifo(target, 0o400)
+
+        program = "\n".join(
+            (
+                "import json",
+                "import sys",
+                "from ctf_os.evaluation import evaluate_workspace",
+                "report = evaluate_workspace(",
+                "    sys.argv[1],",
+                "    contest_id=sys.argv[2],",
+                "    category=sys.argv[3],",
+                "    challenge_id=sys.argv[4],",
+                ")",
+                "print(json.dumps(",
+                "    report.metrics['pwn_crash_gate_pass_rate'].to_dict(),",
+                "    sort_keys=True,",
+                "))",
+            )
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    program,
+                    str(self.root),
+                    helper.identity.contest_id,
+                    helper.identity.category,
+                    helper.identity.challenge_id,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("Pwn crash artifact reader blocked while opening a FIFO")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        metric = json.loads(completed.stdout)
+        self.assertEqual(metric["status"], "partial")
+        self.assertEqual(metric["sample_size"], 1)
+        self.assertEqual(metric["value"]["unverifiable"], 1)
+        self.assertEqual(metric["value"]["rate"], 0.0)
+
+    def test_pwn_crash_tampered_durable_bytes_are_unverifiable(self) -> None:
+        for mutation in (
+            "payload",
+            "stdout",
+            "stdout_symlink",
+            "request",
+            "capability",
+        ):
+            with self.subTest(mutation=mutation):
+                (
+                    helper,
+                    _coordinator,
+                    engine,
+                    state,
+                    experiment_id,
+                    payload_path,
+                ) = self._create_pwn_crash_gate(
+                    f"metric-tampered-{mutation}"
+                )
+                experiment = next(
+                    item
+                    for item in state.experiments
+                    if item.id == experiment_id
+                )
+                evidence = experiment.result["pwn_crash_evidence"]
+                paths = engine.store.challenge_paths(helper.identity)
+                first_attempt = evidence["attempts"][0]
+                if mutation == "payload":
+                    target = payload_path
+                elif mutation in {"stdout", "stdout_symlink"}:
+                    artifact = next(
+                        item
+                        for item in state.artifacts
+                        if item.id
+                        == first_attempt["stdout_artifact_id"]
+                    )
+                    target = paths.root / artifact.path
+                elif mutation == "request":
+                    run = next(
+                        item
+                        for item in state.runs
+                        if item.id == first_attempt["run_id"]
+                    )
+                    target = paths.root / run.request_path
+                else:
+                    first_run = next(
+                        item
+                        for item in state.runs
+                        if item.id == first_attempt["run_id"]
+                    )
+                    capability_id = first_run.extra["pwn_crash"][
+                        "receipt"
+                    ]["capability_attestation_artifact_id"]
+                    artifact = next(
+                        item
+                        for item in state.artifacts
+                        if item.id == capability_id
+                    )
+                    target = paths.root / artifact.path
+                if mutation == "stdout_symlink":
+                    outside = self.root / "outside-stdout.log"
+                    outside.write_bytes(target.read_bytes())
+                    target.unlink()
+                    target.symlink_to(outside)
+                else:
+                    target.chmod(0o600)
+                    target.write_bytes(b"tampered\n")
+                    target.chmod(0o400)
+
+                report = evaluate_workspace(
+                    self.root,
+                    contest_id=helper.identity.contest_id,
+                    category=helper.identity.category,
+                    challenge_id=helper.identity.challenge_id,
+                )
+                metric = report.metrics["pwn_crash_gate_pass_rate"]
+                self.assertEqual(metric.status, "partial")
+                self.assertEqual(metric.sample_size, 1)
+                self.assertEqual(metric.value["unverifiable"], 1)
+                self.assertEqual(metric.value["rate"], 0.0)
+                self.assertTrue(
+                    any(
+                        "unverifiable" in item
+                        for item in report.diagnostics
+                    )
+                )
+
+    def test_pwn_crash_deep_request_is_bounded_unverifiable(self) -> None:
+        (
+            helper,
+            _coordinator,
+            engine,
+            state,
+            experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate("metric-deep-request")
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        first_attempt = experiment.result["pwn_crash_evidence"][
+            "attempts"
+        ][0]
+        run = next(
+            item
+            for item in state.runs
+            if item.id == first_attempt["run_id"]
+        )
+        request_path = (
+            engine.store.challenge_paths(helper.identity).root
+            / run.request_path
+        )
+        request = json.loads(request_path.read_bytes())
+        request.pop("created_at")
+        shallow = json.dumps(
+            request,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )[1:-1]
+        nesting = 10_000
+        payload = (
+            b'{"created_at":'
+            + (b"[" * nesting)
+            + b"0"
+            + (b"]" * nesting)
+            + b","
+            + shallow.encode("ascii")
+            + b"}\n"
+        )
+        atomic_write_bytes(request_path, payload, mode=0o400)
+        request_sha256 = sha256_file(request_path)
+
+        def rebind_request_hash(current) -> None:
+            current_run = next(
+                item
+                for item in current.runs
+                if item.id == first_attempt["run_id"]
+            )
+            record = current_run.extra["pwn_crash"]
+            record["request_sha256"] = request_sha256
+            record["receipt"]["request_sha256"] = request_sha256
+            current_receipt = next(
+                item
+                for item in current.receipts
+                if item.id == first_attempt["receipt_id"]
+            )
+            current_receipt.extra["pwn_crash"] = copy.deepcopy(record)
+
+        engine.store.update(helper.identity, rebind_request_hash)
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "partial")
+        self.assertEqual(metric.value["unverifiable"], 1)
+        self.assertEqual(metric.value["rate"], 0.0)
+        self.assertTrue(
+            any(
+                "nesting limits" in diagnostic
+                for diagnostic in report.diagnostics
+            )
+        )
+
+    def test_pwn_crash_incomplete_gate_is_explicitly_partial(self) -> None:
+        (
+            helper,
+            _coordinator,
+            _engine,
+            _state,
+            _experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate(
+            "metric-incomplete",
+            execute=False,
+        )
+
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "partial")
+        self.assertEqual(metric.sample_size, 0)
+        self.assertEqual(metric.value["terminal_attempts"], 0)
+        self.assertEqual(metric.value["incomplete"], 1)
+        self.assertIsNone(metric.value["rate"])
+
     def test_scope_requires_parent_components(self) -> None:
         with self.assertRaisesRegex(
             EvaluationError, "category scope requires"
@@ -909,7 +1404,7 @@ class EvaluationTests(unittest.TestCase):
 
         self.assertEqual(status, 0, stderr.getvalue())
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(payload["evaluated_states"], 1)
         self.assertEqual(
             payload["metrics"]["time_to_first_primitive"]["status"],

@@ -13,12 +13,13 @@ import heapq
 import json
 import math
 import os
+import re
 import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from statistics import median
 from typing import Any
 
@@ -31,9 +32,34 @@ from ctf_os.models import (
     RunStatus,
     SubmissionStatus,
 )
+from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_ATTEMPT_COUNT,
+    PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+    PWN_CRASH_V1_CONTRACT_ID,
+    PWN_CRASH_V1_CONTRACT_VERSION,
+    PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+    PWN_CRASH_V1_MAX_INPUT_BYTES,
+    PWN_CRASH_V1_PROTOCOL,
+)
+from ctf_os.engine.pwn_crash import (
+    PWN_CRASH_INPUT_DESTINATION_LOCATOR,
+    PWN_CRASH_NETWORK_POLICY,
+    PWN_CRASH_ONE_SHOT,
+    PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+    PWN_CRASH_PRODUCER_INTERPRETER_PATH,
+    PWN_CRASH_PRODUCER_PATH,
+    PWN_CRASH_SANDBOX_METHOD,
+    PwnCrashCapabilityAttestation,
+    PwnCrashGateEvaluation,
+    PwnCrashReceiptMetadata,
+    PwnCrashRecipe,
+    evaluate_pwn_crash_gate,
+)
+from ctf_os.director.resources import tool_profile
+from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION
 from ctf_os.store.upgrades import UnsupportedSchemaVersion, upgrade_state
 
-EVALUATION_SCHEMA_VERSION = 2
+EVALUATION_SCHEMA_VERSION = 3
 DEFAULT_MAX_STATES = 1024
 MAX_STATE_LIMIT = 4096
 MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -44,6 +70,8 @@ MAX_COMMAND_BYTES = 64 * 1024
 MAX_METADATA_ID_BYTES = 256
 MAX_BREAKDOWN_ITEMS = 64
 MAX_COUNTER_VALUE = (1 << 63) - 1
+MAX_PWN_CRASH_REQUEST_BYTES = 1024 * 1024
+MAX_PWN_CRASH_CAPABILITY_BYTES = 16 * 1024
 
 _METRIC_AVAILABLE = "available"
 _METRIC_PARTIAL = "partial"
@@ -67,6 +95,62 @@ _PROOF_RESULT_KEYS = {
     "source_manifest_sha256",
     "failures",
     "run_ids",
+}
+_PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
+_PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_CRASH_FLAG_PATTERNS_ENV = "CTF_WRAP_FLAG_PATTERNS_JSON"
+_PWN_CRASH_EVIDENCE_KEYS = {
+    "schema_version",
+    "protocol",
+    "recipe_sha256",
+    "evaluated_at",
+    "evaluation",
+    "evaluation_sha256",
+    "attempts",
+}
+_PWN_CRASH_ATTEMPT_KEYS = {
+    "ordinal",
+    "run_id",
+    "receipt_id",
+    "stdout_artifact_id",
+}
+_PWN_CRASH_RUN_RECORD_KEYS = {
+    "recipe_sha256",
+    "request_sha256",
+    "execution_contract",
+    "execution_contract_sha256",
+    "ordinal",
+    "phase",
+    "input_sha256",
+    "input_size_bytes",
+    "receipt",
+}
+_PWN_CRASH_REQUEST_KEYS = {
+    "base_revision",
+    "category",
+    "challenge_id",
+    "contest_id",
+    "created_at",
+    "execution_contract",
+    "execution_contract_sha256",
+    "experiment_id",
+    "kind",
+    "run_id",
+    "schema_version",
+}
+_PWN_CRASH_EXECUTION_CONTRACT_KEYS = {
+    "schema_version",
+    "contract",
+    "protocol",
+    "recipe_sha256",
+    "configuration_epoch",
+    "gate",
+    "attempt",
+    "input",
+    "argv",
+    "sandbox",
+    "producer",
 }
 _EXECUTED_EXPERIMENT_STATUSES = {
     ExperimentStatus.AWAITING_EVALUATION,
@@ -151,6 +235,13 @@ class EvaluationReport:
                 "clean_reproduction": (
                     "successful/total attempts from bounded, hash-validated "
                     "proof result artifacts"
+                ),
+                "pwn_crash_gate_pass_rate": (
+                    "confirmed/terminal typed Pwn crash gates after bounded "
+                    "nofollow re-reading of the nominated payload, six stdout "
+                    "artifacts, capability attestation, and six issued run "
+                    "requests; setup failures and unverifiable terminal gates "
+                    "remain in the denominator"
                 ),
                 "first_valid_result": (
                     "earliest hash-validated passed proof or manual accepted "
@@ -294,7 +385,11 @@ def _read_bounded_descriptor(
 
 
 def _read_bounded_regular(path: Path, maximum_bytes: int) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
@@ -322,6 +417,10 @@ def _strict_json_bytes(payload: bytes, display_name: str) -> object:
         raise EvaluationInputError(
             f"{display_name} is not valid JSON: {error.msg}"
         ) from error
+    except RecursionError as error:
+        raise EvaluationInputError(
+            f"{display_name} exceeds JSON nesting limits"
+        ) from error
 
 
 def _read_strict_json(path: Path, maximum_bytes: int) -> object:
@@ -329,6 +428,137 @@ def _read_strict_json(path: Path, maximum_bytes: int) -> object:
         _read_bounded_regular(path, maximum_bytes),
         path.name,
     )
+
+
+def _normalized_relative_parts(
+    value: str,
+    *,
+    display_name: str,
+) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise EvaluationInputError(
+            f"{display_name} path is not a normalized relative path"
+        )
+    try:
+        encoded_value = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise EvaluationInputError(
+            f"{display_name} path is not a normalized relative path"
+        ) from error
+    relative = PurePosixPath(value)
+    if (
+        not value
+        or len(encoded_value) > 4096
+        or relative.is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or "\\" in value
+        or "\x00" in value
+        or relative.as_posix() != value
+        or not relative.parts
+        or any(
+            part in {"", ".", ".."}
+            or len(part.encode("utf-8")) > 255
+            for part in relative.parts
+        )
+    ):
+        raise EvaluationInputError(
+            f"{display_name} path is not a normalized relative path"
+        )
+    return relative.parts
+
+
+def _read_bounded_relative(
+    challenge_root: Path,
+    relative_path: str,
+    *,
+    maximum_bytes: int,
+    display_name: str,
+) -> tuple[bytes, os.stat_result]:
+    """Read one challenge-relative regular file without following symlinks."""
+
+    parts = _normalized_relative_parts(
+        relative_path,
+        display_name=display_name,
+    )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        current = os.open(challenge_root, directory_flags)
+        descriptors.append(current)
+        for component in parts[:-1]:
+            current = os.open(
+                component,
+                directory_flags,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        descriptor = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=current,
+        )
+        descriptors.append(descriptor)
+        return _read_bounded_descriptor(
+            descriptor,
+            display_name=display_name,
+            maximum_bytes=maximum_bytes,
+        )
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_verified_reference(
+    challenge_root: Path,
+    artifact: ArtifactReference,
+    *,
+    maximum_bytes: int,
+    display_name: str,
+    require_size: bool = True,
+) -> bytes:
+    if (
+        len(artifact.sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in artifact.sha256
+        )
+    ):
+        raise EvaluationInputError(
+            f"{display_name} has an invalid SHA-256"
+        )
+    payload, metadata = _read_bounded_relative(
+        challenge_root,
+        artifact.path,
+        maximum_bytes=maximum_bytes,
+        display_name=display_name,
+    )
+    if (
+        (require_size and artifact.size is None)
+        or (
+            artifact.size is not None
+            and metadata.st_size != artifact.size
+        )
+    ):
+        raise EvaluationInputError(
+            f"{display_name} size does not match its canonical reference"
+        )
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256.lower() != artifact.sha256.lower():
+        raise EvaluationInputError(
+            f"{display_name} SHA-256 does not match its canonical reference"
+        )
+    return payload
 
 
 def _read_verified_artifact(
@@ -349,61 +579,13 @@ def _read_verified_artifact(
         raise EvaluationInputError(
             "proof artifact path is not a normalized relative proof path"
         )
-    if (
-        len(artifact.sha256) != 64
-        or any(
-            character not in "0123456789abcdefABCDEF"
-            for character in artifact.sha256
-        )
-    ):
-        raise EvaluationInputError("proof artifact has an invalid SHA-256")
-
-    directory_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+    return _read_verified_reference(
+        challenge_root,
+        artifact,
+        maximum_bytes=maximum_bytes,
+        display_name="proof result artifact",
+        require_size=False,
     )
-    file_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptors: list[int] = []
-    try:
-        current = os.open(challenge_root, directory_flags)
-        descriptors.append(current)
-        for component in relative.parts[:-1]:
-            current = os.open(
-                component,
-                directory_flags,
-                dir_fd=current,
-            )
-            descriptors.append(current)
-        descriptor = os.open(
-            relative.parts[-1],
-            file_flags,
-            dir_fd=current,
-        )
-        descriptors.append(descriptor)
-        payload, metadata = _read_bounded_descriptor(
-            descriptor,
-            display_name="proof result artifact",
-            maximum_bytes=maximum_bytes,
-        )
-        if artifact.size is not None and metadata.st_size != artifact.size:
-            raise EvaluationInputError(
-                "proof artifact size does not match its canonical reference"
-            )
-        actual_sha256 = hashlib.sha256(payload).hexdigest()
-        if actual_sha256.lower() != artifact.sha256.lower():
-            raise EvaluationInputError(
-                "proof artifact SHA-256 does not match its canonical reference"
-            )
-        return payload
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def _child_directories(path: Path) -> Iterable[Path]:
@@ -1703,6 +1885,691 @@ def _proof_metrics(
     return metrics
 
 
+def _pwn_crash_experiment_marker(experiment: object) -> bool:
+    command = getattr(experiment, "command", None)
+    extra = getattr(experiment, "extra", None)
+    result = getattr(experiment, "result", None)
+    return (
+        command == _PWN_CRASH_ENGINE_COMMAND
+        or (
+            isinstance(extra, Mapping)
+            and (
+                extra.get("engine_executor")
+                == _PWN_CRASH_ENGINE_EXECUTOR
+                or extra.get("managed_action_kind")
+                == _PWN_CRASH_ACTION_KIND
+                or "pwn_crash_request" in extra
+                or "pwn_crash_recipe" in extra
+            )
+        )
+        or (
+            isinstance(result, Mapping)
+            and "pwn_crash_evidence" in result
+        )
+    )
+
+
+def _pwn_crash_canonical_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Pwn crash execution contract is not canonical JSON"
+        ) from error
+
+
+def _pwn_crash_execution_contract_error(
+    contract: object,
+    *,
+    recipe: PwnCrashRecipe,
+    ordinal: int,
+    capability_artifact: ArtifactReference,
+    experiment_timeout_seconds: int,
+    experiment_resource_class: str,
+) -> str | None:
+    """Return why one issued execution contract is not engine-owned."""
+
+    binding = recipe.attempt_input_binding(ordinal)
+    if type(contract) is not dict or set(contract) != (
+        _PWN_CRASH_EXECUTION_CONTRACT_KEYS
+    ):
+        return "execution contract schema is not exact"
+    expected_contract = {
+        "fingerprint": PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+        "id": PWN_CRASH_V1_CONTRACT_ID,
+        "version": PWN_CRASH_V1_CONTRACT_VERSION,
+    }
+    expected_attempt = {
+        "ordinal": ordinal,
+        "phase": binding["phase"],
+    }
+    expected_input = {
+        "kind": binding["input_kind"],
+        "artifact_id": (
+            recipe.payload_artifact_id
+            if binding["phase"] == "positive"
+            else None
+        ),
+        "sha256": binding["input_sha256"],
+        "size_bytes": binding["input_size_bytes"],
+        "destination_locator": PWN_CRASH_INPUT_DESTINATION_LOCATOR,
+    }
+    gate = contract.get("gate")
+    sandbox = contract.get("sandbox")
+    environment = (
+        sandbox.get("environment")
+        if type(sandbox) is dict
+        else None
+    )
+    patterns_json = (
+        environment.get(_PWN_CRASH_FLAG_PATTERNS_ENV)
+        if type(environment) is dict
+        else None
+    )
+    producer = contract.get("producer")
+    resource_request = (
+        sandbox.get("resource_request")
+        if type(sandbox) is dict
+        else None
+    )
+    if (
+        contract.get("schema_version") != 1
+        or contract.get("contract") != expected_contract
+        or contract.get("protocol") != PWN_CRASH_V1_PROTOCOL
+        or contract.get("recipe_sha256") != recipe.recipe_sha256
+        or contract.get("configuration_epoch")
+        != recipe.configuration_epoch
+        or contract.get("attempt") != expected_attempt
+        or contract.get("input") != expected_input
+        or contract.get("argv") != list(recipe.argv_for_attempt(ordinal))
+    ):
+        return "execution contract does not match its recipe"
+    gate_deadline = (
+        gate.get("deadline_epoch_seconds")
+        if type(gate) is dict
+        else None
+    )
+    if (
+        type(gate) is not dict
+        or set(gate)
+        != {"timeout_seconds", "deadline_epoch_seconds"}
+        or gate.get("timeout_seconds") != experiment_timeout_seconds
+        or type(gate_deadline) not in {int, float}
+        or not math.isfinite(float(gate_deadline))
+        or float(gate_deadline) <= 0
+    ):
+        return "execution contract gate deadline is invalid"
+    try:
+        patterns = (
+            json.loads(patterns_json)
+            if type(patterns_json) is str
+            and len(patterns_json.encode("utf-8")) <= 64 * 1024
+            else None
+        )
+        patterns_valid = (
+            type(patterns) is list
+            and 1 <= len(patterns) <= 64
+            and all(
+                type(pattern) is str
+                and 1 <= len(pattern.encode("utf-8")) <= 4096
+                for pattern in patterns
+            )
+            and json.dumps(
+                patterns,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            == patterns_json
+        )
+        if patterns_valid:
+            for pattern in patterns:
+                re.compile(pattern)
+    except (RecursionError, TypeError, UnicodeError, ValueError, re.error):
+        patterns_valid = False
+    try:
+        expected_resource_request = tool_profile(
+            experiment_resource_class,
+            needs_kvm=False,
+            network=False,
+        ).as_dict()
+    except (TypeError, ValueError):
+        return "execution contract resource class is invalid"
+    if (
+        type(sandbox) is not dict
+        or set(sandbox)
+        != {
+            "method",
+            "one_shot",
+            "outer_timeout_seconds",
+            "environment",
+            "resource_request",
+            "image",
+            "network",
+            "network_target",
+        }
+        or sandbox.get("method") != PWN_CRASH_SANDBOX_METHOD
+        or sandbox.get("one_shot") is not PWN_CRASH_ONE_SHOT
+        or type(sandbox.get("outer_timeout_seconds")) is not int
+        or not 1
+        <= sandbox["outer_timeout_seconds"]
+        <= min(10, experiment_timeout_seconds)
+        or type(environment) is not dict
+        or set(environment) != {_PWN_CRASH_FLAG_PATTERNS_ENV}
+        or not patterns_valid
+        or sandbox.get("image")
+        != {
+            "reference": recipe.image_reference,
+            "digest": recipe.image_digest,
+        }
+        or sandbox.get("network") != PWN_CRASH_NETWORK_POLICY
+        or sandbox.get("network_target") is not None
+        or resource_request != expected_resource_request
+    ):
+        return "execution contract sandbox boundary is not exact"
+    if (
+        type(producer) is not dict
+        or producer
+        != {
+            "interpreter_path": PWN_CRASH_PRODUCER_INTERPRETER_PATH,
+            "path": PWN_CRASH_PRODUCER_PATH,
+            "capability_name": PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+            "file_sha256": recipe.producer_file_sha256,
+            "capability_attestation_artifact_id": (
+                capability_artifact.id
+            ),
+            "capability_attestation_sha256": (
+                capability_artifact.sha256
+            ),
+        }
+    ):
+        return "execution contract producer binding is not exact"
+    return None
+
+
+def _revalidate_pwn_crash_gate(
+    record: _LoadedState,
+    experiment: object,
+) -> PwnCrashGateEvaluation:
+    """Rebuild one terminal Pwn gate from independently read durable bytes."""
+
+    state = record.state
+    extra = getattr(experiment, "extra", None)
+    result = getattr(experiment, "result", None)
+    experiment_id = getattr(experiment, "id", None)
+    if (
+        type(extra) is not dict
+        or type(result) is not dict
+        or set(result) != {"pwn_crash_evidence"}
+        or type(experiment_id) is not str
+    ):
+        raise EvaluationInputError(
+            "terminal Pwn crash result does not have an exact envelope"
+        )
+    try:
+        recipe = PwnCrashRecipe.from_dict(extra["pwn_crash_recipe"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise EvaluationInputError(
+            "terminal Pwn crash recipe is invalid"
+        ) from error
+    if recipe.experiment_id != experiment_id:
+        raise EvaluationInputError(
+            "Pwn crash recipe references a different experiment"
+        )
+
+    artifacts = {item.id: item for item in state.artifacts}
+    runs = {item.id: item for item in state.runs}
+    receipts = {item.id: item for item in state.receipts}
+    payload_artifact = artifacts.get(recipe.payload_artifact_id)
+    payload_source_run = runs.get(recipe.payload_source_run_id)
+    if (
+        payload_artifact is None
+        or payload_source_run is None
+        or payload_artifact.source_run_id != payload_source_run.id
+        or payload_artifact.path != recipe.payload_artifact_locator
+        or payload_artifact.sha256 != recipe.payload_sha256
+        or payload_artifact.size != recipe.payload_size_bytes
+    ):
+        raise EvaluationInputError(
+            "Pwn crash payload source-run binding is inconsistent"
+        )
+    payload = _read_verified_reference(
+        record.root,
+        payload_artifact,
+        maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+        display_name="Pwn crash nominated payload",
+    )
+    try:
+        recipe.validate_payload(payload)
+    except (TypeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Pwn crash nominated payload does not match its recipe"
+        ) from error
+
+    evidence = result["pwn_crash_evidence"]
+    if type(evidence) is not dict or set(evidence) != _PWN_CRASH_EVIDENCE_KEYS:
+        raise EvaluationInputError(
+            "Pwn crash evidence envelope schema is not exact"
+        )
+    attempts = evidence.get("attempts")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("protocol") != PWN_CRASH_V1_PROTOCOL
+        or evidence.get("recipe_sha256") != recipe.recipe_sha256
+        or type(attempts) is not list
+        or len(attempts) != PWN_CRASH_V1_ATTEMPT_COUNT
+    ):
+        raise EvaluationInputError(
+            "Pwn crash evidence envelope values are invalid"
+        )
+
+    stdout_payloads: list[bytes] = []
+    receipt_metadata: list[PwnCrashReceiptMetadata] = []
+    capability_artifact: ArtifactReference | None = None
+    shared_gate_binding: dict[str, Any] | None = None
+    shared_flag_environment: dict[str, Any] | None = None
+    seen_ids: set[str] = set()
+    experiment_timeout_seconds = getattr(
+        experiment,
+        "timeout_seconds",
+        None,
+    )
+    if (
+        type(experiment_timeout_seconds) is not int
+        or experiment_timeout_seconds <= 0
+    ):
+        raise EvaluationInputError(
+            "Pwn crash experiment timeout is invalid"
+        )
+    experiment_resource_class = getattr(
+        experiment,
+        "resource_class",
+        None,
+    )
+    if type(experiment_resource_class) is not str:
+        raise EvaluationInputError(
+            "Pwn crash experiment resource class is invalid"
+        )
+    for ordinal, attempt in enumerate(attempts, start=1):
+        if (
+            type(attempt) is not dict
+            or set(attempt) != _PWN_CRASH_ATTEMPT_KEYS
+            or attempt.get("ordinal") != ordinal
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} link is not exact"
+            )
+        run_id = attempt.get("run_id")
+        receipt_id = attempt.get("receipt_id")
+        stdout_id = attempt.get("stdout_artifact_id")
+        if (
+            type(run_id) is not str
+            or type(receipt_id) is not str
+            or type(stdout_id) is not str
+            or run_id in seen_ids
+            or receipt_id in seen_ids
+            or stdout_id in seen_ids
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} reuses an evidence identifier"
+            )
+        seen_ids.update((run_id, receipt_id, stdout_id))
+        run = runs.get(run_id)
+        receipt = receipts.get(receipt_id)
+        stdout_artifact = artifacts.get(stdout_id)
+        if run is None or receipt is None or stdout_artifact is None:
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} lacks durable evidence"
+            )
+        pwn_record = run.extra.get("pwn_crash")
+        if (
+            type(pwn_record) is not dict
+            or set(pwn_record) != _PWN_CRASH_RUN_RECORD_KEYS
+            or receipt.extra.get("pwn_crash") != pwn_record
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} run record is not exact"
+            )
+        try:
+            metadata = PwnCrashReceiptMetadata.from_dict(
+                pwn_record["receipt"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} receipt metadata is invalid"
+            ) from error
+        binding = recipe.attempt_input_binding(ordinal)
+        if (
+            run.extra.get("experiment_id") != experiment_id
+            or run.request_path != f"runs/{run.id}/request.json"
+            or run.configuration_epoch != recipe.configuration_epoch
+            or receipt.experiment_id != experiment_id
+            or receipt.run_id != run.id
+            or receipt.id != metadata.receipt_id
+            or metadata.run_id != run.id
+            or receipt.outcome.value != metadata.outcome
+            or receipt.exit_code != metadata.exit_code
+            or receipt.stdout_artifact_id != stdout_artifact.id
+            or stdout_artifact.source_run_id != run.id
+            or stdout_artifact.sha256
+            != metadata.stdout_artifact_sha256
+            or stdout_artifact.size
+            != metadata.stdout_artifact_size_bytes
+            or metadata.stdout_artifact_id != stdout_artifact.id
+            or pwn_record.get("recipe_sha256")
+            != recipe.recipe_sha256
+            or pwn_record.get("ordinal") != ordinal
+            or pwn_record.get("phase") != binding["phase"]
+            or pwn_record.get("input_sha256")
+            != binding["input_sha256"]
+            or pwn_record.get("input_size_bytes")
+            != binding["input_size_bytes"]
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} state links are inconsistent"
+            )
+
+        stdout_payloads.append(
+            _read_verified_reference(
+                record.root,
+                stdout_artifact,
+                maximum_bytes=PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+                display_name=f"Pwn crash attempt {ordinal} stdout",
+            )
+        )
+        capability_id = metadata.capability_attestation_artifact_id
+        current_capability = artifacts.get(capability_id)
+        if current_capability is None:
+            raise EvaluationInputError(
+                "Pwn crash capability attestation artifact is missing"
+            )
+        if capability_artifact is None:
+            capability_artifact = current_capability
+        elif current_capability.id != capability_artifact.id:
+            raise EvaluationInputError(
+                "Pwn crash attempts use different capability attestations"
+            )
+        if (
+            current_capability.source_run_id is not None
+            or current_capability.sha256
+            != metadata.capability_attestation_sha256
+        ):
+            raise EvaluationInputError(
+                "Pwn crash capability attestation state link is inconsistent"
+            )
+
+        request_payload, _request_metadata = _read_bounded_relative(
+            record.root,
+            run.request_path,
+            maximum_bytes=MAX_PWN_CRASH_REQUEST_BYTES,
+            display_name=f"Pwn crash attempt {ordinal} request",
+        )
+        request_sha256 = hashlib.sha256(request_payload).hexdigest()
+        if (
+            request_sha256 != pwn_record.get("request_sha256")
+            or request_sha256 != metadata.request_sha256
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} request hash changed"
+            )
+        request = _strict_json_bytes(
+            request_payload,
+            f"Pwn crash attempt {ordinal} request",
+        )
+        execution_contract = (
+            request.get("execution_contract")
+            if type(request) is dict
+            else None
+        )
+        execution_contract_sha256 = hashlib.sha256(
+            _pwn_crash_canonical_bytes(execution_contract)
+        ).hexdigest()
+        if (
+            type(request) is not dict
+            or set(request) != _PWN_CRASH_REQUEST_KEYS
+            or request.get("schema_version")
+            != RUN_ENVELOPE_SCHEMA_VERSION
+            or request.get("contest_id") != state.contest_id
+            or request.get("category") != state.category
+            or request.get("challenge_id") != state.challenge_id
+            or request.get("run_id") != run.id
+            or request.get("base_revision") != run.base_revision
+            or type(request.get("created_at")) is not str
+            or request.get("kind") != "pwn_crash_gate"
+            or request.get("experiment_id") != experiment_id
+            or request.get("execution_contract_sha256")
+            != execution_contract_sha256
+            or pwn_record.get("execution_contract")
+            != execution_contract
+            or pwn_record.get("execution_contract_sha256")
+            != execution_contract_sha256
+            or metadata.execution_contract_sha256
+            != execution_contract_sha256
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} request binding is invalid"
+            )
+        contract_error = _pwn_crash_execution_contract_error(
+            execution_contract,
+            recipe=recipe,
+            ordinal=ordinal,
+            capability_artifact=current_capability,
+            experiment_timeout_seconds=experiment_timeout_seconds,
+            experiment_resource_class=experiment_resource_class,
+        )
+        if contract_error is not None:
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} {contract_error}"
+            )
+        current_gate_binding = execution_contract["gate"]
+        if shared_gate_binding is None:
+            shared_gate_binding = dict(current_gate_binding)
+        elif current_gate_binding != shared_gate_binding:
+            raise EvaluationInputError(
+                "Pwn crash attempts changed the shared gate deadline"
+            )
+        current_flag_environment = execution_contract["sandbox"][
+            "environment"
+        ]
+        if shared_flag_environment is None:
+            shared_flag_environment = dict(current_flag_environment)
+        elif current_flag_environment != shared_flag_environment:
+            raise EvaluationInputError(
+                "Pwn crash attempts changed the shared flag environment"
+            )
+        receipt_metadata.append(metadata)
+
+    assert capability_artifact is not None
+    capability_payload = _read_verified_reference(
+        record.root,
+        capability_artifact,
+        maximum_bytes=MAX_PWN_CRASH_CAPABILITY_BYTES,
+        display_name="Pwn crash capability attestation",
+    )
+    capability_value = _strict_json_bytes(
+        capability_payload,
+        "Pwn crash capability attestation",
+    )
+    try:
+        capability = PwnCrashCapabilityAttestation.from_dict(
+            capability_value
+        )
+    except (TypeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Pwn crash capability attestation is invalid"
+        ) from error
+    if (
+        capability.image_digest != recipe.image_digest
+        or capability.recipe_sha256 != recipe.recipe_sha256
+        or capability.canonical_bytes() != capability_payload
+    ):
+        raise EvaluationInputError(
+            "Pwn crash capability attestation does not match its recipe"
+        )
+
+    stored_value = evidence.get("evaluation")
+    try:
+        stored = PwnCrashGateEvaluation.from_dict(stored_value)
+        rebuilt = evaluate_pwn_crash_gate(
+            recipe,
+            poc_input=payload,
+            stdout_payloads=stdout_payloads,
+            receipts=receipt_metadata,
+        )
+    except (TypeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Pwn crash gate evaluation cannot be reconstructed"
+        ) from error
+    expected_status = {
+        "CONFIRMED": ExperimentStatus.KEPT,
+        "INCONCLUSIVE": ExperimentStatus.INCONCLUSIVE,
+        "ERROR": ExperimentStatus.FAILED,
+    }[rebuilt.verdict.value]
+    expected_reason = (
+        f"pwn_crash:{rebuilt.verdict.value}:{rebuilt.reason_code}"
+    )[:512]
+    if (
+        rebuilt.to_dict() != stored.to_dict()
+        or rebuilt.evidence_sha256 != evidence.get("evaluation_sha256")
+        or getattr(experiment, "status", None) is not expected_status
+        or getattr(experiment, "evaluation_reason", None)
+        != expected_reason
+        or getattr(experiment, "evaluated_at", None)
+        != evidence.get("evaluated_at")
+    ):
+        raise EvaluationInputError(
+            "Pwn crash recomputed verdict, hash, or status disagrees"
+        )
+    return rebuilt
+
+
+def _pwn_crash_gate_metric(
+    records: Sequence[_LoadedState],
+    diagnostics: _Diagnostics,
+) -> EvaluationMetric:
+    counts = {
+        "confirmed": 0,
+        "inconclusive": 0,
+        "semantic_error": 0,
+        "transport_error": 0,
+        "setup_failed": 0,
+        "unverifiable": 0,
+    }
+    incomplete = 0
+    typed = 0
+    terminal_statuses = {
+        ExperimentStatus.KEPT,
+        ExperimentStatus.INCONCLUSIVE,
+        ExperimentStatus.FAILED,
+    }
+    for record in records:
+        for experiment in record.state.experiments:
+            if not _pwn_crash_experiment_marker(experiment):
+                continue
+            typed += 1
+            if experiment.status not in terminal_statuses:
+                incomplete += 1
+                continue
+            result = experiment.result
+            if (
+                experiment.status is ExperimentStatus.FAILED
+                and type(result) is dict
+                and set(result) == {"error"}
+                and type(result.get("error")) is str
+                and result["error"].startswith(
+                    "Pwn crash gate failed closed: "
+                )
+            ):
+                counts["setup_failed"] += 1
+                continue
+            try:
+                rebuilt = _revalidate_pwn_crash_gate(
+                    record,
+                    experiment,
+                )
+            except (
+                EvaluationInputError,
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as error:
+                counts["unverifiable"] += 1
+                diagnostics.add(
+                    f"{record.state.identity.key}: Pwn crash gate "
+                    f"{experiment.id} is unverifiable: {error}"
+                )
+                continue
+            if rebuilt.verdict.value == "CONFIRMED":
+                counts["confirmed"] += 1
+            elif rebuilt.verdict.value == "INCONCLUSIVE":
+                counts["inconclusive"] += 1
+            elif rebuilt.transport_error is None:
+                counts["semantic_error"] += 1
+            else:
+                counts["transport_error"] += 1
+
+    if not typed:
+        return _unavailable(
+            "no typed Pwn crash gate experiment is recorded",
+            evidence={**counts, "incomplete": 0},
+        )
+    terminal = sum(counts.values())
+    value = {
+        **counts,
+        "terminal_attempts": terminal,
+        "incomplete": incomplete,
+        "rate": (
+            _round(counts["confirmed"] / terminal)
+            if terminal
+            else None
+        ),
+    }
+    partial_reason = _combine_reasons(
+        (
+            f"{counts['setup_failed']} terminal gate(s) failed during setup"
+            if counts["setup_failed"]
+            else None
+        ),
+        (
+            f"{counts['unverifiable']} terminal gate(s) could not be "
+            "independently revalidated"
+            if counts["unverifiable"]
+            else None
+        ),
+        (
+            f"{incomplete} typed gate(s) are not terminal"
+            if incomplete
+            else None
+        ),
+    )
+    if not terminal:
+        partial_reason = _combine_reasons(
+            "no typed Pwn crash gate has reached a terminal state",
+            partial_reason,
+        )
+    return _metric(
+        value,
+        terminal,
+        partial_reason=partial_reason,
+        evidence={
+            "typed_gate_experiments": typed,
+            "denominator": (
+                "all terminal typed Pwn crash experiments, including "
+                "setup failures and unverifiable results"
+            ),
+        },
+    )
+
+
 def _first_claimed_progress_metric(
     records: Sequence[_LoadedState],
 ) -> EvaluationMetric:
@@ -2073,6 +2940,7 @@ def _empty_metrics(reason: str) -> dict[str, EvaluationMetric]:
         "category_floor",
         "fixed_budget_comparability",
         "clean_reproduction_rate",
+        "pwn_crash_gate_pass_rate",
         "proof_pass_rate",
         "false_proof_count",
         "time_to_first_claimed_progress",
@@ -2201,6 +3069,10 @@ def evaluate_workspace(
     solve_metrics, _invalid_trials = _solve_metrics(loaded)
     metrics = dict(solve_metrics)
     metrics.update(_proof_metrics(loaded, diagnostics))
+    metrics["pwn_crash_gate_pass_rate"] = _pwn_crash_gate_metric(
+        loaded,
+        diagnostics,
+    )
     metrics["human_intervention_count"] = _human_intervention_metric(
         loaded
     )
