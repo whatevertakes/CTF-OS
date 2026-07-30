@@ -1,15 +1,43 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from ctf_os.capabilities import (
+    REQUIRED_MANAGED_ATTESTATIONS,
+    REQUIRED_MANAGED_CAPABILITIES,
+)
 from ctf_os.config import load_config
 from ctf_os.doctor import collect_diagnostics
 
 IMAGE_DIGEST = "sha256:" + "a" * 64
 OTHER_DIGEST = "sha256:" + "b" * 64
+
+
+def capability_manifest(
+    *,
+    missing: frozenset[str] = frozenset(),
+) -> str:
+    records = []
+    for name in sorted(REQUIRED_MANAGED_CAPABILITIES):
+        record = {
+            "name": name,
+            "available": name not in missing,
+        }
+        if name not in missing and name in {
+            "pwn_crash_v1",
+            "rev_inventory_v2",
+            "rev_safe_output",
+            "rev_stdin_exec",
+        }:
+            record["attestation"] = REQUIRED_MANAGED_ATTESTATIONS[name]
+        records.append(record)
+    return json.dumps(
+        {"schema_version": 2, "capabilities": records}
+    )
 
 
 class DoctorTests(unittest.TestCase):
@@ -59,7 +87,11 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(report["image"]["id"], IMAGE_DIGEST)
         self.assertNotIn("error", report["image"])
         self.assertEqual(report["image"]["pin_status"], "unpinned")
-        self.assertTrue(report["ok"])
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["managed_capabilities"]["status"],
+            "blocked",
+        )
 
     def test_image_inspect_uses_bounded_fields_instead_of_truncated_object(
         self,
@@ -111,6 +143,13 @@ class DoctorTests(unittest.TestCase):
                     return subprocess.CompletedProcess(
                         command, 0, f'"{IMAGE_DIGEST}"\n[]', ""
                     )
+                if command[:2] == ["docker", "run"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        capability_manifest(),
+                        "",
+                    )
                 if command[:3] == ["docker", "info", "--format"]:
                     return subprocess.CompletedProcess(command, 0, "{}", "")
                 return subprocess.CompletedProcess(command, 0, "ok", "")
@@ -123,6 +162,58 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(report["image"]["pin_status"], "matched")
         self.assertEqual(report["image"]["execution_reference"], IMAGE_DIGEST)
         self.assertTrue(report["image"]["execution_available"])
+        self.assertEqual(
+            report["managed_capabilities"]["status"],
+            "ready",
+        )
+
+    def test_missing_managed_capability_is_not_false_green(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_root = root / ".ctfos"
+            config_root.mkdir()
+            (config_root / "engine.toml").write_text(
+                f'[runtime]\nimage_digest = "{IMAGE_DIGEST}"\n',
+                encoding="utf-8",
+            )
+
+            def fake_runner(command, **kwargs):
+                if command[:2] == ["docker", "image"]:
+                    return subprocess.CompletedProcess(
+                        command, 0, f'"{IMAGE_DIGEST}"\n[]', ""
+                    )
+                if command[:2] == ["docker", "run"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        capability_manifest(
+                            missing=frozenset({"pwn_crash_v1"})
+                        ),
+                        "",
+                    )
+                if command[:3] == ["docker", "info", "--format"]:
+                    return subprocess.CompletedProcess(command, 0, "{}", "")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+            report = collect_diagnostics(
+                load_config(root), runner=fake_runner, which=lambda name: None
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["managed_capabilities"]["status"],
+            "missing",
+        )
+        self.assertEqual(
+            report["managed_capabilities"]["missing"],
+            ["pwn_crash_v1"],
+        )
+        self.assertTrue(
+            any(
+                "pwn_crash_v1" in item
+                for item in report["warnings"]
+            )
+        )
 
     def test_pinned_tag_mismatch_is_not_false_green(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

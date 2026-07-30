@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from .capabilities import CapabilityError, inspect_pinned_capabilities
 from .config import EngineConfig
 from .container_tools import detect_gpu_plan, detect_kvm
 from .images import (
@@ -125,6 +126,45 @@ def _image_report(
     return report
 
 
+def _managed_capability_report(
+    image: dict[str, Any],
+    *,
+    runner: Runner,
+) -> dict[str, Any]:
+    """Probe the exact execution image used by managed challenge sessions."""
+
+    digest = image.get("configured_digest")
+    if (
+        image.get("execution_available") is not True
+        or image.get("pin_status") != "matched"
+        or not isinstance(digest, str)
+    ):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "error": (
+                "managed readiness requires runtime.image_digest to match "
+                "the local tool image"
+            ),
+        }
+    try:
+        report = inspect_pinned_capabilities(
+            digest,
+            runner=runner,
+        )
+    except CapabilityError as error:
+        return {
+            "ok": False,
+            "status": "probe_failed",
+            "image_digest": digest,
+            "error": str(error)[:1024],
+        }
+    return {
+        **report,
+        "status": "ready" if report.get("ok") is True else "missing",
+    }
+
+
 def collect_diagnostics(
     config: EngineConfig,
     *,
@@ -143,6 +183,10 @@ def collect_diagnostics(
     image = _image_report(
         config,
         docker_available=docker_available,
+        runner=runner,
+    )
+    managed_capabilities = _managed_capability_report(
+        image,
         runner=runner,
     )
     try:
@@ -185,10 +229,31 @@ def collect_diagnostics(
                 "pinned tool image is missing: "
                 f"{config.runtime.image_digest}"
             )
+        if managed_capabilities.get("status") == "blocked":
+            warnings.append(
+                "managed capability readiness is blocked until the local "
+                "tool image is exactly pinned"
+            )
+        elif managed_capabilities.get("status") == "probe_failed":
+            warnings.append(
+                "managed capability readiness probe failed: "
+                f"{managed_capabilities.get('error', 'unknown error')}"
+            )
+        elif managed_capabilities.get("ok") is not True:
+            missing = managed_capabilities.get("missing", [])
+            detail = (
+                ", ".join(str(item) for item in missing)
+                if isinstance(missing, list)
+                else "unknown"
+            )
+            warnings.append(
+                "managed tool image is missing required capabilities: "
+                f"{detail}"
+            )
 
     image_ready = (
         image.get("execution_available") is True
-        and image.get("pin_status") in {"unpinned", "matched"}
+        and image.get("pin_status") == "matched"
     )
 
     report: dict[str, Any] = {
@@ -196,11 +261,13 @@ def collect_diagnostics(
             codex.get("exit_code") == 0
             and docker_available
             and image_ready
+            and managed_capabilities.get("ok") is True
         ),
         "workspace": str(config.workspace_root),
         "codex": codex,
         "docker": docker,
         "image": image,
+        "managed_capabilities": managed_capabilities,
         "gpu": gpu,
         "kvm": kvm,
         "host": {

@@ -74,9 +74,11 @@ proof는 같은 exact image ID를 실행합니다. 이미지를 다시 빌드했
 시작 전에 `ctfos pin-image`를 다시 실행하십시오.
 
 `doctor`는 Codex, Docker, 이미지, GPU/KVM, CPU/RAM/디스크와 정책을
-읽기 전용으로 보고합니다. `doctor --calibrate`도 설정을 자동 변경하지 않고
-권장값만 출력합니다. `ok: true`만 보지 말고 `warnings`에서 이미지 부재와
-image digest 미고정 여부도 확인하십시오.
+읽기 전용으로 보고합니다. 또한 exact local image ID가 현재 tag와 일치하는지,
+Managed 실행에 필요한 capability와 파일 attestation이 실제 pinned image
+안에 모두 있는지를 network-none/read-only probe로 확인합니다.
+`doctor --calibrate`도 설정을 자동 변경하지 않고 권장값만 출력합니다.
+이미지가 미고정이거나 capability가 하나라도 빠지면 `ok`는 false입니다.
 
 Managed 실행에 쓰는 이미지는 tag가 아니라 exact local image ID로 고정합니다.
 최초 `ctfos init` 뒤의 릴리스 순서는
