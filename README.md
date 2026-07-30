@@ -91,8 +91,10 @@ uv run python scripts/check-rev-docker-proof.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 ctfos pin-image
 ctfos doctor
-ctfos preflight 'Demo CTF' rev 'Example'
 ```
+
+challenge preflight는 전역 초기화 명령이 아닙니다. 아래 절차에서 사람이
+해당 challenge를 등록한 뒤 첫 managed model call 전에 실행합니다.
 
 Batch의 논리적 worker 수와 실제 provider 호출 상한은 서로 다른 값입니다.
 
@@ -144,6 +146,12 @@ ctfos add-challenge \
   'Demo CTF' web 'Example' \
   --description '로그인 없이 admin 문서를 읽는 문제' \
   --prompt-file ./prompts/example.txt
+```
+
+등록된 문제의 managed 요구사항은 문제별로 점검합니다.
+
+```sh
+ctfos preflight 'Demo CTF' web 'Example'
 ```
 
 새 문제는 state schema v2와 28,800초 wall budget으로 생성됩니다.
@@ -445,9 +453,11 @@ wave에서 durable candidate 하나와 canonical artifact 하나를
 - 동일 입력 positive 3회 뒤 `xor-first`, `xor-last`, `truncate` control을
   각각 한 번 실행합니다. 빈 입력은 `00`, `0a`, `ff` control을 씁니다.
 - positive의 engine-owned stdout/stderr에 exact candidate가 매번 있어야
-  하고, 세 control에는 없어야 합니다. 정상적인 nonzero control exit은
-  transport failure가 아닙니다.
-- control이 candidate를 출력하면 가설을 반증해 proof experiment를
+  하고, 세 control에는 선택된 candidate뿐 아니라 flag-looking 문자열이
+  하나도 없어야 합니다. 정상적인 nonzero control exit은 transport
+  failure가 아닙니다.
+- positive에서 exact candidate가 빠지거나 control에서 flag-looking
+  문자열이 하나라도 나오면 의미적 반증으로 proof experiment를
   `COMPLETED`로 닫습니다. timeout, exit 125, capture 불완전, stale pin 같은
   구조적 오류는 `FAILED`입니다. 여섯 실행을 모두 통과한 경우만 candidate를
   `READY_TO_SUBMIT`으로 올립니다.
@@ -863,11 +873,13 @@ invalid contract와 사람이 기록한 점수를 계산하며, 근거가 없는
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-최종 수용 기준 인터프리터는 Python `3.13.14`다. Freeze source
-`79cbc53`에서 전체 901개 테스트가 175.985초에 통과했다(측정 wall
-173.51초). 같은 source의 fresh-clone 검증은 901개 테스트와 capability,
-tool manifest, browser safety, Rev inventory/stdin runner, shell syntax를
-모두 통과해 174.631초가 걸렸다(측정 wall 173.83초). 다른 인터프리터
+최종 수용 기준 인터프리터는 Python `3.13.14`다. Managed Rev production
+code freeze `79cbc53`에서 전체 901개 테스트가 175.985초에 통과했다(측정
+wall 173.51초). deterministic remote-limiter test와 release 문서를 포함한
+최종 production/test tree `abdea5b`에서도 fresh-clone의 901개 테스트,
+capability, tool manifest, browser safety, Rev inventory/stdin runner와
+shell/source 검증이 모두 통과했다(테스트 345.999초, 측정 wall 343.54초).
+이후 변경은 이 결과를 설명하는 문서 전용 commit이다. 다른 인터프리터
 결과는 최종 gate에 사용하지 않는다.
 
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
