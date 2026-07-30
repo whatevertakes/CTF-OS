@@ -31,6 +31,7 @@ from ctf_os.engine.web_impact_execution import (
     evaluate_web_impact_execution,
     parse_web_impact_operator_spec,
     plan_web_impact_execution,
+    web_impact_execution_plan_is_canonical,
 )
 
 
@@ -1030,6 +1031,124 @@ class WebImpactExecutionTests(unittest.TestCase):
         self.assertLess(
             len(result.semantic_evaluation.canonical_bytes),
             512 * 1024,
+        )
+
+    def test_boolean_values_never_satisfy_integer_schema_fields(
+        self,
+    ) -> None:
+        operator_cases = []
+        schema = copy.deepcopy(self.operator_document)
+        schema["schema_version"] = True
+        operator_cases.append(schema)
+        generation = copy.deepcopy(self.operator_document)
+        generation["authorized_target"]["generation"] = True
+        operator_cases.append(generation)
+        timeline_ordinal = copy.deepcopy(self.operator_document)
+        timeline_ordinal["timeline"][0]["ordinal"] = True
+        operator_cases.append(timeline_ordinal)
+        timeline_status = copy.deepcopy(self.operator_document)
+        timeline_status["timeline"][0]["expected_status"] = True
+        operator_cases.append(timeline_status)
+        oracle_size = copy.deepcopy(self.operator_document)
+        oracle_size["oracle"]["expected_response_size_bytes"] = True
+        operator_cases.append(oracle_size)
+        for document in operator_cases:
+            with self.subTest(field=document):
+                with self.assertRaises(
+                    WebImpactExecutionPreflightError
+                ):
+                    self._parse(_json_bytes(document))
+
+        receipt = WebImpactExecutionReceipt.from_payload(
+            self.transports[0].receipt_payload
+        )
+        with self.assertRaises(ValueError):
+            replace(receipt, exit_code=True)
+        receipt_document = receipt.to_dict()
+        receipt_document["schema_version"] = True
+        transports = list(self.transports)
+        transports[0] = replace(
+            transports[0],
+            receipt_payload=_json_bytes(receipt_document),
+        )
+        self.assertEqual(
+            self._evaluate(transports=transports).reason_codes,
+            ("replay-1:receipt_document_invalid",),
+        )
+
+        requests = list(self.execution_plan.requests)
+        requests[0] = replace(requests[0], replay_ordinal=True)
+        forged_plan = replace(
+            self.execution_plan,
+            requests=tuple(requests),
+        )
+        self.assertFalse(
+            web_impact_execution_plan_is_canonical(forged_plan)
+        )
+        self.assertEqual(
+            self._evaluate(execution_plan=forged_plan).reason_codes,
+            ("execution_plan_invalid",),
+        )
+
+        scalar_mutations = (
+            {"replay_ordinal": True},
+            {"target_generation": True},
+            {"exit_code": True},
+        )
+        for mutation in scalar_mutations:
+            transports = list(self.transports)
+            transports[0] = replace(
+                transports[0],
+                semantic_observation=replace(
+                    transports[0].semantic_observation,
+                    **mutation,
+                ),
+            )
+            with self.subTest(mutation=mutation):
+                self.assertEqual(
+                    self._evaluate(
+                        transports=transports
+                    ).reason_codes,
+                    (
+                        "replay-1:"
+                        "semantic_observation_shape_invalid",
+                    ),
+                )
+
+        transports = list(self.transports)
+        events = list(transports[0].semantic_observation.timeline)
+        events[0] = replace(events[0], status=True)
+        transports[0] = replace(
+            transports[0],
+            semantic_observation=replace(
+                transports[0].semantic_observation,
+                timeline=tuple(events),
+            ),
+        )
+        self.assertEqual(
+            self._evaluate(transports=transports).reason_codes,
+            ("replay-1:semantic_observation_shape_invalid",),
+        )
+
+        transports = list(self.transports)
+        events = list(transports[0].semantic_observation.timeline)
+        events[0] = replace(
+            events[0],
+            request_artifact=replace(
+                events[0].request_artifact,
+                size_bytes=True,
+            ),
+        )
+        transports[0] = replace(
+            transports[0],
+            semantic_observation=replace(
+                transports[0].semantic_observation,
+                timeline=tuple(events),
+            ),
+        )
+        self.assertEqual(
+            self._evaluate(transports=transports).reason_codes,
+            ("replay-1:semantic_observation_shape_invalid",),
         )
 
 

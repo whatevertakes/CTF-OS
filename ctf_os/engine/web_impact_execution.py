@@ -396,6 +396,7 @@ def parse_web_impact_operator_spec(
     )
     if (
         root["protocol"] != WEB_IMPACT_OPERATOR_SPEC_PROTOCOL
+        or type(root["schema_version"]) is not int
         or root["schema_version"] != WEB_IMPACT_EXECUTION_SCHEMA_VERSION
     ):
         raise WebImpactExecutionPreflightError(
@@ -1035,6 +1036,45 @@ def _observation_is_bounded(
 ) -> bool:
     if (
         type(observation) is not WebImpactReplayObservation
+        or observation.target_kind not in _REPLAY_TARGET_KINDS
+        or type(observation.replay_ordinal) is not int
+        or not 1
+        <= observation.replay_ordinal
+        <= WEB_IMPACT_REPLAY_COUNT
+        or not _valid_id(observation.run_id)
+        or not _valid_id(observation.receipt_id)
+        or not _valid_sha256(observation.receipt_sha256)
+        or not _valid_sha256(observation.replay_nonce_sha256)
+        or not _valid_sha256(observation.identity_epoch_sha256)
+        or not _valid_sha256(
+            observation.execution_contract_sha256
+        )
+        or not _valid_sha256(observation.plan_sha256)
+        or not _valid_sha256(observation.source_manifest_sha256)
+        or not _valid_image_digest(observation.runtime_image_digest)
+        or not _valid_sha256(
+            observation.authorized_target_binding_sha256
+        )
+        or not _valid_generation(observation.target_generation)
+        or type(observation.clean_workspace) is not bool
+        or type(observation.fresh_identity_state) is not bool
+        or type(observation.network_target_authorized) is not bool
+        or type(observation.orchestration_status) is not str
+        or (
+            observation.exit_code is not None
+            and type(observation.exit_code) is not int
+        )
+        or type(observation.timed_out) is not bool
+        or type(observation.capture_complete) is not bool
+        or type(observation.truncation_known) is not bool
+        or (
+            observation.truncated is not None
+            and type(observation.truncated) is not bool
+        )
+        or (
+            observation.capture_error is not None
+            and type(observation.capture_error) is not str
+        )
         or type(observation.timeline) is not tuple
         or not 2
         <= len(observation.timeline)
@@ -1279,6 +1319,7 @@ class WebImpactExecutionReceipt:
         root = _receipt_exact_dict(raw, _RECEIPT_KEYS)
         if (
             root["protocol"] != WEB_IMPACT_EXECUTION_PROTOCOL
+            or type(root["schema_version"]) is not int
             or root["schema_version"]
             != WEB_IMPACT_EXECUTION_SCHEMA_VERSION
         ):
@@ -1755,6 +1796,7 @@ def _preissued_plan_is_canonical(
             or not _valid_sha256(request.replay_nonce_sha256)
             or request.replay_nonce_sha256 in nonce_hashes
             or request.replay_target_kind != expected_kind
+            or type(request.replay_ordinal) is not int
             or request.replay_ordinal != expected_ordinal
             or request.operator_spec_sha256
             != specification.operator_spec_sha256
@@ -1811,6 +1853,20 @@ def _preissued_plan_is_canonical(
     except (AttributeError, TypeError, ValueError):
         return False
     return True
+
+
+def web_impact_execution_plan_is_canonical(
+    execution_plan: object,
+) -> bool:
+    """Return whether every pre-issued request retains its exact contract."""
+
+    try:
+        return (
+            type(execution_plan) is WebImpactExecutionPlan
+            and _preissued_plan_is_canonical(execution_plan)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _semantic_observation_matches(
@@ -2165,6 +2221,7 @@ __all__ = [
     "evaluate_web_impact_execution",
     "parse_web_impact_operator_spec",
     "plan_web_impact_execution",
+    "web_impact_execution_plan_is_canonical",
     "web_impact_artifact_manifest_sha256",
     "web_impact_observation_commitment_sha256",
 ]
