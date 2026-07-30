@@ -43,6 +43,92 @@ def _valid_summary(task_id: str) -> dict[str, object]:
             "submission_count": 0,
             "tamper_controls_rejected": 3,
         }
+    if task_id == "pwn_interaction_effect":
+        return {
+            "authority": {
+                "auto_submit_authorized": False,
+                "candidates_added": 0,
+                "executed_fact_added": 1,
+                "progress_added": 1,
+                "status_changed": False,
+                "submissions_added": 0,
+            },
+            "bindings": {
+                "image_digest": IMAGE_DIGEST,
+                "preissue_sha256": SHA256,
+                "producer_sha256": (
+                    "d2a5a4370242adb0fae75ac4ddc68ffd"
+                    "43952e671ba0abc0ad68f1924423b5b9"
+                ),
+                "recipe_sha256": SHA256,
+                "source_sha256": SHA256,
+            },
+            "evaluation": {
+                "attack_replays": 3,
+                "control_replays": 3,
+                "matched_terminal": True,
+                "passed": True,
+                "reason_code": (
+                    "validated_three_positive_three_control_replays"
+                ),
+                "sha256": SHA256,
+                "unique_sentinels": 6,
+            },
+            "failure_control": {
+                "candidates_added": 0,
+                "facts_added": 0,
+                "failure_mode": "preissue_sha256_tamper",
+                "progress_added": 0,
+                "receipts": 6,
+                "runs_terminal": 6,
+                "state_store_reopen_ok": True,
+                "status": "failed",
+                "terminal": True,
+                "tested": True,
+                "submissions_added": 0,
+            },
+            "image_digest": IMAGE_DIGEST,
+            "network": "none",
+            "ok": True,
+            "parent": {
+                "authority": "canonical_executed_parent_v1",
+                "experiment_id": "E-executed-parent",
+                "fact_id": "F-executed-parent",
+                "run_id": "R-executed-parent",
+            },
+            "preissue": {
+                "preissued_before_first_run": True,
+                "replay_count": 6,
+                "sha256": SHA256,
+                "status": "passed",
+                "terminal": True,
+            },
+            "protocol": "ctfos.pwn.interaction.hotpath.v1",
+            "sandbox": "production_real_docker",
+            "source_challenge": {
+                "category": "pwn",
+                "challenge_id": "interaction",
+                "contest_id": "release",
+                "source_sha256": SHA256,
+            },
+            "transport": {
+                "canonical_scope_fingerprint": SHA256,
+                "fresh_clean_workspaces": 6,
+                "network_none": 6,
+                "one_shot": 6,
+                "physical_identities": [
+                    {
+                        "clean_prefix": f"clean-{ordinal:012x}",
+                        "sandbox_run_id": "producer-run",
+                        "scope_fingerprint": SHA256,
+                    }
+                    for ordinal in range(1, 7)
+                ],
+                "proof_outputs_per_run": 4,
+                "unique_clean_prefix_count": 6,
+                "unique_proof_identity_count": 6,
+            },
+        }
     if task_id == "web_state_impact":
         endpoint_counts = {
             "/admin": 3,
@@ -221,7 +307,11 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
             covered,
             {"pwn", "web", "rev", "crypto", "forensics", "misc"},
         )
-        self.assertEqual(len(release.RELEASE_TASKS), 6)
+        self.assertEqual(len(release.RELEASE_TASKS), 7)
+        self.assertEqual(
+            sum(task.categories == ("pwn",) for task in release.RELEASE_TASKS),
+            2,
+        )
         self.assertEqual(
             sum(task.categories == ("web",) for task in release.RELEASE_TASKS),
             2,
@@ -405,6 +495,8 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
                 summary = _valid_summary(task.id)
                 if task.id == "pwn_dependency_effect":
                     summary["real_clean_proofs"] = 0
+                elif task.id == "pwn_interaction_effect":
+                    summary["failure_control"]["tested"] = False
                 elif task.id == "web_state_impact":
                     summary["control_target"]["extract_status"] = 200
                 elif task.id == "web_active_probe":
@@ -431,6 +523,77 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
                         capture,
                         IMAGE_DIGEST,
                     )
+
+    def test_pwn_interaction_summary_is_exact_and_requires_physical_controls(
+        self,
+    ) -> None:
+        task = next(
+            item
+            for item in release.RELEASE_TASKS
+            if item.id == "pwn_interaction_effect"
+        )
+        valid = _valid_summary(task.id)
+        release._validate_pwn_interaction_summary(valid)
+        mutations = (
+            lambda value: value["evaluation"].__setitem__(
+                "attack_replays",
+                2,
+            ),
+            lambda value: value["transport"]["physical_identities"].__setitem__(
+                5,
+                dict(value["transport"]["physical_identities"][0]),
+            ),
+            lambda value: value["transport"].__setitem__(
+                "unique_clean_prefix_count",
+                5,
+            ),
+            lambda value: value["transport"]["physical_identities"][5].update(
+                {
+                    "clean_prefix": value["transport"][
+                        "physical_identities"
+                    ][0]["clean_prefix"],
+                    "sandbox_run_id": "different-run",
+                }
+            ),
+            lambda value: value["transport"]["physical_identities"][5].update(
+                {"scope_fingerprint": "c" * 64}
+            ),
+            lambda value: value["authority"].__setitem__(
+                "candidates_added",
+                1,
+            ),
+            lambda value: value["failure_control"].__setitem__(
+                "facts_added",
+                1,
+            ),
+            lambda value: value["failure_control"].__setitem__(
+                "state_store_reopen_ok",
+                False,
+            ),
+            lambda value: value["parent"].__setitem__(
+                "authority",
+                "model_claimed",
+            ),
+            lambda value: value["evaluation"].__setitem__(
+                "unexpected",
+                True,
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                summary = _valid_summary(task.id)
+                mutate(summary)
+                with self.assertRaises(release.ReleaseMatrixError):
+                    release._validate_pwn_interaction_summary(summary)
+
+        typed = _valid_summary(task.id)
+        typed["parent"] = {
+            "authority": "typed_pwn_ip_control_v1",
+            "experiment_id": "E-typed-parent",
+            "fact_id": None,
+            "run_id": None,
+        }
+        release._validate_pwn_interaction_summary(typed)
 
     def test_web_impact_summary_keeps_dataflow_authority_false(self) -> None:
         endpoint_counts = {

@@ -31,6 +31,10 @@ PROTOCOL = "ctfos.all_category_release_matrix.v1"
 SCHEMA_VERSION = 1
 IMAGE_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+PWN_INTERACTION_PRODUCER_SHA256 = (
+    "d2a5a4370242adb0fae75ac4ddc68ffd"
+    "43952e671ba0abc0ad68f1924423b5b9"
+)
 CAPTURE_LIMIT_BYTES = 1_048_576
 SUMMARY_LINE_LIMIT_BYTES = 65_536
 REPORT_LIMIT_BYTES = 131_072
@@ -69,6 +73,12 @@ RELEASE_TASKS = (
         id="pwn_dependency_effect",
         categories=("pwn",),
         script="scripts/check-pwn-dependency-hotpath-docker.py",
+        network_contract="none",
+    ),
+    ReleaseTask(
+        id="pwn_interaction_effect",
+        categories=("pwn",),
+        script="scripts/check-pwn-interaction-hotpath-docker.py",
         network_contract="none",
     ),
     ReleaseTask(
@@ -392,6 +402,261 @@ def _validate_pwn_summary(value: dict[str, object]) -> None:
     ):
         raise ReleaseMatrixError(
             "pwn dependency summary did not meet its exact oracle"
+        )
+
+
+def _validate_pwn_interaction_summary(value: dict[str, object]) -> None:
+    root = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "authority",
+                "bindings",
+                "evaluation",
+                "failure_control",
+                "image_digest",
+                "network",
+                "ok",
+                "parent",
+                "preissue",
+                "protocol",
+                "sandbox",
+                "source_challenge",
+                "transport",
+            }
+        ),
+        label="pwn interaction release summary",
+    )
+    source = _exact_mapping(
+        root["source_challenge"],
+        required=frozenset(
+            {
+                "category",
+                "challenge_id",
+                "contest_id",
+                "source_sha256",
+            }
+        ),
+        label="pwn interaction source summary",
+    )
+    bindings = _exact_mapping(
+        root["bindings"],
+        required=frozenset(
+            {
+                "image_digest",
+                "preissue_sha256",
+                "producer_sha256",
+                "recipe_sha256",
+                "source_sha256",
+            }
+        ),
+        label="pwn interaction immutable bindings",
+    )
+    parent = _exact_mapping(
+        root["parent"],
+        required=frozenset(
+            {"authority", "experiment_id", "fact_id", "run_id"}
+        ),
+        label="pwn interaction parent summary",
+    )
+    preissue = _exact_mapping(
+        root["preissue"],
+        required=frozenset(
+            {
+                "preissued_before_first_run",
+                "replay_count",
+                "sha256",
+                "status",
+                "terminal",
+            }
+        ),
+        label="pwn interaction preissue summary",
+    )
+    evaluation = _exact_mapping(
+        root["evaluation"],
+        required=frozenset(
+            {
+                "attack_replays",
+                "control_replays",
+                "matched_terminal",
+                "passed",
+                "reason_code",
+                "sha256",
+                "unique_sentinels",
+            }
+        ),
+        label="pwn interaction evaluation summary",
+    )
+    transport = _exact_mapping(
+        root["transport"],
+        required=frozenset(
+            {
+                "canonical_scope_fingerprint",
+                "fresh_clean_workspaces",
+                "network_none",
+                "one_shot",
+                "physical_identities",
+                "proof_outputs_per_run",
+                "unique_clean_prefix_count",
+                "unique_proof_identity_count",
+            }
+        ),
+        label="pwn interaction transport summary",
+    )
+    authority = _exact_mapping(
+        root["authority"],
+        required=frozenset(
+            {
+                "auto_submit_authorized",
+                "candidates_added",
+                "executed_fact_added",
+                "progress_added",
+                "status_changed",
+                "submissions_added",
+            }
+        ),
+        label="pwn interaction authority summary",
+    )
+    failure = _exact_mapping(
+        root["failure_control"],
+        required=frozenset(
+            {
+                "candidates_added",
+                "facts_added",
+                "failure_mode",
+                "progress_added",
+                "receipts",
+                "runs_terminal",
+                "state_store_reopen_ok",
+                "status",
+                "submissions_added",
+                "terminal",
+                "tested",
+            }
+        ),
+        label="pwn interaction failure control",
+    )
+    physical_identities = transport["physical_identities"]
+    physical_tuples: list[tuple[str, str, str]] = []
+    clean_prefixes: list[str] = []
+    canonical_scope = transport["canonical_scope_fingerprint"]
+    if type(physical_identities) is list:
+        for ordinal, item in enumerate(physical_identities, start=1):
+            identity_record = _exact_mapping(
+                item,
+                required=frozenset(
+                    {
+                        "clean_prefix",
+                        "sandbox_run_id",
+                        "scope_fingerprint",
+                    }
+                ),
+                label=(
+                    "pwn interaction physical identity "
+                    f"{ordinal}"
+                ),
+            )
+            scope = identity_record["scope_fingerprint"]
+            sandbox_run_id = identity_record["sandbox_run_id"]
+            clean_prefix = identity_record["clean_prefix"]
+            if (
+                not _valid_sha256(scope)
+                or scope != canonical_scope
+                or type(sandbox_run_id) is not str
+                or not sandbox_run_id
+                or type(clean_prefix) is not str
+                or re.fullmatch(r"clean-[0-9a-f]{12}", clean_prefix)
+                is None
+            ):
+                raise ReleaseMatrixError(
+                    "pwn interaction physical identity is invalid"
+                )
+            physical_tuples.append(
+                (str(scope), sandbox_run_id, clean_prefix)
+            )
+            clean_prefixes.append(clean_prefix)
+    parent_authority = parent["authority"]
+    parent_pointer_valid = (
+        type(parent["experiment_id"]) is str
+        and bool(parent["experiment_id"])
+        and (
+            (
+                parent_authority == "canonical_executed_parent_v1"
+                and type(parent["run_id"]) is str
+                and bool(parent["run_id"])
+                and type(parent["fact_id"]) is str
+                and bool(parent["fact_id"])
+            )
+            or (
+                parent_authority == "typed_pwn_ip_control_v1"
+                and parent["run_id"] is None
+                and parent["fact_id"] is None
+            )
+        )
+    )
+    if (
+        root["ok"] is not True
+        or root["protocol"] != "ctfos.pwn.interaction.hotpath.v1"
+        or root["network"] != "none"
+        or root["sandbox"] != "production_real_docker"
+        or bindings["image_digest"] != root["image_digest"]
+        or bindings["producer_sha256"]
+        != PWN_INTERACTION_PRODUCER_SHA256
+        or not _valid_sha256(bindings["source_sha256"])
+        or not _valid_sha256(bindings["recipe_sha256"])
+        or not _valid_sha256(bindings["preissue_sha256"])
+        or bindings["source_sha256"] != source["source_sha256"]
+        or bindings["preissue_sha256"] != preissue["sha256"]
+        or source["category"] != "pwn"
+        or type(source["contest_id"]) is not str
+        or not source["contest_id"]
+        or type(source["challenge_id"]) is not str
+        or not source["challenge_id"]
+        or not _valid_sha256(source["source_sha256"])
+        or not parent_pointer_valid
+        or not _valid_sha256(preissue["sha256"])
+        or preissue["status"] != "passed"
+        or preissue["terminal"] is not True
+        or preissue["replay_count"] != 6
+        or preissue["preissued_before_first_run"] is not True
+        or evaluation["passed"] is not True
+        or evaluation["reason_code"]
+        != "validated_three_positive_three_control_replays"
+        or not _valid_sha256(evaluation["sha256"])
+        or evaluation["attack_replays"] != 3
+        or evaluation["control_replays"] != 3
+        or evaluation["unique_sentinels"] != 6
+        or evaluation["matched_terminal"] is not True
+        or not _valid_sha256(canonical_scope)
+        or transport["fresh_clean_workspaces"] != 6
+        or len(physical_tuples) != 6
+        or len(set(physical_tuples)) != 6
+        or len(set(clean_prefixes)) != 6
+        or transport["unique_clean_prefix_count"] != 6
+        or transport["unique_proof_identity_count"] != 6
+        or transport["network_none"] != 6
+        or transport["one_shot"] != 6
+        or transport["proof_outputs_per_run"] != 4
+        or authority["executed_fact_added"] != 1
+        or authority["progress_added"] != 1
+        or authority["candidates_added"] != 0
+        or authority["submissions_added"] != 0
+        or authority["status_changed"] is not False
+        or authority["auto_submit_authorized"] is not False
+        or failure["tested"] is not True
+        or failure["failure_mode"] != "preissue_sha256_tamper"
+        or failure["status"] != "failed"
+        or failure["terminal"] is not True
+        or failure["state_store_reopen_ok"] is not True
+        or failure["runs_terminal"] != 6
+        or failure["receipts"] != 6
+        or failure["facts_added"] != 0
+        or failure["progress_added"] != 0
+        or failure["candidates_added"] != 0
+        or failure["submissions_added"] != 0
+    ):
+        raise ReleaseMatrixError(
+            "pwn interaction summary did not meet its exact 3+3 oracle"
         )
 
 
@@ -802,6 +1067,7 @@ def _validate_child_summary(
         )
     validators = {
         "pwn_dependency_effect": _validate_pwn_summary,
+        "pwn_interaction_effect": _validate_pwn_interaction_summary,
         "web_state_impact": _validate_web_impact_summary,
         "web_active_probe": _validate_web_active_summary,
         "rev_original_binary_acceptance": _validate_rev_summary,
