@@ -109,6 +109,8 @@ class ScaffoldBindingTests(unittest.TestCase):
             ("runtime_image_digest", "sha256:" + SHA_A),
             ("command_contract_sha256", SHA_A),
             ("binding_sha256", SHA_A),
+            ("launched_at", "2026-08-01T00:00:00Z"),
+            ("record_sha256", SHA_A),
         ):
             with self.subTest(field=field):
                 changed = copy.deepcopy(record)

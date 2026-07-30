@@ -163,12 +163,16 @@ class ScaffoldLaunchBinding:
         ).hexdigest()
 
     def to_record(self, *, launched_at: str | None = None) -> dict[str, object]:
-        return {
+        record = {
             "schema_version": SCAFFOLD_LAUNCH_SCHEMA_VERSION,
             **self.core_dict(),
             "binding_sha256": self.binding_sha256,
             "launched_at": launched_at or _now(),
         }
+        record["record_sha256"] = hashlib.sha256(
+            canonical_json_bytes(record)
+        ).hexdigest()
+        return record
 
 
 def build_scaffold_launch_binding(
@@ -272,6 +276,7 @@ def parse_scaffold_launch_record(
         "model_config_sha256",
         "model_id",
         "protocol",
+        "record_sha256",
         "runtime_image_digest",
         "schema_version",
         "session_id",
@@ -331,7 +336,17 @@ def parse_scaffold_launch_record(
         raise ScaffoldBindingError(
             "scaffold launch binding hash does not match"
         )
-    return binding, _utc_timestamp(value["launched_at"])
+    launched_at = _utc_timestamp(value["launched_at"])
+    recorded_hash = _sha256(value["record_sha256"], "record_sha256")
+    hash_input = dict(value)
+    del hash_input["record_sha256"]
+    if recorded_hash != hashlib.sha256(
+        canonical_json_bytes(hash_input)
+    ).hexdigest():
+        raise ScaffoldBindingError(
+            "scaffold launch record hash does not match"
+        )
+    return binding, launched_at
 
 
 def validate_scaffold_launch_record(
