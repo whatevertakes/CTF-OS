@@ -56,6 +56,12 @@ dispatch를 확인하고, stale adapter seed와 shell-text/direct-argv 계약
 불일치를 새 실전 병목으로 고정한 기록입니다. 성공 exit code가 곧 target
 관측 증거가 아니라는 판정은 18을 따릅니다.
 
+19는 18에서 찾은 stale binding과 shell contract 병목을 수정한 뒤 같은
+`zone`을 다시 실행한 회귀입니다. 세 selected action이 모두 실제 bounded
+artifact를 만들었지만 sandbox-local locator 충돌이 false stall을 만든
+새 병목과, 아직 semantic evaluation 전이므로 solve로 집계할 수 없다는
+경계를 기록합니다.
+
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
 12는 확정 계약을 현재 증거로 수용할 수 있는지를 기록합니다. 운영 명령은
@@ -72,6 +78,7 @@ dispatch를 확인하고, stale adapter seed와 shell-text/direct-argv 계약
 - [16. Pwn crash 실행 게이트와 실패 재투입 구현 기록](16-pwn-crash-gate-and-failure-replay.md) — engine-owned 3+3 D→V oracle, stdout/stderr commit 재검증, typed non-pass failure capsule, 1,536-byte resume와 독립 평가 metric의 현재 구현 및 아직 남은 leak/primitive/exploit 경계를 기록합니다 (구현·검증일 2026-07-30)
 - [17. Pwn runtime readiness와 address-resolution advisory](17-pwn-runtime-readiness-and-address-advisory.md) — stale image와 piped core handler 병목을 닫고 실제 Docker 3+3 및 보안 반례를 검증한 결과, source/evidence-bound advisory가 global leak N/A나 stage pass 권한을 갖지 않는 경계를 기록합니다 (구현·검증일 2026-07-30)
 - [18. Zone one-cycle live diagnostic](18-zone-one-cycle-live-diagnostic.md) — 개선된 all-Sol 엔진으로 `zone` 한 cycle을 재실행해 stale adapter seed와 managed shell/argv 의미 불일치가 target 관측을 막는 실제 병목임을 고정합니다 (관측일 2026-07-30)
+- [19. Zone shell-contract live regression](19-zone-shell-contract-live-regression.md) — stale action retirement와 managed shell contract가 실제 bounded output을 만든 회귀, sandbox-local artifact locator 충돌의 false stall, semantic evaluation 전 결과를 solve로 세지 않는 경계를 기록합니다 (관측일 2026-07-30)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
