@@ -46,6 +46,7 @@ from ctf_os.sandbox.files import (
     WorkTreeLimitError,
     copy_bounded_regular,
     measure_work_tree,
+    read_bounded_regular,
 )
 from ctf_os.sandbox.types import (
     BackgroundJobUnsupported,
@@ -3103,6 +3104,181 @@ class SandboxTests(unittest.TestCase):
             list(destination.parent.glob(".*.tmp")),
             [],
         )
+
+    def test_bounded_read_requires_exact_stable_binding(self) -> None:
+        source_root = self.root / "bounded-read-source"
+        source = source_root / "nested" / "source.bin"
+        source.parent.mkdir(parents=True)
+        payload = b"exact bounded artifact"
+        source.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+
+        self.assertEqual(
+            read_bounded_regular(
+                source_root,
+                "nested/source.bin",
+                maximum_bytes=len(payload),
+                expected_sha256=digest.upper(),
+                expected_size=len(payload),
+            ),
+            payload,
+        )
+        empty = source_root / "empty.bin"
+        empty.write_bytes(b"")
+        self.assertEqual(
+            read_bounded_regular(
+                source_root,
+                empty.name,
+                maximum_bytes=1,
+                expected_sha256=hashlib.sha256(b"").hexdigest(),
+                expected_size=0,
+            ),
+            b"",
+        )
+        with self.assertRaisesRegex(SafeFileError, "size.*binding"):
+            read_bounded_regular(
+                source_root,
+                "nested/source.bin",
+                maximum_bytes=len(payload) + 1,
+                expected_sha256=digest,
+                expected_size=len(payload) + 1,
+            )
+        with self.assertRaisesRegex(SafeFileError, "hash.*binding"):
+            read_bounded_regular(
+                source_root,
+                "nested/source.bin",
+                maximum_bytes=len(payload),
+                expected_sha256="0" * 64,
+                expected_size=len(payload),
+            )
+
+    def test_bounded_read_rejects_symlinks_and_non_regular_files(
+        self,
+    ) -> None:
+        source_root = self.root / "bounded-read-hostile"
+        source_root.mkdir()
+        outside = self.root / "bounded-read-outside"
+        outside.mkdir()
+        target = outside / "target.bin"
+        target.write_bytes(b"outside")
+        digest = hashlib.sha256(b"outside").hexdigest()
+        (source_root / "leaf-link").symlink_to(target)
+        (source_root / "directory-link").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+        fifo = source_root / "source.fifo"
+        os.mkfifo(fifo)
+
+        for locator in (
+            "leaf-link",
+            "directory-link/target.bin",
+            "source.fifo",
+        ):
+            with self.subTest(locator=locator):
+                with self.assertRaisesRegex(
+                    SafeFileError,
+                    "safely|regular",
+                ):
+                    read_bounded_regular(
+                        source_root,
+                        locator,
+                        maximum_bytes=64,
+                        expected_sha256=digest,
+                        expected_size=len(b"outside"),
+                    )
+
+    def test_bounded_read_rejects_same_size_mutation_during_read(
+        self,
+    ) -> None:
+        source_root = self.root / "bounded-read-race"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        original = b"original"
+        replacement = b"mutated!"
+        self.assertEqual(len(original), len(replacement))
+        source.write_bytes(original)
+        real_read = sandbox_files.os.read
+        mutated = False
+
+        def mutate_after_read(descriptor, size):
+            nonlocal mutated
+            block = real_read(descriptor, size)
+            if block and not mutated:
+                mutated = True
+                source.write_bytes(replacement)
+            return block
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "read",
+                side_effect=mutate_after_read,
+            ),
+            self.assertRaisesRegex(
+                SafeFileError,
+                "changed while reading",
+            ),
+        ):
+            read_bounded_regular(
+                source_root,
+                source.name,
+                maximum_bytes=len(original),
+                expected_sha256=hashlib.sha256(original).hexdigest(),
+                expected_size=len(original),
+            )
+        self.assertTrue(mutated)
+
+    def test_bounded_read_closes_source_descriptor_on_read_error(
+        self,
+    ) -> None:
+        source_root = self.root / "bounded-read-error"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        payload = b"read failure"
+        source.write_bytes(payload)
+        real_open = sandbox_files.os.open
+        source_descriptor: int | None = None
+
+        def traced_open(path, flags, *args, **kwargs):
+            nonlocal source_descriptor
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if (
+                str(path) == source.name
+                and kwargs.get("dir_fd") is not None
+                and not flags & os.O_DIRECTORY
+            ):
+                source_descriptor = descriptor
+            return descriptor
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "open",
+                side_effect=traced_open,
+            ),
+            patch.object(
+                sandbox_files.os,
+                "read",
+                side_effect=OSError("synthetic bounded read failure"),
+            ),
+            self.assertRaisesRegex(
+                SafeFileError,
+                "bounded source read failed",
+            ),
+        ):
+            read_bounded_regular(
+                source_root,
+                source.name,
+                maximum_bytes=len(payload),
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                expected_size=len(payload),
+            )
+
+        assert source_descriptor is not None
+        with self.assertRaises(OSError) as closed:
+            os.fstat(source_descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_bounded_copy_removes_partial_file_when_size_limit_is_hit(
         self,

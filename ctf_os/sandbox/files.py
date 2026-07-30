@@ -598,6 +598,110 @@ def _open_relative_regular(
     return source_descriptor, opened, normalized
 
 
+def read_bounded_regular(
+    root: Path,
+    locator: str,
+    *,
+    maximum_bytes: int,
+    expected_sha256: str,
+    expected_size: int,
+) -> bytes:
+    """Read one exactly bound regular file without following path symlinks.
+
+    The source is opened component-by-component, read through the resulting
+    descriptor in bounded chunks, and accepted only when its identity and
+    mutation-sensitive metadata remain stable for the whole read.
+    """
+
+    _validate_maximum_bytes(maximum_bytes)
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_sha256
+        )
+    ):
+        raise ValueError("expected_sha256 must be a SHA-256 digest")
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 0
+        or expected_size > maximum_bytes
+    ):
+        raise ValueError("expected_size is outside the read bound")
+
+    source_descriptor: int | None = None
+    owned_source_descriptors: _OwnedDescriptors = {}
+    digest = hashlib.sha256()
+    payload = bytearray()
+    try:
+        source_descriptor, before, _normalized = _open_relative_regular(
+            root,
+            locator,
+            maximum_bytes=maximum_bytes,
+            owned_source_descriptors=owned_source_descriptors,
+        )
+        if before.st_size != expected_size:
+            raise SafeFileError(
+                "bounded source size does not match its expected binding"
+            )
+        while True:
+            remaining = maximum_bytes - len(payload)
+            block = os.read(
+                source_descriptor,
+                min(_COPY_CHUNK_BYTES, remaining + 1),
+            )
+            if not block:
+                break
+            if len(payload) + len(block) > maximum_bytes:
+                raise SafeFileError(
+                    "bounded source grew beyond its size limit"
+                )
+            payload.extend(block)
+            digest.update(block)
+
+        after = os.fstat(source_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            len(payload) != before.st_size
+            or any(
+                getattr(after, field) != getattr(before, field)
+                for field in stable_fields
+            )
+        ):
+            raise SafeFileError("bounded source changed while reading")
+        if len(payload) != expected_size:
+            raise SafeFileError(
+                "bounded source size does not match its expected binding"
+            )
+        if digest.hexdigest() != expected_sha256.lower():
+            raise SafeFileError(
+                "bounded source hash does not match its expected binding"
+            )
+        return bytes(payload)
+    except OSError as error:
+        raise SafeFileError("bounded source read failed") from error
+    finally:
+        active_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            _close_owned_descriptors(owned_source_descriptors)
+        except BaseException as error:
+            cleanup_errors.append(("source descriptor", error))
+        _resolve_cleanup_errors(
+            active_error,
+            cleanup_errors,
+            context="bounded source read",
+        )
+
+
 def copy_bounded_regular(
     source_root: Path,
     source_locator: str,
