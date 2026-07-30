@@ -392,6 +392,42 @@ pin match, 필수 capability 9/9, attestation error 0, warning 0으로
 통과했다. 이 검증은 x86-64 WSL2에서 수행했다. aarch64 seccomp 상수와
 계약은 고정했지만 aarch64 runtime 실행을 검증했다는 뜻은 아니다.
 
+## 2026-07-30 Managed Pwn runtime snapshot 재빌드
+
+확인된 crash payload를 한 번만 재실행해 fault-stop 시점의 register와
+`/proc/<pid>/maps`를 bounded canonical JSON으로 보존하는
+`pwn_runtime_snapshot_v1` producer를 추가하고 이미지를 다시 빌드했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:b35630c32f0ff00af423e81264a4ef57a56244fc5d0282d99aa505b4b9a6a5aa` |
+| 생성 시각 | `2026-07-30T17:06:46.806479955+09:00` |
+| Docker inspect Size | 12,512,569,327 bytes |
+| capability manifest | schema v2, 10개 중 10개 사용 가능 |
+| snapshot producer SHA-256 | `e9d0927e42258a589d17b02f94071379ea015b040051a405cda455ba14879d97` |
+| snapshot contract fingerprint | `0b008ed31cd7daf240bf2d96f76c5ce1ac3b340bb5425bfd56fe0fe55f956d4a` |
+
+실제 `DockerSandboxBackend.run_clean_proof`에서 network none, read-only
+challenge/root와 서로 다른 clean workspace를 사용해 다음을 확인했다.
+
+- 동일 crash payload의 snapshot 3/3이 `CAPTURED`
+- RIP는 executable mapping, RSP는 `[stack]` mapping에 포함
+- maps의 SHA-256, byte size, LF line count와 마지막 LF가 일치
+- descendant, shared-mm descendant와 target self re-exec는 fail-closed
+- 여섯 workspace 모두 `.proof-live` residue 없음
+- 같은 이미지의 Pwn crash positive/control 3+3과 Managed Rev
+  positive/negative 3+3도 재통과
+
+엔진 경로에서도 confirmed crash가 다음 pass의 deterministic diagnostic
+child를 만들고, exact image/capability와 network-none clean execution을
+거쳐 `CAPTURED` terminal state와 별도 run/receipt/stdout/stderr/capability
+evidence를 남기는 것을 확인했다. snapshot은 exploit primitive나 solve
+proof로 승격되지 않는 진단 증거다.
+
+`ctfos pin-image` 뒤 exact ID가 local config에 기록됐고 `ctfos doctor`는
+pin match, 필수 capability 10/10, attestation error 0, warning 0으로
+통과했다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를

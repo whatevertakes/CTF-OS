@@ -1009,6 +1009,16 @@ core-file 비의존 Pwn observer와 address-resolution advisory를 포함한
 `76bb84a`의 fresh clone에서도 같은 1,025개와 capability/browser/Pwn/Rev
 source gate가 모두 통과했다(측정 wall 225.78초, exit 0).
 
+Pwn runtime snapshot lifecycle/state/context를 연결한 `0456eeb`에서는
+전체 1,060개 테스트가 461.378초에 통과했다. 같은 commit의 fresh-clone
+source gate에서도 capability contract, tool manifest, browser safety,
+Pwn crash 16개, Pwn snapshot 14개, Rev inventory 13개, Rev stdin 17개와
+shell/source 검증이 모두 통과했다(측정 wall 454.71초, exit 0). 실제
+Docker snapshot 3/3과 안전 probe, Pwn crash/Rev control 재검증은 exact
+local image
+`sha256:b35630c32f0ff00af423e81264a4ef57a56244fc5d0282d99aa505b4b9a6a5aa`
+에서 별도로 통과했다.
+
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
 동작을 검증하지만 실제 Codex 계정과 실제 대회 서버를 사용하는 end-to-end
 성공을 보증하지 않습니다. Luna의 좁은 `agent.flag` model probe는 통과했지만
