@@ -58,6 +58,19 @@ _BASES = (
     0x7F5300000000,
 )
 _RELATIVE_OFFSET = 0x1234
+_PREEXISTING_ARTIFACT_IDS = tuple(sorted((
+    "A-payload",
+    "A-crash-capability",
+    "A-crash-stdout-1",
+    "A-crash-stderr-1",
+    "A-crash-stdout-2",
+    "A-crash-stderr-2",
+    "A-crash-stdout-3",
+    "A-crash-stderr-3",
+    "A-snapshot-capability",
+    "A-snapshot-stdout",
+    "A-snapshot-stderr",
+)))
 
 
 def _snapshot_receipt(
@@ -272,6 +285,7 @@ def _trusted_expectation(
     return build_pwn_leak_trusted_replay_expectation(
         replay_recipes=tuple(replay.recipe for replay in replays),
         preissued_identities=_preissued_identities(replays),
+        preexisting_artifact_ids=_PREEXISTING_ARTIFACT_IDS,
     )
 
 
@@ -614,6 +628,35 @@ class PwnLeakTests(unittest.TestCase):
                     replay.recipe for replay in replays
                 ),
                 preissued_identities=tuple(identities),
+                preexisting_artifact_ids=(
+                    _PREEXISTING_ARTIFACT_IDS
+                ),
+            )
+
+    def test_preissued_expectation_rejects_prior_artifact_collision(
+        self,
+    ) -> None:
+        _, recipe, _, plan = _baseline()
+        replays = _replays(plan, recipe)
+        identities = list(_preissued_identities(replays))
+        identities[0] = replace(
+            identities[0],
+            capability_attestation_artifact_id=(
+                "A-snapshot-capability"
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "artifact identity collision",
+        ):
+            build_pwn_leak_trusted_replay_expectation(
+                replay_recipes=tuple(
+                    replay.recipe for replay in replays
+                ),
+                preissued_identities=tuple(identities),
+                preexisting_artifact_ids=(
+                    _PREEXISTING_ARTIFACT_IDS
+                ),
             )
 
     def test_receipt_must_match_preissued_request_and_artifact_ids(
@@ -705,6 +748,108 @@ class PwnLeakTests(unittest.TestCase):
 
         result_document = copy.deepcopy(result.to_dict())
         result_document["authorities"]["primitive_proven"] = True
+        with self.assertRaises(ValueError):
+            PwnLeakResult.from_dict(
+                result_document,
+                expected_result=result,
+            )
+
+    def test_json_bool_integer_aliases_are_rejected(self) -> None:
+        baseline = _baseline()
+        _, recipe, _, plan = baseline
+        replays = _replays(plan, recipe)
+        expectation = _trusted_expectation(replays)
+        result = _evaluate(
+            baseline,
+            replays,
+            trusted_replay_expectation=expectation,
+        )
+
+        plan_document = copy.deepcopy(plan.to_dict())
+        plan_document["schema_version"] = True
+        unsigned = dict(plan_document)
+        unsigned.pop("recipe_sha256")
+        plan_document["recipe_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    unsigned,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        with self.assertRaises(ValueError):
+            validate_pwn_leak_plan_document(plan_document)
+
+        plan_document = copy.deepcopy(plan.to_dict())
+        plan_document["contract"]["version"] = True
+        unsigned = dict(plan_document)
+        unsigned.pop("recipe_sha256")
+        plan_document["recipe_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    unsigned,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        with self.assertRaises(ValueError):
+            validate_pwn_leak_plan_document(plan_document)
+
+        plan_document = copy.deepcopy(plan.to_dict())
+        plan_document["replays"][0]["ordinal"] = True
+        unsigned = dict(plan_document)
+        unsigned.pop("recipe_sha256")
+        plan_document["recipe_sha256"] = hashlib.sha256(
+            (
+                json.dumps(
+                    unsigned,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        with self.assertRaises(ValueError):
+            validate_pwn_leak_plan_document(plan_document)
+
+        expectation_document = copy.deepcopy(expectation.to_dict())
+        expectation_document["schema_version"] = True
+        with self.assertRaises(ValueError):
+            PwnLeakTrustedReplayExpectation.from_dict(
+                expectation_document
+            )
+
+        result_document = copy.deepcopy(result.to_dict())
+        result_document["schema_version"] = True
+        with self.assertRaises(ValueError):
+            PwnLeakResult.from_dict(
+                result_document,
+                expected_result=result,
+            )
+
+        result_document = copy.deepcopy(result.to_dict())
+        result_document["contract"]["version"] = True
+        with self.assertRaises(ValueError):
+            PwnLeakResult.from_dict(
+                result_document,
+                expected_result=result,
+            )
+
+        result_document = copy.deepcopy(result.to_dict())
+        result_document["authorities"] = {
+            key: int(value)
+            for key, value in result_document["authorities"].items()
+        }
         with self.assertRaises(ValueError):
             PwnLeakResult.from_dict(
                 result_document,

@@ -23,9 +23,12 @@ satisfaction, stage advancement, or submission authority.
 The engine/store boundary remains part of the trust model: it must persist
 the preissued expectation before starting any replay and supply receipts from
 the challenge sandbox rather than rebuilding an expectation from selected
-outputs.  This pure evaluator can reject direct encodings and use a
-same-input control, but it is not a causal taint tracker and does not claim to
-exclude every target-computed transformation of input bytes.
+outputs.  Each preissued request and execution-contract hash must commit to
+the exact canonical request document already persisted by the engine; this
+pure evaluator cannot establish that temporal fact from a hash label alone.
+It can reject direct encodings and use a same-input control, but it is not a
+causal taint tracker and does not claim to exclude every target-computed
+transformation of input bytes.
 """
 
 from __future__ import annotations
@@ -183,7 +186,7 @@ _TRUST_BINDING_KEYS = frozenset(
     }
 )
 _TRUST_EXPECTATION_KEYS = frozenset(
-    {"replays", "schema_version"}
+    {"preexisting_artifact_ids", "replays", "schema_version"}
 )
 _PREISSUED_IDENTITY_KEYS = frozenset(
     {
@@ -325,6 +328,9 @@ def pwn_leak_contract_descriptor() -> dict[str, object]:
             "result_max_bytes": PWN_LEAK_MAX_RESULT_BYTES,
         },
         "replay": {
+            "artifact_identity_scope": (
+                "all-preexisting-and-replay-artifact-identities"
+            ),
             "clean_workspace": True,
             "count": PWN_LEAK_REPLAY_COUNT,
             "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
@@ -537,12 +543,14 @@ def validate_pwn_leak_plan_document(
         or set(binding) != _PLAN_BINDING_KEYS
         or type(contract) is not dict
         or set(contract) != _CONTRACT_KEYS
+        or type(contract.get("version")) is not int
         or contract
         != {
             "fingerprint": PWN_LEAK_CONTRACT_FINGERPRINT,
             "id": PWN_LEAK_CONTRACT_ID,
             "version": PWN_LEAK_CONTRACT_VERSION,
         }
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != PWN_LEAK_SCHEMA_VERSION
         or value.get("derivation_algorithm") != _DERIVATION_ALGORITHM
         or type(replays) is not list
@@ -592,7 +600,9 @@ def validate_pwn_leak_plan_document(
         if (
             type(replay) is not dict
             or set(replay) != _PLAN_REPLAY_KEYS
+            or type(replay.get("ordinal")) is not int
             or replay.get("ordinal") != ordinal
+            or type(replay.get("input_size_bytes")) is not int
             or replay.get("input_size_bytes") != size
             or not _sha256(replay.get("input_sha256"))
             or not _sha256(replay.get("nonce_sha256"))
@@ -903,16 +913,28 @@ class PwnLeakTrustedReplayExpectation:
     """Engine-issued trust anchor persisted before target execution.
 
     Build this from exact replay recipes and preissued run/request/artifact
-    identities, persist it in canonical engine state, and only then execute
-    the three runs.  Building it after observing target output defeats the
-    anti-cherry-picking boundary and is unsupported.
+    identities plus the sorted IDs of every artifact already in canonical
+    state.  Persist it and the exact request documents in canonical engine
+    state, and only then execute the three runs.  Building it after observing
+    target output defeats the anti-cherry-picking boundary and is unsupported.
     """
 
+    preexisting_artifact_ids: tuple[str, ...]
     replays: tuple[PwnLeakTrustedReplayBinding, ...]
 
     def __post_init__(self) -> None:
         if (
-            type(self.replays) is not tuple
+            type(self.preexisting_artifact_ids) is not tuple
+            or not self.preexisting_artifact_ids
+            or any(
+                not _identifier(item)
+                for item in self.preexisting_artifact_ids
+            )
+            or len(set(self.preexisting_artifact_ids))
+            != len(self.preexisting_artifact_ids)
+            or self.preexisting_artifact_ids
+            != tuple(sorted(self.preexisting_artifact_ids))
+            or type(self.replays) is not tuple
             or len(self.replays) != PWN_LEAK_REPLAY_COUNT
             or any(
                 type(item) is not PwnLeakTrustedReplayBinding
@@ -953,12 +975,20 @@ class PwnLeakTrustedReplayExpectation:
                 replay.output_artifact_id,
             )
         )
-        if len(set(artifact_ids)) != len(artifact_ids):
+        if (
+            len(set(artifact_ids)) != len(artifact_ids)
+            or not set(artifact_ids).isdisjoint(
+                self.preexisting_artifact_ids
+            )
+        ):
             raise ValueError("trusted Pwn leak artifact identity collision")
         self.canonical_bytes()
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "preexisting_artifact_ids": list(
+                self.preexisting_artifact_ids
+            ),
             "replays": [item.to_dict() for item in self.replays],
             "schema_version": PWN_LEAK_SCHEMA_VERSION,
         }
@@ -981,12 +1011,17 @@ class PwnLeakTrustedReplayExpectation:
         if (
             type(value) is not dict
             or set(value) != _TRUST_EXPECTATION_KEYS
+            or type(value.get("schema_version")) is not int
             or value.get("schema_version") != PWN_LEAK_SCHEMA_VERSION
+            or type(value.get("preexisting_artifact_ids")) is not list
             or type(value.get("replays")) is not list
             or len(value["replays"]) != PWN_LEAK_REPLAY_COUNT
         ):
             raise ValueError("invalid trusted Pwn leak expectation")
         result = cls(
+            preexisting_artifact_ids=tuple(
+                value["preexisting_artifact_ids"]
+            ),
             replays=tuple(
                 PwnLeakTrustedReplayBinding.from_dict(item)
                 for item in value["replays"]
@@ -1026,8 +1061,15 @@ def build_pwn_leak_trusted_replay_expectation(
     *,
     replay_recipes: tuple[PwnRuntimeSnapshotRecipe, ...],
     preissued_identities: tuple[PwnLeakPreissuedReplayIdentity, ...],
+    preexisting_artifact_ids: tuple[str, ...],
 ) -> PwnLeakTrustedReplayExpectation:
-    """Build the canonical trust anchor before executing the target."""
+    """Build the canonical trust anchor before executing the target.
+
+    The caller must derive ``preissued_identities`` from exact canonical
+    request documents and persist both those documents and the returned
+    expectation before starting replay one.  Hash labels alone cannot prove
+    this ordering inside a pure evaluator.
+    """
 
     if (
         type(replay_recipes) is not tuple
@@ -1042,6 +1084,11 @@ def build_pwn_leak_trusted_replay_expectation(
             type(item) is not PwnLeakPreissuedReplayIdentity
             for item in preissued_identities
         )
+        or type(preexisting_artifact_ids) is not tuple
+        or not preexisting_artifact_ids
+        or any(not _identifier(item) for item in preexisting_artifact_ids)
+        or len(set(preexisting_artifact_ids))
+        != len(preexisting_artifact_ids)
         or tuple(item.ordinal for item in preissued_identities)
         != tuple(range(1, PWN_LEAK_REPLAY_COUNT + 1))
     ):
@@ -1068,6 +1115,9 @@ def build_pwn_leak_trusted_replay_expectation(
     ):
         raise ValueError("trusted Pwn leak run binding mismatch")
     result = PwnLeakTrustedReplayExpectation(
+        preexisting_artifact_ids=tuple(
+            sorted(preexisting_artifact_ids)
+        ),
         replays=tuple(
             _trusted_replay_binding(recipe, identity)
             for recipe, identity in zip(
@@ -1233,6 +1283,7 @@ class PwnLeakResult:
     def __post_init__(self) -> None:
         if (
             type(self.status) is not PwnLeakStatus
+            or type(self.reason_code) is not str
             or (
                 self.status is PwnLeakStatus.PROVEN
                 and self.reason_code != _PROVEN_REASON
@@ -1473,6 +1524,7 @@ class PwnLeakResult:
         replays = value.get("replays")
         if (
             type(authorities) is not dict
+            or any(type(item) is not bool for item in authorities.values())
             or authorities
             != {
                 **_AUTHORITIES_FALSE,
@@ -1481,6 +1533,7 @@ class PwnLeakResult:
             or type(binding) is not dict
             or set(binding) != _RESULT_BINDING_KEYS
             or type(contract) is not dict
+            or type(contract.get("version")) is not int
             or contract
             != {
                 "fingerprint": PWN_LEAK_CONTRACT_FINGERPRINT,
@@ -1490,7 +1543,10 @@ class PwnLeakResult:
             or type(summary) is not dict
             or set(summary) != _SUMMARY_KEYS
             or type(replays) is not list
+            or type(value.get("schema_version")) is not int
             or value.get("schema_version") != PWN_LEAK_SCHEMA_VERSION
+            or type(value.get("status")) is not str
+            or type(value.get("reason_code")) is not str
         ):
             raise ValueError("invalid Pwn leak result schema")
         try:
