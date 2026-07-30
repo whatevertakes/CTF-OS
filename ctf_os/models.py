@@ -5292,6 +5292,21 @@ def _web_impact_state_marker(value: object) -> bool:
     )
 
 
+def _pwn_exploit_effect_state_marker(value: object) -> bool:
+    """Identify the exact multi-replay Pwn E graph for later validation."""
+
+    extra = getattr(value, "extra", None)
+    return (
+        type(extra) is dict
+        and (
+            extra.get("engine_executor")
+            == "ctfos.pwn.exploit_effect.hotpath.v1"
+            or "pwn_exploit_effect_replay" in extra
+            or "pwn_exploit_effect" in extra
+        )
+    )
+
+
 def _pwn_crash_safe_locator(value: object) -> bool:
     if (
         type(value) is not str
@@ -14058,6 +14073,9 @@ class ChallengeState:
                                 )
                             )
                             and not _web_impact_state_marker(experiment)
+                            and not _pwn_exploit_effect_state_marker(
+                                experiment
+                            )
                         )
                     )
                 ):

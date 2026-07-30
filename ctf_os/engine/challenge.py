@@ -23818,6 +23818,30 @@ class ChallengeEngine:
                 else:
                     raise cleanup_error
 
+    def prove_pwn_exploit_effect(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        parent_experiment_id: str,
+        payload_locator: str,
+        timeout_seconds: int = 300,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, Any]:
+        """Run one pre-issued local Pwn primitive-to-effect replay matrix."""
+
+        from ctf_os.engine.pwn_exploit_effect_hotpath import (
+            prove_pwn_exploit_effect,
+        )
+
+        return prove_pwn_exploit_effect(
+            self,
+            identity,
+            parent_experiment_id=parent_experiment_id,
+            payload_locator=payload_locator,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
     def prove_web_impact(
         self,
         identity: ChallengeIdentity,

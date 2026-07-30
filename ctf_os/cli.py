@@ -997,6 +997,26 @@ def build_parser() -> argparse.ArgumentParser:
     prove.add_argument("--repetitions", type=int)
     prove.add_argument("proof_command", nargs=argparse.REMAINDER)
 
+    pwn_effect = commands.add_parser(
+        "pwn-prove-effect",
+        help=(
+            "검증된 RIP-control 부모와 정적 payload를 사전 발행한 뒤 "
+            "network-denied 원본 3회 + control 3회로 exploit effect 검증"
+        ),
+    )
+    _identity_values(pwn_effect)
+    pwn_effect.add_argument(
+        "--parent",
+        required=True,
+        help="완료된 Pwn instruction-pointer-control experiment ID",
+    )
+    pwn_effect.add_argument(
+        "--payload",
+        required=True,
+        help="challenge workspace 안의 정적 exploit payload locator",
+    )
+    pwn_effect.add_argument("--timeout", type=int, default=300)
+
     web_prove = commands.add_parser(
         "web-prove",
         help=(
@@ -1885,6 +1905,30 @@ def main(
             )
             _print_json(result.to_dict())
             return 0 if result.passed else 1
+
+        if args.command == "pwn-prove-effect":
+            state, result = engine.prove_pwn_exploit_effect(
+                _identity(args),
+                parent_experiment_id=args.parent,
+                payload_locator=args.payload,
+                timeout_seconds=args.timeout,
+            )
+            _print_json(
+                {
+                    "authorities": result.to_dict()["authorities"],
+                    "plan_recipe_sha256": (
+                        result.plan_recipe_sha256
+                    ),
+                    "reason_code": result.reason_code,
+                    "replay_count": len(result.replays),
+                    "state_revision": state.revision,
+                    "status": result.status.value,
+                    "trusted_expectation_sha256": (
+                        result.trusted_expectation_sha256
+                    ),
+                }
+            )
+            return 0 if result.status.value == "PROVEN" else 1
 
         if args.command == "web-prove":
             state, result = engine.prove_web_impact(
