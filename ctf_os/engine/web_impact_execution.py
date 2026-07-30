@@ -36,6 +36,7 @@ from ctf_os.engine.web_impact import (
     WEB_IMPACT_MAX_TIMELINE_STEPS,
     WEB_IMPACT_MAX_TRACE_BYTES,
     WEB_IMPACT_REPLAY_COUNT,
+    WEB_SOURCE_SINK_OBSERVATION_AUTHORITY,
     WebArtifactCommitment,
     WebDifferentialPolicy,
     WebIdentityBinding,
@@ -1133,6 +1134,10 @@ def _observation_is_bounded(
             maximum_bytes=WEB_IMPACT_MAX_TRACE_BYTES,
         )
         and type(source_sink.reached_sink) is bool
+        and source_sink.observation_authority
+        == WEB_SOURCE_SINK_OBSERVATION_AUTHORITY
+        and source_sink.observer_attestation_sha256 is None
+        and source_sink.source_sink_observed is False
     )
 
 
@@ -1586,12 +1591,29 @@ class WebImpactExecutionEvaluation:
             == len(self.semantic_evaluation.replay_records)
         )
 
+    @property
+    def runtime_request_response_differential_confirmed(self) -> bool:
+        return (
+            self.confirmed
+            and self.semantic_evaluation is not None
+            and self.semantic_evaluation
+            .runtime_request_response_differential_confirmed
+        )
+
+    @property
+    def source_sink_observed(self) -> bool:
+        return False
+
     def to_dict(self) -> dict[str, object]:
         return {
             "authorities": {
                 **_NON_AUTHORITIES,
                 "executed_web_impact_fact_authorized": self.confirmed,
                 "progress_marker_authorized": self.confirmed,
+                "runtime_request_response_differential_confirmed": (
+                    self.runtime_request_response_differential_confirmed
+                ),
+                "source_sink_observed": self.source_sink_observed,
                 "web_impact_oracle_satisfied": self.confirmed,
             },
             "confirmed": self.confirmed,
@@ -1600,6 +1622,9 @@ class WebImpactExecutionEvaluation:
             "reason_codes": list(self.reason_codes),
             "records": [item.to_dict() for item in self.records],
             "schema_version": WEB_IMPACT_EXECUTION_SCHEMA_VERSION,
+            "runtime_request_response_differential_confirmed": (
+                self.runtime_request_response_differential_confirmed
+            ),
             "semantic_evaluation": (
                 self.semantic_evaluation.to_dict()
                 if self.semantic_evaluation is not None
@@ -1610,6 +1635,7 @@ class WebImpactExecutionEvaluation:
                 if self.semantic_evaluation is not None
                 else None
             ),
+            "source_sink_observed": self.source_sink_observed,
             "verdict": self.verdict.value,
         }
 

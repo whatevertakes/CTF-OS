@@ -42,9 +42,15 @@ MAX_JOBS = 3
 TRUNCATION_MARKER = (
     b"\n... [ctfos release matrix omitted bounded middle bytes] ...\n"
 )
-SENSITIVE_ENVIRONMENT_PATTERN = re.compile(
-    r"(?:API[_-]?KEY|AUTH|BEARER|CREDENTIAL|PASSWORD|SECRET|SESSION|TOKEN)",
-    re.IGNORECASE,
+SAFE_CHILD_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "TZ",
+    }
 )
 
 
@@ -313,7 +319,7 @@ def _child_environment() -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if SENSITIVE_ENVIRONMENT_PATTERN.search(key) is None
+        if key in SAFE_CHILD_ENVIRONMENT_KEYS
     }
     existing = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
@@ -323,6 +329,412 @@ def _child_environment() -> dict[str, str]:
     )
     environment["CTFOS_RELEASE_MATRIX"] = "1"
     return environment
+
+
+def _exact_mapping(
+    value: object,
+    *,
+    required: frozenset[str],
+    label: str,
+    allow_extra: bool = False,
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ReleaseMatrixError(f"{label} is not an object")
+    keys = set(value)
+    if not required.issubset(keys) or (
+        not allow_extra and keys != required
+    ):
+        raise ReleaseMatrixError(f"{label} schema is invalid")
+    return value
+
+
+def _valid_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value) is not None
+    )
+
+
+def _validate_pwn_summary(value: dict[str, object]) -> None:
+    required = frozenset(
+        {
+            "candidate_count",
+            "graph_ids",
+            "image_digest",
+            "network",
+            "no_leak_required_chains",
+            "ok",
+            "real_clean_proofs",
+            "repetitions",
+            "submission_count",
+            "tamper_controls_rejected",
+        }
+    )
+    root = _exact_mapping(
+        value,
+        required=required,
+        label="pwn release summary",
+    )
+    graph_ids = root["graph_ids"]
+    if (
+        root["ok"] is not True
+        or root["network"] != "none"
+        or root["candidate_count"] != 0
+        or root["submission_count"] != 0
+        or root["repetitions"] != 3
+        or root["no_leak_required_chains"] != 3
+        or root["real_clean_proofs"] != 48
+        or root["tamper_controls_rejected"] != 3
+        or type(graph_ids) is not list
+        or len(graph_ids) != 3
+        or len(set(graph_ids)) != 3
+        or any(type(item) is not str or not item for item in graph_ids)
+    ):
+        raise ReleaseMatrixError(
+            "pwn dependency summary did not meet its exact oracle"
+        )
+
+
+def _validate_web_impact_summary(value: dict[str, object]) -> None:
+    root = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "control_target",
+                "engine",
+                "image_digest",
+                "network",
+                "ok",
+                "vulnerable_target",
+            }
+        ),
+        label="web impact release summary",
+    )
+    engine = _exact_mapping(
+        root["engine"],
+        required=frozenset(
+            {
+                "automatic_submissions",
+                "canonical_requests_preissued",
+                "executed_facts",
+                "network_enforcement",
+                "progress_markers",
+                "replays",
+                "runtime_request_response_differential_confirmed",
+                "source_sink_observed",
+                "state_revision",
+                "verdict",
+            }
+        ),
+        label="web impact engine summary",
+        # New semantic-authority fields may be added without weakening the
+        # required physical transport oracle below.
+        allow_extra=True,
+    )
+    network = _exact_mapping(
+        root["network"],
+        required=frozenset({"external_internet", "internal", "name"}),
+        label="web impact network summary",
+    )
+    vulnerable = _exact_mapping(
+        root["vulnerable_target"],
+        required=frozenset(
+            {"accepted_requests", "endpoint_counts", "extract_status"}
+        ),
+        label="web vulnerable target summary",
+    )
+    control = _exact_mapping(
+        root["control_target"],
+        required=frozenset(
+            {"accepted_requests", "endpoint_counts", "extract_status"}
+        ),
+        label="web control target summary",
+    )
+    vulnerable_counts = vulnerable["endpoint_counts"]
+    control_counts = control["endpoint_counts"]
+    if (
+        root["ok"] is not True
+        or network["external_internet"] is not False
+        or network["internal"] is not True
+        or type(network["name"]) is not str
+        or not network["name"]
+        or engine["automatic_submissions"] != 0
+        or engine["canonical_requests_preissued"] != 6
+        or engine["executed_facts"] != 1
+        or engine["network_enforcement"] != "proxy"
+        or engine["progress_markers"] != 1
+        or engine["replays"] != 6
+        or engine[
+            "runtime_request_response_differential_confirmed"
+        ]
+        is not True
+        or engine["source_sink_observed"] is not False
+        or engine["verdict"] != "CONFIRMED"
+        or vulnerable["accepted_requests"] != 18
+        or vulnerable["extract_status"] != 200
+        or control["accepted_requests"] != 18
+        or control["extract_status"] != 403
+        or type(vulnerable_counts) is not dict
+        or type(control_counts) is not dict
+        or vulnerable_counts != control_counts
+        or len(vulnerable_counts) != 6
+        or set(vulnerable_counts.values()) != {3}
+    ):
+        raise ReleaseMatrixError(
+            "web impact summary did not meet its exact differential oracle"
+        )
+
+
+def _validate_rev_summary(value: dict[str, object]) -> None:
+    root = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "candidates",
+                "cleaned_containers",
+                "fact_count",
+                "image_digest",
+                "managed_action",
+                "network",
+                "ok",
+                "progress_count",
+                "receipts",
+                "runs",
+                "submissions",
+            }
+        ),
+        label="rev release summary",
+    )
+    if (
+        root["ok"] is not True
+        or root["managed_action"] != "rev_accepted_input"
+        or root["network"] != "none"
+        or root["runs"] != 6
+        or root["receipts"] != 6
+        or root["fact_count"] != 1
+        or root["progress_count"] != 1
+        or root["candidates"] != 0
+        or root["submissions"] != 0
+        or type(root["cleaned_containers"]) is not int
+        or not 0 <= root["cleaned_containers"] <= 6
+    ):
+        raise ReleaseMatrixError(
+            "rev acceptance summary did not meet its exact 3+3 oracle"
+        )
+
+
+def _validate_crypto_runtime(
+    value: object,
+    *,
+    runtime: str,
+) -> None:
+    record = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "candidate_status",
+                "network",
+                "runtime",
+                "runs",
+                "successful_attempts",
+                "submissions",
+            }
+        ),
+        label=f"crypto {runtime} summary",
+        # A hidden-oracle preissue identifier/authority may be added by the
+        # managed-oracle hardening without weakening these execution facts.
+        allow_extra=True,
+    )
+    if (
+        record["candidate_status"] != "ready_to_submit"
+        or record["network"] != "none"
+        or record["runtime"] != runtime
+        or record["runs"] != 6
+        or record["successful_attempts"] != 6
+        or record["submissions"] != 0
+    ):
+        raise ReleaseMatrixError(
+            f"crypto {runtime} summary did not meet its exact 3+3 oracle"
+        )
+
+
+def _validate_crypto_misc_summary(value: dict[str, object]) -> None:
+    root = _exact_mapping(
+        value,
+        required=frozenset({"crypto", "image_digest", "misc", "ok"}),
+        label="crypto/misc release summary",
+    )
+    crypto = _exact_mapping(
+        root["crypto"],
+        required=frozenset({"python", "sage"}),
+        label="crypto release summary",
+    )
+    _validate_crypto_runtime(crypto["python"], runtime="python")
+    _validate_crypto_runtime(crypto["sage"], runtime="sage")
+    misc = _exact_mapping(
+        root["misc"],
+        required=frozenset(
+            {
+                "candidate_status",
+                "network",
+                "runs",
+                "submissions",
+                "transform_evidence_passed",
+            }
+        ),
+        label="misc release summary",
+        allow_extra=True,
+    )
+    if (
+        root["ok"] is not True
+        or misc["candidate_status"] != "observed_candidate"
+        or misc["network"] != "none"
+        or misc["runs"] != 4
+        or misc["submissions"] != 0
+        or misc["transform_evidence_passed"] is not True
+    ):
+        raise ReleaseMatrixError(
+            "misc summary did not meet its exact DAG+3 oracle"
+        )
+
+
+def _validate_forensic_summary(value: dict[str, object]) -> None:
+    root = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "assertion_facts",
+                "assertion_progress",
+                "candidates",
+                "cleanup",
+                "confirmed",
+                "control",
+                "image_digest",
+                "index_execution_sha256",
+                "network",
+                "ok",
+                "operator_plans",
+                "pointer",
+                "readiness_probes",
+                "sandbox",
+                "state_status",
+                "submissions",
+            }
+        ),
+        label="forensic release summary",
+    )
+    control = _exact_mapping(
+        root["control"],
+        required=frozenset({"algorithms", "confirmed", "reason_codes"}),
+        label="forensic control summary",
+    )
+    plans = _exact_mapping(
+        root["operator_plans"],
+        required=frozenset({"control", "positive"}),
+        label="forensic operator plans",
+    )
+    pointer = _exact_mapping(
+        root["pointer"],
+        required=frozenset(
+            {
+                "kind",
+                "length_bytes",
+                "offset_bytes",
+                "pointer_id",
+                "source_path",
+                "source_sha256",
+                "sha256",
+            }
+        ),
+        label="forensic evidence pointer",
+        allow_extra=True,
+    )
+    confirmed = root["confirmed"]
+    confirmations_valid = (
+        type(confirmed) is list
+        and len(confirmed) == 3
+        and [item.get("ordinal") for item in confirmed if type(item) is dict]
+        == [1, 2, 3]
+        and all(
+            type(item) is dict
+            and item.get("algorithms") == ["descriptor", "mmap"]
+            and item.get("record_count") == 2
+            and _valid_sha256(item.get("evaluation_sha256"))
+            for item in confirmed
+        )
+    )
+    if (
+        root["ok"] is not True
+        or root["assertion_facts"] != 3
+        or root["assertion_progress"] != 3
+        or root["candidates"] != 0
+        or root["submissions"] != 0
+        or not confirmations_valid
+        or root["readiness_probes"] != 4
+        or root["network"] != "none"
+        or root["sandbox"] != "production_real_docker"
+        or root["cleanup"] != "verified"
+        or control["algorithms"] != ["descriptor", "mmap"]
+        or control["confirmed"] is not False
+        or type(control["reason_codes"]) is not list
+        or not control["reason_codes"]
+        or not any(
+            "observation_request_binding_mismatch" in item
+            for item in control["reason_codes"]
+            if type(item) is str
+        )
+        or not all(_valid_sha256(item) for item in plans.values())
+        or not _valid_sha256(root["index_execution_sha256"])
+        or pointer["kind"] != "file_range"
+        or not _valid_sha256(pointer["source_sha256"])
+        or not _valid_sha256(pointer["sha256"])
+    ):
+        raise ReleaseMatrixError(
+            "forensic summary did not meet its exact assertion oracle"
+        )
+
+
+def _validate_web_active_summary(value: dict[str, object]) -> None:
+    race = value.get("race")
+    oob = value.get("oob")
+    target_audit = value.get("target_audit")
+    if (
+        value.get("protocol")
+        != "ctfos.web.active_probe.docker_release.v1"
+        or value.get("schema_version") != 1
+        or value.get("external_network") is not False
+        or value.get("automatic_submission_count") != 0
+        or type(race) is not dict
+        or type(oob) is not dict
+        or type(target_audit) is not dict
+        or race.get("mode") != "race"
+        or oob.get("mode") != "oob"
+        or race.get("replay_count") != 6
+        or oob.get("replay_count") != 6
+        or race.get("executed_fact_count") != 1
+        or oob.get("executed_fact_count") != 1
+        or race.get("candidate_count") != 0
+        or oob.get("candidate_count") != 0
+        or race.get("submission_count") != 0
+        or oob.get("submission_count") != 0
+        or race.get("physical_artifact_count") != 29
+        or oob.get("physical_artifact_count") != 26
+        or not _valid_sha256(race.get("evaluation_sha256"))
+        or not _valid_sha256(oob.get("evaluation_sha256"))
+        or not _valid_sha256(race.get("graph_sha256"))
+        or not _valid_sha256(oob.get("graph_sha256"))
+        or target_audit
+        != {
+            "control_oob_callbacks": 0,
+            "control_race_requests": 6,
+            "maximum_parallel_race_requests": 2,
+            "vulnerable_oob_callbacks": 3,
+            "vulnerable_race_requests": 6,
+        }
+    ):
+        raise ReleaseMatrixError(
+            "web_active_probe did not meet its exact race/OOB oracle"
+        )
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -372,31 +784,22 @@ def _validate_child_summary(
         raise ReleaseMatrixError(
             f"{task.id} did not bind the exact release image digest"
         )
-    if task.id == "web_active_probe":
-        race = value.get("race")
-        oob = value.get("oob")
-        if (
-            value.get("protocol")
-            != "ctfos.web.active_probe.docker_release.v1"
-            or value.get("schema_version") != 1
-            or value.get("external_network") is not False
-            or value.get("automatic_submission_count") != 0
-            or type(race) is not dict
-            or type(oob) is not dict
-            or race.get("mode") != "race"
-            or oob.get("mode") != "oob"
-            or race.get("replay_count") != 6
-            or oob.get("replay_count") != 6
-            or race.get("candidate_count") != 0
-            or oob.get("candidate_count") != 0
-            or race.get("submission_count") != 0
-            or oob.get("submission_count") != 0
-        ):
-            raise ReleaseMatrixError(
-                "web_active_probe did not meet its exact race/OOB oracle"
-            )
-    elif value.get("ok") is not True:
-        raise ReleaseMatrixError(f"{task.id} did not report ok=true")
+    validators = {
+        "pwn_dependency_effect": _validate_pwn_summary,
+        "web_state_impact": _validate_web_impact_summary,
+        "web_active_probe": _validate_web_active_summary,
+        "rev_original_binary_acceptance": _validate_rev_summary,
+        "crypto_metamorphic_and_misc_transform": (
+            _validate_crypto_misc_summary
+        ),
+        "forensic_assertion_graph": _validate_forensic_summary,
+    }
+    validator = validators.get(task.id)
+    if validator is None:
+        raise ReleaseMatrixError(
+            f"{task.id} has no field-level release oracle"
+        )
+    validator(value)
     return _sha256(_canonical_json(value))
 
 

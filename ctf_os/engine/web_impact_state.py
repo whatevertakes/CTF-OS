@@ -128,9 +128,11 @@ _EVALUATION_KEYS = frozenset(
         "confirmed",
         "execution_plan_sha256",
         "reason_codes",
+        "runtime_request_response_differential_confirmed",
         "semantic_evaluation_sha256",
         "sha256",
         "size_bytes",
+        "source_sink_observed",
         "verdict",
     }
 )
@@ -152,6 +154,8 @@ _REDUCTION_BINDING_KEYS = frozenset(
         "oracle_contract_sha256",
         "plan_sha256",
         "response_artifact_sha256",
+        "runtime_request_response_differential_confirmed",
+        "source_sink_observed",
     }
 )
 _TARGET_KEYS = frozenset({"binding_sha256", "generation", "kind"})
@@ -1054,6 +1058,10 @@ def _build_binding(
         **_AUTHORITIES_FALSE,
         "executed_web_impact_fact_authorized": confirmed,
         "progress_marker_authorized": confirmed,
+        "runtime_request_response_differential_confirmed": (
+            evaluation.runtime_request_response_differential_confirmed
+        ),
+        "source_sink_observed": evaluation.source_sink_observed,
         "web_impact_oracle_satisfied": confirmed,
     }
     binding: dict[str, object] = {
@@ -1065,6 +1073,10 @@ def _build_binding(
             "confirmed": confirmed,
             "execution_plan_sha256": evaluation.execution_plan_sha256,
             "reason_codes": list(evaluation.reason_codes),
+            "runtime_request_response_differential_confirmed": (
+                evaluation
+                .runtime_request_response_differential_confirmed
+            ),
             "semantic_evaluation_sha256": (
                 evaluation.semantic_evaluation.sha256
                 if evaluation.semantic_evaluation is not None
@@ -1072,6 +1084,7 @@ def _build_binding(
             ),
             "sha256": _sha256(evaluation_payload),
             "size_bytes": len(evaluation_payload),
+            "source_sink_observed": evaluation.source_sink_observed,
             "verdict": evaluation.verdict.value,
         },
         "experiment": {
@@ -1550,6 +1563,13 @@ def _validate_binding_document(binding: object) -> dict[str, object]:
     )
     if (
         type(evaluation["confirmed"]) is not bool
+        or type(
+            evaluation[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        is not bool
+        or evaluation["source_sink_observed"] is not False
         or evaluation["verdict"]
         not in {
             WebImpactExecutionVerdict.CONFIRMED.value,
@@ -1630,11 +1650,25 @@ def _validate_binding_document(binding: object) -> dict[str, object]:
         raise WebImpactStateContractError(
             "state_binding_plan_invalid"
         )
+    if evaluation[
+        "runtime_request_response_differential_confirmed"
+    ] is not (
+        evaluation["confirmed"] and plan["control_target"] is not None
+    ):
+        raise WebImpactStateContractError(
+            "state_binding_evaluation_invalid"
+        )
     authorities = root["authorities"]
     expected_authorities = {
         **_AUTHORITIES_FALSE,
         "executed_web_impact_fact_authorized": evaluation["confirmed"],
         "progress_marker_authorized": evaluation["confirmed"],
+        "runtime_request_response_differential_confirmed": (
+            evaluation[
+                "runtime_request_response_differential_confirmed"
+            ]
+        ),
+        "source_sink_observed": False,
         "web_impact_oracle_satisfied": evaluation["confirmed"],
     }
     if type(authorities) is not dict or authorities != expected_authorities:
@@ -1914,17 +1948,21 @@ def _validate_binding_document(binding: object) -> dict[str, object]:
         ]
         expected_fact_statement = (
             "Three fresh sandbox replays satisfied the explicit "
-            f"{plan['impact_kind']} Web impact oracle"
+            f"{plan['impact_kind']} HTTP response oracle"
             + (
                 " and three patched/non-vulnerable controls "
-                "produced the declared differential."
+                "confirmed a runtime request/response differential. "
+                "Declared source/sink commitments were not "
+                "runtime-observed."
                 if plan["control_target"] is not None
-                else "."
+                else "; declared source/sink commitments were not "
+                "runtime-observed."
             )
         )
         expected_progress_statement = (
-            "Deterministic Web impact oracle reproduced in three "
-            "fresh identity-isolated executions"
+            "Deterministic Web response oracle reproduced in three "
+            "fresh identity-isolated executions; source/sink "
+            "observation authority remains false"
         )
         if (
             type(fact) is not dict
@@ -1984,8 +2022,20 @@ def _validate_binding_document(binding: object) -> dict[str, object]:
         if (
             any(
                 not _valid_sha256(reduction_binding[key])
-                for key in _REDUCTION_BINDING_KEYS
+                for key in {
+                    "evaluation_sha256",
+                    "oracle_contract_sha256",
+                    "plan_sha256",
+                    "response_artifact_sha256",
+                }
             )
+            or reduction_binding[
+                "runtime_request_response_differential_confirmed"
+            ]
+            is not evaluation[
+                "runtime_request_response_differential_confirmed"
+            ]
+            or reduction_binding["source_sink_observed"] is not False
             or reduction_binding["evaluation_sha256"]
             != evaluation["semantic_evaluation_sha256"]
             or reduction_binding["plan_sha256"]

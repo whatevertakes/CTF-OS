@@ -176,6 +176,29 @@ class WebImpactStateContractTests(unittest.TestCase):
         self.assertFalse(
             authorities["automatic_submission_authorized"]
         )
+        self.assertFalse(
+            authorities[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(authorities["source_sink_observed"])
+        self.assertFalse(
+            projection.binding["evaluation"][
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(
+            projection.binding["evaluation"]["source_sink_observed"]
+        )
+        reduction_binding = projection.binding["reduction"][
+            "executed_fact"
+        ]["extra"]["web_impact"]
+        self.assertFalse(
+            reduction_binding[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(reduction_binding["source_sink_observed"])
         self.assertNotIn("candidate", projection.to_dict())
         self.assertNotIn("submission", projection.to_dict())
         validate_web_impact_state_projection(
@@ -278,6 +301,51 @@ class WebImpactStateContractTests(unittest.TestCase):
         ):
             validate_web_impact_state_projection(
                 widened,
+                evaluation=self.evaluation,
+                execution_plan=self.execution_plan,
+                operator_spec_payload=self.operator_payload,
+            )
+
+        forged_source_sink = copy.deepcopy(self.projection)
+        forged_source_sink.binding["authorities"][
+            "source_sink_observed"
+        ] = True
+        with self.assertRaisesRegex(
+            WebImpactStateContractError,
+            "authority",
+        ):
+            validate_web_impact_state_projection(
+                forged_source_sink,
+                evaluation=self.evaluation,
+                execution_plan=self.execution_plan,
+                operator_spec_payload=self.operator_payload,
+            )
+
+        forged_evaluation = copy.deepcopy(self.projection)
+        forged_evaluation.binding["evaluation"][
+            "source_sink_observed"
+        ] = True
+        with self.assertRaisesRegex(
+            WebImpactStateContractError,
+            "evaluation",
+        ):
+            validate_web_impact_state_projection(
+                forged_evaluation,
+                evaluation=self.evaluation,
+                execution_plan=self.execution_plan,
+                operator_spec_payload=self.operator_payload,
+            )
+
+        forged_reduction = copy.deepcopy(self.projection)
+        forged_reduction.binding["reduction"]["executed_fact"][
+            "extra"
+        ]["web_impact"]["source_sink_observed"] = True
+        with self.assertRaisesRegex(
+            WebImpactStateContractError,
+            "reduction",
+        ):
+            validate_web_impact_state_projection(
+                forged_reduction,
                 evaluation=self.evaluation,
                 execution_plan=self.execution_plan,
                 operator_spec_payload=self.operator_payload,

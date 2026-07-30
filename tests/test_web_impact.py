@@ -8,6 +8,7 @@ from dataclasses import replace
 from ctf_os.engine.web_impact import (
     WEB_IDENTITY_ROLES,
     WEB_IMPACT_REPLAY_COUNT,
+    WEB_SOURCE_SINK_OBSERVATION_AUTHORITY,
     WebArtifactCommitment,
     WebDifferentialPolicy,
     WebIdentityBinding,
@@ -310,6 +311,13 @@ class WebImpactContractTests(unittest.TestCase):
         self.assertFalse(authorities["challenge_proof_satisfied"])
         self.assertFalse(authorities["self_report_accepted"])
         self.assertFalse(authorities["automatic_submission_authorized"])
+        self.assertFalse(
+            authorities[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(authorities["source_sink_observed"])
+        self.assertFalse(evaluation.source_sink_observed)
 
         reduction = evaluation.reduction_projection()
         self.assertEqual(
@@ -319,6 +327,21 @@ class WebImpactContractTests(unittest.TestCase):
         self.assertIsNone(reduction["candidate"])
         self.assertIsNone(reduction["proof"])
         self.assertFalse(reduction["automatic_submission"])
+        binding = reduction["executed_fact"]["extra"]["web_impact"]
+        self.assertFalse(
+            binding[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(binding["source_sink_observed"])
+
+        source_sink = evaluation.replay_records[0].source_sink.to_dict()
+        self.assertEqual(
+            source_sink["observation_authority"],
+            WEB_SOURCE_SINK_OBSERVATION_AUTHORITY,
+        )
+        self.assertIsNone(source_sink["observer_attestation_sha256"])
+        self.assertFalse(source_sink["source_sink_observed"])
 
     def test_serialized_contract_is_value_free_and_target_is_hash_only(
         self,
@@ -566,6 +589,31 @@ class WebImpactContractTests(unittest.TestCase):
             any("source_sink_evidence_invalid" in item for item in failures)
         )
 
+    def test_fabricated_observer_attestation_cannot_gain_authority(
+        self,
+    ) -> None:
+        observations = list(self._observations())
+        observations[0] = replace(
+            observations[0],
+            source_sink=replace(
+                observations[0].source_sink,
+                observation_authority="image_owned_observer",
+                observer_attestation_sha256="f" * 64,
+                source_sink_observed=True,
+            ),
+        )
+
+        evaluation = evaluate_web_impact(self.plan, observations)
+
+        self.assertFalse(evaluation.passed)
+        self.assertFalse(evaluation.source_sink_observed)
+        self.assertTrue(
+            any(
+                "source_sink_evidence_invalid" in item
+                for item in evaluation.failure_codes
+            )
+        )
+
     def test_declared_differential_requires_three_exact_controls(self) -> None:
         policy = WebDifferentialPolicy(
             control_target_binding_sha256=_digest("patched-target"),
@@ -581,6 +629,34 @@ class WebImpactContractTests(unittest.TestCase):
         )
         self.assertTrue(evaluation.passed)
         self.assertEqual(len(evaluation.replay_records), 6)
+        self.assertTrue(
+            evaluation.runtime_request_response_differential_confirmed
+        )
+        self.assertFalse(evaluation.source_sink_observed)
+        document = evaluation.to_dict()
+        self.assertTrue(
+            document[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(document["source_sink_observed"])
+        self.assertTrue(
+            document["authorities"][
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(
+            document["authorities"]["source_sink_observed"]
+        )
+        binding = evaluation.reduction_projection()[
+            "executed_fact"
+        ]["extra"]["web_impact"]
+        self.assertTrue(
+            binding[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(binding["source_sink_observed"])
 
         missing_controls = evaluate_web_impact(
             plan,

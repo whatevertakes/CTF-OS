@@ -34,6 +34,7 @@ WEB_IMPACT_MAX_EVALUATION_BYTES = 512 * 1024
 
 WEB_IDENTITY_ROLES = ("admin", "attacker", "user")
 WEB_TIMELINE_CHANNELS = frozenset({"browser", "http"})
+WEB_SOURCE_SINK_OBSERVATION_AUTHORITY = "declared_commitment_only"
 WEB_HTTP_METHODS = frozenset(
     {
         "DELETE",
@@ -648,9 +649,18 @@ class WebSourceSinkObservation:
     trace_contract_sha256: str
     trace_artifact: WebArtifactCommitment
     reached_sink: bool
+    observation_authority: str = (
+        WEB_SOURCE_SINK_OBSERVATION_AUTHORITY
+    )
+    observer_attestation_sha256: str | None = None
+    source_sink_observed: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "observation_authority": self.observation_authority,
+            "observer_attestation_sha256": (
+                self.observer_attestation_sha256
+            ),
             "reached_sink": self.reached_sink,
             "runtime_request_sha256": self.runtime_request_sha256,
             "runtime_step_ordinal": self.runtime_step_ordinal,
@@ -658,6 +668,7 @@ class WebSourceSinkObservation:
             "sink_pointer_sha256": self.sink_pointer_sha256,
             "source_kind": self.source_kind,
             "source_pointer_sha256": self.source_pointer_sha256,
+            "source_sink_observed": self.source_sink_observed,
             "trace_artifact": self.trace_artifact.to_dict(),
             "trace_contract_sha256": self.trace_contract_sha256,
         }
@@ -767,12 +778,32 @@ class WebImpactEvaluation:
             and len(self.replay_records) == expected
         )
 
+    @property
+    def runtime_request_response_differential_confirmed(self) -> bool:
+        return (
+            self.passed
+            and self.plan is not None
+            and self.plan.differential is not None
+        )
+
+    @property
+    def source_sink_observed(self) -> bool:
+        # The current HTTP/browser helpers observe requests, responses, and
+        # cookie transitions.  They do not carry an image-owned source/sink
+        # observer attestation, so declared pointer commitments cannot acquire
+        # runtime data-flow authority.
+        return False
+
     def to_dict(self) -> dict[str, object]:
         return {
             "authorities": {
                 **_NON_AUTHORITIES,
                 "executed_web_impact_fact_authorized": self.passed,
                 "progress_marker_authorized": self.passed,
+                "runtime_request_response_differential_confirmed": (
+                    self.runtime_request_response_differential_confirmed
+                ),
+                "source_sink_observed": self.source_sink_observed,
                 "web_impact_oracle_satisfied": self.passed,
             },
             "failure_codes": list(self.failure_codes),
@@ -788,6 +819,10 @@ class WebImpactEvaluation:
                 item.to_dict() for item in self.replay_records
             ],
             "schema_version": WEB_IMPACT_SCHEMA_VERSION,
+            "source_sink_observed": self.source_sink_observed,
+            "runtime_request_response_differential_confirmed": (
+                self.runtime_request_response_differential_confirmed
+            ),
             "verdict": self.verdict.value,
         }
 
@@ -825,6 +860,10 @@ class WebImpactEvaluation:
             "response_artifact_sha256": (
                 sink_event.response_artifact.sha256
             ),
+            "runtime_request_response_differential_confirmed": (
+                self.runtime_request_response_differential_confirmed
+            ),
+            "source_sink_observed": self.source_sink_observed,
         }
         return {
             "automatic_submission": False,
@@ -836,12 +875,15 @@ class WebImpactEvaluation:
                 "source_run_id": last.run_id,
                 "statement": (
                     "Three fresh sandbox replays satisfied the explicit "
-                    f"{self.plan.oracle.impact_kind} Web impact oracle"
+                    f"{self.plan.oracle.impact_kind} HTTP response oracle"
                     + (
                         " and three patched/non-vulnerable controls "
-                        "produced the declared differential."
+                        "confirmed a runtime request/response differential. "
+                        "Declared source/sink commitments were not "
+                        "runtime-observed."
                         if self.plan.differential is not None
-                        else "."
+                        else "; declared source/sink commitments were not "
+                        "runtime-observed."
                     )
                 ),
             },
@@ -853,8 +895,9 @@ class WebImpactEvaluation:
                 "extra": {"web_impact": binding},
                 "run_id": last.run_id,
                 "statement": (
-                    "Deterministic Web impact oracle reproduced in three "
-                    "fresh identity-isolated executions"
+                    "Deterministic Web response oracle reproduced in three "
+                    "fresh identity-isolated executions; source/sink "
+                    "observation authority remains false"
                 ),
             },
             "proof": None,
@@ -956,6 +999,10 @@ def _source_sink_valid(
     ]
     if (
         type(value.reached_sink) is not bool
+        or value.observation_authority
+        != WEB_SOURCE_SINK_OBSERVATION_AUTHORITY
+        or value.observer_attestation_sha256 is not None
+        or value.source_sink_observed is not False
         or type(value.runtime_step_ordinal) is not int
         or value.source_kind != expected.source_kind
         or value.source_pointer_sha256
@@ -1235,6 +1282,7 @@ __all__ = [
     "WEB_IDENTITY_ROLES",
     "WEB_IMPACT_PROTOCOL",
     "WEB_IMPACT_REPLAY_COUNT",
+    "WEB_SOURCE_SINK_OBSERVATION_AUTHORITY",
     "WebArtifactCommitment",
     "WebDifferentialPolicy",
     "WebIdentityBinding",

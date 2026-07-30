@@ -512,6 +512,13 @@ class WebImpactExecutionTests(unittest.TestCase):
         self.assertFalse(authorities["candidate_authorized"])
         self.assertFalse(authorities["challenge_proof_satisfied"])
         self.assertFalse(authorities["automatic_submission_authorized"])
+        self.assertFalse(
+            authorities[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(authorities["source_sink_observed"])
+        self.assertFalse(result.source_sink_observed)
         reduction = result.reduction_projection()
         self.assertIsNone(reduction["candidate"])
         self.assertIsNone(reduction["proof"])
@@ -564,6 +571,25 @@ class WebImpactExecutionTests(unittest.TestCase):
 
         self.assertTrue(result.confirmed)
         self.assertEqual(len(result.records), 6)
+        self.assertTrue(
+            result.runtime_request_response_differential_confirmed
+        )
+        self.assertFalse(result.source_sink_observed)
+        document = result.to_dict()
+        self.assertTrue(
+            document[
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(document["source_sink_observed"])
+        self.assertTrue(
+            document["authorities"][
+                "runtime_request_response_differential_confirmed"
+            ]
+        )
+        self.assertFalse(
+            document["authorities"]["source_sink_observed"]
+        )
         self.assertEqual(
             [record.replay_target_kind for record in result.records],
             ["vulnerable"] * 3 + ["control"] * 3,
@@ -948,6 +974,29 @@ class WebImpactExecutionTests(unittest.TestCase):
                     result.reason_codes,
                     ("replay-1:artifact_payload_mismatch",),
                 )
+
+    def test_fabricated_source_sink_observer_is_rejected_at_transport(
+        self,
+    ) -> None:
+        first = self.transports[0]
+        forged = replace(
+            first.semantic_observation,
+            source_sink=replace(
+                first.semantic_observation.source_sink,
+                observation_authority="image_owned_observer",
+                observer_attestation_sha256="a" * 64,
+                source_sink_observed=True,
+            ),
+        )
+        with self.assertRaisesRegex(
+            WebImpactExecutionPreflightError,
+            "observation_type_invalid",
+        ):
+            self._rebuild_transport(
+                self.execution_plan.requests[0],
+                first,
+                observation=forged,
+            )
 
     def test_semantic_oracle_is_reused_after_transport_verification(
         self,

@@ -575,8 +575,23 @@ def _prove(
     forbidden = (*COOKIE_VALUES, VULNERABLE_BODY, CONTROL_BODY)
     if any(value in state_bytes for value in forbidden):
         raise AssertionError("raw Web secret/body entered canonical state")
+    evaluation_document = evaluation.to_dict()
+    evaluation_authorities = evaluation_document["authorities"]
     if (
         evaluation.confirmed is not True
+        or evaluation.runtime_request_response_differential_confirmed
+        is not True
+        or evaluation.source_sink_observed is not False
+        or evaluation_document[
+            "runtime_request_response_differential_confirmed"
+        ]
+        is not True
+        or evaluation_document["source_sink_observed"] is not False
+        or evaluation_authorities[
+            "runtime_request_response_differential_confirmed"
+        ]
+        is not True
+        or evaluation_authorities["source_sink_observed"] is not False
         or len(evaluation.records) != 6
         or final.status is not initial_status
         or final.candidates
@@ -601,6 +616,10 @@ def _prove(
         "network_enforcement": "proxy",
         "progress_markers": len(final.progress_markers),
         "replays": len(evaluation.records),
+        "runtime_request_response_differential_confirmed": (
+            evaluation.runtime_request_response_differential_confirmed
+        ),
+        "source_sink_observed": evaluation.source_sink_observed,
         "state_revision": final.revision,
         "verdict": evaluation.verdict.value,
     }
