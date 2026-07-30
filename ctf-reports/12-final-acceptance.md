@@ -1,19 +1,57 @@
-# CTF-OS 최종 수용성 기록
+# CTF-OS 수용성 기록
 
-판정 기준일: 2026-07-28 (Asia/Seoul)
+역사적 판정 기준일: 2026-07-28 (Asia/Seoul)
 
-> 현재 상태: **최종 수용**  
-> 이 문서는 source freeze
+현재 상태 갱신: 2026-07-31 (Asia/Seoul)
+
+> 2026-07-28 동결 상태: **당시 범위 최종 수용**
+>
+> 현재 source 상태: **release acceptance 대기**
+>
+> 아래 2026-07-28 판정은 source freeze
 > `09641f4466b30add7d18d6239a6ff73fb9afa8baccf2fb2d49b2ce5c55a8d96b`
 > 의 코드, Python 3.13 회귀, 정적·image gate, 독립 감사와 Claude CLI
-> read-only 검토를 직접 대조한 최종 요구사항 판정이다. 실제 대회 solve
-> 성능과 아래 P3 운영 경계는 수용 이후에도 별도다.
+> read-only 검토를 직접 대조한 **역사적 요구사항 판정**이다. 이후
+> managed/category hot path가 변경됐으므로 그 hash, test 수와 image
+> receipt를 현재 source의 승인으로 재사용하지 않는다. 현재 승격에는
+> 현재 source의 전체 회귀와 exact-image all-category matrix가 새로
+> 필요하다.
 
 충돌 시 권위 순서는 현재 코드와 통과한 회귀, 이 문서의 요구사항 판정,
 [10 구현 결과](10-implementation-result.md), [09 역사적 설계](09-implementation-blueprint.md)
 순이다. 운영 명령은 저장소 [README](../README.md)를 따른다.
 
-## 1. 확정 계약 수용표
+## 0. 2026-07-31 현재 수용성 delta
+
+현재 source에는 2026-07-28 이후 다음 권위 경로가 구현돼 있습니다.
+
+| 영역 | 현재 코드 상태 | 아직 수용하지 않는 주장 |
+|---|---|---|
+| Managed 연속성 | CLI managed solve/run/cycle의 생략 기본은 `captain_lane`; 같은 challenge의 Captain만 resume하고 explorer/builder/verifier/proof는 fresh context | retained reasoning이 blind/live solve를 높였다는 주장 |
+| Pwn | D→V crash, runtime snapshot, address-dependency L/N/A, IP-control primitive와 one-shot 3+3 exploit-effect를 engine-owned artifact로 판정 | 실행 중 pointer capture/derive/staged send가 필요한 exploit을 typed interaction gate가 검증했다는 주장 |
+| Web | 역할별 session/state, runtime timeline, differential impact, race/OOB의 실행 oracle | 실제 대회 proxy, remote portability와 source-only 추론을 impact로 인정하는 것 |
+| Rev | 원본 바이너리 positive 3회와 mutated negative 3회 | 원격/argv/multi-file/non-native 범위 |
+| Crypto | managed Builder보다 앞서 operator가 challenge 밖에서 hidden variant를 preissue하고 engine-private authority를 one-shot 소비하는 3+3 oracle | 현재 source와 image에 결속된 최종 Docker release receipt 및 hidden/live solve 성능 |
+| Forensics | immutable index, file/offset/frame 계열 pointer, readiness와 cross-tool assertion graph | coverage가 낮거나 pointer가 없는 사건 서술 |
+| Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay; candidate-only | verifier 통과를 제출/solve 권한으로 취급하는 것과 현재 Docker release receipt |
+
+실제 `zone` 한 문제에서는 bounded operator harness가 매 process의 stack/libc
+주소를 다시 구해 exploit effect를 attack 3/3, matched control 0/3으로
+재현했습니다. 그러나 local flag source와 active remote target이 없었고,
+현재 one-shot typed effect producer가 그 interaction을 표현하지 못합니다.
+따라서 genuine flag, solve, remote portability 또는 typed interaction
+P/E 승격이 아닙니다. 정본 포인터는
+[21-zone-solve-capable-exploit-evidence.md](21-zone-solve-capable-exploit-evidence.md)에
+있습니다.
+
+이 delta는 코드 구현 기록이지 현재 release 승인서가 아닙니다. 전체 suite와
+현재 exact-image matrix가 끝나기 전에는 아래 역사적 PASS를 현재 source에
+적용하지 않습니다. 그 뒤에도 동일 모델·도구 thin baseline 대비 3회 중
+2회 재현, blind/live solve@1, 카테고리 floor는 별도 측정 대상입니다.
+ExploitGym/CyberGym-E2E와 미지 코드베이스 CVE 발견 능력도 CTF 점수와
+합치지 않습니다.
+
+## 1. 확정 계약 수용표 — 2026-07-28 역사적 동결
 
 | 계약 | 판정 | 코드·회귀 근거와 정확한 경계 |
 |---|---|---|
@@ -140,11 +178,11 @@ size/SHA-256의 재검증으로 변조를 탐지하고 fail-closed한다는 뜻�
 - Model/log 비노출 typed credential channel, 자동 제출, background Live
   session 생성은 없다.
 
-## 5. 검증으로 증명하지 않는 것
+## 5. 2026-07-28 검증으로 증명하지 않은 것
 
 로컬 suite는 model API나 실제 CTF remote request를 호출하지 않는다. Fake
 runner/backend와 local process integration으로 contract와 경계를 검증한다.
-따라서 다음은 최종 수용 이후에도 운영/성능 미검증으로 남는다.
+따라서 다음은 당시 수용 이후에도 운영/성능 미검증으로 남았다.
 
 - 실제 계정의 Sol/Terra/Luna 세 모델 전체 end-to-end solve
 - 실제 Sol interactive TUI와 세 native worker의 병렬 시작·완료
@@ -157,9 +195,10 @@ runner/backend와 local process integration으로 contract와 경계를 검증�
 candidate 영속과 `submissions=0`만 확인했다. 전체 solve 성능 증거로
 확대하지 않는다.
 
-## 6. 최종 판정 gate
+## 6. 2026-07-28 역사적 최종 판정 gate
 
-다음 gate가 모두 성공했다.
+다음 gate는 2026-07-28 동결에서 모두 성공했다. 현재 source의 gate 결과가
+아니다.
 
 1. Python 3.13 전체 unit/integration suite
 2. source compile과 정적 import/error lint
@@ -187,9 +226,10 @@ candidate 영속과 `submissions=0`만 확인했다. 전체 solve 성능 증거�
   `FINAL VERDICT: PASS`, 미해결 P0/P1/P2 없음
 - Claude 검토 뒤 aggregate source hash 재계산: 동일
 
-## 7. 수용된 P3 잔여 위험
+## 7. 2026-07-28 수용된 P3 잔여 위험
 
-다음은 최종 수용을 막지 않지만 운영자가 알아야 하는 명시적 경계다.
+다음은 당시 동결의 수용을 막지 않았지만 운영자가 알아야 하는 명시적
+경계다.
 
 1. Raw syscall CALL→Python owner STORE와 ownership retire→single-close의
    극소 창에서 FD 하나가 process exit까지 남을 수 있다. 모호한 close 뒤
@@ -212,6 +252,7 @@ candidate 영속과 `submissions=0`만 확인했다. 전체 solve 성능 증거�
    evidence와 exact output 반복을 증명한다. 사람이 고른 proof command의
    원인성이나 의도적으로 hardcode한 flag를 일반적으로 판별하지는 못한다.
 
-실패가 하나라도 있으면 관련 표 행은 수용이 아니라 차단/조건부 상태로
-되돌린다. 실제 세 모델 solve와 대회 성능은 위 gate가 통과해도 별도
-운영 검증으로 남는다.
+현재 source의 새 전체 회귀나 all-category matrix에서 실패가 하나라도
+있으면 관련 현재 표 행은 수용이 아니라 차단/조건부 상태로 둔다. 실제
+same-model solve와 대회 성능은 새 local gate가 통과해도 별도 운영
+검증으로 남는다.

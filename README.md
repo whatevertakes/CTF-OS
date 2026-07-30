@@ -18,8 +18,34 @@ CTF 사이트 자동 제출 기능은 없습니다.
 channel이 생기기 전까지 지원 범위가 아닙니다.
 
 현재 코드가 실제로 구현한 범위와 남은 제한은
-[구현 결과](ctf-reports/10-implementation-result.md), 요구사항별 판정은
-[최종 수용성 기록](ctf-reports/12-final-acceptance.md)에 정리돼 있습니다.
+[구현 결과](ctf-reports/10-implementation-result.md), 요구사항별 판정 이력은
+[수용성 기록](ctf-reports/12-final-acceptance.md)에 정리돼 있습니다.
+
+## 현재 검증 상태
+
+2026-07-28의 source freeze, image digest와 test 수치는 역사적 수용
+기록입니다. 이후 managed hot path와 카테고리 게이트가 크게 바뀌었으므로
+그 동결을 현재 source의 release 승인으로 사용하지 않습니다. 현재 source는
+최종 전체 회귀와 exact-image all-category release matrix를 새로 통과하기
+전까지 **release candidate**입니다. 특히 operator-preissued hidden
+Crypto/Misc 경로의 코드는 연결됐지만, 현재 source와 image에 결속된 최종
+Docker release receipt는 아직 발행 대기입니다.
+
+현재 구현된 결정론적 권위와 범위는 다음과 같습니다.
+
+| 카테고리 | 현재 engine-owned 실행 게이트 | 정확한 경계 |
+|---|---|---|
+| Pwn | ELF 관측, D→V crash, runtime snapshot, address dependency의 L/N/A 판정, IP-control primitive, 3+3 exploit-effect | 기존 effect producer는 one-shot payload를 검증한다. 실행 중 leak을 capture·derive해 다음 payload를 만드는 interaction recipe는 아직 typed managed gate에 연결되지 않았다. |
+| Web | 역할별 session/state, runtime request timeline, differential impact, race 3+3, OOB 3+3 | source-to-sink는 실제 runtime 관측이 있을 때만 권위를 얻는다. 실제 대회 proxy·remote portability는 별도다. |
+| Rev | assembly/dynamic evidence와 원본 바이너리 positive 3 / mutated control 3 | network-none local standalone Linux ELF의 stdin oracle 범위다. |
+| Crypto | managed Builder의 solver를 operator-preissued hidden variant로 3+3 검증 | hidden input은 challenge/model workspace 밖 engine-private authority다. 현재 Docker release receipt는 대기 중이다. |
+| Forensics | immutable index, pointer/hash 결속, readiness와 cross-tool assertion graph | 지원 tool/profile과 실제 evidence coverage 밖의 결론은 승격하지 않는다. |
+| Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay | candidate-only이며 verifier 통과가 자동 제출 권한을 만들지 않는다. 현재 Docker release receipt는 대기 중이다. |
+
+이 표는 코드와 local deterministic gate의 구현 범위입니다. 같은 모델·도구의
+thin scaffold 대비 3회 중 2회 재현, blind/live solve@1, 카테고리 최저 성능과
+CVE 발견 성능을 측정했다는 뜻이 아닙니다. CTF 성능과
+ExploitGym/CyberGym-E2E/CVE 연구 축은 서로 분리해 평가합니다.
 
 ## 요구 환경
 
@@ -987,14 +1013,14 @@ request를 다시 읽어 판정을 재구성합니다. setup 실패와 unverifia
 terminal gate도 분모에서 빠지지 않습니다.
 
 모델이 기록한 임의 progress marker의 최초 시간은
-`time_to_first_claimed_progress`로만 집계합니다. 실행 가능한 engine-owned
-primitive stage gate가 아직 없으므로 `time_to_first_primitive`는 그런
-게이트가 연결될 때까지 `unavailable`입니다. marker 문구나 임의
-`extra.engine_owned=true`는 검증 증거로 승격되지 않습니다. 이 의미 변경과
-관련 metric key는 evaluation output `schema_version: 2`부터 적용됩니다.
-독립 재검증된 Pwn crash gate metric은 `schema_version: 3`에서
-추가됐습니다. crash D→V는 취약 동작 확인이지 exploit primitive가 아니므로
-`time_to_first_primitive`의 근거로 사용하지 않습니다.
+`time_to_first_claimed_progress`로만 집계합니다.
+`time_to_first_primitive`는 engine-owned Pwn IP-control 결과 artifact를
+bounded하게 다시 읽어 독립 검증할 수 있을 때만 값이 생기며, 해당 state에
+그 결과가 없으면 `unavailable`입니다. 별도의 Pwn exploit-effect 게이트가
+구현돼 있어도 임의 marker 문구나 `extra.engine_owned=true`는 primitive
+근거로 승격되지 않습니다. 독립 재검증된 Pwn crash gate metric은
+`schema_version: 3`에서 추가됐습니다. crash D→V만으로는 exploit
+primitive가 아니므로 `time_to_first_primitive`의 근거가 되지 않습니다.
 
 로컬 회귀 테스트:
 
@@ -1002,7 +1028,8 @@ primitive stage gate가 아직 없으므로 `time_to_first_primitive`는 그런
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-최종 수용 기준 인터프리터는 Python `3.13.14`다. Managed Rev production
+아래 역사적 동결 기록에서 사용한 수용 기준 인터프리터는 Python
+`3.13.14`다. Managed Rev production
 code freeze `79cbc53`에서 전체 901개 테스트가 175.985초에 통과했다(측정
 wall 173.51초). deterministic remote-limiter test와 release 문서를 포함한
 최종 production/test tree `abdea5b`에서도 fresh-clone의 901개 테스트,
@@ -1136,12 +1163,23 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   파일, non-native target과 이미지에 없는 dynamic library는 지원하지 않고
   fail-closed합니다. mutation control을 모두 거부하지 않는 의도적으로
   관대한 parser도 proof를 통과하지 못할 수 있습니다.
-- Local Pwn에는 stdin 기반 ELF D→V crash gate가 있지만 leak/`N/A`,
-  primitive, exploit chain, local stability, remote portability와 impact
-  proof는 아직 없습니다. Web multi-user impact, Crypto metamorphic
-  variant, Forensic evidence hash-chain과 Misc transform-DAG의 managed
-  proof oracle도 아직 구현되지 않았으며 해당 조합은 proof 등록 단계에서
-  fail-closed합니다.
+- Local Pwn에는 D→V crash, runtime snapshot, address-dependency L/N/A,
+  IP-control primitive와 3+3 exploit-effect gate가 있습니다. 다만 기존
+  effect producer는 one-shot payload용입니다. 실제 `zone`에서 관측한
+  동적 leak→derive→staged-send 체인은 attack 3/3, matched control 0/3의
+  effect를 냈지만 local flag source와 active remote target이 없었고,
+  bounded operator harness로 실행됐습니다. 따라서 flag/solve/remote
+  portability나 typed interaction P/E로 세지 않습니다.
+  [정본 evidence pointer](ctf-reports/21-zone-solve-capable-exploit-evidence.md)를
+  참고하십시오.
+- Web multi-user/differential impact와 race/OOB, Crypto hidden
+  metamorphic 3+3, Forensic pointer-bound assertion graph, Misc
+  transform-DAG/negative-control oracle는 코드 hot path에 연결됐습니다.
+  Crypto/Misc의 hidden authority는 operator가 challenge 밖 host file에서
+  Builder보다 먼저 preissue하고 engine-private artifact로 한 번만
+  소비합니다. 현재 source의 최종 전체 회귀와 managed Crypto/Misc Docker
+  release receipt가 끝나기 전에는 이 구현 상태를 release acceptance나
+  solve 성능으로 확대하지 않습니다.
 - image digest가 설정되지 않아도 실행은 가능하며 `doctor`가 경고합니다.
 - `work_tree_max_bytes`와 canonical artifact 합계 cap은 문제 디렉터리 전체의
   disk quota가 아닙니다. 누적 `runs/` raw, contest
@@ -1150,7 +1188,7 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   materialize하기 전에 전역 상한+1에서 즉시 중단합니다.
 - 자동 제출은 없습니다.
 
-이 제한을 포함한 요구사항 판정은
-[12. 최종 수용성 기록](ctf-reports/12-final-acceptance.md), 상세 구현은
+이 제한을 포함한 요구사항 판정 이력은
+[12. 수용성 기록](ctf-reports/12-final-acceptance.md), 상세 구현은
 [10. 구현 결과](ctf-reports/10-implementation-result.md)를 기준으로
 판단하십시오.

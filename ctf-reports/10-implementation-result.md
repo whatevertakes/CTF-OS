@@ -1,16 +1,53 @@
 # CTF-OS 구현 결과
 
-> 상태: 2026-07-28 코드 기준 as-built 정본  
+> 역사적 본문 상태: 2026-07-28 코드 기준 as-built 정본
+>
+> 현재 delta: 2026-07-31 release candidate, 최종 전체 회귀와
+> exact-image all-category release receipt 대기
+>
 > 범위: 저장소 루트의 `ctf_os/`, `tests/`, `pyproject.toml`과
-> `ctf-os-image/` 연동 경계  
-> 운영 방법: 저장소 루트의 [README](../README.md)  
-> 요구사항 판정: [12 최종 수용성 기록](12-final-acceptance.md)  
+> `ctf-os-image/` 연동 경계
+>
+> 운영 방법: 저장소 루트의 [README](../README.md)
+>
+> 요구사항 판정 이력: [12 수용성 기록](12-final-acceptance.md)
+>
 > 설계 근거: [09 구현 설계도](09-implementation-blueprint.md)
 
-이 문서는 09의 목표를 현재 코드가 어디까지 구현했는지 기록한다. 09는 설계
-근거와 장기 방향이다. 충돌 시 현재 코드와 통과한 회귀, 12의 요구사항
-판정, 이 문서, 09의 역사적 설계 순으로 따른다. 기능 이름이나 파일이
-존재한다는 이유만으로 end-to-end 완료로 표시하지 않았다.
+이 문서의 §1~12는 09의 목표를 2026-07-28 동결 코드가 어디까지
+구현했는지 기록한 역사적 as-built다. 09는 설계 근거와 장기 방향이다.
+충돌 시 현재 코드와 현재 source에서 통과한 회귀, 아래 현재 delta, 12의
+판정 이력, 역사적 본문, 09 순으로 따른다. 기능 이름이나 파일이 존재한다는
+이유만으로 end-to-end 완료로 표시하지 않는다.
+
+## 0. 2026-07-31 current-source delta
+
+7월 28일 이후의 핵심 변경은 역할 추가가 아니라 deterministic category
+authority와 실패 인계가 실제 managed 경로에 들어간 것입니다.
+
+| 영역 | 현재 구현 | 제한/미검증 |
+|---|---|---|
+| 모델·연속성 | 모든 기본 논리 역할은 같은 `gpt-5.6-sol` 계열을 사용한다. CLI managed 기본은 Captain lane만 resume하고 explorer/builder/verifier/proof는 fresh다. provider 한도는 wave 폭을 줄이지 않는다. | Captain continuity의 solve uplift는 미측정이다. programmatic API와 assisted/thin/legacy의 생략 기본은 fresh다. |
+| 상태·되먹임 | hypothesis/experiment/result/falsifier, bounded raw pointer, failure/resume capsule과 다음 Captain 재투입 | capsule과 raw/no-memory의 blind A/B 결과는 아직 없다. |
+| Pwn | D→V crash, runtime register/maps snapshot, address dependency L/N/A, IP-control primitive와 one-shot payload 3+3 exploit-effect | 동적 pointer capture/derive/staged send interaction은 아직 typed managed effect gate가 아니다. |
+| Web | multi-user state/timeline, differential impact, race 3+3, OOB 3+3; runtime source-to-sink가 없으면 정직하게 false | 실제 제한 proxy와 대회 remote portability는 별도다. |
+| Rev | 원본 ELF stdin positive 3 / mutation negative 3 acceptance oracle | local standalone Linux ELF 범위다. |
+| Crypto | operator가 Builder보다 앞서 challenge 밖 host source에서 hidden variant를 engine-private로 preissue하고 one-shot consume하는 managed 3+3 oracle | 현재 source/image의 최종 Docker receipt가 대기 중이다. |
+| Forensics | evidence index, typed pointer, tool readiness와 cross-tool assertion graph | 실제 image/profile별 coverage가 낮으면 결론을 보류한다. |
+| Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay; candidate-only | 현재 source/image의 최종 Docker receipt가 대기 중이다. |
+
+실제 `zone`에서는 stack disclosure부터 per-process libc 계산과 `system()`까지
+이어지는 체인이 fresh attack 3/3에서 sentinel을 냈고 matched control은
+0/3이었습니다. 이는 [정본 실행 증거](21-zone-solve-capable-exploit-evidence.md)가
+있는 solve-capable effect지만, flag source와 active remote가 없었고 bounded
+operator harness를 썼으므로 genuine flag/solve/typed interaction
+P/E/remote portability로 승격하지 않습니다.
+
+현재 코드 완성과 local deterministic release는 모델 성능 평가와 분리합니다.
+최종 suite와 exact-image matrix가 통과해도 same-model thin scaffold 대비
+3회 중 2회 재현, blind/live solve@1, median first-valid, category floor는
+별도 실행 전까지 미측정입니다. CTF 대회 축, ExploitGym exploit 전환 축,
+CyberGym-E2E와 미지 코드베이스 CVE 발견 축도 하나의 점수로 합치지 않습니다.
 
 ## 1. 확정된 운영 계약
 
@@ -743,7 +780,7 @@ guardian은 과설계를 피하기 위해 범위에 넣지 않았다.
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-현재 suite는 다음을 포함한다.
+2026-07-28 당시 suite는 다음을 포함했다.
 
 - 상태 원자 교체, stale revision, 손상 복구, crash 후 lock 재획득,
   state 16 MiB와 typed/repeated collection 16,384개 상한
@@ -827,7 +864,8 @@ Local process integration은 Codex가 생성할 것과 같은 stdio MCP handshak
 `ctf-os-image/tests/`는 이미지 lifecycle의 별도 suite이며 저장소 Python
 unit suite를 실행했다고 자동으로 수행되지는 않는다.
 
-2026-07-28 현재 호스트에서 별도 Docker smoke도 수행했다.
+다음은 **2026-07-28 역사적 동결**에서 수행한 Docker smoke다. 현재
+source/image의 release receipt가 아니다.
 
 - `ctf-os:core` exact image ID
   `sha256:114da21d7258593dd7db586e210ebfdf9a9b75eaa9efa16337b0dec53ad575c7`
@@ -841,7 +879,7 @@ unit suite를 실행했다고 자동으로 수행되지는 않는다.
 이는 현재 호스트의 runtime 결속을 확인한 것이지 다른 호스트나 실제 대회
 solve 성능을 보증하는 결과는 아니다.
 
-최종 freeze 검증은 Python `3.13.14`만 권위 있는 gate로 사용했다.
+이 역사적 freeze 검증은 Python `3.13.14`만 권위 있는 gate로 사용했다.
 
 - aggregate source hash:
   `09641f4466b30add7d18d6239a6ff73fb9afa8baccf2fb2d49b2ce5c55a8d96b`
@@ -890,22 +928,26 @@ solve 성능을 보증하는 결과는 아니다.
 | host별 remote budget | hostname별 command-start FIFO는 구현. command 내부 HTTP request budget은 외부 restricted proxy 책임이며 network 동시 lease와 혼동하지 않음 |
 | `ctfosd`가 Docker 독점 | Live의 유일한 state/challenge-execution MCP는 shell-disabled 환경의 required `ctfos_live`이고 mailbox/capability는 MCP env에만 있음. 부모가 state/Docker를 소유하며 persistent·별도 권한 daemon 배포는 미완성 |
 
-## 13. 남은 작업 우선순위
+## 13. 현재 남은 작업 우선순위
 
 대회 hot path에 직접 영향을 주는 순서다.
 
-1. 적대적 원격 문제에 필요한 제한 proxy/network를 배포하고 `proxy`
-   enforcement의 egress를 실제 테스트한다.
-2. 대회 정책에 맞는 command 내부 HTTP request rate/token bucket을 외부
-   proxy에서 강제하고 429·우회 egress를 실제 서버와 대조한다.
-3. configured Sol/Terra/Luna 전체 solve와 Sol Live TUI/native 세 worker를
-   실제 계정에서 고정 예산으로 검증한다.
-4. 구현된 evaluator로 L2 held-out와 L3 live fixed-budget 실험을 수행하고
-   solve@1/3, consistency, clean proof와 시간·사용량을 비교한다.
-5. job lifetime 전체에 resource lease를 유지하고 사망 시 회수하는
+1. 현재 source의 전체 Python suite와 exact tracked source/image에 결속된
+   all-category Docker matrix를 통과시키고 새 receipt를 발행한다. 이전
+   동결의 test 수·digest를 재사용하지 않는다.
+2. 실제 `zone`에 필요한 bounded capture/derive/staged-send interaction
+   recipe를 image-owned producer와 managed 3+3 validator에 연결한다.
+3. 같은 frontier model·도구·예산의 thin baseline과 full managed engine을
+   regression/blind/live-like에서 각각 3회 실행해 solve@1, pass²/₃,
+   first-valid, proof와 사람 개입을 비교한다.
+4. ExploitGym exploit 전환과 CyberGym-E2E/CVE 발견 평가는 CTF 성능과
+   분리해 실행한다.
+5. 적대적 원격 문제에 필요한 제한 proxy/network와 command 내부 request
+   rate/token bucket을 배포하고 우회 egress·429를 실제 정책과 대조한다.
+6. job lifetime 전체에 resource lease를 유지하고 사망 시 회수하는
    supervisor를 먼저 구현한 뒤 background start/status/log/cancel을
    연결할지는 실제 대회에서 장기 background 수요가 확인될 때만 결정한다.
-6. 부모 sandbox backend까지 별도 권한 daemon으로 분리하려면 persistent
+7. 부모 sandbox backend까지 별도 권한 daemon으로 분리하려면 persistent
    `ctfosd` lifecycle, registration과 권한 분리 설치를 완성한다. Attached
    Live의 shell-disabled required MCP→network-free mailbox broker 경로는
    이미 기본 경로다.
