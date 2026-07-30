@@ -130,6 +130,7 @@ PWN_CRASH_V1_PRODUCER_ERROR_REASONS = frozenset(
         "target_exec_failed",
         "target_process_group_cleanup_failed",
         "target_reap_failed",
+        "target_reexec_unsupported",
         "target_task_limit_exceeded",
         "target_timeout",
         "unobserved_core_signal_termination",
@@ -268,7 +269,8 @@ def pwn_crash_v1_contract_descriptor() -> dict[str, object]:
             "network": "outer-challenge-sandbox-none",
             "process_containment": (
                 "one-shot-clean-sandbox-required;"
-                "fork-vfork-clone-exec-traced;"
+                "fork-vfork-clone-traced;"
+                "initial-exec-only;later-exec-fails-closed;"
                 "session-process-group-and-tracee-reap"
             ),
             "producer_process": "pr-set-dumpable-zero-verified",
@@ -323,6 +325,7 @@ def pwn_crash_v1_contract_descriptor() -> dict[str, object]:
             "trace": (
                 "fixed-ptrace-traceme;"
                 "initial-and-later-exec-events-distinguished;"
+                "later-exec-fails-closed;"
                 "exitkill-enabled"
             ),
             "traced_task_limit": PWN_CRASH_V1_MAX_TRACED_TASKS,

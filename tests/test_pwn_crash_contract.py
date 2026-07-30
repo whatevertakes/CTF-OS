@@ -291,6 +291,7 @@ class PwnCrashV1ContractTests(unittest.TestCase):
             "multithreaded_core_signal_unsupported",
             "non_root_core_signal_unsupported",
             "seccomp_filter_unavailable",
+            "target_reexec_unsupported",
             "unobserved_core_signal_termination",
         )
         for reason in reasons:
@@ -449,6 +450,7 @@ class PwnCrashV1ContractTests(unittest.TestCase):
             (
                 "fixed-ptrace-traceme;"
                 "initial-and-later-exec-events-distinguished;"
+                "later-exec-fails-closed;"
                 "exitkill-enabled"
             ),
         )

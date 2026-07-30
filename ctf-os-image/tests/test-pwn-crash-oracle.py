@@ -374,21 +374,20 @@ int main(int argc, char **argv) {
             )
             self.assertIsNone(document["target"])
 
-    def test_later_exec_trap_is_not_reported_as_a_fault(self) -> None:
+    def test_later_exec_cannot_substitute_the_bound_source(self) -> None:
         result = self._invoke(
             b"X",
             ordinal=1,
             phase="positive",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["status"], "error")
         self.assertEqual(
-            json.loads(result.stdout)["target"],
-            {
-                "exit_code": 0,
-                "signal_number": None,
-                "termination": "exited",
-            },
+            document["reason_code"],
+            "target_reexec_unsupported",
         )
+        self.assertIsNone(document["target"])
 
     def test_root_thread_group_fault_is_a_finite_error(
         self,

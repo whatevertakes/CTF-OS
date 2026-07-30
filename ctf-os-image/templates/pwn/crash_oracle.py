@@ -133,6 +133,7 @@ PRODUCER_ERROR_REASONS = frozenset(
         "target_exec_failed",
         "target_process_group_cleanup_failed",
         "target_reap_failed",
+        "target_reexec_unsupported",
         "target_task_limit_exceeded",
         "target_timeout",
         "unobserved_core_signal_termination",
@@ -302,7 +303,8 @@ def contract_descriptor() -> dict[str, object]:
             "network": "outer-challenge-sandbox-none",
             "process_containment": (
                 "one-shot-clean-sandbox-required;"
-                "fork-vfork-clone-exec-traced;"
+                "fork-vfork-clone-traced;"
+                "initial-exec-only;later-exec-fails-closed;"
                 "session-process-group-and-tracee-reap"
             ),
             "producer_process": "pr-set-dumpable-zero-verified",
@@ -353,6 +355,7 @@ def contract_descriptor() -> dict[str, object]:
             "trace": (
                 "fixed-ptrace-traceme;"
                 "initial-and-later-exec-events-distinguished;"
+                "later-exec-fails-closed;"
                 "exitkill-enabled"
             ),
             "traced_task_limit": MAX_TRACED_TASKS,
@@ -1531,13 +1534,9 @@ def _execute_target(
                 _ptrace(_PTRACE_CONT, pid)
                 continue
             if event == _PTRACE_EVENT_EXEC:
-                former_pid = _ptrace_event_pid(pid)
-                if former_pid != pid:
-                    tracees.discard(former_pid)
-                    initial_stops.discard(former_pid)
-                    tracees.add(pid)
-                _ptrace(_PTRACE_CONT, pid)
-                continue
+                raise CrashOracleError(
+                    "target_reexec_unsupported"
+                )
             if event != 0:
                 raise CrashOracleError("ptrace_protocol_invalid")
 
