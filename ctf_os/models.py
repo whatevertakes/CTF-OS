@@ -20,6 +20,15 @@ from typing import Any, Iterable, Mapping
 
 from ctf_os.candidates import candidate_value_is_valid
 from ctf_os.contracts import resolve_rev_inventory_contract
+from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_ATTEMPT_COUNT,
+    PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+    PWN_CRASH_V1_CONTRACT_ID,
+    PWN_CRASH_V1_CONTRACT_VERSION,
+    PWN_CRASH_V1_MAX_INPUT_BYTES,
+    PWN_CRASH_V1_MAX_SOURCE_BYTES,
+    PWN_CRASH_V1_PROTOCOL,
+)
 from ctf_os.contracts.rev_inventory_v1 import (
     REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
     REV_INVENTORY_V1_CONTRACT_ID,
@@ -4896,6 +4905,1150 @@ def _rev_inventory_state_errors(
     return errors
 
 
+_PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
+_PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_CRASH_RESULT_KEY = "pwn_crash_evidence"
+_PWN_CRASH_REQUEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "contract_id",
+        "contract_version",
+        "contract_fingerprint",
+        "protocol",
+        "configuration_epoch",
+        "payload_artifact_id",
+        "payload_reported_locator",
+        "payload_sha256",
+        "payload_size_bytes",
+        "hypothesis_id",
+        "source_builder_run_id",
+    }
+)
+_PWN_CRASH_EVIDENCE_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol",
+        "recipe_sha256",
+        "evaluated_at",
+        "evaluation",
+        "evaluation_sha256",
+        "attempts",
+    }
+)
+_PWN_CRASH_ATTEMPT_LINK_KEYS = frozenset(
+    {
+        "ordinal",
+        "run_id",
+        "receipt_id",
+        "stdout_artifact_id",
+    }
+)
+_PWN_CRASH_RUN_RECORD_KEYS = frozenset(
+    {
+        "recipe_sha256",
+        "request_sha256",
+        "execution_contract",
+        "execution_contract_sha256",
+        "ordinal",
+        "phase",
+        "input_sha256",
+        "input_size_bytes",
+        "receipt",
+    }
+)
+
+
+def _pwn_crash_exact_dict(
+    value: object,
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != expected_keys:
+        raise ModelValidationError(
+            f"{label} has missing or unknown fields"
+        )
+    return value
+
+
+def _pwn_crash_experiment_marker(experiment: Experiment) -> bool:
+    result = experiment.result
+    return (
+        experiment.command == _PWN_CRASH_ENGINE_COMMAND
+        or experiment.extra.get("engine_executor")
+        == _PWN_CRASH_ENGINE_EXECUTOR
+        or experiment.extra.get("managed_action_kind")
+        == _PWN_CRASH_ACTION_KIND
+        or "pwn_crash_request" in experiment.extra
+        or "pwn_crash_recipe" in experiment.extra
+        or (
+            isinstance(result, Mapping)
+            and _PWN_CRASH_RESULT_KEY in result
+        )
+    )
+
+
+def _pwn_crash_safe_locator(value: object) -> bool:
+    if (
+        type(value) is not str
+        or not value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "\\" in value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > 4096
+    ):
+        return False
+    parts = value.split("/")
+    return (
+        all(
+            part not in {"", ".", ".."}
+            and len(part.encode("utf-8")) <= 255
+            for part in parts
+        )
+        and PurePosixPath(value).as_posix() == value
+    )
+
+
+def _pwn_crash_registered_binding(
+    state: "ChallengeState",
+    experiment: Experiment,
+    *,
+    runs: Mapping[str, RunReference],
+    artifacts: Mapping[str, ArtifactReference],
+    hypotheses: Mapping[str, Hypothesis],
+) -> tuple[
+    Mapping[str, Any] | None,
+    RunReference | None,
+    ArtifactReference | None,
+    list[str],
+]:
+    """Validate the model nomination without granting it execution control."""
+
+    label = f"Pwn crash experiment {experiment.id}"
+    pre_execution = experiment.status in {
+        ExperimentStatus.REGISTERED,
+        ExperimentStatus.RUNNING,
+    }
+    errors: list[str] = []
+    raw_request = experiment.extra.get("pwn_crash_request")
+    if type(raw_request) is not dict or set(raw_request) != (
+        _PWN_CRASH_REQUEST_KEYS
+    ):
+        return None, None, None, [
+            f"{label} request has missing or unknown fields"
+        ]
+    request = raw_request
+    if (
+        state.schema_version < STATE_SCHEMA_VERSION
+        or state.category.strip().casefold() != "pwn"
+        or experiment.kind is not ExperimentKind.STRATEGIC
+        or experiment.command != _PWN_CRASH_ENGINE_COMMAND
+        or experiment.proof_recipe is not None
+        or experiment.extra.get("managed_contract_version") != 2
+        or experiment.extra.get("managed_action_kind")
+        != _PWN_CRASH_ACTION_KIND
+        or experiment.extra.get("engine_executor")
+        != _PWN_CRASH_ENGINE_EXECUTOR
+    ):
+        errors.append(f"{label} lacks its exact engine-owned identity")
+    configuration_epoch = request.get("configuration_epoch")
+    payload_size = request.get("payload_size_bytes")
+    if (
+        type(request.get("schema_version")) is not int
+        or request["schema_version"] != 1
+        or request.get("contract_id") != PWN_CRASH_V1_CONTRACT_ID
+        or type(request.get("contract_version")) is not int
+        or request["contract_version"] != PWN_CRASH_V1_CONTRACT_VERSION
+        or request.get("contract_fingerprint")
+        != PWN_CRASH_V1_CONTRACT_FINGERPRINT
+        or request.get("protocol") != PWN_CRASH_V1_PROTOCOL
+        or type(configuration_epoch) is not int
+        or not 0 <= configuration_epoch <= state.configuration_epoch
+        or (
+            pre_execution
+            and configuration_epoch != state.configuration_epoch
+        )
+        or experiment.extra.get("configuration_epoch")
+        != configuration_epoch
+        or not _proof_binding_identifier(request.get("hypothesis_id"))
+        or not _proof_binding_identifier(
+            request.get("source_builder_run_id")
+        )
+        or not _proof_binding_identifier(
+            request.get("payload_artifact_id")
+        )
+        or not _pwn_crash_safe_locator(
+            request.get("payload_reported_locator")
+        )
+        or not _proof_binding_sha256(request.get("payload_sha256"))
+        or type(payload_size) is not int
+        or not 1 <= payload_size <= PWN_CRASH_V1_MAX_INPUT_BYTES
+    ):
+        errors.append(f"{label} request values are invalid")
+
+    hypothesis_id = request.get("hypothesis_id")
+    source_run_id = request.get("source_builder_run_id")
+    payload_id = request.get("payload_artifact_id")
+    hypothesis = (
+        hypotheses.get(hypothesis_id)
+        if isinstance(hypothesis_id, str)
+        else None
+    )
+    source_run = (
+        runs.get(source_run_id)
+        if isinstance(source_run_id, str)
+        else None
+    )
+    payload = (
+        artifacts.get(payload_id)
+        if isinstance(payload_id, str)
+        else None
+    )
+    if (
+        hypothesis is None
+        or experiment.hypothesis_ids != [hypothesis_id]
+        or (
+            pre_execution
+            and hypothesis.status not in ACTIVE_HYPOTHESIS_STATUSES
+        )
+    ):
+        errors.append(
+            f"{label} does not bind one eligible hypothesis"
+        )
+    if (
+        source_run is None
+        or source_run.status is not RunStatus.COMPLETED
+        or source_run.origin is not RunOrigin.MANAGED_MODEL
+        or source_run.role != "builder"
+        or source_run.configuration_epoch != configuration_epoch
+        or source_run.extra.get("semantic_merge") is not True
+        or experiment.source_run_id != source_run_id
+    ):
+        errors.append(f"{label} does not bind its completed Builder run")
+    if (
+        payload is None
+        or payload.source_run_id != source_run_id
+        or payload.sha256 != request.get("payload_sha256")
+        or payload.size != payload_size
+        or type(payload.size) is not int
+        or payload.extra.get("reported_locator")
+        != request.get("payload_reported_locator")
+    ):
+        errors.append(f"{label} does not bind its canonical payload")
+    return request, source_run, payload, errors
+
+
+def _pwn_crash_recipe_binding(
+    state: "ChallengeState",
+    experiment: Experiment,
+    *,
+    request: Mapping[str, Any],
+    payload: ArtifactReference,
+) -> tuple[Any | None, list[str]]:
+    """Parse the exact engine recipe and bind it back to canonical state."""
+
+    label = f"Pwn crash experiment {experiment.id}"
+    raw_recipe = experiment.extra.get("pwn_crash_recipe")
+    if type(raw_recipe) is not dict:
+        return None, [f"{label} lacks its canonical execution recipe"]
+    try:
+        from ctf_os.engine.pwn_crash import (  # local: avoids cycle
+            PwnCrashRecipe,
+        )
+
+        recipe = PwnCrashRecipe.from_dict(raw_recipe)
+    except (
+        ImportError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        # PwnCrashRecipeError is a ValueError subclass.  Keeping this bounded
+        # exception list also lets old recovery environments fail closed.
+        return None, [f"{label} recipe is invalid: {error}"]
+
+    manifest = state.metadata.get("source_manifest_sha256")
+    primary_locator = state.metadata.get("adapter_primary_source")
+    matching_sources = [
+        source
+        for source in state.source_inventory
+        if source.path == primary_locator
+    ]
+    errors: list[str] = []
+    if (
+        recipe.experiment_id != experiment.id
+        or recipe.hypothesis_id != request.get("hypothesis_id")
+        or recipe.configuration_epoch
+        != request.get("configuration_epoch")
+        or recipe.payload_artifact_id != payload.id
+        or recipe.payload_source_run_id != payload.source_run_id
+        or recipe.payload_artifact_locator != payload.path
+        or recipe.payload_sha256 != payload.sha256
+        or recipe.payload_size_bytes != payload.size
+    ):
+        errors.append(f"{label} recipe request/payload binding changed")
+    if (
+        not _proof_binding_sha256(manifest)
+        or not isinstance(primary_locator, str)
+        or len(matching_sources) != 1
+    ):
+        errors.append(f"{label} has no exact current primary source")
+    else:
+        primary = matching_sources[0]
+        if (
+            primary.kind != "file"
+            or not _proof_binding_sha256(primary.sha256)
+            or type(primary.size) is not int
+            or not 1 <= primary.size <= PWN_CRASH_V1_MAX_SOURCE_BYTES
+            or recipe.primary_elf_locator != primary.path
+            or recipe.source_manifest_sha256 != manifest
+            or recipe.source_sha256 != primary.sha256
+            or recipe.source_size_bytes != primary.size
+        ):
+            errors.append(f"{label} recipe source binding changed")
+    if (
+        not isinstance(recipe.image_reference, str)
+        or not recipe.image_reference
+        or not isinstance(recipe.image_digest, str)
+        or not recipe.image_digest.startswith("sha256:")
+        or not _proof_binding_sha256(
+            recipe.image_digest.removeprefix("sha256:")
+        )
+    ):
+        errors.append(f"{label} recipe image binding is not digest-pinned")
+    return recipe, errors
+
+
+def _pwn_crash_gate_binding(
+    value: object,
+    *,
+    recipe: Any,
+) -> tuple[Any | None, list[str]]:
+    """Parse one aggregate verdict and bind its semantic pins to the recipe."""
+
+    try:
+        from ctf_os.engine.pwn_crash import (  # local: avoids cycle
+            PwnCrashGateEvaluation,
+        )
+
+        evaluation = PwnCrashGateEvaluation.from_dict(value)
+    except (
+        ImportError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return None, [f"Pwn crash gate evaluation is invalid: {error}"]
+
+    errors: list[str] = []
+    if evaluation.to_dict() != value:
+        errors.append("Pwn crash gate evaluation is not canonical")
+    semantic = evaluation.semantic_evaluation
+    if semantic is not None and (
+        semantic.recipe_sha256 != recipe.recipe_sha256
+        or semantic.source_manifest_sha256
+        != recipe.source_manifest_sha256
+        or semantic.source_sha256 != recipe.source_sha256
+        or semantic.source_size_bytes != recipe.source_size_bytes
+        or semantic.poc_sha256 != recipe.payload_sha256
+        or semantic.poc_size_bytes != recipe.payload_size_bytes
+    ):
+        errors.append(
+            "Pwn crash gate evaluation changed its recipe/source/payload "
+            "binding"
+        )
+    return evaluation, errors
+
+
+def _pwn_crash_run_marker(run: RunReference) -> bool:
+    return (
+        run.role == "pwn_crash_gate"
+        or "pwn_crash" in run.extra
+    )
+
+
+def _pwn_crash_artifact_marker(artifact: ArtifactReference) -> bool:
+    return (
+        artifact.extra.get("engine_executor")
+        == _PWN_CRASH_ENGINE_EXECUTOR
+        or artifact.extra.get("kind")
+        == "pwn_crash_capability_attestation"
+    )
+
+
+def _pwn_crash_precommit_failure_errors(
+    experiment: Experiment,
+    *,
+    payload: ArtifactReference,
+    linked_runs: list[RunReference],
+    linked_receipts: list[ExecutionReceipt],
+    linked_artifacts: list[ArtifactReference],
+) -> list[str]:
+    label = f"Pwn crash experiment {experiment.id}"
+    errors: list[str] = []
+    result = experiment.result
+    reason = (
+        result.get("error")
+        if type(result) is dict and set(result) == {"error"}
+        else None
+    )
+    if (
+        experiment.status is not ExperimentStatus.FAILED
+        or type(reason) is not str
+        or not reason.startswith("Pwn crash gate failed closed: ")
+        or len(reason.encode("utf-8")) > 4096
+    ):
+        errors.append(f"{label} has an invalid pre-commit failure result")
+    if (
+        experiment.artifact_ids != [payload.id]
+        or experiment.evidence_fact_ids
+        or experiment.evidence_run_ids
+        or experiment.evidence_receipt_ids
+        or experiment.evaluation_reason is not None
+        or experiment.evaluated_at is not None
+        or linked_runs
+        or linked_receipts
+        or linked_artifacts
+    ):
+        errors.append(
+            f"{label} pre-commit failure retained execution evidence"
+        )
+    return errors
+
+
+def _pwn_crash_execution_contract_errors(
+    value: object,
+    *,
+    supplied_sha256: object,
+    experiment: Experiment,
+    recipe: Any,
+    ordinal: int,
+    capability_artifact_id: str,
+    capability_sha256: str,
+) -> list[str]:
+    """Reconstruct every engine-owned execution field except issued timeout."""
+
+    label = f"Pwn crash experiment {experiment.id} attempt {ordinal}"
+    if type(value) is not dict:
+        return [f"{label} execution contract is not an object"]
+    try:
+        encoded = (
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (RecursionError, TypeError, UnicodeError, ValueError):
+        return [f"{label} execution contract is not canonical JSON"]
+    if (
+        len(encoded) > 256 * 1024
+        or not _proof_binding_sha256(supplied_sha256)
+        or hashlib.sha256(encoded).hexdigest() != supplied_sha256
+    ):
+        return [f"{label} execution contract hash does not match"]
+
+    sandbox = value.get("sandbox")
+    outer_timeout = (
+        sandbox.get("outer_timeout_seconds")
+        if type(sandbox) is dict
+        else None
+    )
+    if (
+        type(outer_timeout) is not int
+        or not 1 <= outer_timeout <= min(10, experiment.timeout_seconds)
+    ):
+        return [f"{label} execution timeout is invalid"]
+    try:
+        from ctf_os.director.resources import tool_profile
+        from ctf_os.engine.pwn_crash import (
+            PWN_CRASH_INPUT_DESTINATION_LOCATOR,
+            PWN_CRASH_NETWORK_POLICY,
+            PWN_CRASH_ONE_SHOT,
+            PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+            PWN_CRASH_PRODUCER_INTERPRETER_PATH,
+            PWN_CRASH_PRODUCER_PATH,
+            PWN_CRASH_SANDBOX_METHOD,
+        )
+
+        binding = recipe.attempt_input_binding(ordinal)
+        expected = {
+            "schema_version": 1,
+            "contract": {
+                "id": PWN_CRASH_V1_CONTRACT_ID,
+                "version": PWN_CRASH_V1_CONTRACT_VERSION,
+                "fingerprint": PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+            },
+            "protocol": PWN_CRASH_V1_PROTOCOL,
+            "recipe_sha256": recipe.recipe_sha256,
+            "configuration_epoch": recipe.configuration_epoch,
+            "attempt": {
+                "ordinal": ordinal,
+                "phase": binding["phase"],
+            },
+            "input": {
+                "kind": binding["input_kind"],
+                "artifact_id": (
+                    recipe.payload_artifact_id
+                    if binding["phase"] == "positive"
+                    else None
+                ),
+                "sha256": binding["input_sha256"],
+                "size_bytes": binding["input_size_bytes"],
+                "destination_locator": (
+                    PWN_CRASH_INPUT_DESTINATION_LOCATOR
+                ),
+            },
+            "argv": list(recipe.argv_for_attempt(ordinal)),
+            "sandbox": {
+                "method": PWN_CRASH_SANDBOX_METHOD,
+                "one_shot": PWN_CRASH_ONE_SHOT,
+                "outer_timeout_seconds": outer_timeout,
+                "environment": {},
+                "resource_request": tool_profile(
+                    experiment.resource_class,
+                    needs_kvm=False,
+                    network=False,
+                ).as_dict(),
+                "image": {
+                    "reference": recipe.image_reference,
+                    "digest": recipe.image_digest,
+                },
+                "network": PWN_CRASH_NETWORK_POLICY,
+                "network_target": None,
+            },
+            "producer": {
+                "interpreter_path": (
+                    PWN_CRASH_PRODUCER_INTERPRETER_PATH
+                ),
+                "path": PWN_CRASH_PRODUCER_PATH,
+                "capability_name": (
+                    PWN_CRASH_PRODUCER_CAPABILITY_NAME
+                ),
+                "file_sha256": recipe.producer_file_sha256,
+                "capability_attestation_artifact_id": (
+                    capability_artifact_id
+                ),
+                "capability_attestation_sha256": capability_sha256,
+            },
+        }
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        return [f"{label} execution contract cannot be rebuilt: {error}"]
+    if value != expected:
+        return [f"{label} execution contract changed"]
+    return []
+
+
+def _pwn_crash_attempt_graph_errors(
+    experiment: Experiment,
+    *,
+    recipe: Any,
+    source_run: RunReference,
+    attempts: list[Mapping[str, Any]],
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    artifacts_by_run: Mapping[str, list[ArtifactReference]],
+) -> tuple[list[str], str | None]:
+    """Validate six state-level run/receipt/artifact chains.
+
+    Semantic classification remains owned by ``PwnCrashGateEvaluation``.
+    This helper only verifies that its six attempt links point at the exact
+    durable execution records declared by the engine.
+    """
+
+    label = f"Pwn crash experiment {experiment.id}"
+    errors: list[str] = []
+    capability_id: str | None = None
+    seen_runs: set[str] = set()
+    seen_receipts: set[str] = set()
+    seen_stdout: set[str] = set()
+    seen_requests: set[str] = set()
+    seen_execution_contracts: set[str] = set()
+
+    try:
+        from ctf_os.engine.pwn_crash import (  # local: avoids cycle
+            PWN_CRASH_NETWORK_POLICY,
+            PWN_CRASH_ONE_SHOT,
+            PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+            PWN_CRASH_SANDBOX_METHOD,
+            PwnCrashReceiptMetadata,
+        )
+    except ImportError as error:
+        return [f"{label} cannot load its receipt contract: {error}"], None
+
+    for expected_ordinal, attempt in enumerate(attempts, start=1):
+        attempt_label = f"{label} attempt {expected_ordinal}"
+        if (
+            type(attempt) is not dict
+            or set(attempt) != _PWN_CRASH_ATTEMPT_LINK_KEYS
+        ):
+            errors.append(f"{attempt_label} link is not canonical")
+            continue
+        ordinal = attempt.get("ordinal")
+        run_id = attempt.get("run_id")
+        receipt_id = attempt.get("receipt_id")
+        stdout_id = attempt.get("stdout_artifact_id")
+        if (
+            type(ordinal) is not int
+            or ordinal != expected_ordinal
+            or not _proof_binding_identifier(run_id)
+            or not _proof_binding_identifier(receipt_id)
+            or not _proof_binding_identifier(stdout_id)
+        ):
+            errors.append(f"{attempt_label} link values are invalid")
+            continue
+        assert isinstance(run_id, str)
+        assert isinstance(receipt_id, str)
+        assert isinstance(stdout_id, str)
+        if (
+            run_id in seen_runs
+            or receipt_id in seen_receipts
+            or stdout_id in seen_stdout
+        ):
+            errors.append(f"{attempt_label} reuses an evidence record")
+        seen_runs.add(run_id)
+        seen_receipts.add(receipt_id)
+        seen_stdout.add(stdout_id)
+
+        run = runs.get(run_id)
+        receipt = receipts.get(receipt_id)
+        stdout = artifacts.get(stdout_id)
+        if run is None or receipt is None or stdout is None:
+            errors.append(f"{attempt_label} has a missing evidence record")
+            continue
+        pwn_record = run.extra.get("pwn_crash")
+        receipt_record = receipt.extra.get("pwn_crash")
+        raw_metadata = (
+            pwn_record.get("receipt")
+            if type(pwn_record) is dict
+            else None
+        )
+        try:
+            metadata = PwnCrashReceiptMetadata.from_dict(raw_metadata)
+        except (TypeError, ValueError) as error:
+            errors.append(
+                f"{attempt_label} receipt metadata is invalid: {error}"
+            )
+            continue
+        binding = recipe.attempt_input_binding(expected_ordinal)
+        request_sha256 = (
+            pwn_record.get("request_sha256")
+            if type(pwn_record) is dict
+            else None
+        )
+        execution_contract_sha256 = (
+            pwn_record.get("execution_contract_sha256")
+            if type(pwn_record) is dict
+            else None
+        )
+        if (
+            type(pwn_record) is not dict
+            or set(pwn_record) != _PWN_CRASH_RUN_RECORD_KEYS
+            or pwn_record != receipt_record
+            or pwn_record.get("recipe_sha256")
+            != recipe.recipe_sha256
+            or pwn_record.get("ordinal") != expected_ordinal
+            or pwn_record.get("phase") != binding["phase"]
+            or pwn_record.get("input_sha256")
+            != binding["input_sha256"]
+            or pwn_record.get("input_size_bytes")
+            != binding["input_size_bytes"]
+            or not _proof_binding_sha256(request_sha256)
+            or metadata.request_sha256 != request_sha256
+            or not _proof_binding_sha256(execution_contract_sha256)
+            or metadata.execution_contract_sha256
+            != execution_contract_sha256
+        ):
+            errors.append(
+                f"{attempt_label} run/receipt binding is inconsistent"
+            )
+        if isinstance(request_sha256, str):
+            if request_sha256 in seen_requests:
+                errors.append(f"{attempt_label} reuses a request hash")
+            seen_requests.add(request_sha256)
+        if isinstance(execution_contract_sha256, str):
+            if execution_contract_sha256 in seen_execution_contracts:
+                errors.append(
+                    f"{attempt_label} reuses an execution-contract hash"
+                )
+            seen_execution_contracts.add(execution_contract_sha256)
+
+        current_capability_id = (
+            metadata.capability_attestation_artifact_id
+        )
+        current_capability_sha256 = (
+            metadata.capability_attestation_sha256
+        )
+        if capability_id is None and isinstance(
+            current_capability_id,
+            str,
+        ):
+            capability_id = current_capability_id
+        if (
+            not _proof_binding_identifier(current_capability_id)
+            or not _proof_binding_sha256(current_capability_sha256)
+            or current_capability_id != capability_id
+        ):
+            errors.append(
+                f"{attempt_label} capability binding is inconsistent"
+            )
+        errors.extend(
+            _pwn_crash_execution_contract_errors(
+                pwn_record.get("execution_contract"),
+                supplied_sha256=execution_contract_sha256,
+                experiment=experiment,
+                recipe=recipe,
+                ordinal=expected_ordinal,
+                capability_artifact_id=current_capability_id,
+                capability_sha256=current_capability_sha256,
+            )
+        )
+
+        if (
+            run.origin is not RunOrigin.MANAGED_TOOL
+            or run.role != "pwn_crash_gate"
+            or run.extra.get("experiment_id") != experiment.id
+            or run.configuration_epoch != recipe.configuration_epoch
+            or run.session_id != source_run.session_id
+            or run.cycle_id != source_run.cycle_id
+            or run.wave_id != source_run.wave_id
+            or not _pwn_crash_safe_locator(run.request_path)
+            or not _pwn_crash_safe_locator(run.result_path)
+            or not _pwn_crash_safe_locator(run.validation_path)
+            or receipt.experiment_id != experiment.id
+            or receipt.run_id != run.id
+            or receipt.id != metadata.receipt_id
+            or receipt.run_id != metadata.run_id
+            or receipt.outcome.value != metadata.outcome
+            or receipt.exit_code != metadata.exit_code
+            or receipt.stdout_artifact_id != stdout.id
+            or receipt.stdout_bytes != metadata.stdout_drained_bytes
+            or stdout.source_run_id != run.id
+            or stdout.sha256 != metadata.stdout_artifact_sha256
+            or stdout.size != metadata.stdout_artifact_size_bytes
+            or metadata.stdout_artifact_id != stdout.id
+            or metadata.ordinal != expected_ordinal
+            or metadata.configuration_epoch != recipe.configuration_epoch
+            or metadata.image_digest != recipe.image_digest
+            or metadata.recipe_sha256 != recipe.recipe_sha256
+            or metadata.producer_capability_name
+            != PWN_CRASH_PRODUCER_CAPABILITY_NAME
+            or metadata.producer_file_sha256
+            != recipe.producer_file_sha256
+            or metadata.one_shot is not PWN_CRASH_ONE_SHOT
+            or metadata.sandbox_method != PWN_CRASH_SANDBOX_METHOD
+            or metadata.network != PWN_CRASH_NETWORK_POLICY
+        ):
+            errors.append(
+                f"{attempt_label} durable execution chain is inconsistent"
+            )
+
+        stderr = (
+            artifacts.get(receipt.stderr_artifact_id)
+            if isinstance(receipt.stderr_artifact_id, str)
+            else None
+        )
+        per_run_artifacts = artifacts_by_run.get(run.id, [])
+        if (
+            stderr is None
+            or stderr.source_run_id != run.id
+            or stdout.id == stderr.id
+            or {item.id for item in per_run_artifacts}
+            != {stdout.id, stderr.id}
+            or stdout.id not in experiment.artifact_ids
+            or stderr.id in experiment.artifact_ids
+        ):
+            errors.append(
+                f"{attempt_label} stdout/stderr artifact graph is invalid"
+            )
+        expected_stream_extra = {
+            "engine_executor": _PWN_CRASH_ENGINE_EXECUTOR,
+            "recipe_sha256": recipe.recipe_sha256,
+            "ordinal": expected_ordinal,
+            "phase": binding["phase"],
+        }
+        for stream, artifact in (("stdout", stdout), ("stderr", stderr)):
+            if artifact is None:
+                continue
+            extra = artifact.extra
+            if (
+                set(extra)
+                != {
+                    "stream",
+                    "engine_executor",
+                    "recipe_sha256",
+                    "ordinal",
+                    "phase",
+                    "capture_placeholder",
+                }
+                or extra.get("stream") != stream
+                or any(
+                    extra.get(key) != value
+                    for key, value in expected_stream_extra.items()
+                )
+                or type(extra.get("capture_placeholder")) is not bool
+            ):
+                errors.append(
+                    f"{attempt_label} {stream} artifact is not canonical"
+                )
+    return errors, capability_id
+
+
+def _pwn_crash_state_errors(
+    state: "ChallengeState",
+    *,
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+    hypotheses: Mapping[str, Hypothesis],
+) -> list[str]:
+    """Validate the typed six-attempt Pwn crash state graph."""
+
+    errors: list[str] = []
+    receipts_by_experiment: dict[str, list[ExecutionReceipt]] = {}
+    artifacts_by_run: dict[str, list[ArtifactReference]] = {}
+    for receipt in state.receipts:
+        receipts_by_experiment.setdefault(
+            receipt.experiment_id,
+            [],
+        ).append(receipt)
+    for artifact in state.artifacts:
+        if artifact.source_run_id is not None:
+            artifacts_by_run.setdefault(
+                artifact.source_run_id,
+                [],
+            ).append(artifact)
+
+    marked_experiments = {
+        experiment.id: experiment
+        for experiment in state.experiments
+        if _pwn_crash_experiment_marker(experiment)
+    }
+    marked_run_ids = {
+        run.id for run in state.runs if _pwn_crash_run_marker(run)
+    }
+    terminal_recipe_hashes: set[str] = set()
+
+    for run in state.runs:
+        if not _pwn_crash_run_marker(run):
+            continue
+        experiment_id = run.extra.get("experiment_id")
+        if (
+            type(experiment_id) is not str
+            or experiment_id not in marked_experiments
+        ):
+            errors.append(
+                f"Pwn crash run {run.id} has no typed experiment"
+            )
+    for receipt in state.receipts:
+        if (
+            "pwn_crash" in receipt.extra
+            and receipt.experiment_id not in marked_experiments
+        ):
+            errors.append(
+                f"Pwn crash receipt {receipt.id} has no typed experiment"
+            )
+
+    for experiment in marked_experiments.values():
+        label = f"Pwn crash experiment {experiment.id}"
+        request, source_run, payload, binding_errors = (
+            _pwn_crash_registered_binding(
+                state,
+                experiment,
+                runs=runs,
+                artifacts=artifacts,
+                hypotheses=hypotheses,
+            )
+        )
+        errors.extend(binding_errors)
+        if request is None or source_run is None or payload is None:
+            continue
+        linked_receipts = receipts_by_experiment.get(
+            experiment.id,
+            [],
+        )
+        linked_runs = [
+            run
+            for run in state.runs
+            if (
+                run.extra.get("experiment_id") == experiment.id
+                and (
+                    run.origin is RunOrigin.MANAGED_TOOL
+                    or _pwn_crash_run_marker(run)
+                )
+            )
+        ]
+        raw_recipe = experiment.extra.get("pwn_crash_recipe")
+        recipe = None
+        recipe_errors: list[str] = []
+        if raw_recipe is not None:
+            recipe, recipe_errors = _pwn_crash_recipe_binding(
+                state,
+                experiment,
+                request=request,
+                payload=payload,
+            )
+            errors.extend(recipe_errors)
+        linked_artifacts = [
+            artifact
+            for artifact in state.artifacts
+            if (
+                _pwn_crash_artifact_marker(artifact)
+                and (
+                    artifact.source_run_id
+                    in {run.id for run in linked_runs}
+                    or (
+                        recipe is not None
+                        and artifact.extra.get("recipe_sha256")
+                        == recipe.recipe_sha256
+                    )
+                )
+            )
+        ]
+
+        if experiment.status in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            if (
+                experiment.result is not None
+                or experiment.artifact_ids != [payload.id]
+                or experiment.evidence_fact_ids
+                or experiment.evidence_run_ids
+                or experiment.evidence_receipt_ids
+                or experiment.evaluation_reason is not None
+                or experiment.evaluated_at is not None
+                or linked_runs
+                or linked_receipts
+                or linked_artifacts
+                or (
+                    experiment.status is ExperimentStatus.REGISTERED
+                    and raw_recipe is not None
+                )
+                or (
+                    experiment.status is ExperimentStatus.RUNNING
+                    and recipe is None
+                )
+            ):
+                errors.append(
+                    f"{label} active lifecycle/evidence is inconsistent"
+                )
+            continue
+
+        result = experiment.result
+        has_gate_evidence = (
+            type(result) is dict
+            and set(result) == {_PWN_CRASH_RESULT_KEY}
+        )
+        if not has_gate_evidence:
+            if raw_recipe is not None and recipe is None:
+                # A malformed recipe was already reported above.
+                continue
+            errors.extend(
+                _pwn_crash_precommit_failure_errors(
+                    experiment,
+                    payload=payload,
+                    linked_runs=linked_runs,
+                    linked_receipts=linked_receipts,
+                    linked_artifacts=linked_artifacts,
+                )
+            )
+            continue
+        if recipe is None:
+            errors.append(f"{label} terminal evidence lacks its recipe")
+            continue
+
+        raw_evidence = result[_PWN_CRASH_RESULT_KEY]
+        if (
+            type(raw_evidence) is not dict
+            or set(raw_evidence) != _PWN_CRASH_EVIDENCE_KEYS
+        ):
+            errors.append(f"{label} result envelope is not canonical")
+            continue
+        evaluation, evaluation_errors = _pwn_crash_gate_binding(
+            raw_evidence.get("evaluation"),
+            recipe=recipe,
+        )
+        errors.extend(f"{label}: {item}" for item in evaluation_errors)
+        attempts = raw_evidence.get("attempts")
+        evaluated_at = raw_evidence.get("evaluated_at")
+        if (
+            type(raw_evidence.get("schema_version")) is not int
+            or raw_evidence.get("schema_version") != 1
+            or raw_evidence.get("protocol") != PWN_CRASH_V1_PROTOCOL
+            or raw_evidence.get("recipe_sha256")
+            != recipe.recipe_sha256
+            or not _proof_binding_utc_timestamp(evaluated_at)
+            or type(attempts) is not list
+            or len(attempts) != PWN_CRASH_V1_ATTEMPT_COUNT
+        ):
+            errors.append(f"{label} result envelope values are invalid")
+            continue
+        if evaluation is None:
+            continue
+        if (
+            raw_evidence.get("evaluation_sha256")
+            != evaluation.evidence_sha256
+        ):
+            errors.append(f"{label} evaluation hash does not match")
+        expected_status = {
+            "CONFIRMED": ExperimentStatus.KEPT,
+            "INCONCLUSIVE": ExperimentStatus.INCONCLUSIVE,
+            "ERROR": ExperimentStatus.FAILED,
+        }.get(evaluation.verdict.value)
+        if (
+            expected_status is None
+            or experiment.status is not expected_status
+            or experiment.evaluation_reason
+            != (
+                "pwn_crash:"
+                f"{evaluation.verdict.value}:"
+                f"{evaluation.reason_code}"
+            )[:512]
+            or experiment.evaluated_at != evaluated_at
+            or experiment.evidence_fact_ids
+        ):
+            errors.append(f"{label} verdict/status metadata is inconsistent")
+
+        attempt_errors, capability_id = (
+            _pwn_crash_attempt_graph_errors(
+                experiment,
+                recipe=recipe,
+                source_run=source_run,
+                attempts=attempts,
+                runs=runs,
+                receipts=receipts,
+                artifacts=artifacts,
+                artifacts_by_run=artifacts_by_run,
+            )
+        )
+        errors.extend(attempt_errors)
+        run_ids = [
+            item.get("run_id")
+            for item in attempts
+            if isinstance(item, Mapping)
+        ]
+        receipt_ids = [
+            item.get("receipt_id")
+            for item in attempts
+            if isinstance(item, Mapping)
+        ]
+        stdout_ids = [
+            item.get("stdout_artifact_id")
+            for item in attempts
+            if isinstance(item, Mapping)
+        ]
+        if (
+            experiment.evidence_run_ids != run_ids
+            or experiment.evidence_receipt_ids != receipt_ids
+            or experiment.artifact_ids != [payload.id, *stdout_ids]
+            or {item.id for item in linked_receipts}
+            != set(receipt_ids)
+            or len(linked_receipts) != PWN_CRASH_V1_ATTEMPT_COUNT
+        ):
+            errors.append(f"{label} evidence lists are not exact")
+
+        hypothesis = hypotheses.get(recipe.hypothesis_id)
+        if hypothesis is not None:
+            evidence_sets = (
+                (hypothesis.evidence_run_ids, run_ids),
+                (hypothesis.evidence_receipt_ids, receipt_ids),
+                (hypothesis.evidence_artifact_ids, stdout_ids),
+            )
+            if evaluation.verdict.value == "CONFIRMED":
+                if any(
+                    not set(expected).issubset(actual)
+                    for actual, expected in evidence_sets
+                ):
+                    errors.append(
+                        f"{label} does not support its hypothesis with all "
+                        "six evidence chains"
+                    )
+            elif any(
+                not set(actual).isdisjoint(expected)
+                for actual, expected in evidence_sets
+            ):
+                errors.append(
+                    f"{label} non-confirmation promoted its hypothesis"
+                )
+
+        if capability_id is None:
+            errors.append(f"{label} lacks a capability attestation link")
+        else:
+            try:
+                from ctf_os.engine.pwn_crash import (
+                    PwnCrashCapabilityAttestation,
+                )
+
+                expected_attestation = PwnCrashCapabilityAttestation(
+                    image_digest=recipe.image_digest,
+                    recipe_sha256=recipe.recipe_sha256,
+                )
+                capability = artifacts.get(capability_id)
+                if (
+                    capability is None
+                    or capability.source_run_id is not None
+                    or capability.sha256
+                    != expected_attestation.evidence_sha256
+                    or capability.size
+                    != len(expected_attestation.canonical_bytes())
+                    or capability.media_type != "application/json"
+                    or capability.extra
+                    != {
+                        "kind": "pwn_crash_capability_attestation",
+                        "engine_executor": _PWN_CRASH_ENGINE_EXECUTOR,
+                        "recipe_sha256": recipe.recipe_sha256,
+                    }
+                    or capability.id in experiment.artifact_ids
+                ):
+                    errors.append(
+                        f"{label} capability attestation artifact is invalid"
+                    )
+            except (ImportError, TypeError, ValueError) as error:
+                errors.append(
+                    f"{label} capability attestation is invalid: {error}"
+                )
+        terminal_recipe_hashes.add(recipe.recipe_sha256)
+
+    for artifact in state.artifacts:
+        if not _pwn_crash_artifact_marker(artifact):
+            continue
+        if artifact.source_run_id is not None:
+            if artifact.source_run_id not in marked_run_ids:
+                errors.append(
+                    f"Pwn crash artifact {artifact.id} has no typed run"
+                )
+        elif (
+            artifact.extra.get("recipe_sha256")
+            not in terminal_recipe_hashes
+        ):
+            errors.append(
+                f"Pwn crash capability artifact {artifact.id} is orphaned"
+            )
+
+    pwn_artifact_ids = {
+        artifact.id
+        for artifact in state.artifacts
+        if _pwn_crash_artifact_marker(artifact)
+    }
+    for fact in facts.values():
+        if (
+            "pwn_crash" in fact.extra
+            or fact.source_run_id in marked_run_ids
+            or fact.artifact_id in pwn_artifact_ids
+        ):
+            errors.append(
+                f"Pwn crash evidence cannot be copied into Fact {fact.id}"
+            )
+    return errors
+
+
 _REV_PROOF_ENVELOPE_KEYS = frozenset(
     {
         "schema_version",
@@ -6232,7 +7385,10 @@ class ChallengeState:
                     f"experiment {experiment.id} semantic evaluation requires "
                     "a reason and timestamp"
                 )
-            if experiment.status in evaluated_statuses:
+            if (
+                experiment.status in evaluated_statuses
+                and not _pwn_crash_experiment_marker(experiment)
+            ):
                 result_run_id = (
                     experiment.result.get("run_id")
                     if isinstance(experiment.result, Mapping)
@@ -7219,7 +8375,13 @@ class ChallengeState:
                     errors.append(
                         f"run {receipt.run_id} has more than one receipt"
                     )
-                if receipt.experiment_id in seen_receipt_experiments:
+                if (
+                    receipt.experiment_id in seen_receipt_experiments
+                    and (
+                        experiment is None
+                        or not _pwn_crash_experiment_marker(experiment)
+                    )
+                ):
                     errors.append(
                         f"experiment {receipt.experiment_id} has more than "
                         "one receipt"
@@ -7767,6 +8929,16 @@ class ChallengeState:
                     receipts=receipts,
                     artifacts=artifacts,
                     facts=facts,
+                )
+            )
+            errors.extend(
+                _pwn_crash_state_errors(
+                    self,
+                    runs=runs,
+                    receipts=receipts,
+                    artifacts=artifacts,
+                    facts=facts,
+                    hypotheses=hypotheses,
                 )
             )
             errors.extend(
