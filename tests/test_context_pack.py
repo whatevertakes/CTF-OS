@@ -87,6 +87,40 @@ class ContextPackTests(unittest.TestCase):
         state.validate()
         return state
 
+    def pwn_crash_state(
+        self,
+        statuses=None,
+        *,
+        truncated_ordinals=(),
+    ) -> tuple[ChallengeState, str]:
+        import tests.test_pwn_crash_execution as pwn_execution
+
+        case = pwn_execution.PwnCrashExecutionTests(
+            methodName=(
+                "test_confirmed_gate_uses_six_clean_networkless_fixed_calls"
+            )
+        )
+        case.setUp()
+        try:
+            selected_statuses = (
+                tuple(statuses)
+                if statuses is not None
+                else case._confirming_statuses()
+            )
+            coordinator = pwn_execution._SandboxCoordinator(
+                selected_statuses,
+                truncated_ordinals=truncated_ordinals,
+            )
+            engine, experiment_id, _artifact_path, _payload = (
+                case._fixture(coordinator)
+            )
+            return (
+                copy.deepcopy(case._execute(engine, experiment_id)),
+                experiment_id,
+            )
+        finally:
+            case.tearDown()
+
     def failure_capsule_state(self) -> tuple[ChallengeState, dict[str, str]]:
         state = self.state()
         state.schema_version = 2
@@ -747,6 +781,701 @@ class ContextPackTests(unittest.TestCase):
                 tampered,
                 state_path=Path("/state/state.json"),
             )
+
+    def test_resume_capsule_projects_six_typed_pwn_receipts_in_result_order(
+        self,
+    ) -> None:
+        state, experiment_id = self.pwn_crash_state()
+        experiment = next(
+            item for item in state.experiments
+            if item.id == experiment_id
+        )
+        evidence = experiment.result["pwn_crash_evidence"]
+        expected_receipt_ids = [
+            item["receipt_id"] for item in evidence["attempts"]
+        ]
+        # Canonical attempt order is result-owned, not incidental state-list
+        # order.
+        state.receipts.reverse()
+        state.validate()
+
+        rendered = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+        )
+        record = strict_json_loads(rendered.text)
+        projection = record["pwn_crash"]
+
+        self.assertEqual(projection["verdict"], "CONFIRMED")
+        self.assertEqual(
+            projection["reason_code"],
+            "reproducible_input_triggered_fault_signal",
+        )
+        self.assertEqual(
+            projection["evaluation_sha256"],
+            evidence["evaluation_sha256"],
+        )
+        self.assertEqual(
+            projection["recipe_sha256"],
+            evidence["recipe_sha256"],
+        )
+        self.assertEqual(projection["attempt_count"], 6)
+        self.assertEqual(len(projection["attempts"]), 6)
+        self.assertEqual(
+            [
+                item["receipt_id"]
+                for item in projection["attempts"]
+            ],
+            expected_receipt_ids,
+        )
+        self.assertEqual(
+            [item["phase"] for item in projection["attempts"]],
+            ["positive"] * 3 + ["control"] * 3,
+        )
+        for attempt in projection["attempts"]:
+            self.assertEqual(
+                set(attempt["artifacts"]),
+                {"stdout", "stderr"},
+            )
+            self.assertEqual(
+                set(attempt["run"]),
+                {
+                    "id",
+                    "request_path",
+                    "result_path",
+                    "status",
+                    "validation_path",
+                },
+            )
+            for pointer in attempt["artifacts"].values():
+                self.assertEqual(
+                    set(pointer),
+                    {
+                        "capture_placeholder",
+                        "id",
+                        "path",
+                        "sha256",
+                        "size",
+                    },
+                )
+
+        compact = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        compact_projection = strict_json_loads(compact.text)["pwn_crash"]
+        self.assertLessEqual(len(compact.text.encode("ascii")), 1536)
+        self.assertEqual(compact_projection["verdict"], "CONFIRMED")
+        self.assertEqual(
+            compact_projection["reason_code"],
+            "reproducible_input_triggered_fault_signal",
+        )
+        self.assertEqual(compact_projection["attempt_count"], 6)
+        self.assertEqual(len(compact_projection["attempts"]), 1)
+        pointer = compact_projection["attempts"][0]
+        self.assertTrue(pointer["run_id"])
+        self.assertEqual(
+            set(pointer["artifact"]),
+            {
+                "capture_placeholder",
+                "id",
+                "path",
+                "sha256",
+                "size",
+            },
+        )
+
+    def test_resume_capsule_pwn_pointer_tamper_fails_closed(self) -> None:
+        state, experiment_id = self.pwn_crash_state()
+        experiment = next(
+            item for item in state.experiments
+            if item.id == experiment_id
+        )
+        stdout_id = experiment.result["pwn_crash_evidence"][
+            "attempts"
+        ][0]["stdout_artifact_id"]
+        stdout = next(
+            item for item in state.artifacts if item.id == stdout_id
+        )
+        stdout.path = "artifacts/tampered.stdout"
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid stdout artifact pointer",
+        ):
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            )
+
+        stderr_tampered, experiment_id = self.pwn_crash_state()
+        experiment = next(
+            item for item in stderr_tampered.experiments
+            if item.id == experiment_id
+        )
+        first_attempt = experiment.result["pwn_crash_evidence"][
+            "attempts"
+        ][0]
+        receipt = next(
+            item
+            for item in stderr_tampered.receipts
+            if item.id == first_attempt["receipt_id"]
+        )
+        stderr = next(
+            item
+            for item in stderr_tampered.artifacts
+            if item.id == receipt.stderr_artifact_id
+        )
+        stderr.sha256 = "f" * 64
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "Pwn crash",
+        ):
+            render_resume_capsule(
+                stderr_tampered,
+                state_path=Path("/state/state.json"),
+            )
+
+    def test_pwn_failure_capsule_verdict_and_reason_mismatch_fail_closed(
+        self,
+    ) -> None:
+        no_fault_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        cases = (
+            (
+                "confirmed",
+                None,
+                ExperimentStatus.KEPT,
+                "CONFIRMED",
+            ),
+            (
+                "inconclusive_reason_mismatch",
+                no_fault_statuses,
+                ExperimentStatus.INCONCLUSIVE,
+                "INCONCLUSIVE",
+            ),
+        )
+        for (
+            label,
+            statuses,
+            expected_status,
+            expected_verdict,
+        ) in cases:
+            with self.subTest(case=label):
+                state, experiment_id = self.pwn_crash_state(statuses)
+                experiment = next(
+                    item
+                    for item in state.experiments
+                    if item.id == experiment_id
+                )
+                evaluation = experiment.result[
+                    "pwn_crash_evidence"
+                ]["evaluation"]
+                self.assertIs(experiment.status, expected_status)
+                self.assertEqual(
+                    evaluation["verdict"],
+                    expected_verdict,
+                )
+
+                session = state.sessions[0]
+                cycle = state.cycles[0]
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "(?i)(pwn crash|failure capsule|verdict|reason)",
+                ):
+                    build_failure_capsule(
+                        state,
+                        session_id=session.id,
+                        cycle_id=cycle.id,
+                        reason_code="pwn_crash_setup_failed",
+                        stage="attack",
+                        state_revision_after=state.revision + 1,
+                    )
+                if expected_status is ExperimentStatus.KEPT:
+                    with self.assertRaisesRegex(
+                        ModelValidationError,
+                        "(?i)(only successful|non-pwn failure)",
+                    ):
+                        build_failure_capsule(
+                            state,
+                            session_id=session.id,
+                            cycle_id=cycle.id,
+                            reason_code="analysis_wave_invalid",
+                            stage="attack",
+                            state_revision_after=state.revision + 1,
+                        )
+                valid_reason = (
+                    "pwn_crash_no_positive_fault_observed"
+                    if expected_status is ExperimentStatus.INCONCLUSIVE
+                    else "analysis_wave_invalid"
+                )
+                if expected_status is ExperimentStatus.KEPT:
+                    generic_failure = Experiment(
+                        id="E-selected-generic-failure",
+                        hypothesis_ids=[],
+                        command="false",
+                        expected_observation="the probe succeeds",
+                        keep_if="the probe succeeds",
+                        drop_if="the probe fails",
+                        timeout_seconds=1,
+                        kind=ExperimentKind.PROBE,
+                        status=ExperimentStatus.FAILED,
+                    )
+                    state.experiments.append(generic_failure)
+                    cycle.selected_action_ids.append(
+                        generic_failure.id
+                    )
+                failure = build_failure_capsule(
+                    state,
+                    session_id=session.id,
+                    cycle_id=cycle.id,
+                    reason_code=valid_reason,
+                    stage="attack",
+                    state_revision_after=state.revision + 1,
+                )
+                failure.reason_code = "pwn_crash_setup_failed"
+                failure.content_sha256 = (
+                    failure.computed_content_sha256()
+                )
+                checkpoint_id = f"CP-pwn-mismatch-{label}"
+                cycle.checkpoint_id = checkpoint_id
+                state.checkpoints.append(
+                    Checkpoint(
+                        id=checkpoint_id,
+                        session_id=session.id,
+                        cycle_id=cycle.id,
+                        active_goal_id=state.active_goal_id,
+                        failure_capsule=failure,
+                    )
+                )
+                state.revision += 1
+
+                entrypoints = (
+                    ("state.validate", state.validate),
+                    (
+                        "render_resume_capsule",
+                        lambda: render_resume_capsule(
+                            state,
+                            state_path=Path("/state/state.json"),
+                        ),
+                    ),
+                )
+                for entrypoint, action in entrypoints:
+                    with self.subTest(
+                        case=label,
+                        entrypoint=entrypoint,
+                    ):
+                        with self.assertRaisesRegex(
+                            ModelValidationError,
+                            (
+                                "(?i)(pwn crash|failure capsule|"
+                                "verdict|reason|non-pass)"
+                            ),
+                        ):
+                            action()
+
+    def test_pwn_compact_transport_error_points_to_failing_ordinal(
+        self,
+    ) -> None:
+        state, experiment_id = self.pwn_crash_state(
+            truncated_ordinals=(2,),
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        evidence = experiment.result["pwn_crash_evidence"]
+        transport_error = evidence["evaluation"]["transport_error"]
+        self.assertEqual(transport_error["ordinal"], 2)
+        failing_attempt = next(
+            item
+            for item in evidence["attempts"]
+            if item["ordinal"] == transport_error["ordinal"]
+        )
+
+        compact = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        record = strict_json_loads(compact.text)
+        pointer = record["pwn_crash"]["attempts"][0]
+        self.assertLessEqual(len(compact.text.encode("ascii")), 1536)
+        self.assertEqual(
+            record["pwn_crash"]["reason_code"],
+            "transport_stdout_capture_incomplete",
+        )
+        self.assertEqual(pointer["run_id"], failing_attempt["run_id"])
+        self.assertEqual(
+            pointer["artifact"]["id"],
+            failing_attempt["stdout_artifact_id"],
+        )
+
+    def test_resume_capsule_rejects_typed_pwn_on_legacy_schema(self) -> None:
+        state, _experiment_id = self.pwn_crash_state()
+        state.schema_version = 1
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "current state schema",
+        ):
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            )
+
+    def test_resume_capsule_still_rejects_generic_multi_receipt(
+        self,
+    ) -> None:
+        state = self.state()
+        experiment = Experiment(
+            id="E-generic-multi-receipt",
+            hypothesis_ids=["H-1"],
+            command="probe --generic",
+            expected_observation="one observation",
+            keep_if="the branch changes",
+            drop_if="the branch remains fixed",
+            timeout_seconds=10,
+            status=ExperimentStatus.AWAITING_EVALUATION,
+        )
+        state.experiments.append(experiment)
+        for ordinal in (1, 2):
+            run = RunReference(
+                id=f"R-generic-receipt-{ordinal}",
+                base_revision=state.revision,
+                status=RunStatus.COMPLETED,
+            )
+            state.runs.append(run)
+            state.receipts.append(
+                ExecutionReceipt(
+                    id=f"RC-generic-receipt-{ordinal}",
+                    experiment_id=experiment.id,
+                    run_id=run.id,
+                    outcome=ReceiptOutcome.SUCCEEDED,
+                    exit_code=0,
+                )
+            )
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "more than one receipt",
+        ):
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            )
+
+    def test_pwn_failure_capsule_prefers_gate_and_compacts_to_1536(
+        self,
+    ) -> None:
+        no_fault_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        state, _experiment_id = self.pwn_crash_state(
+            no_fault_statuses
+        )
+        captain = next(
+            item for item in state.runs if item.role == "captain"
+        )
+        captain.status = RunStatus.COMPLETED
+        captain.result_path = f"runs/{captain.id}/result.json"
+        captain.validation_path = (
+            f"runs/{captain.id}/validation.json"
+        )
+        session = state.sessions[0]
+        cycle = state.cycles[0]
+        failure = build_failure_capsule(
+            state,
+            session_id=session.id,
+            cycle_id=cycle.id,
+            reason_code="pwn_crash_no_positive_fault_observed",
+            stage="attack",
+            state_revision_after=state.revision + 1,
+        )
+        cycle.checkpoint_id = "CP-pwn-crash"
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-pwn-crash",
+                session_id=session.id,
+                cycle_id=cycle.id,
+                active_goal_id=state.active_goal_id,
+                failure_capsule=failure,
+            )
+        )
+        state.revision += 1
+        state.validate()
+
+        wide = strict_json_loads(
+            render_resume_capsule(
+                state,
+                state_path=Path("/state/state.json"),
+            ).text
+        )
+        failure_projection = wide["checkpoint"]["failure_capsule"]
+        self.assertEqual(
+            failure_projection["runs"][0]["role"],
+            "pwn_crash_gate",
+        )
+        self.assertNotEqual(
+            failure_projection["runs"][0]["id"],
+            captain.id,
+        )
+
+        compact = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        compact_record = strict_json_loads(compact.text)
+        self.assertLessEqual(len(compact.text.encode("ascii")), 1536)
+        self.assertEqual(
+            compact_record["pwn_crash"]["verdict"],
+            "INCONCLUSIVE",
+        )
+        self.assertEqual(
+            compact_record["pwn_crash"]["reason_code"],
+            "no_positive_fault_observed",
+        )
+        self.assertTrue(
+            compact_record["checkpoint"]["failure_capsule"][
+                "pwn_crash_pointer"
+            ],
+        )
+        self.assertEqual(
+            compact_record["checkpoint"]["failure_capsule"][
+                "pwn_crash_pointer"
+            ],
+            compact_record["pwn_crash"]["experiment_id"],
+        )
+        self.assertTrue(
+            compact_record["pwn_crash"]["attempts"][0]["run_id"]
+        )
+        self.assertTrue(
+            compact_record["pwn_crash"]["attempts"][0]["artifact"][
+                "path"
+            ]
+        )
+
+    def test_pwn_failure_capsule_preserves_selected_typed_experiment(
+        self,
+    ) -> None:
+        no_fault_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        state, experiment_id = self.pwn_crash_state(
+            no_fault_statuses
+        )
+        session = state.sessions[0]
+        cycle = state.cycles[0]
+        self.assertIn(experiment_id, cycle.selected_action_ids)
+        self.assertIsNotNone(cycle.captain_run_id)
+
+        for ordinal in range(16):
+            state.experiments.append(
+                Experiment(
+                    id=f"E-earlier-generic-{ordinal:02d}",
+                    hypothesis_ids=[],
+                    command=f"probe --earlier-generic {ordinal}",
+                    expected_observation="one bounded observation",
+                    keep_if="the observation changes",
+                    drop_if="the observation remains unchanged",
+                    timeout_seconds=1,
+                    resource_class="light",
+                    kind=ExperimentKind.PROBE,
+                    status=ExperimentStatus.REGISTERED,
+                    source_run_id=cycle.captain_run_id,
+                    created_at=(
+                        f"2000-01-01T00:00:{ordinal:02d}Z"
+                    ),
+                )
+            )
+        state.validate()
+
+        failure = build_failure_capsule(
+            state,
+            session_id=session.id,
+            cycle_id=cycle.id,
+            reason_code="pwn_crash_no_positive_fault_observed",
+            stage="attack",
+            state_revision_after=state.revision + 1,
+        )
+        self.assertIn(
+            experiment_id,
+            failure.failed_experiment_ids,
+        )
+
+        cycle.checkpoint_id = "CP-pwn-selected-typed"
+        state.checkpoints.append(
+            Checkpoint(
+                id=cycle.checkpoint_id,
+                session_id=session.id,
+                cycle_id=cycle.id,
+                active_goal_id=state.active_goal_id,
+                failure_capsule=failure,
+            )
+        )
+        state.revision += 1
+        state.validate()
+
+        compact = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=2304),
+        )
+        record = strict_json_loads(compact.text)
+        failure_projection = record["checkpoint"]["failure_capsule"]
+        self.assertLessEqual(len(compact.text.encode("ascii")), 2304)
+        self.assertEqual(
+            record["pwn_crash"]["experiment_id"],
+            experiment_id,
+        )
+        self.assertEqual(
+            failure_projection["pwn_crash_pointer"],
+            experiment_id,
+        )
+
+    def test_pwn_failure_capsule_rejects_unselected_causal_binding(
+        self,
+    ) -> None:
+        no_fault_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        state, experiment_id = self.pwn_crash_state(
+            no_fault_statuses
+        )
+        session = state.sessions[0]
+        cycle = state.cycles[0]
+        failure = build_failure_capsule(
+            state,
+            session_id=session.id,
+            cycle_id=cycle.id,
+            reason_code="pwn_crash_no_positive_fault_observed",
+            stage="attack",
+            state_revision_after=state.revision + 1,
+        )
+        cycle.checkpoint_id = "CP-pwn-unselected"
+        state.checkpoints.append(
+            Checkpoint(
+                id=cycle.checkpoint_id,
+                session_id=session.id,
+                cycle_id=cycle.id,
+                active_goal_id=state.active_goal_id,
+                failure_capsule=failure,
+            )
+        )
+        state.revision += 1
+        state.validate()
+
+        cycle.selected_action_ids.remove(experiment_id)
+        entrypoints = (
+            ("state.validate", state.validate),
+            (
+                "render_resume_capsule",
+                lambda: render_resume_capsule(
+                    state,
+                    state_path=Path("/state/state.json"),
+                ),
+            ),
+        )
+        for entrypoint, action in entrypoints:
+            with self.subTest(entrypoint=entrypoint):
+                with self.assertRaisesRegex(
+                    ModelValidationError,
+                    "(?i)(selected cycle action|failure capsule|pwn)",
+                ):
+                    action()
+
+    def test_pwn_compaction_preserves_selected_negative_non_pwn_run(
+        self,
+    ) -> None:
+        no_fault_statuses = (
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 139, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+            ("exited", 0, None),
+        )
+        state, _experiment_id = self.pwn_crash_state(
+            no_fault_statuses
+        )
+        session = state.sessions[0]
+        cycle = state.cycles[0]
+        negative_run = RunReference(
+            id="R-negative-falsifier",
+            base_revision=state.revision,
+            status=RunStatus.INVALID,
+            result_path="runs/R-negative-falsifier/result.json",
+            validation_path=(
+                "runs/R-negative-falsifier/validation.json"
+            ),
+            role="falsifier",
+            session_id=session.id,
+            cycle_id=cycle.id,
+        )
+        state.runs.append(negative_run)
+        failure = build_failure_capsule(
+            state,
+            session_id=session.id,
+            cycle_id=cycle.id,
+            reason_code="pwn_crash_no_positive_fault_observed",
+            stage="attack",
+            state_revision_after=state.revision + 1,
+        )
+        cycle.checkpoint_id = "CP-pwn-negative"
+        state.checkpoints.append(
+            Checkpoint(
+                id="CP-pwn-negative",
+                session_id=session.id,
+                cycle_id=cycle.id,
+                active_goal_id=state.active_goal_id,
+                failure_capsule=failure,
+            )
+        )
+        state.revision += 1
+        state.validate()
+
+        compact = render_resume_capsule(
+            state,
+            state_path=Path("/state/state.json"),
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        record = strict_json_loads(compact.text)
+        failure_projection = record["checkpoint"]["failure_capsule"]
+
+        self.assertLessEqual(len(compact.text.encode("ascii")), 1536)
+        self.assertNotIn("pwn_crash_pointer", failure_projection)
+        self.assertEqual(
+            failure_projection["runs"][0]["id"],
+            negative_run.id,
+        )
+        self.assertEqual(
+            failure_projection["runs"][0]["status"],
+            "invalid",
+        )
 
     def test_failure_capsule_rendering_is_deterministic_and_structured(
         self,

@@ -34,7 +34,11 @@ from ctf_os.engine.challenge import (
     EngineError,
     SessionAlreadyRunning,
 )
-from ctf_os.engine.failure_capsule import build_failure_capsule
+from ctf_os.engine.failure_capsule import (
+    bounded_pwn_crash_failure_reason,
+    build_failure_capsule,
+    selected_pwn_crash_failure_reason,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     BudgetMode,
@@ -1390,6 +1394,53 @@ class ManagedOrchestrator:
             raise primary
         return self.engine.store.load(identity)
 
+    @staticmethod
+    def _bounded_pwn_crash_failure_reason(
+        verdict: str,
+        reason_code: str,
+    ) -> str:
+        """Project one typed gate verdict into a capsule-safe identifier."""
+
+        return bounded_pwn_crash_failure_reason(verdict, reason_code)
+
+    @classmethod
+    def _selected_pwn_crash_failure_reason(
+        cls,
+        state: ChallengeState,
+        selected: Sequence[str],
+    ) -> str | None:
+        """Return a deterministic capsule reason for selected non-pass gates."""
+
+        return selected_pwn_crash_failure_reason(state, selected)
+
+    def _checkpoint_selected_actions(
+        self,
+        identity: ChallengeIdentity,
+        session_id: str,
+        cycle_id: str,
+        wave: ManagedWave,
+        selected: Sequence[str],
+        *,
+        note: str | None,
+    ) -> ChallengeState:
+        """Checkpoint selected results, making typed Pwn non-passes durable."""
+
+        latest = self.engine.store.load(identity)
+        failure_reason = self._selected_pwn_crash_failure_reason(
+            latest,
+            selected,
+        )
+        return self._checkpoint(
+            identity,
+            session_id,
+            cycle_id,
+            note=note,
+            failure_reason_code=failure_reason,
+            failure_stage=(
+                wave.kind.value if failure_reason is not None else None
+            ),
+        )
+
     def _finish_session(
         self,
         identity: ChallengeIdentity,
@@ -1936,10 +1987,12 @@ class ManagedOrchestrator:
                         ),
                         note=note,
                     )
-            state = self._checkpoint(
+            state = self._checkpoint_selected_actions(
                 identity,
                 selected_session,
                 cycle.id,
+                wave,
+                selected,
                 note=note,
             )
             if state.status in {

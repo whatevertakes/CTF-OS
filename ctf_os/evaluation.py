@@ -38,6 +38,7 @@ from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_CONTRACT_ID,
     PWN_CRASH_V1_CONTRACT_VERSION,
     PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES,
     PWN_CRASH_V1_MAX_INPUT_BYTES,
     PWN_CRASH_V1_PROTOCOL,
 )
@@ -72,6 +73,10 @@ MAX_BREAKDOWN_ITEMS = 64
 MAX_COUNTER_VALUE = (1 << 63) - 1
 MAX_PWN_CRASH_REQUEST_BYTES = 1024 * 1024
 MAX_PWN_CRASH_CAPABILITY_BYTES = 16 * 1024
+MAX_PWN_CRASH_STDERR_BYTES = (
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES
+    - (PWN_CRASH_V1_ATTEMPT_COUNT * PWN_CRASH_V1_MAX_DOCUMENT_BYTES)
+) // PWN_CRASH_V1_ATTEMPT_COUNT
 
 _METRIC_AVAILABLE = "available"
 _METRIC_PARTIAL = "partial"
@@ -238,10 +243,10 @@ class EvaluationReport:
                 ),
                 "pwn_crash_gate_pass_rate": (
                     "confirmed/terminal typed Pwn crash gates after bounded "
-                    "nofollow re-reading of the nominated payload, six stdout "
-                    "artifacts, capability attestation, and six issued run "
-                    "requests; setup failures and unverifiable terminal gates "
-                    "remain in the denominator"
+                    "nofollow re-reading of the nominated payload, six "
+                    "stdout/stderr artifact pairs, capability attestation, "
+                    "and six issued run requests; setup failures and "
+                    "unverifiable terminal gates remain in the denominator"
                 ),
                 "first_valid_result": (
                     "earliest hash-validated passed proof or manual accepted "
@@ -2246,6 +2251,21 @@ def _revalidate_pwn_crash_gate(
             raise EvaluationInputError(
                 f"Pwn crash attempt {ordinal} receipt metadata is invalid"
             ) from error
+        stderr_id = receipt.stderr_artifact_id
+        stderr_artifact = (
+            artifacts.get(stderr_id)
+            if type(stderr_id) is str
+            else None
+        )
+        if (
+            type(stderr_id) is not str
+            or stderr_id in seen_ids
+            or stderr_artifact is None
+        ):
+            raise EvaluationInputError(
+                f"Pwn crash attempt {ordinal} lacks distinct stderr evidence"
+            )
+        seen_ids.add(stderr_id)
         binding = recipe.attempt_input_binding(ordinal)
         if (
             run.extra.get("experiment_id") != experiment_id
@@ -2258,12 +2278,23 @@ def _revalidate_pwn_crash_gate(
             or receipt.outcome.value != metadata.outcome
             or receipt.exit_code != metadata.exit_code
             or receipt.stdout_artifact_id != stdout_artifact.id
+            or receipt.stderr_artifact_id != stderr_artifact.id
             or stdout_artifact.source_run_id != run.id
+            or stderr_artifact.source_run_id != run.id
             or stdout_artifact.sha256
             != metadata.stdout_artifact_sha256
             or stdout_artifact.size
             != metadata.stdout_artifact_size_bytes
+            or stderr_artifact.sha256
+            != metadata.stderr_artifact_sha256
+            or stderr_artifact.size
+            != metadata.stderr_artifact_size_bytes
             or metadata.stdout_artifact_id != stdout_artifact.id
+            or metadata.stderr_artifact_id != stderr_artifact.id
+            or stdout_artifact.extra.get("capture_placeholder")
+            is not metadata.stdout_artifact_capture_placeholder
+            or stderr_artifact.extra.get("capture_placeholder")
+            is not metadata.stderr_artifact_capture_placeholder
             or pwn_record.get("recipe_sha256")
             != recipe.recipe_sha256
             or pwn_record.get("ordinal") != ordinal
@@ -2284,6 +2315,12 @@ def _revalidate_pwn_crash_gate(
                 maximum_bytes=PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
                 display_name=f"Pwn crash attempt {ordinal} stdout",
             )
+        )
+        _read_verified_reference(
+            record.root,
+            stderr_artifact,
+            maximum_bytes=MAX_PWN_CRASH_STDERR_BYTES,
+            display_name=f"Pwn crash attempt {ordinal} stderr",
         )
         capability_id = metadata.capability_attestation_artifact_id
         current_capability = artifacts.get(capability_id)

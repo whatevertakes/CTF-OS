@@ -5726,6 +5726,8 @@ def _pwn_crash_attempt_graph_errors(
             or receipt.outcome.value != metadata.outcome
             or receipt.exit_code != metadata.exit_code
             or receipt.stdout_artifact_id != stdout.id
+            or receipt.stderr_artifact_id
+            != metadata.stderr_artifact_id
             or receipt.stdout_bytes != metadata.stdout_drained_bytes
             or stdout.source_run_id != run.id
             or stdout.sha256 != metadata.stdout_artifact_sha256
@@ -5756,6 +5758,9 @@ def _pwn_crash_attempt_graph_errors(
         if (
             stderr is None
             or stderr.source_run_id != run.id
+            or stderr.id != metadata.stderr_artifact_id
+            or stderr.sha256 != metadata.stderr_artifact_sha256
+            or stderr.size != metadata.stderr_artifact_size_bytes
             or stdout.id == stderr.id
             or {item.id for item in per_run_artifacts}
             != {stdout.id, stderr.id}
@@ -5775,6 +5780,11 @@ def _pwn_crash_attempt_graph_errors(
             if artifact is None:
                 continue
             extra = artifact.extra
+            expected_placeholder = (
+                metadata.stdout_artifact_capture_placeholder
+                if stream == "stdout"
+                else metadata.stderr_artifact_capture_placeholder
+            )
             if (
                 set(extra)
                 != {
@@ -5791,6 +5801,8 @@ def _pwn_crash_attempt_graph_errors(
                     for key, value in expected_stream_extra.items()
                 )
                 or type(extra.get("capture_placeholder")) is not bool
+                or extra.get("capture_placeholder")
+                is not expected_placeholder
             ):
                 errors.append(
                     f"{attempt_label} {stream} artifact is not canonical"
@@ -5883,6 +5895,35 @@ def _pwn_crash_state_errors(
                 )
             )
         ]
+        if experiment.status not in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            source_cycle = (
+                next(
+                    (
+                        cycle
+                        for cycle in state.cycles
+                        if (
+                            source_run.cycle_id is not None
+                            and cycle.id == source_run.cycle_id
+                            and cycle.session_id == source_run.session_id
+                        )
+                    ),
+                    None,
+                )
+                if source_run is not None
+                else None
+            )
+            if (
+                source_cycle is None
+                or experiment.id
+                not in source_cycle.selected_action_ids
+            ):
+                errors.append(
+                    f"{label} terminal evidence is not a selected "
+                    "cycle action"
+                )
         raw_recipe = experiment.extra.get("pwn_crash_recipe")
         recipe = None
         recipe_errors: list[str] = []
@@ -8724,6 +8765,7 @@ class ChallengeState:
                         "canonical"
                     )
                     continue
+                bound_cycle = None
                 if (
                     checkpoint.session_id is None
                     or checkpoint.cycle_id is None
@@ -8747,6 +8789,7 @@ class ChallengeState:
                             f"references unknown cycle {checkpoint.cycle_id}"
                         )
                     else:
+                        bound_cycle = cycle
                         if cycle.session_id != checkpoint.session_id:
                             errors.append(
                                 f"checkpoint {checkpoint.id} failure capsule "
@@ -8918,6 +8961,21 @@ class ChallengeState:
                                 f"checkpoint {checkpoint.id} failure capsule "
                                 f"references unknown {label} {record_id}"
                             )
+                if bound_cycle is not None:
+                    try:
+                        from ctf_os.engine.failure_capsule import (
+                            validate_pwn_failure_capsule_binding,
+                        )
+
+                        validate_pwn_failure_capsule_binding(
+                            self,
+                            capsule,
+                            cycle=bound_cycle,
+                        )
+                    except ModelValidationError as error:
+                        errors.append(
+                            f"checkpoint {checkpoint.id}: {error}"
+                        )
 
             if self.primary_target_id is not None:
                 primary = targets.get(self.primary_target_id)

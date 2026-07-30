@@ -1493,6 +1493,78 @@ class PwnCrashExecutionTests(unittest.TestCase):
     def test_capability_attestation_hash_tamper_blocks_commit(self):
         self._assert_engine_evidence_tamper_blocks_commit("capability")
 
+    def _assert_durable_stream_tamper_before_commit_guard_fails(
+        self,
+        stream: str,
+    ) -> None:
+        coordinator = _SandboxCoordinator(
+            self._confirming_statuses(),
+            stderr_payload=b"producer diagnostic\n",
+        )
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        paths = engine.store.challenge_paths(self.identity)
+        original_guard = engine._require_pwn_crash_external_pins
+        tampered = False
+
+        def tamper_then_guard(*args, **kwargs):
+            nonlocal tampered
+            if not tampered:
+                attempts = kwargs["attempts"]
+                artifact = getattr(attempts[0], f"{stream}_artifact")
+                target = paths.root / artifact.path
+                payload = target.read_bytes()
+                self.assertTrue(payload)
+                replacement = (
+                    (b"X" if payload[:1] != b"X" else b"Y")
+                    + payload[1:]
+                )
+                self.assertEqual(len(replacement), len(payload))
+                target.chmod(0o600)
+                target.write_bytes(replacement)
+                target.chmod(0o400)
+                tampered = True
+            return original_guard(*args, **kwargs)
+
+        with patch.object(
+            engine,
+            "_require_pwn_crash_external_pins",
+            side_effect=tamper_then_guard,
+        ):
+            state = self._execute(engine, experiment_id)
+
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        hypothesis = next(
+            item
+            for item in state.hypotheses
+            if item.id == experiment.hypothesis_ids[0]
+        )
+        self.assertTrue(tampered)
+        self.assertEqual(coordinator.clean_calls, 6)
+        self.assertIs(experiment.status, ExperimentStatus.FAILED)
+        self.assertNotIn("pwn_crash_evidence", experiment.result)
+        self.assertIs(hypothesis.status, HypothesisStatus.OPEN)
+        self.assertEqual(hypothesis.evidence_run_ids, [])
+        self.assertEqual(hypothesis.evidence_receipt_ids, [])
+        self.assertEqual(hypothesis.evidence_artifact_ids, [])
+        self.assertEqual(state.submissions, [])
+        state.validate()
+
+    def test_durable_stdout_tamper_before_commit_guard_fails_closed(self):
+        self._assert_durable_stream_tamper_before_commit_guard_fails(
+            "stdout"
+        )
+
+    def test_durable_stderr_tamper_before_commit_guard_fails_closed(self):
+        self._assert_durable_stream_tamper_before_commit_guard_fails(
+            "stderr"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

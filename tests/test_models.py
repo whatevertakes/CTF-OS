@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import ctf_os.models as models_module
+from ctf_os.engine import failure_capsule as failure_capsule_module
 from ctf_os.contracts.rev_inventory_v2 import (
     REV_INVENTORY_V2_MAX_SOURCE_BYTES,
     REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
@@ -601,6 +602,36 @@ def _failure_capsule_state():
 
 
 class ModelTests(unittest.TestCase):
+    def test_failure_capsule_projection_retains_generated_pwn_ids(
+        self,
+    ) -> None:
+        generated_ids = (
+            "R-" + ("r" * 63),
+            "RC-" + ("c" * 74),
+            "A-" + ("a" * 72),
+        )
+
+        selected, omitted = (
+            failure_capsule_module._bounded_unique_projection(
+                generated_ids,
+                maximum=16,
+            )
+        )
+
+        self.assertEqual(selected, generated_ids)
+        self.assertEqual(omitted, 0)
+        self.assertTrue(
+            all(
+                len(
+                    failure_capsule_module.canonical_json_record(value).encode(
+                        "ascii"
+                    )
+                )
+                <= failure_capsule_module.MAX_CAPTURE_ID_CANONICAL_BYTES
+                for value in generated_ids
+            )
+        )
+
     def test_failure_capsule_round_trips_with_committed_revision(
         self,
     ) -> None:

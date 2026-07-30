@@ -322,6 +322,7 @@ class _PwnCrashAttemptEvidence:
     stdout_artifact: ArtifactReference
     stderr_artifact: ArtifactReference
     stdout_payload: bytes
+    stderr_payload: bytes
     execution_contract: dict[str, Any]
     execution_contract_sha256: str
     request_sha256: str
@@ -8671,6 +8672,26 @@ class ChallengeEngine:
                 or attempt.receipt_metadata.run_id != attempt.run.id
                 or attempt.receipt_metadata.stdout_artifact_id
                 != attempt.stdout_artifact.id
+                or (
+                    attempt.receipt_metadata
+                    .stdout_artifact_capture_placeholder
+                    != attempt.stdout_artifact.extra.get(
+                        "capture_placeholder"
+                    )
+                )
+                or attempt.receipt_metadata.stderr_artifact_id
+                != attempt.stderr_artifact.id
+                or attempt.receipt_metadata.stderr_artifact_sha256
+                != attempt.stderr_artifact.sha256
+                or attempt.receipt_metadata.stderr_artifact_size_bytes
+                != attempt.stderr_artifact.size
+                or (
+                    attempt.receipt_metadata
+                    .stderr_artifact_capture_placeholder
+                    != attempt.stderr_artifact.extra.get(
+                        "capture_placeholder"
+                    )
+                )
                 or attempt.receipt_metadata.request_sha256
                 != attempt.request_sha256
                 or attempt.receipt_metadata.execution_contract_sha256
@@ -8689,6 +8710,10 @@ class ChallengeEngine:
                 != attempt.stdout_artifact.sha256
                 or len(attempt.stdout_payload)
                 != attempt.stdout_artifact.size
+                or hashlib.sha256(attempt.stderr_payload).hexdigest()
+                != attempt.stderr_artifact.sha256
+                or len(attempt.stderr_payload)
+                != attempt.stderr_artifact.size
             ):
                 raise EngineError(
                     "Pwn crash attempt evidence changed before commit"
@@ -8728,6 +8753,39 @@ class ChallengeEngine:
                         request_snapshot.path.read_bytes(),
                         max_bytes=256 * 1024,
                     )
+                    for (
+                        stream,
+                        artifact,
+                        payload,
+                        maximum_bytes,
+                    ) in (
+                        (
+                            "stdout",
+                            attempt.stdout_artifact,
+                            attempt.stdout_payload,
+                            PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+                        ),
+                        (
+                            "stderr",
+                            attempt.stderr_artifact,
+                            attempt.stderr_payload,
+                            _PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES,
+                        ),
+                    ):
+                        stream_snapshot = copy_bounded_regular(
+                            paths.root,
+                            artifact.path,
+                            Path(request_temporary) / f"{stream}.log",
+                            maximum_bytes=maximum_bytes,
+                            expected_sha256=artifact.sha256,
+                            expected_size=artifact.size,
+                            mode=0o400,
+                        )
+                        if stream_snapshot.path.read_bytes() != payload:
+                            raise EngineError(
+                                f"Pwn crash durable {stream} changed "
+                                "before commit"
+                            )
             except (
                 OSError,
                 SafeFileError,
@@ -8735,7 +8793,8 @@ class ChallengeEngine:
                 ValueError,
             ) as error:
                 raise EngineError(
-                    "Pwn crash durable request cannot be read safely"
+                    "Pwn crash durable request or stream evidence cannot "
+                    "be read safely"
                 ) from error
             expected_request_keys = {
                 "base_revision",
@@ -9806,6 +9865,15 @@ class ChallengeEngine:
                     stdout_artifact_id=stdout_artifact.id,
                     stdout_artifact_sha256=stdout_artifact.sha256,
                     stdout_artifact_size_bytes=stdout_artifact.size,
+                    stdout_artifact_capture_placeholder=(
+                        snapshot_failed["stdout"]
+                    ),
+                    stderr_artifact_id=stderr_artifact.id,
+                    stderr_artifact_sha256=stderr_artifact.sha256,
+                    stderr_artifact_size_bytes=stderr_artifact.size,
+                    stderr_artifact_capture_placeholder=(
+                        snapshot_failed["stderr"]
+                    ),
                     stdout_drained_bytes=stdout_bytes,
                     stdout_stored_bytes=stdout_stored,
                     stdout_capture_complete=stdout_capture_complete,
@@ -9904,6 +9972,7 @@ class ChallengeEngine:
                     stdout_artifact=stdout_artifact,
                     stderr_artifact=stderr_artifact,
                     stdout_payload=stream_payloads["stdout"],
+                    stderr_payload=stream_payloads["stderr"],
                     execution_contract=copy.deepcopy(
                         execution_contract
                     ),

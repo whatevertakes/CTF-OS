@@ -189,6 +189,11 @@ _RECEIPT_KEYS = frozenset(
         "stdout_artifact_id",
         "stdout_artifact_sha256",
         "stdout_artifact_size_bytes",
+        "stdout_artifact_capture_placeholder",
+        "stderr_artifact_id",
+        "stderr_artifact_sha256",
+        "stderr_artifact_size_bytes",
+        "stderr_artifact_capture_placeholder",
         "stdout_capture_complete",
         "stdout_drained_bytes",
         "stdout_error",
@@ -976,6 +981,11 @@ class PwnCrashReceiptMetadata:
     stdout_artifact_id: str | None
     stdout_artifact_sha256: str | None
     stdout_artifact_size_bytes: int | None
+    stdout_artifact_capture_placeholder: bool
+    stderr_artifact_id: str | None
+    stderr_artifact_sha256: str | None
+    stderr_artifact_size_bytes: int | None
+    stderr_artifact_capture_placeholder: bool
     stdout_drained_bytes: int
     stdout_stored_bytes: int
     stdout_capture_complete: bool
@@ -1011,6 +1021,8 @@ class PwnCrashReceiptMetadata:
             "stdout_capture_complete",
             "stdout_truncation_known",
             "durable_stdout_artifact_complete",
+            "stdout_artifact_capture_placeholder",
+            "stderr_artifact_capture_placeholder",
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"invalid receipt {name}")
@@ -1048,22 +1060,31 @@ class PwnCrashReceiptMetadata:
             self.producer_capability_name,
             "producer_capability_name",
         )
-        for name in ("stdout_artifact_id",):
+        for name in ("stdout_artifact_id", "stderr_artifact_id"):
             value = getattr(self, name)
             if value is not None:
                 _receipt_identifier(value, name)
-        if self.stdout_artifact_sha256 is not None and (
-            type(self.stdout_artifact_sha256) is not str
-            or _SHA256.fullmatch(self.stdout_artifact_sha256) is None
+        for name in (
+            "stdout_artifact_sha256",
+            "stderr_artifact_sha256",
         ):
-            raise ValueError("invalid receipt stdout_artifact_sha256")
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not str
+                or _SHA256.fullmatch(value) is None
+            ):
+                raise ValueError(f"invalid receipt {name}")
         for name in (
             "stdout_artifact_size_bytes",
+            "stderr_artifact_size_bytes",
             "stdout_drained_bytes",
             "stdout_stored_bytes",
         ):
             value = getattr(self, name)
-            if value is None and name == "stdout_artifact_size_bytes":
+            if value is None and name in {
+                "stdout_artifact_size_bytes",
+                "stderr_artifact_size_bytes",
+            }:
                 continue
             if type(value) is not int or value < 0:
                 raise ValueError(f"invalid receipt {name}")
@@ -1075,6 +1096,20 @@ class PwnCrashReceiptMetadata:
             value = getattr(self, name)
             if value is not None:
                 _receipt_text(value, name)
+        if (
+            self.stdout_artifact_capture_placeholder
+            and self.stdout_artifact_size_bytes != 0
+        ):
+            raise ValueError(
+                "stdout capture placeholder must have zero stored bytes"
+            )
+        if (
+            self.stderr_artifact_capture_placeholder
+            and self.stderr_artifact_size_bytes != 0
+        ):
+            raise ValueError(
+                "stderr capture placeholder must have zero stored bytes"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1110,6 +1145,17 @@ class PwnCrashReceiptMetadata:
             "stdout_artifact_sha256": self.stdout_artifact_sha256,
             "stdout_artifact_size_bytes": (
                 self.stdout_artifact_size_bytes
+            ),
+            "stdout_artifact_capture_placeholder": (
+                self.stdout_artifact_capture_placeholder
+            ),
+            "stderr_artifact_id": self.stderr_artifact_id,
+            "stderr_artifact_sha256": self.stderr_artifact_sha256,
+            "stderr_artifact_size_bytes": (
+                self.stderr_artifact_size_bytes
+            ),
+            "stderr_artifact_capture_placeholder": (
+                self.stderr_artifact_capture_placeholder
             ),
             "stdout_capture_complete": self.stdout_capture_complete,
             "stdout_drained_bytes": self.stdout_drained_bytes,
@@ -1392,12 +1438,27 @@ def evaluate_pwn_crash_evidence(
                 "stdout_artifact_binding_incomplete",
                 ordinal=ordinal,
             )
-        if receipt.stdout_artifact_id in artifact_ids:
+        if (
+            receipt.stderr_artifact_id is None
+            or receipt.stderr_artifact_sha256 is None
+            or receipt.stderr_artifact_size_bytes is None
+        ):
             raise PwnCrashTransportError(
-                "duplicate_stdout_artifact_id",
+                "stderr_artifact_binding_incomplete",
+                ordinal=ordinal,
+            )
+        if (
+            receipt.stdout_artifact_id in artifact_ids
+            or receipt.stderr_artifact_id in artifact_ids
+            or receipt.stdout_artifact_id
+            == receipt.stderr_artifact_id
+        ):
+            raise PwnCrashTransportError(
+                "duplicate_stream_artifact_id",
                 ordinal=ordinal,
             )
         artifact_ids.add(receipt.stdout_artifact_id)
+        artifact_ids.add(receipt.stderr_artifact_id)
 
         payload_size = len(payload)
         if (

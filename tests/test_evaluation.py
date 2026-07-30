@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import ctf_os.evaluation as evaluation_module
 from ctf_os import cli
+from ctf_os.engine.resume_capsule import render_resume_capsule
 from ctf_os.evaluation import EvaluationError, evaluate_workspace
 from ctf_os.models import (
     ArtifactReference,
@@ -23,6 +24,7 @@ from ctf_os.models import (
     Experiment,
     ExperimentStatus,
     FlagCandidate,
+    ModelValidationError,
     ProgressMarker,
     RunReference,
     RunStatus,
@@ -64,6 +66,7 @@ class EvaluationTests(unittest.TestCase):
         execute: bool = True,
         statuses=None,
         truncated_ordinals=(),
+        stderr_payload: bytes = b"",
     ):
         helper = pwn_execution_fixture.PwnCrashExecutionTests()
         helper.root = self.root
@@ -88,6 +91,7 @@ class EvaluationTests(unittest.TestCase):
         coordinator = pwn_execution_fixture._SandboxCoordinator(
             statuses or helper._confirming_statuses(),
             truncated_ordinals=truncated_ordinals,
+            stderr_payload=stderr_payload,
         )
         engine, experiment_id, payload_path, _payload = helper._fixture(
             coordinator
@@ -974,6 +978,90 @@ class EvaluationTests(unittest.TestCase):
             ],
         )
 
+    def test_large_stderr_placeholder_is_disclosed_and_revalidates(self):
+        (
+            helper,
+            _coordinator,
+            engine,
+            state,
+            experiment_id,
+            _payload_path,
+        ) = self._create_pwn_crash_gate(
+            "metric-large-stderr-placeholder",
+            stderr_payload=b"X" * (64 * 1024),
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        first_attempt = experiment.result["pwn_crash_evidence"][
+            "attempts"
+        ][0]
+        receipt = next(
+            item
+            for item in state.receipts
+            if item.id == first_attempt["receipt_id"]
+        )
+        run = next(
+            item for item in state.runs if item.id == first_attempt["run_id"]
+        )
+        stderr_artifact = next(
+            item
+            for item in state.artifacts
+            if item.id == receipt.stderr_artifact_id
+        )
+        receipt_metadata = run.extra["pwn_crash"]["receipt"]
+        self.assertEqual(stderr_artifact.size, 0)
+        self.assertTrue(
+            stderr_artifact.extra["capture_placeholder"]
+        )
+        self.assertTrue(
+            receipt_metadata["stderr_artifact_capture_placeholder"]
+        )
+
+        paths = engine.store.challenge_paths(helper.identity)
+        capsule = json.loads(
+            render_resume_capsule(
+                state,
+                state_path=paths.state,
+            ).text
+        )
+        stderr_pointer = capsule["pwn_crash"]["attempts"][0][
+            "artifacts"
+        ]["stderr"]
+        self.assertTrue(stderr_pointer["capture_placeholder"])
+        self.assertEqual(stderr_pointer["size"], 0)
+
+        report = evaluate_workspace(
+            self.root,
+            contest_id=helper.identity.contest_id,
+            category=helper.identity.category,
+            challenge_id=helper.identity.challenge_id,
+        )
+        metric = report.metrics["pwn_crash_gate_pass_rate"]
+        self.assertEqual(metric.status, "available")
+        self.assertEqual(metric.sample_size, 1)
+        self.assertEqual(metric.value["confirmed"], 1)
+        self.assertEqual(metric.value["unverifiable"], 0)
+        self.assertEqual(metric.value["rate"], 1.0)
+
+        tampered = copy.deepcopy(state)
+        tampered_stderr = next(
+            item
+            for item in tampered.artifacts
+            if item.id == receipt.stderr_artifact_id
+        )
+        tampered_stderr.extra["capture_placeholder"] = False
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "Pwn crash",
+        ):
+            render_resume_capsule(
+                tampered,
+                state_path=paths.state,
+            )
+
     def test_pwn_crash_setup_failure_stays_in_denominator(self) -> None:
         (
             helper,
@@ -1183,6 +1271,7 @@ class EvaluationTests(unittest.TestCase):
         for mutation in (
             "payload",
             "stdout",
+            "stderr",
             "stdout_symlink",
             "request",
             "capability",
@@ -1214,6 +1303,18 @@ class EvaluationTests(unittest.TestCase):
                         for item in state.artifacts
                         if item.id
                         == first_attempt["stdout_artifact_id"]
+                    )
+                    target = paths.root / artifact.path
+                elif mutation == "stderr":
+                    receipt = next(
+                        item
+                        for item in state.receipts
+                        if item.id == first_attempt["receipt_id"]
+                    )
+                    artifact = next(
+                        item
+                        for item in state.artifacts
+                        if item.id == receipt.stderr_artifact_id
                     )
                     target = paths.root / artifact.path
                 elif mutation == "request":

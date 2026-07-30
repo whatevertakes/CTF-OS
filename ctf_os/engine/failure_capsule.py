@@ -37,9 +37,17 @@ MAX_NEXT_EXPERIMENTS = 3
 MAX_MACHINE_FAILURE_RECORDS = 128
 MAX_MACHINE_FAILURE_KINDS = 32
 MAX_MACHINE_IDENTIFIER_BYTES = 64
-MAX_CAPTURE_ID_CANONICAL_BYTES = 64
+# Engine-generated Pwn run, receipt, and stream-artifact identifiers can
+# exceed 64 canonical JSON bytes.  The collection cardinality limits below
+# remain the primary capsule bound; 128 retains those exact evidence pointers
+# without admitting the model-wide 256-byte identifier maximum.
+MAX_CAPTURE_ID_CANONICAL_BYTES = 128
 
 _MACHINE_IDENTIFIER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
+_PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_PWN_CRASH_RESULT_KEY = "pwn_crash_evidence"
+_PWN_CRASH_SETUP_FAILED_REASON = "pwn_crash_setup_failed"
 _SAFE_FAILURE_KINDS = frozenset(
     {
         "challenge_budget_expired",
@@ -134,6 +142,194 @@ def _command_sha256(experiment: Experiment) -> str:
             f"experiment {experiment.id} command is not valid UTF-8"
         ) from error
     return hashlib.sha256(payload).hexdigest()
+
+
+def _pwn_crash_experiment_marker(experiment: Experiment) -> bool:
+    return (
+        experiment.command == _PWN_CRASH_ENGINE_COMMAND
+        and experiment.extra.get("engine_executor")
+        == _PWN_CRASH_ENGINE_EXECUTOR
+    )
+
+
+def bounded_pwn_crash_failure_reason(
+    verdict: str,
+    reason_code: str,
+) -> str:
+    """Project one typed Pwn verdict into a capsule-safe identifier."""
+
+    if (
+        not isinstance(verdict, str)
+        or re.fullmatch(r"[A-Z_]{1,64}", verdict) is None
+        or not isinstance(reason_code, str)
+        or re.fullmatch(r"[a-z0-9_]{1,160}", reason_code) is None
+    ):
+        raise ModelValidationError(
+            "typed Pwn failure verdict/reason is not canonical"
+        )
+    normalized_verdict = verdict.casefold()
+    projected = f"pwn_crash_{reason_code}"
+    if (
+        len(projected.encode("ascii", errors="strict")) <= 64
+        and projected.replace("_", "").isalnum()
+        and projected[0].isalpha()
+        and projected == projected.casefold()
+    ):
+        return projected
+    digest = hashlib.sha256(
+        f"{verdict}\0{reason_code}".encode("ascii", errors="strict")
+    ).hexdigest()[:16]
+    return f"pwn_crash_{normalized_verdict}_{digest}"
+
+
+def selected_pwn_crash_failure_reason(
+    state: ChallengeState,
+    selected_action_ids: Sequence[str],
+) -> str | None:
+    """Derive the only valid Pwn failure reason for selected actions."""
+
+    selected = set(selected_action_ids)
+    reasons: list[str] = []
+    for experiment in sorted(
+        (
+            item
+            for item in state.experiments
+            if (
+                item.id in selected
+                and _pwn_crash_experiment_marker(item)
+                and item.status
+                in {
+                    ExperimentStatus.INCONCLUSIVE,
+                    ExperimentStatus.FAILED,
+                }
+            )
+        ),
+        key=lambda item: item.id,
+    ):
+        result = experiment.result
+        evidence = (
+            result.get(_PWN_CRASH_RESULT_KEY)
+            if isinstance(result, Mapping)
+            else None
+        )
+        evaluation = (
+            evidence.get("evaluation")
+            if isinstance(evidence, Mapping)
+            else None
+        )
+        verdict = (
+            evaluation.get("verdict")
+            if isinstance(evaluation, Mapping)
+            else None
+        )
+        reason_code = (
+            evaluation.get("reason_code")
+            if isinstance(evaluation, Mapping)
+            else None
+        )
+        expected_verdict = (
+            "INCONCLUSIVE"
+            if experiment.status is ExperimentStatus.INCONCLUSIVE
+            else "ERROR"
+        )
+        if (
+            isinstance(verdict, str)
+            and verdict == expected_verdict
+            and isinstance(reason_code, str)
+            and reason_code
+        ):
+            reasons.append(
+                bounded_pwn_crash_failure_reason(
+                    verdict,
+                    reason_code,
+                )
+            )
+        else:
+            reasons.append(_PWN_CRASH_SETUP_FAILED_REASON)
+    if not reasons:
+        return None
+    distinct = tuple(sorted(set(reasons)))
+    if len(distinct) == 1:
+        return distinct[0]
+    digest = hashlib.sha256(
+        "\0".join(distinct).encode("ascii", errors="strict")
+    ).hexdigest()[:16]
+    return f"pwn_crash_nonpass_{digest}"
+
+
+def validate_pwn_failure_capsule_binding(
+    state: ChallengeState,
+    capsule: FailureCapsule,
+    *,
+    cycle: Any,
+) -> None:
+    """Bind a typed Pwn checkpoint to its selected non-pass verdict."""
+
+    selected_ids = tuple(cycle.selected_action_ids)
+    selected_id_set = set(selected_ids)
+    selected_pwn = tuple(
+        experiment
+        for experiment in state.experiments
+        if (
+            experiment.id in selected_id_set
+            and _pwn_crash_experiment_marker(experiment)
+        )
+    )
+    if not selected_pwn:
+        if capsule.reason_code.startswith("pwn_crash_"):
+            raise ModelValidationError(
+                "failure capsule Pwn reason requires a selected typed "
+                "Pwn non-pass"
+            )
+        return
+    if any(
+        experiment.status
+        not in {
+            ExperimentStatus.KEPT,
+            ExperimentStatus.INCONCLUSIVE,
+            ExperimentStatus.FAILED,
+        }
+        for experiment in selected_pwn
+    ):
+        raise ModelValidationError(
+            "failure capsule cannot bind an active typed Pwn experiment"
+        )
+    expected_reason = selected_pwn_crash_failure_reason(
+        state,
+        selected_ids,
+    )
+    if expected_reason is None:
+        if capsule.reason_code.startswith("pwn_crash_"):
+            raise ModelValidationError(
+                "failure capsule Pwn reason cannot bind only successful "
+                "typed Pwn experiments"
+            )
+        selected_negative_non_pwn = any(
+            experiment.id in selected_id_set
+            and not _pwn_crash_experiment_marker(experiment)
+            and experiment.status
+            in {
+                ExperimentStatus.DROPPED,
+                ExperimentStatus.INCONCLUSIVE,
+                ExperimentStatus.FAILED,
+                ExperimentStatus.CANCELLED,
+            }
+            for experiment in state.experiments
+        )
+        if not selected_negative_non_pwn:
+            raise ModelValidationError(
+                "failure capsule cannot bind only successful typed Pwn "
+                "experiments without a selected non-Pwn failure"
+            )
+        return
+    if (
+        capsule.reason_code != expected_reason
+        or capsule.stage != "attack"
+    ):
+        raise ModelValidationError(
+            "failure capsule reason/stage does not match its selected "
+            "typed Pwn verdict"
+        )
 
 
 def _safe_failure_counts(run: RunReference) -> dict[str, object]:
@@ -346,6 +542,7 @@ def _all_failed_cycle_experiments(
             str,
         )
     }
+
     values = tuple(
         sorted(
             (
@@ -369,6 +566,37 @@ def _all_failed_cycle_experiments(
         )
     )
     return values
+
+
+def _bounded_failed_experiment_projection(
+    experiments: Sequence[Experiment],
+    *,
+    selected_action_ids: Sequence[str],
+) -> tuple[tuple[str, ...], int]:
+    """Pin selected typed Pwn evidence without reordering generic history."""
+
+    selected = set(selected_action_ids)
+    pinned = [
+        experiment.id
+        for experiment in experiments
+        if (
+            experiment.id in selected
+            and _pwn_crash_experiment_marker(experiment)
+        )
+    ]
+    pinned_set = set(pinned)
+    ordered = [
+        *pinned,
+        *(
+            experiment.id
+            for experiment in experiments
+            if experiment.id not in pinned_set
+        ),
+    ]
+    return _bounded_unique_projection(
+        ordered,
+        maximum=MAX_FAILED_EXPERIMENTS,
+    )
 
 
 def _evidence_ids(
@@ -508,12 +736,9 @@ def build_failure_capsule(
         failed_runs=all_runs,
     )
     failed_experiment_ids, omitted_failed_experiments = (
-        _bounded_unique_projection(
-            [
-                experiment.id
-                for experiment in all_failed_experiments
-            ],
-            maximum=MAX_FAILED_EXPERIMENTS,
+        _bounded_failed_experiment_projection(
+            all_failed_experiments,
+            selected_action_ids=cycle.selected_action_ids,
         )
     )
     fact_ids, artifact_ids, receipt_ids, evidence_omitted = _evidence_ids(
@@ -576,6 +801,11 @@ def build_failure_capsule(
         },
     )
     capsule.content_sha256 = _content_sha256(capsule)
+    validate_pwn_failure_capsule_binding(
+        state,
+        capsule,
+        cycle=cycle,
+    )
     return capsule
 
 
@@ -616,6 +846,11 @@ def validate_failure_capsule(
         )
 
     cycle = _cycle(state, session_id, cycle_id)
+    validate_pwn_failure_capsule_binding(
+        state,
+        capsule,
+        cycle=cycle,
+    )
     runs_by_id = {run.id: run for run in state.runs}
     experiments_by_id = {
         experiment.id: experiment for experiment in state.experiments
@@ -699,12 +934,9 @@ def validate_failure_capsule(
         failed_runs=all_cycle_runs,
     )
     expected_failed_ids, expected_failed_omitted = (
-        _bounded_unique_projection(
-            [
-                experiment.id
-                for experiment in all_failed_experiments
-            ],
-            maximum=MAX_FAILED_EXPERIMENTS,
+        _bounded_failed_experiment_projection(
+            all_failed_experiments,
+            selected_action_ids=cycle.selected_action_ids,
         )
     )
     if (
@@ -894,8 +1126,11 @@ def experiment_command_sha256(experiment: Experiment) -> str:
 __all__ = [
     "FAILURE_CAPSULE_SCHEMA_VERSION",
     "MAX_NEXT_EXPERIMENTS",
+    "bounded_pwn_crash_failure_reason",
     "build_failure_capsule",
     "experiment_command_sha256",
     "safe_run_diagnostics",
+    "selected_pwn_crash_failure_reason",
     "validate_failure_capsule",
+    "validate_pwn_failure_capsule_binding",
 ]

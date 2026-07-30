@@ -1006,6 +1006,204 @@ class ManagedV2Tests(unittest.TestCase):
             [str(index) for index in range(1, 65)],
         )
 
+    def test_selected_pwn_crash_nonpass_always_creates_failure_capsule(
+        self,
+    ):
+        from tests.test_pwn_crash_execution import (
+            PwnCrashExecutionTests,
+            _SandboxCoordinator,
+        )
+
+        cases = (
+            (
+                "inconclusive",
+                (
+                    ("exited", 139, None),
+                    ("exited", 139, None),
+                    ("exited", 139, None),
+                    ("exited", 0, None),
+                    ("exited", 0, None),
+                    ("exited", 0, None),
+                ),
+                (),
+                ExperimentStatus.INCONCLUSIVE,
+            ),
+            (
+                "failed",
+                PwnCrashExecutionTests._confirming_statuses(),
+                (2,),
+                ExperimentStatus.FAILED,
+            ),
+            (
+                "confirmed",
+                PwnCrashExecutionTests._confirming_statuses(),
+                (),
+                ExperimentStatus.KEPT,
+            ),
+        )
+        for (
+            label,
+            statuses,
+            truncated_ordinals,
+            expected_status,
+        ) in cases:
+            with self.subTest(label=label):
+                fixture = PwnCrashExecutionTests(
+                    "test_confirmed_gate_uses_six_clean_networkless_fixed_calls"
+                )
+                fixture.setUp()
+                try:
+                    coordinator = _SandboxCoordinator(
+                        statuses,
+                        truncated_ordinals=truncated_ordinals,
+                    )
+                    (
+                        engine,
+                        experiment_id,
+                        _artifact_path,
+                        _payload,
+                    ) = fixture._fixture(coordinator)
+                    executed = fixture._execute(engine, experiment_id)
+                    experiment = next(
+                        item
+                        for item in executed.experiments
+                        if item.id == experiment_id
+                    )
+                    self.assertIs(experiment.status, expected_status)
+                    cycle = executed.cycles[0]
+                    wave = executed.waves[0]
+                    orchestrator = ManagedOrchestrator(
+                        engine,
+                        capability_probe=fixture._capability,
+                    )
+                    checkpointed = (
+                        orchestrator._checkpoint_selected_actions(
+                            fixture.identity,
+                            cycle.session_id,
+                            cycle.id,
+                            wave,
+                            (experiment_id,),
+                            note="typed Pwn gate checkpoint",
+                        )
+                    )
+                    capsule = checkpointed.checkpoints[
+                        -1
+                    ].failure_capsule
+                    if expected_status is ExperimentStatus.KEPT:
+                        self.assertIsNone(capsule)
+                        continue
+
+                    self.assertIsNotNone(capsule)
+                    assert capsule is not None
+                    evaluation = experiment.result[
+                        "pwn_crash_evidence"
+                    ]["evaluation"]
+                    expected_reason = (
+                        orchestrator._bounded_pwn_crash_failure_reason(
+                            evaluation["verdict"],
+                            evaluation["reason_code"],
+                        )
+                    )
+                    self.assertEqual(capsule.reason_code, expected_reason)
+                    self.assertEqual(capsule.stage, "attack")
+                    self.assertEqual(
+                        capsule.state_revision_after,
+                        checkpointed.revision,
+                    )
+
+                    pwn_run_ids = set(experiment.evidence_run_ids)
+                    pwn_receipt_ids = set(
+                        experiment.evidence_receipt_ids
+                    )
+                    stream_artifact_ids = {
+                        artifact.id
+                        for artifact in checkpointed.artifacts
+                        if (
+                            artifact.source_run_id in pwn_run_ids
+                            and artifact.extra.get("stream")
+                            in {"stdout", "stderr"}
+                        )
+                    }
+                    self.assertEqual(len(pwn_run_ids), 6)
+                    self.assertEqual(len(pwn_receipt_ids), 6)
+                    self.assertEqual(len(stream_artifact_ids), 12)
+                    self.assertTrue(
+                        pwn_run_ids.issubset(capsule.run_ids)
+                    )
+                    self.assertTrue(
+                        pwn_receipt_ids.issubset(capsule.receipt_ids)
+                    )
+                    self.assertTrue(
+                        stream_artifact_ids.issubset(
+                            capsule.artifact_ids
+                        )
+                    )
+                    self.assertNotEqual(
+                        checkpointed.status,
+                        ChallengeStatus.READY_TO_SUBMIT,
+                    )
+                finally:
+                    fixture.tearDown()
+
+    def test_selected_pwn_crash_setup_failure_uses_fixed_capsule_reason(
+        self,
+    ):
+        from tests.test_pwn_crash_execution import (
+            PwnCrashExecutionTests,
+            _SandboxCoordinator,
+        )
+
+        fixture = PwnCrashExecutionTests(
+            "test_confirmed_gate_uses_six_clean_networkless_fixed_calls"
+        )
+        fixture.setUp()
+        try:
+            coordinator = _SandboxCoordinator(
+                PwnCrashExecutionTests._confirming_statuses()
+            )
+            engine, experiment_id, _artifact_path, _payload = (
+                fixture._fixture(coordinator)
+            )
+            with mock.patch.object(
+                engine,
+                "_execute_pwn_crash_differential",
+                side_effect=EngineError("synthetic setup failure"),
+            ):
+                executed = fixture._execute(engine, experiment_id)
+            experiment = next(
+                item
+                for item in executed.experiments
+                if item.id == experiment_id
+            )
+            self.assertIs(experiment.status, ExperimentStatus.FAILED)
+            self.assertNotIn(
+                "pwn_crash_evidence",
+                experiment.result or {},
+            )
+            cycle = executed.cycles[0]
+            wave = executed.waves[0]
+            checkpointed = ManagedOrchestrator(
+                engine,
+                capability_probe=fixture._capability,
+            )._checkpoint_selected_actions(
+                fixture.identity,
+                cycle.session_id,
+                cycle.id,
+                wave,
+                (experiment_id,),
+                note=None,
+            )
+            capsule = checkpointed.checkpoints[-1].failure_capsule
+            self.assertIsNotNone(capsule)
+            assert capsule is not None
+            self.assertEqual(
+                capsule.reason_code,
+                "pwn_crash_setup_failed",
+            )
+            self.assertEqual(capsule.stage, "attack")
+        finally:
+            fixture.tearDown()
+
     def execute_managed_source_fixture(
         self,
         orchestrator: ManagedOrchestrator,

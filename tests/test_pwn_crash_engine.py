@@ -181,6 +181,11 @@ def receipts(
             stdout_artifact_id=f"stdout-artifact-{ordinal}",
             stdout_artifact_sha256=hashlib.sha256(payload).hexdigest(),
             stdout_artifact_size_bytes=len(payload),
+            stdout_artifact_capture_placeholder=False,
+            stderr_artifact_id=f"stderr-artifact-{ordinal}",
+            stderr_artifact_sha256=hashlib.sha256(b"").hexdigest(),
+            stderr_artifact_size_bytes=0,
+            stderr_artifact_capture_placeholder=False,
             stdout_drained_bytes=len(payload),
             stdout_stored_bytes=len(payload),
             stdout_capture_complete=True,
@@ -666,6 +671,12 @@ class PwnCrashEvidenceTests(unittest.TestCase):
                 "durable_stdout_artifact_incomplete",
             ),
             (
+                "stderr binding incomplete",
+                0,
+                {"stderr_artifact_id": None},
+                "stderr_artifact_binding_incomplete",
+            ),
+            (
                 "wrong size",
                 0,
                 {"stdout_stored_bytes": len(values[0]) - 1},
@@ -682,6 +693,18 @@ class PwnCrashEvidenceTests(unittest.TestCase):
                 1,
                 {"run_id": base[0].run_id},
                 "duplicate_run_id",
+            ),
+            (
+                "stdout and stderr artifact collide",
+                0,
+                {"stderr_artifact_id": base[0].stdout_artifact_id},
+                "duplicate_stream_artifact_id",
+            ),
+            (
+                "duplicate stderr artifact",
+                1,
+                {"stderr_artifact_id": base[0].stderr_artifact_id},
+                "duplicate_stream_artifact_id",
             ),
             (
                 "duplicate request",
