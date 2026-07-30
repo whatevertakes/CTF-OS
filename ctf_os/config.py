@@ -79,6 +79,9 @@ class RuntimeConfig:
     work_tree_max_bytes: int = 16 * 1024 * 1024 * 1024
     command_timeout_s: int = 900
     wave_deadline_s: float = 1800.0
+    managed_wave_queue_reserve_s: float = 90.0
+    managed_wave_role_call_reserve_s: float = 240.0
+    managed_wave_action_commit_reserve_s: float = 180.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,16 +241,22 @@ def _validate(config: EngineConfig) -> EngineConfig:
             "[runtime] command_timeout_s must be an integer between 1 and "
             f"{MAX_EXPERIMENT_TIMEOUT_SECONDS}"
         )
-    wave_deadline = runtime.wave_deadline_s
-    if (
-        isinstance(wave_deadline, bool)
-        or not isinstance(wave_deadline, (int, float))
-        or not math.isfinite(float(wave_deadline))
-        or wave_deadline <= 0
+    for name in (
+        "wave_deadline_s",
+        "managed_wave_queue_reserve_s",
+        "managed_wave_role_call_reserve_s",
+        "managed_wave_action_commit_reserve_s",
     ):
-        raise ConfigError(
-            "[runtime] wave_deadline_s must be finite and positive"
-        )
+        value = getattr(runtime, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ConfigError(
+                f"[runtime] {name} must be finite and positive"
+            )
     return config
 
 
@@ -372,6 +381,13 @@ flag_scan_max_bytes = 16777216
 work_tree_max_bytes = 17179869184
 command_timeout_s = 900
 wave_deadline_s = 1800.0
+# Before a Captain may reserve a fixed three-role wave, the engine conservatively
+# reserves one provider-admission interval, one call interval per provider
+# batch, and deterministic action/checkpoint time. Provider concurrency changes
+# only the number of batches; it never narrows the logical wave.
+managed_wave_queue_reserve_s = 90.0
+managed_wave_role_call_reserve_s = 240.0
+managed_wave_action_commit_reserve_s = 180.0
 """
 
 

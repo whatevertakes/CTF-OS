@@ -7,6 +7,8 @@ never falls back to assisted solving after a managed failure.
 
 from __future__ import annotations
 
+import math
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +18,11 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ctf_os.adapters import get_adapter
+from ctf_os.benchmark import CTF_OS_SYSTEM
+from ctf_os.budget import (
+    BudgetExhausted,
+    remaining_seconds as budget_remaining_seconds,
+)
 from ctf_os.capabilities import (
     CapabilityError,
     inspect_pinned_capabilities,
@@ -84,6 +91,11 @@ from ctf_os.managed_continuity import (
     valid_thread_id,
     validate_thread_continuity_policy,
 )
+from ctf_os.managed_budget import (
+    MANAGED_WAVE_BUDGET_GUARD_KEY,
+    ManagedWaveBudgetContractError,
+    build_managed_wave_budget_guard,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     BudgetMode,
@@ -109,6 +121,12 @@ from ctf_os.models import (
     utc_now,
 )
 from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION, STATE_SCHEMA_VERSION
+from ctf_os.scaffold_binding import (
+    SCAFFOLD_LAUNCH_METADATA_KEY,
+    ScaffoldBindingError,
+    managed_command_contract_sha256,
+    validate_scaffold_launch_record,
+)
 from ctf_os.store import ChallengeLock, LockTimeout
 from ctf_os.sandbox.files import SafeFileError, read_bounded_regular
 from ctf_os.store.atomic import (
@@ -262,6 +280,24 @@ class ManagedPreflightBlocked(ManagedError):
     def __init__(self, issues: Sequence[str]) -> None:
         self.issues = tuple(issues)
         super().__init__("managed preflight blocked: " + "; ".join(self.issues))
+
+
+class ManagedWaveBudgetInsufficient(ManagedError):
+    """A Captain completed, but the full next wave cannot fit safely."""
+
+    def __init__(
+        self,
+        state: ChallengeState,
+        audit: Mapping[str, object],
+    ) -> None:
+        self.state = state
+        self.audit = dict(audit)
+        remaining_ms = self.audit.get("remaining_budget_ms")
+        minimum_ms = self.audit.get("minimum_required_ms")
+        super().__init__(
+            "insufficient_budget_for_wave: "
+            f"remaining_ms={remaining_ms}, minimum_required_ms={minimum_ms}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,9 +590,11 @@ class ManagedOrchestrator:
         engine: ChallengeEngine,
         *,
         capability_probe: CapabilityProbe = inspect_pinned_capabilities,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.engine = engine
         self.capability_probe = capability_probe
+        self.wall_clock = wall_clock
 
     def preflight(
         self,
@@ -1275,6 +1313,66 @@ class ManagedOrchestrator:
             or current.active_managed_session_id
             or f"S-{uuid.uuid4().hex}"
         )
+        existing_session = next(
+            (item for item in current.sessions if item.id == selected),
+            None,
+        )
+        if current.metadata.get("evaluation_prepared") is True:
+            try:
+                command_contract_sha256 = managed_command_contract_sha256(
+                    model_id=self.engine.config.models.captain,
+                    captain_effort=(
+                        self.engine.config.models.captain_effort
+                    ),
+                    worker_effort=(
+                        self.engine.config.models.worker_effort
+                    ),
+                    thread_continuity_policy=(
+                        thread_continuity_policy
+                    ),
+                )
+            except ScaffoldBindingError as error:
+                raise ManagedError(
+                    f"managed evaluation scaffold contract is invalid: {error}"
+                ) from error
+            if existing_session is None:
+                if current.active_managed_session_id not in {
+                    None,
+                    selected,
+                }:
+                    raise ManagedError(
+                        "another managed session is active for this challenge"
+                    )
+                current = self.engine.record_evaluation_scaffold_launch(
+                    identity,
+                    arm=CTF_OS_SYSTEM,
+                    command_contract_sha256=command_contract_sha256,
+                )
+            launch_record = current.metadata.get(
+                SCAFFOLD_LAUNCH_METADATA_KEY
+            )
+            try:
+                validate_scaffold_launch_record(
+                    metadata=current.metadata,
+                    configuration_epoch=current.configuration_epoch,
+                    contest_id=identity.contest_id,
+                    category=identity.category,
+                    challenge_id=identity.challenge_id,
+                    value=launch_record,
+                    expected_arm=CTF_OS_SYSTEM,
+                    expected_command_contract_sha256=(
+                        command_contract_sha256
+                    ),
+                )
+            except ScaffoldBindingError as error:
+                raise ManagedError(
+                    "managed evaluation scaffold launch is invalid: "
+                    f"{error}"
+                ) from error
+            expected_continuity = self._expected_continuity_metadata(
+                current,
+                thread_continuity_policy,
+            )
 
         def apply(state: ChallengeState) -> None:
             if state.configuration_epoch != current.configuration_epoch:
@@ -1475,17 +1573,121 @@ class ManagedOrchestrator:
             expected_revision=current.revision,
         )
 
+    def _managed_wave_budget_guard(
+        self,
+        state: ChallengeState,
+        wave_name: str,
+    ) -> dict[str, object]:
+        """Decide admission from one finite clock sample and fixed config."""
+
+        try:
+            now_epoch = self.wall_clock()
+        except Exception as error:
+            raise ManagedError(
+                "managed wave budget clock failed"
+            ) from error
+        if (
+            isinstance(now_epoch, bool)
+            or not isinstance(now_epoch, (int, float))
+            or not math.isfinite(float(now_epoch))
+        ):
+            raise ManagedError("managed wave budget clock must be finite")
+        try:
+            remaining = budget_remaining_seconds(
+                state.budget,
+                now_epoch=float(now_epoch),
+            )
+            runtime = self.engine.config.runtime
+            return build_managed_wave_budget_guard(
+                wave_kind=wave_name,
+                provider_max_concurrent_calls=(
+                    self.engine.config.resources
+                    .provider_max_concurrent_calls
+                ),
+                queue_reserve_seconds=(
+                    runtime.managed_wave_queue_reserve_s
+                ),
+                role_call_reserve_seconds=(
+                    runtime.managed_wave_role_call_reserve_s
+                ),
+                action_commit_reserve_seconds=(
+                    runtime.managed_wave_action_commit_reserve_s
+                ),
+                remaining_seconds=remaining,
+                checked_state_revision=state.revision,
+                configuration_epoch=state.configuration_epoch,
+                budget_mode=state.budget.mode.value,
+            )
+        except (
+            BudgetExhausted,
+            ManagedWaveBudgetContractError,
+            OverflowError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ManagedError(
+                f"managed wave budget guard is invalid: {error}"
+            ) from error
+
     def _reserve_wave(
         self,
         identity: ChallengeIdentity,
         session_id: str,
         cycle_id: str,
         wave_name: str,
+        *,
+        enforce_budget_guard: bool = False,
     ) -> tuple[ChallengeState, ManagedWave, dict[Role, str]]:
         roles = WAVE_ROLES[wave_name]
         kind = WaveKind(wave_name)
         current = self.engine.store.load(identity)
         self._require_epoch(current, session_id)
+        budget_audit = (
+            self._managed_wave_budget_guard(current, wave_name)
+            if enforce_budget_guard
+            else None
+        )
+        if (
+            budget_audit is not None
+            and budget_audit["decision"] == "pause"
+        ):
+            def apply_budget_pause(state: ChallengeState) -> None:
+                self._require_epoch(state, session_id)
+                cycle = next(
+                    (
+                        item
+                        for item in state.cycles
+                        if item.id == cycle_id
+                    ),
+                    None,
+                )
+                if cycle is None:
+                    raise ManagedError(
+                        f"unknown managed cycle: {cycle_id}"
+                    )
+                if cycle.wave_id is not None:
+                    raise ManagedError(
+                        f"cycle {cycle_id} already has wave "
+                        f"{cycle.wave_id}"
+                    )
+                if MANAGED_WAVE_BUDGET_GUARD_KEY in cycle.extra:
+                    raise ManagedError(
+                        "managed wave budget guard is already recorded"
+                    )
+                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = (
+                    dict(budget_audit)
+                )
+                cycle.phase = "wave_budget_blocked"
+
+            committed = self.engine.store.update(
+                identity,
+                apply_budget_pause,
+                expected_revision=current.revision,
+            )
+            raise ManagedWaveBudgetInsufficient(
+                committed,
+                budget_audit,
+            )
         wave_id = _stable_id(
             "MW",
             identity.key,
@@ -1530,6 +1732,14 @@ class ManagedOrchestrator:
             if cycle.wave_id is not None:
                 raise ManagedError(
                     f"cycle {cycle_id} already has wave {cycle.wave_id}"
+                )
+            if budget_audit is not None:
+                if MANAGED_WAVE_BUDGET_GUARD_KEY in cycle.extra:
+                    raise ManagedError(
+                        "managed wave budget guard is already recorded"
+                    )
+                cycle.extra[MANAGED_WAVE_BUDGET_GUARD_KEY] = dict(
+                    budget_audit
                 )
             anticipated_revision = state.revision + 1
             wave = ManagedWave(
@@ -4093,12 +4303,39 @@ class ManagedOrchestrator:
                     note=note,
                 )
             wave_name = self._wave_name(captain.output)
-            _state, wave, role_runs = self._reserve_wave(
-                identity,
-                selected_session,
-                cycle.id,
-                wave_name,
-            )
+            try:
+                _state, wave, role_runs = self._reserve_wave(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    wave_name,
+                    enforce_budget_guard=True,
+                )
+            except ManagedWaveBudgetInsufficient as blocked:
+                reason = (
+                    "Captain evidence was preserved, but the complete "
+                    "three-role wave and deterministic action/checkpoint "
+                    "reserve did not fit the remaining challenge budget "
+                    f"(remaining_ms="
+                    f"{blocked.audit.get('remaining_budget_ms')}, "
+                    f"minimum_required_ms="
+                    f"{blocked.audit.get('minimum_required_ms')})."
+                )
+                self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason_code="insufficient_budget_for_wave",
+                    reason=reason,
+                    note=note,
+                )
+                return self._finish_session(
+                    identity,
+                    selected_session,
+                    status=SessionStatus.PAUSED,
+                    reason=reason,
+                    challenge_target=ChallengeStatus.PAUSED,
+                )
             self.require_preflight(
                 identity,
                 session_id=selected_session,

@@ -15016,6 +15016,16 @@ class ChallengeState:
 
             errors.extend(pwn_dependency_state_graph_errors(self))
 
+            # A managed admission record is authoritative only when it binds a
+            # completed Captain to either all three role runs or a typed
+            # Captain-stage pause capsule. Provider limits alter serial
+            # batches, never logical width.
+            from ctf_os.managed_budget import (
+                managed_wave_budget_state_errors,
+            )
+
+            errors.extend(managed_wave_budget_state_errors(self))
+
             # Candidate-free Rev accepted-input evidence owns one fixed 3+3
             # multi-receipt graph.  The local generic exception above is
             # marker-scoped; this exact validator rejects copied, rebound, or

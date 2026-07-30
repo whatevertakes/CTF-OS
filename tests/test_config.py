@@ -58,6 +58,15 @@ class ConfigTests(unittest.TestCase):
             config.runtime.work_tree_max_bytes,
             16 * 1024 * 1024 * 1024,
         )
+        self.assertEqual(config.runtime.managed_wave_queue_reserve_s, 90.0)
+        self.assertEqual(
+            config.runtime.managed_wave_role_call_reserve_s,
+            240.0,
+        )
+        self.assertEqual(
+            config.runtime.managed_wave_action_commit_reserve_s,
+            180.0,
+        )
 
     def test_default_text_round_trips(self) -> None:
         text = default_config_text()
@@ -71,6 +80,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("not an HTTP request limiter", text)
         self.assertIn("command_timeout_s = 900\n", text)
         self.assertNotIn("command_timeout_s = 900.0", text)
+        self.assertIn("managed_wave_queue_reserve_s = 90.0", text)
+        self.assertIn(
+            "Provider concurrency changes",
+            text,
+        )
         self.assertEqual(text.count('= "gpt-5.6-sol"'), 9)
         self.assertNotIn("gpt-5.6-terra", text)
         self.assertNotIn("gpt-5.6-luna", text)
@@ -125,6 +139,9 @@ class ConfigTests(unittest.TestCase):
             ("resources", "provider_wait_timeout_s"),
             ("resources", "lease_wait_timeout_s"),
             ("runtime", "wave_deadline_s"),
+            ("runtime", "managed_wave_queue_reserve_s"),
+            ("runtime", "managed_wave_role_call_reserve_s"),
+            ("runtime", "managed_wave_action_commit_reserve_s"),
         ):
             for value in invalid_values:
                 with self.subTest(

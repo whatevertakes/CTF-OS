@@ -571,6 +571,7 @@ def _all_failed_cycle_experiments(
     *,
     selected_action_ids: Sequence[str],
     failed_runs: Sequence[RunReference],
+    preserve_registered_experiments: bool = False,
 ) -> tuple[Experiment, ...]:
     selected = set(selected_action_ids)
     cycle_run_ids = {run.id for run in failed_runs}
@@ -597,6 +598,10 @@ def _all_failed_cycle_experiments(
                             experiment.evidence_run_ids
                         )
                     )
+                )
+                and not (
+                    preserve_registered_experiments
+                    and experiment.status is ExperimentStatus.REGISTERED
                 )
             ),
             key=lambda experiment: (
@@ -774,6 +779,9 @@ def build_failure_capsule(
         state,
         selected_action_ids=cycle.selected_action_ids,
         failed_runs=all_runs,
+        preserve_registered_experiments=(
+            reason_code == "insufficient_budget_for_wave"
+        ),
     )
     failed_experiment_ids, omitted_failed_experiments = (
         _bounded_failed_experiment_projection(
@@ -972,6 +980,9 @@ def validate_failure_capsule(
         state,
         selected_action_ids=cycle.selected_action_ids,
         failed_runs=all_cycle_runs,
+        preserve_registered_experiments=(
+            capsule.reason_code == "insufficient_budget_for_wave"
+        ),
     )
     expected_failed_ids, expected_failed_omitted = (
         _bounded_failed_experiment_projection(
