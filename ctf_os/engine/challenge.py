@@ -7170,15 +7170,61 @@ class ChallengeEngine:
 
                 local_hypothesis_ids: list[str] = []
                 local_hypothesis_map: dict[str, str] = {}
+                managed_hypothesis_publish = (
+                    run_record.origin is RunOrigin.MANAGED_MODEL
+                )
+                managed_hypothesis_prefix = f"H-{run_id}-"
+                published_hypothesis_ids = {
+                    item.id for item in state.hypotheses
+                }
                 hypotheses = semantic_output.get("hypotheses", [])
                 if isinstance(hypotheses, list):
                     for index, hypothesis in enumerate(hypotheses, start=1):
                         if not isinstance(hypothesis, Mapping):
                             continue
-                        local = str(hypothesis.get("id", index))
+                        raw_local = str(hypothesis.get("id", index))
+                        local = (
+                            raw_local.removeprefix(
+                                managed_hypothesis_prefix
+                            )
+                            if managed_hypothesis_publish
+                            else raw_local
+                        )
+                        if managed_hypothesis_publish and not re.sub(
+                            r"[^A-Za-z0-9_.:-]+",
+                            "-",
+                            local,
+                        ).strip("-"):
+                            reject_model_item(
+                                "rejected_hypothesis_proposals",
+                                "hypothesis_id",
+                                raw_local,
+                                (
+                                    "managed hypothesis id has an empty "
+                                    "normalized local suffix"
+                                ),
+                            )
+                            continue
                         hypothesis_id = _record_id("H", run_id, local)
+                        if managed_hypothesis_publish:
+                            # Keep the exact model-authored key available to
+                            # action reference resolution.
+                            local_hypothesis_map[raw_local] = hypothesis_id
+                            if hypothesis_id in published_hypothesis_ids:
+                                reject_model_item(
+                                    "rejected_hypothesis_proposals",
+                                    "hypothesis_id",
+                                    raw_local,
+                                    (
+                                        "managed hypothesis id collides "
+                                        "after current-run normalization: "
+                                        f"{hypothesis_id}"
+                                    ),
+                                )
+                                continue
+                            published_hypothesis_ids.add(hypothesis_id)
                         local_hypothesis_ids.append(hypothesis_id)
-                        local_hypothesis_map[local] = hypothesis_id
+                        local_hypothesis_map[raw_local] = hypothesis_id
                         v2_proposal = "claim" in hypothesis
                         refs = hypothesis.get(
                             "evidence"

@@ -105,6 +105,8 @@ class ProbeRoleExecutor:
         proof_artifact_purpose: str = "reproducer",
         proof_extra_action: bool = False,
         command_by_role: dict[Role, str] | None = None,
+        captain_hypothesis_ids: tuple[str, ...] | None = None,
+        captain_action_hypothesis_ids: tuple[str, ...] | None = None,
     ) -> None:
         self.invalid_role = invalid_role
         self.invalid_command_role = invalid_command_role
@@ -117,6 +119,10 @@ class ProbeRoleExecutor:
         self.proof_artifact_purpose = proof_artifact_purpose
         self.proof_extra_action = proof_extra_action
         self.command_by_role = dict(command_by_role or {})
+        self.captain_hypothesis_ids = captain_hypothesis_ids
+        self.captain_action_hypothesis_ids = (
+            captain_action_hypothesis_ids
+        )
         self.lock = threading.Lock()
         self.active = 0
         self.max_active = 0
@@ -149,9 +155,15 @@ class ProbeRoleExecutor:
             contract_version = output_schema["properties"][
                 "schema_version"
             ]["enum"][0]
+            current_run_id = _output_path(command).parent.name
             if contract_version == 2:
                 payload["schema_version"] = 2
                 if role is Role.CAPTAIN:
+                    hypothesis_count = (
+                        len(self.captain_hypothesis_ids)
+                        if self.captain_hypothesis_ids is not None
+                        else self.captain_hypothesis_count
+                    )
                     payload["hypotheses"] = [
                         {
                             "id": f"hyp-{index}",
@@ -173,14 +185,23 @@ class ProbeRoleExecutor:
                             ),
                         }
                         for index in range(
-                            1, self.captain_hypothesis_count + 1
+                            1, hypothesis_count + 1
                         )
                     ]
                 for action in payload["actions"]:
                     action.update(
                         {
                             "hypothesis_ids": (
-                                ["hyp-1"]
+                                [
+                                    item.replace(
+                                        "{run_id}",
+                                        current_run_id,
+                                    )
+                                    for item in (
+                                        self.captain_action_hypothesis_ids
+                                        or ("hyp-1",)
+                                    )
+                                ]
                                 if role is Role.CAPTAIN
                                 else []
                             ),
@@ -257,6 +278,19 @@ class ProbeRoleExecutor:
                     and payload["actions"]
                 ):
                     payload["actions"][0]["command"] = ""
+            if (
+                role is Role.CAPTAIN
+                and self.captain_hypothesis_ids is not None
+            ):
+                for hypothesis, hypothesis_id in zip(
+                    payload["hypotheses"],
+                    self.captain_hypothesis_ids,
+                    strict=True,
+                ):
+                    hypothesis["id"] = hypothesis_id.replace(
+                        "{run_id}",
+                        current_run_id,
+                    )
             if role is self.invalid_role:
                 on_stdout_line(
                     json.dumps(
@@ -3309,6 +3343,130 @@ class ManagedV2Tests(unittest.TestCase):
                     )
                 },
             )
+        )
+
+    def test_managed_hypothesis_ids_preserve_current_and_namespace_foreign(
+        self,
+    ):
+        executor = ProbeRoleExecutor(
+            captain_hypothesis_ids=(
+                "H-{run_id}-hyp-1",
+                "hyp-2",
+                "H-foreign-run-hyp-3",
+            ),
+            captain_action_hypothesis_ids=(
+                "H-{run_id}-hyp-1",
+                "H-foreign-run-hyp-3",
+            ),
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain_run_id = state.cycles[0].captain_run_id
+        current_id = f"H-{captain_run_id}-hyp-1"
+        foreign_id = (
+            f"H-{captain_run_id}-H-foreign-run-hyp-3"
+        )
+        self.assertEqual(
+            {item.id for item in state.hypotheses},
+            {
+                current_id,
+                f"H-{captain_run_id}-hyp-2",
+                foreign_id,
+            },
+        )
+        self.assertNotIn(
+            f"H-{captain_run_id}-{current_id}",
+            {item.id for item in state.hypotheses},
+        )
+        captain_experiment = next(
+            item
+            for item in state.experiments
+            if item.source_run_id == captain_run_id
+        )
+        self.assertEqual(
+            captain_experiment.hypothesis_ids,
+            [current_id, foreign_id],
+        )
+
+    def test_managed_hypothesis_collisions_are_contained_per_item(self):
+        executor = ProbeRoleExecutor(
+            captain_hypothesis_ids=(
+                "hyp-1",
+                "H-{run_id}-hyp-1",
+                "H-{run_id}-",
+                "hyp-2",
+                "hyp-3",
+            ),
+            captain_action_hypothesis_ids=(
+                "H-{run_id}-hyp-1",
+            ),
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        captain_run_id = state.cycles[0].captain_run_id
+        self.assertEqual(
+            {item.id for item in state.hypotheses},
+            {
+                f"H-{captain_run_id}-hyp-1",
+                f"H-{captain_run_id}-hyp-2",
+                f"H-{captain_run_id}-hyp-3",
+            },
+        )
+        captain = next(
+            item for item in state.runs if item.id == captain_run_id
+        )
+        self.assertIs(captain.status, RunStatus.COMPLETED)
+        rejections = captain.extra[
+            "rejected_hypothesis_proposals"
+        ]
+        self.assertEqual(
+            {
+                item["hypothesis_id"]
+                for item in rejections
+            },
+            {
+                f"H-{captain_run_id}-hyp-1",
+                f"H-{captain_run_id}-",
+            },
+        )
+        self.assertTrue(
+            any("collides" in item["reason"] for item in rejections)
+        )
+        self.assertTrue(
+            any("empty" in item["reason"] for item in rejections)
+        )
+        self.assertIsNotNone(state.cycles[0].wave_id)
+
+    def test_non_managed_hypothesis_keeps_ordinary_prefixing(self):
+        executor = ProbeRoleExecutor(
+            captain_hypothesis_ids=("H-{run_id}-hyp-1",),
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+
+        result = engine.run_role(
+            self.identity,
+            Role.CAPTAIN,
+            instruction="publish one ordinary hypothesis",
+        )
+        state = engine.store.load(self.identity)
+
+        run_id = result.invocation.run_id
+        self.assertEqual(
+            [item.id for item in state.hypotheses],
+            [f"H-{run_id}-H-{run_id}-hyp-1"],
         )
 
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
