@@ -24,8 +24,10 @@ python3 /work/pwn-template/solve.py /challenge/chall
 ```bash
 python3 /opt/ctf-templates/web/request.py \
   'http://target:8080/' --header 'Accept: application/json' \
-  --timeout 15 --max-bytes 16777216 --max-request-bytes 16777216
-ctf-browser 'http://target:8080/' --timeout 20 --screenshot
+  --session attacker --timeout 15 --max-bytes 16777216 \
+  --max-request-bytes 16777216
+ctf-browser 'http://target:8080/' --session attacker \
+  --timeout 20 --screenshot
 
 bash /opt/ctf-templates/pwn/inspect.sh /challenge/chall
 python3 /opt/ctf-templates/pwn/solve.py /challenge/chall \
@@ -43,6 +45,10 @@ python3 /opt/ctf-templates/misc/decode.py /challenge/blob \
 
 `web/request.py --timeout`은 단일 socket read timeout이 아니라 연결부터
 drip-feed 응답 수신까지 포함하는 monotonic 전체 deadline이다.
+`--session attacker|user|admin`은 역할별 쿠키 jar를 격리하고 request와 browser
+실행을 role 표시가 있는 `/work/web/timeline.json`의 한 타임라인으로 묶는다.
+쿠키·Authorization·CSRF/JWT 값은 private jar에만 두며 타임라인과 응답
+metadata에는 이름과 생성·변경·삭제만 남긴다.
 `web/browser.py`도 Chromium 시작·탐색·추가 대기를 하나의 전체 deadline으로
 제한한다. deadline 뒤 정리가 멈추면 격리된 브라우저 session의 Node·Chromium
 프로세스를 강제 종료한다. 렌더링된 HTML과 콘솔 이벤트를 제한된 크기로 저장하며,

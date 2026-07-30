@@ -10,11 +10,34 @@ class ForensicsAdapter(GenericAdapter):
         return (
             ExperimentSpec(
                 "file_inventory",
-                "detect types and hashes without modifying evidence",
-                ("find", "/challenge", "-type", "f", "-maxdepth", "3"),
-                "file inventory linked to source hashes",
-                "evidence types and next parser are known",
-                "evidence is missing or unreadable",
+                (
+                    "build a bounded typed evidence index from the immutable "
+                    "sandbox provenance"
+                ),
+                (
+                    "/usr/bin/python3",
+                    "/opt/ctf-templates/forensic/evidence_index.py",
+                    "--root",
+                    "/challenge",
+                    "--tree",
+                    "/work/.ctf/challenge.tree",
+                    "--metadata",
+                    "/work/.ctf/challenge.json",
+                ),
+                (
+                    "canonical JSON with source hashes, typed evidence "
+                    "pointers, explicit coverage, and a graph commitment"
+                ),
+                (
+                    "all evidence is hash-bound and the next parser can be "
+                    "chosen from observed modality evidence"
+                ),
+                (
+                    "provenance is invalid, an input changed, or pointer "
+                    "coverage is insufficient"
+                ),
+                "light",
+                300,
             ),
         )
 
@@ -52,4 +75,3 @@ class ForensicsAdapter(GenericAdapter):
             "do not spend budget on downstream questions while a prerequisite is "
             "blocked. Keep raw output external and preserve the evidence hash chain."
         )
-

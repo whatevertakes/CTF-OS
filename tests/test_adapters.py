@@ -26,8 +26,37 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("ordered", adapter.captain_guidance().lower())
 
     def test_web_intake_never_makes_an_implicit_remote_request(self) -> None:
-        for experiment in get_adapter("web").initial_observations():
+        adapter = get_adapter("web")
+        for experiment in adapter.initial_observations():
             self.assertFalse(experiment.requires_network)
+        marker_keys = {marker.key for marker in adapter.progress_markers()}
+        self.assertIn("endpoint_observed", marker_keys)
+        self.assertIn("auth_state_captured", marker_keys)
+        self.assertIn("impact_verified", marker_keys)
+        self.assertIn("--session attacker|user|admin", adapter.captain_guidance())
+
+    def test_forensics_intake_uses_bounded_read_only_evidence_index(
+        self,
+    ) -> None:
+        experiments = get_adapter("forensics").initial_observations()
+        self.assertEqual(len(experiments), 1)
+        inventory = experiments[0]
+        self.assertEqual(inventory.id, "file_inventory")
+        self.assertEqual(
+            inventory.command_template,
+            (
+                "/usr/bin/python3",
+                "/opt/ctf-templates/forensic/evidence_index.py",
+                "--root",
+                "/challenge",
+                "--tree",
+                "/work/.ctf/challenge.tree",
+                "--metadata",
+                "/work/.ctf/challenge.json",
+            ),
+        )
+        self.assertFalse(inventory.requires_network)
+        self.assertIn("coverage", inventory.expected_observation)
 
 
 if __name__ == "__main__":

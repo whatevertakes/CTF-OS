@@ -21,6 +21,9 @@ catalog_source = (REPO_ROOT / "scripts" / "gen-manifest.sh").read_text(
 browser_source = (REPO_ROOT / "templates" / "web" / "browser.py").read_text(
     encoding="utf-8"
 )
+forensic_index_source = (
+    REPO_ROOT / "templates" / "forensic" / "evidence_index.py"
+).read_text(encoding="utf-8")
 managed_manifest = json.loads(
     (REPO_ROOT / "capabilities.v2.json").read_text(encoding="utf-8")
 )
@@ -110,6 +113,15 @@ assert "sqlmap" not in {name.casefold() for name in catalog_names}
 
 ast.parse(browser_source, filename="templates/web/browser.py")
 assert browser_source.startswith("#!/opt/venvs/pw/bin/python\n")
+ast.parse(
+    forensic_index_source,
+    filename="templates/forensic/evidence_index.py",
+)
+assert forensic_index_source.startswith("#!/usr/bin/env python3\n")
+assert (
+    "/opt/ctf-templates/forensic/evidence_index.py"
+    in dockerfile
+)
 ast.parse(managed_probe_source, filename="scripts/ctf-capabilities")
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2

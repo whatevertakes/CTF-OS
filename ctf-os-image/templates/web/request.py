@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -17,6 +18,14 @@ from typing import Iterable
 import chardet
 import requests
 from safe_output import atomic_write, open_output_dir
+from session_state import (
+    PersistentWebSession,
+    SESSION_NAMES,
+    WebSessionStateError,
+    normalize_cookies,
+    redact_headers,
+    sanitize_url,
+)
 
 OUTPUT_DIR = Path("/work/web")
 HARD_MAX_BYTES = 256 * 1024 * 1024
@@ -51,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-H", "--header", action="append", default=[], type=header, metavar="NAME: VALUE"
+    )
+    parser.add_argument(
+        "--session",
+        choices=SESSION_NAMES,
+        help=(
+            "persist an isolated attacker, user, or admin cookie jar and append "
+            "a redacted HTTP/browser timeline"
+        ),
     )
     body = parser.add_mutually_exclusive_group()
     body.add_argument("--data", help="literal request body")
@@ -146,6 +163,59 @@ def choose_encoding(response: requests.Response, body: bytes) -> str:
     return str(detected.get("encoding") or "utf-8")
 
 
+def load_requests_cookies(
+    session: requests.Session,
+    cookies: list[dict[str, object]],
+) -> None:
+    for cookie in cookies:
+        rest: dict[str, object] = {}
+        if cookie["http_only"]:
+            rest["HttpOnly"] = True
+        if cookie["same_site"] is not None:
+            rest["SameSite"] = cookie["same_site"]
+        session.cookies.set_cookie(
+            requests.cookies.create_cookie(
+                name=str(cookie["name"]),
+                value=str(cookie["value"]),
+                domain=str(cookie["domain"]),
+                path=str(cookie["path"]),
+                secure=bool(cookie["secure"]),
+                expires=(
+                    int(float(cookie["expires"]))
+                    if cookie["expires"] is not None
+                    else None
+                ),
+                rest=rest,
+            )
+        )
+
+
+def dump_requests_cookies(
+    session: requests.Session,
+) -> list[dict[str, object]]:
+    cookies: list[dict[str, object]] = []
+    for cookie in session.cookies:
+        rest = getattr(cookie, "_rest", {})
+        same_site = (
+            rest.get("SameSite") if isinstance(rest, dict) else None
+        )
+        cookies.append(
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+                "expires": cookie.expires,
+                "http_only": (
+                    isinstance(rest, dict) and "HttpOnly" in rest
+                ),
+                "secure": cookie.secure,
+                "same_site": same_site,
+            }
+        )
+    return normalize_cookies(cookies)
+
+
 def main() -> int:
     args = parse_args()
     request_headers = dict(args.header)
@@ -189,8 +259,18 @@ def main() -> int:
 
     signal.signal(signal.SIGALRM, deadline_alarm)
     signal.setitimer(signal.ITIMER_REAL, args.timeout)
+    session_state: PersistentWebSession | None = None
+    cookies_before: list[dict[str, object]] = []
+    cookies_after: list[dict[str, object]] = []
     try:
-        with requests.Session() as session:
+        with contextlib.ExitStack() as stack:
+            if args.session is not None:
+                session_state = stack.enter_context(
+                    PersistentWebSession(OUTPUT_DIR, args.session)
+                )
+                cookies_before = session_state.load_cookies()
+            session = stack.enter_context(requests.Session())
+            load_requests_cookies(session, cookies_before)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RequestDeadlineExceeded("whole-request deadline exceeded")
@@ -209,6 +289,20 @@ def main() -> int:
                     args.max_bytes,
                     deadline,
                 )
+            cookies_after = dump_requests_cookies(session)
+            if session_state is not None:
+                session_state.save_cookies(cookies_after)
+                session_state.record_exchange(
+                    source="http",
+                    method=args.method,
+                    url=args.url,
+                    status=response.status_code,
+                    cookies_before=cookies_before,
+                    cookies_after=cookies_after,
+                    request_headers=request_headers,
+                    response_headers=dict(response.headers),
+                    artifact=str(OUTPUT_DIR / "response.json"),
+                )
     except RequestDeadlineExceeded as exc:
         signal.setitimer(signal.ITIMER_REAL, 0)
         error = {
@@ -225,6 +319,22 @@ def main() -> int:
         )
         print(json.dumps(error, ensure_ascii=False))
         return 2
+    except WebSessionStateError as exc:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        error = {
+            "ok": False,
+            "error": "WebSessionStateError",
+            "message": str(exc),
+        }
+        atomic_write(
+            output_descriptor,
+            "error.json",
+            (json.dumps(error, ensure_ascii=False, indent=2) + "\n").encode(
+                "utf-8"
+            ),
+        )
+        print(json.dumps(error, ensure_ascii=False))
+        return 2
     except requests.RequestException as exc:
         signal.setitimer(signal.ITIMER_REAL, 0)
         if time.monotonic() >= deadline:
@@ -236,7 +346,12 @@ def main() -> int:
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             }
         else:
-            error = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+            error = {
+                "ok": False,
+                "error": type(exc).__name__,
+                "message": "HTTP request failed",
+                "request": sanitize_url(args.url),
+            }
         atomic_write(
             output_descriptor,
             "error.json",
@@ -259,16 +374,23 @@ def main() -> int:
 
     metadata = {
         "ok": True,
-        "request": {"method": args.method, "url": args.url},
+        "request": {
+            "method": args.method,
+            **sanitize_url(args.url),
+        },
         "deadline_seconds": args.timeout,
         "elapsed_seconds": round(time.monotonic() - started, 6),
         "response": {
             "status": response.status_code,
             "reason": response.reason,
-            "url": response.url,
-            "headers": dict(response.headers),
+            **sanitize_url(response.url),
+            "headers": redact_headers(dict(response.headers)),
             "history": [
-                {"status": item.status_code, "url": item.url} for item in response.history
+                {
+                    "status": item.status_code,
+                    **sanitize_url(item.url),
+                }
+                for item in response.history
             ],
             "encoding": encoding,
             "saved_bytes": len(raw_body),
@@ -280,6 +402,14 @@ def main() -> int:
             "metadata": str(OUTPUT_DIR / "response.json"),
         },
     }
+    if args.session is not None:
+        metadata["session"] = {
+            "name": args.session,
+            "cookie_count": len(cookies_after),
+            "timeline": str(
+                OUTPUT_DIR / "timeline.json"
+            ),
+        }
     atomic_write(
         output_descriptor,
         "response.json",

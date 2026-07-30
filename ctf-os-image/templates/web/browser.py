@@ -19,6 +19,14 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from safe_output import atomic_write, open_output_dir
+from session_state import (
+    PersistentWebSession,
+    SESSION_NAMES,
+    WebSessionStateError,
+    normalize_cookies,
+    redact_headers,
+    sanitize_url,
+)
 
 OUTPUT_DIR = Path("/work/web")
 HARD_MAX_DEADLINE = 300.0
@@ -90,6 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("url", help="absolute http:// or https:// URL")
     parser.add_argument(
         "-H", "--header", action="append", default=[], type=header, metavar="NAME: VALUE"
+    )
+    parser.add_argument(
+        "--session",
+        choices=SESSION_NAMES,
+        help=(
+            "persist an isolated attacker, user, or admin cookie jar and append "
+            "a redacted HTTP/browser timeline"
+        ),
     )
     parser.add_argument("--insecure", action="store_true", help="ignore TLS errors")
     parser.add_argument(
@@ -190,10 +206,54 @@ def bounded_text(value: object, limit: int = MAX_EVENT_BYTES) -> str:
 
 
 def bounded_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {
+    return redact_headers({
         bounded_text(name, 256): bounded_text(value, 4096)
         for name, value in list(headers.items())[:100]
-    }
+    })
+
+
+def playwright_cookie_input(
+    cookies: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    converted: list[dict[str, object]] = []
+    for cookie in cookies:
+        item: dict[str, object] = {
+            "name": cookie["name"],
+            "value": cookie["value"],
+            "domain": cookie["domain"],
+            "path": cookie["path"],
+            "expires": (
+                float(cookie["expires"])
+                if cookie["expires"] is not None
+                else -1
+            ),
+            "httpOnly": cookie["http_only"],
+            "secure": cookie["secure"],
+        }
+        if cookie["same_site"] is not None:
+            item["sameSite"] = cookie["same_site"]
+        converted.append(item)
+    return converted
+
+
+def normalize_playwright_cookies(
+    cookies: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return normalize_cookies(
+        [
+            {
+                "name": cookie.get("name"),
+                "value": cookie.get("value"),
+                "domain": cookie.get("domain", ""),
+                "path": cookie.get("path", "/"),
+                "expires": cookie.get("expires"),
+                "http_only": cookie.get("httpOnly", False),
+                "secure": cookie.get("secure", False),
+                "same_site": cookie.get("sameSite"),
+            }
+            for cookie in cookies
+        ]
+    )
 
 
 def notify_supervisor(control_descriptor: int | None, event: bytes) -> None:
@@ -412,9 +472,17 @@ def run_browser(
     page_errors: list[str] = []
     browser = None
     playwright = None
+    web_session: PersistentWebSession | None = None
+    cookies_before: list[dict[str, object]] = []
+    cookies_after: list[dict[str, object]] = []
     signal.signal(signal.SIGALRM, deadline_alarm)
     signal.setitimer(signal.ITIMER_REAL, remaining)
     try:
+        session_name = getattr(args, "session", None)
+        if session_name is not None:
+            web_session = PersistentWebSession(OUTPUT_DIR, session_name)
+            web_session.__enter__()
+            cookies_before = web_session.load_cookies()
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
@@ -428,6 +496,11 @@ def run_browser(
         }
         if args.user_agent:
             context_options["user_agent"] = args.user_agent
+        if web_session is not None:
+            context_options["storage_state"] = {
+                "cookies": playwright_cookie_input(cookies_before),
+                "origins": [],
+            }
         context = browser.new_context(**context_options)
         if args.header:
             context.set_extra_http_headers(dict(args.header))
@@ -472,10 +545,27 @@ def run_browser(
             atomic_write(output_descriptor, "browser.png", screenshot)
             files["screenshot"] = str(OUTPUT_DIR / "browser.png")
 
+        if web_session is not None:
+            cookies_after = normalize_playwright_cookies(context.cookies())
+            web_session.save_cookies(cookies_after)
+            web_session.record_exchange(
+                source="browser",
+                method="GET",
+                url=args.url,
+                status=response.status if response is not None else None,
+                cookies_before=cookies_before,
+                cookies_after=cookies_after,
+                request_headers=dict(args.header),
+                response_headers=(
+                    dict(response.headers) if response is not None else {}
+                ),
+                artifact=str(OUTPUT_DIR / "browser.json"),
+            )
+
         metadata = {
             "ok": True,
             "request": {
-                "url": args.url,
+                **sanitize_url(args.url),
                 "wait_until": args.wait_until,
                 "wait_ms": args.wait_ms,
                 "full_page": args.full_page,
@@ -489,7 +579,7 @@ def run_browser(
             "elapsed_seconds": round(time.monotonic() - started, 6),
             "response": {
                 "status": response.status if response is not None else None,
-                "url": page.url,
+                **sanitize_url(page.url),
                 "headers": (
                     bounded_headers(response.headers) if response is not None else {}
                 ),
@@ -501,6 +591,12 @@ def run_browser(
             "page_errors": page_errors,
             "files": files,
         }
+        if web_session is not None:
+            metadata["session"] = {
+                "name": web_session.session_name,
+                "cookie_count": len(cookies_after),
+                "timeline": str(web_session.timeline_path),
+            }
         if screenshot_metadata is not None:
             metadata["screenshot"] = {
                 **screenshot_metadata,
@@ -556,13 +652,26 @@ def run_browser(
             control_descriptor,
         )
         return 2
-    except PlaywrightError as exc:
+    except WebSessionStateError as exc:
         write_error(
             output_descriptor,
             {
                 "ok": False,
                 "error": type(exc).__name__,
                 "message": bounded_text(exc),
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+            },
+            control_descriptor,
+        )
+        return 2
+    except PlaywrightError as exc:
+        write_error(
+            output_descriptor,
+            {
+                "ok": False,
+                "error": type(exc).__name__,
+                "message": "browser operation failed",
+                "request": sanitize_url(args.url),
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             control_descriptor,
@@ -589,6 +698,8 @@ def run_browser(
                     playwright.stop()
                 except PlaywrightError:
                     pass
+            if web_session is not None:
+                web_session.close()
         except BrowserCleanupDeadlineExceeded:
             pass
         finally:

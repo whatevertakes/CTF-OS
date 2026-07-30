@@ -24,10 +24,13 @@ class WebAdapter(GenericAdapter):
         return tuple(
             ProgressMarker(key, label, "HTTP/browser trace or exact source locator")
             for key, label in (
+                ("endpoint_observed", "endpoint observed at runtime"),
+                ("auth_state_captured", "role-scoped authentication state captured"),
                 ("state_modeled", "state transition modeled"),
                 ("invariant_identified", "security invariant identified"),
                 ("preconditions_met", "exploit preconditions met"),
                 ("exploit_demonstrated", "exploit demonstrated"),
+                ("impact_verified", "impact independently verified"),
                 ("flag_reached", "intended flag path reached"),
             )
         )
@@ -45,6 +48,8 @@ class WebAdapter(GenericAdapter):
             "route_list_without_model",
             "missing_precondition",
             "authorization_assumption",
+            "session_identity_crossover",
+            "missing_runtime_timeline",
             "rate_limited",
             "remote_state_drift",
         )
@@ -52,7 +57,10 @@ class WebAdapter(GenericAdapter):
     def captain_guidance(self) -> str:
         return (
             "Model state transitions and invariants before enumerating payloads. "
-            "Record authentication and business preconditions. Remote requests "
+            "Record authentication and business preconditions. For dynamic Web "
+            "work, run /opt/ctf-templates/web/request.py or ctf-browser with "
+            "--session attacker|user|admin so both tools share isolated cookie "
+            "jars and one redacted timeline. "
+            "Never copy cookie or token values into prompts. Remote requests "
             "require an explicit target allowlist and shared host rate limit."
         )
-

@@ -909,7 +909,9 @@ RUN find /opt/ctf-templates -type f \
       -exec chmod 0755 '{}' +
 
 # 도구 인덱스 — 빌드 시점에 실제 실행해서 생성한다. 손으로 쓰지 말 것.
-RUN /usr/local/bin/gen-manifest.sh > /tools/manifest.json \
+RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
+      --help >/dev/null \
+ && /usr/local/bin/gen-manifest.sh > /tools/manifest.json \
  && jq -e '.schema_version == 1 \
       and (.failed | type == "array" and length == 0) \
       and (.tools | type == "array" and length > 0) \
