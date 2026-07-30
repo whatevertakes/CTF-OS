@@ -1199,6 +1199,8 @@ _REV_ADAPTER_SEED_CONTRACT_VERSION = (
 _REV_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = (
     REV_INVENTORY_V2_SEED_REQUIRES_EXPLICIT_EXECUTION
 )
+_MANAGED_ADAPTER_SEED_CONTRACT_VERSION = 1
+_MANAGED_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION = True
 _REV_SOURCE_SNAPSHOT_FILE_MODE = REV_INVENTORY_V2_SNAPSHOT_FILE_MODE
 _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = (
     REV_INVENTORY_V2_SNAPSHOT_DIRECTORY_MODE
@@ -2052,6 +2054,355 @@ class ChallengeEngine:
                 existing_ids.add(experiment_id)
 
         return self.store.update(state.identity, apply)
+
+    @staticmethod
+    def _managed_adapter_seed_digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest()
+
+    def _managed_adapter_seed_plan(
+        self,
+        state: ChallengeState,
+        adapter: Any,
+    ) -> tuple[
+        SourceFile | None,
+        str,
+        dict[str, Any],
+        tuple[tuple[Any, str, tuple[str, ...], dict[str, Any]], ...],
+    ]:
+        """Bind non-Rev cartography seeds to their executable source plan."""
+
+        if str(adapter.name) == "reversing":
+            raise EngineError(
+                "Rev adapter seeds use their immutable category contract"
+            )
+        manifest = state.metadata.get("source_manifest_sha256")
+        if (
+            not isinstance(manifest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest)
+        ):
+            raise EngineError(
+                "managed adapter seeds require a canonical source manifest"
+            )
+        primary_source = _select_adapter_primary_source(
+            state.category,
+            self.challenge_input(state.identity),
+            state.source_inventory,
+        )
+        source_binding: dict[str, Any] = {
+            "manifest_sha256": manifest,
+            "path": None,
+            "schema_version": 1,
+            "sha256": None,
+            "size_bytes": None,
+        }
+        if primary_source is not None:
+            if (
+                not re.fullmatch(r"[0-9a-f]{64}", primary_source.sha256)
+                or isinstance(primary_source.size, bool)
+                or not isinstance(primary_source.size, int)
+                or primary_source.size < 0
+            ):
+                raise EngineError(
+                    "managed adapter primary source binding is invalid"
+                )
+            source_binding.update(
+                {
+                    "path": primary_source.path,
+                    "sha256": primary_source.sha256,
+                    "size_bytes": primary_source.size,
+                }
+            )
+        primary = (
+            f"/challenge/{primary_source.path}"
+            if primary_source is not None
+            else "/challenge"
+        )
+        specs: list[tuple[Any, tuple[str, ...], dict[str, Any]]] = []
+        for spec in adapter.initial_observations():
+            argv = tuple(
+                argument.replace("{primary}", primary)
+                for argument in spec.command_template
+            )
+            descriptor = {
+                "argv": list(argv),
+                "command_template": list(spec.command_template),
+                "drop_condition": str(spec.drop_condition),
+                "expected_observation": str(spec.expected_observation),
+                "keep_condition": str(spec.keep_condition),
+                "purpose": str(spec.purpose),
+                "requires_network": bool(spec.requires_network),
+                "resource_class": str(spec.resource_class),
+                "template_spec_id": str(spec.id),
+                "timeout_s": int(spec.timeout_s),
+            }
+            specs.append((spec, argv, descriptor))
+        plan_descriptor = {
+            "adapter_name": str(adapter.name),
+            "contract_version": _MANAGED_ADAPTER_SEED_CONTRACT_VERSION,
+            "runtime_image_digest": self.config.runtime.image_digest,
+            "source": source_binding,
+            "specs": [item[2] for item in specs],
+        }
+        plan_sha256 = self._managed_adapter_seed_digest(plan_descriptor)
+        source_binding["adapter_plan_sha256"] = plan_sha256
+        plan: list[
+            tuple[Any, str, tuple[str, ...], dict[str, Any]]
+        ] = []
+        for ordinal, (spec, argv, descriptor) in enumerate(specs):
+            spec_sha256 = self._managed_adapter_seed_digest(
+                {
+                    "adapter_plan_sha256": plan_sha256,
+                    "order": ordinal,
+                    "spec": descriptor,
+                }
+            )
+            bound_spec_id = f"{spec.id}@{spec_sha256}"
+            experiment_id = _record_id(
+                "E-adapter",
+                str(adapter.name),
+                bound_spec_id,
+            )
+            extra = {
+                "adapter_name": str(adapter.name),
+                "adapter_plan_sha256": plan_sha256,
+                "adapter_seed": True,
+                "adapter_seed_contract_version": (
+                    _MANAGED_ADAPTER_SEED_CONTRACT_VERSION
+                ),
+                "adapter_seed_generation_sha256": plan_sha256,
+                "adapter_seed_order": ordinal,
+                "adapter_spec_id": bound_spec_id,
+                "adapter_spec_sha256": spec_sha256,
+                "adapter_spec_template_id": str(spec.id),
+                "purpose": str(spec.purpose),
+                "requires_explicit_execution": (
+                    _MANAGED_ADAPTER_SEED_REQUIRES_EXPLICIT_EXECUTION
+                ),
+                "source_binding": copy.deepcopy(source_binding),
+            }
+            plan.append((spec, experiment_id, argv, extra))
+        return (
+            primary_source,
+            plan_sha256,
+            source_binding,
+            tuple(plan),
+        )
+
+    @staticmethod
+    def _managed_adapter_seed_matches(
+        experiment: Experiment,
+        spec: Any,
+        experiment_id: str,
+        argv: Sequence[str],
+        extra: Mapping[str, Any],
+    ) -> bool:
+        allowed_extra = {
+            *extra,
+            "orphan_recovered_at",
+            "orphan_recovery",
+        }
+        return (
+            experiment.id == experiment_id
+            and experiment.kind is ExperimentKind.PROBE
+            and not experiment.hypothesis_ids
+            and experiment.command == shlex.join(argv)
+            and experiment.expected_observation
+            == spec.expected_observation
+            and experiment.keep_if == spec.keep_condition
+            and experiment.drop_if == spec.drop_condition
+            and experiment.resource_class == spec.resource_class
+            and all(
+                experiment.extra.get(key) == value
+                for key, value in extra.items()
+            )
+            and set(experiment.extra).issubset(allowed_extra)
+        )
+
+    def synchronize_managed_adapter_seed_plan(
+        self,
+        identity: ChallengeIdentity,
+        session_id: str,
+    ) -> ChallengeState:
+        """Create a new non-Rev seed only when its executable plan changed."""
+
+        state = self.store.load(identity)
+        adapter = get_adapter(state.category)
+        if str(adapter.name) == "reversing":
+            return state
+        session = next(
+            (item for item in state.sessions if item.id == session_id),
+            None,
+        )
+        if (
+            state.active_managed_session_id != session_id
+            or not session_id
+            or session is None
+            or session.status is not SessionStatus.RUNNING
+            or session.configuration_epoch != state.configuration_epoch
+        ):
+            raise EngineError(
+                "managed adapter seeds require the active current session"
+            )
+        primary_source, plan_sha256, source_binding, plan = (
+            self._managed_adapter_seed_plan(
+                state,
+                adapter,
+            )
+        )
+        desired_ids = {item[1] for item in plan}
+        existing_by_id = {
+            experiment.id: experiment
+            for experiment in state.experiments
+        }
+        metadata_current = (
+            state.metadata.get("adapter_name") == str(adapter.name)
+            and state.metadata.get("failure_labels")
+            == list(adapter.failure_labels())
+            and state.metadata.get("adapter_primary_source")
+            == (
+                primary_source.path
+                if primary_source is not None
+                else None
+            )
+            and state.metadata.get("adapter_seed_plan_sha256")
+            == plan_sha256
+            and state.metadata.get("adapter_seed_source_binding")
+            == source_binding
+        )
+        stale_registered = any(
+            experiment.extra.get("adapter_seed") is True
+            and experiment.status is ExperimentStatus.REGISTERED
+            and experiment.id not in desired_ids
+            for experiment in state.experiments
+        )
+        desired_complete = all(
+            item[1] in existing_by_id
+            and self._managed_adapter_seed_matches(
+                existing_by_id[item[1]],
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+            )
+            for item in plan
+        )
+        if metadata_current and not stale_registered and desired_complete:
+            return state
+
+        def apply(current: ChallengeState) -> None:
+            current_adapter = get_adapter(current.category)
+            (
+                current_primary,
+                current_plan_sha256,
+                current_source_binding,
+                current_plan,
+            ) = self._managed_adapter_seed_plan(
+                current,
+                current_adapter,
+            )
+            current_session = next(
+                (
+                    item
+                    for item in current.sessions
+                    if item.id == session_id
+                ),
+                None,
+            )
+            if (
+                current.active_managed_session_id != session_id
+                or current_session is None
+                or current_session.status is not SessionStatus.RUNNING
+                or current_session.configuration_epoch
+                != current.configuration_epoch
+            ):
+                raise EngineError(
+                    "managed adapter seed session changed during sync"
+                )
+            current_desired_ids = {item[1] for item in current_plan}
+            current.metadata["adapter_name"] = str(current_adapter.name)
+            current.metadata["failure_labels"] = list(
+                current_adapter.failure_labels()
+            )
+            if current_primary is None:
+                current.metadata.pop("adapter_primary_source", None)
+            else:
+                current.metadata["adapter_primary_source"] = (
+                    current_primary.path
+                )
+            current.metadata["adapter_seed_plan_sha256"] = (
+                current_plan_sha256
+            )
+            current.metadata.pop(
+                "adapter_seed_managed_session_id",
+                None,
+            )
+            current.metadata["adapter_seed_source_binding"] = copy.deepcopy(
+                current_source_binding
+            )
+            for experiment in current.experiments:
+                if (
+                    experiment.extra.get("adapter_seed") is True
+                    and experiment.status is ExperimentStatus.REGISTERED
+                    and experiment.id not in current_desired_ids
+                ):
+                    experiment.status = ExperimentStatus.CANCELLED
+                    experiment.extra["cancelled_at"] = utc_now()
+                    experiment.extra["cancelled_reason"] = (
+                        "managed_seed_generation_replaced"
+                    )
+            current_existing_by_id = {
+                experiment.id: experiment
+                for experiment in current.experiments
+            }
+            for spec, experiment_id, argv, extra in current_plan:
+                existing = current_existing_by_id.get(experiment_id)
+                if existing is not None:
+                    if not self._managed_adapter_seed_matches(
+                        existing,
+                        spec,
+                        experiment_id,
+                        argv,
+                        extra,
+                    ):
+                        raise EngineError(
+                            "managed adapter seed identity content drifted"
+                        )
+                    continue
+                current.experiments.append(
+                    Experiment(
+                        id=experiment_id,
+                        hypothesis_ids=[],
+                        command=shlex.join(argv),
+                        expected_observation=spec.expected_observation,
+                        keep_if=spec.keep_condition,
+                        drop_if=spec.drop_condition,
+                        timeout_seconds=self._budget_command_timeout(
+                            current,
+                            int(spec.timeout_s),
+                        ),
+                        resource_class=spec.resource_class,
+                        kind=ExperimentKind.PROBE,
+                        status=ExperimentStatus.REGISTERED,
+                        extra=copy.deepcopy(extra),
+                    )
+                )
+                current_existing_by_id[experiment_id] = (
+                    current.experiments[-1]
+                )
+
+        return self.store.update(
+            identity,
+            apply,
+            expected_revision=state.revision,
+        )
 
     def _rev_adapter_seed_plan(
         self,
@@ -4046,12 +4397,49 @@ class ChallengeEngine:
         state: ChallengeState,
         experiment: Experiment,
     ) -> None:
-        """Fail closed if a Rev seed no longer matches the current input."""
+        """Fail closed if a bound seed no longer matches the current input."""
 
         if experiment.extra.get("adapter_seed") is not True:
             return
         adapter = get_adapter(state.category)
         if str(adapter.name) != "reversing":
+            if (
+                experiment.extra.get("adapter_seed_contract_version")
+                != _MANAGED_ADAPTER_SEED_CONTRACT_VERSION
+                or not isinstance(
+                    experiment.extra.get("adapter_plan_sha256"),
+                    str,
+                )
+            ):
+                # Historical intake seeds remain manually executable. Managed
+                # orchestration replaces their registered instances before
+                # action selection.
+                return
+            session_id = state.active_managed_session_id
+            if session_id is None:
+                raise EngineError(
+                    "managed adapter experiment has no active session"
+                )
+            _primary, _plan_hash, _binding, plan = (
+                self._managed_adapter_seed_plan(
+                    state,
+                    adapter,
+                )
+            )
+            expected = next(
+                (item for item in plan if item[1] == experiment.id),
+                None,
+            )
+            if expected is None or not self._managed_adapter_seed_matches(
+                experiment,
+                expected[0],
+                expected[1],
+                expected[2],
+                expected[3],
+            ):
+                raise EngineError(
+                    "managed adapter experiment binding is stale"
+                )
             return
         _primary_source, plan = self._rev_adapter_seed_plan(state, adapter)
         expected = next(

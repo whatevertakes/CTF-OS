@@ -2048,6 +2048,10 @@ class ManagedOrchestrator:
         self.require_preflight(identity, session_id=session_id)
         state, selected_session = self._reserve_session(identity, session_id)
         try:
+            state = self.engine.synchronize_managed_adapter_seed_plan(
+                identity,
+                selected_session,
+            )
             state, cycle = self._reserve_cycle(
                 identity,
                 selected_session,

@@ -75,6 +75,7 @@ from ctf_os.workspace_publish import (
 )
 from tests.test_engine import (
     FakeSandbox,
+    _elf64_image,
     _output_path,
     _payload,
     _rev_inventory_payload,
@@ -2754,6 +2755,172 @@ class ManagedV2Tests(unittest.TestCase):
                         for argv in pre_captain_argv
                     )
                 )
+
+    def test_pwn_managed_refresh_replaces_only_unbound_or_stale_seeds(
+        self,
+    ) -> None:
+        identity = ChallengeIdentity(
+            "Managed CTF",
+            "pwn",
+            "bound-cartography",
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        library = incoming / "libc-2.23.so"
+        library.write_bytes(_elf64_image(3, program_types=(1,)))
+        library.chmod(0o755)
+        challenge = incoming / "zone"
+        challenge.write_bytes(_elf64_image(3, program_types=(3,)))
+        challenge.chmod(0o755)
+        engine = self.engine(ProbeRoleExecutor())
+        state = engine.add_challenge(
+            identity,
+            prompt="solve the selected pwn challenge",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        legacy_ids = [
+            experiment.id
+            for experiment in state.experiments
+            if experiment.extra.get("adapter_seed") is True
+        ]
+        self.assertEqual(len(legacy_ids), 2)
+
+        def make_legacy_plan_stale(current):
+            current.metadata["adapter_primary_source"] = "libc-2.23.so"
+            seeds = [
+                experiment
+                for experiment in current.experiments
+                if experiment.id in legacy_ids
+            ]
+            for experiment in seeds:
+                experiment.command = experiment.command.replace(
+                    "/challenge/zone",
+                    "/challenge/libc-2.23.so",
+                )
+            seeds[0].status = ExperimentStatus.CANCELLED
+
+        engine.store.update(identity, make_legacy_plan_stale)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            identity,
+            "S-current-plan",
+        )
+
+        refreshed = engine.synchronize_managed_adapter_seed_plan(
+            identity,
+            session_id,
+        )
+        old = [
+            experiment
+            for experiment in refreshed.experiments
+            if experiment.id in legacy_ids
+        ]
+        self.assertEqual(
+            {experiment.status for experiment in old},
+            {ExperimentStatus.CANCELLED},
+        )
+        self.assertTrue(
+            all(
+                "/challenge/libc-2.23.so" in experiment.command
+                for experiment in old
+            )
+        )
+        bound = [
+            experiment
+            for experiment in refreshed.experiments
+            if (
+                experiment.extra.get("adapter_seed") is True
+                and experiment.id not in legacy_ids
+            )
+        ]
+        self.assertEqual(len(bound), 2)
+        self.assertTrue(
+            all(
+                experiment.status is ExperimentStatus.REGISTERED
+                and "/challenge/zone" in experiment.command
+                for experiment in bound
+            )
+        )
+        self.assertTrue(
+            all(
+                experiment.extra["adapter_plan_sha256"]
+                == refreshed.metadata["adapter_seed_plan_sha256"]
+                and experiment.extra["source_binding"]
+                == refreshed.metadata["adapter_seed_source_binding"]
+                and experiment.extra["source_binding"]["path"] == "zone"
+                for experiment in bound
+            )
+        )
+        first_bound_ids = {experiment.id for experiment in bound}
+        unchanged = engine.synchronize_managed_adapter_seed_plan(
+            identity,
+            session_id,
+        )
+        self.assertEqual(unchanged.revision, refreshed.revision)
+
+        _state, cycle = orchestrator._reserve_cycle(
+            identity,
+            session_id,
+        )
+        orchestrator._mark_action_selection(
+            identity,
+            session_id,
+            cycle.id,
+            tuple(sorted(first_bound_ids)),
+        )
+        executed = orchestrator._execute_selected_actions(
+            identity,
+            tuple(sorted(first_bound_ids)),
+        )
+        assert executed is not None
+        self.assertFalse(
+            any(
+                experiment.status is ExperimentStatus.REGISTERED
+                for experiment in executed.experiments
+                if experiment.id in first_bound_ids
+            )
+        )
+        orchestrator._finish_session(
+            identity,
+            session_id,
+            status=SessionStatus.COMPLETED,
+            reason="one human-opened session completed",
+        )
+        _state, reopened_session = orchestrator._reserve_session(
+            identity,
+            "S-reopened-same-plan",
+        )
+        reopened = engine.synchronize_managed_adapter_seed_plan(
+            identity,
+            reopened_session,
+        )
+        self.assertEqual(
+            {
+                experiment.id
+                for experiment in reopened.experiments
+                if (
+                    experiment.extra.get("adapter_seed") is True
+                    and experiment.id not in legacy_ids
+                )
+            },
+            first_bound_ids,
+        )
+        self.assertFalse(
+            any(
+                experiment.status is ExperimentStatus.REGISTERED
+                for experiment in reopened.experiments
+                if experiment.id in first_bound_ids
+            )
+        )
 
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()
