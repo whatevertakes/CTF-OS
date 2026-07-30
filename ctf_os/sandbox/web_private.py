@@ -8,6 +8,7 @@ commands do not receive the mount.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -46,6 +47,13 @@ _TRUSTED_HELPERS = {
             "/opt/ctf-templates/web/browser.py",
         ),
     ),
+    "/opt/ctf-templates/web/active_probe.py": (
+        "active",
+        (
+            "/opt/venvs/main/bin/python",
+            "/opt/ctf-templates/web/active_probe.py",
+        ),
+    ),
     "/usr/local/bin/ctf-browser": (
         "browser",
         (
@@ -58,6 +66,20 @@ _TRUSTED_HELPERS = {
         (
             "/opt/venvs/pw/bin/python",
             "/opt/ctf-templates/web/browser.py",
+        ),
+    ),
+    "/usr/local/bin/ctf-web-probe": (
+        "active",
+        (
+            "/opt/venvs/main/bin/python",
+            "/opt/ctf-templates/web/active_probe.py",
+        ),
+    ),
+    "ctf-web-probe": (
+        "active",
+        (
+            "/opt/venvs/main/bin/python",
+            "/opt/ctf-templates/web/active_probe.py",
         ),
     ),
 }
@@ -80,10 +102,15 @@ _RUN_FILES = frozenset(
         "stdout.log",
     }
 )
+_ACTIVE_WEB_FILE = re.compile(
+    r"^(?:(?:callback-[0-9]{2}|response-[0-9]{4}|"
+    r"trigger-response)\.bin|(?:error|report|timeline)\.json)$"
+)
 _MAX_COOKIE_FILE_BYTES = 1024 * 1024
 _MAX_COOKIE_COUNT = 256
 _MAX_SECRET_BYTES = 16 * 1024
 _MAX_REDACTION_FILE_BYTES = 512 * 1024 * 1024
+_MAX_ACTIVE_PUBLIC_FILES = 300
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -277,7 +304,7 @@ def prepare_web_session_command(
             "persistent browser screenshots are disabled because pixels "
             "cannot be checked for cookie disclosure"
         )
-    if kind == "http":
+    if kind in {"active", "http"}:
         data_files: list[str] = []
         for index, value in enumerate(argv[1:], start=1):
             if value == "--data-file":
@@ -664,6 +691,98 @@ def snapshot_all_cookie_values(private_root: Path) -> tuple[str, ...]:
     return tuple(sorted(values, key=lambda value: (-len(value), value)))
 
 
+def private_web_cookie_lineage_sha256(
+    scope: ChallengeScope,
+    session_name: str,
+    *,
+    identity_epoch_sha256: str,
+    lineage_nonce: bytes,
+) -> str:
+    """Hash one role jar with an engine nonce without exposing jar values."""
+
+    if (
+        session_name not in WEB_SESSION_NAMES
+        or type(identity_epoch_sha256) is not str
+        or _SHA256.fullmatch(identity_epoch_sha256) is None
+        or type(lineage_nonce) is not bytes
+        or not 16 <= len(lineage_nonce) <= 64
+    ):
+        raise WebPrivateStateError(
+            "private Web cookie lineage binding is invalid"
+        )
+    session_root, _timeline_root = resolve_private_web_mounts(
+        scope,
+        session_name,
+    )
+    values = snapshot_cookie_values(session_root, session_name)
+    payload = (
+        json.dumps(
+            {
+                "identity_epoch_sha256": identity_epoch_sha256,
+                "protocol": "ctfos.web.cookie_lineage.v1",
+                "session": session_name,
+                "values": list(values),
+            },
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    digest = hashlib.sha256()
+    digest.update(lineage_nonce)
+    digest.update(b"\0")
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _active_public_paths(work_dir: Path) -> tuple[Path, ...]:
+    root = work_dir / "web-active"
+    try:
+        metadata = root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise WebPrivateStateError(
+            "active Web output directory cannot be inspected"
+        ) from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WebPrivateStateError(
+            "active Web output path is not a directory"
+        )
+    try:
+        values = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError as error:
+        raise WebPrivateStateError(
+            "active Web output directory cannot be listed"
+        ) from error
+    if len(values) > _MAX_ACTIVE_PUBLIC_FILES:
+        raise WebPrivateStateError(
+            "active Web output file count exceeds its bound"
+        )
+    for path in values:
+        if _ACTIVE_WEB_FILE.fullmatch(path.name) is None:
+            raise WebPrivateStateError(
+                "active Web output contains an unexpected file"
+            )
+        try:
+            entry = path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise WebPrivateStateError(
+                "active Web output file cannot be inspected"
+            ) from error
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or entry.st_size > _MAX_REDACTION_FILE_BYTES
+        ):
+            raise WebPrivateStateError(
+                "active Web output is not a bounded single-link regular file"
+            )
+    return tuple(values)
+
+
 def _secret_byte_patterns(secrets: Sequence[str]) -> tuple[bytes, ...]:
     patterns: set[bytes] = set()
     for secret in secrets:
@@ -877,12 +996,15 @@ def redact_public_artifacts(
 ) -> None:
     """Scrub exact cookie values before the sandbox result is returned."""
 
+    active_paths = _active_public_paths(work_dir)
     patterns = _secret_byte_patterns(secrets)
     if not patterns:
         return
     web_root = work_dir / "web"
     for name in sorted(_PUBLIC_WEB_FILES):
         _redact_regular(web_root / name, patterns)
+    for path in active_paths:
+        _redact_regular(path, patterns)
     for run_id in sorted(snapshot_run_ids(work_dir) - previous_run_ids):
         run_root = work_dir / ".ctf" / "runs" / run_id
         for name in sorted(_RUN_FILES):
@@ -898,6 +1020,7 @@ def discard_public_artifacts(
 
     paths = [
         *(work_dir / "web" / name for name in sorted(_PUBLIC_WEB_FILES)),
+        *_active_public_paths(work_dir),
     ]
     for run_id in sorted(snapshot_run_ids(work_dir) - previous_run_ids):
         paths.extend(
@@ -935,6 +1058,7 @@ __all__ = [
     "WebPrivateStateError",
     "WebSessionCommand",
     "prepare_web_session_command",
+    "private_web_cookie_lineage_sha256",
     "private_web_identity_epoch_sha256",
     "reset_private_web_identity_state",
     "discard_public_artifacts",
