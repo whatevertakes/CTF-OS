@@ -26,6 +26,10 @@ from ctf_os.models import (
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
 
+RELEASE_IMAGE_DIGEST = (
+    "sha256:"
+    "62bc44f2b84ccaa86cb5321ff700b73c42edd8b901c21cd61cfb3036bd985886"
+)
 CRYPTO_CANDIDATE = "KCTF{docker-crypto-metamorphic-hotpath}"
 
 
@@ -124,12 +128,19 @@ def _add_candidate(
     engine.store.update(identity, mutate)
 
 
-def _crypto(root: Path, image_digest: str) -> dict[str, object]:
+def _crypto(
+    root: Path,
+    image_digest: str,
+    *,
+    runtime: str,
+) -> dict[str, object]:
+    if runtime not in {"python", "sage"}:
+        raise ValueError("release smoke runtime must be python or sage")
     engine = _engine(root, image_digest)
     identity = ChallengeIdentity(
         "release-smoke",
         "crypto",
-        "metamorphic-hotpath",
+        f"metamorphic-hotpath-{runtime}",
     )
     incoming = engine.challenge_input(identity)
     incoming.mkdir(parents=True)
@@ -163,24 +174,24 @@ def _crypto(root: Path, image_digest: str) -> dict[str, object]:
     _add_candidate(
         engine,
         identity,
-        candidate_id="C-crypto-docker",
+        candidate_id=f"C-crypto-docker-{runtime}",
         value=CRYPTO_CANDIDATE,
     )
 
     final, result = engine.prove_crypto_metamorphic_candidate(
         identity,
-        "C-crypto-docker",
+        f"C-crypto-docker-{runtime}",
         solver_locator="solver.py",
         original_parameters_locator="original.json",
         variant_parameters_locator="variant.json",
         variant_expected_output_locator="variant.out",
         mutation_id="release-smoke-rsa-parameter-variant",
-        runtime="python",
+        runtime=runtime,
     )
     candidate = next(
         item
         for item in final.candidates
-        if item.id == "C-crypto-docker"
+        if item.id == f"C-crypto-docker-{runtime}"
     )
     runs = [
         item
@@ -202,6 +213,7 @@ def _crypto(root: Path, image_digest: str) -> dict[str, object]:
     return {
         "candidate_status": candidate.status.value,
         "network": "none",
+        "runtime": runtime,
         "runs": len(runs),
         "successful_attempts": result.successful_attempts,
         "submissions": len(final.submissions),
@@ -315,6 +327,10 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
 
 def main() -> int:
     image_digest = validate_image_digest(_parse_args().image_digest)
+    if image_digest != RELEASE_IMAGE_DIGEST:
+        raise AssertionError(
+            "release smoke requires the repository-pinned image digest"
+        )
     readiness = inspect_pinned_capabilities(image_digest)
     if readiness.get("ok") is not True:
         raise AssertionError(
@@ -325,12 +341,24 @@ def main() -> int:
         prefix="ctfos-crypto-misc-docker-"
     ) as temporary:
         root = Path(temporary)
-        crypto = _crypto(root / "crypto", image_digest)
+        crypto_python = _crypto(
+            root / "crypto-python",
+            image_digest,
+            runtime="python",
+        )
+        crypto_sage = _crypto(
+            root / "crypto-sage",
+            image_digest,
+            runtime="sage",
+        )
         misc = _misc(root / "misc", image_digest)
     print(
         json.dumps(
             {
-                "crypto": crypto,
+                "crypto": {
+                    "python": crypto_python,
+                    "sage": crypto_sage,
+                },
                 "image_digest": image_digest,
                 "misc": misc,
                 "ok": True,
