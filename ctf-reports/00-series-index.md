@@ -67,6 +67,12 @@ prefix, retained reasoning, compaction 결과를 현재 코드와 대조합니�
 ARC-AGI-3의 3배 수치를 CTF로 일반화하지 않고 fresh thread / Captain-only
 continuation / per-role continuation의 X-26 A/B로 바꾼 기록입니다.
 
+21은 그 뒤 같은 사람이 선택한 `zone` 한 문제에서 실제 off-by-one heap
+primitive, 동적 stack/libc disclosure, staged pivot과 `system()` 효과를
+3 attack/3 control로 재현한 기록입니다. 로컬 flag source와 active target이
+없어 solve로 승격하지 않았고, 동적 interaction을 image-owned typed oracle로
+옮겨야 하는 남은 제품 경계를 함께 고정합니다.
+
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
 12는 확정 계약을 현재 증거로 수용할 수 있는지를 기록합니다. 운영 명령은
@@ -85,6 +91,7 @@ continuation / per-role continuation의 X-26 A/B로 바꾼 기록입니다.
 - [18. Zone one-cycle live diagnostic](18-zone-one-cycle-live-diagnostic.md) — 개선된 all-Sol 엔진으로 `zone` 한 cycle을 재실행해 stale adapter seed와 managed shell/argv 의미 불일치가 target 관측을 막는 실제 병목임을 고정합니다 (관측일 2026-07-30)
 - [19. Zone shell-contract live regression](19-zone-shell-contract-live-regression.md) — stale action retirement와 managed shell contract가 실제 bounded output을 만든 회귀, sandbox-local artifact locator 충돌의 false stall, semantic evaluation 전 결과를 solve로 세지 않는 경계를 기록합니다 (관측일 2026-07-30)
 - [20. OpenAI 2026 agent harness 운용 delta](20-openai-agent-harness-2026-delta.md) — external oracle, bounded append-only context, retained reasoning과 compaction의 최신 공식 근거를 현재 Batch runner에 대입하고 X-26 role-continuity A/B로 제한합니다 (검토일 2026-07-31)
+- [21. Zone solve-capable exploit 실행 증거](21-zone-solve-capable-exploit-evidence.md) — 실제 원본 `zone`에서 동적 stack/libc disclosure와 staged `system()` chain을 3/3 attack 대 3/3 control로 재현하고, flag 부재와 아직 남은 typed interaction-oracle 경계를 기록합니다 (관측일 2026-07-30)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
