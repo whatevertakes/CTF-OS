@@ -8,6 +8,7 @@ summaries, receipt previews, or checkpoint action text into model context.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
@@ -23,6 +24,7 @@ from ctf_os.models import (
     ChallengeState,
     ExecutionReceipt,
     Experiment,
+    ExperimentKind,
     ExperimentStatus,
     Fact,
     ModelValidationError,
@@ -71,6 +73,13 @@ _RUN_STATUS_FOR_OUTCOME = {
     ReceiptOutcome.CANCELLED: RunStatus.CANCELLED,
     ReceiptOutcome.INTERRUPTED: RunStatus.INTERRUPTED,
 }
+_ENGINE_EVALUATION_REASON = re.compile(
+    r"(?:"
+    r"rev_inventory:(?:evaluated|rejected):"
+    r"|rev_proof:(?:semantic_falsification|structural_failure):"
+    r")"
+    r"[a-z0-9_/,.-]{1,384}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +261,29 @@ def _experiment_contract_sha256(experiment: Experiment) -> str:
             }
         ).encode("ascii")
     ).hexdigest()
+
+
+def _safe_engine_evaluation_reason(
+    experiment: Experiment,
+) -> str | None:
+    """Expose only reasons from a structurally engine-owned oracle path."""
+
+    reason = experiment.evaluation_reason
+    if not isinstance(reason, str) or not _ENGINE_EVALUATION_REASON.fullmatch(
+        reason
+    ):
+        return None
+    if reason.startswith("rev_inventory:"):
+        if not experiment.id.startswith(
+            "E-adapter-reversing-inventory_observation-"
+        ):
+            return None
+    elif (
+        experiment.kind is not ExperimentKind.PROOF
+        or experiment.proof_recipe is None
+    ):
+        return None
+    return reason
 
 
 def _receipt_maps(
@@ -448,10 +480,12 @@ def _experiment_digest(
         if receipt is not None
         else None
     )
+    safe_evaluation_reason = _safe_engine_evaluation_reason(experiment)
     return {
         "command_sha256": _command_sha256(experiment),
         "contract_sha256": _experiment_contract_sha256(experiment),
         "evaluated_at": _bounded(experiment.evaluated_at, 64),
+        "evaluation_reason": safe_evaluation_reason,
         "evaluation_reason_available": bool(
             (experiment.evaluation_reason or "").strip()
         ),
