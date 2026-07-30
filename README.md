@@ -91,6 +91,8 @@ CTFOS_RELEASE_IMAGE_ID="$(
 )"
 uv run python scripts/check-pwn-docker-crash.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
+uv run python scripts/check-pwn-docker-snapshot.py \
+  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 uv run python scripts/check-rev-docker-proof.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 ctfos pin-image
@@ -1020,6 +1022,10 @@ positive 3회와 negative control 3회를 exact pinned image에서 추가 검증
 3회와 빈 control 3회뿐 아니라 clone 추적 회피 차단, 정상 pthread,
 caught/child/multithread core-stop의 fail-closed 판정까지 서로 다른 clean
 workspace에서 검증합니다.
+실제 Docker Pwn runtime snapshot은
+`scripts/check-pwn-docker-snapshot.py --image-digest sha256:...`로
+register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
+다른 network-none clean workspace에서 검증합니다.
 
 ## 안전상 중요한 현재 제한
 
