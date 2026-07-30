@@ -640,7 +640,13 @@ class PwnIpControlReplayCommitment(PwnIpControlEvidenceCommitment):
             raise ValueError("invalid Pwn IP-control replay commitment")
 
     def to_dict(self) -> dict[str, object]:
-        value = super().to_dict()
+        # ``dataclass(slots=True)`` returns a replacement class object.
+        # Zero-argument ``super()`` can therefore retain the pre-replacement
+        # ``__class__`` cell on Python 3.11 and fail at runtime with
+        # ``super(type, obj): obj must be an instance or subtype of type``.
+        # Use the exact base implementation so a proven P replay can always
+        # be reduced to its durable commitment.
+        value = PwnIpControlEvidenceCommitment.to_dict(self)
         value.update(
             {
                 "ordinal": self.ordinal,

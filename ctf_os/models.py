@@ -15006,6 +15006,16 @@ class ChallengeState:
                 pwn_exploit_effect_state_graph_errors(self)
             )
 
+            # A FINAL production exploit effect must also be bound to the
+            # exact D->V->(L|N/A)->P->E dependency closure.  Keeping this
+            # validator at the persistence boundary makes a removed, copied,
+            # stale, or rehashed graph fail closed during every state load.
+            from ctf_os.engine.pwn_dependency_state import (
+                pwn_dependency_state_graph_errors,
+            )
+
+            errors.extend(pwn_dependency_state_graph_errors(self))
+
             # Candidate-free Rev accepted-input evidence owns one fixed 3+3
             # multi-receipt graph.  The local generic exception above is
             # marker-scoped; this exact validator rejects copied, rebound, or

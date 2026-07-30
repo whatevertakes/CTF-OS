@@ -24323,6 +24323,42 @@ class ChallengeEngine:
             _session_owned=_session_owned,
         )
 
+    def query_pwn_dependency_graph(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        graph_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return a raw-free Pwn dependency capsule after physical checks."""
+
+        from ctf_os.engine.pwn_dependency_query import (
+            query_pwn_dependency_graph,
+        )
+
+        return query_pwn_dependency_graph(
+            self,
+            identity,
+            graph_id=graph_id,
+        )
+
+    def validate_pwn_dependency_graph(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        graph_id: str | None = None,
+    ) -> dict[str, object]:
+        """Physically revalidate one exact Pwn dependency graph."""
+
+        from ctf_os.engine.pwn_dependency_query import (
+            validate_pwn_dependency_graph_query,
+        )
+
+        return validate_pwn_dependency_graph_query(
+            self,
+            identity,
+            graph_id=graph_id,
+        )
+
     def prove_web_impact(
         self,
         identity: ChallengeIdentity,

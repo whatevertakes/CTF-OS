@@ -1873,6 +1873,14 @@ def render_resume_capsule(
         if selected_pwn_disclosure is not None
         else None
     )
+    from ctf_os.engine.pwn_dependency_state import (
+        project_pwn_dependency_context,
+    )
+
+    selected_pwn_dependency = project_pwn_dependency_context(
+        state,
+        compact=True,
+    )
     pwn_disclosure_is_compact = False
     if terminal_pwn_experiments:
         checkpoint_pwn = _checkpoint_pwn_pointer_experiment(state)
@@ -1940,6 +1948,8 @@ def render_resume_capsule(
             result["pwn_crash"] = selected_pwn_crash
         if selected_pwn_disclosure is not None:
             result["pwn_disclosure"] = selected_pwn_disclosure
+        if selected_pwn_dependency is not None:
+            result["pwn_dependency"] = selected_pwn_dependency
         return result
 
     def render() -> str:
@@ -1951,7 +1961,12 @@ def render_resume_capsule(
     # records have been compacted; the exact canonical state remains pointed
     # to by this record.
     while len(text.encode("ascii")) > policy.max_bytes:
-        if selected_negative:
+        if selected_pwn_dependency is not None:
+            # The exact graph remains canonical in state.json.  This summary
+            # is useful continuity context, but never displaces the capsule's
+            # mandatory index, failure record, or confirmed-fact pointer.
+            selected_pwn_dependency = None
+        elif selected_negative:
             selected_negative.pop()
         elif len(selected_pending) > 1:
             selected_pending.pop()
