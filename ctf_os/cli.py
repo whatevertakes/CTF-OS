@@ -891,6 +891,26 @@ def build_parser() -> argparse.ArgumentParser:
     prove.add_argument("--repetitions", type=int)
     prove.add_argument("proof_command", nargs=argparse.REMAINDER)
 
+    crypto_prove = commands.add_parser(
+        "crypto-prove",
+        help=(
+            "운영자가 제공한 독립 variant oracle로 고정 solver를 "
+            "원본 3회 + 변경 파라미터 3회 검증"
+        ),
+    )
+    _identity_values(crypto_prove)
+    crypto_prove.add_argument("--candidate", required=True)
+    crypto_prove.add_argument("--solver", required=True)
+    crypto_prove.add_argument("--original-parameters", required=True)
+    crypto_prove.add_argument("--variant-parameters", required=True)
+    crypto_prove.add_argument("--variant-expected-output", required=True)
+    crypto_prove.add_argument("--mutation-id", required=True)
+    crypto_prove.add_argument(
+        "--runtime",
+        choices=("python", "sage"),
+        default="python",
+    )
+
     submit = commands.add_parser(
         "submit",
         help="flag를 표시하거나 사람이 제출한 결과만 기록",
@@ -1675,6 +1695,22 @@ def main(
                 input_locators=args.input,
                 network_target=args.target,
                 repetitions=args.repetitions,
+            )
+            _print_json(result.to_dict())
+            return 0 if result.passed else 1
+
+        if args.command == "crypto-prove":
+            state, result = engine.prove_crypto_metamorphic_candidate(
+                _identity(args),
+                args.candidate,
+                solver_locator=args.solver,
+                original_parameters_locator=args.original_parameters,
+                variant_parameters_locator=args.variant_parameters,
+                variant_expected_output_locator=(
+                    args.variant_expected_output
+                ),
+                mutation_id=args.mutation_id,
+                runtime=args.runtime,
             )
             _print_json(result.to_dict())
             return 0 if result.passed else 1

@@ -110,6 +110,13 @@ from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceLimits, tool_profile
 from ctf_os.engine.context_archive import archive_context_pack
 from ctf_os.engine.context_pack import build_context_pack
+from ctf_os.engine.crypto_metamorphic import (
+    CRYPTO_METAMORPHIC_MAX_RESULT_BYTES,
+    CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+    CryptoMetamorphicObservation,
+    build_crypto_metamorphic_plan,
+    evaluate_crypto_metamorphic_proof,
+)
 from ctf_os.engine.flags import (
     FLAG_PATTERNS_ENV,
     DetectedFlag,
@@ -149,6 +156,18 @@ from ctf_os.engine.pwn_disclosure import (
     PwnDisclosureTrustedReceiptExpectation,
     build_pwn_disclosure_trusted_receipt_expectation,
     evaluate_pwn_disclosure,
+)
+from ctf_os.engine.pwn_ip_control import (
+    PWN_IP_CONTROL_REPLAY_COUNT,
+    PWN_IP_CONTROL_WIDTH_BYTES,
+    PwnIpControlPlan,
+    PwnIpControlPlanError,
+    PwnIpControlReplayEvidence,
+    PwnIpControlResult,
+    derive_pwn_ip_control_plan,
+    evaluate_pwn_ip_control,
+    pwn_ip_control_child_experiment_id,
+    validate_pwn_ip_control_plan_document,
 )
 from ctf_os.engine.pwn_runtime_snapshot import (
     PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
@@ -365,6 +384,18 @@ class _PwnDisclosureCanonicalInputs:
     ]
     snapshot_stdout_artifact: ArtifactReference
     snapshot_stderr_artifact: ArtifactReference
+
+
+@dataclass(frozen=True, slots=True)
+class _PwnIpControlCanonicalInputs:
+    """Canonical baseline and engine-owned metamorphic payload bindings."""
+
+    child_experiment_id: str
+    baseline_experiment_id: str
+    disclosure: _PwnDisclosureCanonicalInputs
+    baseline_evidence: PwnIpControlReplayEvidence
+    plan: PwnIpControlPlan
+    variant_artifacts: tuple[ArtifactReference, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1312,6 +1343,21 @@ _PWN_RUNTIME_SNAPSHOT_KEEP_CONDITION = (
 )
 _PWN_RUNTIME_SNAPSHOT_DROP_CONDITION = (
     "typed runtime snapshot result is INCONCLUSIVE or ERROR"
+)
+_PWN_IP_CONTROL_ENGINE_COMMAND = "ctfos-engine:pwn-ip-control-v1"
+_PWN_IP_CONTROL_ENGINE_EXECUTOR = "pwn_ip_control_v1"
+_PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
+_PWN_IP_CONTROL_PROTOCOL = "pwn_ip_control_metamorphic_replay_v1"
+_PWN_IP_CONTROL_TIMEOUT_SECONDS = 30
+_PWN_IP_CONTROL_EXPECTED_OBSERVATION = (
+    "three clean replays move the full x86_64 RIP to three engine-derived "
+    "unmapped addresses"
+)
+_PWN_IP_CONTROL_KEEP_CONDITION = (
+    "typed result proves full-width instruction-pointer control"
+)
+_PWN_IP_CONTROL_DROP_CONDITION = (
+    "any replay, binding, signal, RIP, or maps check is unverifiable"
 )
 
 
@@ -10421,6 +10467,1266 @@ class ChallengeEngine:
                 child,
             )
 
+    def _pwn_ip_control_baseline(
+        self,
+        state: ChallengeState,
+        baseline: Experiment,
+    ) -> tuple[
+        _PwnDisclosureCanonicalInputs,
+        PwnIpControlReplayEvidence,
+        PwnIpControlPlan,
+    ]:
+        """Recompute the exact snapshot gate and derive one raw-free plan."""
+
+        disclosure = self._pwn_disclosure_inputs_from_state(
+            state,
+            baseline,
+        )
+        envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            baseline.extra["pwn_disclosure"]
+        )
+        if (
+            envelope.phase is not PwnDisclosurePhase.COMPLETE
+            or envelope.result is None
+        ):
+            raise EngineError(
+                "Pwn IP control requires a complete disclosure reduction"
+            )
+        payload = self._read_pwn_disclosure_artifact(
+            state,
+            disclosure.payload_artifact,
+            maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
+        )
+        stdout = self._read_pwn_disclosure_artifact(
+            state,
+            disclosure.snapshot_stdout_artifact,
+            maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+        )
+        recomputed = evaluate_pwn_runtime_snapshot_gate(
+            disclosure.snapshot_recipe,
+            stdout_payload=stdout,
+            receipt=disclosure.snapshot_receipt,
+        )
+        if recomputed != disclosure.snapshot_evaluation:
+            raise EngineError(
+                "Pwn IP-control baseline snapshot gate changed"
+            )
+        evidence = PwnIpControlReplayEvidence(
+            ordinal=0,
+            payload=payload,
+            recipe=disclosure.snapshot_recipe,
+            evaluation=recomputed,
+            receipt=disclosure.snapshot_receipt,
+            stdout_payload=stdout,
+        )
+        plan = derive_pwn_ip_control_plan(
+            disclosure.snapshot_recipe,
+            recomputed,
+            payload,
+        )
+        validate_pwn_ip_control_plan_document(plan.to_dict())
+        return disclosure, evidence, plan
+
+    def _pwn_ip_control_inputs_from_state(
+        self,
+        state: ChallengeState,
+        child: Experiment,
+        *,
+        required_status: ExperimentStatus | None = None,
+    ) -> _PwnIpControlCanonicalInputs:
+        """Reconstruct a registered primitive probe from canonical state."""
+
+        if (
+            str(get_adapter(state.category).name) != "pwn"
+            or child.command != _PWN_IP_CONTROL_ENGINE_COMMAND
+            or child.extra.get("managed_contract_version") != 1
+            or child.extra.get("engine_executor")
+            != _PWN_IP_CONTROL_ENGINE_EXECUTOR
+            or type(child.extra.get("baseline_experiment_id")) is not str
+            or type(child.extra.get("pwn_ip_control_plan")) is not dict
+            or (
+                required_status is not None
+                and child.status is not required_status
+            )
+        ):
+            raise EngineError("Pwn IP-control child binding is invalid")
+        baseline_id = child.extra["baseline_experiment_id"]
+        try:
+            baseline = next(
+                item
+                for item in state.experiments
+                if item.id == baseline_id
+            )
+        except StopIteration as error:
+            raise EngineError(
+                "Pwn IP-control baseline experiment is unavailable"
+            ) from error
+        disclosure, baseline_evidence, plan = (
+            self._pwn_ip_control_baseline(state, baseline)
+        )
+        raw_plan = child.extra["pwn_ip_control_plan"]
+        validate_pwn_ip_control_plan_document(raw_plan)
+        if (
+            child.id != pwn_ip_control_child_experiment_id(baseline.id)
+            or raw_plan != plan.to_dict()
+            or child.timeout_seconds != _PWN_IP_CONTROL_TIMEOUT_SECONDS
+            or child.resource_class != "light"
+            or child.kind is not ExperimentKind.PROBE
+        ):
+            raise EngineError("Pwn IP-control plan changed")
+        artifacts = {item.id: item for item in state.artifacts}
+        variants: list[ArtifactReference] = []
+        replay_records = plan.to_dict()["replays"]
+        if type(replay_records) is not list:
+            raise EngineError("Pwn IP-control plan replay list is invalid")
+        if len(child.artifact_ids) < PWN_IP_CONTROL_REPLAY_COUNT:
+            raise EngineError(
+                "Pwn IP-control variant artifact list is incomplete"
+            )
+        for ordinal, (artifact_id, payload, record) in enumerate(
+            zip(
+                child.artifact_ids[:PWN_IP_CONTROL_REPLAY_COUNT],
+                plan.payloads,
+                replay_records,
+                strict=True,
+            ),
+            start=1,
+        ):
+            artifact = artifacts.get(artifact_id)
+            if (
+                artifact is None
+                or artifact.source_run_id is not None
+                or artifact.sha256
+                != hashlib.sha256(payload).hexdigest()
+                or artifact.size != len(payload)
+                or artifact.extra
+                != {
+                    "kind": "pwn_ip_control_variant_payload",
+                    "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+                    "plan_recipe_sha256": plan.recipe_sha256,
+                    "ordinal": ordinal,
+                    "target_value_sha256": record[
+                        "target_value_sha256"
+                    ],
+                }
+            ):
+                raise EngineError(
+                    "Pwn IP-control variant artifact binding changed"
+                )
+            variants.append(artifact)
+        return _PwnIpControlCanonicalInputs(
+            child_experiment_id=child.id,
+            baseline_experiment_id=baseline.id,
+            disclosure=disclosure,
+            baseline_evidence=baseline_evidence,
+            plan=plan,
+            variant_artifacts=tuple(variants),
+        )
+
+    def _register_pwn_ip_control_child_if_applicable(
+        self,
+        identity: ChallengeIdentity,
+        state: ChallengeState,
+    ) -> ChallengeState:
+        """Register at most one deterministic primitive probe per snapshot."""
+
+        existing_baselines = {
+            item.extra.get("baseline_experiment_id")
+            for item in state.experiments
+            if item.extra.get("engine_executor")
+            == _PWN_IP_CONTROL_ENGINE_EXECUTOR
+        }
+        eligible = [
+            item
+            for item in state.experiments
+            if (
+                item.status is ExperimentStatus.COMPLETED
+                and item.extra.get("managed_contract_version") == 2
+                and item.extra.get("engine_executor")
+                == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                and item.id not in existing_baselines
+            )
+        ]
+        if not eligible:
+            return state
+        baseline = eligible[0]
+        try:
+            _disclosure, _baseline_evidence, plan = (
+                self._pwn_ip_control_baseline(state, baseline)
+            )
+        except PwnIpControlPlanError:
+            # Full-width direct RIP control is a partial oracle.  Absence of
+            # its narrow applicability is not a failed experiment and grants
+            # no authority.
+            return state
+        child_id = pwn_ip_control_child_experiment_id(baseline.id)
+        paths = self.store.challenge_paths(identity)
+        root = ensure_private_directory(
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-ip-control-{plan.recipe_sha256}"
+        )
+        plan_replays = plan.to_dict()["replays"]
+        if type(plan_replays) is not list:
+            raise EngineError("Pwn IP-control plan replay list is invalid")
+        variant_artifacts: list[ArtifactReference] = []
+        for ordinal, (payload, record) in enumerate(
+            zip(plan.payloads, plan_replays, strict=True),
+            start=1,
+        ):
+            path = root / f"{ordinal:02d}-payload.bin"
+            locator = path.relative_to(paths.root).as_posix()
+            expected_sha256 = hashlib.sha256(payload).hexdigest()
+            if path.exists():
+                observed = read_bounded_regular(
+                    paths.root,
+                    locator,
+                    maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
+                    expected_sha256=expected_sha256,
+                    expected_size=len(payload),
+                )
+                if observed != payload:
+                    raise EngineError(
+                        "Pwn IP-control existing variant changed"
+                    )
+            else:
+                atomic_write_bytes(path, payload, mode=0o400)
+            variant_artifacts.append(
+                ArtifactReference(
+                    id=_record_id(
+                        "A",
+                        child_id,
+                        f"variant-{ordinal}",
+                    ),
+                    path=locator,
+                    sha256=expected_sha256,
+                    source_run_id=None,
+                    media_type="application/octet-stream",
+                    size=len(payload),
+                    extra={
+                        "kind": "pwn_ip_control_variant_payload",
+                        "engine_executor": (
+                            _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                        ),
+                        "plan_recipe_sha256": plan.recipe_sha256,
+                        "ordinal": ordinal,
+                        "target_value_sha256": record[
+                            "target_value_sha256"
+                        ],
+                    },
+                )
+            )
+
+        child = Experiment(
+            id=child_id,
+            hypothesis_ids=list(baseline.hypothesis_ids),
+            command=_PWN_IP_CONTROL_ENGINE_COMMAND,
+            expected_observation=_PWN_IP_CONTROL_EXPECTED_OBSERVATION,
+            keep_if=_PWN_IP_CONTROL_KEEP_CONDITION,
+            drop_if=_PWN_IP_CONTROL_DROP_CONDITION,
+            timeout_seconds=_PWN_IP_CONTROL_TIMEOUT_SECONDS,
+            resource_class="light",
+            kind=ExperimentKind.PROBE,
+            status=ExperimentStatus.REGISTERED,
+            artifact_ids=[item.id for item in variant_artifacts],
+            extra={
+                "managed_contract_version": 1,
+                "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+                "baseline_experiment_id": baseline.id,
+                "pwn_ip_control_plan": plan.to_dict(),
+            },
+        )
+
+        def verify_variants() -> None:
+            for artifact, payload in zip(
+                variant_artifacts,
+                plan.payloads,
+                strict=True,
+            ):
+                if (
+                    read_bounded_regular(
+                        paths.root,
+                        artifact.path,
+                        maximum_bytes=(
+                            PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+                        ),
+                        expected_sha256=artifact.sha256,
+                        expected_size=artifact.size,
+                    )
+                    != payload
+                ):
+                    raise EngineError(
+                        "Pwn IP-control variant changed before commit"
+                    )
+
+        def register(current: ChallengeState) -> None:
+            if any(item.id == child.id for item in current.experiments):
+                raise EngineError("Pwn IP-control child already exists")
+            latest_baseline = next(
+                item
+                for item in current.experiments
+                if item.id == baseline.id
+            )
+            _latest_disclosure, _latest_evidence, latest_plan = (
+                self._pwn_ip_control_baseline(
+                    current,
+                    latest_baseline,
+                )
+            )
+            if latest_plan != plan:
+                raise EngineError(
+                    "Pwn IP-control baseline changed before registration"
+                )
+            current.artifacts.extend(copy.deepcopy(variant_artifacts))
+            current.experiments.append(copy.deepcopy(child))
+
+        try:
+            committed = self.store.update(
+                identity,
+                register,
+                expected_revision=state.revision,
+                commit_guard=verify_variants,
+                pre_replace_guard=verify_variants,
+            )
+        except BaseException:
+            canonical_ids: set[str] = set()
+            try:
+                canonical_ids = {
+                    artifact.id
+                    for artifact in self.store.load(
+                        identity,
+                        recover=False,
+                    ).artifacts
+                }
+            except BaseException:
+                # A state replacement may have completed across a hard
+                # interruption.  Preserve bounded files when uncertain.
+                raise
+            if not any(
+                artifact.id in canonical_ids
+                for artifact in variant_artifacts
+            ):
+                self._cleanup_uncommitted_artifacts(
+                    identity,
+                    variant_artifacts,
+                )
+            raise
+        return committed
+
+    @staticmethod
+    def _pwn_ip_control_transport_recipe(
+        inputs: _PwnIpControlCanonicalInputs,
+        artifact: ArtifactReference,
+        *,
+        run_id: str,
+    ) -> PwnRuntimeSnapshotRecipe:
+        baseline = inputs.disclosure.snapshot_recipe
+        return PwnRuntimeSnapshotRecipe(
+            configuration_epoch=baseline.configuration_epoch,
+            child_experiment_id=baseline.child_experiment_id,
+            parent_experiment_id=baseline.parent_experiment_id,
+            primary_elf_locator=baseline.primary_elf_locator,
+            source_manifest_sha256=baseline.source_manifest_sha256,
+            source_sha256=baseline.source_sha256,
+            source_size_bytes=baseline.source_size_bytes,
+            payload_artifact_id=artifact.id,
+            payload_source_run_id=run_id,
+            payload_artifact_locator=artifact.path,
+            payload_sha256=artifact.sha256,
+            payload_size_bytes=artifact.size,
+            parent_crash_recipe_sha256=(
+                baseline.parent_crash_recipe_sha256
+            ),
+            parent_crash_evaluation_sha256=(
+                baseline.parent_crash_evaluation_sha256
+            ),
+            expected_signal_number=baseline.expected_signal_number,
+            image_reference=baseline.image_reference,
+            image_digest=baseline.image_digest,
+            producer_file_sha256=baseline.producer_file_sha256,
+        )
+
+    def _execute_pwn_ip_control(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        *,
+        automated: bool,
+        live_only: bool,
+    ) -> ChallengeState:
+        """Run three pinned clean snapshot replays for full-width RIP control."""
+
+        current = self.store.load(identity)
+        self._require_model_work_allowed(current, automated=automated)
+        child = next(
+            (
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if child is None:
+            raise EngineError(f"unknown experiment: {experiment_id}")
+        inputs = self._pwn_ip_control_inputs_from_state(
+            current,
+            child,
+            required_status=ExperimentStatus.REGISTERED,
+        )
+
+        def mark_running(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            )
+            rebuilt = self._pwn_ip_control_inputs_from_state(
+                state,
+                item,
+                required_status=ExperimentStatus.REGISTERED,
+            )
+            if rebuilt.plan != inputs.plan:
+                raise EngineError(
+                    "Pwn IP-control plan changed before execution"
+                )
+            item.status = ExperimentStatus.RUNNING
+
+        running = self.store.update(
+            identity,
+            mark_running,
+            expected_revision=current.revision,
+        )
+        child = next(
+            item for item in running.experiments if item.id == experiment_id
+        )
+        inputs = self._pwn_ip_control_inputs_from_state(
+            running,
+            child,
+            required_status=ExperimentStatus.RUNNING,
+        )
+        workspace = self._workspace(running)
+        paths = self.store.challenge_paths(identity)
+        source_staging: tempfile.TemporaryDirectory[str] | None = None
+        input_staging: tempfile.TemporaryDirectory[str] | None = None
+        lease = None
+        pending_artifacts: list[ArtifactReference] = []
+        run_ids: list[str] = []
+        committed = False
+        started = time.monotonic()
+        replay_evidence: list[PwnIpControlReplayEvidence] = []
+        run_references: list[RunReference] = []
+        execution_receipts: list[ExecutionReceipt] = []
+        replay_artifacts: list[ArtifactReference] = []
+        plan_root = ensure_private_directory(
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-ip-control-{inputs.plan.recipe_sha256}"
+        )
+        source_run = next(
+            (
+                item
+                for item in running.runs
+                if item.id
+                == inputs.disclosure.crash_recipe.payload_source_run_id
+            ),
+            None,
+        )
+        if source_run is None:
+            raise EngineError(
+                "Pwn IP-control source Builder run is unavailable"
+            )
+        (
+            gate_deadline_monotonic,
+            _gate_deadline_epoch,
+        ) = self._budget_deadline_pair(
+            running,
+            child.timeout_seconds,
+        )
+
+        def receive_diagnostic_flag(detected: DetectedFlag) -> None:
+            if candidate_value_is_valid(detected.value):
+                # The primitive probe has no candidate/proof authority.
+                self._on_tool_flag(identity, detected)
+
+        flag_policy = resolve_flag_format(
+            running,
+            self.config.runtime.flag_patterns,
+        )
+        detector = FlagDetector(
+            flag_policy.patterns,
+            callback=receive_diagnostic_flag,
+        )
+        try:
+            (
+                source_staging,
+                challenge_root,
+                _source_snapshot,
+            ) = self._prepare_pwn_crash_source_snapshot(
+                running,
+                inputs.disclosure.snapshot_recipe,  # type: ignore[arg-type]
+            )
+            input_staging = tempfile.TemporaryDirectory(
+                prefix=".pwn-ip-control-input-",
+                dir=workspace,
+            )
+            input_root = Path(input_staging.name)
+            proof_inputs: list[ProofInput] = []
+            for ordinal, artifact in enumerate(
+                inputs.variant_artifacts,
+                start=1,
+            ):
+                snapshot = copy_bounded_regular(
+                    paths.root,
+                    artifact.path,
+                    input_root / f"payload-{ordinal}.bin",
+                    maximum_bytes=(
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+                    ),
+                    expected_sha256=artifact.sha256,
+                    expected_size=artifact.size,
+                    mode=0o400,
+                )
+                proof_inputs.append(
+                    ProofInput(
+                        source_locator=snapshot.path.relative_to(
+                            workspace
+                        ).as_posix(),
+                        destination_locator=(
+                            PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                        ),
+                        sha256=artifact.sha256,
+                        size_bytes=artifact.size,
+                    )
+                )
+            request = tool_profile(
+                child.resource_class,
+                needs_kvm=False,
+                network=False,
+            )
+            if request.network != 0:
+                raise EngineError("Pwn IP control must deny network")
+            lease = self.lease_broker.acquire(
+                request,
+                timeout=min(
+                    self._budget_wait_timeout(
+                        running,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    max(
+                        0.0,
+                        gate_deadline_monotonic - time.monotonic(),
+                    ),
+                ),
+                owner=f"{identity.key}:{experiment_id}:ip-control",
+            )
+            if lease is None:
+                raise EngineError(
+                    "Pwn IP-control resource lease unavailable"
+                )
+            client = self.sandbox(
+                running,
+                workspace_override=workspace,
+                challenge_dir_override=challenge_root,
+                network_policy_override=NetworkPolicy.deny_all(),
+            )
+
+            for ordinal, (variant, proof_input) in enumerate(
+                zip(
+                    inputs.variant_artifacts,
+                    proof_inputs,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    f"Pwn IP-control replay {ordinal}",
+                )
+                run_id = _run_id(f"pwn-ip-control-{ordinal}")
+                run_ids.append(run_id)
+                recipe = self._pwn_ip_control_transport_recipe(
+                    inputs,
+                    variant,
+                    run_id=run_id,
+                )
+                capability = self._probe_pwn_runtime_snapshot_capability(
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        gate_deadline_monotonic
+                    ),
+                )
+                capability_path = (
+                    plan_root
+                    / f"{ordinal:02d}-capability-attestation.json"
+                )
+                atomic_write_bytes(
+                    capability_path,
+                    capability.canonical_bytes(),
+                    mode=0o400,
+                )
+                capability_artifact = ArtifactReference(
+                    id=_record_id(
+                        "A",
+                        experiment_id,
+                        f"capability-{ordinal}",
+                    ),
+                    path=capability_path.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    sha256=capability.evidence_sha256,
+                    source_run_id=None,
+                    media_type="application/json",
+                    size=len(capability.canonical_bytes()),
+                    extra={
+                        "kind": (
+                            "pwn_ip_control_capability_attestation"
+                        ),
+                        "engine_executor": (
+                            _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                        ),
+                        "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                        "ordinal": ordinal,
+                        "transport_recipe_sha256": (
+                            recipe.recipe_sha256
+                        ),
+                    },
+                )
+                pending_artifacts.append(capability_artifact)
+                latest = self.store.load(identity)
+                command_timeout, command_deadline = (
+                    self._budget_command_limits(
+                        latest,
+                        child.timeout_seconds,
+                    )
+                )
+                command_deadline = min(
+                    command_deadline,
+                    gate_deadline_monotonic,
+                )
+                remaining = command_deadline - time.monotonic()
+                if remaining < 1:
+                    raise _HardDeadlineExpired(
+                        "Pwn IP control has less than one second to run"
+                    )
+                command_timeout = min(
+                    command_timeout,
+                    max(1, int(remaining)),
+                )
+                argv = recipe.argv()
+                execution_contract = {
+                    "schema_version": 1,
+                    "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+                    "protocol": _PWN_IP_CONTROL_PROTOCOL,
+                    "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                    "ordinal": ordinal,
+                    "baseline_experiment_id": (
+                        inputs.baseline_experiment_id
+                    ),
+                    "ip_control_experiment_id": experiment_id,
+                    "transport_recipe_sha256": recipe.recipe_sha256,
+                    "configuration_epoch": recipe.configuration_epoch,
+                    "source": {
+                        "locator": recipe.primary_elf_locator,
+                        "manifest_sha256": (
+                            recipe.source_manifest_sha256
+                        ),
+                        "sha256": recipe.source_sha256,
+                        "size_bytes": recipe.source_size_bytes,
+                    },
+                    "payload": {
+                        "artifact_id": recipe.payload_artifact_id,
+                        "source_run_id": recipe.payload_source_run_id,
+                        "sha256": recipe.payload_sha256,
+                        "size_bytes": recipe.payload_size_bytes,
+                        "destination_locator": (
+                            PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                        ),
+                    },
+                    "argv": list(argv),
+                    "sandbox": {
+                        "method": PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                        "one_shot": PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                        "outer_timeout_seconds": command_timeout,
+                        "resource_request": request.as_dict(),
+                        "image": {
+                            "reference": recipe.image_reference,
+                            "digest": recipe.image_digest,
+                        },
+                        "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                        "network_target": None,
+                    },
+                    "producer": {
+                        "interpreter_path": (
+                            PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH
+                        ),
+                        "path": PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+                        "capability_name": (
+                            PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                        ),
+                        "file_sha256": recipe.producer_file_sha256,
+                        "capability_attestation_artifact_id": (
+                            capability_artifact.id
+                        ),
+                        "capability_attestation_sha256": (
+                            capability_artifact.sha256
+                        ),
+                    },
+                }
+                execution_contract_sha256 = hashlib.sha256(
+                    _pwn_crash_canonical_bytes(execution_contract)
+                ).hexdigest()
+                run_paths = self.store.create_run(
+                    identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "pwn_ip_control_replay",
+                        "experiment_id": experiment_id,
+                        "execution_contract": execution_contract,
+                        "execution_contract_sha256": (
+                            execution_contract_sha256
+                        ),
+                    },
+                    base_revision=running.revision,
+                )
+                issued_request = read_json(run_paths.request)
+                if type(issued_request) is not dict:
+                    raise EngineError(
+                        "Pwn IP-control request is not canonical"
+                    )
+                request_sha256 = sha256_file(run_paths.request)
+                replay_started = time.monotonic()
+                sandbox_result = client.run_clean_proof(
+                    CommandSpec.create(
+                        argv,
+                        timeout_seconds=command_timeout,
+                        deadline_monotonic_seconds=command_deadline,
+                        environment={},
+                        network_target=None,
+                        resource_request=request,
+                    ),
+                    proof_inputs=(proof_input,),
+                )
+                artifact_records: dict[str, ArtifactReference] = {}
+                stream_payloads: dict[str, bytes] = {}
+                snapshot_failed: dict[str, bool] = {}
+                for stream, maximum_bytes in (
+                    (
+                        "stdout",
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+                    ),
+                    (
+                        "stderr",
+                        _PWN_RUNTIME_SNAPSHOT_STDERR_ARTIFACT_MAX_BYTES,
+                    ),
+                ):
+                    destination = (
+                        plan_root
+                        / f"{ordinal:02d}-{run_id}-{stream}.log"
+                    )
+                    snapshot = None
+                    try:
+                        snapshot = self._snapshot_pwn_crash_stream(
+                            latest,
+                            client,
+                            workspace=workspace,
+                            locator=getattr(
+                                sandbox_result,
+                                f"{stream}_path",
+                            ).removeprefix("/work/").lstrip("/"),
+                            destination=destination,
+                            maximum_bytes=maximum_bytes,
+                        )
+                    except (
+                        EngineError,
+                        SandboxError,
+                        OSError,
+                        ValueError,
+                    ):
+                        snapshot = None
+                    if snapshot is None:
+                        atomic_write_bytes(destination, b"", mode=0o400)
+                        stream_payload = b""
+                        stream_sha256 = hashlib.sha256(b"").hexdigest()
+                        stream_size = 0
+                        snapshot_failed[stream] = True
+                    else:
+                        stream_payload = snapshot.path.read_bytes()
+                        stream_sha256 = snapshot.sha256
+                        stream_size = snapshot.size_bytes
+                        snapshot_failed[stream] = False
+                    artifact = ArtifactReference(
+                        id=_record_id("A", run_id, stream),
+                        path=destination.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        sha256=stream_sha256,
+                        source_run_id=run_id,
+                        media_type=(
+                            "application/json"
+                            if stream == "stdout"
+                            else "text/plain"
+                        ),
+                        size=stream_size,
+                        extra={
+                            "stream": stream,
+                            "engine_executor": (
+                                _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                            ),
+                            "plan_recipe_sha256": (
+                                inputs.plan.recipe_sha256
+                            ),
+                            "ordinal": ordinal,
+                            "transport_recipe_sha256": (
+                                recipe.recipe_sha256
+                            ),
+                            "capture_placeholder": snapshot_failed[
+                                stream
+                            ],
+                        },
+                    )
+                    pending_artifacts.append(artifact)
+                    artifact_records[stream] = artifact
+                    stream_payloads[stream] = stream_payload
+                detector.feed(
+                    stream_payloads["stderr"][
+                        : self.config.runtime.flag_scan_max_bytes
+                    ].decode("utf-8", errors="replace"),
+                    source=f"tool:{run_id}:stderr",
+                )
+                timed_out = sandbox_result.timed_out
+                outcome = (
+                    "timed_out"
+                    if timed_out
+                    else "succeeded"
+                    if (
+                        sandbox_result.exit_code == 0
+                        and sandbox_result.orchestration_error is None
+                    )
+                    else "failed"
+                )
+                stdout_artifact = artifact_records["stdout"]
+                stderr_artifact = artifact_records["stderr"]
+                receipt_id = _record_id("RCPT", run_id, "result")
+                stdout_stored = (
+                    sandbox_result.stdout_stored_bytes
+                    if sandbox_result.stdout_stored_bytes is not None
+                    else stdout_artifact.size or 0
+                )
+                metadata = PwnRuntimeSnapshotReceiptMetadata(
+                    receipt_id=receipt_id,
+                    run_id=run_id,
+                    outcome=outcome,
+                    exit_code=sandbox_result.exit_code,
+                    timed_out=timed_out,
+                    clean_workspace=True,
+                    one_shot=PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                    sandbox_method=PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                    network=PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                    configuration_epoch=recipe.configuration_epoch,
+                    image_digest=recipe.image_digest,
+                    recipe_sha256=recipe.recipe_sha256,
+                    request_sha256=request_sha256,
+                    execution_contract_sha256=(
+                        execution_contract_sha256
+                    ),
+                    capability_attestation_artifact_id=(
+                        capability_artifact.id
+                    ),
+                    capability_attestation_sha256=(
+                        capability_artifact.sha256
+                    ),
+                    producer_capability_name=(
+                        PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                    ),
+                    producer_file_sha256=recipe.producer_file_sha256,
+                    stdout_artifact_id=stdout_artifact.id,
+                    stdout_artifact_sha256=stdout_artifact.sha256,
+                    stdout_artifact_size_bytes=stdout_artifact.size,
+                    stderr_artifact_id=stderr_artifact.id,
+                    stderr_artifact_sha256=stderr_artifact.sha256,
+                    stderr_artifact_size_bytes=stderr_artifact.size,
+                    stderr_capture_placeholder=snapshot_failed["stderr"],
+                    stdout_drained_bytes=sandbox_result.stdout_bytes,
+                    stdout_stored_bytes=stdout_stored,
+                    stdout_capture_complete=(
+                        sandbox_result.stdout_capture_complete
+                        and not snapshot_failed["stdout"]
+                    ),
+                    stdout_truncation_known=(
+                        sandbox_result.stdout_truncation_known
+                    ),
+                    stdout_truncated=sandbox_result.stdout_truncated,
+                    stdout_error=(
+                        "stdout_capture_error"
+                        if sandbox_result.stdout_error is not None
+                        else None
+                    ),
+                    stream_capture_error=(
+                        "stream_capture_error"
+                        if sandbox_result.stream_capture_error is not None
+                        or snapshot_failed["stdout"]
+                        else None
+                    ),
+                    orchestration_error=(
+                        "orchestration_error"
+                        if sandbox_result.orchestration_error is not None
+                        else None
+                    ),
+                    durable_stdout_artifact_complete=(
+                        not snapshot_failed["stdout"]
+                        and stdout_artifact.size
+                        == sandbox_result.stdout_bytes
+                        and stdout_artifact.size == stdout_stored
+                    ),
+                )
+                evaluation = evaluate_pwn_runtime_snapshot_gate(
+                    recipe,
+                    stdout_payload=stream_payloads["stdout"],
+                    receipt=metadata,
+                )
+                evaluation.canonical_bytes()
+                record = {
+                    "schema_version": 1,
+                    "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                    "ordinal": ordinal,
+                    "transport_recipe": recipe.to_dict(),
+                    "request_sha256": request_sha256,
+                    "execution_contract": copy.deepcopy(
+                        execution_contract
+                    ),
+                    "execution_contract_sha256": (
+                        execution_contract_sha256
+                    ),
+                    "receipt": metadata.to_dict(),
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.evidence_sha256,
+                }
+                replay_evidence.append(
+                    PwnIpControlReplayEvidence(
+                        ordinal=ordinal,
+                        payload=inputs.plan.payloads[ordinal - 1],
+                        recipe=recipe,
+                        evaluation=evaluation,
+                        receipt=metadata,
+                        stdout_payload=stream_payloads["stdout"],
+                    )
+                )
+                run_reference = RunReference(
+                    id=run_id,
+                    base_revision=int(issued_request["base_revision"]),
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if timed_out
+                        else RunStatus.COMPLETED
+                        if outcome == "succeeded"
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="pwn_ip_control",
+                    origin=RunOrigin.MANAGED_TOOL,
+                    session_id=source_run.session_id,
+                    cycle_id=source_run.cycle_id,
+                    wave_id=source_run.wave_id,
+                    configuration_epoch=recipe.configuration_epoch,
+                    extra={
+                        "experiment_id": experiment_id,
+                        "pwn_ip_control_replay": copy.deepcopy(record),
+                    },
+                )
+                execution_receipt = ExecutionReceipt(
+                    id=receipt_id,
+                    experiment_id=experiment_id,
+                    run_id=run_id,
+                    outcome=(
+                        ReceiptOutcome.TIMED_OUT
+                        if timed_out
+                        else ReceiptOutcome.SUCCEEDED
+                        if outcome == "succeeded"
+                        else ReceiptOutcome.FAILED
+                    ),
+                    exit_code=sandbox_result.exit_code,
+                    wall_seconds=(
+                        time.monotonic() - replay_started
+                    ),
+                    stdout_artifact_id=stdout_artifact.id,
+                    stderr_artifact_id=stderr_artifact.id,
+                    stdout_bytes=sandbox_result.stdout_bytes,
+                    stderr_bytes=sandbox_result.stderr_bytes,
+                    stdout_lines=0,
+                    stderr_lines=0,
+                    preview=(
+                        f"Pwn IP control replay {ordinal} "
+                        f"{evaluation.status.value}:"
+                        f"{evaluation.reason_code}"
+                    )[:160],
+                    extra={
+                        "pwn_ip_control_replay": copy.deepcopy(record)
+                    },
+                )
+                self.store.write_run_result(
+                    identity,
+                    None,
+                    None,
+                    run_id,
+                    {
+                        "status": sandbox_result.status,
+                        "exit_code": sandbox_result.exit_code,
+                        "timed_out": sandbox_result.timed_out,
+                        "duration_ms": sandbox_result.duration_ms,
+                        "pwn_ip_control_replay": copy.deepcopy(record),
+                        "artifacts": [
+                            stdout_artifact.to_dict(),
+                            stderr_artifact.to_dict(),
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    {
+                        "ok": evaluation.transport_error is None,
+                        "pwn_ip_control_replay": copy.deepcopy(record),
+                        "errors": (
+                            []
+                            if evaluation.transport_error is None
+                            else [evaluation.transport_error.code]
+                        ),
+                    },
+                )
+                run_references.append(run_reference)
+                execution_receipts.append(execution_receipt)
+                replay_artifacts.extend(
+                    (
+                        capability_artifact,
+                        stdout_artifact,
+                        stderr_artifact,
+                    )
+                )
+
+            result = evaluate_pwn_ip_control(
+                parent_crash_recipe=inputs.disclosure.crash_recipe,
+                parent_crash_evaluation=(
+                    inputs.disclosure.crash_evaluation
+                ),
+                baseline=inputs.baseline_evidence,
+                replays=tuple(replay_evidence),
+            )
+            result_bytes = result.canonical_bytes()
+            result_path = plan_root / "result.json"
+            atomic_write_bytes(result_path, result_bytes, mode=0o400)
+            result_artifact = ArtifactReference(
+                id=_record_id("A", experiment_id, "result"),
+                path=result_path.relative_to(paths.root).as_posix(),
+                sha256=result.evidence_sha256,
+                source_run_id=None,
+                media_type="application/json",
+                size=len(result_bytes),
+                extra={
+                    "kind": "pwn_ip_control_result",
+                    "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+                    "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                    "result_sha256": result.evidence_sha256,
+                },
+            )
+            pending_artifacts.append(result_artifact)
+            evaluated_at = utc_now()
+            result_envelope = {
+                "schema_version": 1,
+                "baseline_experiment_id": inputs.baseline_experiment_id,
+                "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                "evaluated_at": evaluated_at,
+                "result": result.to_dict(),
+                "result_sha256": result.evidence_sha256,
+                "run_ids": list(run_ids),
+                "receipt_ids": [
+                    item.id for item in execution_receipts
+                ],
+                "result_artifact_id": result_artifact.id,
+            }
+
+            def verify_result() -> None:
+                if (
+                    read_bounded_regular(
+                        paths.root,
+                        result_artifact.path,
+                        maximum_bytes=len(result_bytes),
+                        expected_sha256=result_artifact.sha256,
+                        expected_size=result_artifact.size,
+                    )
+                    != result_bytes
+                ):
+                    raise EngineError(
+                        "Pwn IP-control result changed before commit"
+                    )
+
+            def finish(state: ChallengeState) -> None:
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    "Pwn IP-control canonical state reduction",
+                )
+                item = next(
+                    value
+                    for value in state.experiments
+                    if value.id == experiment_id
+                )
+                rebuilt = self._pwn_ip_control_inputs_from_state(
+                    state,
+                    item,
+                    required_status=ExperimentStatus.RUNNING,
+                )
+                if rebuilt.plan != inputs.plan:
+                    raise EngineError(
+                        "Pwn IP-control inputs changed before commit"
+                    )
+                item.status = ExperimentStatus.COMPLETED
+                item.result = {
+                    _PWN_IP_CONTROL_RESULT_KEY: copy.deepcopy(
+                        result_envelope
+                    )
+                }
+                item.evidence_run_ids = list(run_ids)
+                item.evidence_receipt_ids = [
+                    value.id for value in execution_receipts
+                ]
+                item.artifact_ids = [
+                    *[value.id for value in inputs.variant_artifacts],
+                    *[value.id for value in replay_artifacts],
+                    result_artifact.id,
+                ]
+                state.runs.extend(copy.deepcopy(run_references))
+                state.receipts.extend(
+                    copy.deepcopy(execution_receipts)
+                )
+                state.artifacts.extend(
+                    copy.deepcopy(
+                        [*replay_artifacts, result_artifact]
+                    )
+                )
+                if result.instruction_pointer_control_proven:
+                    offset = result.controlled_offset
+                    if offset is None:
+                        raise EngineError(
+                            "proven Pwn IP-control result lacks an offset"
+                        )
+                    fact_id = _record_id(
+                        "F",
+                        experiment_id,
+                        "instruction-pointer-control",
+                    )
+                    progress_id = _record_id(
+                        "P",
+                        experiment_id,
+                        "instruction-pointer-control",
+                    )
+                    binding = {
+                        "experiment_id": experiment_id,
+                        "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                        "result_sha256": result.evidence_sha256,
+                        "controlled_offset": offset,
+                        "controlled_width_bytes": (
+                            PWN_IP_CONTROL_WIDTH_BYTES
+                        ),
+                    }
+                    statement = (
+                        "Engine-owned metamorphic replays proved full-width "
+                        "x86_64 instruction-pointer control at payload "
+                        f"offset {offset}."
+                    )
+                    state.facts.append(
+                        Fact(
+                            id=fact_id,
+                            statement=statement,
+                            provenance=Provenance.EXECUTED,
+                            challenge_id=state.challenge_id,
+                            source_run_id=run_ids[-1],
+                            artifact_id=result_artifact.id,
+                            locator=result_artifact.path,
+                            extra={
+                                "pwn_ip_control": copy.deepcopy(
+                                    binding
+                                )
+                            },
+                        )
+                    )
+                    item.evidence_fact_ids = [fact_id]
+                    state.progress_markers.append(
+                        ProgressMarker(
+                            id=progress_id,
+                            statement=(
+                                "Full-width x86_64 instruction-pointer "
+                                "control reproduced in three clean replays"
+                            ),
+                            run_id=run_ids[-1],
+                            artifact_ids=[result_artifact.id],
+                            extra={
+                                "pwn_ip_control": copy.deepcopy(
+                                    binding
+                                )
+                            },
+                        )
+                    )
+                state.budget.spent_seconds += max(
+                    0,
+                    int(time.monotonic() - started),
+                )
+
+            self.store.update(
+                identity,
+                finish,
+                expected_revision=running.revision,
+                commit_guard=verify_result,
+                pre_replace_guard=verify_result,
+            )
+            committed = True
+            return self.store.load(identity, recover=False)
+        finally:
+            if lease is not None and not lease.released:
+                lease.release()
+            if input_staging is not None:
+                input_staging.cleanup()
+            if source_staging is not None:
+                source_staging.cleanup()
+            if not committed:
+                cleanup_is_safe = True
+                try:
+                    canonical = self.store.load(
+                        identity,
+                        recover=False,
+                    )
+                    canonical_runs = {item.id for item in canonical.runs}
+                    canonical_artifacts = {
+                        item.id for item in canonical.artifacts
+                    }
+                    if (
+                        any(item in canonical_runs for item in run_ids)
+                        or any(
+                            item.id in canonical_artifacts
+                            for item in pending_artifacts
+                        )
+                    ):
+                        cleanup_is_safe = False
+                except BaseException:
+                    cleanup_is_safe = False
+                if cleanup_is_safe:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        pending_artifacts,
+                    )
+                    self._cleanup_uncommitted_pwn_crash_runs(
+                        identity,
+                        tuple(run_ids),
+                    )
+
     def _pwn_runtime_snapshot_child_for_confirmed_crash(
         self,
         parent: Experiment,
@@ -12783,6 +14089,10 @@ class ChallengeEngine:
             state = self._advance_pwn_runtime_snapshot_disclosures(
                 identity
             )
+            state = self._register_pwn_ip_control_child_if_applicable(
+                identity,
+                state,
+            )
         if (
             _automated
             and state.status in _AUTOMATED_LOOP_STOP_STATUSES
@@ -12908,6 +14218,50 @@ class ChallengeEngine:
             )
             self._remaining_budget_seconds(latest_before_start)
             first_new_flag = len(detected_flags)
+            if (
+                experiment.command == _PWN_IP_CONTROL_ENGINE_COMMAND
+                or experiment.extra.get("engine_executor")
+                == _PWN_IP_CONTROL_ENGINE_EXECUTOR
+            ):
+                try:
+                    state = self._execute_pwn_ip_control(
+                        identity,
+                        experiment.id,
+                        automated=_automated,
+                        live_only=_live_only,
+                    )
+                except Exception as error:
+                    latest_after_error = self.store.load(
+                        identity,
+                        recover=False,
+                    )
+                    current_item = next(
+                        item
+                        for item in latest_after_error.experiments
+                        if item.id == experiment.id
+                    )
+                    if current_item.status in {
+                        ExperimentStatus.REGISTERED,
+                        ExperimentStatus.RUNNING,
+                    }:
+                        state = self._finish_tool_failure(
+                            identity,
+                            experiment.id,
+                            (
+                                "Pwn IP control failed closed: "
+                                f"{error}"
+                            ),
+                            _live_only=_live_only,
+                        )
+                    else:
+                        state = latest_after_error
+                        print(
+                            "warning: Pwn IP control raised after "
+                            f"terminal commit: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                continue
             if (
                 experiment.command
                 == _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
@@ -17881,6 +19235,984 @@ class ChallengeEngine:
                 )
             raise
 
+    def prove_crypto_metamorphic_candidate(
+        self,
+        identity: ChallengeIdentity,
+        candidate_id: str,
+        *,
+        solver_locator: str,
+        original_parameters_locator: str,
+        variant_parameters_locator: str,
+        variant_expected_output_locator: str,
+        mutation_id: str,
+        runtime: str = "python",
+    ) -> tuple[ChallengeState, ProofResult]:
+        """Run one pinned Crypto solver in the mandatory clean 3+3 matrix.
+
+        This is an explicit, local operator hot path: the operator is the
+        authority supplying the changed parameters and their independently
+        expected output.  Managed models cannot invoke it while a session owns
+        the challenge lock.  It never selects a challenge, enables a target,
+        or submits a candidate.  The solver receives exactly one canonical
+        JSON file path and must write the exact result bytes to stdout without
+        diagnostics.  Stderr remains preserved as bounded evidence.
+        """
+
+        if runtime not in {"python", "sage"}:
+            raise EngineError("Crypto proof runtime must be python or sage")
+        locators = (
+            solver_locator,
+            original_parameters_locator,
+            variant_parameters_locator,
+            variant_expected_output_locator,
+        )
+        if len(set(locators)) != len(locators):
+            raise EngineError("Crypto proof locators must be unique")
+
+        paths = self.store.challenge_paths(identity)
+        try:
+            session_lock = ChallengeLock(
+                paths.runtime / "session.lock",
+                timeout=0,
+            ).acquire()
+        except LockTimeout as error:
+            raise SessionAlreadyRunning(
+                f"another session already owns {identity.key}"
+            ) from error
+
+        preparation: _ProofInputPreparation | None = None
+        input_artifacts: tuple[ArtifactReference, ...] = ()
+        evaluation_artifact: ArtifactReference | None = None
+        finalized = False
+        try:
+            self._recover_session_boundary(identity)
+            state = self.refresh_ingest(identity)
+            if get_adapter(state.category).name != "crypto":
+                raise EngineError(
+                    "Crypto metamorphic proof requires a Crypto challenge"
+                )
+            if state.schema_version < STATE_SCHEMA_VERSION:
+                raise EngineError(
+                    "Crypto metamorphic proof requires the current state "
+                    "schema"
+                )
+            if state.primary_target_id is not None:
+                raise EngineError(
+                    "Crypto metamorphic proof is local and network-denied"
+                )
+            if state.status in {
+                ChallengeStatus.NEW,
+                ChallengeStatus.PAUSED,
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+                ChallengeStatus.PROVING,
+                ChallengeStatus.READY_TO_SUBMIT,
+            }:
+                raise EngineError(
+                    "Crypto proof cannot start in "
+                    f"{state.status.value}"
+                )
+            candidate = next(
+                (
+                    item
+                    for item in state.candidates
+                    if item.id == candidate_id
+                ),
+                None,
+            )
+            if candidate is None:
+                raise EngineError(f"unknown candidate: {candidate_id}")
+            if candidate.status in {
+                CandidateStatus.REJECTED,
+                CandidateStatus.ACCEPTED,
+                CandidateStatus.READY_TO_SUBMIT,
+            }:
+                raise EngineError(
+                    "Crypto proof cannot replace a terminal candidate outcome"
+                )
+            manifest = state.metadata.get("source_manifest_sha256")
+            if not isinstance(manifest, str) or len(manifest) != 64:
+                raise EngineError("source manifest is unavailable")
+            image_reference = self.config.runtime.image_digest
+            if (
+                not isinstance(image_reference, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_reference)
+                is None
+            ):
+                raise EngineError(
+                    "Crypto metamorphic proof requires a digest-pinned image"
+                )
+            configuration_epoch = state.configuration_epoch
+            client = self.sandbox(state)
+            evaluation_id = _run_id("crypto-metamorphic")
+            result_directory = (
+                paths.proof / candidate_id / evaluation_id
+            )
+            preparation = self._prepare_proof_inputs(
+                state,
+                client,
+                locators,
+                result_directory,
+                evaluation_id,
+                input_destinations=(
+                    "oracle/solver-source",
+                    "oracle/original-parameters-source.json",
+                    "oracle/variant-parameters-source.json",
+                    "oracle/variant-expected-output-source.bin",
+                ),
+            )
+            entries = preparation.manifest["inputs"]
+            if not isinstance(entries, list) or len(entries) != 4:
+                raise EngineError(
+                    "Crypto proof input manifest is incomplete"
+                )
+            snapshots = tuple(
+                (
+                    paths.root / str(entry["snapshot_path"]),
+                    str(entry["sha256"]),
+                    int(entry["size_bytes"]),
+                )
+                for entry in entries
+            )
+            input_artifacts = tuple(
+                ArtifactReference(
+                    id=_record_id(
+                        "A",
+                        evaluation_id,
+                        f"input-{index:02d}",
+                    ),
+                    path=str(entry["snapshot_path"]),
+                    sha256=str(entry["sha256"]),
+                    size=int(entry["size_bytes"]),
+                    extra={
+                        "kind": "crypto_metamorphic_input",
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "purpose": purpose,
+                        "source_locator": str(entry["locator"]),
+                        "context_visibility": (
+                            "engine_private"
+                            if purpose == "variant_expected_output"
+                            else "model_visible"
+                        ),
+                    },
+                )
+                for index, (entry, purpose) in enumerate(
+                    zip(
+                        entries,
+                        (
+                            "solver",
+                            "original_parameters",
+                            "variant_parameters",
+                            "variant_expected_output",
+                        ),
+                        strict=True,
+                    ),
+                    start=1,
+                )
+            ) + (
+                ArtifactReference(
+                    id=_record_id(
+                        "A",
+                        evaluation_id,
+                        "input-manifest",
+                    ),
+                    path=preparation.manifest_path.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    sha256=preparation.manifest_sha256,
+                    size=preparation.manifest_path.stat().st_size,
+                    extra={
+                        "kind": "crypto_metamorphic_input_manifest",
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "context_visibility": "engine_private",
+                    },
+                ),
+            )
+            solver_bytes = read_bounded_regular(
+                paths.root,
+                snapshots[0][0].relative_to(paths.root).as_posix(),
+                maximum_bytes=min(
+                    DEFAULT_SNAPSHOT_MAX_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=snapshots[0][1],
+                expected_size=snapshots[0][2],
+            )
+            if candidate.value.encode("utf-8") in solver_bytes:
+                raise EngineError(
+                    "Crypto solver source embeds the exact candidate bytes"
+                )
+            original_parameters = read_bounded_regular(
+                paths.root,
+                snapshots[1][0].relative_to(paths.root).as_posix(),
+                maximum_bytes=min(
+                    DEFAULT_SNAPSHOT_MAX_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=snapshots[1][1],
+                expected_size=snapshots[1][2],
+            )
+            variant_parameters = read_bounded_regular(
+                paths.root,
+                snapshots[2][0].relative_to(paths.root).as_posix(),
+                maximum_bytes=min(
+                    DEFAULT_SNAPSHOT_MAX_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=snapshots[2][1],
+                expected_size=snapshots[2][2],
+            )
+            variant_expected_output = read_bounded_regular(
+                paths.root,
+                snapshots[3][0].relative_to(paths.root).as_posix(),
+                maximum_bytes=min(
+                    CRYPTO_METAMORPHIC_MAX_RESULT_BYTES,
+                    self.store.max_artifact_bytes,
+                ),
+                expected_sha256=snapshots[3][1],
+                expected_size=snapshots[3][2],
+            )
+            plan = build_crypto_metamorphic_plan(
+                candidate.value,
+                original_parameters,
+                variant_parameters,
+                variant_expected_output,
+                mutation_id=mutation_id,
+            )
+            if (
+                original_parameters != plan.cases[0].parameters
+                or variant_parameters != plan.cases[1].parameters
+            ):
+                raise EngineError(
+                    "Crypto parameter inputs must be canonical JSON records"
+                )
+            runtime_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "image_reference": image_reference,
+                        "runtime": runtime,
+                        "solver_sha256": snapshots[0][1],
+                    },
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ).hexdigest()
+            solver_destination = (
+                "oracle/solver.py"
+                if runtime == "python"
+                else "oracle/solver.sage"
+            )
+            runner_argv = (
+                (
+                    "python3",
+                    f"/work/{solver_destination}",
+                    "/work/oracle/parameters.json",
+                )
+                if runtime == "python"
+                else (
+                    "sage",
+                    f"/work/{solver_destination}",
+                    "/work/oracle/parameters.json",
+                )
+            )
+            solver_input = ProofInput(
+                source_locator=(
+                    preparation.prepared_inputs[0].source_locator
+                ),
+                destination_locator=solver_destination,
+                sha256=snapshots[0][1],
+                size_bytes=snapshots[0][2],
+            )
+            case_inputs = {
+                "original": ProofInput(
+                    source_locator=(
+                        preparation.prepared_inputs[1].source_locator
+                    ),
+                    destination_locator="oracle/parameters.json",
+                    sha256=plan.cases[0].parameters_sha256,
+                    size_bytes=len(plan.cases[0].parameters),
+                ),
+                "metamorphic-variant": ProofInput(
+                    source_locator=(
+                        preparation.prepared_inputs[2].source_locator
+                    ),
+                    destination_locator="oracle/parameters.json",
+                    sha256=plan.cases[1].parameters_sha256,
+                    size_bytes=len(plan.cases[1].parameters),
+                ),
+            }
+            input_base = self.store.load(identity)
+
+            def register_crypto_proof_inputs(
+                latest: ChallengeState,
+            ) -> None:
+                latest_candidate = next(
+                    (
+                        item
+                        for item in latest.candidates
+                        if item.id == candidate_id
+                    ),
+                    None,
+                )
+                if (
+                    get_adapter(latest.category).name != "crypto"
+                    or latest.configuration_epoch != configuration_epoch
+                    or latest.metadata.get("source_manifest_sha256")
+                    != manifest
+                    or latest_candidate is None
+                    or latest_candidate.status
+                    in {
+                        CandidateStatus.REJECTED,
+                        CandidateStatus.ACCEPTED,
+                        CandidateStatus.READY_TO_SUBMIT,
+                    }
+                ):
+                    raise EngineError(
+                        "Crypto proof binding changed before input commit"
+                    )
+                latest.artifacts.extend(input_artifacts)
+
+            try:
+                self.store.update(
+                    identity,
+                    register_crypto_proof_inputs,
+                    expected_revision=input_base.revision,
+                )
+            except BaseException as input_update_error:
+                self._handle_proof_interruption(
+                    identity,
+                    input_artifacts,
+                    input_update_error,
+                )
+                input_artifacts = ()
+                raise
+            observations: list[CryptoMetamorphicObservation] = []
+            for planned in plan.attempts:
+                current = self.store.load(identity)
+                current_candidate = next(
+                    (
+                        item
+                        for item in current.candidates
+                        if item.id == candidate_id
+                    ),
+                    None,
+                )
+                if (
+                    get_adapter(current.category).name != "crypto"
+                    or current.configuration_epoch != configuration_epoch
+                    or current.metadata.get("source_manifest_sha256")
+                    != manifest
+                    or current_candidate is None
+                    or current_candidate.status
+                    in {
+                        CandidateStatus.REJECTED,
+                        CandidateStatus.ACCEPTED,
+                        CandidateStatus.READY_TO_SUBMIT,
+                    }
+                    or current.status
+                    in {
+                        ChallengeStatus.PAUSED,
+                        ChallengeStatus.SOLVED,
+                        ChallengeStatus.ABANDONED,
+                        ChallengeStatus.PROVING,
+                        ChallengeStatus.READY_TO_SUBMIT,
+                    }
+                ):
+                    raise EngineError(
+                        "Crypto proof state or configuration changed during "
+                        "the six-run matrix"
+                    )
+                self._remaining_budget_seconds(current)
+                run_id = _run_id(
+                    f"crypto-proof-{candidate_id}-{planned.ordinal}"
+                )
+                run_paths = self.store.create_run(
+                    identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "crypto_metamorphic_proof",
+                        "candidate_id": candidate_id,
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "plan_sha256": plan.sha256,
+                        "attempt": planned.to_dict(),
+                        "command": list(runner_argv),
+                        "network_target": None,
+                        "source_manifest_sha256": manifest,
+                        "solver_sha256": snapshots[0][1],
+                        "runtime_fingerprint_sha256": (
+                            runtime_fingerprint
+                        ),
+                        "oracle_artifact_sha256": snapshots[3][1],
+                        "configuration_epoch": configuration_epoch,
+                        "image_reference": image_reference,
+                    },
+                    base_revision=current.revision,
+                )
+                lease_request = tool_profile("standard", network=False)
+                lease = self.lease_broker.acquire(
+                    lease_request,
+                    timeout=self._budget_wait_timeout(
+                        current,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    owner=(
+                        f"{identity.key}:crypto-proof:{candidate_id}"
+                    ),
+                )
+                if lease is None:
+                    raise EngineError(
+                        "timed out waiting for Crypto proof sandbox resources"
+                    )
+                sandbox_failure: BaseException | None = None
+                try:
+                    timeout, deadline = self._budget_command_limits(
+                        current,
+                        self.config.runtime.command_timeout_s,
+                    )
+                    sandbox_result = client.run_clean_proof(
+                        CommandSpec.create(
+                            runner_argv,
+                            timeout_seconds=timeout,
+                            deadline_monotonic_seconds=deadline,
+                            network_target=None,
+                            resource_request=lease_request,
+                        ),
+                        proof_inputs=(
+                            solver_input,
+                            case_inputs[planned.case_id],
+                        ),
+                    )
+                except BaseException as error:
+                    sandbox_failure = error
+                finally:
+                    lease.release()
+                if sandbox_failure is not None:
+                    failure_status = (
+                        RunStatus.FAILED
+                        if isinstance(sandbox_failure, Exception)
+                        else RunStatus.INTERRUPTED
+                    )
+                    failure_payload = {
+                        "status": failure_status.value,
+                        "error": "crypto_proof_sandbox_execution_failed",
+                        "error_type": type(sandbox_failure).__name__[:128],
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "plan_sha256": plan.sha256,
+                        "attempt_ordinal": planned.ordinal,
+                    }
+                    try:
+                        self.store.write_run_result(
+                            identity,
+                            run_id,
+                            failure_payload,
+                        )
+                        self.store.write_run_validation(
+                            identity,
+                            run_id,
+                            {
+                                "ok": False,
+                                **failure_payload,
+                            },
+                        )
+                        failure_reference = RunReference(
+                            id=run_id,
+                            base_revision=current.revision,
+                            status=failure_status,
+                            request_path=run_paths.request.relative_to(
+                                paths.root
+                            ).as_posix(),
+                            result_path=run_paths.result.relative_to(
+                                paths.root
+                            ).as_posix(),
+                            validation_path=(
+                                run_paths.validation.relative_to(
+                                    paths.root
+                                ).as_posix()
+                            ),
+                            role="crypto_metamorphic_proof",
+                            origin=RunOrigin.PROOF,
+                            configuration_epoch=configuration_epoch,
+                            extra={
+                                "crypto_metamorphic_protocol": (
+                                    CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                                ),
+                                "plan_sha256": plan.sha256,
+                                "attempt_ordinal": planned.ordinal,
+                                "execution_error": failure_payload[
+                                    "error"
+                                ],
+                                "execution_error_type": failure_payload[
+                                    "error_type"
+                                ],
+                            },
+                        )
+                        failure_base = self.store.load(identity)
+
+                        def commit_crypto_sandbox_failure(
+                            latest: ChallengeState,
+                        ) -> None:
+                            latest_candidate = next(
+                                (
+                                    item
+                                    for item in latest.candidates
+                                    if item.id == candidate_id
+                                ),
+                                None,
+                            )
+                            if (
+                                latest.configuration_epoch
+                                != configuration_epoch
+                                or latest.metadata.get(
+                                    "source_manifest_sha256"
+                                )
+                                != manifest
+                                or latest_candidate is None
+                            ):
+                                raise EngineError(
+                                    "Crypto failure binding changed before "
+                                    "terminal commit"
+                                )
+                            latest.runs.append(failure_reference)
+                            latest_candidate.proof_run_ids.append(run_id)
+
+                        self.store.update(
+                            identity,
+                            commit_crypto_sandbox_failure,
+                            expected_revision=failure_base.revision,
+                        )
+                    except BaseException as terminalization_error:
+                        sandbox_failure.add_note(
+                            "Crypto proof sandbox failure could not be "
+                            "terminalized: "
+                            f"{type(terminalization_error).__name__}"
+                        )
+                    raise sandbox_failure
+
+                evidence_directory = ensure_private_directory(
+                    result_directory / "evidence" / run_id
+                )
+                stream_artifacts: list[ArtifactReference] = []
+                stream_snapshots: dict[str, ImmutableFile] = {}
+                try:
+                    for stream, locator in (
+                        ("stdout", sandbox_result.stdout_path),
+                        ("stderr", sandbox_result.stderr_path),
+                    ):
+                        relative_locator = locator.removeprefix(
+                            "/work/"
+                        ).lstrip("/")
+                        snapshot = self._snapshot_workspace_file(
+                            current,
+                            client,
+                            relative_locator,
+                            evidence_directory / f"{stream}.log",
+                        )
+                        stream_snapshots[stream] = snapshot
+                        stream_artifacts.append(
+                            ArtifactReference(
+                                id=_record_id("A", run_id, stream),
+                                path=snapshot.path.relative_to(
+                                    paths.root
+                                ).as_posix(),
+                                sha256=snapshot.sha256,
+                                size=snapshot.size_bytes,
+                                source_run_id=run_id,
+                                extra={
+                                    "kind": "crypto_metamorphic_stream",
+                                    "stream": stream,
+                                    "protocol": (
+                                        CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                                    ),
+                                    "attempt_ordinal": planned.ordinal,
+                                    "plan_sha256": plan.sha256,
+                                },
+                            )
+                        )
+                except BaseException as snapshot_error:
+                    self._handle_proof_interruption(
+                        identity,
+                        tuple(stream_artifacts),
+                        snapshot_error,
+                    )
+                    raise
+                stdout = stream_snapshots["stdout"]
+                stderr = stream_snapshots["stderr"]
+                complete_capture = (
+                    sandbox_result.stdout_capture_complete is True
+                    and sandbox_result.stderr_capture_complete is True
+                    and sandbox_result.stdout_truncation_known is True
+                    and sandbox_result.stderr_truncation_known is True
+                    and sandbox_result.stdout_truncated is False
+                    and sandbox_result.stderr_truncated is False
+                    and sandbox_result.stdout_stored_bytes
+                    == stdout.size_bytes
+                    and sandbox_result.stderr_stored_bytes
+                    == stderr.size_bytes
+                    and sandbox_result.stdout_bytes == stdout.size_bytes
+                    and sandbox_result.stderr_bytes == stderr.size_bytes
+                    and sandbox_result.stream_capture_error is None
+                    and sandbox_result.stdout_error is None
+                    and sandbox_result.stderr_error is None
+                )
+                capture_error = (
+                    None
+                    if complete_capture
+                    else "incomplete_stream_capture"
+                )
+                observation = CryptoMetamorphicObservation(
+                    run_id=run_id,
+                    ordinal=planned.ordinal,
+                    case_id=planned.case_id,
+                    mutation_id=planned.mutation_id,
+                    parameters_sha256=planned.parameters_sha256,
+                    parameters_size_bytes=planned.parameters_size_bytes,
+                    source_manifest_sha256=manifest,
+                    solver_artifact_sha256=snapshots[0][1],
+                    runtime_fingerprint_sha256=runtime_fingerprint,
+                    oracle_artifact_sha256=snapshots[3][1],
+                    clean_workspace=True,
+                    target_exit_code=sandbox_result.exit_code,
+                    runner_exit_code=sandbox_result.exit_code,
+                    ctfwrap_exit_code=sandbox_result.exit_code,
+                    timed_out=sandbox_result.timed_out,
+                    orchestration_status=(
+                        "completed"
+                        if sandbox_result.status == "completed"
+                        and sandbox_result.orchestration_error is None
+                        else "failed"
+                    ),
+                    result_artifact_id=stream_artifacts[0].id,
+                    result_artifact_sha256=stdout.sha256,
+                    result_artifact_size_bytes=stdout.size_bytes,
+                    capture_complete=complete_capture,
+                    truncation_known=(
+                        sandbox_result.stdout_truncation_known is True
+                        and sandbox_result.stderr_truncation_known is True
+                    ),
+                    truncated=(
+                        False
+                        if sandbox_result.stdout_truncated is False
+                        and sandbox_result.stderr_truncated is False
+                        else True
+                    ),
+                    capture_error=capture_error,
+                )
+                observations.append(observation)
+                structural_success = (
+                    sandbox_result.exit_code == 0
+                    and not sandbox_result.timed_out
+                    and complete_capture
+                )
+                self.store.write_run_result(
+                    identity,
+                    run_id,
+                    {
+                        "status": sandbox_result.status,
+                        "exit_code": sandbox_result.exit_code,
+                        "timed_out": sandbox_result.timed_out,
+                        "duration_ms": sandbox_result.duration_ms,
+                        "observation": observation.to_dict(),
+                        "artifacts": [
+                            item.to_dict() for item in stream_artifacts
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    {
+                        "ok": structural_success,
+                        "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                        "plan_sha256": plan.sha256,
+                        "attempt_ordinal": planned.ordinal,
+                    },
+                )
+                run_reference = RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if sandbox_result.timed_out
+                        else RunStatus.COMPLETED
+                        if sandbox_result.exit_code == 0
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="crypto_metamorphic_proof",
+                    origin=RunOrigin.PROOF,
+                    configuration_epoch=configuration_epoch,
+                    extra={
+                        "crypto_metamorphic_protocol": (
+                            CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                        ),
+                        "plan_sha256": plan.sha256,
+                        "attempt_ordinal": planned.ordinal,
+                        "observation": observation.to_dict(),
+                    },
+                )
+
+                def commit_attempt(latest: ChallengeState) -> None:
+                    latest_candidate = next(
+                        (
+                            item
+                            for item in latest.candidates
+                            if item.id == candidate_id
+                        ),
+                        None,
+                    )
+                    if (
+                        latest.configuration_epoch != configuration_epoch
+                        or latest.metadata.get(
+                            "source_manifest_sha256"
+                        )
+                        != manifest
+                        or latest_candidate is None
+                        or latest_candidate.status
+                        in {
+                            CandidateStatus.REJECTED,
+                            CandidateStatus.ACCEPTED,
+                            CandidateStatus.READY_TO_SUBMIT,
+                        }
+                    ):
+                        raise EngineError(
+                            "Crypto proof binding changed before attempt commit"
+                        )
+                    latest.runs.append(run_reference)
+                    latest.artifacts.extend(stream_artifacts)
+                    latest_candidate.proof_run_ids.append(run_id)
+
+                try:
+                    self.store.update(
+                        identity,
+                        commit_attempt,
+                        expected_revision=current.revision,
+                    )
+                except BaseException as update_error:
+                    self._handle_proof_interruption(
+                        identity,
+                        tuple(stream_artifacts),
+                        update_error,
+                    )
+                    raise
+
+            latest_inventory = inventory_challenge(
+                self.challenge_input(identity)
+            )
+            evaluated_observations = tuple(observations)
+            if latest_inventory.manifest_sha256 != manifest:
+                evaluated_observations = tuple(
+                    replace(
+                        item,
+                        source_manifest_sha256="0" * 64,
+                    )
+                    for item in observations
+                )
+            proof_result, evaluation = (
+                evaluate_crypto_metamorphic_proof(
+                    candidate.value,
+                    original_parameters,
+                    variant_parameters,
+                    variant_expected_output,
+                    mutation_id=mutation_id,
+                    source_manifest_sha256=manifest,
+                    solver_artifact_sha256=snapshots[0][1],
+                    runtime_fingerprint_sha256=runtime_fingerprint,
+                    oracle_artifact_sha256=snapshots[3][1],
+                    observations=evaluated_observations,
+                )
+            )
+            evaluation_path = result_directory / "evaluation.json"
+            atomic_write_json(
+                evaluation_path,
+                evaluation.to_dict(),
+                mode=0o400,
+            )
+            evaluation_artifact = ArtifactReference(
+                id=_record_id("A", evaluation_id, "evaluation"),
+                path=evaluation_path.relative_to(paths.root).as_posix(),
+                sha256=sha256_file(evaluation_path),
+                size=evaluation_path.stat().st_size,
+                extra={
+                    "kind": "crypto_metamorphic_evaluation",
+                    "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                    "candidate_id": candidate_id,
+                    "plan_sha256": plan.sha256,
+                    "evaluation_sha256": evaluation.sha256,
+                },
+            )
+            final_base = self.store.load(identity)
+
+            def apply_evaluation(latest: ChallengeState) -> None:
+                latest_candidate = next(
+                    (
+                        item
+                        for item in latest.candidates
+                        if item.id == candidate_id
+                    ),
+                    None,
+                )
+                if (
+                    get_adapter(latest.category).name != "crypto"
+                    or latest.configuration_epoch != configuration_epoch
+                    or latest.metadata.get("source_manifest_sha256")
+                    != manifest
+                    or latest_candidate is None
+                    or latest_candidate.status
+                    in {
+                        CandidateStatus.REJECTED,
+                        CandidateStatus.ACCEPTED,
+                        CandidateStatus.READY_TO_SUBMIT,
+                    }
+                    or tuple(
+                        latest_candidate.proof_run_ids[-6:]
+                    )
+                    != tuple(item.run_id for item in observations)
+                ):
+                    raise EngineError(
+                        "Crypto proof binding changed before final commit"
+                    )
+                latest.artifacts.append(evaluation_artifact)
+                latest_candidate.extra[
+                    "crypto_metamorphic_proof"
+                ] = {
+                    "artifact_id": evaluation_artifact.id,
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.sha256,
+                    "oracle_authority": "explicit_operator_input",
+                    "passed": proof_result.passed,
+                    "plan_sha256": plan.sha256,
+                    "proof_result": proof_result.to_dict(),
+                    "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                    "run_ids": [
+                        item.run_id for item in observations
+                    ],
+                }
+                if proof_result.passed:
+                    if latest.status is not ChallengeStatus.ACTIVE:
+                        validate_transition(
+                            latest.status,
+                            ChallengeStatus.ACTIVE,
+                        )
+                        latest.status = ChallengeStatus.ACTIVE
+                    validate_transition(
+                        latest.status,
+                        ChallengeStatus.PROVING,
+                    )
+                    latest.status = ChallengeStatus.PROVING
+                    validate_transition(
+                        latest.status,
+                        ChallengeStatus.READY_TO_SUBMIT,
+                        evidence=TransitionEvidence(proof_passed=True),
+                    )
+                    latest.status = ChallengeStatus.READY_TO_SUBMIT
+                    latest_candidate.status = (
+                        CandidateStatus.READY_TO_SUBMIT
+                    )
+                    latest.progress_markers.append(
+                        ProgressMarker(
+                            id=_record_id(
+                                "P",
+                                evaluation_id,
+                                "metamorphic-verified",
+                            ),
+                            statement=(
+                                "Crypto changed-parameter variant verified "
+                                "against an explicit operator oracle in three "
+                                "clean original and three clean variant runs"
+                            ),
+                            run_id=observations[-1].run_id,
+                            artifact_ids=[evaluation_artifact.id],
+                            extra={
+                                "adapter_marker": (
+                                    "metamorphic_variant_verified"
+                                ),
+                                "protocol": (
+                                    CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                                ),
+                                "oracle_authority": (
+                                    "explicit_operator_input"
+                                ),
+                            },
+                        )
+                    )
+
+            try:
+                committed = self.store.update(
+                    identity,
+                    apply_evaluation,
+                    expected_revision=final_base.revision,
+                )
+            except BaseException as update_error:
+                self._handle_proof_interruption(
+                    identity,
+                    (*input_artifacts, evaluation_artifact),
+                    update_error,
+                )
+                input_artifacts = ()
+                evaluation_artifact = None
+                raise
+            finalized = True
+            return committed, proof_result
+        finally:
+            active_error = sys.exception()
+            cleanup_error: BaseException | None = None
+            if preparation is not None:
+                try:
+                    preparation.staging.cleanup()
+                except BaseException as error:
+                    cleanup_error = error
+            pending_final_artifacts = (
+                *input_artifacts,
+                *(
+                    (evaluation_artifact,)
+                    if evaluation_artifact is not None
+                    else ()
+                ),
+            )
+            if not finalized and pending_final_artifacts:
+                try:
+                    self._cleanup_uncommitted_proof_files(
+                        identity,
+                        pending_final_artifacts,
+                    )
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Crypto proof input cleanup also failed: "
+                            f"{error}"
+                        )
+            try:
+                session_lock.release()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                elif active_error is not None:
+                    active_error.add_note(
+                        f"Crypto proof lock cleanup also failed: {error}"
+                    )
+            if cleanup_error is not None:
+                if (
+                    active_error is not None
+                    and not isinstance(active_error, Exception)
+                ):
+                    active_error.add_note(
+                        f"Crypto proof cleanup failed: {cleanup_error}"
+                    )
+                else:
+                    raise cleanup_error
+
     def prove_candidate(
         self,
         identity: ChallengeIdentity,
@@ -17945,6 +20277,12 @@ class ChallengeEngine:
                 self._recover_session_boundary(identity)
             state = self.refresh_ingest(identity)
             self._remaining_budget_seconds(state)
+            if get_adapter(state.category).name == "crypto":
+                raise EngineError(
+                    "Crypto candidates cannot use the generic proof gate; "
+                    "use the typed crypto_solver_metamorphic_variant_v1 "
+                    "executor"
+                )
             managed_recipe: ProofRecipe | None = None
             if _proof_experiment_id is not None:
                 managed_experiment = next(
@@ -19316,6 +21654,18 @@ class ChallengeEngine:
             CandidateStatus.READY_TO_SUBMIT,
             CandidateStatus.ACCEPTED,
         }
+        if get_adapter(state.category).name == "crypto":
+            crypto_proof = candidate.extra.get(
+                "crypto_metamorphic_proof"
+            )
+            proof_passed = (
+                proof_passed
+                and state.schema_version >= STATE_SCHEMA_VERSION
+                and isinstance(crypto_proof, Mapping)
+                and crypto_proof.get("protocol")
+                == CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                and crypto_proof.get("passed") is True
+            )
         normalized = outcome.lower()
         if (
             normalized == "accepted"
@@ -19526,6 +21876,25 @@ class ChallengeEngine:
                     experiment.extra["orphan_recovery"] = (
                         "retryable_without_canonical_outcome"
                     )
+                    continue
+                if (
+                    experiment.command
+                    == _PWN_IP_CONTROL_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                ):
+                    # The three replay records are committed atomically with
+                    # the aggregate result.  A RUNNING child therefore has no
+                    # canonical primitive evidence to salvage, and its exact
+                    # managed schema intentionally admits no recovery metadata.
+                    experiment.status = ExperimentStatus.FAILED
+                    experiment.result = {
+                        "error": (
+                            "Pwn IP control failed closed: orphaned "
+                            "execution recovered after the previous "
+                            "session owner exited"
+                        )
+                    }
                     continue
                 if (
                     experiment.command

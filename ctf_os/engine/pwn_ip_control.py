@@ -63,6 +63,7 @@ PWN_IP_CONTROL_MAX_RESULT_BYTES = 64 * 1024
 PWN_IP_CONTROL_TARGET_PREFIX = 0x0000600000000000
 PWN_IP_CONTROL_TARGET_MASK = (1 << 40) - 1
 PWN_IP_CONTROL_MAX_DERIVATION_ATTEMPTS = 256
+PWN_IP_CONTROL_MAX_IDENTIFIER_BYTES = 512
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}$")
@@ -161,6 +162,42 @@ _AUTHORITY_KEYS = frozenset(
         "stage_advance_authorized",
     }
 )
+_PLAN_KEYS = frozenset(
+    {
+        "binding",
+        "contract",
+        "derivation_algorithm",
+        "recipe_sha256",
+        "replays",
+        "schema_version",
+    }
+)
+_PLAN_BINDING_KEYS = frozenset(
+    {
+        "baseline_evaluation_sha256",
+        "baseline_recipe_sha256",
+        "controlled_offset",
+        "controlled_width_bytes",
+        "derivation_seed_sha256",
+        "original_payload_sha256",
+        "original_payload_size_bytes",
+        "parent_crash_evaluation_sha256",
+        "parent_crash_recipe_sha256",
+    }
+)
+_PLAN_REPLAY_KEYS = frozenset(
+    {
+        "ordinal",
+        "payload_sha256",
+        "payload_size_bytes",
+        "target_value_sha256",
+    }
+)
+_PLAN_DERIVATION_ALGORITHM = (
+    "sha256-domain-seed-ordinal-attempt;"
+    "prefix-0x000060-plus-40-bits;first-distinct-"
+    "unmapped-baseline-and-not-in-original"
+)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -252,6 +289,24 @@ def pwn_ip_control_contract_descriptor() -> dict[str, object]:
 PWN_IP_CONTROL_CONTRACT_FINGERPRINT = hashlib.sha256(
     _canonical_json_bytes(pwn_ip_control_contract_descriptor())
 ).hexdigest()
+
+
+def pwn_ip_control_child_experiment_id(
+    baseline_experiment_id: str,
+) -> str:
+    """Return the only primitive child id for one runtime snapshot."""
+
+    if (
+        type(baseline_experiment_id) is not str
+        or len(baseline_experiment_id.encode("utf-8"))
+        > PWN_IP_CONTROL_MAX_IDENTIFIER_BYTES
+        or _IDENTIFIER.fullmatch(baseline_experiment_id) is None
+    ):
+        raise ValueError("invalid Pwn IP-control baseline experiment id")
+    digest = hashlib.sha256(
+        baseline_experiment_id.encode("utf-8")
+    ).hexdigest()
+    return f"E-pwn-ip-control-v1-{digest}"
 
 
 class PwnIpControlStatus(str, Enum):
@@ -381,9 +436,7 @@ class PwnIpControlPlan:
                 "version": PWN_IP_CONTROL_CONTRACT_VERSION,
             },
             "derivation_algorithm": (
-                "sha256-domain-seed-ordinal-attempt;"
-                "prefix-0x000060-plus-40-bits;first-distinct-"
-                "unmapped-baseline-and-not-in-original"
+                _PLAN_DERIVATION_ALGORITHM
             ),
             "replays": [
                 {
@@ -415,6 +468,94 @@ class PwnIpControlPlan:
         value = self.content_dict()
         value["recipe_sha256"] = self.recipe_sha256
         return value
+
+
+def validate_pwn_ip_control_plan_document(
+    value: object,
+) -> dict[str, object]:
+    """Validate one raw-free persisted plan without trusting its self-hash."""
+
+    if type(value) is not dict or set(value) != _PLAN_KEYS:
+        raise ValueError("invalid Pwn IP-control plan schema")
+    binding = value.get("binding")
+    contract = value.get("contract")
+    replays = value.get("replays")
+    supplied = value.get("recipe_sha256")
+    if (
+        type(binding) is not dict
+        or set(binding) != _PLAN_BINDING_KEYS
+        or type(contract) is not dict
+        or set(contract) != _CONTRACT_KEYS
+        or contract
+        != {
+            "fingerprint": PWN_IP_CONTROL_CONTRACT_FINGERPRINT,
+            "id": PWN_IP_CONTROL_CONTRACT_ID,
+            "version": PWN_IP_CONTROL_CONTRACT_VERSION,
+        }
+        or value.get("schema_version")
+        != PWN_IP_CONTROL_SCHEMA_VERSION
+        or value.get("derivation_algorithm")
+        != _PLAN_DERIVATION_ALGORITHM
+        or type(replays) is not list
+        or len(replays) != PWN_IP_CONTROL_REPLAY_COUNT
+        or type(supplied) is not str
+        or _SHA256.fullmatch(supplied) is None
+    ):
+        raise ValueError("invalid Pwn IP-control plan schema")
+    for name in (
+        "baseline_evaluation_sha256",
+        "baseline_recipe_sha256",
+        "derivation_seed_sha256",
+        "original_payload_sha256",
+        "parent_crash_evaluation_sha256",
+        "parent_crash_recipe_sha256",
+    ):
+        item = binding.get(name)
+        if type(item) is not str or _SHA256.fullmatch(item) is None:
+            raise ValueError("invalid Pwn IP-control plan binding")
+    offset = binding.get("controlled_offset")
+    size = binding.get("original_payload_size_bytes")
+    if (
+        type(offset) is not int
+        or offset < 0
+        or binding.get("controlled_width_bytes")
+        != PWN_IP_CONTROL_WIDTH_BYTES
+        or type(size) is not int
+        or not 1 <= size <= PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+        or offset + PWN_IP_CONTROL_WIDTH_BYTES > size
+    ):
+        raise ValueError("invalid Pwn IP-control plan offset")
+    seen_payloads: set[str] = set()
+    seen_targets: set[str] = set()
+    for ordinal, replay in enumerate(replays, start=1):
+        if (
+            type(replay) is not dict
+            or set(replay) != _PLAN_REPLAY_KEYS
+            or replay.get("ordinal") != ordinal
+            or replay.get("payload_size_bytes") != size
+        ):
+            raise ValueError("invalid Pwn IP-control plan replay")
+        payload_sha = replay.get("payload_sha256")
+        target_sha = replay.get("target_value_sha256")
+        if (
+            type(payload_sha) is not str
+            or _SHA256.fullmatch(payload_sha) is None
+            or type(target_sha) is not str
+            or _SHA256.fullmatch(target_sha) is None
+            or payload_sha in seen_payloads
+            or target_sha in seen_targets
+        ):
+            raise ValueError("invalid Pwn IP-control plan replay")
+        seen_payloads.add(payload_sha)
+        seen_targets.add(target_sha)
+    content = dict(value)
+    del content["recipe_sha256"]
+    if (
+        hashlib.sha256(_canonical_json_bytes(content)).hexdigest()
+        != supplied
+    ):
+        raise ValueError("Pwn IP-control plan recipe hash mismatch")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1480,5 +1621,7 @@ __all__ = [
     "PwnIpControlStatus",
     "derive_pwn_ip_control_plan",
     "evaluate_pwn_ip_control",
+    "pwn_ip_control_child_experiment_id",
     "pwn_ip_control_contract_descriptor",
+    "validate_pwn_ip_control_plan_document",
 ]

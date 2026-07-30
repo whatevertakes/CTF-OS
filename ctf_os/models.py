@@ -7790,6 +7790,1331 @@ def _pwn_runtime_snapshot_state_errors(
     return errors
 
 
+_PWN_IP_CONTROL_ENGINE_COMMAND = "ctfos-engine:pwn-ip-control-v1"
+_PWN_IP_CONTROL_ENGINE_EXECUTOR = "pwn_ip_control_v1"
+_PWN_IP_CONTROL_REPLAY_PROTOCOL = (
+    "pwn_ip_control_metamorphic_replay_v1"
+)
+_PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
+_PWN_IP_CONTROL_EXPECTED_OBSERVATION = (
+    "three clean replays move the full x86_64 RIP to three engine-derived "
+    "unmapped addresses"
+)
+_PWN_IP_CONTROL_KEEP_CONDITION = (
+    "typed result proves full-width instruction-pointer control"
+)
+_PWN_IP_CONTROL_DROP_CONDITION = (
+    "any replay, binding, signal, RIP, or maps check is unverifiable"
+)
+_PWN_IP_CONTROL_EXPERIMENT_EXTRA_KEYS = frozenset(
+    {
+        "managed_contract_version",
+        "engine_executor",
+        "baseline_experiment_id",
+        "pwn_ip_control_plan",
+    }
+)
+_PWN_IP_CONTROL_RESULT_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "baseline_experiment_id",
+        "plan_recipe_sha256",
+        "evaluated_at",
+        "result",
+        "result_sha256",
+        "run_ids",
+        "receipt_ids",
+        "result_artifact_id",
+    }
+)
+_PWN_IP_CONTROL_REPLAY_RECORD_KEYS = frozenset(
+    {
+        "schema_version",
+        "plan_recipe_sha256",
+        "ordinal",
+        "transport_recipe",
+        "request_sha256",
+        "execution_contract",
+        "execution_contract_sha256",
+        "receipt",
+        "evaluation",
+        "evaluation_sha256",
+    }
+)
+_PWN_IP_CONTROL_EXECUTION_KEYS = frozenset(
+    {
+        "schema_version",
+        "engine_executor",
+        "protocol",
+        "plan_recipe_sha256",
+        "ordinal",
+        "baseline_experiment_id",
+        "ip_control_experiment_id",
+        "transport_recipe_sha256",
+        "configuration_epoch",
+        "source",
+        "payload",
+        "argv",
+        "sandbox",
+        "producer",
+    }
+)
+_PWN_IP_CONTROL_VARIANT_EXTRA_KEYS = frozenset(
+    {
+        "kind",
+        "engine_executor",
+        "plan_recipe_sha256",
+        "ordinal",
+        "target_value_sha256",
+    }
+)
+_PWN_IP_CONTROL_CAPABILITY_EXTRA_KEYS = frozenset(
+    {
+        "kind",
+        "engine_executor",
+        "plan_recipe_sha256",
+        "ordinal",
+        "transport_recipe_sha256",
+    }
+)
+_PWN_IP_CONTROL_STREAM_EXTRA_KEYS = frozenset(
+    {
+        "stream",
+        "engine_executor",
+        "plan_recipe_sha256",
+        "ordinal",
+        "transport_recipe_sha256",
+        "capture_placeholder",
+    }
+)
+_PWN_IP_CONTROL_RESULT_ARTIFACT_EXTRA_KEYS = frozenset(
+    {
+        "kind",
+        "engine_executor",
+        "plan_recipe_sha256",
+        "result_sha256",
+    }
+)
+_PWN_IP_CONTROL_AUTHORITY_KEYS = frozenset(
+    {
+        "experiment_id",
+        "plan_recipe_sha256",
+        "result_sha256",
+        "controlled_offset",
+        "controlled_width_bytes",
+    }
+)
+
+
+def _pwn_ip_control_experiment_marker(
+    experiment: Experiment,
+) -> bool:
+    result = experiment.result
+    return (
+        experiment.command == _PWN_IP_CONTROL_ENGINE_COMMAND
+        or experiment.extra.get("engine_executor")
+        == _PWN_IP_CONTROL_ENGINE_EXECUTOR
+        or "pwn_ip_control_plan" in experiment.extra
+        or (
+            isinstance(result, Mapping)
+            and _PWN_IP_CONTROL_RESULT_KEY in result
+        )
+    )
+
+
+def _pwn_ip_control_run_marker(run: RunReference) -> bool:
+    return (
+        run.role == "pwn_ip_control"
+        or "pwn_ip_control_replay" in run.extra
+    )
+
+
+def _pwn_ip_control_artifact_marker(
+    artifact: ArtifactReference,
+) -> bool:
+    return (
+        artifact.extra.get("engine_executor")
+        == _PWN_IP_CONTROL_ENGINE_EXECUTOR
+        or artifact.extra.get("kind")
+        in {
+            "pwn_ip_control_variant_payload",
+            "pwn_ip_control_capability_attestation",
+            "pwn_ip_control_result",
+        }
+    )
+
+
+def _pwn_ip_control_fact_marker(fact: Fact) -> bool:
+    return "pwn_ip_control" in fact.extra
+
+
+def _pwn_ip_control_authority_record(
+    value: object,
+    *,
+    child_id: str,
+    plan_sha256: str,
+    result_sha256: str,
+    controlled_offset: int,
+) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == _PWN_IP_CONTROL_AUTHORITY_KEYS
+        and value
+        == {
+            "experiment_id": child_id,
+            "plan_recipe_sha256": plan_sha256,
+            "result_sha256": result_sha256,
+            "controlled_offset": controlled_offset,
+            "controlled_width_bytes": 8,
+        }
+    )
+
+
+def _pwn_ip_control_execution_contract_errors(
+    value: object,
+    *,
+    supplied_sha256: object,
+    child: Experiment,
+    baseline_experiment_id: str,
+    plan_sha256: str,
+    ordinal: int,
+    recipe: Any,
+    run: RunReference,
+    capability: ArtifactReference,
+) -> list[str]:
+    """Reconstruct one fixed clean, networkless IP-control replay."""
+
+    label = f"Pwn IP-control replay {ordinal}"
+    if (
+        type(value) is not dict
+        or set(value) != _PWN_IP_CONTROL_EXECUTION_KEYS
+    ):
+        return [f"{label} execution contract is not exact"]
+    source = value.get("source")
+    payload = value.get("payload")
+    sandbox = value.get("sandbox")
+    producer = value.get("producer")
+    image = (
+        sandbox.get("image")
+        if type(sandbox) is dict
+        else None
+    )
+    if (
+        type(source) is not dict
+        or set(source)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_SOURCE_KEYS
+        or type(payload) is not dict
+        or set(payload)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_PAYLOAD_KEYS
+        or type(sandbox) is not dict
+        or set(sandbox)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_SANDBOX_KEYS
+        or type(image) is not dict
+        or set(image) != _PWN_RUNTIME_SNAPSHOT_EXECUTION_IMAGE_KEYS
+        or type(producer) is not dict
+        or set(producer)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_PRODUCER_KEYS
+    ):
+        return [f"{label} execution contract nested schema is not exact"]
+    computed_sha256 = _pwn_runtime_snapshot_canonical_sha256(value)
+    if (
+        computed_sha256 is None
+        or not _proof_binding_sha256(supplied_sha256)
+        or supplied_sha256 != computed_sha256
+    ):
+        return [f"{label} execution contract hash does not match"]
+    try:
+        from ctf_os.director.resources import tool_profile
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
+            PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+            PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+            PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+        )
+
+        expected_resource = tool_profile(
+            child.resource_class,
+            needs_kvm=False,
+            network=False,
+        ).as_dict()
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        return [f"{label} execution policy cannot be rebuilt: {error}"]
+    outer_timeout = sandbox.get("outer_timeout_seconds")
+    expected = {
+        "schema_version": 1,
+        "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+        "protocol": _PWN_IP_CONTROL_REPLAY_PROTOCOL,
+        "plan_recipe_sha256": plan_sha256,
+        "ordinal": ordinal,
+        "baseline_experiment_id": baseline_experiment_id,
+        "ip_control_experiment_id": child.id,
+        "transport_recipe_sha256": recipe.recipe_sha256,
+        "configuration_epoch": recipe.configuration_epoch,
+        "source": {
+            "locator": recipe.primary_elf_locator,
+            "manifest_sha256": recipe.source_manifest_sha256,
+            "sha256": recipe.source_sha256,
+            "size_bytes": recipe.source_size_bytes,
+        },
+        "payload": {
+            "artifact_id": recipe.payload_artifact_id,
+            "source_run_id": run.id,
+            "sha256": recipe.payload_sha256,
+            "size_bytes": recipe.payload_size_bytes,
+            "destination_locator": (
+                PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+            ),
+        },
+        "argv": list(recipe.argv()),
+        "sandbox": {
+            "method": PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+            "one_shot": PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+            "outer_timeout_seconds": outer_timeout,
+            "resource_request": expected_resource,
+            "image": {
+                "reference": recipe.image_reference,
+                "digest": recipe.image_digest,
+            },
+            "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+            "network_target": None,
+        },
+        "producer": {
+            "interpreter_path": (
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH
+            ),
+            "path": PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+            "capability_name": (
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+            ),
+            "file_sha256": recipe.producer_file_sha256,
+            "capability_attestation_artifact_id": capability.id,
+            "capability_attestation_sha256": capability.sha256,
+        },
+    }
+    if (
+        type(outer_timeout) is not int
+        or not 1 <= outer_timeout <= child.timeout_seconds
+        or value != expected
+    ):
+        return [f"{label} execution policy binding changed"]
+    return []
+
+
+def _pwn_ip_control_state_errors(
+    state: "ChallengeState",
+    *,
+    experiments: Mapping[str, Experiment],
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+    candidates: Mapping[str, FlagCandidate],
+) -> list[str]:
+    """Validate the three-replay instruction-pointer partial oracle graph."""
+
+    errors: list[str] = []
+    children = {
+        experiment.id: experiment
+        for experiment in state.experiments
+        if _pwn_ip_control_experiment_marker(experiment)
+    }
+    claimed_run_ids: set[str] = set()
+    claimed_receipt_ids: set[str] = set()
+    claimed_artifact_ids: set[str] = set()
+    claimed_fact_ids: set[str] = set()
+    claimed_marker_ids: set[str] = set()
+
+    for child in children.values():
+        label = f"Pwn IP-control experiment {child.id}"
+        raw_plan = child.extra.get("pwn_ip_control_plan")
+        try:
+            from ctf_os.engine.pwn_ip_control import (
+                PWN_IP_CONTROL_REPLAY_COUNT,
+                PwnIpControlResult,
+                PwnIpControlStatus,
+                pwn_ip_control_child_experiment_id,
+                validate_pwn_ip_control_plan_document,
+            )
+            from ctf_os.engine.pwn_runtime_snapshot import (
+                PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME,
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256,
+                PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                PwnRuntimeSnapshotCapabilityAttestation,
+                PwnRuntimeSnapshotGateEvaluation,
+                PwnRuntimeSnapshotReceiptMetadata,
+                PwnRuntimeSnapshotRecipe,
+            )
+
+            plan = validate_pwn_ip_control_plan_document(raw_plan)
+            plan_sha256 = plan["recipe_sha256"]
+        except (
+            ImportError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} plan is invalid: {error}")
+            continue
+
+        baseline_id = child.extra.get("baseline_experiment_id")
+        baseline = (
+            experiments.get(baseline_id)
+            if isinstance(baseline_id, str)
+            else None
+        )
+        if (
+            type(child.extra) is not dict
+            or set(child.extra)
+            != _PWN_IP_CONTROL_EXPERIMENT_EXTRA_KEYS
+            or child.extra.get("managed_contract_version") != 1
+            or child.extra.get("engine_executor")
+            != _PWN_IP_CONTROL_ENGINE_EXECUTOR
+            or state.category.strip().casefold() != "pwn"
+            or not isinstance(baseline_id, str)
+            or child.id
+            != pwn_ip_control_child_experiment_id(baseline_id)
+            or baseline is None
+            or not _pwn_runtime_snapshot_experiment_marker(baseline)
+            or baseline.status is not ExperimentStatus.COMPLETED
+            or child.kind is not ExperimentKind.PROBE
+            or child.command != _PWN_IP_CONTROL_ENGINE_COMMAND
+            or child.hypothesis_ids
+            != (baseline.hypothesis_ids if baseline is not None else [])
+            or child.expected_observation
+            != _PWN_IP_CONTROL_EXPECTED_OBSERVATION
+            or child.keep_if != _PWN_IP_CONTROL_KEEP_CONDITION
+            or child.drop_if != _PWN_IP_CONTROL_DROP_CONDITION
+            or child.timeout_seconds != 30
+            or child.resource_class != "light"
+            or child.source_run_id is not None
+            or child.proof_recipe is not None
+            or child.evaluation_reason is not None
+            or child.evaluated_at is not None
+        ):
+            errors.append(f"{label} lacks its exact managed identity")
+        if baseline is None:
+            continue
+
+        baseline_raw_recipe = baseline.extra.get(
+            "pwn_runtime_snapshot_recipe"
+        )
+        baseline_envelope = baseline.result
+        baseline_evidence = (
+            baseline_envelope.get(_PWN_RUNTIME_SNAPSHOT_RESULT_KEY)
+            if type(baseline_envelope) is dict
+            and set(baseline_envelope)
+            == {_PWN_RUNTIME_SNAPSHOT_RESULT_KEY}
+            else None
+        )
+        try:
+            if (
+                type(baseline_raw_recipe) is not dict
+                or type(baseline_evidence) is not dict
+                or type(baseline_evidence.get("evaluation")) is not dict
+            ):
+                raise ValueError("baseline evidence is unavailable")
+            baseline_recipe = PwnRuntimeSnapshotRecipe.from_dict(
+                baseline_raw_recipe
+            )
+            baseline_evaluation = (
+                PwnRuntimeSnapshotGateEvaluation.from_dict(
+                    baseline_evidence["evaluation"],
+                    recipe=baseline_recipe,
+                )
+            )
+            baseline_receipt = receipts.get(
+                baseline_evidence.get("receipt_id")
+            )
+            baseline_record = (
+                baseline_receipt.extra.get("pwn_runtime_snapshot")
+                if baseline_receipt is not None
+                else None
+            )
+            if (
+                type(baseline_record) is not dict
+                or type(baseline_record.get("receipt")) is not dict
+            ):
+                raise ValueError("baseline receipt is unavailable")
+            baseline_metadata = (
+                PwnRuntimeSnapshotReceiptMetadata.from_dict(
+                    baseline_record["receipt"]
+                )
+            )
+            baseline_payload = artifacts.get(
+                baseline_recipe.payload_artifact_id
+            )
+            baseline_stdout = artifacts.get(
+                baseline_metadata.stdout_artifact_id
+            )
+            baseline_capability = artifacts.get(
+                baseline_metadata.capability_attestation_artifact_id
+            )
+            if (
+                not baseline_evaluation.captured
+                or baseline_payload is None
+                or baseline_stdout is None
+                or baseline_capability is None
+            ):
+                raise ValueError("baseline snapshot was not captured")
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} baseline is invalid: {error}")
+            continue
+
+        plan_binding = plan["binding"]
+        if (
+            plan_binding["baseline_recipe_sha256"]
+            != baseline_recipe.recipe_sha256
+            or plan_binding["baseline_evaluation_sha256"]
+            != baseline_evaluation.evidence_sha256
+            or plan_binding["original_payload_sha256"]
+            != baseline_recipe.payload_sha256
+            or plan_binding["original_payload_size_bytes"]
+            != baseline_recipe.payload_size_bytes
+            or plan_binding["parent_crash_recipe_sha256"]
+            != baseline_recipe.parent_crash_recipe_sha256
+            or plan_binding["parent_crash_evaluation_sha256"]
+            != baseline_recipe.parent_crash_evaluation_sha256
+        ):
+            errors.append(f"{label} plan does not bind its baseline")
+
+        root = f"artifacts/snapshots/pwn-ip-control-{plan_sha256}"
+        plan_replays = plan["replays"]
+        variants: list[ArtifactReference] = []
+        for ordinal, plan_replay in enumerate(plan_replays, start=1):
+            matches = [
+                artifact
+                for artifact in state.artifacts
+                if (
+                    artifact.extra.get("kind")
+                    == "pwn_ip_control_variant_payload"
+                    and artifact.extra.get("plan_recipe_sha256")
+                    == plan_sha256
+                    and artifact.extra.get("ordinal") == ordinal
+                )
+            ]
+            if len(matches) != 1:
+                errors.append(
+                    f"{label} must own one exact variant {ordinal}"
+                )
+                continue
+            variant = matches[0]
+            variants.append(variant)
+            if (
+                set(variant.extra) != _PWN_IP_CONTROL_VARIANT_EXTRA_KEYS
+                or variant.extra.get("engine_executor")
+                != _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                or variant.extra.get("target_value_sha256")
+                != plan_replay["target_value_sha256"]
+                or variant.source_run_id is not None
+                or variant.sha256 != plan_replay["payload_sha256"]
+                or variant.size != plan_replay["payload_size_bytes"]
+                or variant.media_type != "application/octet-stream"
+                or variant.path
+                != f"{root}/{ordinal:02d}-payload.bin"
+            ):
+                errors.append(
+                    f"{label} variant {ordinal} binding is invalid"
+                )
+            claimed_artifact_ids.add(variant.id)
+        if len(variants) != PWN_IP_CONTROL_REPLAY_COUNT:
+            continue
+
+        linked_runs = [
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == child.id
+        ]
+        linked_receipts = [
+            receipt
+            for receipt in state.receipts
+            if receipt.experiment_id == child.id
+        ]
+        linked_artifacts = [
+            artifact
+            for artifact in state.artifacts
+            if (
+                _pwn_ip_control_artifact_marker(artifact)
+                and artifact.extra.get("plan_recipe_sha256")
+                == plan_sha256
+            )
+        ]
+        variant_ids = [artifact.id for artifact in variants]
+        matching_facts = [
+            fact
+            for fact in state.facts
+            if (
+                fact.source_run_id in {run.id for run in linked_runs}
+                or fact.artifact_id
+                in {artifact.id for artifact in linked_artifacts}
+                or (
+                    type(fact.extra.get("pwn_ip_control")) is dict
+                    and fact.extra["pwn_ip_control"].get("experiment_id")
+                    == child.id
+                )
+            )
+        ]
+        matching_markers = [
+            marker
+            for marker in state.progress_markers
+            if (
+                marker.run_id in {run.id for run in linked_runs}
+                or not set(marker.artifact_ids).isdisjoint(
+                    {artifact.id for artifact in linked_artifacts}
+                )
+                or (
+                    type(marker.extra.get("pwn_ip_control")) is dict
+                    and marker.extra["pwn_ip_control"].get(
+                        "experiment_id"
+                    )
+                    == child.id
+                )
+            )
+        ]
+
+        if child.status in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            if (
+                child.result is not None
+                or child.artifact_ids != variant_ids
+                or child.evidence_fact_ids
+                or child.evidence_run_ids
+                or child.evidence_receipt_ids
+                or linked_runs
+                or linked_receipts
+                or len(linked_artifacts) != 3
+                or matching_facts
+                or matching_markers
+            ):
+                errors.append(
+                    f"{label} active lifecycle is inconsistent"
+                )
+            continue
+
+        if child.status is ExperimentStatus.FAILED:
+            failure = (
+                child.result.get("error")
+                if type(child.result) is dict
+                and set(child.result) == {"error"}
+                else None
+            )
+            if (
+                type(failure) is not str
+                or not failure.startswith(
+                    "Pwn IP control failed closed: "
+                )
+                or len(failure.encode("utf-8")) > 4096
+                or child.artifact_ids != variant_ids
+                or child.evidence_fact_ids
+                or child.evidence_run_ids
+                or child.evidence_receipt_ids
+                or linked_runs
+                or linked_receipts
+                or len(linked_artifacts) != 3
+                or matching_facts
+                or matching_markers
+            ):
+                errors.append(
+                    f"{label} failed-closed lifecycle is inconsistent"
+                )
+            continue
+
+        if child.status is not ExperimentStatus.COMPLETED:
+            errors.append(f"{label} has a non-canonical status")
+            continue
+
+        result_envelope = (
+            child.result.get(_PWN_IP_CONTROL_RESULT_KEY)
+            if type(child.result) is dict
+            and set(child.result) == {_PWN_IP_CONTROL_RESULT_KEY}
+            else None
+        )
+        try:
+            if (
+                type(result_envelope) is not dict
+                or set(result_envelope)
+                != _PWN_IP_CONTROL_RESULT_ENVELOPE_KEYS
+                or result_envelope.get("schema_version") != 1
+                or result_envelope.get("baseline_experiment_id")
+                != baseline_id
+                or result_envelope.get("plan_recipe_sha256")
+                != plan_sha256
+                or not _proof_binding_utc_timestamp(
+                    result_envelope.get("evaluated_at")
+                )
+                or type(result_envelope.get("run_ids")) is not list
+                or type(result_envelope.get("receipt_ids")) is not list
+            ):
+                raise ValueError("result envelope is not exact")
+            result = PwnIpControlResult.from_dict(
+                result_envelope["result"]
+            )
+            result_sha256 = result.evidence_sha256
+            if (
+                result_envelope.get("result_sha256")
+                != result_sha256
+                or result.plan_recipe_sha256 != plan_sha256
+                or result.source_manifest_sha256
+                != baseline_recipe.source_manifest_sha256
+                or result.source_sha256 != baseline_recipe.source_sha256
+                or result.source_size_bytes
+                != baseline_recipe.source_size_bytes
+                or result.parent_crash_recipe_sha256
+                != baseline_recipe.parent_crash_recipe_sha256
+                or result.parent_crash_evaluation_sha256
+                != baseline_recipe.parent_crash_evaluation_sha256
+                or result.controlled_offset
+                != plan_binding["controlled_offset"]
+                or result.derivation_seed_sha256
+                != plan_binding["derivation_seed_sha256"]
+            ):
+                raise ValueError("result binding is inconsistent")
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} result is invalid: {error}")
+            continue
+
+        baseline_receipt_sha256 = (
+            _pwn_runtime_snapshot_canonical_sha256(
+                baseline_metadata.to_dict()
+            )
+        )
+        baseline_source_run = runs.get(
+            baseline_recipe.payload_source_run_id
+        )
+        expected_baseline_commitment = {
+            "capability_attestation_artifact_id": (
+                baseline_capability.id
+            ),
+            "capability_attestation_sha256": baseline_capability.sha256,
+            "evaluation_sha256": baseline_evaluation.evidence_sha256,
+            "payload_artifact_id": baseline_payload.id,
+            "payload_sha256": baseline_payload.sha256,
+            "payload_size_bytes": baseline_payload.size,
+            "receipt_sha256": baseline_receipt_sha256,
+            "recipe_sha256": baseline_recipe.recipe_sha256,
+            "stdout_artifact_id": baseline_stdout.id,
+            "stdout_artifact_sha256": baseline_stdout.sha256,
+            "stdout_artifact_size_bytes": baseline_stdout.size,
+        }
+        if result.baseline.to_dict() != expected_baseline_commitment:
+            errors.append(
+                f"{label} result baseline commitment is inconsistent"
+            )
+
+        run_ids = result_envelope["run_ids"]
+        receipt_ids = result_envelope["receipt_ids"]
+        if (
+            len(run_ids) != PWN_IP_CONTROL_REPLAY_COUNT
+            or len(set(run_ids)) != PWN_IP_CONTROL_REPLAY_COUNT
+            or len(receipt_ids) != PWN_IP_CONTROL_REPLAY_COUNT
+            or len(set(receipt_ids)) != PWN_IP_CONTROL_REPLAY_COUNT
+            or child.evidence_run_ids != run_ids
+            or child.evidence_receipt_ids != receipt_ids
+            or {run.id for run in linked_runs} != set(run_ids)
+            or {receipt.id for receipt in linked_receipts}
+            != set(receipt_ids)
+        ):
+            errors.append(f"{label} replay evidence lists are not exact")
+
+        ordered_artifact_ids = list(variant_ids)
+        replay_commitments: list[dict[str, object]] = []
+        seen_request_sha256: set[str] = set()
+        seen_execution_sha256: set[str] = set()
+        for ordinal, (run_id, receipt_id, variant) in enumerate(
+            zip(run_ids, receipt_ids, variants, strict=True),
+            start=1,
+        ):
+            run = runs.get(run_id)
+            receipt = receipts.get(receipt_id)
+            if run is None or receipt is None:
+                errors.append(
+                    f"{label} replay {ordinal} is unavailable"
+                )
+                continue
+            raw_record = run.extra.get("pwn_ip_control_replay")
+            if (
+                type(raw_record) is not dict
+                or set(raw_record)
+                != _PWN_IP_CONTROL_REPLAY_RECORD_KEYS
+                or receipt.extra
+                != {"pwn_ip_control_replay": raw_record}
+                or run.extra
+                != {
+                    "experiment_id": child.id,
+                    "pwn_ip_control_replay": raw_record,
+                }
+                or raw_record.get("schema_version") != 1
+                or raw_record.get("plan_recipe_sha256")
+                != plan_sha256
+                or raw_record.get("ordinal") != ordinal
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} record is not exact"
+                )
+                continue
+            try:
+                transport_recipe = PwnRuntimeSnapshotRecipe.from_dict(
+                    raw_record["transport_recipe"]
+                )
+                evaluation = PwnRuntimeSnapshotGateEvaluation.from_dict(
+                    raw_record["evaluation"],
+                    recipe=transport_recipe,
+                )
+                metadata = PwnRuntimeSnapshotReceiptMetadata.from_dict(
+                    raw_record["receipt"]
+                )
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as error:
+                errors.append(
+                    f"{label} replay {ordinal} is invalid: {error}"
+                )
+                continue
+            capability = artifacts.get(
+                metadata.capability_attestation_artifact_id
+            )
+            stdout = artifacts.get(metadata.stdout_artifact_id)
+            stderr = artifacts.get(metadata.stderr_artifact_id)
+            if capability is None or stdout is None or stderr is None:
+                errors.append(
+                    f"{label} replay {ordinal} artifacts are incomplete"
+                )
+                continue
+            ordered_artifact_ids.extend(
+                (capability.id, stdout.id, stderr.id)
+            )
+            claimed_run_ids.add(run.id)
+            claimed_receipt_ids.add(receipt.id)
+            claimed_artifact_ids.update(
+                (capability.id, stdout.id, stderr.id)
+            )
+
+            same_runtime = all(
+                getattr(transport_recipe, field)
+                == getattr(baseline_recipe, field)
+                for field in (
+                    "configuration_epoch",
+                    "child_experiment_id",
+                    "parent_experiment_id",
+                    "primary_elf_locator",
+                    "source_manifest_sha256",
+                    "source_sha256",
+                    "source_size_bytes",
+                    "parent_crash_recipe_sha256",
+                    "parent_crash_evaluation_sha256",
+                    "expected_signal_number",
+                    "image_reference",
+                    "image_digest",
+                    "producer_file_sha256",
+                )
+            )
+            plan_replay = plan_replays[ordinal - 1]
+            if (
+                not same_runtime
+                or transport_recipe.payload_artifact_id != variant.id
+                or transport_recipe.payload_source_run_id != run.id
+                or transport_recipe.payload_artifact_locator
+                != variant.path
+                or transport_recipe.payload_sha256 != variant.sha256
+                or transport_recipe.payload_size_bytes != variant.size
+                or raw_record.get("evaluation_sha256")
+                != evaluation.evidence_sha256
+                or metadata.recipe_sha256
+                != transport_recipe.recipe_sha256
+                or metadata.request_sha256
+                != raw_record.get("request_sha256")
+                or metadata.execution_contract_sha256
+                != raw_record.get("execution_contract_sha256")
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} transport binding changed"
+                )
+
+            errors.extend(
+                _pwn_ip_control_execution_contract_errors(
+                    raw_record.get("execution_contract"),
+                    supplied_sha256=raw_record.get(
+                        "execution_contract_sha256"
+                    ),
+                    child=child,
+                    baseline_experiment_id=baseline_id,
+                    plan_sha256=plan_sha256,
+                    ordinal=ordinal,
+                    recipe=transport_recipe,
+                    run=run,
+                    capability=capability,
+                )
+            )
+            expected_run_status = {
+                "succeeded": RunStatus.COMPLETED,
+                "failed": RunStatus.FAILED,
+                "timed_out": RunStatus.TIMED_OUT,
+            }.get(metadata.outcome)
+            expected_receipt_outcome = {
+                "succeeded": ReceiptOutcome.SUCCEEDED,
+                "failed": ReceiptOutcome.FAILED,
+                "timed_out": ReceiptOutcome.TIMED_OUT,
+            }.get(metadata.outcome)
+            if (
+                run.role != "pwn_ip_control"
+                or run.origin is not RunOrigin.MANAGED_TOOL
+                or run.configuration_epoch != state.configuration_epoch
+                or baseline_source_run is None
+                or run.session_id != baseline_source_run.session_id
+                or run.cycle_id != baseline_source_run.cycle_id
+                or run.wave_id != baseline_source_run.wave_id
+                or run.model is not None
+                or run.context_hash is not None
+                or not _pwn_crash_safe_locator(run.request_path)
+                or not _pwn_crash_safe_locator(run.result_path)
+                or not _pwn_crash_safe_locator(run.validation_path)
+                or run.status is not expected_run_status
+                or receipt.id != metadata.receipt_id
+                or receipt.run_id != run.id
+                or receipt.experiment_id != child.id
+                or receipt.outcome is not expected_receipt_outcome
+                or receipt.exit_code != metadata.exit_code
+                or receipt.stdout_artifact_id != stdout.id
+                or receipt.stderr_artifact_id != stderr.id
+                or receipt.stdout_bytes
+                != metadata.stdout_drained_bytes
+                or receipt.stderr_bytes != metadata.stderr_artifact_size_bytes
+                or receipt.stdout_lines != 0
+                or receipt.stderr_lines != 0
+                or receipt.preview
+                != (
+                    f"Pwn IP control replay {ordinal} "
+                    f"{evaluation.status.value}:"
+                    f"{evaluation.reason_code}"
+                )[:160]
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} durable chain is inconsistent"
+                )
+
+            expected_attestation = (
+                PwnRuntimeSnapshotCapabilityAttestation(
+                    image_digest=transport_recipe.image_digest,
+                    recipe_sha256=transport_recipe.recipe_sha256,
+                )
+            )
+            if (
+                metadata.timed_out
+                is not (metadata.outcome == "timed_out")
+                or metadata.clean_workspace is not True
+                or metadata.one_shot is not PWN_RUNTIME_SNAPSHOT_ONE_SHOT
+                or metadata.sandbox_method
+                != PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD
+                or metadata.network != PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY
+                or metadata.configuration_epoch
+                != transport_recipe.configuration_epoch
+                or metadata.image_digest != transport_recipe.image_digest
+                or metadata.producer_capability_name
+                != PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                or metadata.producer_file_sha256
+                != PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256
+                or metadata.capability_attestation_artifact_id
+                != capability.id
+                or metadata.capability_attestation_sha256
+                != capability.sha256
+                or metadata.stdout_artifact_id != stdout.id
+                or metadata.stdout_artifact_sha256 != stdout.sha256
+                or metadata.stdout_artifact_size_bytes != stdout.size
+                or metadata.stderr_artifact_id != stderr.id
+                or metadata.stderr_artifact_sha256 != stderr.sha256
+                or metadata.stderr_artifact_size_bytes != stderr.size
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} receipt binding changed"
+                )
+
+            expected_transport_sha = transport_recipe.recipe_sha256
+            if (
+                capability.source_run_id is not None
+                or capability.sha256
+                != expected_attestation.evidence_sha256
+                or capability.size
+                != len(expected_attestation.canonical_bytes())
+                or capability.media_type != "application/json"
+                or set(capability.extra)
+                != _PWN_IP_CONTROL_CAPABILITY_EXTRA_KEYS
+                or capability.extra
+                != {
+                    "kind": "pwn_ip_control_capability_attestation",
+                    "engine_executor": (
+                        _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                    ),
+                    "plan_recipe_sha256": plan_sha256,
+                    "ordinal": ordinal,
+                    "transport_recipe_sha256": expected_transport_sha,
+                }
+                or capability.path
+                != f"{root}/{ordinal:02d}-capability-attestation.json"
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} capability is invalid"
+                )
+            for stream, artifact in (
+                ("stdout", stdout),
+                ("stderr", stderr),
+            ):
+                placeholder = artifact.extra.get("capture_placeholder")
+                if (
+                    artifact.source_run_id != run.id
+                    or type(placeholder) is not bool
+                    or set(artifact.extra)
+                    != _PWN_IP_CONTROL_STREAM_EXTRA_KEYS
+                    or artifact.extra
+                    != {
+                        "stream": stream,
+                        "engine_executor": (
+                            _PWN_IP_CONTROL_ENGINE_EXECUTOR
+                        ),
+                        "plan_recipe_sha256": plan_sha256,
+                        "ordinal": ordinal,
+                        "transport_recipe_sha256": (
+                            expected_transport_sha
+                        ),
+                        "capture_placeholder": placeholder,
+                    }
+                    or artifact.path
+                    != (
+                        f"{root}/{ordinal:02d}-{run.id}-"
+                        f"{stream}.log"
+                    )
+                    or artifact.media_type
+                    != (
+                        "application/json"
+                        if stream == "stdout"
+                        else "text/plain"
+                    )
+                    or (placeholder and artifact.size != 0)
+                    or (
+                        placeholder
+                        and artifact.sha256
+                        != hashlib.sha256(b"").hexdigest()
+                    )
+                ):
+                    errors.append(
+                        f"{label} replay {ordinal} {stream} is invalid"
+                    )
+            per_run_artifacts = {
+                artifact.id
+                for artifact in state.artifacts
+                if artifact.source_run_id == run.id
+            }
+            if per_run_artifacts != {stdout.id, stderr.id}:
+                errors.append(
+                    f"{label} replay {ordinal} owns unexpected artifacts"
+                )
+            if (
+                metadata.stderr_capture_placeholder
+                is not stderr.extra.get("capture_placeholder")
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} stderr capture changed"
+                )
+            semantic_result = evaluation.semantic_result
+            if semantic_result is not None:
+                semantic_bytes = semantic_result.canonical_bytes()
+                if (
+                    metadata.outcome != "succeeded"
+                    or metadata.exit_code != 0
+                    or metadata.timed_out
+                    or metadata.orchestration_error is not None
+                    or not metadata.stdout_capture_complete
+                    or not metadata.stdout_truncation_known
+                    or metadata.stdout_truncated is not False
+                    or metadata.stdout_error is not None
+                    or metadata.stream_capture_error is not None
+                    or not metadata.durable_stdout_artifact_complete
+                    or stdout.extra.get("capture_placeholder") is not False
+                    or stdout.sha256
+                    != hashlib.sha256(semantic_bytes).hexdigest()
+                    or stdout.size != len(semantic_bytes)
+                    or metadata.stdout_drained_bytes
+                    != len(semantic_bytes)
+                    or metadata.stdout_stored_bytes
+                    != len(semantic_bytes)
+                ):
+                    errors.append(
+                        f"{label} replay {ordinal} semantic stdout changed"
+                    )
+
+            request_sha = raw_record.get("request_sha256")
+            execution_sha = raw_record.get(
+                "execution_contract_sha256"
+            )
+            if (
+                not _proof_binding_sha256(request_sha)
+                or request_sha in seen_request_sha256
+                or not _proof_binding_sha256(execution_sha)
+                or execution_sha in seen_execution_sha256
+            ):
+                errors.append(
+                    f"{label} replay {ordinal} reused an execution identity"
+                )
+            else:
+                seen_request_sha256.add(request_sha)
+                seen_execution_sha256.add(execution_sha)
+
+            receipt_sha256 = _pwn_runtime_snapshot_canonical_sha256(
+                metadata.to_dict()
+            )
+            replay_commitments.append(
+                {
+                    "capability_attestation_artifact_id": capability.id,
+                    "capability_attestation_sha256": capability.sha256,
+                    "evaluation_sha256": evaluation.evidence_sha256,
+                    "ordinal": ordinal,
+                    "payload_artifact_id": variant.id,
+                    "payload_sha256": variant.sha256,
+                    "payload_size_bytes": variant.size,
+                    "receipt_sha256": receipt_sha256,
+                    "recipe_sha256": transport_recipe.recipe_sha256,
+                    "stdout_artifact_id": stdout.id,
+                    "stdout_artifact_sha256": stdout.sha256,
+                    "stdout_artifact_size_bytes": stdout.size,
+                    "target_value_sha256": (
+                        plan_replay["target_value_sha256"]
+                    ),
+                }
+            )
+
+        result_artifact_id = result_envelope["result_artifact_id"]
+        result_artifact = artifacts.get(result_artifact_id)
+        if result_artifact is None:
+            errors.append(f"{label} result artifact is unavailable")
+            continue
+        ordered_artifact_ids.append(result_artifact.id)
+        claimed_artifact_ids.add(result_artifact.id)
+        result_bytes = result.canonical_bytes()
+        if (
+            result_artifact.source_run_id is not None
+            or result_artifact.sha256
+            != hashlib.sha256(result_bytes).hexdigest()
+            or result_artifact.size != len(result_bytes)
+            or result_artifact.media_type != "application/json"
+            or set(result_artifact.extra)
+            != _PWN_IP_CONTROL_RESULT_ARTIFACT_EXTRA_KEYS
+            or result_artifact.extra
+            != {
+                "kind": "pwn_ip_control_result",
+                "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+                "plan_recipe_sha256": plan_sha256,
+                "result_sha256": result_sha256,
+            }
+            or result_artifact.path != f"{root}/result.json"
+        ):
+            errors.append(f"{label} result artifact is invalid")
+        if (
+            child.artifact_ids != ordered_artifact_ids
+            or len(linked_artifacts) != 13
+            or {artifact.id for artifact in linked_artifacts}
+            != set(ordered_artifact_ids)
+            or child.evidence_run_ids != run_ids
+            or child.evidence_receipt_ids != receipt_ids
+        ):
+            errors.append(f"{label} terminal artifact graph is not exact")
+
+        if result.replays:
+            expected_replays = replay_commitments[
+                : len(result.replays)
+            ]
+            if [
+                replay.to_dict() for replay in result.replays
+            ] != expected_replays:
+                errors.append(
+                    f"{label} result replay commitments are inconsistent"
+                )
+        elif result.status is PwnIpControlStatus.PROVEN:
+            errors.append(f"{label} proven result has no replay commitments")
+
+        proven = result.status is PwnIpControlStatus.PROVEN
+        if proven:
+            offset = result.controlled_offset
+            assert isinstance(offset, int)
+            authority = {
+                "experiment_id": child.id,
+                "plan_recipe_sha256": plan_sha256,
+                "result_sha256": result_sha256,
+                "controlled_offset": offset,
+                "controlled_width_bytes": 8,
+            }
+            fact_id = (
+                f"F-{child.id}-instruction-pointer-control"
+            )
+            marker_id = (
+                f"P-{child.id}-instruction-pointer-control"
+            )
+            statement = (
+                "Engine-owned metamorphic replays proved full-width x86_64 "
+                "instruction-pointer control at payload offset "
+                f"{offset}."
+            )
+            matching_fact = facts.get(fact_id)
+            matching_marker = next(
+                (
+                    marker
+                    for marker in state.progress_markers
+                    if marker.id == marker_id
+                ),
+                None,
+            )
+            last_run_id = run_ids[-1]
+            if (
+                len(matching_facts) != 1
+                or matching_fact is None
+                or matching_fact not in matching_facts
+                or matching_fact.statement != statement
+                or matching_fact.provenance is not Provenance.EXECUTED
+                or matching_fact.kind is not FactKind.OBSERVATION
+                or matching_fact.challenge_id != state.challenge_id
+                or matching_fact.source_run_id != last_run_id
+                or matching_fact.artifact_id != result_artifact.id
+                or matching_fact.locator != result_artifact.path
+                or matching_fact.supersedes_id is not None
+                or matching_fact.supports
+                or matching_fact.contradicts
+                or matching_fact.extra != {"pwn_ip_control": authority}
+                or child.evidence_fact_ids != [matching_fact.id]
+            ):
+                errors.append(f"{label} proven Fact is not exact")
+            if (
+                len(matching_markers) != 1
+                or matching_marker is None
+                or matching_marker not in matching_markers
+                or matching_marker.statement
+                not in {
+                    statement,
+                    "Full-width x86_64 instruction-pointer control "
+                    "reproduced in three clean replays",
+                }
+                or matching_marker.run_id != last_run_id
+                or matching_marker.goal_id is not None
+                or matching_marker.artifact_ids
+                != [result_artifact.id]
+                or matching_marker.extra
+                != {"pwn_ip_control": authority}
+            ):
+                errors.append(
+                    f"{label} proven progress marker is not exact"
+                )
+            if matching_fact is not None:
+                claimed_fact_ids.add(matching_fact.id)
+            if matching_marker is not None:
+                claimed_marker_ids.add(matching_marker.id)
+        elif (
+            child.evidence_fact_ids
+            or matching_facts
+            or matching_markers
+        ):
+            errors.append(
+                f"{label} unverified result promoted authority"
+            )
+
+    for run in state.runs:
+        if (
+            _pwn_ip_control_run_marker(run)
+            and run.id not in claimed_run_ids
+        ):
+            errors.append(f"Pwn IP-control run {run.id} is orphaned")
+    for receipt in state.receipts:
+        if (
+            "pwn_ip_control_replay" in receipt.extra
+            and receipt.id not in claimed_receipt_ids
+        ):
+            errors.append(
+                f"Pwn IP-control receipt {receipt.id} is orphaned"
+            )
+    pwn_artifact_ids = {
+        artifact.id
+        for artifact in state.artifacts
+        if _pwn_ip_control_artifact_marker(artifact)
+    }
+    for artifact in state.artifacts:
+        if (
+            _pwn_ip_control_artifact_marker(artifact)
+            and artifact.id not in claimed_artifact_ids
+        ):
+            errors.append(
+                f"Pwn IP-control artifact {artifact.id} is orphaned"
+            )
+    for fact in state.facts:
+        if (
+            (
+                _pwn_ip_control_fact_marker(fact)
+                or fact.source_run_id in claimed_run_ids
+                or fact.artifact_id in pwn_artifact_ids
+            )
+            and fact.id not in claimed_fact_ids
+        ):
+            errors.append(f"Pwn IP-control Fact {fact.id} is unauthorized")
+    for marker in state.progress_markers:
+        if (
+            (
+                "pwn_ip_control" in marker.extra
+                or marker.run_id in claimed_run_ids
+                or not set(marker.artifact_ids).isdisjoint(
+                    pwn_artifact_ids
+                )
+            )
+            and marker.id not in claimed_marker_ids
+        ):
+            errors.append(
+                f"Pwn IP-control progress marker {marker.id} is unauthorized"
+            )
+    for candidate in candidates.values():
+        if (
+            "pwn_ip_control" in candidate.extra
+            or candidate.source_run_id in claimed_run_ids
+            or candidate.artifact_id in pwn_artifact_ids
+            or not set(candidate.proof_run_ids).isdisjoint(
+                claimed_run_ids
+            )
+        ):
+            errors.append(
+                f"Pwn IP-control evidence cannot promote candidate "
+                f"{candidate.id}"
+            )
+    for experiment in state.experiments:
+        proof_recipe = experiment.proof_recipe
+        if (
+            experiment.kind is ExperimentKind.PROOF
+            and proof_recipe is not None
+            and (
+                proof_recipe.source_experiment_id in children
+                or proof_recipe.source_run_id in claimed_run_ids
+                or any(
+                    item.artifact_id in pwn_artifact_ids
+                    or item.source_run_id in claimed_run_ids
+                    for item in proof_recipe.inputs
+                )
+            )
+        ):
+            errors.append(
+                f"Pwn IP-control evidence cannot satisfy proof "
+                f"{experiment.id}"
+            )
+    return errors
+
+
 _REV_PROOF_ENVELOPE_KEYS = frozenset(
     {
         "schema_version",
@@ -8406,6 +9731,643 @@ def _rev_proof_state_errors(
     return errors
 
 
+_CRYPTO_METAMORPHIC_PROTOCOL = (
+    "crypto_solver_metamorphic_variant_v1"
+)
+_CRYPTO_METAMORPHIC_BINDING_KEYS = frozenset(
+    {
+        "artifact_id",
+        "evaluation",
+        "evaluation_sha256",
+        "oracle_authority",
+        "passed",
+        "plan_sha256",
+        "proof_result",
+        "protocol",
+        "run_ids",
+    }
+)
+_CRYPTO_METAMORPHIC_EVALUATION_KEYS = frozenset(
+    {
+        "candidate_sha256",
+        "failure_codes",
+        "observations",
+        "oracle_artifact_sha256",
+        "passed",
+        "plan",
+        "protocol",
+        "runtime_fingerprint_sha256",
+        "schema_version",
+        "solver_artifact_sha256",
+        "source_manifest_sha256",
+    }
+)
+_CRYPTO_METAMORPHIC_OBSERVATION_KEYS = frozenset(
+    {
+        "capture_complete",
+        "capture_error_present",
+        "case_id",
+        "clean_workspace",
+        "ctfwrap_exit_code",
+        "mutation_id",
+        "oracle_artifact_sha256",
+        "orchestration_status",
+        "ordinal",
+        "parameters_sha256",
+        "parameters_size_bytes",
+        "result_artifact_id",
+        "result_artifact_sha256",
+        "result_artifact_size_bytes",
+        "run_id",
+        "runner_exit_code",
+        "runtime_fingerprint_sha256",
+        "solver_artifact_sha256",
+        "source_manifest_sha256",
+        "target_exit_code",
+        "timed_out",
+        "truncated",
+        "truncation_known",
+    }
+)
+_CRYPTO_METAMORPHIC_PROOF_RESULT_KEYS = frozenset(
+    {
+        "candidate",
+        "failures",
+        "passed",
+        "policy_mode",
+        "required_attempts",
+        "run_ids",
+        "source_manifest_sha256",
+        "successful_attempts",
+        "total_attempts",
+    }
+)
+_CRYPTO_METAMORPHIC_PLAN_KEYS = frozenset(
+    {"attempts", "cases", "protocol"}
+)
+_CRYPTO_METAMORPHIC_CASE_KEYS = frozenset(
+    {
+        "case_id",
+        "changed_parameter_pointers",
+        "expected_output_sha256",
+        "expected_output_size_bytes",
+        "mutation_id",
+        "parameters_sha256",
+        "parameters_size_bytes",
+    }
+)
+_CRYPTO_METAMORPHIC_ATTEMPT_KEYS = frozenset(
+    set(_CRYPTO_METAMORPHIC_CASE_KEYS)
+    - {"changed_parameter_pointers"}
+    | {"ordinal"}
+)
+
+
+def _crypto_compact_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _crypto_artifact_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _crypto_exact_mapping(
+    value: object,
+    keys: frozenset[str],
+) -> Mapping[str, Any] | None:
+    return value if type(value) is dict and set(value) == keys else None
+
+
+def _crypto_nonnegative_int(value: object, *, maximum: int) -> bool:
+    return (
+        type(value) is int
+        and 0 <= value <= maximum
+    )
+
+
+def _crypto_metamorphic_state_errors(
+    state: "ChallengeState",
+    *,
+    runs: Mapping[str, RunReference],
+    artifacts: Mapping[str, ArtifactReference],
+    candidates: Mapping[str, FlagCandidate],
+) -> list[str]:
+    """Revalidate the persisted Crypto proof graph without trusting READY."""
+
+    if state.category.strip().casefold() not in {"crypto", "cryptography"}:
+        return []
+    errors: list[str] = []
+    for candidate in candidates.values():
+        raw_binding = candidate.extra.get("crypto_metamorphic_proof")
+        authoritative = candidate.status in {
+            CandidateStatus.READY_TO_SUBMIT,
+            CandidateStatus.ACCEPTED,
+        }
+        if raw_binding is None:
+            if authoritative:
+                errors.append(
+                    f"Crypto candidate {candidate.id} lacks its typed "
+                    "metamorphic proof binding"
+                )
+            continue
+        label = f"Crypto candidate {candidate.id} metamorphic proof"
+        try:
+            binding = _crypto_exact_mapping(
+                raw_binding,
+                _CRYPTO_METAMORPHIC_BINDING_KEYS,
+            )
+            if binding is None:
+                raise ModelValidationError("binding schema is not exact")
+            evaluation = _crypto_exact_mapping(
+                binding["evaluation"],
+                _CRYPTO_METAMORPHIC_EVALUATION_KEYS,
+            )
+            proof_result = _crypto_exact_mapping(
+                binding["proof_result"],
+                _CRYPTO_METAMORPHIC_PROOF_RESULT_KEYS,
+            )
+            if evaluation is None or proof_result is None:
+                raise ModelValidationError(
+                    "evaluation or ProofResult schema is not exact"
+                )
+            run_ids = binding["run_ids"]
+            observations = evaluation["observations"]
+            failure_codes = evaluation["failure_codes"]
+            if (
+                binding["protocol"] != _CRYPTO_METAMORPHIC_PROTOCOL
+                or evaluation["protocol"]
+                != _CRYPTO_METAMORPHIC_PROTOCOL
+                or binding["oracle_authority"]
+                != "explicit_operator_input"
+                or type(binding["passed"]) is not bool
+                or type(evaluation["passed"]) is not bool
+                or binding["passed"] is not evaluation["passed"]
+                or type(run_ids) is not list
+                or len(run_ids) != 6
+                or len(set(run_ids)) != 6
+                or any(
+                    not _proof_binding_identifier(run_id)
+                    for run_id in run_ids
+                )
+                or type(observations) is not list
+                or len(observations) != 6
+                or type(failure_codes) is not list
+                or any(type(code) is not str for code in failure_codes)
+                or type(evaluation["schema_version"]) is not int
+                or evaluation["schema_version"] != 1
+                or any(
+                    not _proof_binding_sha256(evaluation[field])
+                    for field in (
+                        "candidate_sha256",
+                        "oracle_artifact_sha256",
+                        "runtime_fingerprint_sha256",
+                        "solver_artifact_sha256",
+                        "source_manifest_sha256",
+                    )
+                )
+                or evaluation["candidate_sha256"]
+                != hashlib.sha256(
+                    candidate.value.encode("utf-8")
+                ).hexdigest()
+                or evaluation["source_manifest_sha256"]
+                != state.metadata.get("source_manifest_sha256")
+            ):
+                raise ModelValidationError(
+                    "evaluation bindings are invalid"
+                )
+            semantic_bytes = _crypto_compact_bytes(evaluation)
+            semantic_sha256 = hashlib.sha256(semantic_bytes).hexdigest()
+            if (
+                not _proof_binding_sha256(binding["evaluation_sha256"])
+                or binding["evaluation_sha256"] != semantic_sha256
+            ):
+                raise ModelValidationError(
+                    "evaluation commitment is invalid"
+                )
+
+            plan = _crypto_exact_mapping(
+                evaluation["plan"],
+                _CRYPTO_METAMORPHIC_PLAN_KEYS,
+            )
+            if plan is None:
+                raise ModelValidationError("passing plan is absent")
+            cases = plan["cases"]
+            attempts = plan["attempts"]
+            if (
+                plan["protocol"] != _CRYPTO_METAMORPHIC_PROTOCOL
+                or type(cases) is not list
+                or len(cases) != 2
+                or type(attempts) is not list
+                or len(attempts) != 6
+                or binding["plan_sha256"]
+                != hashlib.sha256(_crypto_compact_bytes(plan)).hexdigest()
+            ):
+                raise ModelValidationError("plan binding is invalid")
+            parsed_cases: list[Mapping[str, Any]] = []
+            for case in cases:
+                parsed = _crypto_exact_mapping(
+                    case,
+                    _CRYPTO_METAMORPHIC_CASE_KEYS,
+                )
+                if (
+                    parsed is None
+                    or not _proof_binding_sha256(
+                        parsed["parameters_sha256"]
+                    )
+                    or not _proof_binding_sha256(
+                        parsed["expected_output_sha256"]
+                    )
+                    or not _crypto_nonnegative_int(
+                        parsed["parameters_size_bytes"],
+                        maximum=4 * 1024 * 1024,
+                    )
+                    or not _crypto_nonnegative_int(
+                        parsed["expected_output_size_bytes"],
+                        maximum=1024 * 1024,
+                    )
+                    or type(parsed["changed_parameter_pointers"])
+                    is not list
+                    or len(parsed["changed_parameter_pointers"]) > 128
+                    or any(
+                        type(pointer) is not str
+                        for pointer
+                        in parsed["changed_parameter_pointers"]
+                    )
+                ):
+                    raise ModelValidationError("case schema is invalid")
+                parsed_cases.append(parsed)
+            original, variant = parsed_cases
+            candidate_bytes = candidate.value.encode("utf-8")
+            if (
+                original["case_id"] != "original"
+                or original["mutation_id"] != "original-baseline"
+                or original["changed_parameter_pointers"] != []
+                or original["expected_output_sha256"]
+                != hashlib.sha256(candidate_bytes).hexdigest()
+                or original["expected_output_size_bytes"]
+                != len(candidate_bytes)
+                or variant["case_id"] != "metamorphic-variant"
+                or not variant["changed_parameter_pointers"]
+                or variant["parameters_sha256"]
+                == original["parameters_sha256"]
+                or variant["expected_output_sha256"]
+                != evaluation["oracle_artifact_sha256"]
+                or variant["expected_output_sha256"]
+                == original["expected_output_sha256"]
+            ):
+                raise ModelValidationError(
+                    "original/variant cases are not independent"
+                )
+            for ordinal, attempt in enumerate(attempts, start=1):
+                parsed = _crypto_exact_mapping(
+                    attempt,
+                    _CRYPTO_METAMORPHIC_ATTEMPT_KEYS,
+                )
+                expected_case = original if ordinal <= 3 else variant
+                if (
+                    parsed is None
+                    or parsed["ordinal"] != ordinal
+                    or any(
+                        parsed[field] != expected_case[field]
+                        for field in (
+                            "case_id",
+                            "expected_output_sha256",
+                            "expected_output_size_bytes",
+                            "mutation_id",
+                            "parameters_sha256",
+                            "parameters_size_bytes",
+                        )
+                    )
+                ):
+                    raise ModelValidationError(
+                        "attempt plan order is invalid"
+                    )
+
+            expected_run_ids: list[str] = []
+            result_artifact_ids: set[str] = set()
+            for ordinal, raw_observation in enumerate(
+                observations,
+                start=1,
+            ):
+                observation = _crypto_exact_mapping(
+                    raw_observation,
+                    _CRYPTO_METAMORPHIC_OBSERVATION_KEYS,
+                )
+                expected_attempt = attempts[ordinal - 1]
+                if (
+                    observation is None
+                    or observation["ordinal"] != ordinal
+                    or any(
+                        observation[field] != expected_attempt[field]
+                        for field in (
+                            "case_id",
+                            "mutation_id",
+                            "parameters_sha256",
+                            "parameters_size_bytes",
+                        )
+                    )
+                    or observation["source_manifest_sha256"]
+                    != evaluation["source_manifest_sha256"]
+                    or observation["solver_artifact_sha256"]
+                    != evaluation["solver_artifact_sha256"]
+                    or observation["runtime_fingerprint_sha256"]
+                    != evaluation["runtime_fingerprint_sha256"]
+                    or observation["oracle_artifact_sha256"]
+                    != evaluation["oracle_artifact_sha256"]
+                    or not _proof_binding_identifier(
+                        observation["run_id"]
+                    )
+                    or not _proof_binding_identifier(
+                        observation["result_artifact_id"]
+                    )
+                    or not _proof_binding_sha256(
+                        observation["result_artifact_sha256"]
+                    )
+                    or not _crypto_nonnegative_int(
+                        observation["result_artifact_size_bytes"],
+                        maximum=1024 * 1024,
+                    )
+                ):
+                    raise ModelValidationError(
+                        "observation binding is invalid"
+                    )
+                expected_run_ids.append(observation["run_id"])
+                if observation["result_artifact_id"] in result_artifact_ids:
+                    raise ModelValidationError(
+                        "result artifact identity is reused"
+                    )
+                result_artifact_ids.add(
+                    observation["result_artifact_id"]
+                )
+                run = runs.get(observation["run_id"])
+                stdout_artifact = artifacts.get(
+                    observation["result_artifact_id"]
+                )
+                linked_streams = [
+                    artifact
+                    for artifact in artifacts.values()
+                    if artifact.source_run_id == observation["run_id"]
+                    and artifact.extra.get("kind")
+                    == "crypto_metamorphic_stream"
+                    and artifact.extra.get("protocol")
+                    == _CRYPTO_METAMORPHIC_PROTOCOL
+                ]
+                if (
+                    run is None
+                    or run.origin is not RunOrigin.PROOF
+                    or run.role != "crypto_metamorphic_proof"
+                    or run.configuration_epoch
+                    != state.configuration_epoch
+                    or run.extra.get("crypto_metamorphic_protocol")
+                    != _CRYPTO_METAMORPHIC_PROTOCOL
+                    or run.extra.get("plan_sha256")
+                    != binding["plan_sha256"]
+                    or run.extra.get("attempt_ordinal") != ordinal
+                    or run.extra.get("observation") != observation
+                    or stdout_artifact is None
+                    or stdout_artifact.source_run_id != run.id
+                    or stdout_artifact.sha256
+                    != observation["result_artifact_sha256"]
+                    or stdout_artifact.size
+                    != observation["result_artifact_size_bytes"]
+                    or stdout_artifact.extra.get("stream") != "stdout"
+                    or len(linked_streams) != 2
+                    or {
+                        artifact.extra.get("stream")
+                        for artifact in linked_streams
+                    }
+                    != {"stdout", "stderr"}
+                    or any(
+                        artifact.extra.get("attempt_ordinal") != ordinal
+                        or artifact.extra.get("plan_sha256")
+                        != binding["plan_sha256"]
+                        for artifact in linked_streams
+                    )
+                ):
+                    raise ModelValidationError(
+                        f"run {ordinal} evidence graph is invalid"
+                    )
+            if expected_run_ids != run_ids:
+                raise ModelValidationError(
+                    "candidate run order differs from evaluation"
+                )
+
+            artifact_id = binding["artifact_id"]
+            evaluation_artifact = artifacts.get(artifact_id)
+            if (
+                not _proof_binding_identifier(artifact_id)
+                or evaluation_artifact is None
+                or evaluation_artifact.source_run_id is not None
+                or evaluation_artifact.sha256
+                != hashlib.sha256(
+                    _crypto_artifact_bytes(evaluation)
+                ).hexdigest()
+                or evaluation_artifact.size
+                != len(_crypto_artifact_bytes(evaluation))
+                or evaluation_artifact.extra
+                != {
+                    "candidate_id": candidate.id,
+                    "evaluation_sha256": semantic_sha256,
+                    "kind": "crypto_metamorphic_evaluation",
+                    "plan_sha256": binding["plan_sha256"],
+                    "protocol": _CRYPTO_METAMORPHIC_PROTOCOL,
+                }
+            ):
+                raise ModelValidationError(
+                    "evaluation artifact is not exact"
+                )
+            evaluation_parent = PurePosixPath(
+                evaluation_artifact.path
+            ).parent
+            proof_inputs = [
+                artifact
+                for artifact in artifacts.values()
+                if (
+                    artifact.extra.get("protocol")
+                    == _CRYPTO_METAMORPHIC_PROTOCOL
+                    and PurePosixPath(artifact.path).is_relative_to(
+                        evaluation_parent
+                    )
+                    and artifact.id != evaluation_artifact.id
+                    and artifact.extra.get("kind")
+                    in {
+                        "crypto_metamorphic_input",
+                        "crypto_metamorphic_input_manifest",
+                    }
+                )
+            ]
+            purposes = {
+                artifact.extra.get("purpose"): artifact
+                for artifact in proof_inputs
+                if artifact.extra.get("kind")
+                == "crypto_metamorphic_input"
+            }
+            manifests = [
+                artifact
+                for artifact in proof_inputs
+                if artifact.extra.get("kind")
+                == "crypto_metamorphic_input_manifest"
+            ]
+            if (
+                len(proof_inputs) != 5
+                or set(purposes)
+                != {
+                    "solver",
+                    "original_parameters",
+                    "variant_parameters",
+                    "variant_expected_output",
+                }
+                or len(manifests) != 1
+                or purposes["solver"].sha256
+                != evaluation["solver_artifact_sha256"]
+                or purposes["original_parameters"].sha256
+                != original["parameters_sha256"]
+                or purposes["original_parameters"].size
+                != original["parameters_size_bytes"]
+                or purposes["variant_parameters"].sha256
+                != variant["parameters_sha256"]
+                or purposes["variant_parameters"].size
+                != variant["parameters_size_bytes"]
+                or purposes["variant_expected_output"].sha256
+                != evaluation["oracle_artifact_sha256"]
+                or purposes["variant_expected_output"].size
+                != variant["expected_output_size_bytes"]
+                or any(
+                    artifact.source_run_id is not None
+                    for artifact in proof_inputs
+                )
+                or purposes["variant_expected_output"].extra.get(
+                    "context_visibility"
+                )
+                != "engine_private"
+                or manifests[0].extra
+                != {
+                    "context_visibility": "engine_private",
+                    "kind": "crypto_metamorphic_input_manifest",
+                    "protocol": _CRYPTO_METAMORPHIC_PROTOCOL,
+                }
+            ):
+                raise ModelValidationError(
+                    "proof input artifact graph is invalid"
+                )
+
+            if (
+                proof_result["passed"] is not evaluation["passed"]
+                or proof_result["candidate"] != candidate.value
+                or proof_result["policy_mode"]
+                != _CRYPTO_METAMORPHIC_PROTOCOL
+                or proof_result["source_manifest_sha256"]
+                != evaluation["source_manifest_sha256"]
+                or type(proof_result["run_ids"]) not in {list, tuple}
+                or tuple(proof_result["run_ids"]) != tuple(run_ids)
+                or type(proof_result["failures"]) not in {list, tuple}
+                or tuple(proof_result["failures"])
+                != tuple(failure_codes)
+                or type(proof_result["successful_attempts"]) is not int
+                or type(proof_result["required_attempts"]) is not int
+                or proof_result["required_attempts"] != 6
+                or type(proof_result["total_attempts"]) is not int
+                or proof_result["total_attempts"] != 6
+            ):
+                raise ModelValidationError(
+                    "ProofResult contradicts evaluation"
+                )
+            if authoritative:
+                if (
+                    evaluation["passed"] is not True
+                    or failure_codes
+                    or proof_result["successful_attempts"] != 6
+                    or tuple(candidate.proof_run_ids[-6:])
+                    != tuple(run_ids)
+                    or any(
+                        runs[run_id].status is not RunStatus.COMPLETED
+                        for run_id in run_ids
+                    )
+                    or any(
+                        observation[field] is not expected
+                        for observation in observations
+                        for field, expected in (
+                            ("capture_complete", True),
+                            ("capture_error_present", False),
+                            ("clean_workspace", True),
+                            ("timed_out", False),
+                            ("truncated", False),
+                            ("truncation_known", True),
+                        )
+                    )
+                    or any(
+                        observation[field] != expected
+                        for observation in observations
+                        for field, expected in (
+                            ("ctfwrap_exit_code", 0),
+                            ("orchestration_status", "completed"),
+                            ("runner_exit_code", 0),
+                            ("target_exit_code", 0),
+                        )
+                    )
+                    or any(
+                        observation["result_artifact_sha256"]
+                        != attempts[index][
+                            "expected_output_sha256"
+                        ]
+                        or observation["result_artifact_size_bytes"]
+                        != attempts[index][
+                            "expected_output_size_bytes"
+                        ]
+                        for index, observation in enumerate(observations)
+                    )
+                ):
+                    raise ModelValidationError(
+                        "authoritative READY evidence does not pass"
+                    )
+                matching_markers = [
+                    marker
+                    for marker in state.progress_markers
+                    if (
+                        marker.extra.get("adapter_marker")
+                        == "metamorphic_variant_verified"
+                        and marker.extra.get("protocol")
+                        == _CRYPTO_METAMORPHIC_PROTOCOL
+                        and marker.extra.get("oracle_authority")
+                        == "explicit_operator_input"
+                        and marker.run_id == run_ids[-1]
+                        and marker.artifact_ids
+                        == [evaluation_artifact.id]
+                    )
+                ]
+                if len(matching_markers) != 1:
+                    raise ModelValidationError(
+                        "authoritative proof lacks one exact progress marker"
+                    )
+        except (
+            KeyError,
+            ModelValidationError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} is invalid: {error}")
+    return errors
+
+
 @dataclass
 class ChallengeState:
     contest_id: str
@@ -8964,6 +10926,10 @@ class ChallengeState:
                 elif fact.artifact_id in artifacts and (
                     artifacts[fact.artifact_id].source_run_id
                     != fact.source_run_id
+                    and not (
+                        self.schema_version >= STATE_SCHEMA_VERSION
+                        and _pwn_ip_control_fact_marker(fact)
+                    )
                 ):
                     errors.append(
                         f"executed fact {fact.id} artifact/run mismatch"
@@ -10168,7 +12134,15 @@ class ChallengeState:
                     receipt.experiment_id in seen_receipt_experiments
                     and (
                         experiment is None
-                        or not _pwn_crash_experiment_marker(experiment)
+                        or (
+                            not _pwn_crash_experiment_marker(experiment)
+                            and not (
+                                self.schema_version >= STATE_SCHEMA_VERSION
+                                and _pwn_ip_control_experiment_marker(
+                                    experiment
+                                )
+                            )
+                        )
                     )
                 ):
                     errors.append(
@@ -10763,7 +12737,26 @@ class ChallengeState:
                 )
             )
             errors.extend(
+                _pwn_ip_control_state_errors(
+                    self,
+                    experiments=experiments,
+                    runs=runs,
+                    receipts=receipts,
+                    artifacts=artifacts,
+                    facts=facts,
+                    candidates=candidates,
+                )
+            )
+            errors.extend(
                 _rev_proof_state_errors(
+                    self,
+                    runs=runs,
+                    artifacts=artifacts,
+                    candidates=candidates,
+                )
+            )
+            errors.extend(
+                _crypto_metamorphic_state_errors(
                     self,
                     runs=runs,
                     artifacts=artifacts,

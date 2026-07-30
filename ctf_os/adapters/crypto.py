@@ -27,6 +27,10 @@ class CryptoAdapter(GenericAdapter):
                 ("known_attack_matched", "known attack conditions matched"),
                 ("sweep_bounded", "parameter sweep bounded"),
                 ("plaintext_recovered", "plaintext recovered"),
+                (
+                    "metamorphic_variant_verified",
+                    "changed-parameter variant verified",
+                ),
             )
         )
 
@@ -35,7 +39,11 @@ class CryptoAdapter(GenericAdapter):
             mode="sample_matrix",
             clean_repetitions=3,
             remote_repetitions=1 if remote else 0,
-            notes="preserve per-sample successes and failures separately",
+            notes=(
+                "preserve per-sample successes and failures separately; "
+                "candidate promotion requires the six-run "
+                "crypto_solver_metamorphic_variant_v1 contract"
+            ),
         )
 
     def failure_labels(self) -> tuple[str, ...]:
@@ -45,6 +53,9 @@ class CryptoAdapter(GenericAdapter):
             "abstract_only_reference",
             "reimplemented_known_primitive",
             "sample_overfit",
+            "metamorphic_variant_failed",
+            "solver_nondeterministic",
+            "runtime_unpinned",
         )
 
     def captain_guidance(self) -> str:
@@ -52,6 +63,10 @@ class CryptoAdapter(GenericAdapter):
             "Classify the paradigm before writing a solver. Preserve full source "
             "documents with hashes when external knowledge is needed; abstracts "
             "alone are insufficient. Prefer vetted Sage/flatter implementations "
-            "for lattice and finite-field operations."
+            "for lattice and finite-field operations. Preserve the solver, "
+            "runtime fingerprint, inputs, outputs, and assumptions as one "
+            "replayable workspace. A candidate is not Crypto proof until "
+            "crypto_solver_metamorphic_variant_v1 passes three clean original "
+            "runs and three clean runs of an independently expected, changed-"
+            "parameter variant."
         )
-
