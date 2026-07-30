@@ -174,6 +174,7 @@ MANAGED_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
 MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND = "prove_pwn_exploit_effect"
 MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND = "rev_accepted_input"
 MANAGED_WEB_IMPACT_ACTION_KIND = "prove_web_impact"
+MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND = "prove_web_active_probe"
 MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND = "prove_crypto_metamorphic"
 MANAGED_FORENSIC_ASSERTION_ACTION_KIND = "prove_forensic_assertion"
 MANAGED_MISC_TRANSFORM_ACTION_KIND = "evaluate_misc_transform"
@@ -181,6 +182,7 @@ MANAGED_TYPED_GATE_ACTION_KINDS = (
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_WEB_IMPACT_ACTION_KIND,
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
     MANAGED_MISC_TRANSFORM_ACTION_KIND,
@@ -524,7 +526,10 @@ def role_output_schema(
                     }
                 )
                 continue
-            if action_kind == MANAGED_WEB_IMPACT_ACTION_KIND:
+            if action_kind in {
+                MANAGED_WEB_IMPACT_ACTION_KIND,
+                MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
+            }:
                 action_variants.append(
                     {
                         "type": "object",
@@ -1575,6 +1580,14 @@ def validate_role_output(
                         "hypothesis_ids",
                         "timeout_seconds",
                     },
+                    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: {
+                        "kind",
+                        "description",
+                        "operator_spec_artifact_path",
+                        "driver_artifact_path",
+                        "hypothesis_ids",
+                        "timeout_seconds",
+                    },
                     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: {
                         "kind",
                         "description",
@@ -1662,6 +1675,7 @@ def validate_role_output(
                 timeout_limits = {
                     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
                     MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
+                    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: 86_400,
                     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
                 }
                 if kind in timeout_limits:
@@ -2039,8 +2053,9 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "Supply only canonical candidate, experiment, and hypothesis "
                 "IDs already present in state or proposed by this run. Never "
                 "supply a verdict: the engine alone executes and reduces the "
-                "Pwn effect, Rev accepted-input, Web impact, Crypto "
-                "metamorphic, Forensic assertion, or Misc DAG gate. For "
+                "Pwn effect, Rev accepted-input, Web impact or active "
+                "race/OOB, Crypto metamorphic, Forensic assertion, or Misc "
+                "DAG gate. For "
                 "rev_accepted_input, keep the accepted bytes only in the "
                 "reported artifact: output exactly its relative pointer and "
                 "SHA-256, the canonical operator-spec pointer and SHA-256, "

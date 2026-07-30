@@ -36,6 +36,7 @@ from ctf_os.codex.contracts import (
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_TYPED_GATE_ACTION_KINDS,
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
     MANAGED_WEB_IMPACT_ACTION_KIND,
 )
 from ctf_os.contracts.managed_rejection_v1 import (
@@ -174,6 +175,7 @@ _MANAGED_TYPED_GATE_CATEGORIES = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: "pwn",
     MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: "reversing",
     MANAGED_WEB_IMPACT_ACTION_KIND: "web",
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: "web",
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: "crypto",
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: "forensics",
     MANAGED_MISC_TRANSFORM_ACTION_KIND: "misc",
@@ -187,6 +189,10 @@ _MANAGED_TYPED_GATE_PATH_FIELDS = {
         "accepted_input_artifact_path",
     ),
     MANAGED_WEB_IMPACT_ACTION_KIND: (
+        "operator_spec_artifact_path",
+        "driver_artifact_path",
+    ),
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: (
         "operator_spec_artifact_path",
         "driver_artifact_path",
     ),
@@ -234,6 +240,16 @@ _MANAGED_TYPED_GATE_KEYS = {
             "timeout_seconds",
         }
     ),
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "description",
+            "operator_spec_artifact_path",
+            "driver_artifact_path",
+            "hypothesis_ids",
+            "timeout_seconds",
+        }
+    ),
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: frozenset(
         {
             "kind",
@@ -268,6 +284,7 @@ _MANAGED_TYPED_GATE_KEYS = {
 _MANAGED_TYPED_GATE_TIMEOUT_LIMITS = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: 3600,
     MANAGED_WEB_IMPACT_ACTION_KIND: 86_400,
+    MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND: 86_400,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: 86_400,
 }
 
@@ -2358,6 +2375,33 @@ class ManagedOrchestrator:
                 passed = bool(evaluation.confirmed)
                 reason_codes = tuple(evaluation.reason_codes)
                 evaluation_sha256 = str(evaluation.sha256)
+            elif kind == MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND:
+                _state, evaluation = (
+                    self.engine.prove_web_active_probe(
+                        identity,
+                        operator_spec_locator=locators[
+                            "operator_spec_artifact_path"
+                        ],
+                        driver_locator=locators[
+                            "driver_artifact_path"
+                        ],
+                        hypothesis_ids=tuple(
+                            request["hypothesis_ids"]
+                        ),
+                        timeout_seconds=int(
+                            request["timeout_seconds"]
+                        ),
+                        _session_owned=True,
+                    )
+                )
+                passed = evaluation["confirmed"] is True
+                reason_codes = tuple(
+                    str(item)
+                    for item in evaluation["reason_codes"]
+                )
+                evaluation_sha256 = str(
+                    evaluation["evaluation_sha256"]
+                )
             elif kind == MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND:
                 _state, evaluation = (
                     self.engine.prove_crypto_metamorphic_candidate(
@@ -3326,6 +3370,7 @@ class ManagedOrchestrator:
                 }
             elif kind in {
                 MANAGED_WEB_IMPACT_ACTION_KIND,
+                MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
                 MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
             }:
                 timeout = action.get("timeout_seconds")

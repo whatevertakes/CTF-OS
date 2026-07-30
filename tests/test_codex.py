@@ -608,6 +608,14 @@ class ContractTests(unittest.TestCase):
                 "hypothesis_ids": ["H-web"],
                 "timeout_seconds": 900,
             },
+            "prove_web_active_probe": {
+                "kind": "prove_web_active_probe",
+                "description": "Run the exact race/OOB differential plan.",
+                "operator_spec_artifact_path": "web/active-spec.json",
+                "driver_artifact_path": "web/active-driver.json",
+                "hypothesis_ids": ["H-web-active"],
+                "timeout_seconds": 900,
+            },
             "prove_crypto_metamorphic": {
                 "kind": "prove_crypto_metamorphic",
                 "description": "Run the original and mutated parameters.",

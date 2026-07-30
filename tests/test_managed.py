@@ -5416,6 +5416,21 @@ class ManagedTypedGateTests(unittest.TestCase):
                 },
             ),
             (
+                "web",
+                {
+                    "kind": "prove_web_active_probe",
+                    "description": "prove bounded race/OOB impact",
+                    "operator_spec_artifact_path": (
+                        "web/active-spec.json"
+                    ),
+                    "driver_artifact_path": (
+                        "web/active-driver.json"
+                    ),
+                    "hypothesis_ids": ["local-web-active"],
+                    "timeout_seconds": 900,
+                },
+            ),
+            (
                 "crypto",
                 {
                     "kind": "prove_crypto_metamorphic",
@@ -5758,6 +5773,72 @@ class ManagedTypedGateTests(unittest.TestCase):
             "managed_typed_gate_nonpass",
         )
         self.assertIn(experiment_id, capsule.failed_experiment_ids)
+
+    def test_web_active_probe_dispatch_uses_engine_owned_matrix(self):
+        action = {
+            "kind": "prove_web_active_probe",
+            "description": "prove bounded race impact",
+            "operator_spec_artifact_path": "web/active-spec.json",
+            "driver_artifact_path": "web/active-driver.json",
+            "hypothesis_ids": [],
+            "timeout_seconds": 900,
+        }
+        (
+            engine,
+            orchestrator,
+            identity,
+            _session_id,
+            _cycle,
+            _wave,
+            _result,
+            _publish,
+            registration,
+        ) = self.fixture(
+            suffix="active-dispatch",
+            category="web",
+            action=action,
+        )
+        experiment_id = registration.experiment_ids[0]
+        before = engine.store.load(identity)
+        evaluation = {
+            "authorities": {
+                "candidate_authorized": False,
+                "submission_authorized": False,
+            },
+            "confirmed": True,
+            "evaluation_sha256": "a" * 64,
+            "reason_codes": [],
+        }
+        with mock.patch.object(
+            engine,
+            "prove_web_active_probe",
+            return_value=(before, evaluation),
+        ) as prove:
+            state = orchestrator._execute_typed_gate_experiment(
+                identity,
+                experiment_id,
+            )
+        prove.assert_called_once_with(
+            identity,
+            operator_spec_locator="web/active-spec.json",
+            driver_locator="web/active-driver.json",
+            hypothesis_ids=(),
+            timeout_seconds=900,
+            _session_owned=True,
+        )
+        experiment = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.COMPLETED)
+        self.assertTrue(experiment.result["passed"])
+        self.assertEqual(
+            experiment.result["evaluation_sha256"],
+            "a" * 64,
+        )
+        self.assertEqual(state.candidates, before.candidates)
+        self.assertEqual(state.submissions, before.submissions)
 
     def test_gate_exception_is_bounded_and_never_uses_model_verdict(self):
         action = {
