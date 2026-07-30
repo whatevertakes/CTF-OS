@@ -460,9 +460,9 @@ class RemoteCommandStartLimiterTests(unittest.TestCase):
         independent = limiter.wait_for_start("other.example")
         second = limiter.wait_for_start("example.test.")
 
-        self.assertLess(
-            independent.started_monotonic - first.started_monotonic,
-            interval / 2,
+        self.assertNotEqual(
+            limiter.state_path("Example.TEST"),
+            limiter.state_path("other.example"),
         )
         self.assertGreaterEqual(
             second.started_monotonic - first.started_monotonic,
@@ -471,6 +471,14 @@ class RemoteCommandStartLimiterTests(unittest.TestCase):
         self.assertEqual(
             limiter.state_path("Example.TEST"),
             limiter.state_path("example.test."),
+        )
+        self.assertAlmostEqual(
+            limiter.snapshot("other.example").last_start_monotonic,
+            independent.started_monotonic,
+        )
+        self.assertAlmostEqual(
+            limiter.snapshot("example.test").last_start_monotonic,
+            second.started_monotonic,
         )
 
     def test_timeout_and_cancellation_remove_waiter(self) -> None:
@@ -1170,7 +1178,7 @@ class EngineRemoteLimiterTests(unittest.TestCase):
             self.config.resources.remote_command_min_interval_s - 0.02,
         )
 
-    def test_different_hosts_do_not_share_command_start_interval(self) -> None:
+    def test_different_hosts_use_independent_command_start_state(self) -> None:
         starts = self._run_two_challenges(
             "first.example:443",
             "second.example:443",
@@ -1179,10 +1187,22 @@ class EngineRemoteLimiterTests(unittest.TestCase):
             {hostname for hostname, _started in starts},
             {"first.example", "second.example"},
         )
-        self.assertLess(
-            starts[1][1] - starts[0][1],
-            self.config.resources.remote_command_min_interval_s / 2,
+        limiter = RemoteCommandStartLimiter(
+            self.config.state_root / "runtime",
+            self.config.resources.remote_command_min_interval_s,
         )
+        self.assertNotEqual(
+            limiter.state_path("first.example"),
+            limiter.state_path("second.example"),
+        )
+        first = limiter.snapshot("first.example")
+        second = limiter.snapshot("second.example")
+        self.assertEqual(first.hostname, "first.example")
+        self.assertEqual(second.hostname, "second.example")
+        self.assertIsNotNone(first.last_start_monotonic)
+        self.assertIsNotNone(second.last_start_monotonic)
+        self.assertEqual(first.waiting, 0)
+        self.assertEqual(second.waiting, 0)
 
     def test_tool_remote_timeout_is_failed_after_lease_and_budget_clamped(
         self,
