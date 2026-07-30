@@ -23873,6 +23873,30 @@ class ChallengeEngine:
             _session_owned=_session_owned,
         )
 
+    def prove_forensic_assertion(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        operator_spec_locator: str,
+        hypothesis_ids: Sequence[str] = (),
+        timeout_seconds: int = 900,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, Any]:
+        """Execute one operator-issued, independently corroborated assertion."""
+
+        from ctf_os.engine.forensic_assertion_hotpath import (
+            execute_forensic_assertion_hotpath,
+        )
+
+        return execute_forensic_assertion_hotpath(
+            self,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            hypothesis_ids=tuple(hypothesis_ids),
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
     def prove_crypto_metamorphic_candidate(
         self,
         identity: ChallengeIdentity,

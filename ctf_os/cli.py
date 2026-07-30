@@ -1034,6 +1034,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web_prove.add_argument("--timeout", type=int, default=900)
 
+    forensic_prove = commands.add_parser(
+        "forensic-prove",
+        help=(
+            "운영자 assertion spec을 증거 index와 결속하고 독립 tool "
+            "family의 격리 실행으로 교차 검증"
+        ),
+    )
+    _identity_values(forensic_prove)
+    forensic_prove.add_argument("--spec", required=True)
+    forensic_prove.add_argument(
+        "--hypothesis",
+        action="append",
+        default=[],
+    )
+    forensic_prove.add_argument("--timeout", type=int, default=900)
+
     crypto_prove = commands.add_parser(
         "crypto-prove",
         help=(
@@ -1952,6 +1968,32 @@ def main(
                     "reason_codes": list(result.reason_codes),
                     "replay_count": len(result.records),
                     "semantic_evaluation_sha256": semantic_sha256,
+                    "state_revision": state.revision,
+                    "verdict": result.verdict.value,
+                }
+            )
+            return 0 if result.confirmed else 1
+
+        if args.command == "forensic-prove":
+            state, result = engine.prove_forensic_assertion(
+                _identity(args),
+                operator_spec_locator=args.spec,
+                hypothesis_ids=tuple(args.hypothesis),
+                timeout_seconds=args.timeout,
+            )
+            document = result.to_dict()
+            _print_json(
+                {
+                    "authorities": document["authorities"],
+                    "confirmed": result.confirmed,
+                    "execution_plan_sha256": (
+                        result.execution_plan_sha256
+                    ),
+                    "reason_codes": list(result.reason_codes),
+                    "record_count": len(result.records),
+                    "semantic_evaluation_sha256": document[
+                        "semantic_evaluation_sha256"
+                    ],
                     "state_revision": state.revision,
                     "verdict": result.verdict.value,
                 }
