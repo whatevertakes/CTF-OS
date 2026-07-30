@@ -30,6 +30,7 @@ from ctf_os.models import (
     Fact,
     ModelValidationError,
     Provenance,
+    PwnRuntimeSnapshotDisclosureEnvelope,
     ReceiptOutcome,
     RunReference,
     RunStatus,
@@ -91,6 +92,8 @@ _PWN_CRASH_TERMINAL_STATUSES = frozenset(
         ExperimentStatus.FAILED,
     }
 )
+_PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR = "pwn_runtime_snapshot_v1"
+_PWN_RUNTIME_SNAPSHOT_RESULT_KEY = "pwn_runtime_snapshot_evidence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +380,120 @@ def _pwn_crash_attempt_links(
     ):
         return None
     return attempts
+
+
+def _pwn_disclosure_projection(
+    state: ChallengeState,
+    *,
+    artifacts: Mapping[str, ArtifactReference],
+    compact: bool,
+) -> dict[str, object] | None:
+    """Project the latest v2 diagnostic without raw addresses or maps."""
+
+    eligible = sorted(
+        (
+            item
+            for item in state.experiments
+            if (
+                item.status is ExperimentStatus.COMPLETED
+                and item.extra.get("engine_executor")
+                == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                and item.extra.get("managed_contract_version") == 2
+                and type(item.result) is dict
+                and set(item.result)
+                == {_PWN_RUNTIME_SNAPSHOT_RESULT_KEY}
+            )
+        ),
+        key=_recent_key,
+        reverse=True,
+    )
+    if not eligible:
+        return None
+    experiment = eligible[0]
+    evidence = experiment.result[_PWN_RUNTIME_SNAPSHOT_RESULT_KEY]
+    if type(evidence) is not dict:
+        raise ModelValidationError(
+            "Pwn disclosure resume evidence is not canonical"
+        )
+    evaluation = evidence.get("evaluation")
+    if type(evaluation) is not dict:
+        raise ModelValidationError(
+            "Pwn disclosure resume evaluation is not canonical"
+        )
+    envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+        experiment.extra.get("pwn_disclosure")
+    )
+    result = envelope.result
+    pointers: list[dict[str, object]] = []
+    for label, key in (
+        ("stdout", "stdout_artifact_id"),
+        ("stderr", "stderr_artifact_id"),
+        ("capability", "capability_attestation_artifact_id"),
+    ):
+        artifact_id = evidence.get(key)
+        artifact = (
+            artifacts.get(artifact_id)
+            if isinstance(artifact_id, str)
+            else None
+        )
+        if (
+            artifact is None
+            or type(artifact.sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", artifact.sha256) is None
+            or type(artifact.size) is not int
+            or artifact.size < 0
+        ):
+            raise ModelValidationError(
+                "Pwn disclosure resume artifact pointer is invalid"
+            )
+        pointers.append(
+            {
+                "artifact_id": artifact.id,
+                "label": label,
+                "path": artifact.path,
+                "sha256": artifact.sha256,
+                "size": artifact.size,
+            }
+        )
+    if compact:
+        projection: dict[str, object] = {
+            "artifact_pointer": pointers[0],
+            "diagnostic_only": True,
+        }
+        if result is None:
+            projection["phase"] = envelope.phase.value
+        return projection
+    projection: dict[str, object] = {
+        "artifact_pointers": pointers,
+        "candidate_count": (
+            len(result.candidates) if result is not None else 0
+        ),
+        "diagnostic_only": True,
+        "evaluation_source_state_revision": (
+            envelope.evaluation_source_state_revision
+        ),
+        "expectation_source_state_revision": (
+            envelope.expectation_source_state_revision
+        ),
+        "experiment_id": experiment.id,
+        "parent_experiment_id": experiment.extra.get(
+            "parent_experiment_id"
+        ),
+        "phase": envelope.phase.value,
+        "result_reason_code": (
+            result.reason_code if result is not None else None
+        ),
+        "result_sha256": envelope.result_sha256,
+        "result_status": (
+            result.status.value if result is not None else None
+        ),
+        "snapshot_reason_code": evaluation.get("reason_code"),
+        "snapshot_status": evaluation.get("status"),
+        "trusted_receipt_expectation_sha256": (
+            envelope.trusted_receipt_expectation_sha256
+        ),
+    }
+    return projection
 
 
 def _pwn_crash_artifact_pointer(
@@ -1740,8 +1857,26 @@ def render_resume_capsule(
     selected_pwn_crash: dict[str, object] | None = None
     compact_pwn_crash: dict[str, object] | None = None
     pwn_crash_is_compact = False
+    pwn_crash_is_checkpoint_pointer = False
+    selected_pwn_disclosure = _pwn_disclosure_projection(
+        state,
+        artifacts=artifacts,
+        compact=False,
+    )
+    compact_pwn_disclosure = _pwn_disclosure_projection(
+        state,
+        artifacts=artifacts,
+        compact=True,
+    )
+    pwn_disclosure_parent_id = (
+        selected_pwn_disclosure.get("parent_experiment_id")
+        if selected_pwn_disclosure is not None
+        else None
+    )
+    pwn_disclosure_is_compact = False
     if terminal_pwn_experiments:
         checkpoint_pwn = _checkpoint_pwn_pointer_experiment(state)
+        pwn_crash_is_checkpoint_pointer = checkpoint_pwn is not None
         latest_pwn = (
             checkpoint_pwn
             if checkpoint_pwn is not None
@@ -1803,6 +1938,8 @@ def render_resume_capsule(
         }
         if selected_pwn_crash is not None:
             result["pwn_crash"] = selected_pwn_crash
+        if selected_pwn_disclosure is not None:
+            result["pwn_disclosure"] = selected_pwn_disclosure
         return result
 
     def render() -> str:
@@ -1835,6 +1972,40 @@ def render_resume_capsule(
         ):
             selected_pwn_crash = compact_pwn_crash
             pwn_crash_is_compact = True
+        elif (
+            selected_pwn_disclosure is not None
+            and compact_pwn_disclosure is not None
+            and not pwn_disclosure_is_compact
+        ):
+            selected_pwn_disclosure = compact_pwn_disclosure
+            pwn_disclosure_is_compact = True
+        elif (
+            selected_pwn_disclosure is not None
+            and selected_pwn_crash is not None
+            and pwn_disclosure_is_compact
+            and pwn_crash_is_compact
+        ):
+            selected_pwn_crash_id = selected_pwn_crash.get(
+                "experiment_id"
+            )
+            if (
+                not pwn_crash_is_checkpoint_pointer
+                and type(pwn_disclosure_parent_id) is str
+                and pwn_disclosure_parent_id == selected_pwn_crash_id
+            ):
+                selected_pwn_crash = None
+                compact_pwn_crash = None
+                selected_pwn_disclosure = {
+                    **selected_pwn_disclosure,
+                    "parent_crash_omitted": True,
+                }
+            else:
+                selected_pwn_disclosure = None
+                compact_pwn_disclosure = None
+                selected_pwn_crash = {
+                    **selected_pwn_crash,
+                    "disclosure_omitted": True,
+                }
         elif len(selected_confirmed) > 1:
             selected_confirmed.pop()
             compact_confirmed.pop()

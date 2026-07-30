@@ -15,6 +15,7 @@ from ctf_os.models import (
     CandidateTier,
     ChallengeState,
     Provenance,
+    PwnRuntimeSnapshotDisclosureEnvelope,
     TargetStatus,
 )
 from ctf_os.engine.resume_capsule import (
@@ -152,30 +153,6 @@ def _pwn_runtime_snapshot_context_records(
         evaluation = evidence.get("evaluation")
         if not isinstance(evaluation, Mapping):
             continue
-        semantic = evaluation.get("semantic_result")
-        snapshot = (
-            semantic.get("snapshot")
-            if isinstance(semantic, Mapping)
-            else None
-        )
-        registers = (
-            snapshot.get("registers")
-            if isinstance(snapshot, Mapping)
-            else None
-        )
-        maps = (
-            snapshot.get("maps")
-            if isinstance(snapshot, Mapping)
-            else None
-        )
-        recipe = experiment.extra.get(
-            "pwn_runtime_snapshot_recipe"
-        )
-        parent = (
-            recipe.get("parent")
-            if isinstance(recipe, Mapping)
-            else None
-        )
         pointers: list[dict[str, object]] = []
         for label, key in (
             ("stdout", "stdout_artifact_id"),
@@ -202,6 +179,103 @@ def _pwn_runtime_snapshot_context_records(
                     "size": artifact.size,
                 }
             )
+        if experiment.extra.get("managed_contract_version") == 2:
+            envelope = (
+                PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                    experiment.extra.get("pwn_disclosure")
+                )
+            )
+            result = envelope.result
+            commitments: list[dict[str, object]] = []
+            if result is not None:
+                for candidate in result.candidates:
+                    candidate_value = candidate.to_dict()
+                    commitments.append(
+                        {
+                            "byte_offset": candidate_value[
+                                "byte_offset"
+                            ],
+                            "hex_width": candidate_value["hex_width"],
+                            "final_value_sha256": candidate_value[
+                                "final_value_sha256"
+                            ],
+                            "replay_value_sha256": candidate_value[
+                                "replay_value_sha256"
+                            ],
+                        }
+                    )
+            records.append(
+                _record(
+                    "pwn_runtime_snapshot_disclosure",
+                    trust="evidence",
+                    diagnostic_only=True,
+                    experiment_id=experiment.id,
+                    parent_experiment_id=experiment.extra.get(
+                        "parent_experiment_id"
+                    ),
+                    state_revision=state.revision,
+                    snapshot_status=evaluation.get("status"),
+                    snapshot_reason_code=evaluation.get(
+                        "reason_code"
+                    ),
+                    disclosure_phase=envelope.phase.value,
+                    expectation_source_state_revision=(
+                        envelope.expectation_source_state_revision
+                    ),
+                    evaluation_source_state_revision=(
+                        envelope.evaluation_source_state_revision
+                    ),
+                    trusted_receipt_expectation_sha256=(
+                        envelope
+                        .trusted_receipt_expectation_sha256
+                    ),
+                    result_status=(
+                        result.status.value
+                        if result is not None
+                        else None
+                    ),
+                    result_reason_code=(
+                        result.reason_code
+                        if result is not None
+                        else None
+                    ),
+                    result_sha256=envelope.result_sha256,
+                    candidate_count=(
+                        len(result.candidates)
+                        if result is not None
+                        else 0
+                    ),
+                    candidate_commitments=commitments,
+                    artifact_pointers=pointers,
+                )
+            )
+            if len(records) == 3:
+                break
+            continue
+        semantic = evaluation.get("semantic_result")
+        snapshot = (
+            semantic.get("snapshot")
+            if isinstance(semantic, Mapping)
+            else None
+        )
+        registers = (
+            snapshot.get("registers")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        maps = (
+            snapshot.get("maps")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        recipe = experiment.extra.get(
+            "pwn_runtime_snapshot_recipe"
+        )
+        parent = (
+            recipe.get("parent")
+            if isinstance(recipe, Mapping)
+            else None
+        )
         records.append(
             _record(
                 "pwn_runtime_snapshot",
