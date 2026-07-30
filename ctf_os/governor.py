@@ -241,9 +241,17 @@ def _run_failure_label(
 
 
 def _logical_locator(artifact: ArtifactReference) -> str | None:
+    # ``source_locator`` is the path inside one challenge-scoped sandbox
+    # capture.  Different sandbox runs may legitimately reuse paths such as
+    # ``.ctf/runs/run-00000001/stdout.log``; treating that run-local path as a
+    # cross-run identity turns distinct immutable snapshots into false churn.
+    #
+    # A worker's ``reported_locator`` (or the legacy explicit ``locator``)
+    # names a logical output across runs.  Without one, retain the canonical
+    # immutable artifact path as the identity, which is already bound to the
+    # producer/run-specific snapshot.
     for value in (
         artifact.extra.get("reported_locator"),
-        artifact.extra.get("source_locator"),
         artifact.extra.get("locator"),
         artifact.path,
     ):

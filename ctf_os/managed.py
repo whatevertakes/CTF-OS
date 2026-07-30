@@ -1678,7 +1678,7 @@ class ManagedOrchestrator:
         *,
         record_stall: bool = True,
     ) -> ChallengeState:
-        """Run different role lanes concurrently while serializing each role."""
+        """Run role lanes, then evaluate stall once for the bounded wave."""
 
         if not selected:
             return self.engine.store.load(identity)
@@ -1713,7 +1713,12 @@ class ManagedOrchestrator:
                 proof_experiments[0].id,
                 _session_owned=True,
             )
-            return self.engine.store.load(identity)
+            completed = self.engine.store.load(identity)
+            return (
+                self.engine._record_stall_if_needed(completed)
+                if record_stall
+                else completed
+            )
         run_roles = {item.id: item.role for item in state.runs}
         lanes: dict[str, list[str]] = {}
         for experiment_id in selected:
@@ -1737,36 +1742,43 @@ class ManagedOrchestrator:
                     experiment_ids=(experiment_id,),
                     _session_owned=True,
                     _automated=True,
-                    _record_stall=record_stall,
+                    # A selected action set is one bounded experiment wave.
+                    # Per-action governor commits can race other lanes and
+                    # freeze a valid wave at an intermediate revision.
+                    _record_stall=False,
                 )
 
         if len(lanes) == 1:
             execute_lane(next(iter(lanes.values())))
-            return self.engine.store.load(identity)
-
-        errors: list[BaseException] = []
-        with ThreadPoolExecutor(
-            max_workers=len(lanes),
-            thread_name_prefix="ctfos-managed-tool",
-        ) as executor:
-            futures = [
-                executor.submit(execute_lane, tuple(experiment_ids))
-                for experiment_ids in lanes.values()
-            ]
-            for future in futures:
-                try:
-                    future.result()
-                except BaseException as error:
-                    errors.append(error)
-        if errors:
-            primary = errors[0]
-            for additional in errors[1:]:
-                primary.add_note(
-                    "additional managed tool lane failed: "
-                    f"{type(additional).__name__}: {additional}"
-                )
-            raise primary
-        return self.engine.store.load(identity)
+        else:
+            errors: list[BaseException] = []
+            with ThreadPoolExecutor(
+                max_workers=len(lanes),
+                thread_name_prefix="ctfos-managed-tool",
+            ) as executor:
+                futures = [
+                    executor.submit(execute_lane, tuple(experiment_ids))
+                    for experiment_ids in lanes.values()
+                ]
+                for future in futures:
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        errors.append(error)
+            if errors:
+                primary = errors[0]
+                for additional in errors[1:]:
+                    primary.add_note(
+                        "additional managed tool lane failed: "
+                        f"{type(additional).__name__}: {additional}"
+                    )
+                raise primary
+        completed = self.engine.store.load(identity)
+        return (
+            self.engine._record_stall_if_needed(completed)
+            if record_stall
+            else completed
+        )
 
     @staticmethod
     def _bounded_pwn_crash_failure_reason(

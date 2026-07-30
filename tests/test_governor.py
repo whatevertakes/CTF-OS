@@ -226,6 +226,38 @@ class GovernorTests(unittest.TestCase):
         self.assertNotIn(StallSignal.ARTIFACT_CHURN, decision.signals)
         self.assertFalse(decision.stalled)
 
+    def test_run_local_source_locator_does_not_merge_distinct_snapshots(
+        self,
+    ) -> None:
+        source_locator = ".ctf/runs/run-00000001/stdout.log"
+        for number, (digest_character, size) in enumerate(
+            (("a", 11), ("b", 22), ("c", 33)),
+            start=1,
+        ):
+            run = self._run(number)
+            self.state.runs.append(run)
+            self.state.artifacts.append(
+                ArtifactReference(
+                    id=f"A-{run.id}-stdout",
+                    path=(
+                        "artifacts/snapshots/"
+                        f"A-{run.id}-stdout.log"
+                    ),
+                    sha256=digest_character * 64,
+                    source_run_id=run.id,
+                    size=size,
+                    extra={
+                        "source_locator": source_locator,
+                        "stream": "stdout",
+                    },
+                )
+            )
+
+        decision = evaluate_stall(self.state)
+
+        self.assertNotIn(StallSignal.ARTIFACT_CHURN, decision.signals)
+        self.assertFalse(decision.stalled)
+
     def test_multiple_signals_still_choose_exactly_one_action(self) -> None:
         for number in range(1, 4):
             self.state.experiments.append(

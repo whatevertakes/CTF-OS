@@ -3604,8 +3604,10 @@ class ManagedV2Tests(unittest.TestCase):
             capability_probe=self.capability,
         )
         observed_controls: list[tuple[bool, bool]] = []
+        stall_evaluation_roles: list[tuple[Role, ...]] = []
         observed_lock = threading.Lock()
         original_execute = engine.execute_registered_experiments
+        original_record_stall = engine._record_stall_if_needed
 
         def observe_execution(*args, **kwargs):
             selected = tuple(kwargs.get("experiment_ids") or ())
@@ -3630,14 +3632,33 @@ class ManagedV2Tests(unittest.TestCase):
                     )
             return original_execute(*args, **kwargs)
 
-        with mock.patch.object(
-            engine,
-            "execute_registered_experiments",
-            side_effect=observe_execution,
+        def observe_stall(state):
+            with executor.lock:
+                stall_evaluation_roles.append(tuple(executor.roles))
+            return original_record_stall(state)
+
+        with (
+            mock.patch.object(
+                engine,
+                "execute_registered_experiments",
+                side_effect=observe_execution,
+            ),
+            mock.patch.object(
+                engine,
+                "_record_stall_if_needed",
+                side_effect=observe_stall,
+            ),
         ):
             state = orchestrator.run_cycle(self.identity)
 
         self.assertIn(Role.CAPTAIN, executor.roles)
+        self.assertTrue(stall_evaluation_roles)
+        self.assertTrue(
+            all(
+                Role.CAPTAIN in roles
+                for roles in stall_evaluation_roles
+            )
+        )
         adapter_controls = {
             record_stall
             for adapter_seed, record_stall in observed_controls
@@ -3649,8 +3670,91 @@ class ManagedV2Tests(unittest.TestCase):
             if not adapter_seed
         }
         self.assertEqual(adapter_controls, {False})
-        self.assertEqual(model_controls, {True})
+        # Selected managed actions also defer their individual commits; their
+        # bounded wave is evaluated once only after every lane has joined.
+        self.assertEqual(model_controls, {False})
         self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+
+    def test_selected_action_wave_records_stall_once_after_all_actions(
+        self,
+    ):
+        engine = self.engine(ProbeRoleExecutor())
+        state = self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            "S-stall-wave",
+        )
+        state = engine.synchronize_managed_adapter_seed_plan(
+            self.identity,
+            session_id,
+        )
+        _state, cycle = orchestrator._reserve_cycle(
+            self.identity,
+            session_id,
+        )
+        selected = tuple(
+            item.id
+            for item in state.experiments
+            if (
+                item.extra.get("adapter_seed") is True
+                and item.status is ExperimentStatus.REGISTERED
+            )
+        )
+        self.assertEqual(len(selected), 3)
+        orchestrator._mark_action_selection(
+            self.identity,
+            session_id,
+            cycle.id,
+            selected,
+        )
+        per_action_controls: list[bool] = []
+        original_execute = engine.execute_registered_experiments
+
+        def observe_execution(*args, **kwargs):
+            if (
+                kwargs.get("experiment_ids")
+                and kwargs.get("_pending_artifact_handoff") is None
+            ):
+                per_action_controls.append(
+                    kwargs.get("_record_stall", True)
+                )
+            return original_execute(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                engine,
+                "execute_registered_experiments",
+                side_effect=observe_execution,
+            ),
+            mock.patch.object(
+                engine,
+                "_record_stall_if_needed",
+                wraps=engine._record_stall_if_needed,
+            ) as record_stall,
+        ):
+            completed = orchestrator._execute_selected_actions(
+                self.identity,
+                selected,
+            )
+
+        self.assertEqual(len(per_action_controls), 3)
+        self.assertEqual(set(per_action_controls), {False})
+        record_stall.assert_called_once()
+        self.assertEqual(
+            record_stall.call_args.args[0].revision,
+            completed.revision,
+        )
+        self.assertTrue(
+            all(
+                item.status is not ExperimentStatus.REGISTERED
+                for item in completed.experiments
+                if item.id in selected
+            )
+        )
 
     def test_managed_receipt_evidence_reaches_first_captain_safely(
         self,
