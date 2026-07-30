@@ -4441,10 +4441,16 @@ class BatchRunnerTests(unittest.TestCase):
         self,
     ) -> None:
         limiter = FifoModelCallLimiter(1)
+        waiter_results = []
+        waiter_finished = threading.Event()
 
         class NeverExecutor:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def run(self, command, *, cwd, timeout, on_stdout_line):
                 del command, cwd, timeout, on_stdout_line
+                self.calls += 1
                 raise AssertionError("a cancelled provider waiter ran")
 
         class WaitingInterruptRunner(BatchRunner):
@@ -4461,7 +4467,10 @@ class BatchRunnerTests(unittest.TestCase):
                             "the sibling did not enter the provider queue"
                         )
                     raise KeyboardInterrupt
-                return super().run(invocation, **kwargs)
+                result = super().run(invocation, **kwargs)
+                waiter_results.append(result)
+                waiter_finished.set()
+                return result
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4484,27 +4493,43 @@ class BatchRunnerTests(unittest.TestCase):
                     ),
                 ],
             )
+            process_executor = NeverExecutor()
             runner = WaitingInterruptRunner(
-                process_executor=NeverExecutor(),
+                process_executor=process_executor,
                 limiter=limiter,
                 limiter_wait_timeout=30,
                 max_schema_retries=0,
             )
             with limiter.slot() as model_call_slot:
                 model_call_slot.acquire()
-                started = time.monotonic()
                 with self.assertRaises(KeyboardInterrupt):
                     BatchWaveRunner(runner).run(wave)
-                elapsed = time.monotonic() - started
-                deadline = time.monotonic() + 1
-                while (
-                    limiter.snapshot().waiting
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.01)
-                self.assertEqual(limiter.snapshot().waiting, 0)
+                # BatchWaveRunner drains admitted workers before propagating the
+                # interrupt. The external holder still owns all capacity here,
+                # so the sibling can only have finished by observing
+                # cancellation (not by acquiring a slot).
+                self.assertTrue(waiter_finished.is_set())
+                self.assertEqual(
+                    limiter.snapshot(),
+                    LimiterSnapshot(1, 1, 0),
+                )
 
-        self.assertLess(elapsed, 0.5)
+        self.assertEqual(process_executor.calls, 0)
+        self.assertEqual(len(waiter_results), 1)
+        waiter_result = waiter_results[0]
+        self.assertFalse(waiter_result.success)
+        self.assertEqual(len(waiter_result.attempts), 1)
+        self.assertEqual(waiter_result.attempts[0].returncode, 130)
+        self.assertFalse(waiter_result.attempts[0].timed_out)
+        self.assertIn(
+            "model_call_cancelled",
+            {failure.kind for failure in waiter_result.failures},
+        )
+        self.assertNotIn(
+            "model_call_wait_timeout",
+            {failure.kind for failure in waiter_result.failures},
+        )
+        self.assertEqual(limiter.snapshot(), LimiterSnapshot(1, 0, 0))
 
 
 @unittest.skipUnless(os.name == "posix" and Path("/proc").exists(), "requires Linux /proc")
