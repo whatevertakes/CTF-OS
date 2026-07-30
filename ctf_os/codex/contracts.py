@@ -170,6 +170,7 @@ STATUS_VALUES = ("ok", "blocked", "needs_human", "refused")
 NEXT_STAGE_VALUES = ("discover", "attack", "proof", "pause", "complete", "needs_human")
 ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", "none")
 MANAGED_PROOF_ACTION_KIND = "prove_candidate"
+MANAGED_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
 PROOF_INPUT_PURPOSE_VALUES = (
     "reproducer",
     "fixture",
@@ -207,6 +208,8 @@ def role_output_schema(
     )
     if contract_version == 2 and role is Role.REPRODUCER:
         action_kinds = (*action_kinds, MANAGED_PROOF_ACTION_KIND)
+    if contract_version == 2 and role is Role.BUILDER:
+        action_kinds = (*action_kinds, MANAGED_PWN_CRASH_ACTION_KIND)
     decision_schema: dict[str, Any]
     if role is Role.CAPTAIN:
         decision_schema = {
@@ -318,6 +321,39 @@ def role_output_schema(
         )
         action_variants: list[dict[str, Any]] = []
         for action_kind in action_kinds:
+            if action_kind == MANAGED_PWN_CRASH_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "description",
+                            "payload_artifact_path",
+                            "hypothesis_id",
+                        ],
+                        "properties": {
+                            "kind": {
+                                "enum": [
+                                    MANAGED_PWN_CRASH_ACTION_KIND
+                                ]
+                            },
+                            "description": {"type": "string"},
+                            "payload_artifact_path": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                            "hypothesis_id": {
+                                "type": "string",
+                                "pattern": (
+                                    r"^[A-Za-z0-9]"
+                                    r"[A-Za-z0-9_.:-]{0,255}$"
+                                ),
+                            },
+                        },
+                    }
+                )
+                continue
             if action_kind == MANAGED_PROOF_ACTION_KIND:
                 action_variants.append(
                     {
@@ -1022,6 +1058,39 @@ def validate_role_output(
                 errors.append(f"{path}: expected object")
                 continue
             kind = item.get("kind")
+            if kind == MANAGED_PWN_CRASH_ACTION_KIND:
+                crash_keys = {
+                    "kind",
+                    "description",
+                    "payload_artifact_path",
+                    "hypothesis_id",
+                }
+                _exact_keys(item, crash_keys, path, errors)
+                if contract_version != 2 or role is not Role.BUILDER:
+                    errors.append(
+                        f"{path}.kind: verify_pwn_crash is restricted to "
+                        "the v2 builder"
+                    )
+                if not isinstance(item.get("description"), str):
+                    errors.append(
+                        f"{path}.description: expected string"
+                    )
+                artifact_path = item.get("payload_artifact_path")
+                if (
+                    not isinstance(artifact_path, str)
+                    or not _valid_relative_path(artifact_path)
+                ):
+                    errors.append(
+                        f"{path}.payload_artifact_path: expected safe "
+                        "relative path"
+                    )
+                hypothesis_id = item.get("hypothesis_id")
+                if (
+                    not isinstance(hypothesis_id, str)
+                    or not _REFERENCE_ID_RE.fullmatch(hypothesis_id)
+                ):
+                    errors.append(f"{path}.hypothesis_id: invalid id")
+                continue
             if kind == MANAGED_PROOF_ACTION_KIND:
                 proof_keys = {
                     "kind",
@@ -1399,6 +1468,14 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "artifacts. The engine owns proof repetitions and oracle "
                 "policy."
                 if role is Role.REPRODUCER
+                else ""
+            ),
+            (
+                "When the schema offers verify_pwn_crash, point only to one "
+                "reported non-empty PoC artifact and one active hypothesis. "
+                "Do not supply a command, target, signal, or verdict; the "
+                "engine owns differential execution and classification."
+                if role is Role.BUILDER
                 else ""
             ),
             "Use only these provenance values: executed, tool_inferred, model_claimed, "

@@ -509,6 +509,83 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("unexpected keys", "\n".join(result.errors))
 
+    def test_managed_pwn_crash_action_is_minimal_and_builder_only(
+        self,
+    ) -> None:
+        payload = valid_payload(Role.BUILDER)
+        payload["schema_version"] = 2
+        payload["hypotheses"] = []
+        payload["actions"] = [
+            {
+                "kind": "verify_pwn_crash",
+                "description": "Check the reported stdin PoC.",
+                "payload_artifact_path": "artifacts/workspace/crash.bin",
+                "hypothesis_id": "hyp-crash",
+            }
+        ]
+
+        result = validate_role_output(
+            payload,
+            Role.BUILDER,
+            contract_version=2,
+        )
+
+        self.assertTrue(result.valid, result.errors)
+        schema = role_output_schema(
+            Role.BUILDER,
+            contract_version=2,
+        )
+        variants = {
+            item["properties"]["kind"]["enum"][0]: item
+            for item in schema["properties"]["actions"]["items"]["anyOf"]
+        }
+        crash = variants["verify_pwn_crash"]
+        self.assertEqual(
+            set(crash["properties"]),
+            {
+                "kind",
+                "description",
+                "payload_artifact_path",
+                "hypothesis_id",
+            },
+        )
+
+        escaped = copy.deepcopy(payload)
+        escaped["actions"][0]["payload_artifact_path"] = "../crash.bin"
+        result = validate_role_output(
+            escaped,
+            Role.BUILDER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "expected safe relative path",
+            "\n".join(result.errors),
+        )
+
+        wrong_role = copy.deepcopy(payload)
+        wrong_role["role"] = Role.REPRODUCER.value
+        result = validate_role_output(
+            wrong_role,
+            Role.REPRODUCER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "restricted to the v2 builder",
+            "\n".join(result.errors),
+        )
+
+        injected = copy.deepcopy(payload)
+        injected["actions"][0]["command"] = "kill -SEGV $$"
+        result = validate_role_output(
+            injected,
+            Role.BUILDER,
+            contract_version=2,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("unexpected keys", "\n".join(result.errors))
+
     def test_contract_rejects_extra_keys_wrong_decision_and_readonly_write(self) -> None:
         payload = valid_payload(Role.FALSIFIER)
         payload["extra"] = True

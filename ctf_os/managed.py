@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 from ctf_os.capabilities import (
@@ -19,6 +20,14 @@ from ctf_os.capabilities import (
     inspect_pinned_capabilities,
 )
 from ctf_os.codex import Role
+from ctf_os.codex.contracts import MANAGED_PWN_CRASH_ACTION_KIND
+from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+    PWN_CRASH_V1_CONTRACT_ID,
+    PWN_CRASH_V1_CONTRACT_VERSION,
+    PWN_CRASH_V1_MAX_INPUT_BYTES,
+    PWN_CRASH_V1_PROTOCOL,
+)
 from ctf_os.engine.challenge import (
     WAVE_ROLES,
     ChallengeEngine,
@@ -81,6 +90,9 @@ _TERMINAL_RUN_STATUSES = frozenset(
         RunStatus.INTERRUPTED,
     }
 )
+_PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
+_PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
+_MAX_MANAGED_REJECTED_ACTIONS = 64
 
 
 class ManagedError(EngineError):
@@ -132,6 +144,29 @@ def _bounded_checkpoint_note(*parts: str | None) -> str:
         encoded[: 4096 - len(suffix)].decode("utf-8", errors="ignore")
         + suffix.decode("utf-8")
     )
+
+
+def _safe_managed_artifact_locator(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw_parts = value.split("/")
+    path = PurePosixPath(value)
+    if (
+        not value
+        or value == "."
+        or "\x00" in value
+        or "\\" in value
+        or len(value.encode("utf-8")) > 4096
+        or path.is_absolute()
+        or ".." in path.parts
+        or any(
+            part in {"", ".", ".."}
+            or len(part.encode("utf-8")) > 255
+            for part in raw_parts
+        )
+    ):
+        return None
+    return value
 
 
 class ManagedOrchestrator:
@@ -834,6 +869,288 @@ class ManagedOrchestrator:
                     relative,
                 ),
             )
+
+    def _register_pwn_crash_actions(
+        self,
+        identity: ChallengeIdentity,
+        wave: ManagedWave,
+        results: Sequence[Any],
+    ) -> ChallengeState:
+        """Turn one v2 Builder request into an engine-owned crash proposal."""
+
+        proposals: list[tuple[Any, int, Mapping[str, Any]]] = []
+        for result in results:
+            output = result.output
+            actions = (
+                output.get("actions")
+                if isinstance(output, Mapping)
+                else None
+            )
+            if not isinstance(actions, list):
+                continue
+            for index, action in enumerate(actions, start=1):
+                if (
+                    isinstance(action, Mapping)
+                    and action.get("kind")
+                    == MANAGED_PWN_CRASH_ACTION_KIND
+                ):
+                    proposals.append((result, index, action))
+        if not proposals:
+            return self.engine.store.load(identity)
+
+        current = self.engine.store.load(identity)
+
+        def apply(state: ChallengeState) -> None:
+            self._require_epoch(state, wave.session_id)
+            canonical_wave = next(
+                (item for item in state.waves if item.id == wave.id),
+                None,
+            )
+            if canonical_wave is None:
+                raise ManagedError(
+                    f"unknown managed wave for Pwn crash action: {wave.id}"
+                )
+
+            for result, index, action in proposals:
+                invocation = result.invocation
+                run = next(
+                    (
+                        item
+                        for item in state.runs
+                        if item.id == invocation.run_id
+                    ),
+                    None,
+                )
+                if run is None:
+                    raise ManagedError(
+                        "Pwn crash action references an unknown managed run: "
+                        f"{invocation.run_id}"
+                    )
+
+                def reject(reason: str) -> None:
+                    bucket = run.extra.setdefault("rejected_actions", [])
+                    if isinstance(bucket, list):
+                        entry = {
+                            "action": str(index),
+                            "reason": reason[:1024],
+                        }
+                        if len(bucket) > _MAX_MANAGED_REJECTED_ACTIONS:
+                            del bucket[_MAX_MANAGED_REJECTED_ACTIONS:]
+                        if (
+                            entry not in bucket
+                            and len(bucket) < _MAX_MANAGED_REJECTED_ACTIONS
+                        ):
+                            bucket.append(entry)
+
+                if state.category.strip().casefold() != "pwn":
+                    reject("verify_pwn_crash is restricted to category pwn")
+                    continue
+                if canonical_wave.kind is not WaveKind.ATTACK:
+                    reject(
+                        "verify_pwn_crash is restricted to an ATTACK wave"
+                    )
+                    continue
+                if (
+                    invocation.role is not Role.BUILDER
+                    or canonical_wave.role_run_ids.get("builder")
+                    != invocation.run_id
+                    or run.role != Role.BUILDER.value
+                ):
+                    reject(
+                        "verify_pwn_crash is restricted to the reserved "
+                        "ATTACK Builder"
+                    )
+                    continue
+                if invocation.contract_version != 2:
+                    reject("verify_pwn_crash requires the v2 role contract")
+                    continue
+                if (
+                    run.origin is not RunOrigin.MANAGED_MODEL
+                    or run.wave_id != canonical_wave.id
+                    or run.session_id != canonical_wave.session_id
+                    or run.cycle_id != canonical_wave.cycle_id
+                    or run.configuration_epoch != state.configuration_epoch
+                    or run.status is not RunStatus.COMPLETED
+                    or run.extra.get("semantic_merge") is not True
+                ):
+                    reject(
+                        "verify_pwn_crash requires the current semantically "
+                        "merged Builder result"
+                    )
+                    continue
+
+                payload_locator = _safe_managed_artifact_locator(
+                    action.get("payload_artifact_path")
+                )
+                if payload_locator is None:
+                    reject(
+                        "verify_pwn_crash payload locator is not a safe "
+                        "relative path"
+                    )
+                    continue
+                payload_matches = [
+                    artifact
+                    for artifact in state.artifacts
+                    if artifact.source_run_id == invocation.run_id
+                    and artifact.extra.get("reported_locator")
+                    == payload_locator
+                ]
+                if len(payload_matches) != 1:
+                    reject(
+                        "verify_pwn_crash payload locator must resolve to "
+                        "exactly one normalized artifact from the current "
+                        f"Builder result; observed {len(payload_matches)}"
+                    )
+                    continue
+                payload = payload_matches[0]
+                if (
+                    type(payload.size) is not int
+                    or payload.size <= 0
+                    or payload.size > PWN_CRASH_V1_MAX_INPUT_BYTES
+                ):
+                    reject(
+                        "verify_pwn_crash payload artifact must be non-empty "
+                        f"and at most {PWN_CRASH_V1_MAX_INPUT_BYTES} bytes"
+                    )
+                    continue
+
+                requested_hypothesis = action.get("hypothesis_id")
+                if not isinstance(requested_hypothesis, str):
+                    reject(
+                        "verify_pwn_crash hypothesis_id must be a string"
+                    )
+                    continue
+                local_hypothesis_ids = {
+                    str(item.get("id"))
+                    for item in (
+                        result.output.get("hypotheses", [])
+                        if isinstance(result.output, Mapping)
+                        else []
+                    )
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("id"), str)
+                }
+                hypothesis_matches = {
+                    hypothesis.id
+                    for hypothesis in state.hypotheses
+                    if (
+                        hypothesis.status in ACTIVE_HYPOTHESIS_STATUSES
+                        and (
+                            hypothesis.id == requested_hypothesis
+                            or (
+                                requested_hypothesis
+                                in local_hypothesis_ids
+                                and hypothesis.id
+                                == (
+                                    f"H-{invocation.run_id}-"
+                                    f"{requested_hypothesis}"
+                                )
+                                and hypothesis.source_run_id
+                                == invocation.run_id
+                            )
+                        )
+                    )
+                }
+                if len(hypothesis_matches) != 1:
+                    reject(
+                        "verify_pwn_crash hypothesis_id must resolve to "
+                        "exactly one active local or canonical hypothesis"
+                    )
+                    continue
+                hypothesis_id = next(iter(hypothesis_matches))
+
+                experiment_id = _stable_id(
+                    "E",
+                    identity.key,
+                    canonical_wave.id,
+                    invocation.run_id,
+                    index,
+                )
+                existing = next(
+                    (
+                        item
+                        for item in state.experiments
+                        if item.id == experiment_id
+                    ),
+                    None,
+                )
+                request = {
+                    "schema_version": 1,
+                    "contract_id": PWN_CRASH_V1_CONTRACT_ID,
+                    "contract_version": PWN_CRASH_V1_CONTRACT_VERSION,
+                    "contract_fingerprint": (
+                        PWN_CRASH_V1_CONTRACT_FINGERPRINT
+                    ),
+                    "protocol": PWN_CRASH_V1_PROTOCOL,
+                    "configuration_epoch": state.configuration_epoch,
+                    "payload_artifact_id": payload.id,
+                    "payload_reported_locator": payload_locator,
+                    "payload_sha256": payload.sha256,
+                    "payload_size_bytes": payload.size,
+                    "hypothesis_id": hypothesis_id,
+                    "source_builder_run_id": invocation.run_id,
+                }
+                if existing is not None:
+                    if (
+                        existing.command != _PWN_CRASH_ENGINE_COMMAND
+                        or existing.hypothesis_ids != [hypothesis_id]
+                        or existing.artifact_ids != [payload.id]
+                        or existing.extra.get("pwn_crash_request")
+                        != request
+                    ):
+                        raise ManagedError(
+                            "Pwn crash action idempotency collision: "
+                            f"{experiment_id}"
+                        )
+                    continue
+                state.experiments.append(
+                    Experiment(
+                        id=experiment_id,
+                        hypothesis_ids=[hypothesis_id],
+                        command=_PWN_CRASH_ENGINE_COMMAND,
+                        expected_observation=(
+                            "the same allowlisted target fault signal occurs "
+                            "in at least two of three exact-input runs while "
+                            "all three empty-input controls exit normally"
+                        ),
+                        keep_if=(
+                            "the engine-owned v1 differential evaluator "
+                            "returns CONFIRMED"
+                        ),
+                        drop_if=(
+                            "the v1 contract fails closed or the differential "
+                            "positive/control condition is not satisfied"
+                        ),
+                        timeout_seconds=self.engine._budget_command_timeout(
+                            state,
+                            60,
+                        ),
+                        resource_class="standard",
+                        kind=ExperimentKind.STRATEGIC,
+                        status=ExperimentStatus.REGISTERED,
+                        source_run_id=invocation.run_id,
+                        artifact_ids=[payload.id],
+                        extra={
+                            "managed_contract_version": 2,
+                            "managed_action_kind": (
+                                MANAGED_PWN_CRASH_ACTION_KIND
+                            ),
+                            "engine_executor": (
+                                _PWN_CRASH_ENGINE_EXECUTOR
+                            ),
+                            "configuration_epoch": (
+                                state.configuration_epoch
+                            ),
+                            "pwn_crash_request": request,
+                        },
+                    )
+                )
+
+        return self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
 
     def _checkpoint(
         self,
@@ -1570,6 +1887,11 @@ class ManagedOrchestrator:
                     note=note,
                 )
             self._apply_builder_publishes(identity, outcome.results)
+            self._register_pwn_crash_actions(
+                identity,
+                wave,
+                outcome.results,
+            )
             latest = self.engine.store.load(identity)
             self._require_epoch(latest, selected_session)
             try:

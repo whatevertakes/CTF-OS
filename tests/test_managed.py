@@ -36,11 +36,14 @@ from ctf_os.migration import (
     rollback_migration,
 )
 from ctf_os.models import (
+    ArtifactReference,
     CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
     ExperimentKind,
     ExperimentStatus,
+    Falsifier,
+    Hypothesis,
     ModelValidationError,
     RunOrigin,
     RunReference,
@@ -666,6 +669,341 @@ class ManagedV2Tests(unittest.TestCase):
             self.identity,
             prompt="solve this one challenge",
             state_schema_version=STATE_SCHEMA_VERSION,
+        )
+
+    def pwn_crash_registration_fixture(
+        self,
+        *,
+        suffix: str,
+        category: str = "pwn",
+        wave_name: str = "attack",
+        role: Role = Role.BUILDER,
+        contract_version: int = 2,
+        artifact_sizes: tuple[int, ...] = (4,),
+        action_locator: str = "payload.bin",
+        hypothesis_reference: str = "local",
+        reprocess_count: int = 1,
+        action_count: int = 1,
+    ):
+        identity = ChallengeIdentity(
+            "Managed CTF",
+            category,
+            f"pwn-crash-{suffix}",
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / identity.contest_id
+            / identity.category
+            / identity.challenge_id
+        )
+        incoming.mkdir(parents=True)
+        (incoming / "challenge.bin").write_bytes(b"\x7fELFpwn-crash")
+        engine = self.engine(ProbeRoleExecutor())
+        engine.add_challenge(
+            identity,
+            prompt="verify one local stdin crash",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(identity, None)
+        _state, cycle = orchestrator._reserve_cycle(identity, session_id)
+        _state, wave, role_runs = orchestrator._reserve_wave(
+            identity,
+            session_id,
+            cycle.id,
+            wave_name,
+        )
+        run_id = (
+            role_runs[role]
+            if role in role_runs
+            else next(iter(role_runs.values()))
+        )
+        local_hypothesis_id = "builder-local"
+        canonical_hypothesis_id = (
+            f"H-{run_id}-{local_hypothesis_id}"
+        )
+        challenge_paths = engine.store.challenge_paths(identity)
+        snapshot_directory = challenge_paths.artifacts / "snapshots"
+        snapshot_directory.mkdir(parents=True, exist_ok=True)
+        artifact_payloads: list[tuple[str, bytes]] = []
+        for index, size in enumerate(artifact_sizes, start=1):
+            artifact_id = f"A-{run_id}-{index}"
+            payload_bytes = bytes((index & 0xFF,)) * size
+            artifact_path = snapshot_directory / f"{artifact_id}.bin"
+            artifact_path.write_bytes(payload_bytes)
+            artifact_path.chmod(0o400)
+            artifact_payloads.append((artifact_id, payload_bytes))
+
+        def seed(state):
+            run = next(item for item in state.runs if item.id == run_id)
+            run.status = RunStatus.COMPLETED
+            run.result_path = f"runs/{run_id}/result.json"
+            run.validation_path = f"runs/{run_id}/validation.json"
+            run.extra["semantic_merge"] = True
+            state.hypotheses.append(
+                Hypothesis(
+                    id=canonical_hypothesis_id,
+                    statement="the exact payload triggers a target crash",
+                    falsifier=Falsifier(
+                        "empty stdin or exact replay does not preserve a fault"
+                    ),
+                    source_run_id=run_id,
+                )
+            )
+            for artifact_id, payload_bytes in artifact_payloads:
+                state.artifacts.append(
+                    ArtifactReference(
+                        id=artifact_id,
+                        path=(
+                            "artifacts/snapshots/"
+                            f"{artifact_id}.bin"
+                        ),
+                        sha256=hashlib.sha256(payload_bytes).hexdigest(),
+                        source_run_id=run_id,
+                        size=len(payload_bytes),
+                        extra={
+                            "reported_locator": "payload.bin",
+                            "purpose": "crash payload",
+                        },
+                    )
+                )
+
+        engine.store.update(identity, seed)
+        requested_hypothesis = (
+            canonical_hypothesis_id
+            if hypothesis_reference == "canonical"
+            else "unknown-hypothesis"
+            if hypothesis_reference == "missing"
+            else local_hypothesis_id
+        )
+        result = mock.Mock(
+            invocation=mock.Mock(
+                role=role,
+                run_id=run_id,
+                contract_version=contract_version,
+            ),
+            output={
+                "hypotheses": [
+                    {
+                        "id": local_hypothesis_id,
+                        "claim": "the exact payload crashes the target",
+                    }
+                ],
+                "actions": [
+                    {
+                        "kind": "verify_pwn_crash",
+                        "description": "verify the crash",
+                        "payload_artifact_path": action_locator,
+                        "hypothesis_id": requested_hypothesis,
+                    }
+                    for _ in range(action_count)
+                ],
+            },
+        )
+        state = engine.store.load(identity)
+        for _ in range(reprocess_count):
+            state = orchestrator._register_pwn_crash_actions(
+                identity,
+                wave,
+                (result,),
+            )
+        return state, run_id, canonical_hypothesis_id
+
+    @staticmethod
+    def pwn_crash_experiments(state):
+        return [
+            item
+            for item in state.experiments
+            if item.extra.get("engine_executor")
+            == "pwn_crash_differential_v1"
+        ]
+
+    def test_pwn_crash_registration_accepts_local_and_canonical_hypotheses(
+        self,
+    ):
+        for reference in ("local", "canonical"):
+            with self.subTest(reference=reference):
+                state, run_id, hypothesis_id = (
+                    self.pwn_crash_registration_fixture(
+                        suffix=f"valid-{reference}",
+                        hypothesis_reference=reference,
+                    )
+                )
+                experiments = self.pwn_crash_experiments(state)
+                self.assertEqual(len(experiments), 1)
+                experiment = experiments[0]
+                self.assertEqual(
+                    experiment.command,
+                    "ctfos-engine:pwn-crash-v1",
+                )
+                self.assertEqual(experiment.hypothesis_ids, [hypothesis_id])
+                self.assertEqual(len(experiment.artifact_ids), 1)
+                self.assertEqual(experiment.source_run_id, run_id)
+                self.assertIs(
+                    experiment.kind,
+                    ExperimentKind.STRATEGIC,
+                )
+                self.assertIs(
+                    experiment.status,
+                    ExperimentStatus.REGISTERED,
+                )
+                self.assertEqual(
+                    experiment.extra["managed_action_kind"],
+                    "verify_pwn_crash",
+                )
+                request = experiment.extra["pwn_crash_request"]
+                self.assertEqual(
+                    set(request),
+                    {
+                        "schema_version",
+                        "contract_id",
+                        "contract_version",
+                        "contract_fingerprint",
+                        "protocol",
+                        "configuration_epoch",
+                        "payload_artifact_id",
+                        "payload_reported_locator",
+                        "payload_sha256",
+                        "payload_size_bytes",
+                        "hypothesis_id",
+                        "source_builder_run_id",
+                    },
+                )
+                self.assertEqual(request["schema_version"], 1)
+                self.assertEqual(
+                    request["payload_artifact_id"],
+                    experiment.artifact_ids[0],
+                )
+                self.assertEqual(
+                    request["payload_reported_locator"],
+                    "payload.bin",
+                )
+                self.assertEqual(request["payload_size_bytes"], 4)
+                self.assertEqual(request["hypothesis_id"], hypothesis_id)
+                self.assertEqual(request["source_builder_run_id"], run_id)
+                self.assertTrue(
+                    {
+                        "command",
+                        "network_target",
+                        "signal",
+                        "verdict",
+                        "recipe_sha256",
+                    }.isdisjoint(request)
+                )
+
+    def test_pwn_crash_registration_requires_v2_pwn_attack_builder(self):
+        cases = (
+            {
+                "suffix": "wrong-category",
+                "category": "rev",
+                "reason": "category pwn",
+            },
+            {
+                "suffix": "wrong-wave",
+                "wave_name": "discovery",
+                "reason": "ATTACK wave",
+            },
+            {
+                "suffix": "wrong-role",
+                "role": Role.FALSIFIER,
+                "reason": "ATTACK Builder",
+            },
+            {
+                "suffix": "wrong-contract",
+                "contract_version": 1,
+                "reason": "v2 role contract",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["suffix"]):
+                kwargs = {
+                    key: value
+                    for key, value in case.items()
+                    if key != "reason"
+                }
+                state, run_id, _hypothesis_id = (
+                    self.pwn_crash_registration_fixture(**kwargs)
+                )
+                self.assertEqual(self.pwn_crash_experiments(state), [])
+                run = next(item for item in state.runs if item.id == run_id)
+                self.assertIn(
+                    case["reason"],
+                    run.extra["rejected_actions"][-1]["reason"],
+                )
+
+    def test_pwn_crash_registration_rejects_unsafe_payload_or_hypothesis(
+        self,
+    ):
+        cases = (
+            {
+                "suffix": "missing-payload",
+                "artifact_sizes": (),
+                "reprocess_count": 2,
+                "reason": "exactly one normalized artifact",
+            },
+            {
+                "suffix": "ambiguous-payload",
+                "artifact_sizes": (4, 4),
+                "reason": "observed 2",
+            },
+            {
+                "suffix": "empty-payload",
+                "artifact_sizes": (0,),
+                "reason": "non-empty",
+            },
+            {
+                "suffix": "oversize-payload",
+                "artifact_sizes": (1024 * 1024 + 1,),
+                "reason": "at most 1048576 bytes",
+            },
+            {
+                "suffix": "unsafe-locator",
+                "action_locator": "../payload.bin",
+                "reason": "safe relative path",
+            },
+            {
+                "suffix": "missing-hypothesis",
+                "hypothesis_reference": "missing",
+                "reason": "active local or canonical hypothesis",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["suffix"]):
+                kwargs = {
+                    key: value
+                    for key, value in case.items()
+                    if key != "reason"
+                }
+                state, run_id, _hypothesis_id = (
+                    self.pwn_crash_registration_fixture(**kwargs)
+                )
+                self.assertEqual(self.pwn_crash_experiments(state), [])
+                run = next(item for item in state.runs if item.id == run_id)
+                self.assertIn(
+                    case["reason"],
+                    run.extra["rejected_actions"][-1]["reason"],
+                )
+                if case["suffix"] == "missing-payload":
+                    self.assertEqual(len(run.extra["rejected_actions"]), 1)
+
+    def test_pwn_crash_registration_bounds_distinct_rejections(self):
+        state, run_id, _hypothesis_id = (
+            self.pwn_crash_registration_fixture(
+                suffix="bounded-rejections",
+                artifact_sizes=(),
+                action_count=70,
+                reprocess_count=2,
+            )
+        )
+        run = next(item for item in state.runs if item.id == run_id)
+        self.assertEqual(len(run.extra["rejected_actions"]), 64)
+        self.assertEqual(
+            [item["action"] for item in run.extra["rejected_actions"]],
+            [str(index) for index in range(1, 65)],
         )
 
     def execute_managed_source_fixture(
