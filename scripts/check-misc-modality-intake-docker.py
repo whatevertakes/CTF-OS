@@ -38,7 +38,7 @@ from ctf_os.store.atomic import read_json, strict_json_loads
 
 RELEASE_IMAGE_DIGEST = (
     "sha256:"
-    "82ef8c155a8bbe9cfe33ce1a475425c77097b6fcefc32b678da1b14bf9c8339a"
+    "f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338"
 )
 PROBE_IDS = ("typed_inventory", "primary_magic", "primary_strings")
 PRINTABLE_MARKER = b"CTFOS-MISC-PROTOCOL-MARKER SEND LENGTH PAYLOAD"

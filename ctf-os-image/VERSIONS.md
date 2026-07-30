@@ -507,6 +507,37 @@ release 이미지를 다시 빌드하고 pin했다.
 결정적 Web gate의 실행과 증거 결속을 보장할 뿐 live Web solve, 원격
 portability 또는 source-to-sink 관측을 주장하지 않는다.
 
+## 2026-07-31 Pwn bounded-interaction producer 이미지
+
+정적 stdin payload로 표현할 수 없었던 메뉴·binary leak·주소 계산·staged
+send 흐름을 임의 Python/shell harness 없이 실행하기 위해
+`pwn_interaction_v1` producer를 추가하고 exact 이미지를 다시 빌드했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338` |
+| 생성 시각 | `2026-07-31T08:12:02.203885246+09:00` |
+| Docker inspect Size | 12,512,645,433 bytes |
+| 도구 manifest | schema v1, 183개 중 183개 사용 가능, failed 0 |
+| managed capability manifest | schema v2, 12개 중 12개 사용 가능 |
+| interaction producer SHA-256 | `d2a5a4370242adb0fae75ac4ddc68ffd43952e671ba0abc0ad68f1924423b5b9` |
+| recipe contract fingerprint | `5f8df2cf3cbaa9dc897d6a7c46c677c5fa3578f5369e9de5052bfe9acae3c9f3` |
+
+recipe는 최대 128 step, 32 capture, send당 64 KiB·전체 1 MiB,
+step당 1 MiB read, 120초, delay당 500 ms·전체 5초의 닫힌 data contract다.
+shell, interpreter, argv 확장, 환경, 파일 목적지와 network target을
+지정할 수 없다. producer는 원본 local ELF를 직접 실행하고 실행 시점에만
+무작위 sentinel을 만든다. control에서는 recipe가 선언한 최종 effect
+address node만 0으로 치환하며 나머지 recipe와 source는 동일하게 유지한다.
+
+host-side image tests는 fresh workspace의 attack 3회와 control 3회에서
+mixed line/raw I/O, hex·little-endian leak capture, checked address 계산,
+effect differential과 immutable stdout/stderr/transcript/derivation-DAG
+hash를 검증했다. 이 항목은 이미지 producer와 그 내부 계약의 영수증이다.
+engine state preissue, 독립 host 재계산, 실제 challenge의 typed P→E 승격과
+전 카테고리 release matrix 영수증은 최종 source gate에서 별도로 판정하며,
+이 이미지 빌드만으로 solve·flag·원격 portability를 주장하지 않는다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를
