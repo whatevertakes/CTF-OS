@@ -273,8 +273,24 @@ class EvaluationTests(unittest.TestCase):
             {"count": 1, "audited_proof_submissions": 2},
         )
         self.assertEqual(
-            metrics["time_to_first_primitive"].value["mean_seconds"],
+            metrics["time_to_first_claimed_progress"].value["mean_seconds"],
             5.0,
+        )
+        self.assertEqual(
+            metrics["time_to_first_claimed_progress"].evidence["proxy"],
+            "first canonical claimed progress marker",
+        )
+        verified_primitive = metrics["time_to_first_primitive"]
+        self.assertEqual(verified_primitive.status, "unavailable")
+        self.assertIn(
+            "no engine-owned executable primitive stage gate",
+            verified_primitive.reason,
+        )
+        self.assertEqual(
+            verified_primitive.evidence[
+                "states_with_claimed_progress_markers"
+            ],
+            3,
         )
         self.assertEqual(
             metrics["time_to_proof"].value["mean_seconds"], 20.0
@@ -572,6 +588,7 @@ class EvaluationTests(unittest.TestCase):
             "clean_reproduction_rate",
             "proof_pass_rate",
             "false_proof_count",
+            "time_to_first_claimed_progress",
             "time_to_first_primitive",
             "time_to_proof",
             "median_time_to_first_valid_result",
@@ -586,6 +603,53 @@ class EvaluationTests(unittest.TestCase):
                 self.assertEqual(metrics[name].status, "unavailable")
                 self.assertTrue(metrics[name].reason)
         self.assertEqual(metrics["manual_points"].value["total"], 0.0)
+
+    def test_arbitrary_progress_marker_never_verifies_a_primitive(
+        self,
+    ) -> None:
+        identity = ChallengeIdentity(
+            "contest",
+            "pwn",
+            "claimed-primitive",
+        )
+        self.store.create_challenge(identity)
+
+        def add_claimed_marker(current) -> None:
+            current.progress_markers.append(
+                ProgressMarker(
+                    id="PM-claimed",
+                    statement="working arbitrary write primitive",
+                    elapsed_seconds=7,
+                    extra={
+                        "engine_owned": True,
+                        "executable_primitive_stage_gate": True,
+                        "primitive_verified": True,
+                    },
+                )
+            )
+
+        self.store.update(identity, add_claimed_marker)
+        metrics = evaluate_workspace(
+            self.root,
+            contest_id="contest",
+            category="pwn",
+            challenge_id="claimed-primitive",
+        ).metrics
+
+        claimed = metrics["time_to_first_claimed_progress"]
+        self.assertEqual(claimed.status, "available")
+        self.assertEqual(claimed.value["mean_seconds"], 7.0)
+        verified = metrics["time_to_first_primitive"]
+        self.assertEqual(verified.status, "unavailable")
+        self.assertIsNone(verified.value)
+        self.assertIn(
+            "no engine-owned executable primitive stage gate",
+            verified.reason,
+        )
+        self.assertEqual(
+            verified.evidence["states_with_claimed_progress_markers"],
+            1,
+        )
 
     def test_invalid_proof_is_bounded_and_reported(self) -> None:
         identity = ChallengeIdentity("contest", "pwn", "bad-proof")
@@ -845,8 +909,24 @@ class EvaluationTests(unittest.TestCase):
 
         self.assertEqual(status, 0, stderr.getvalue())
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["evaluated_states"], 1)
+        self.assertEqual(
+            payload["metrics"]["time_to_first_primitive"]["status"],
+            "unavailable",
+        )
+        self.assertIn(
+            "engine-owned executable primitive stage gate",
+            payload["metrics"]["time_to_first_primitive"]["reason"],
+        )
+        self.assertIn(
+            "model-claimed",
+            payload["methodology"]["first_claimed_progress"],
+        )
+        self.assertIn(
+            "progress marker text",
+            payload["methodology"]["first_verified_primitive"],
+        )
         self.assertEqual(state_path.read_bytes(), before)
 
 

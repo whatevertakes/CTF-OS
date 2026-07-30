@@ -33,7 +33,7 @@ from ctf_os.models import (
 )
 from ctf_os.store.upgrades import UnsupportedSchemaVersion, upgrade_state
 
-EVALUATION_SCHEMA_VERSION = 1
+EVALUATION_SCHEMA_VERSION = 2
 DEFAULT_MAX_STATES = 1024
 MAX_STATE_LIMIT = 4096
 MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -48,6 +48,9 @@ MAX_COUNTER_VALUE = (1 << 63) - 1
 _METRIC_AVAILABLE = "available"
 _METRIC_PARTIAL = "partial"
 _METRIC_UNAVAILABLE = "unavailable"
+_NO_EXECUTABLE_PRIMITIVE_GATE_REASON = (
+    "no engine-owned executable primitive stage gate is recorded"
+)
 _USAGE_FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -152,6 +155,15 @@ class EvaluationReport:
                 "first_valid_result": (
                     "earliest hash-validated passed proof or manual accepted "
                     "outcome per state"
+                ),
+                "first_claimed_progress": (
+                    "earliest canonical progress marker per state; this is "
+                    "model-claimed and is not an executable primitive proof"
+                ),
+                "first_verified_primitive": (
+                    "unavailable until an engine-owned executable primitive "
+                    "stage gate is recorded; progress marker text and extra "
+                    "fields are never accepted as that gate"
                 ),
                 "human_interventions": (
                     "explicit state.metadata.human_intervention_count only"
@@ -1691,7 +1703,7 @@ def _proof_metrics(
     return metrics
 
 
-def _first_primitive_metric(
+def _first_claimed_progress_metric(
     records: Sequence[_LoadedState],
 ) -> EvaluationMetric:
     values: list[float] = []
@@ -1725,17 +1737,39 @@ def _first_primitive_metric(
     if not values:
         return _unavailable(
             _combine_reasons(
-                "no canonical progress marker has a usable elapsed time",
+                (
+                    "no canonical claimed progress marker has a usable "
+                    "elapsed time"
+                ),
                 reason,
             )
-            or "no canonical progress marker has a usable elapsed time",
+            or (
+                "no canonical claimed progress marker has a usable elapsed "
+                "time"
+            ),
             evidence={"states_with_progress_markers": states_with_markers},
         )
     return _metric(
         _time_summary(values),
         len(values),
         partial_reason=reason,
-        evidence={"proxy": "first canonical progress marker"},
+        evidence={"proxy": "first canonical claimed progress marker"},
+    )
+
+
+def _first_primitive_metric(
+    records: Sequence[_LoadedState],
+) -> EvaluationMetric:
+    states_with_claimed_markers = sum(
+        bool(record.state.progress_markers) for record in records
+    )
+    return _unavailable(
+        _NO_EXECUTABLE_PRIMITIVE_GATE_REASON,
+        evidence={
+            "states_with_claimed_progress_markers": (
+                states_with_claimed_markers
+            )
+        },
     )
 
 
@@ -2041,6 +2075,7 @@ def _empty_metrics(reason: str) -> dict[str, EvaluationMetric]:
         "clean_reproduction_rate",
         "proof_pass_rate",
         "false_proof_count",
+        "time_to_first_claimed_progress",
         "time_to_first_primitive",
         "time_to_proof",
         "median_time_to_first_valid_result",
@@ -2055,7 +2090,16 @@ def _empty_metrics(reason: str) -> dict[str, EvaluationMetric]:
         "invalid_contract_count",
         "manual_points",
     )
-    return {name: _unavailable(reason) for name in names}
+    metrics = {name: _unavailable(reason) for name in names}
+    metrics["time_to_first_primitive"] = _unavailable(
+        _combine_reasons(
+            _NO_EXECUTABLE_PRIMITIVE_GATE_REASON,
+            reason,
+        )
+        or _NO_EXECUTABLE_PRIMITIVE_GATE_REASON,
+        evidence={"states_with_claimed_progress_markers": 0},
+    )
+    return metrics
 
 
 def _validate_scope_component(
@@ -2165,6 +2209,9 @@ def evaluate_workspace(
     )
     metrics["thin_scaffold_uplift"] = (
         _thin_scaffold_uplift_metric(loaded)
+    )
+    metrics["time_to_first_claimed_progress"] = (
+        _first_claimed_progress_metric(loaded)
     )
     metrics["time_to_first_primitive"] = _first_primitive_metric(loaded)
     metrics["repeated_command_count"] = _repeated_command_metric(loaded)
