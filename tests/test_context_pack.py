@@ -87,6 +87,31 @@ class ContextPackTests(unittest.TestCase):
         state.validate()
         return state
 
+    def test_engine_private_artifacts_are_not_projected(self) -> None:
+        state = self.state()
+        private_path = "proof/private/variant-answer.bin"
+        private_id = "A-private-variant-answer"
+        state.artifacts.append(
+            ArtifactReference(
+                id=private_id,
+                path=private_path,
+                sha256="b" * 64,
+                size=17,
+                extra={"context_visibility": "engine_private"},
+            )
+        )
+        state.validate()
+
+        pack = build_context_pack(
+            state,
+            get_adapter(state.category),
+            state_path=Path("/state.json"),
+        )
+
+        self.assertNotIn(private_id, pack.text)
+        self.assertNotIn(private_path, pack.text)
+        self.assertIn('"id":"A-1"', pack.text)
+
     def pwn_crash_state(
         self,
         statuses=None,

@@ -370,6 +370,23 @@ def _inspect_record(state: Any, section: str, item: Any) -> object:
     return item.to_dict()
 
 
+def _live_visible_artifact(artifact: Any) -> bool:
+    """Never expose engine-private proof material to attached model clients."""
+
+    return artifact.extra.get("context_visibility") != "engine_private"
+
+
+def _inspect_values(state: Any, section: str) -> list[Any] | Any:
+    values = getattr(state, section)
+    if section == "artifacts":
+        return [
+            artifact
+            for artifact in values
+            if _live_visible_artifact(artifact)
+        ]
+    return values
+
+
 def _oversized_record_summary(
     record: object,
     *,
@@ -414,7 +431,7 @@ def _inspect_page(
     offset: int,
     limit: int,
 ) -> dict[str, object]:
-    values = getattr(state, section)
+    values = _inspect_values(state, section)
     total = len(values)
     index = min(offset, total)
     items: list[object] = []
@@ -509,11 +526,16 @@ def inspect_state(
         if section == "summary":
             return _state_summary(state)
         full_state = state.to_dict()
+        full_state["artifacts"] = [
+            artifact.to_dict()
+            for artifact in state.artifacts
+            if _live_visible_artifact(artifact)
+        ]
         if _json_bytes(full_state) <= MAX_INSPECT_RESULT_BYTES:
             return full_state
         return _state_summary(state, full_state_omitted=True)
 
-    values = getattr(state, section)
+    values = _inspect_values(state, section)
     pagination_requested = offset is not None or limit is not None
     page_offset = 0 if offset is None else offset
     page_limit = DEFAULT_INSPECT_PAGE_ITEMS if limit is None else limit

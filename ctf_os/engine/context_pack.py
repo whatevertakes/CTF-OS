@@ -41,6 +41,12 @@ class _Group:
     records: tuple[str, ...]
 
 
+def _model_visible_artifact(artifact: Any) -> bool:
+    """Keep engine-private proof material out of every model pointer index."""
+
+    return artifact.extra.get("context_visibility") != "engine_private"
+
+
 def _bounded(value: object, maximum: int = 2048) -> str:
     text = str(value)
     if len(text) <= maximum:
@@ -136,7 +142,11 @@ def _pwn_runtime_snapshot_context_records(
 ) -> tuple[str, ...]:
     """Project diagnostic registers and pointers without embedding raw maps."""
 
-    artifacts = {item.id: item for item in state.artifacts}
+    artifacts = {
+        item.id: item
+        for item in state.artifacts
+        if _model_visible_artifact(item)
+    }
     records: list[str] = []
     for experiment in reversed(state.experiments):
         if (
@@ -800,7 +810,13 @@ def build_context_pack(
                     source_run_id=item.source_run_id,
                     size=item.size,
                 )
-                for item in reversed(state.artifacts[-50:])
+                for item in reversed(
+                    [
+                        artifact
+                        for artifact in state.artifacts
+                        if _model_visible_artifact(artifact)
+                    ][-50:]
+                )
             ),
         ),
     ]

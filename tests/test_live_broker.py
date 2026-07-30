@@ -41,6 +41,7 @@ from ctf_os.live_broker import (
     allocated_live_broker_directory,
 )
 from ctf_os.models import (
+    ArtifactReference,
     CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
@@ -936,6 +937,62 @@ class LiveBrokerTests(unittest.TestCase):
             [item["id"] for item in final["items"]],
             ["PM-0005", "PM-0006"],
         )
+
+    def test_inspect_never_exposes_engine_private_artifacts(self) -> None:
+        service, token = self._service()
+        state = self.engine.store.load(self.identity)
+        paths = self.engine.store.challenge_paths(self.identity)
+        paths.artifacts.mkdir(parents=True, exist_ok=True)
+        visible_path = paths.artifacts / "visible.bin"
+        private_path = paths.artifacts / "variant-answer.bin"
+        visible_path.write_bytes(b"visible")
+        private_path.write_bytes(b"engine-private-answer")
+        state.artifacts.extend(
+            (
+                ArtifactReference(
+                    id="A-visible-live",
+                    path=visible_path.relative_to(paths.root).as_posix(),
+                    sha256=hashlib.sha256(b"visible").hexdigest(),
+                    size=len(b"visible"),
+                ),
+                ArtifactReference(
+                    id="A-private-live",
+                    path=private_path.relative_to(paths.root).as_posix(),
+                    sha256=hashlib.sha256(
+                        b"engine-private-answer"
+                    ).hexdigest(),
+                    size=len(b"engine-private-answer"),
+                    extra={
+                        "context_visibility": "engine_private",
+                        "source_locator": "variant.out",
+                    },
+                ),
+            )
+        )
+        self.engine.store.save(state)
+
+        def inspect(section: str, **params: object) -> object:
+            return service.dispatch(
+                {
+                    "schema_version": 1,
+                    "token": token,
+                    "identity": self.identity.to_dict(),
+                    "operation": "inspect",
+                    "params": {"section": section, **params},
+                }
+            )
+
+        artifact_view = inspect("artifacts")
+        full_state = inspect("state")
+        paged = inspect("artifacts", offset=0, limit=20)
+        encoded = json.dumps(
+            (artifact_view, full_state, paged),
+            sort_keys=True,
+        )
+        self.assertIn("A-visible-live", encoded)
+        self.assertNotIn("A-private-live", encoded)
+        self.assertNotIn("variant-answer.bin", encoded)
+        self.assertNotIn("variant.out", encoded)
 
     def test_knowledge_search_and_read_are_scoped_strict_and_read_only(
         self,
