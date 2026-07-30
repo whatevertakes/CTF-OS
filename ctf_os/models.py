@@ -5316,6 +5316,24 @@ def _forensic_assertion_state_marker(value: object) -> bool:
     )
 
 
+def _rev_acceptance_state_marker(value: object) -> bool:
+    """Identify candidate-free Rev evidence for exact lazy validation."""
+
+    extra = getattr(value, "extra", None)
+    result = getattr(value, "result", None)
+    return (
+        type(extra) is dict
+        and (
+            extra.get("engine_executor")
+            == "rev_accepted_input_state_v1"
+            or "rev_acceptance_state" in extra
+        )
+    ) or (
+        isinstance(result, Mapping)
+        and "rev_acceptance_evidence" in result
+    )
+
+
 def _pwn_crash_safe_locator(value: object) -> bool:
     if (
         type(value) is not str
@@ -14090,6 +14108,9 @@ class ChallengeState:
                             and not _forensic_assertion_state_marker(
                                 experiment
                             )
+                            and not _rev_acceptance_state_marker(
+                                experiment
+                            )
                         )
                     )
                 ):
@@ -14760,6 +14781,16 @@ class ChallengeState:
             errors.extend(
                 pwn_exploit_effect_state_graph_errors(self)
             )
+
+            # Candidate-free Rev accepted-input evidence owns one fixed 3+3
+            # multi-receipt graph.  The local generic exception above is
+            # marker-scoped; this exact validator rejects copied, rebound, or
+            # orphaned markers and never grants candidate/submission authority.
+            from ctf_os.engine.rev_acceptance_state import (
+                rev_acceptance_state_graph_errors,
+            )
+
+            errors.extend(rev_acceptance_state_graph_errors(self))
         if errors:
             raise ModelValidationError("; ".join(errors))
 

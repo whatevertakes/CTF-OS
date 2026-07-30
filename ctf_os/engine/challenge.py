@@ -4882,6 +4882,10 @@ class ChallengeEngine:
     def _resolve_rev_stdin_inventory_binding(
         self,
         state: ChallengeState,
+        *,
+        allowed_run_origins: frozenset[RunOrigin] = frozenset(
+            {RunOrigin.MANAGED_TOOL}
+        ),
     ) -> tuple[RevStdinOracleBinding, Experiment, Path]:
         """Resolve the one current CONFIRMED v2 inventory proof anchor."""
 
@@ -4990,7 +4994,7 @@ class ChallengeEngine:
             if (
                 run is None
                 or run.status is not RunStatus.COMPLETED
-                or run.origin is not RunOrigin.MANAGED_TOOL
+                or run.origin not in allowed_run_origins
                 or run.extra.get("experiment_id") != experiment.id
                 or receipt is None
                 or receipt.outcome is not ReceiptOutcome.SUCCEEDED
@@ -23907,6 +23911,28 @@ class ChallengeEngine:
             identity,
             operator_spec_locator=operator_spec_locator,
             hypothesis_ids=tuple(hypothesis_ids),
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
+    def prove_rev_accepted_input(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        operator_spec_locator: str,
+        timeout_seconds: int = 300,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, dict[str, object]]:
+        """Run the candidate-free Rev original-binary 3+3 oracle."""
+
+        from ctf_os.engine.rev_acceptance_hotpath import (
+            execute_rev_acceptance_hotpath,
+        )
+
+        return execute_rev_acceptance_hotpath(
+            self,
+            identity,
+            operator_spec_locator=operator_spec_locator,
             timeout_seconds=timeout_seconds,
             _session_owned=_session_owned,
         )

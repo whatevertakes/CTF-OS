@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1050,6 +1051,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     forensic_prove.add_argument("--timeout", type=int, default=900)
 
+    rev_accept = commands.add_parser(
+        "rev-prove-accept",
+        help=(
+            "운영자 hash-only oracle spec을 원본 바이너리와 결속하고 "
+            "accepted input 3회 + 고정 변형 3회로 검증"
+        ),
+    )
+    _identity_values(rev_accept)
+    rev_accept.add_argument("--spec", required=True)
+    rev_accept.add_argument("--timeout", type=int, default=300)
+
     crypto_prove = commands.add_parser(
         "crypto-prove",
         help=(
@@ -1999,6 +2011,35 @@ def main(
                 }
             )
             return 0 if result.confirmed else 1
+
+        if args.command == "rev-prove-accept":
+            state, result = engine.prove_rev_accepted_input(
+                _identity(args),
+                operator_spec_locator=args.spec,
+                timeout_seconds=args.timeout,
+            )
+            _print_json(
+                {
+                    "authorities": result["authorities"],
+                    "evaluation_sha256": hashlib.sha256(
+                        (
+                            json.dumps(
+                                result,
+                                allow_nan=False,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        ).encode("ascii")
+                    ).hexdigest(),
+                    "passed": result["passed"],
+                    "reason_codes": result["reason_codes"],
+                    "run_count": len(result["observations"]),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0 if result["passed"] else 1
 
         if args.command == "crypto-prove":
             state, result = engine.prove_crypto_metamorphic_candidate(
