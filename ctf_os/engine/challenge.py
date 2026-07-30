@@ -55,6 +55,11 @@ from ctf_os.codex import (
 )
 from ctf_os.codex.limiter import ModelCallLimitCancelled
 from ctf_os.config import EngineConfig, load_config
+from ctf_os.contracts.managed_rejection_v1 import (
+    MANAGED_REJECTION_V1_MAX_ATTEMPT,
+    build_managed_rejection_v1,
+    project_reported_artifact_normalization_error_v1,
+)
 from ctf_os.contracts.rev_inventory_v1 import (
     REV_INVENTORY_V1_ADAPTER_SEED_CONTRACT_VERSION,
     rev_inventory_v1_oracle_descriptor,
@@ -1394,6 +1399,41 @@ def _relative_workspace_artifact(value: str, role: Role) -> str:
             f"{value!r}"
         )
     return (PurePosixPath(*prefix) / posix).as_posix()
+
+
+def _reported_artifact_rejection_issue(
+    result: BatchResult,
+    normalization_error: str | None,
+) -> dict[str, object] | None:
+    """Locate one rejected artifact without retaining its model-authored path."""
+
+    if normalization_error is None or not isinstance(result.output, Mapping):
+        return None
+    records = result.output.get("artifacts")
+    if not isinstance(records, list):
+        return None
+    for index, item in enumerate(records):
+        if not isinstance(item, Mapping):
+            continue
+        reported_locator = item.get("path")
+        if not isinstance(reported_locator, str):
+            continue
+        try:
+            relative = _relative_workspace_artifact(
+                reported_locator,
+                result.invocation.role,
+            )
+        except WorkerResultValidationError:
+            continue
+        expected_prefix = (
+            f"cannot snapshot reported artifact {relative}: "
+        )
+        if normalization_error.startswith(expected_prefix):
+            return project_reported_artifact_normalization_error_v1(
+                normalization_error=normalization_error,
+                artifact_ordinal=index,
+            )
+    return None
 
 
 def _valid_proof_destination(value: str) -> bool:
@@ -6400,22 +6440,39 @@ class ChallengeEngine:
             and base_state.status not in _AUTOMATED_LOOP_STOP_STATUSES
             for run in managed_reservations
         )
+        barrier_results_valid = all(
+            result.completed
+            and result.validation.valid
+            and normalization_error is None
+            for (
+                result,
+                _output,
+                _artifacts,
+                normalization_error,
+            ) in normalized
+        )
+        managed_semantic_barrier = (
+            semantic_barrier
+            and bool(normalized)
+            and len(managed_reservations) == len(normalized)
+        )
         semantic_merge_allowed = (
             managed_reservations_current
             and (
                 not semantic_barrier
-                or all(
-                    result.completed
-                    and result.validation.valid
-                    and normalization_error is None
-                    for (
-                        result,
-                        _output,
-                        _artifacts,
-                        normalization_error,
-                    ) in normalized
+                or (
+                    barrier_results_valid
+                    and (
+                        not managed_reservations
+                        or managed_semantic_barrier
+                    )
                 )
             )
+        )
+        partial_semantic_merge_allowed = (
+            managed_semantic_barrier
+            and managed_reservations_current
+            and not barrier_results_valid
         )
 
         def apply(state: ChallengeState) -> None:
@@ -6470,6 +6527,49 @@ class ChallengeEngine:
                 )
                 if stale_managed_run:
                     run_status = RunStatus.INTERRUPTED
+                result_semantics_valid = (
+                    result.completed
+                    and result.validation.valid
+                    and normalization_error is None
+                )
+                partial_semantic_merge = (
+                    partial_semantic_merge_allowed
+                    and result_semantics_valid
+                    and not stale_managed_run
+                )
+                managed_rejection = None
+                if (
+                    existing_run is not None
+                    and existing_run.origin is RunOrigin.MANAGED_MODEL
+                ):
+                    reported_artifact_issue = (
+                        _reported_artifact_rejection_issue(
+                            result,
+                            normalization_error,
+                        )
+                    )
+                    contract_errors = (
+                        result.validation.errors
+                        if not result.validation.valid
+                        else ()
+                    )
+                    if contract_errors or reported_artifact_issue is not None:
+                        managed_rejection = build_managed_rejection_v1(
+                            role=result.invocation.role.value,
+                            attempt=max(
+                                1,
+                                min(
+                                    MANAGED_REJECTION_V1_MAX_ATTEMPT,
+                                    len(result.attempts),
+                                ),
+                            ),
+                            contract_errors=contract_errors,
+                            reported_artifact_rejections=(
+                                (reported_artifact_issue,)
+                                if reported_artifact_issue is not None
+                                else ()
+                            ),
+                        )
                 completed_run = RunReference(
                     id=run_id,
                     base_revision=base_state.revision,
@@ -6531,9 +6631,16 @@ class ChallengeEngine:
                         "provisional_wave_output": (
                             not semantic_merge_allowed
                         ),
+                        "partial_semantic_merge": (
+                            partial_semantic_merge
+                        ),
                         "stale_managed_result": stale_managed_run,
                     },
                 )
+                if managed_rejection is not None:
+                    completed_run.extra["managed_rejection_v1"] = (
+                        managed_rejection
+                    )
                 if existing_run is None:
                     state.runs.append(completed_run)
                     run_record = completed_run
@@ -6607,15 +6714,26 @@ class ChallengeEngine:
                         )
 
                 state.artifacts.extend(artifacts)
-                semantic_output = (
-                    output
-                    if semantic_merge_allowed
-                    else {
+                if semantic_merge_allowed:
+                    semantic_output = output
+                elif partial_semantic_merge:
+                    semantic_output = {
+                        "observations": output.get(
+                            "observations", []
+                        ),
+                        "hypotheses": output.get(
+                            "hypotheses", []
+                        ),
+                        "flag_candidates": output.get(
+                            "flag_candidates", []
+                        ),
+                    }
+                else:
+                    semantic_output = {
                         "flag_candidates": output.get(
                             "flag_candidates", []
                         )
                     }
-                )
                 local_fact_ids: dict[str, str] = {}
                 observations = semantic_output.get("observations", [])
                 if isinstance(observations, list):

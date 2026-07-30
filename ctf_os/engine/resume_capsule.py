@@ -1206,33 +1206,98 @@ def _failure_capsule_digest(
     for run in pointer_runs:
         diagnostics = safe_run_diagnostics(run)
         if compact:
+            managed_rejection = diagnostics.get("managed_rejection")
             machine_kinds = diagnostics["machine_failure_kinds"]
+            machine_failure_retryable_count = diagnostics[
+                "machine_failure_retryable_count"
+            ]
+            machine_failure_kinds_omitted = diagnostics[
+                "machine_failure_kinds_omitted"
+            ]
             compact_kind_limit = 2
-            diagnostics = {
-                "contract_errors": diagnostics[
-                    "contract_error_count"
-                ],
-                "failure_kinds": [
-                    item["kind"]
-                    for item in machine_kinds[:compact_kind_limit]
-                ],
-                "failure_kinds_omitted": (
-                    int(diagnostics["machine_failure_kinds_omitted"])
-                    + max(0, len(machine_kinds) - compact_kind_limit)
-                ),
-                "failure_records_over_soft_limit": diagnostics[
-                    "machine_failure_records_over_soft_limit"
-                ],
-                "malformed_fields": diagnostics[
-                    "malformed_failure_field_count"
-                ],
-                "normalization_error": diagnostics[
-                    "normalization_error_present"
-                ],
-                "retryable_count": diagnostics[
-                    "machine_failure_retryable_count"
-                ],
-            }
+            if isinstance(managed_rejection, Mapping):
+                rejection_issues = managed_rejection.get("issues", [])
+                if not isinstance(rejection_issues, list):
+                    raise ModelValidationError(
+                        "managed rejection issues are not an array"
+                    )
+                compact_issue_limit = 2
+                compact_rejections = [
+                    {
+                        key: issue[key]
+                        for key in (
+                            "code",
+                            "pointer",
+                            "proposal_ordinal",
+                        )
+                        if key in issue
+                    }
+                    for issue in rejection_issues[:compact_issue_limit]
+                    if isinstance(issue, Mapping)
+                ]
+                diagnostics = {
+                    "managed_rejection": compact_rejections,
+                }
+                rejection_issues_omitted = (
+                    int(managed_rejection["issues_omitted"])
+                    + max(
+                        0,
+                        len(rejection_issues) - compact_issue_limit,
+                    )
+                )
+                if rejection_issues_omitted:
+                    diagnostics["managed_rejection_issues_omitted"] = (
+                        rejection_issues_omitted
+                    )
+                if machine_kinds:
+                    diagnostics["failure_kinds"] = [
+                        item["kind"]
+                        for item in machine_kinds[:compact_kind_limit]
+                    ]
+                    omitted_failure_kinds = (
+                        int(machine_failure_kinds_omitted)
+                        + max(
+                            0,
+                            len(machine_kinds) - compact_kind_limit,
+                        )
+                    )
+                    if omitted_failure_kinds:
+                        diagnostics["failure_kinds_omitted"] = (
+                            omitted_failure_kinds
+                        )
+                if machine_failure_retryable_count:
+                    diagnostics["retryable_count"] = (
+                        machine_failure_retryable_count
+                    )
+            else:
+                diagnostics = {
+                    "contract_errors": diagnostics[
+                        "contract_error_count"
+                    ],
+                    "failure_kinds": [
+                        item["kind"]
+                        for item in machine_kinds[:compact_kind_limit]
+                    ],
+                    "failure_kinds_omitted": (
+                        int(diagnostics["machine_failure_kinds_omitted"])
+                        + max(
+                            0,
+                            len(machine_kinds) - compact_kind_limit,
+                        )
+                    ),
+                    "failure_records_over_soft_limit": diagnostics[
+                        "machine_failure_records_over_soft_limit"
+                    ],
+                    "malformed_fields": diagnostics[
+                        "malformed_failure_field_count"
+                    ],
+                    "normalization_error": diagnostics[
+                        "normalization_error_present"
+                    ],
+                    "retryable_count": diagnostics[
+                        "machine_failure_retryable_count"
+                    ],
+                }
         result_path = _exact_run_pointer(
             run.result_path,
             run_id=run.id,

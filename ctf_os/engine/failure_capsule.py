@@ -15,6 +15,11 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ctf_os.contracts.managed_rejection_v1 import (
+    ManagedRejectionV1ContractError,
+    managed_rejection_v1_canonical_json_bytes,
+    validate_managed_rejection_v1_mapping,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     ChallengeState,
@@ -37,6 +42,7 @@ MAX_NEXT_EXPERIMENTS = 3
 MAX_MACHINE_FAILURE_RECORDS = 128
 MAX_MACHINE_FAILURE_KINDS = 32
 MAX_MACHINE_IDENTIFIER_BYTES = 64
+MAX_MANAGED_REJECTION_CONTEXT_ISSUES = 4
 # Engine-generated Pwn run, receipt, and stream-artifact identifiers can
 # exceed 64 canonical JSON bytes.  The collection cardinality limits below
 # remain the primary capsule bound; 128 retains those exact evidence pointers
@@ -387,7 +393,7 @@ def _safe_failure_counts(run: RunReference) -> dict[str, object]:
                 "total_count": retryable_count + non_retryable_count,
             }
         )
-    return {
+    diagnostics: dict[str, object] = {
         "contract_error_count": len(raw_contract_errors),
         "machine_failure_count": len(raw_failures),
         "machine_failure_non_retryable_count": sum(
@@ -414,6 +420,40 @@ def _safe_failure_counts(run: RunReference) -> dict[str, object]:
             run.extra.get("normalization_error") is not None
         ),
     }
+    raw_managed_rejection = run.extra.get("managed_rejection_v1")
+    if raw_managed_rejection is not None:
+        try:
+            managed_rejection = validate_managed_rejection_v1_mapping(
+                raw_managed_rejection
+            )
+            encoded_rejection = (
+                managed_rejection_v1_canonical_json_bytes(
+                    managed_rejection
+                )
+            )
+        except ManagedRejectionV1ContractError as error:
+            raise ModelValidationError(
+                f"failure run {run.id} has an invalid managed rejection"
+            ) from error
+        if managed_rejection["role"] != run.role:
+            raise ModelValidationError(
+                f"failure run {run.id} managed rejection role mismatch"
+            )
+        issues = managed_rejection["issues"]
+        assert isinstance(issues, list)
+        diagnostics["managed_rejection"] = {
+            "attempt": managed_rejection["attempt"],
+            "issues": issues[:MAX_MANAGED_REJECTION_CONTEXT_ISSUES],
+            "issues_omitted": (
+                int(managed_rejection["omitted_count"])
+                + max(
+                    0,
+                    len(issues) - MAX_MANAGED_REJECTION_CONTEXT_ISSUES,
+                )
+            ),
+            "sha256": hashlib.sha256(encoded_rejection).hexdigest(),
+        }
+    return diagnostics
 
 
 def _run_fingerprint_digest(run: RunReference) -> dict[str, object]:

@@ -28,6 +28,10 @@ from ctf_os.engine.challenge import (
     _proof_argv_contains_credential_material,
 )
 from ctf_os.engine.context_pack import build_context_pack
+from ctf_os.engine.resume_capsule import (
+    ResumeCapsulePolicy,
+    render_resume_capsule,
+)
 from ctf_os.lifecycle import close_challenge, create_checkpoint
 from ctf_os.managed import ManagedError, ManagedOrchestrator
 from ctf_os.migration import (
@@ -88,6 +92,7 @@ class ProbeRoleExecutor:
         self,
         *,
         invalid_role: Role | None = None,
+        invalid_command_role: Role | None = None,
         source_reference_role: Role | None = None,
         network_target: tuple[str, int] | None = None,
         captain_hypothesis_count: int = 3,
@@ -98,6 +103,7 @@ class ProbeRoleExecutor:
         proof_extra_action: bool = False,
     ) -> None:
         self.invalid_role = invalid_role
+        self.invalid_command_role = invalid_command_role
         self.source_reference_role = source_reference_role
         self.network_target = network_target
         self.captain_hypothesis_count = captain_hypothesis_count
@@ -236,6 +242,11 @@ class ProbeRoleExecutor:
                                 "network_target_generation": None,
                             }
                         )
+                if (
+                    role is self.invalid_command_role
+                    and payload["actions"]
+                ):
+                    payload["actions"][0]["command"] = ""
             if role is self.invalid_role:
                 on_stdout_line(
                     json.dumps(
@@ -3073,7 +3084,7 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertEqual(captain.status, RunStatus.COMPLETED)
         self.assertIn("rejected_decisions", captain.extra)
 
-    def test_invalid_role_preserves_provisional_output_without_semantic_merge(
+    def test_invalid_role_preserves_valid_sibling_evidence_without_full_merge(
         self,
     ):
         executor = ProbeRoleExecutor(invalid_role=Role.FALSIFIER)
@@ -3116,9 +3127,53 @@ class ManagedV2Tests(unittest.TestCase):
                 if run.id in wave_run_ids
             )
         )
+        wave_runs = {
+            run.id: run for run in state.runs if run.id in wave_run_ids
+        }
+        valid_sibling_ids = {
+            run.id
+            for run in wave_runs.values()
+            if run.status is RunStatus.COMPLETED
+        }
+        invalid_run_ids = wave_run_ids - valid_sibling_ids
+        self.assertTrue(valid_sibling_ids)
+        self.assertEqual(len(invalid_run_ids), 1)
+        failed_run = wave_runs[next(iter(invalid_run_ids))]
+        self.assertEqual(
+            failed_run.extra["managed_rejection_v1"]["issues"],
+            [
+                {
+                    "code": "reported_artifact_unavailable",
+                    "kind": "reported_artifact",
+                    "pointer": "/artifacts/0/path",
+                }
+            ],
+        )
+        self.assertEqual(
+            {
+                run.id
+                for run in wave_runs.values()
+                if run.extra.get("partial_semantic_merge") is True
+            },
+            valid_sibling_ids,
+        )
+        self.assertTrue(
+            all(
+                run.extra.get("semantic_merge") is False
+                for run in wave_runs.values()
+            )
+        )
+        self.assertEqual(
+            {
+                fact.source_run_id
+                for fact in state.facts
+                if fact.source_run_id in wave_run_ids
+            },
+            valid_sibling_ids,
+        )
         self.assertFalse(
             any(
-                fact.source_run_id in wave_run_ids
+                fact.source_run_id in invalid_run_ids
                 for fact in state.facts
             )
         )
@@ -3138,6 +3193,79 @@ class ManagedV2Tests(unittest.TestCase):
             "KCTF{provisional_wave}",
             {candidate.value for candidate in state.candidates},
         )
+
+    def test_empty_command_rejection_reenters_next_cycle_as_typed_pointer(
+        self,
+    ):
+        executor = ProbeRoleExecutor(
+            invalid_command_role=Role.BUILDER,
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+
+        first = orchestrator.run_cycle(self.identity)
+        capsule = first.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        builder = next(
+            run
+            for run in first.runs
+            if run.id in capsule.run_ids
+            and run.role == Role.BUILDER.value
+        )
+        self.assertEqual(builder.status, RunStatus.INVALID)
+        self.assertEqual(
+            builder.extra["managed_rejection_v1"]["issues"],
+            [
+                {
+                    "code": "required_text_missing",
+                    "kind": "role_output",
+                    "pointer": "/actions/0/command",
+                }
+            ],
+        )
+        tampered = copy.deepcopy(first)
+        tampered_builder = next(
+            run for run in tampered.runs if run.id == builder.id
+        )
+        tampered_builder.extra["managed_rejection_v1"]["issues"][0][
+            "pointer"
+        ] = "/FLAG_secret"
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid managed rejection",
+        ):
+            build_context_pack(
+                tampered,
+                get_adapter(tampered.category),
+                state_path=engine.store.challenge_paths(
+                    self.identity
+                ).state,
+            )
+        pressure_capsule = render_resume_capsule(
+            first,
+            state_path=engine.store.challenge_paths(
+                self.identity
+            ).state,
+            policy=ResumeCapsulePolicy(max_bytes=1536),
+        )
+        self.assertIn("required_text_missing", pressure_capsule.text)
+        self.assertIn("/actions/0/command", pressure_capsule.text)
+
+        executor.invalid_command_role = None
+        orchestrator.run_cycle(self.identity)
+        next_prompt = [
+            prompt
+            for role, prompt in executor.prompts
+            if role is Role.CAPTAIN
+        ][-1]
+        self.assertIn("required_text_missing", next_prompt)
+        self.assertIn("/actions/0/command", next_prompt)
+        self.assertNotIn("command action requires text", next_prompt)
 
     def test_failure_capsule_reenters_next_cycle_without_raw_failure_text(
         self,
@@ -3250,6 +3378,8 @@ class ManagedV2Tests(unittest.TestCase):
         self.assertIn(capsule.reason_code, next_prompt)
         self.assertIn(capsule.fingerprint_sha256, next_prompt)
         self.assertIn(str(failed_run.validation_path), next_prompt)
+        self.assertIn("reported_artifact_unavailable", next_prompt)
+        self.assertIn("/artifacts/0/path", next_prompt)
         for canary in (
             raw_contract,
             raw_normalization,
