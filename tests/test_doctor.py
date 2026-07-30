@@ -27,13 +27,7 @@ def capability_manifest(
             "name": name,
             "available": name not in missing,
         }
-        if name not in missing and name in {
-            "pwn_crash_v1",
-            "pwn_runtime_snapshot_v1",
-            "rev_inventory_v2",
-            "rev_safe_output",
-            "rev_stdin_exec",
-        }:
+        if name not in missing and name in REQUIRED_MANAGED_ATTESTATIONS:
             record["attestation"] = REQUIRED_MANAGED_ATTESTATIONS[name]
         records.append(record)
     return json.dumps(

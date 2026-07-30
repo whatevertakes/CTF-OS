@@ -50,6 +50,15 @@
       "sha256": "e9d0927e42258a589d17b02f94071379ea015b040051a405cda455ba14879d97"
     },
     {
+      "name": "pwn_exploit_effect_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/pwn/exploit_effect.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.pwn.exploit_effect",
+      "contract_version": 1,
+      "sha256": "ef8827eb7cf5189893302c43560930de1f1e0a6c66636c9e5d485c0ecb114835"
+    },
+    {
       "name": "rev_inventory_v2",
       "kind": "file_sha256",
       "path": "/opt/ctf-templates/rev/inventory_v2.py",

@@ -428,6 +428,51 @@ proof로 승격되지 않는 진단 증거다.
 pin match, 필수 capability 10/10, attestation error 0, warning 0으로
 통과했다.
 
+## 2026-07-31 Managed Pwn exploit-effect 재빌드
+
+proved instruction-pointer control 뒤의 P→E 단계를 모델 자기 보고가 아닌
+원본 ELF의 target-mediated file-read 효과로 판정하는
+`pwn_exploit_effect_v1` producer를 추가하고 이미지를 다시 빌드했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:62bc44f2b84ccaa86cb5321ff700b73c42edd8b901c21cd61cfb3036bd985886` |
+| 생성 시각 | `2026-07-31T03:29:07.679816909+09:00` |
+| Docker inspect Size | 12,512,611,532 bytes |
+| capability manifest | schema v2, 11개 중 11개 사용 가능 |
+| exploit-effect producer SHA-256 | `ef8827eb7cf5189893302c43560930de1f1e0a6c66636c9e5d485c0ecb114835` |
+
+producer는 모델이 만든 shell/harness를 실행하지 않고 원본 ELF와 하나의
+정적 stdin payload만 받는다. payload를 hash 검사하고 sealed memfd에
+고정한 뒤에만 `/work/ctfos-pwn-exploit-sentinel-v1`에 매 실행 새
+256-bit sentinel을 생성한다. target stdout/stderr는 각각 1 MiB 이하
+파일로 분리하며 host 계약이 그 bytes와 producer 문서의 hash, size,
+path, sentinel occurrence를 다시 계산한다. producer는 dumpable 0,
+no-new-privileges, core limit 0, child subreaper를 사용하고 process-group
+밖으로 `fork`+`setsid`한 descendant까지 `/proc` ancestry로 kill/reap한다.
+
+실제 `DockerSandboxBackend.run_clean_proof`에서 새 bounded declared-output
+영속화 계약을 사용해 다음을 통과했다.
+
+- 같은 원본 ELF와 exact positive payload 3회 모두 서로 다른 무작위
+  sentinel을 한 번씩 방출해 `effect_observed`
+- proved control window만 서로 다르게 바꾼 payload 3회는 모두
+  `effect_absent`
+- 여섯 실행은 각각 새 network-none/read-only clean workspace였고,
+  target stdout/stderr와 producer stdout/stderr를 별도 durable artifact로
+  복제한 뒤 host parser가 hash/size/semantic status를 재검증
+- missing, symlink, oversized, pre-existing, proof-input alias output은
+  영속화 전에 fail-closed하며 실패한 durable directory를 제거
+- timeout, exact-size boundary, fake/duplicate sentinel, payload mutation,
+  source/hash/ordinal binding, `fork`+`setsid` descendant cleanup의 hostile
+  producer tests 통과
+- `.proof-live` residue와 자동 제출 없음
+
+이 smoke는 좁은 file-read exploit effect의 원본 실행을 증명한다. flag
+proof, 원격 portability, challenge solve, 자동 제출 권한을 부여하지 않으며
+실제 엔진은 3 positive/3 negative 결과를 preissued state identity와
+별도로 결속해야 한다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를

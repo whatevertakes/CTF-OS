@@ -46,7 +46,7 @@ def capability_payload(
 
 class CapabilityTests(unittest.TestCase):
     def test_host_attestations_match_vendored_v2_manifest(self):
-        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 10)
+        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 11)
         manifest = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -209,6 +209,7 @@ class CapabilityTests(unittest.TestCase):
             report["missing"],
             [
                 "pwn_crash_v1",
+                "pwn_exploit_effect_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
@@ -263,6 +264,33 @@ class CapabilityTests(unittest.TestCase):
             report["attestations"],
         )
 
+    def test_pwn_exploit_effect_capability_missing_fails_closed(self):
+        def runner(argv, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    capability_payload(
+                        excluded_attestations=frozenset(
+                            {"pwn_exploit_effect_v1"}
+                        )
+                    )
+                ).encode(),
+                b"",
+            )
+
+        report = inspect_pinned_capabilities(DIGEST, runner=runner)
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["missing"],
+            ["pwn_exploit_effect_v1"],
+        )
+        self.assertNotIn(
+            "pwn_exploit_effect_v1",
+            report["attestations"],
+        )
+
     def test_managed_fingerprint_or_version_mismatch_fails_closed(self):
         payload = capability_payload()
         records = payload["capabilities"]
@@ -301,6 +329,14 @@ class CapabilityTests(unittest.TestCase):
         runtime_snapshot["attestation"]["contract_id"] = (
             "ctfos.pwn.runtime_snapshot.stale"
         )
+        exploit_effect = next(
+            item
+            for item in records
+            if item["name"] == "pwn_exploit_effect_v1"
+        )
+        exploit_effect["attestation"]["path"] = (
+            "/opt/ctf-templates/pwn/stale-exploit-effect.py"
+        )
 
         def runner(argv, **kwargs):
             del kwargs
@@ -317,6 +353,7 @@ class CapabilityTests(unittest.TestCase):
             report["missing"],
             [
                 "pwn_crash_v1",
+                "pwn_exploit_effect_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
@@ -327,6 +364,7 @@ class CapabilityTests(unittest.TestCase):
             set(report["attestation_errors"]),
             {
                 "pwn_crash_v1",
+                "pwn_exploit_effect_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",

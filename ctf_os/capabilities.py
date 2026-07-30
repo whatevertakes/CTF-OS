@@ -27,6 +27,7 @@ REQUIRED_MANAGED_CAPABILITIES = frozenset(
         "angr_python",
         "pwn_crash_v1",
         "pwn_runtime_snapshot_v1",
+        "pwn_exploit_effect_v1",
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
@@ -51,6 +52,16 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "sha256": (
             "e9d0927e42258a589d17b02f94071379"
             "ea015b040051a405cda455ba14879d97"
+        ),
+    },
+    "pwn_exploit_effect_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.pwn.exploit_effect",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/pwn/exploit_effect.py",
+        "sha256": (
+            "ef8827eb7cf5189893302c43560930de1"
+            "f1e0a6c66636c9e5d485c0ecb114835"
         ),
     },
     "rev_inventory_v2": {
