@@ -1003,7 +1003,9 @@ stdin runner 17개와 shell/source 검증이 모두 통과했다. 다른 인터�
 core-file 비의존 Pwn observer와 address-resolution advisory를 포함한
 `d3cb714` code tree에서는 전체 1,025개 테스트가 210.837초에 통과했다
 (측정 wall 200.42초, exit 0). 이 수치는 실제 Docker smoke와 별개인 host
-회귀 결과이며 solve 성능 측정으로 해석하지 않는다.
+회귀 결과이며 solve 성능 측정으로 해석하지 않는다. 수용 기록 commit
+`76bb84a`의 fresh clone에서도 같은 1,025개와 capability/browser/Pwn/Rev
+source gate가 모두 통과했다(측정 wall 225.78초, exit 0).
 
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
 동작을 검증하지만 실제 Codex 계정과 실제 대회 서버를 사용하는 end-to-end

@@ -85,7 +85,9 @@ attestation error 0, warning 0이었다.
 같은 code tree를 Python 3.13.14로 검증한 host 전체 회귀는 1,025개
 테스트가 210.837초에 통과했다(측정 wall 200.42초, exit 0). 실제 Docker
 smoke와 host 회귀는 서로 다른 증거이며 어느 쪽도 solve 성능으로 집계하지
-않는다.
+않는다. 수용 기록 commit `76bb84a`의 fresh clone에서도 같은 1,025개와
+capability/browser/Pwn/Rev source gate가 모두 통과했다(측정 wall
+225.78초, exit 0).
 
 ## Address-resolution advisory
 
