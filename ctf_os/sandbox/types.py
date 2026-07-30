@@ -1527,6 +1527,11 @@ class SandboxResult:
     stderr_error: str | None = None
     stream_capture_error: str | None = None
     orchestration_error: str | None = None
+    # Clean-proof callers may predeclare a small set of bounded files that
+    # must survive destruction of the one-shot workspace.  Ordinary runs keep
+    # this empty.  Each reference points into the durable challenge-scoped
+    # ``work/proof/clean-*`` tree and is content-addressed during promotion.
+    proof_outputs: tuple[ArtifactRef, ...] = ()
 
 
 def sandbox_result_from_mapping(
@@ -1534,6 +1539,7 @@ def sandbox_result_from_mapping(
     *,
     stdout_path: str | None = None,
     stderr_path: str | None = None,
+    proof_outputs: tuple[ArtifactRef, ...] | None = None,
 ) -> SandboxResult:
     """Decode one backward-compatible ``ctfwrap`` result mapping.
 
@@ -1580,6 +1586,49 @@ def sandbox_result_from_mapping(
     selected_stderr_path = (
         stderr_path if stderr_path is not None else str(value["stderr_path"])
     )
+    selected_proof_outputs: tuple[ArtifactRef, ...]
+    if proof_outputs is not None:
+        selected_proof_outputs = proof_outputs
+    else:
+        raw_proof_outputs = value.get("proof_outputs", [])
+        if type(raw_proof_outputs) is not list:
+            raise ValueError("proof_outputs must be an array")
+        decoded: list[ArtifactRef] = []
+        for raw in raw_proof_outputs:
+            if type(raw) is not dict or set(raw) != {
+                "locator",
+                "scope_fingerprint",
+                "sha256",
+                "size_bytes",
+            }:
+                raise ValueError("invalid proof output reference")
+            locator = raw["locator"]
+            sha256 = raw["sha256"]
+            size_bytes = raw["size_bytes"]
+            scope_fingerprint = raw["scope_fingerprint"]
+            if (
+                type(locator) is not str
+                or type(sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                or type(size_bytes) is not int
+                or size_bytes < 0
+                or type(scope_fingerprint) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", scope_fingerprint) is None
+            ):
+                raise ValueError("invalid proof output reference fields")
+            try:
+                normalized_locator = normalize_locator(locator)
+            except SafeFileError as error:
+                raise ValueError("invalid proof output locator") from error
+            decoded.append(
+                ArtifactRef(
+                    locator=normalized_locator,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    scope_fingerprint=scope_fingerprint,
+                )
+            )
+        selected_proof_outputs = tuple(decoded)
     return SandboxResult(
         run_id=str(value["run_id"]),
         status=str(value["status"]),
@@ -1626,6 +1675,7 @@ def sandbox_result_from_mapping(
         stderr_error=optional_text("stderr_error"),
         stream_capture_error=optional_text("stream_capture_error"),
         orchestration_error=optional_text("orchestration_error"),
+        proof_outputs=selected_proof_outputs,
     )
 
 
@@ -1685,6 +1735,69 @@ class ProofInput:
             destination_locator=destination_locator,
             sha256=sha256,
             size_bytes=size_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProofOutput:
+    """One bounded file promoted out of a clean proof workspace.
+
+    ``source_locator`` names a file that must not exist before execution.
+    ``name`` is a flat engine-chosen durable name, preventing a target from
+    choosing a destination path.  The backend hashes and snapshots the exact
+    regular file after the command and before destroying the clean workspace.
+    """
+
+    source_locator: str
+    name: str
+    maximum_bytes: int
+
+    def __post_init__(self) -> None:
+        try:
+            source = normalize_locator(self.source_locator)
+        except SafeFileError as error:
+            raise ValueError(str(error)) from error
+        if (
+            type(self.name) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.name)
+            is None
+        ):
+            raise ValueError("proof output name is invalid")
+        if (
+            type(self.maximum_bytes) is not int
+            or not 1 <= self.maximum_bytes <= DEFAULT_SNAPSHOT_MAX_BYTES
+        ):
+            raise ValueError("proof output bound is invalid")
+        object.__setattr__(self, "source_locator", source)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "maximum_bytes": self.maximum_bytes,
+            "name": self.name,
+            "source_locator": self.source_locator,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> ProofOutput:
+        if type(value) is not dict or set(value) != {
+            "maximum_bytes",
+            "name",
+            "source_locator",
+        }:
+            raise TypeError("invalid proof output schema")
+        source_locator = value["source_locator"]
+        name = value["name"]
+        maximum_bytes = value["maximum_bytes"]
+        if (
+            type(source_locator) is not str
+            or type(name) is not str
+            or type(maximum_bytes) is not int
+        ):
+            raise TypeError("proof output fields have invalid types")
+        return cls(
+            source_locator=source_locator,
+            name=name,
+            maximum_bytes=maximum_bytes,
         )
 
 

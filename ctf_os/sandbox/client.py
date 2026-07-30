@@ -34,6 +34,7 @@ from .types import (
     NetworkPolicy,
     NetworkTarget,
     ProofInput,
+    ProofOutput,
     SandboxError,
     SandboxResult,
     ScopeError,
@@ -90,6 +91,7 @@ class ChallengeSandboxClient(Protocol):
         *,
         input_locators: Sequence[str] = (),
         proof_inputs: Sequence[ProofInput] = (),
+        proof_outputs: Sequence[ProofOutput] = (),
     ) -> SandboxResult: ...
 
 
@@ -311,11 +313,19 @@ class LocalChallengeSandboxClient:
         *,
         input_locators: Sequence[str] = (),
         proof_inputs: Sequence[ProofInput] = (),
+        proof_outputs: Sequence[ProofOutput] = (),
     ) -> SandboxResult:
+        if not proof_outputs:
+            return self.backend.run_clean_proof(
+                spec,
+                input_locators=input_locators,
+                proof_inputs=proof_inputs,
+            )
         return self.backend.run_clean_proof(
             spec,
             input_locators=input_locators,
             proof_inputs=proof_inputs,
+            proof_outputs=proof_outputs,
         )
 
 
@@ -671,6 +681,7 @@ class UnixChallengeSandboxClient:
         *,
         input_locators: Sequence[str] = (),
         proof_inputs: Sequence[ProofInput] = (),
+        proof_outputs: Sequence[ProofOutput] = (),
     ) -> SandboxResult:
         fallback = (
             spec.timeout_seconds + 150 if spec.timeout_seconds else 604800 + 150
@@ -688,6 +699,9 @@ class UnixChallengeSandboxClient:
                     "input_locators": list(input_locators),
                     "proof_inputs": [
                         item.as_dict() for item in proof_inputs
+                    ],
+                    "proof_outputs": [
+                        item.as_dict() for item in proof_outputs
                     ],
                 },
                 rpc_deadline_monotonic=rpc_deadline,

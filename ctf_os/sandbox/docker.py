@@ -64,6 +64,8 @@ from .types import (
     JobStatus,
     NetworkPolicy,
     ProofInput,
+    ProofOutput,
+    ArtifactRef,
     SandboxError,
     SandboxResult,
     ScopeError,
@@ -1409,6 +1411,7 @@ class DockerSandboxBackend:
         *,
         input_locators: Sequence[str] = (),
         proof_inputs: Sequence[ProofInput] = (),
+        proof_outputs: Sequence[ProofOutput] = (),
     ) -> SandboxResult:
         """Run a proof with stable checks on source and durable work trees."""
 
@@ -1424,6 +1427,7 @@ class DockerSandboxBackend:
                 spec,
                 input_locators=input_locators,
                 proof_inputs=proof_inputs,
+                proof_outputs=proof_outputs,
                 deadline_monotonic=deadline_monotonic,
             )
 
@@ -1433,6 +1437,7 @@ class DockerSandboxBackend:
         *,
         input_locators: Sequence[str] = (),
         proof_inputs: Sequence[ProofInput] = (),
+        proof_outputs: Sequence[ProofOutput] = (),
         deadline_monotonic: float | None,
     ) -> SandboxResult:
         """Run a proof in a new work directory with validated copied inputs."""
@@ -1458,8 +1463,11 @@ class DockerSandboxBackend:
         if (
             len(input_locators) > MAX_PROOF_INPUTS
             or len(proof_inputs) > MAX_PROOF_INPUTS
+            or len(proof_outputs) > MAX_PROOF_INPUTS
         ):
-            raise ValueError("clean proof cannot contain more than 256 inputs")
+            raise ValueError(
+                "clean proof cannot contain more than 256 inputs or outputs"
+            )
         if (
             sum(item.size_bytes for item in proof_inputs)
             > self.limits.work_tree_max_bytes
@@ -1470,6 +1478,23 @@ class DockerSandboxBackend:
         ]
         if len(set(destinations)) != len(destinations):
             raise ValueError("clean proof input destinations must be unique")
+        if (
+            any(type(item) is not ProofOutput for item in proof_outputs)
+            or sum(item.maximum_bytes for item in proof_outputs)
+            > self.limits.work_tree_max_bytes
+        ):
+            raise ValueError("clean proof outputs exceed the total size bound")
+        output_sources = [item.source_locator for item in proof_outputs]
+        output_names = [item.name for item in proof_outputs]
+        if (
+            len(set(output_sources)) != len(output_sources)
+            or len(set(output_names)) != len(output_names)
+            or bool(set(output_sources) & set(destinations))
+        ):
+            raise ValueError(
+                "clean proof output sources and names must be unique and "
+                "must not alias proof inputs"
+            )
         network = self.network_policy.authorize(spec.network_target)
         if bool(spec.resource_request.network) != (network != "none"):
             raise SandboxError(
@@ -1618,6 +1643,40 @@ class DockerSandboxBackend:
                         f"{item.destination_locator}"
                     ) from error
 
+            # A declared proof output must be created by this invocation.  Do
+            # not permit an input or pre-existing workspace file to be
+            # relabelled as command output.  Missing parent directories are
+            # expected; any existing symlink component fails closed.
+            for item in proof_outputs:
+                current = proof_work
+                parts = item.source_locator.split("/")
+                for index, component in enumerate(parts):
+                    current = current / component
+                    try:
+                        metadata = current.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        break
+                    except OSError as error:
+                        raise ScopeError(
+                            "clean proof output path cannot be inspected: "
+                            f"{item.source_locator}"
+                        ) from error
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise ScopeError(
+                            "clean proof output path contains a symlink: "
+                            f"{item.source_locator}"
+                        )
+                    if index == len(parts) - 1:
+                        raise ScopeError(
+                            "clean proof output already exists before command: "
+                            f"{item.source_locator}"
+                        )
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        raise ScopeError(
+                            "clean proof output parent is not a directory: "
+                            f"{item.source_locator}"
+                        )
+
             self.check_work_tree(
                 proof_work,
                 phase="after clean proof input preparation",
@@ -1752,6 +1811,43 @@ class DockerSandboxBackend:
                                 "clean proof produced unsafe or oversized "
                                 f"{filename}: {error}"
                             ) from error
+                    durable_outputs: list[ArtifactRef] = []
+                    if proof_outputs:
+                        try:
+                            output_directory = ensure_relative_directory(
+                                proof_destination,
+                                "outputs",
+                            )
+                        except SafeFileError as error:
+                            raise SandboxError(
+                                "clean proof output directory is unsafe"
+                            ) from error
+                        for item in proof_outputs:
+                            try:
+                                copied = copy_bounded_regular(
+                                    proof_work,
+                                    item.source_locator,
+                                    output_directory / item.name,
+                                    maximum_bytes=item.maximum_bytes,
+                                    mode=0o400,
+                                )
+                            except SafeFileError as error:
+                                raise SandboxError(
+                                    "clean proof produced an unsafe, missing, "
+                                    "or oversized declared output "
+                                    f"{item.name}: {error}"
+                                ) from error
+                            durable_outputs.append(
+                                ArtifactRef(
+                                    locator=(
+                                        f"proof/{proof_destination.name}/"
+                                        f"outputs/{item.name}"
+                                    ),
+                                    sha256=copied.sha256,
+                                    size_bytes=copied.size_bytes,
+                                    scope_fingerprint=self.scope.fingerprint,
+                                )
+                            )
                     sidecar_source = proof_source / FLAG_CANDIDATE_SIDECAR
                     try:
                         sidecar_source.stat(follow_symlinks=False)
@@ -1796,6 +1892,7 @@ class DockerSandboxBackend:
                         value,
                         stdout_path=f"{proof_locator}/stdout.log",
                         stderr_path=f"{proof_locator}/stderr.log",
+                        proof_outputs=tuple(durable_outputs),
                     )
                 except BaseException as persistence_error:
                     cleanup_error: str | None = None

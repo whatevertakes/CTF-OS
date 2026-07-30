@@ -24,6 +24,7 @@ from .client import (
 )
 from .types import (
     ProofInput,
+    ProofOutput,
     SandboxError,
     ScopeError,
     validate_deadline_monotonic_seconds,
@@ -375,13 +376,30 @@ class SandboxService:
             proof_inputs = tuple(
                 ProofInput.from_mapping(item) for item in proof_input_values
             )
-            return asdict(
-                client.run_clean_proof(
-                    command_from_dict(params.get("command")),
+            proof_output_values = params.get("proof_outputs", [])
+            if not isinstance(proof_output_values, list) or not all(
+                isinstance(item, dict) for item in proof_output_values
+            ):
+                raise ValueError("proof_outputs must be an array of objects")
+            proof_outputs = tuple(
+                ProofOutput.from_mapping(item)
+                for item in proof_output_values
+            )
+            command = command_from_dict(params.get("command"))
+            if proof_outputs:
+                result = client.run_clean_proof(
+                    command,
+                    input_locators=inputs,
+                    proof_inputs=proof_inputs,
+                    proof_outputs=proof_outputs,
+                )
+            else:
+                result = client.run_clean_proof(
+                    command,
                     input_locators=inputs,
                     proof_inputs=proof_inputs,
                 )
-            )
+            return asdict(result)
         raise SandboxError(f"unsupported sandbox operation: {operation!r}")
 
     def handle_bytes(self, data: bytes) -> bytes:
