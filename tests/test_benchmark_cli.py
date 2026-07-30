@@ -108,6 +108,7 @@ def _promotion_evidence(*, improve_live: bool = True) -> dict[str, object]:
         "tool_manifest_sha256": "1" * 64,
         "image_sha256": "2" * 64,
         "model_config_sha256": "3" * 64,
+        "engine_source_sha256": "4" * 64,
     }
     budget = {
         "wall_seconds": 60,
@@ -123,7 +124,7 @@ def _promotion_evidence(*, improve_live: bool = True) -> dict[str, object]:
         "terminal_run_records": 1,
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "splits": splits,
         "baseline": {
             "system": "thin_scaffold",

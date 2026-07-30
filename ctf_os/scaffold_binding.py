@@ -15,11 +15,16 @@ from datetime import UTC, datetime
 from typing import Mapping
 
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
+from ctf_os.codex.contracts import (
+    MANAGED_PROOF_ACTION_KIND,
+    MANAGED_PWN_CRASH_ACTION_KIND,
+    MANAGED_TYPED_GATE_ACTION_KINDS,
+)
 from ctf_os.store.atomic import canonical_json_bytes
 
 
-SCAFFOLD_LAUNCH_SCHEMA_VERSION = 1
-SCAFFOLD_LAUNCH_PROTOCOL = "ctfos.execution_scaffold.v1"
+SCAFFOLD_LAUNCH_SCHEMA_VERSION = 2
+SCAFFOLD_LAUNCH_PROTOCOL = "ctfos.execution_scaffold.v2"
 SCAFFOLD_LAUNCH_METADATA_KEY = "evaluation_scaffold_launch"
 THIN_SOLVE_MODE = "thin"
 FULL_SOLVE_MODE = "managed"
@@ -30,6 +35,13 @@ _IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _MAX_TEXT_BYTES = 512
 _MANAGED_CONTINUITY_POLICIES = frozenset(
     {"fresh", "captain_lane", "role_lane"}
+)
+# Derive the exact managed dispatcher surface from its canonical kinds so
+# aliases cannot enter the frozen command contract.
+MANAGED_COMMAND_TYPED_ACTIONS = (
+    MANAGED_PROOF_ACTION_KIND,
+    MANAGED_PWN_CRASH_ACTION_KIND,
+    *MANAGED_TYPED_GATE_ACTION_KINDS,
 )
 
 
@@ -83,14 +95,7 @@ def managed_command_contract_sha256(
                 "evidence_auditor",
             ],
         },
-        "typed_actions": [
-            "crypto_metamorphic",
-            "forensic_assertion",
-            "misc_transform",
-            "pwn_crash",
-            "pwn_exploit_effect",
-            "web_impact",
-        ],
+        "typed_actions": list(MANAGED_COMMAND_TYPED_ACTIONS),
         "state_writer": "engine_store_only",
         "raw_output_transport": "bounded_artifact_pointer",
         "automatic_submission": False,
@@ -205,6 +210,7 @@ class ScaffoldLaunchBinding:
     runtime_image_digest: str
     tool_manifest_sha256: str
     model_config_sha256: str
+    engine_source_sha256: str
     command_contract_sha256: str
 
     def core_dict(self) -> dict[str, object]:
@@ -218,6 +224,7 @@ class ScaffoldLaunchBinding:
             "configuration_epoch": self.configuration_epoch,
             "manifest_sha256": self.manifest_sha256,
             "model_config_sha256": self.model_config_sha256,
+            "engine_source_sha256": self.engine_source_sha256,
             "model_id": self.model_id,
             "protocol": SCAFFOLD_LAUNCH_PROTOCOL,
             "runtime_image_digest": self.runtime_image_digest,
@@ -329,6 +336,10 @@ def build_scaffold_launch_binding(
             metadata.get("evaluation_model_config_sha256"),
             "evaluation_model_config_sha256",
         ),
+        engine_source_sha256=_sha256(
+            metadata.get("evaluation_engine_source_sha256"),
+            "evaluation_engine_source_sha256",
+        ),
         command_contract_sha256=_sha256(
             command_contract_sha256,
             "command_contract_sha256",
@@ -354,6 +365,7 @@ def parse_scaffold_launch_record(
         "launched_at",
         "manifest_sha256",
         "model_config_sha256",
+        "engine_source_sha256",
         "model_id",
         "protocol",
         "record_sha256",
@@ -408,6 +420,10 @@ def parse_scaffold_launch_record(
         model_config_sha256=_sha256(
             value["model_config_sha256"],
             "model_config_sha256",
+        ),
+        engine_source_sha256=_sha256(
+            value["engine_source_sha256"],
+            "engine_source_sha256",
         ),
         command_contract_sha256=_sha256(
             value["command_contract_sha256"],
@@ -469,6 +485,7 @@ def validate_scaffold_launch_record(
 __all__ = [
     "ASSISTED_SOLVE_MODE",
     "FULL_SOLVE_MODE",
+    "MANAGED_COMMAND_TYPED_ACTIONS",
     "SCAFFOLD_LAUNCH_METADATA_KEY",
     "SCAFFOLD_LAUNCH_PROTOCOL",
     "SCAFFOLD_LAUNCH_SCHEMA_VERSION",

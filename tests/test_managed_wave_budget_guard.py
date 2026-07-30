@@ -7,6 +7,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.budget import deadline_utc_after
@@ -66,6 +67,22 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
                 "angr_python": {},
             },
         }
+
+    @staticmethod
+    def evaluation_fingerprint():
+        metadata = prepared_metadata()
+        return mock.Mock(
+            tool_manifest_sha256=metadata[
+                "evaluation_tool_manifest_sha256"
+            ],
+            image_sha256=metadata["evaluation_image_sha256"],
+            model_config_sha256=metadata[
+                "evaluation_model_config_sha256"
+            ],
+            engine_source_sha256=metadata[
+                "evaluation_engine_source_sha256"
+            ],
+        )
 
     def engine(
         self,
@@ -321,11 +338,15 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             engine,
             capability_probe=self.capability,
         )
-        state, session_id = orchestrator._reserve_session(
-            self.identity,
-            "S-evaluation",
-            thread_continuity_policy="fresh",
-        )
+        with mock.patch(
+            "ctf_os.promotion_bundles.local_execution_fingerprint",
+            return_value=self.evaluation_fingerprint(),
+        ):
+            state, session_id = orchestrator._reserve_session(
+                self.identity,
+                "S-evaluation",
+                thread_continuity_policy="fresh",
+            )
         record = state.metadata[SCAFFOLD_LAUNCH_METADATA_KEY]
         expected_contract = managed_command_contract_sha256(
             model_id=engine.config.models.captain,
@@ -407,7 +428,13 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             state.metadata.update(metadata)
 
         engine.store.update(self.identity, prepare)
-        with self.assertRaisesRegex(EngineError, "arm does not match"):
+        with (
+            mock.patch(
+                "ctf_os.promotion_bundles.local_execution_fingerprint",
+                return_value=self.evaluation_fingerprint(),
+            ),
+            self.assertRaisesRegex(EngineError, "arm does not match"),
+        ):
             ManagedOrchestrator(
                 engine,
                 capability_probe=self.capability,

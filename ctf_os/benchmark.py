@@ -38,7 +38,7 @@ MIN_TTFVR_ABSOLUTE_IMPROVEMENT_SECONDS = 1.0
 MIN_TTFVR_RELATIVE_IMPROVEMENT = 0.05
 THIN_SCAFFOLD = "thin_scaffold"
 CTF_OS_SYSTEM = "ctf_os"
-BLIND_LIVE_PROMOTION_SCHEMA_VERSION = 2
+BLIND_LIVE_PROMOTION_SCHEMA_VERSION = 3
 _MAX_IDENTIFIER_BYTES = 256
 _MAX_PROMOTION_CASES = 4096
 _MAX_COUNTER = (1 << 63) - 1
@@ -198,6 +198,7 @@ class BenchmarkExecutionFingerprint:
     tool_manifest_sha256: str
     image_sha256: str
     model_config_sha256: str
+    engine_source_sha256: str
 
     def validate(self) -> None:
         _validate_sha256(
@@ -208,6 +209,10 @@ class BenchmarkExecutionFingerprint:
         _validate_sha256(
             self.model_config_sha256,
             "model_config_sha256",
+        )
+        _validate_sha256(
+            self.engine_source_sha256,
+            "engine_source_sha256",
         )
 
 
@@ -554,6 +559,7 @@ def _fingerprint_from_dict(value: object) -> BenchmarkExecutionFingerprint:
                 "tool_manifest_sha256",
                 "image_sha256",
                 "model_config_sha256",
+                "engine_source_sha256",
             }
         ),
         label="execution_fingerprint",
@@ -562,6 +568,7 @@ def _fingerprint_from_dict(value: object) -> BenchmarkExecutionFingerprint:
         tool_manifest_sha256=raw["tool_manifest_sha256"],
         image_sha256=raw["image_sha256"],
         model_config_sha256=raw["model_config_sha256"],
+        engine_source_sha256=raw["engine_source_sha256"],
     )
     fingerprint.validate()
     return fingerprint
@@ -858,6 +865,9 @@ def _promotion_evidence_to_dict(
                 "image_sha256": fingerprint.image_sha256,
                 "model_config_sha256": (
                     fingerprint.model_config_sha256
+                ),
+                "engine_source_sha256": (
+                    fingerprint.engine_source_sha256
                 ),
             },
         }

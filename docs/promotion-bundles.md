@@ -22,9 +22,15 @@ ctfos pin-image
 ctfos benchmark fingerprint
 ```
 
-`fingerprint` hashes the pinned image ID, the image capability manifest, and
-the complete configured model-role mapping. Promotion preparation requires
-every logical model role to name the single model declared by the manifest.
+`fingerprint` hashes the pinned image ID, the image capability manifest, the
+complete configured model-role mapping, and a deterministic inventory of
+Git-tracked runtime source. The source inventory includes `ctf_os/**/*.py`,
+`pyproject.toml`, and tracked root entrypoints; it excludes mutable challenge
+state, incoming artifacts, tests, and documentation. Dirty, symlinked,
+oversized, or index-mismatched runtime source fails closed.
+
+Promotion preparation requires every logical model role to name the single
+model declared by the manifest.
 
 ## 2. Freeze the paired session manifest
 
@@ -32,7 +38,7 @@ The manifest has these top-level fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "benchmark_id": "promotion-2026-08",
   "model_id": "gpt-5.6-sol",
   "budget": {
@@ -43,7 +49,8 @@ The manifest has these top-level fields:
   "execution_fingerprint": {
     "tool_manifest_sha256": "<fingerprint output>",
     "image_sha256": "<fingerprint output>",
-    "model_config_sha256": "<fingerprint output>"
+    "model_config_sha256": "<fingerprint output>",
+    "engine_source_sha256": "<fingerprint output>"
   },
   "splits": []
 }
@@ -83,9 +90,12 @@ ctfos benchmark prepare \
   --session live-pwn-ctf_os-1
 ```
 
-Preparation fails if the source digest, fixed budget, model/tool/image
-fingerprint, or challenge identity differs, or if execution activity already
-exists. It only writes evaluation binding metadata through the state store.
+Preparation fails if the challenge-source digest, fixed budget,
+model/tool/image/engine-source fingerprint, or challenge identity differs, or
+if execution activity already exists. It only writes evaluation binding
+metadata through the state store. The engine re-attests this fingerprint when
+it records the scaffold launch and again after provider capacity is acquired,
+immediately before every model invocation.
 
 The operator then runs that one session normally. After all activity and manual
 outcomes are recorded, finalize the counters that cannot be inferred from an
@@ -110,7 +120,8 @@ ctfos benchmark capture \
 
 Capture copies only bounded state-referenced evidence, records every file
 digest, evaluates the copied canonical state, and authenticates the bundle.
-Activity timestamped after finalization makes the bundle incomplete.
+It re-attests runtime source before and after capture. Activity timestamped
+after finalization makes the bundle incomplete.
 
 ## 4. Compare only after all explicit sessions finish
 
@@ -129,7 +140,8 @@ ctfos benchmark compare \
 
 The complete real manifest will have more bundles. Comparison re-authenticates
 the manifest and each bundle, checks the exact file inventory and hashes,
-re-runs canonical evaluation, rejects reused session IDs/state, and derives:
+re-attests runtime source before and after verification, re-runs canonical
+evaluation, rejects reused session IDs/state, and derives:
 
 - solve@1
 - pass^2/3

@@ -6,6 +6,7 @@ import unittest
 
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.scaffold_binding import (
+    MANAGED_COMMAND_TYPED_ACTIONS,
     ScaffoldBindingError,
     build_scaffold_launch_binding,
     managed_command_contract_sha256,
@@ -36,11 +37,30 @@ def prepared_metadata(arm: str = THIN_SCAFFOLD) -> dict[str, object]:
         "evaluation_image_sha256": IMAGE.removeprefix("sha256:"),
         "evaluation_tool_manifest_sha256": SHA_C,
         "evaluation_model_config_sha256": SHA_D,
+        "evaluation_engine_source_sha256": SHA_E,
     }
 
 
 class ScaffoldBindingTests(unittest.TestCase):
     def test_managed_contract_binds_policy_model_and_effort(self) -> None:
+        self.assertEqual(
+            MANAGED_COMMAND_TYPED_ACTIONS,
+            (
+                "prove_candidate",
+                "verify_pwn_crash",
+                "prove_pwn_exploit_effect",
+                "rev_accepted_input",
+                "prove_web_impact",
+                "prove_web_active_probe",
+                "prove_crypto_metamorphic",
+                "prove_forensic_assertion",
+                "evaluate_misc_transform",
+            ),
+        )
+        self.assertEqual(
+            len(MANAGED_COMMAND_TYPED_ACTIONS),
+            len(set(MANAGED_COMMAND_TYPED_ACTIONS)),
+        )
         base = managed_command_contract_sha256(
             model_id="frontier-model",
             captain_effort="ultra",
@@ -168,6 +188,7 @@ class ScaffoldBindingTests(unittest.TestCase):
             ("configuration_epoch", 8),
             ("model_id", "other-model"),
             ("runtime_image_digest", "sha256:" + SHA_A),
+            ("engine_source_sha256", SHA_A),
             ("command_contract_sha256", SHA_A),
             ("binding_sha256", SHA_A),
             ("launched_at", "2026-08-01T00:00:00Z"),
@@ -178,6 +199,42 @@ class ScaffoldBindingTests(unittest.TestCase):
                 changed[field] = replacement
                 with self.assertRaises(ScaffoldBindingError):
                     parse_scaffold_launch_record(changed)
+
+        missing_source = copy.deepcopy(record)
+        del missing_source["engine_source_sha256"]
+        with self.assertRaisesRegex(
+            ScaffoldBindingError,
+            "non-canonical schema",
+        ):
+            parse_scaffold_launch_record(missing_source)
+
+        extra_source = copy.deepcopy(record)
+        extra_source["source_commit"] = "deadbeef"
+        with self.assertRaisesRegex(
+            ScaffoldBindingError,
+            "non-canonical schema",
+        ):
+            parse_scaffold_launch_record(extra_source)
+
+        missing_prepared_source = prepared_metadata()
+        del missing_prepared_source[
+            "evaluation_engine_source_sha256"
+        ]
+        with self.assertRaisesRegex(
+            ScaffoldBindingError,
+            "evaluation_engine_source_sha256",
+        ):
+            build_scaffold_launch_binding(
+                metadata=missing_prepared_source,
+                configuration_epoch=7,
+                contest_id="contest-a",
+                category="pwn",
+                challenge_id="challenge-a",
+                arm=THIN_SCAFFOLD,
+                model_id="gpt-5.6-sol",
+                runtime_image_digest=IMAGE,
+                command_contract_sha256=SHA_E,
+            )
 
         other = dict(metadata)
         other["evaluation_session_id"] = "blind-pwn-thin-2"

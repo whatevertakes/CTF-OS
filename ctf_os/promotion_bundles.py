@@ -81,6 +81,11 @@ from ctf_os.scaffold_binding import (
     managed_command_contract_sha256,
     parse_scaffold_launch_record,
 )
+from ctf_os.runtime_source import (
+    RuntimeSourceError,
+    RuntimeSourceInventory,
+    runtime_source_inventory,
+)
 from ctf_os.store import StateStore
 from ctf_os.store.atomic import (
     atomic_write_bytes,
@@ -91,7 +96,7 @@ from ctf_os.store.atomic import (
 from ctf_os.store.upgrades import upgrade_state, validate_state_protocol_shape
 
 
-PROMOTION_MANIFEST_SCHEMA_VERSION = 1
+PROMOTION_MANIFEST_SCHEMA_VERSION = 2
 PROMOTION_BUNDLE_SCHEMA_VERSION = 1
 PROMOTION_SIGNATURE_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -333,6 +338,7 @@ def _parse_fingerprint(
                 "tool_manifest_sha256",
                 "image_sha256",
                 "model_config_sha256",
+                "engine_source_sha256",
             }
         ),
         label="promotion execution fingerprint",
@@ -349,6 +355,10 @@ def _parse_fingerprint(
         model_config_sha256=_sha256_value(
             raw["model_config_sha256"],
             "model_config_sha256",
+        ),
+        engine_source_sha256=_sha256_value(
+            raw["engine_source_sha256"],
+            "engine_source_sha256",
         ),
     )
     result.validate()
@@ -812,6 +822,10 @@ def freeze_promotion_manifest(
             label="promotion manifest",
         )
     )
+    if local_execution_fingerprint(workspace) != parsed.fingerprint:
+        raise PromotionBundleError(
+            "current execution fingerprint differs from the manifest"
+        )
     frozen_at = utc_now()
     unsigned = {
         "schema_version": PROMOTION_SIGNATURE_SCHEMA_VERSION,
@@ -828,6 +842,10 @@ def freeze_promotion_manifest(
             unsigned,
         ),
     }
+    if local_execution_fingerprint(workspace) != parsed.fingerprint:
+        raise PromotionBundleError(
+            "execution fingerprint changed during manifest freeze"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(output, envelope, mode=0o400)
     return {
@@ -904,10 +922,10 @@ def _load_frozen_manifest(
     return manifest, frozen_at
 
 
-def local_execution_fingerprint(
+def _local_execution_fingerprint(
     workspace_root: Path | str,
-) -> BenchmarkExecutionFingerprint:
-    """Derive the local model/tool/image fingerprint used for preparation."""
+) -> tuple[BenchmarkExecutionFingerprint, RuntimeSourceInventory]:
+    """Derive the local fingerprint and its exact runtime-source inventory."""
 
     workspace = Path(workspace_root).resolve()
     config = load_config(workspace)
@@ -929,6 +947,12 @@ def local_execution_fingerprint(
         maximum=MAX_MANIFEST_BYTES,
         label="CTF image capability manifest",
     )
+    try:
+        source_inventory = runtime_source_inventory()
+    except RuntimeSourceError as error:
+        raise PromotionBundleError(
+            "CTF-OS runtime source inventory is not clean and stable"
+        ) from error
     model_configuration = asdict(config.models)
     result = BenchmarkExecutionFingerprint(
         tool_manifest_sha256=_sha256(tool_manifest),
@@ -936,9 +960,21 @@ def local_execution_fingerprint(
         model_config_sha256=_sha256(
             canonical_json_bytes(model_configuration)
         ),
+        engine_source_sha256=source_inventory.sha256,
     )
     result.validate()
-    return result
+    return result, source_inventory
+
+
+def local_execution_fingerprint(
+    workspace_root: Path | str,
+) -> BenchmarkExecutionFingerprint:
+    """Derive the model/tool/image/source fingerprint used for promotion."""
+
+    fingerprint, _inventory = _local_execution_fingerprint(
+        workspace_root
+    )
+    return fingerprint
 
 
 def execution_fingerprint_report(
@@ -946,7 +982,9 @@ def execution_fingerprint_report(
 ) -> dict[str, object]:
     """Return the exact values an operator should freeze into a manifest."""
 
-    fingerprint = local_execution_fingerprint(workspace_root)
+    fingerprint, source_inventory = _local_execution_fingerprint(
+        workspace_root
+    )
     config = load_config(Path(workspace_root).resolve())
     model_ids = {
         getattr(config.models, field)
@@ -964,7 +1002,11 @@ def execution_fingerprint_report(
             "model_config_sha256": (
                 fingerprint.model_config_sha256
             ),
+            "engine_source_sha256": (
+                fingerprint.engine_source_sha256
+            ),
         },
+        "engine_source_inventory": source_inventory.to_dict(),
     }
 
 
@@ -992,6 +1034,9 @@ def _prepared_metadata(
         "evaluation_model_config_sha256": (
             manifest.fingerprint.model_config_sha256
         ),
+        "evaluation_engine_source_sha256": (
+            manifest.fingerprint.engine_source_sha256
+        ),
         "evaluation_prepared": True,
     }
 
@@ -1018,7 +1063,7 @@ def prepare_promotion_session(
     actual_fingerprint = local_execution_fingerprint(workspace)
     if actual_fingerprint != manifest.fingerprint:
         raise PromotionBundleError(
-            "current model/tool/image fingerprint does not match the "
+            "current model/tool/image/source fingerprint does not match the "
             "frozen manifest"
         )
     config = load_config(workspace)
@@ -1151,6 +1196,10 @@ def finalize_promotion_session(
         workspace,
         Path(frozen_manifest_path),
     )
+    if local_execution_fingerprint(workspace) != manifest.fingerprint:
+        raise PromotionBundleError(
+            "current execution fingerprint differs from the frozen manifest"
+        )
     requested_id = _identifier(session_id, "session_id")
     session = manifest.sessions.get(requested_id)
     if session is None:
@@ -1868,6 +1917,9 @@ def _scaffold_collection_blockers(
         "model_config_sha256": (
             manifest.fingerprint.model_config_sha256
         ),
+        "engine_source_sha256": (
+            manifest.fingerprint.engine_source_sha256
+        ),
     }
     observed_static = {
         key: getattr(binding, key) for key in expected_static
@@ -2583,6 +2635,10 @@ def capture_promotion_session(
             envelope,
             mode=0o400,
         )
+        if local_execution_fingerprint(workspace) != manifest.fingerprint:
+            raise PromotionBundleError(
+                "execution fingerprint changed during promotion capture"
+            )
         os.rename(temporary_root, output)
     except BaseException:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -3206,6 +3262,10 @@ def evaluate_promotion_bundles(
         evidence_complete=not collector_blockers,
     )
     gate = evaluate_blind_live_promotion(evidence)
+    if local_execution_fingerprint(workspace) != manifest.fingerprint:
+        raise PromotionBundleError(
+            "execution fingerprint changed during bundle verification"
+        )
     if collector_blockers and gate["promotion_eligible"]:
         raise PromotionBundleError(
             "collector blockers cannot yield an eligible promotion"

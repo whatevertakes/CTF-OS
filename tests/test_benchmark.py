@@ -170,6 +170,7 @@ def promotion_evidence() -> BlindLivePromotionEvidence:
         tool_manifest_sha256="1" * 64,
         image_sha256="2" * 64,
         model_config_sha256="3" * 64,
+        engine_source_sha256="4" * 64,
     )
     return BlindLivePromotionEvidence(
         splits=splits,
@@ -1355,6 +1356,20 @@ class BlindLivePromotionGateTests(unittest.TestCase):
         del missing_fingerprint["candidate"]["execution_fingerprint"]
         with self.assertRaisesRegex(BenchmarkError, "exactly"):
             BlindLivePromotionEvidence.from_dict(missing_fingerprint)
+
+        missing_source = copy.deepcopy(raw)
+        del missing_source["candidate"]["execution_fingerprint"][
+            "engine_source_sha256"
+        ]
+        with self.assertRaisesRegex(BenchmarkError, "exactly"):
+            BlindLivePromotionEvidence.from_dict(missing_source)
+
+        extra_source = copy.deepcopy(raw)
+        extra_source["candidate"]["execution_fingerprint"][
+            "source_commit"
+        ] = "deadbeef"
+        with self.assertRaisesRegex(BenchmarkError, "exactly"):
+            BlindLivePromotionEvidence.from_dict(extra_source)
 
         invalid_manifest = copy.deepcopy(raw)
         invalid_manifest["splits"][0]["cases"][0][

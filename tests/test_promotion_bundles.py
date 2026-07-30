@@ -5,27 +5,32 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from ctf_os import cli
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.codex import (
+    BatchInvocation,
+    BatchRunner,
     LIVE_THIN_SCAFFOLD,
     LiveCommandBuilder,
     LiveSession,
     ModelCatalog,
     ReasoningEffort,
+    Role,
 )
 from ctf_os.config import (
     default_config_text,
     load_config,
     set_runtime_image_digest,
 )
-from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.engine.challenge import ChallengeEngine, EngineError
 from ctf_os.managed_continuity import (
     THREAD_CONTINUITY_CONTRACT_VERSION,
     THREAD_CONTINUITY_RUN_KEY,
@@ -138,7 +143,7 @@ def _manifest(
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark_id": "paired-bundle-fixture",
         "model_id": "gpt-5.6-sol",
         "budget": {
@@ -151,6 +156,7 @@ def _manifest(
             "tool_manifest_sha256": "1" * 64,
             "image_sha256": "2" * 64,
             "model_config_sha256": "3" * 64,
+            "engine_source_sha256": "4" * 64,
         },
         "splits": splits,
     }
@@ -163,6 +169,62 @@ class PromotionBundleTests(unittest.TestCase):
         self.store = StateStore(self.root)
         self.manifest_path = self.root / "manifest.json"
         self.frozen_path = self.root / "manifest.frozen.json"
+        self.source_root = self.root / "runtime-source"
+        for relative, payload in {
+            "ctf_os/__init__.py": b'"""fixture package."""\n',
+            "ctf_os/__main__.py": b"from ctf_os.cli import main\n",
+            "ctf_os/benchmark.py": b"SCHEMA = 3\n",
+            "ctf_os/cli.py": b"def main(): return 0\n",
+            "ctf_os/container_tools.py": b"def main(): return 0\n",
+            "ctf_os/promotion_bundles.py": b"PROMOTION = 2\n",
+            "ctf_os/runtime_source.py": b"INVENTORY = 1\n",
+            "ctf_os/engine/core.py": b"ENGINE = 'clean'\n",
+            "pyproject.toml": (
+                b"[project]\nname='fixture'\nversion='1.0.0'\n"
+            ),
+        }.items():
+            target = self.source_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        subprocess.run(
+            ("git", "init", "-q", str(self.source_root)),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ("git", "-C", str(self.source_root), "add", "--all"),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=CTF-OS Tests",
+                "-c",
+                "user.email=ctfos-tests@example.invalid",
+                "-C",
+                str(self.source_root),
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.source_patch = mock.patch(
+            "ctf_os.runtime_source._RUNTIME_SOURCE_ROOT",
+            self.source_root,
+        )
+        self.source_patch.start()
         config_path = self.root / ".ctfos" / "engine.toml"
         atomic_write_text(
             config_path,
@@ -182,6 +244,9 @@ class PromotionBundleTests(unittest.TestCase):
                 "model_config_sha256": (
                     fingerprint.model_config_sha256
                 ),
+                "engine_source_sha256": (
+                    fingerprint.engine_source_sha256
+                ),
             }
         )
         self.manifest_path.write_text(
@@ -190,6 +255,7 @@ class PromotionBundleTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.source_patch.stop()
         self.temporary_directory.cleanup()
 
     def _session_records(self) -> list[tuple[str, str, str, str, int]]:
@@ -683,6 +749,258 @@ class PromotionBundleTests(unittest.TestCase):
             self.frozen_path,
         )
 
+    def _change_runtime_source_one_byte(self) -> tuple[Path, bytes]:
+        source = self.source_root / "ctf_os" / "engine" / "core.py"
+        original = source.read_bytes()
+        changed = original.replace(b"clean", b"cleao")
+        self.assertEqual(len(changed), len(original))
+        self.assertNotEqual(changed, original)
+        source.write_bytes(changed)
+        return source, original
+
+    def _commit_runtime_source_change(self) -> None:
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.source_root),
+                "add",
+                "ctf_os/engine/core.py",
+            ),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=CTF-OS Tests",
+                "-c",
+                "user.email=ctfos-tests@example.invalid",
+                "-C",
+                str(self.source_root),
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "change runtime source",
+            ),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_dirty_source_rehash_relabel_fails_at_freeze(self) -> None:
+        source, _original = self._change_runtime_source_one_byte()
+        self.manifest["execution_fingerprint"][
+            "engine_source_sha256"
+        ] = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.manifest_path.write_text(
+            json.dumps(self.manifest, sort_keys=True),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "runtime source inventory",
+        ):
+            self._freeze()
+        self.assertFalse(self.frozen_path.exists())
+
+    def test_source_change_after_freeze_blocks_prepare(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._change_runtime_source_one_byte()
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "runtime source inventory",
+        ):
+            self._create_state(*record)
+
+    def test_source_change_after_prepare_blocks_launch(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+        state = self.store.create_challenge(
+            session.identity,
+            metadata={
+                "source_manifest_sha256": (
+                    session.input_manifest_sha256
+                )
+            },
+            budget=Budget(
+                allocated_seconds=60,
+                spent_seconds=0,
+                mode=BudgetMode.BOUNDED,
+            ),
+            schema_version=STATE_SCHEMA_VERSION,
+            exist_ok=False,
+        )
+        prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session.session_id,
+        )
+        self._change_runtime_source_one_byte()
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        )
+        with self.assertRaisesRegex(
+            EngineError,
+            "execution fingerprint",
+        ):
+            engine.record_evaluation_scaffold_launch(
+                session.identity,
+                arm=session.arm,
+                command_contract_sha256="a" * 64,
+            )
+        current = self.store.load(session.identity, recover=False)
+        self.assertEqual(current.revision, state.revision + 1)
+        self.assertNotIn(
+            "evaluation_scaffold_launch",
+            current.metadata,
+        )
+
+    def test_source_change_after_launch_blocks_queued_provider(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        self._change_runtime_source_one_byte()
+
+        class ProviderExecutor:
+            calls = 0
+
+            def run(self, command, *, cwd, timeout, on_stdout_line):
+                del command, cwd, timeout, on_stdout_line
+                self.calls += 1
+                raise AssertionError("provider must not start")
+
+        executor = ProviderExecutor()
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+            batch_runner=BatchRunner(
+                process_executor=executor,
+                max_schema_retries=0,
+            ),
+        )
+        result = engine.batch_runner.run(
+            BatchInvocation(
+                run_id="queued-source-change",
+                role=Role.CAPTAIN,
+                prompt="must not reach the provider",
+                working_directory=self.root,
+                output_directory=self.root / "queued-provider",
+            ),
+            before_provider_start=lambda: (
+                engine._before_provider_start(
+                    parse_promotion_manifest(
+                        self.manifest
+                    ).sessions[record[0]].identity
+                )
+            ),
+        )
+        self.assertEqual(executor.calls, 0)
+        self.assertFalse(result.success)
+        self.assertIn(
+            "model_call_cancelled",
+            {failure.kind for failure in result.failures},
+        )
+
+    def test_source_change_blocks_capture_and_bundle_verification(
+        self,
+    ) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        source, original = self._change_runtime_source_one_byte()
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "runtime source inventory",
+        ):
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=record[0],
+                output_directory=self.root / "dirty-capture",
+            )
+        source.write_bytes(original)
+        bundle = self.root / "clean-capture"
+        capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        self._change_runtime_source_one_byte()
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "runtime source inventory",
+        ):
+            evaluate_promotion_bundles(
+                self.root,
+                self.frozen_path,
+                [bundle],
+            )
+
+    def test_validly_rehashed_source_launch_relabel_still_fails(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+        config = load_config(self.root)
+        self._change_runtime_source_one_byte()
+        self._commit_runtime_source_change()
+        relabelled = local_execution_fingerprint(
+            self.root
+        ).engine_source_sha256
+        self.assertNotEqual(
+            relabelled,
+            parsed.fingerprint.engine_source_sha256,
+        )
+
+        def relabel(current) -> None:
+            prior, _timestamp = parse_scaffold_launch_record(
+                current.metadata["evaluation_scaffold_launch"]
+            )
+            current.metadata[
+                "evaluation_engine_source_sha256"
+            ] = relabelled
+            current.metadata["evaluation_scaffold_launch"] = (
+                build_scaffold_launch_binding(
+                    metadata=current.metadata,
+                    configuration_epoch=current.configuration_epoch,
+                    contest_id=session.contest_id,
+                    category=session.category,
+                    challenge_id=session.challenge_id,
+                    arm=session.arm,
+                    model_id=parsed.model_id,
+                    runtime_image_digest=config.runtime.image_digest,
+                    command_contract_sha256=(
+                        prior.command_contract_sha256
+                    ),
+                ).to_record()
+            )
+
+        self.store.update(session.identity, relabel)
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "execution fingerprint differs",
+        ):
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=record[0],
+                output_directory=self.root / "source-relabel",
+            )
+
     def test_exact_types_leakage_and_missing_attempts_fail_before_freeze(
         self,
     ) -> None:
@@ -714,6 +1032,22 @@ class PromotionBundleTests(unittest.TestCase):
             "attempt"
         ] = True
         mutations["boolean attempt"] = attempt_bool
+
+        missing_source = copy.deepcopy(base)
+        del missing_source["execution_fingerprint"][
+            "engine_source_sha256"
+        ]
+        mutations["missing engine source fingerprint"] = missing_source
+
+        extra_source = copy.deepcopy(base)
+        extra_source["execution_fingerprint"]["source_commit"] = "deadbeef"
+        mutations["extra engine source fingerprint field"] = extra_source
+
+        source_bool = copy.deepcopy(base)
+        source_bool["execution_fingerprint"][
+            "engine_source_sha256"
+        ] = True
+        mutations["boolean engine source fingerprint"] = source_bool
 
         for label, value in mutations.items():
             with self.subTest(label=label):

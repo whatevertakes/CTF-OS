@@ -3559,6 +3559,53 @@ class ChallengeEngine:
                 f"{state.status.value}"
             )
 
+    def _require_prepared_execution_fingerprint(
+        self,
+        state: ChallengeState,
+    ) -> None:
+        """Re-attest every prepared evaluation at its provider boundary."""
+
+        if state.metadata.get("evaluation_prepared") is not True:
+            return
+        from ctf_os.promotion_bundles import (
+            local_execution_fingerprint,
+        )
+
+        try:
+            fingerprint = local_execution_fingerprint(
+                self.config.workspace_root
+            )
+        except ValueError as error:
+            raise EngineError(
+                "prepared evaluation could not attest the current "
+                "execution fingerprint"
+            ) from error
+        expected = {
+            "tool_manifest_sha256": state.metadata.get(
+                "evaluation_tool_manifest_sha256"
+            ),
+            "image_sha256": state.metadata.get(
+                "evaluation_image_sha256"
+            ),
+            "model_config_sha256": state.metadata.get(
+                "evaluation_model_config_sha256"
+            ),
+            "engine_source_sha256": state.metadata.get(
+                "evaluation_engine_source_sha256"
+            ),
+        }
+        observed = {
+            "tool_manifest_sha256": fingerprint.tool_manifest_sha256,
+            "image_sha256": fingerprint.image_sha256,
+            "model_config_sha256": fingerprint.model_config_sha256,
+            "engine_source_sha256": fingerprint.engine_source_sha256,
+        }
+        if observed != expected:
+            raise EngineError(
+                "prepared evaluation execution fingerprint differs "
+                "from the frozen manifest"
+            )
+
     def _before_provider_start(
         self,
         identity: ChallengeIdentity,
@@ -3577,6 +3624,7 @@ class ChallengeEngine:
                 state,
                 automated=automated,
             )
+            self._require_prepared_execution_fingerprint(state)
         except EngineError as error:
             raise ModelCallLimitCancelled(str(error)) from error
 
@@ -6259,6 +6307,8 @@ class ChallengeEngine:
             raise EngineError(
                 "prepared evaluation launch requires a pinned image digest"
             )
+
+        self._require_prepared_execution_fingerprint(current)
         try:
             binding = build_scaffold_launch_binding(
                 metadata=current.metadata,
@@ -6276,6 +6326,7 @@ class ChallengeEngine:
             raise EngineError(
                 f"evaluation scaffold binding rejected: {error}"
             ) from error
+        self._require_prepared_execution_fingerprint(current)
 
         def apply(state: ChallengeState) -> None:
             if (

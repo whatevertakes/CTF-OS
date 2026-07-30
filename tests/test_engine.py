@@ -798,6 +798,7 @@ class EngineTests(unittest.TestCase):
                     ),
                     "evaluation_tool_manifest_sha256": digest(b"tools"),
                     "evaluation_model_config_sha256": digest(b"models"),
+                    "evaluation_engine_source_sha256": digest(b"source"),
                 }
             )
 
@@ -807,11 +808,21 @@ class EngineTests(unittest.TestCase):
             expected_revision=added.revision,
         )
         contract_sha256 = digest(b"thin-contract")
-        launched = engine.record_evaluation_scaffold_launch(
-            self.identity,
-            arm=THIN_SCAFFOLD,
-            command_contract_sha256=contract_sha256,
+        fingerprint = mock.Mock(
+            tool_manifest_sha256=digest(b"tools"),
+            image_sha256=image_digest.removeprefix("sha256:"),
+            model_config_sha256=digest(b"models"),
+            engine_source_sha256=digest(b"source"),
         )
+        with mock.patch(
+            "ctf_os.promotion_bundles.local_execution_fingerprint",
+            return_value=fingerprint,
+        ):
+            launched = engine.record_evaluation_scaffold_launch(
+                self.identity,
+                arm=THIN_SCAFFOLD,
+                command_contract_sha256=contract_sha256,
+            )
         binding, _timestamp = parse_scaffold_launch_record(
             launched.metadata[SCAFFOLD_LAUNCH_METADATA_KEY]
         )
@@ -821,12 +832,126 @@ class EngineTests(unittest.TestCase):
             binding.configuration_epoch,
             launched.configuration_epoch,
         )
-        with self.assertRaisesRegex(EngineError, "already launched"):
+        with (
+            mock.patch(
+                "ctf_os.promotion_bundles.local_execution_fingerprint",
+                return_value=fingerprint,
+            ),
+            self.assertRaisesRegex(EngineError, "already launched"),
+        ):
             engine.record_evaluation_scaffold_launch(
                 self.identity,
                 arm=THIN_SCAFFOLD,
                 command_contract_sha256=contract_sha256,
             )
+
+    def test_provider_start_rechecks_prepared_source_before_executor(
+        self,
+    ) -> None:
+        image_digest = "sha256:" + hashlib.sha256(b"image").hexdigest()
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=image_digest,
+            ),
+        )
+        executor = RoleExecutor()
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=executor,
+                limiter=FifoModelCallLimiter(1),
+                limiter_wait_timeout=2,
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        added = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+
+        def digest(value: bytes) -> str:
+            return hashlib.sha256(value).hexdigest()
+
+        def prepare(state: ChallengeState) -> None:
+            state.metadata.update(
+                {
+                    "evaluation_prepared": True,
+                    "evaluation_system": THIN_SCAFFOLD,
+                    "evaluation_benchmark_id": "blind-release",
+                    "evaluation_case_id": "case-one",
+                    "evaluation_session_id": "case-one-thin-1",
+                    "evaluation_manifest_sha256": digest(b"manifest"),
+                    "evaluation_model": config.models.captain,
+                    "evaluation_image_sha256": (
+                        image_digest.removeprefix("sha256:")
+                    ),
+                    "evaluation_tool_manifest_sha256": digest(b"tools"),
+                    "evaluation_model_config_sha256": digest(b"models"),
+                    "evaluation_engine_source_sha256": digest(b"source"),
+                }
+            )
+
+        engine.store.update(
+            self.identity,
+            prepare,
+            expected_revision=added.revision,
+        )
+        frozen = mock.Mock(
+            tool_manifest_sha256=digest(b"tools"),
+            image_sha256=image_digest.removeprefix("sha256:"),
+            model_config_sha256=digest(b"models"),
+            engine_source_sha256=digest(b"source"),
+        )
+        with mock.patch(
+            "ctf_os.promotion_bundles.local_execution_fingerprint",
+            return_value=frozen,
+        ):
+            launched = engine.record_evaluation_scaffold_launch(
+                self.identity,
+                arm=THIN_SCAFFOLD,
+                command_contract_sha256=digest(b"contract"),
+            )
+
+        deadline_monotonic, deadline_epoch = (
+            engine._budget_deadline_pair(launched, 60)
+        )
+        invocation = engine._make_invocation(
+            launched,
+            Role.RECON,
+            prefix="source-recheck",
+            instruction="must not reach the provider",
+            deadline_monotonic_seconds=deadline_monotonic,
+            deadline_epoch_seconds=deadline_epoch,
+        )
+        changed = mock.Mock(
+            tool_manifest_sha256=digest(b"tools"),
+            image_sha256=image_digest.removeprefix("sha256:"),
+            model_config_sha256=digest(b"models"),
+            engine_source_sha256=digest(b"changed-source"),
+        )
+        with mock.patch(
+            "ctf_os.promotion_bundles.local_execution_fingerprint",
+            return_value=changed,
+        ):
+            result = engine.batch_runner.run(
+                invocation,
+                before_provider_start=lambda: (
+                    engine._before_provider_start(self.identity)
+                ),
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(executor.roles, [])
+        self.assertIn(
+            "model_call_cancelled",
+            {failure.kind for failure in result.failures},
+        )
 
     def test_prepared_full_arm_rejects_assisted_live_before_setup(self) -> None:
         engine = self.engine_with_executor(RoleExecutor())
@@ -946,6 +1071,7 @@ class EngineTests(unittest.TestCase):
                     ),
                     "evaluation_tool_manifest_sha256": digest(b"tools"),
                     "evaluation_model_config_sha256": digest(b"models"),
+                    "evaluation_engine_source_sha256": digest(b"source"),
                 }
             )
 
@@ -955,11 +1081,21 @@ class EngineTests(unittest.TestCase):
             expected_revision=added.revision,
         )
         announced = []
-        status = engine.launch_live(
-            self.identity,
-            scaffold=THIN_SCAFFOLD,
-            on_prepared=announced.append,
+        fingerprint = mock.Mock(
+            tool_manifest_sha256=digest(b"tools"),
+            image_sha256=image_digest.removeprefix("sha256:"),
+            model_config_sha256=digest(b"models"),
+            engine_source_sha256=digest(b"source"),
         )
+        with mock.patch(
+            "ctf_os.promotion_bundles.local_execution_fingerprint",
+            return_value=fingerprint,
+        ):
+            status = engine.launch_live(
+                self.identity,
+                scaffold=THIN_SCAFFOLD,
+                on_prepared=announced.append,
+            )
         self.assertEqual(status, 0)
         self.assertEqual(len(announced), 1)
         self.assertEqual(len(executor.commands), 1)
