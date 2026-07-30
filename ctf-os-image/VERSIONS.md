@@ -348,6 +348,50 @@ upstream download와 일부 mutable build input까지 content-addressed하게
 고정한 globally reproducible build를 뜻하지는 않는다. tag를 다시 빌드하면
 exact ID smoke, pin과 preflight를 다시 수행해야 한다.
 
+## 2026-07-30 Managed Pwn runtime readiness 재빌드
+
+이전 `sha256:bc3d...` 이미지는 역사적 Managed Rev 측정값이다. 이후 host
+계약이 `pwn_crash_v1`을 필수로 요구했지만 그 이미지는 capability 8개만
+포함해 실제 Pwn D→V를 실행할 수 없었다. `doctor`가 이 stale
+capability/attestation을 `ok=false`로 판정하도록 고친 뒤, core 파일에
+의존하지 않는 Pwn producer를 포함해 이미지를 다시 빌드했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:9b685a50c54f6b67013ea72150ebcea47d837faa0e505de8332e4b08a12bfb4f` |
+| 생성 시각 | `2026-07-30T16:16:14.317069064+09:00` |
+| Docker inspect Size | 12,512,543,262 bytes |
+| capability manifest | schema v2, 9개 중 9개 사용 가능 |
+| Pwn producer SHA-256 | `0ce31429a3fb8ffe32367650d5fb58a076bf445fcb2d9ef33bc1cb69643a4482` |
+| Pwn contract fingerprint | `d5e96e3b8c03a3c1eb8e13730c2be5756b50549cfa567e05c37da260c0db97f4` |
+
+호스트의 `/proc/sys/kernel/core_pattern`은
+`|/wsl-capture-crash %t %E %p %s`였으므로, 기존의 piped-handler 거부
+방식은 항상 실행 전 실패했다. 새 producer는 fixed ptrace observer와
+pre-exec seccomp filter를 사용한다.
+
+- single-thread root의 default core signal은 전달 전에 기록하고 억제
+- `exit(139)`는 signal crash로 분류하지 않음
+- caught/ignored, child, multithread, unobserved core signal은 finite error
+- `CLONE_UNTRACED`, cross-Tgid `CLONE_SIGHAND`, clone3/x32 syscall 우회 차단
+- fork/vfork/허용 clone/exec 추적, 64-task bound와 tracee/process-group reap
+
+실제 `DockerSandboxBackend.run_clean_proof`에서 network none, read-only
+challenge/root와 서로 다른 clean workspace를 사용해 다음을 통과했다.
+
+- direct `SIGSEGV` positive 3회와 빈 input control 3회:
+  `CONFIRMED`, signal 11이 3/3
+- 안전 probe 5회: `CLONE_UNTRACED` 차단과 정상 pthread는 exit 0,
+  caught/child/multithread fault는 각각 계약된 producer error
+- 총 11개 Pwn workspace 모두 complete/non-truncated transport,
+  `.proof-live` residue 없음
+- 같은 이미지의 Managed Rev positive 3회/negative 3회도 재통과
+
+`ctfos pin-image` 뒤 exact ID가 local config에 기록됐고 `ctfos doctor`는
+pin match, 필수 capability 9/9, attestation error 0, warning 0으로
+통과했다. 이 검증은 x86-64 WSL2에서 수행했다. aarch64 seccomp 상수와
+계약은 고정했지만 aarch64 runtime 실행을 검증했다는 뜻은 아니다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를

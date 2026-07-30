@@ -89,6 +89,8 @@ tag를 다시 빌드하는 것만으로 이미 고정된 실행 참조가 바뀌
 CTFOS_RELEASE_IMAGE_ID="$(
   docker image inspect --format '{{.Id}}' ctf-os:core
 )"
+uv run python scripts/check-pwn-docker-crash.py \
+  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 uv run python scripts/check-rev-docker-proof.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 ctfos pin-image
@@ -485,6 +487,16 @@ hypothesis를 `verify_pwn_crash`로 지정하면 엔진이 다음을 고정합�
 - payload 실행 중 같은 허용 signal이 2/3회 이상 발생하고 세 control이
   모두 정상 종료할 때만 `CONFIRMED`입니다. 단순 exit code 139는 signal
   crash로 세지 않으며 control crash는 성공을 막습니다.
+- 현재 v1 producer는 host의 piped `core_pattern`을 실행하지 않도록 fault
+  signal을 전달 전에 관측하고 억제합니다. 성공 증거는 단일 스레드 root
+  target의 default core-signal stop으로 한정합니다. caught/ignored signal,
+  자식 process의 fault, thread를 만든 root target의 fault와 관측되지 않은
+  terminal core signal은 bounded producer `ERROR`이며 성공으로 승격되지
+  않습니다.
+- target exec 전에 고정 seccomp filter를 설치해 `CLONE_UNTRACED`와
+  cross-Tgid `CLONE_SIGHAND`를 차단하고 `clone3`는 `ENOSYS` fallback으로
+  보냅니다. 일반 pthread clone은 허용하되 thread가 관측된 target의 core
+  stop은 v1 proof 범위 밖으로 fail-closed합니다.
 - 여섯 request/contract/receipt와 stdout/stderr artifact의 exact
   ID·path·SHA-256·size를 상태에 연결합니다. 외부 evaluator는 파일을
   bounded/no-follow로 다시 읽고 gate 판정을 독립 재계산합니다.
@@ -497,6 +509,28 @@ hypothesis를 `verify_pwn_crash`로 지정하면 엔진이 다음을 고정합�
 `FAILED`로 닫고, canonical state에 없는 정확한 orphan run/evidence만
 symlink를 따라가지 않고 정리합니다. nonpass gate는 failure capsule로
 다음 Captain에게 전달됩니다.
+
+### Pwn address-resolution advisory
+
+고정 선형 `leak 필수` 규칙 대신, exploit strategy가 선언한 각 address
+dependency를 source-bound ELF profile과 함께 분류하는 순수 계약이 있습니다.
+결과는 `RUNTIME_ADDRESS_RESOLUTION_REQUIRED`,
+`CONDITIONAL_NOT_APPLICABLE`, `UNRESOLVED` 중 하나지만 어디까지나 advisory
+입니다.
+
+- exact strategy hash, dependency ID, source manifest/hash/size와 profile
+  evidence hash가 모두 일치해야 합니다.
+- 결과가 스스로 다른 dependency나 ET_EXEC profile을 써서 재분류하는
+  coherent substitution은 거부합니다.
+- dependency는 canonical order이고 strategy/result JSON은 bounded,
+  duplicate-free, canonical bytes만 허용합니다.
+- 모든 verdict는 global leak N/A, leak proof, primitive, proof 또는 stage
+  advance 권한을 갖지 않습니다. 모델이 dependency를 누락하거나 모두
+  relative로 선언해도 L단계를 통과할 수 없습니다.
+
+실제 leak gate는 runtime disclosure provenance와 downstream
+randomized-layout exploit replay가 추가된 뒤에만 이 advisory를 입력으로
+사용합니다.
 
 ### Managed Rev executable oracle
 
@@ -966,6 +1000,11 @@ manifest, browser safety, Pwn crash oracle 9개, Rev inventory 13개, Rev
 stdin runner 17개와 shell/source 검증이 모두 통과했다. 다른 인터프리터
 결과는 최종 gate에 사용하지 않는다.
 
+core-file 비의존 Pwn observer와 address-resolution advisory를 포함한
+`d3cb714` code tree에서는 전체 1,025개 테스트가 210.837초에 통과했다
+(측정 wall 200.42초, exit 0). 이 수치는 실제 Docker smoke와 별개인 host
+회귀 결과이며 solve 성능 측정으로 해석하지 않는다.
+
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
 동작을 검증하지만 실제 Codex 계정과 실제 대회 서버를 사용하는 end-to-end
 성공을 보증하지 않습니다. Luna의 좁은 `agent.flag` model probe는 통과했지만
@@ -974,6 +1013,11 @@ E2E는 호출하지 않았습니다. 이미지 내부 lifecycle은
 `ctf-os-image/tests/`의 별도 테스트 대상입니다. 실제 Docker Rev proof는
 opt-in `scripts/check-rev-docker-proof.py --image-digest sha256:...`로
 positive 3회와 negative control 3회를 exact pinned image에서 추가 검증합니다.
+실제 Docker Pwn crash proof는
+`scripts/check-pwn-docker-crash.py --image-digest sha256:...`로 positive
+3회와 빈 control 3회뿐 아니라 clone 추적 회피 차단, 정상 pthread,
+caught/child/multithread core-stop의 fail-closed 판정까지 서로 다른 clean
+workspace에서 검증합니다.
 
 ## 안전상 중요한 현재 제한
 
