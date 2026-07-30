@@ -270,15 +270,17 @@ class ProbeRoleExecutor:
 
 
 class ToolConcurrency:
-    def __init__(self) -> None:
+    def __init__(self, *, expected_lanes: int) -> None:
         self.lock = threading.Lock()
         self.active = 0
         self.maximum = 0
+        self.rendezvous = threading.Barrier(expected_lanes)
 
     def enter(self) -> None:
         with self.lock:
             self.active += 1
             self.maximum = max(self.maximum, self.active)
+        self.rendezvous.wait(timeout=5)
 
     def leave(self) -> None:
         with self.lock:
@@ -2207,7 +2209,7 @@ class ManagedV2Tests(unittest.TestCase):
 
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()
-        concurrency = ToolConcurrency()
+        concurrency = ToolConcurrency(expected_lanes=3)
         engine = self.engine(
             executor,
             sandbox_factory=lambda state, work, policy: SlowSandbox(
@@ -2215,12 +2217,10 @@ class ManagedV2Tests(unittest.TestCase):
             ),
         )
         self.add_v2(engine)
-        started = time.monotonic()
         state = ManagedOrchestrator(
             engine,
             capability_probe=self.capability,
         ).run_cycle(self.identity)
-        elapsed = time.monotonic() - started
 
         self.assertEqual(len(state.sessions), 1)
         self.assertEqual(len(state.cycles), 1)
@@ -2240,7 +2240,6 @@ class ManagedV2Tests(unittest.TestCase):
         )
         self.assertEqual(executor.max_active, 1)
         self.assertEqual(concurrency.maximum, 3)
-        self.assertLess(elapsed, 2.0)
 
         tool_runs = [
             run
