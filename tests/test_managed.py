@@ -726,6 +726,50 @@ class ManagedV2Tests(unittest.TestCase):
             state_schema_version=STATE_SCHEMA_VERSION,
         )
 
+    def seed_managed_remote_action(
+        self,
+        engine: ChallengeEngine,
+        endpoint: str,
+    ) -> tuple[str, str]:
+        state = engine.add_network_target(
+            self.identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        engine.select_network_target(self.identity, target.id)
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('managed remote')"),
+            expected_observation="remote output",
+            keep_if="output exists",
+            drop_if="output is absent",
+            network_target=endpoint,
+        )
+        run_id = f"R-managed-remote-{experiment_id}"
+
+        def bind_source(current):
+            current.runs.append(
+                RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=RunStatus.CREATED,
+                    role=Role.BUILDER.value,
+                    origin=RunOrigin.MANAGED_MODEL,
+                    configuration_epoch=current.configuration_epoch,
+                )
+            )
+            experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            experiment.source_run_id = run_id
+
+        engine.store.update(self.identity, bind_source)
+        return target.id, experiment_id
+
     def pwn_crash_registration_fixture(
         self,
         *,
@@ -4473,6 +4517,164 @@ class ManagedV2Tests(unittest.TestCase):
             if item.id == experiment_id
         )
         self.assertEqual(experiment.status, ExperimentStatus.REGISTERED)
+
+    def test_cycle_retires_stale_managed_remote_before_preflight(self):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        _target_id, experiment_id = self.seed_managed_remote_action(
+            engine,
+            "https://stale-managed.example:443",
+        )
+        engine.add_network_target(
+            self.identity,
+            "https://epoch-bump.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        retired = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(retired.status, ExperimentStatus.CANCELLED)
+        self.assertEqual(
+            retired.extra["cancelled_reason"],
+            "stale_managed_remote_binding_retired",
+        )
+        self.assertIn("cancelled_at", retired.extra)
+        self.assertIn(Role.CAPTAIN, executor.roles)
+
+    def test_cycle_does_not_retire_stale_operator_remote(self):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        endpoint = "https://operator-stale.example:443"
+        state = engine.add_network_target(
+            self.identity,
+            endpoint,
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+        target = state.targets[-1]
+        engine.select_network_target(self.identity, target.id)
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('operator remote')"),
+            expected_observation="remote output",
+            keep_if="output exists",
+            drop_if="output is absent",
+            network_target=endpoint,
+        )
+        engine.add_network_target(
+            self.identity,
+            "https://operator-epoch-bump.example:443",
+            docker_network="ctfos-proxy",
+            enforcement="proxy",
+        )
+
+        with self.assertRaisesRegex(
+            ManagedError,
+            f"remote experiment {experiment_id} has a stale",
+        ):
+            ManagedOrchestrator(
+                engine,
+                capability_probe=self.capability,
+            ).run_cycle(self.identity)
+
+        state = engine.store.load(self.identity)
+        operator_action = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(
+            operator_action.status,
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertEqual(executor.roles, [])
+
+    def test_reconcile_preserves_current_managed_remote(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        _target_id, experiment_id = self.seed_managed_remote_action(
+            engine,
+            "https://current-managed.example:443",
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        before = engine.store.load(self.identity)
+
+        after = (
+            orchestrator
+            ._retire_stale_registered_managed_remote_actions(self.identity)
+        )
+
+        self.assertEqual(after.revision, before.revision)
+        current = next(
+            item
+            for item in after.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(current.status, ExperimentStatus.REGISTERED)
+        self.assertTrue(orchestrator.preflight(self.identity).ok)
+
+    def test_cycle_retires_managed_remote_when_no_primary_target(self):
+        executor = ProbeRoleExecutor()
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        target_id, experiment_id = self.seed_managed_remote_action(
+            engine,
+            "https://revoked-managed.example:443",
+        )
+        engine.revoke_network_target(
+            self.identity,
+            target_id,
+            reason="operator ended the target",
+        )
+
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        retired = next(
+            item
+            for item in state.experiments
+            if item.id == experiment_id
+        )
+        self.assertIs(retired.status, ExperimentStatus.CANCELLED)
+        self.assertEqual(
+            retired.extra["cancelled_reason"],
+            "stale_managed_remote_binding_retired",
+        )
+        self.assertIn(Role.CAPTAIN, executor.roles)
+        self.assertTrue(
+            all(
+                spec.network_target is None
+                for sandbox in sandboxes
+                for spec in sandbox.specs
+            )
+        )
 
     def test_managed_model_remote_actions_resolve_only_selected_proxy_pin(
         self,

@@ -478,6 +478,137 @@ class ManagedOrchestrator:
             raise ManagedPreflightBlocked(report.issues)
         return report
 
+    def _retire_stale_registered_managed_remote_actions(
+        self,
+        identity: ChallengeIdentity,
+    ) -> ChallengeState:
+        """Cancel stale model-owned remote work before managed preflight."""
+
+        current = self.engine.store.load(identity)
+        runs = {run.id: run for run in current.runs}
+
+        def remote_binding(
+            experiment: Experiment,
+        ) -> tuple[object, object, object, object] | None:
+            if (
+                experiment.kind is ExperimentKind.PROOF
+                and experiment.proof_recipe is not None
+            ):
+                recipe = experiment.proof_recipe
+                if (
+                    recipe.network_endpoint is None
+                    and experiment.extra.get("network_target") is None
+                ):
+                    return None
+                return (
+                    recipe.network_target_id,
+                    recipe.network_target_generation,
+                    recipe.configuration_epoch,
+                    recipe.network_endpoint,
+                )
+            endpoint = experiment.extra.get("network_target")
+            if endpoint is None:
+                return None
+            return (
+                experiment.extra.get("network_target_id"),
+                experiment.extra.get("network_target_generation"),
+                experiment.extra.get("configuration_epoch"),
+                endpoint,
+            )
+
+        primary = next(
+            (
+                target
+                for target in current.targets
+                if target.id == current.primary_target_id
+            ),
+            None,
+        )
+        selected_binding = (
+            (
+                primary.id,
+                primary.generation,
+                current.configuration_epoch,
+                primary.endpoint,
+            )
+            if (
+                primary is not None
+                and primary.status is TargetStatus.ACTIVE
+                and not self.engine._target_is_expired(primary)
+                and primary.enforcement == "proxy"
+            )
+            else None
+        )
+        stale_ids = {
+            experiment.id
+            for experiment in current.experiments
+            if (
+                experiment.status is ExperimentStatus.REGISTERED
+                and remote_binding(experiment) is not None
+                and (
+                    source_run := runs.get(experiment.source_run_id or "")
+                )
+                is not None
+                and source_run.origin is RunOrigin.MANAGED_MODEL
+                and remote_binding(experiment) != selected_binding
+            )
+        }
+        if not stale_ids:
+            return current
+
+        def apply(state: ChallengeState) -> None:
+            canonical_runs = {run.id: run for run in state.runs}
+            canonical_primary = next(
+                (
+                    target
+                    for target in state.targets
+                    if target.id == state.primary_target_id
+                ),
+                None,
+            )
+            canonical_binding = (
+                (
+                    canonical_primary.id,
+                    canonical_primary.generation,
+                    state.configuration_epoch,
+                    canonical_primary.endpoint,
+                )
+                if (
+                    canonical_primary is not None
+                    and canonical_primary.status is TargetStatus.ACTIVE
+                    and not self.engine._target_is_expired(
+                        canonical_primary
+                    )
+                    and canonical_primary.enforcement == "proxy"
+                )
+                else None
+            )
+            cancelled_at = utc_now()
+            for experiment in state.experiments:
+                source_run = canonical_runs.get(
+                    experiment.source_run_id or ""
+                )
+                binding = remote_binding(experiment)
+                if (
+                    experiment.id in stale_ids
+                    and experiment.status is ExperimentStatus.REGISTERED
+                    and binding is not None
+                    and source_run is not None
+                    and source_run.origin is RunOrigin.MANAGED_MODEL
+                    and binding != canonical_binding
+                ):
+                    experiment.status = ExperimentStatus.CANCELLED
+                    experiment.extra["cancelled_at"] = cancelled_at
+                    experiment.extra["cancelled_reason"] = (
+                        "stale_managed_remote_binding_retired"
+                    )
+
+        return self.engine.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+
     @staticmethod
     def _session(state: ChallengeState, session_id: str) -> SolveSession:
         session = next(
@@ -2045,6 +2176,7 @@ class ManagedOrchestrator:
         self.engine._recover_session_boundary(identity)
         reconcile_workspace_publishes(self.engine, identity)
         self.reconcile(identity)
+        self._retire_stale_registered_managed_remote_actions(identity)
         self.require_preflight(identity, session_id=session_id)
         state, selected_session = self._reserve_session(identity, session_id)
         try:
