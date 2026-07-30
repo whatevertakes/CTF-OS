@@ -83,6 +83,66 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(inventory.requires_network)
         self.assertIn("coverage", inventory.expected_observation)
 
+    def test_misc_intake_preserves_three_independent_modality_probes(
+        self,
+    ) -> None:
+        adapter = get_adapter("misc")
+        experiments = adapter.initial_observations()
+
+        self.assertEqual(
+            [item.id for item in experiments],
+            ["typed_inventory", "primary_magic", "primary_strings"],
+        )
+        self.assertTrue(
+            all(not item.requires_network for item in experiments)
+        )
+        self.assertEqual(
+            experiments[0].command_template[1],
+            "/opt/ctf-templates/forensic/evidence_index.py",
+        )
+        self.assertEqual(experiments[1].command_template[0], "/usr/bin/file")
+        self.assertEqual(experiments[2].command_template[:2], ("/bin/sh", "-lc"))
+        self.assertIn("/usr/bin/head -c 65536", experiments[2].command_template[2])
+
+        guidance = adapter.captain_guidance()
+        for prior in (
+            "stego=0.35",
+            "custom_protocol=0.25",
+            "audio_signal=0.15",
+            "jail=0.10",
+            "ppc=0.10",
+            "other=0.05",
+        ):
+            self.assertIn(prior, guidance)
+        self.assertIn("three independent", guidance)
+        self.assertIn("two independent observations", guidance)
+
+    def test_misc_strings_probe_keeps_primary_out_of_shell_source(self) -> None:
+        probe = next(
+            item
+            for item in get_adapter("misc").initial_observations()
+            if item.id == "primary_strings"
+        )
+        primary = "/challenge/name with 'quotes' and $shell"
+        argv = tuple(
+            argument.replace("{primary}", primary)
+            for argument in probe.command_template
+        )
+
+        self.assertEqual(argv[-1], primary)
+        self.assertEqual(argv[-2], "ctfos-misc-primary-strings")
+        self.assertNotIn(primary, argv[2])
+        CommandSpec.create(argv)
+        ensure_foreground_command(argv)
+
+    def test_unknown_category_keeps_single_generic_inventory(self) -> None:
+        adapter = get_adapter("unknown-category")
+        self.assertEqual(adapter.name, "misc")
+        self.assertEqual(
+            [item.id for item in adapter.initial_observations()],
+            ["inventory"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

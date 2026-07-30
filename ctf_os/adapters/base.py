@@ -137,5 +137,14 @@ def get_adapter(category: str) -> CategoryAdapter:
         from .web import WebAdapter
 
         return WebAdapter()
-    return GenericAdapter()
+    if normalized in {
+        "misc",
+        "stego",
+        "jail",
+        "ppc",
+        "custom-protocol",
+    }:
+        from .misc import MiscAdapter
 
+        return MiscAdapter()
+    return GenericAdapter()
