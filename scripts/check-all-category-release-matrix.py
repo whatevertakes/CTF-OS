@@ -534,6 +534,9 @@ def _validate_crypto_runtime(
             {
                 "candidate_status",
                 "network",
+                "one_shot_consumed",
+                "oracle_authority",
+                "oracle_preissue_status",
                 "runtime",
                 "runs",
                 "successful_attempts",
@@ -541,13 +544,13 @@ def _validate_crypto_runtime(
             }
         ),
         label=f"crypto {runtime} summary",
-        # A hidden-oracle preissue identifier/authority may be added by the
-        # managed-oracle hardening without weakening these execution facts.
-        allow_extra=True,
     )
     if (
-        record["candidate_status"] != "ready_to_submit"
+        record["candidate_status"] != "READY_TO_SUBMIT"
         or record["network"] != "none"
+        or record["one_shot_consumed"] is not True
+        or record["oracle_authority"] != "managed_oracle_preissue_v1"
+        or record["oracle_preissue_status"] != "consumed"
         or record["runtime"] != runtime
         or record["runs"] != 6
         or record["successful_attempts"] != 6
@@ -576,22 +579,35 @@ def _validate_crypto_misc_summary(value: dict[str, object]) -> None:
         required=frozenset(
             {
                 "candidate_status",
+                "candidate_only",
                 "network",
+                "one_shot_consumed",
+                "oracle_authority",
+                "oracle_control_runs",
+                "oracle_preissue_status",
                 "runs",
                 "submissions",
                 "transform_evidence_passed",
+                "transform_runs",
+                "verification_runs",
             }
         ),
         label="misc release summary",
-        allow_extra=True,
     )
     if (
         root["ok"] is not True
-        or misc["candidate_status"] != "observed_candidate"
+        or misc["candidate_status"] != "OBSERVED_CANDIDATE"
+        or misc["candidate_only"] is not True
         or misc["network"] != "none"
-        or misc["runs"] != 4
+        or misc["one_shot_consumed"] is not True
+        or misc["oracle_authority"] != "managed_oracle_preissue_v1"
+        or misc["oracle_control_runs"] != 1
+        or misc["oracle_preissue_status"] != "consumed"
+        or misc["runs"] != 5
         or misc["submissions"] != 0
         or misc["transform_evidence_passed"] is not True
+        or misc["transform_runs"] != 1
+        or misc["verification_runs"] != 3
     ):
         raise ReleaseMatrixError(
             "misc summary did not meet its exact DAG+3 oracle"

@@ -37,16 +37,23 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
             "82ef8c155a8bbe9cfe33ce1a475425c77097b6fcefc32b678da1b14bf9c8339a",
         )
         self.assertIn(
-            "engine.prove_crypto_metamorphic_candidate(",
+            "engine.preissue_managed_crypto_oracle(",
             source,
         )
         self.assertIn(
-            "engine.evaluate_misc_transform_candidate(",
+            "engine.preissue_managed_misc_oracle(",
             source,
         )
+        self.assertIn("ManagedOrchestrator(", source)
+        self.assertIn("_execute_managed_builder_action(", source)
+        self.assertIn('"kind": "prove_crypto_metamorphic"', source)
+        self.assertIn('"kind": "evaluate_misc_transform"', source)
         self.assertIn('runtime="python"', source)
         self.assertIn('runtime="sage"', source)
         self.assertIn('network_default="none"', source)
+        self.assertNotIn("variant_parameters_locator=", source)
+        self.assertNotIn("variant_expected_output_locator=", source)
+        self.assertNotIn("spec_locator=", source)
         self.assertNotIn("FakeSandbox", source)
         self.assertNotIn("record_manual_submission", source)
         self.assertNotIn("submit_candidate", source)
@@ -84,13 +91,63 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
         )
         for runtime in ("python", "sage"):
             result = summary["crypto"][runtime]
+            self.assertEqual(
+                set(result),
+                {
+                    "candidate_status",
+                    "network",
+                    "one_shot_consumed",
+                    "oracle_authority",
+                    "oracle_preissue_status",
+                    "runtime",
+                    "runs",
+                    "successful_attempts",
+                    "submissions",
+                },
+            )
             self.assertEqual(result["runtime"], runtime)
             self.assertEqual(result["runs"], 6)
             self.assertEqual(result["successful_attempts"], 6)
             self.assertEqual(result["candidate_status"], "READY_TO_SUBMIT")
             self.assertEqual(result["submissions"], 0)
             self.assertEqual(result["network"], "none")
-        self.assertEqual(summary["misc"]["runs"], 4)
+            self.assertEqual(
+                result["oracle_authority"],
+                "managed_oracle_preissue_v1",
+            )
+            self.assertEqual(result["oracle_preissue_status"], "consumed")
+            self.assertTrue(result["one_shot_consumed"])
+        self.assertEqual(
+            set(summary["misc"]),
+            {
+                "candidate_only",
+                "candidate_status",
+                "network",
+                "one_shot_consumed",
+                "oracle_authority",
+                "oracle_control_runs",
+                "oracle_preissue_status",
+                "runs",
+                "submissions",
+                "transform_evidence_passed",
+                "transform_runs",
+                "verification_runs",
+            },
+        )
+        self.assertEqual(summary["misc"]["runs"], 5)
+        self.assertEqual(summary["misc"]["transform_runs"], 1)
+        self.assertEqual(summary["misc"]["oracle_control_runs"], 1)
+        self.assertEqual(summary["misc"]["verification_runs"], 3)
+        self.assertTrue(summary["misc"]["candidate_only"])
+        self.assertEqual(
+            summary["misc"]["oracle_authority"],
+            "managed_oracle_preissue_v1",
+        )
+        self.assertEqual(
+            summary["misc"]["oracle_preissue_status"],
+            "consumed",
+        )
+        self.assertTrue(summary["misc"]["one_shot_consumed"])
         self.assertTrue(
             summary["misc"]["transform_evidence_passed"]
         )

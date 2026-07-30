@@ -25,10 +25,11 @@
       "artifact_path_fields": [
         "solver_artifact_path",
         "original_parameters_artifact_path",
-        "variant_parameters_artifact_path",
-        "variant_expected_output_artifact_path"
+        "oracle_preissue_id"
       ],
       "public_oracle": "ChallengeEngine.prove_crypto_metamorphic_candidate",
+      "oracle_authority": "managed_oracle_preissue_v1",
+      "one_shot_consumed": true,
       "expected_oracle_runs": 6,
       "state_authority": [
         "candidate",
@@ -36,7 +37,7 @@
         "progress"
       ],
       "unit_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_crypto_builder_action_reaches_six_run_metamorphic_proof",
-      "hostile_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_post_registration_crypto_solver_mutation_is_rejected",
+      "hostile_test": "tests.test_managed_oracle_preissue.ManagedOraclePreissueTests.test_managed_crypto_streams_and_private_residue_are_not_exposed",
       "docker_script": "scripts/check-crypto-misc-docker-hotpaths.py"
     },
     {
@@ -46,6 +47,8 @@
         "operator_spec_artifact_path"
       ],
       "public_oracle": "ChallengeEngine.prove_forensic_assertion",
+      "oracle_authority": "forensic_assertion_operator_spec_v1",
+      "one_shot_consumed": false,
       "expected_oracle_runs": 2,
       "state_authority": [
         "fact",
@@ -59,17 +62,20 @@
       "category": "misc",
       "action_kind": "evaluate_misc_transform",
       "artifact_path_fields": [
-        "spec_artifact_path"
+        "spec_artifact_path",
+        "oracle_preissue_id"
       ],
       "public_oracle": "ChallengeEngine.evaluate_misc_transform_candidate",
-      "expected_oracle_runs": 4,
+      "oracle_authority": "managed_oracle_preissue_v1",
+      "one_shot_consumed": true,
+      "expected_oracle_runs": 5,
       "state_authority": [
         "candidate_observation",
         "fact",
         "progress"
       ],
       "unit_test": "tests.test_managed_category_hotpaths.ManagedCategoryHotPathTests.test_misc_builder_action_reaches_dag_and_original_oracle",
-      "hostile_test": "tests.test_misc_engine.MiscEngineTests.test_final_pre_replace_guard_rejects_incoming_toctou",
+      "hostile_test": "tests.test_managed_oracle_preissue.ManagedOraclePreissueTests.test_managed_misc_always_zero_verifier_fails_negative_control",
       "docker_script": "scripts/check-crypto-misc-docker-hotpaths.py"
     }
   ]

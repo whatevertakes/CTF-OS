@@ -25237,7 +25237,13 @@ class ChallengeEngine:
                     )
                     raise
                 managed_oracle_control_passed = (
-                    control_result.status == "completed"
+                    # ctfwrap records every non-zero target exit as ``failed``.
+                    # For this negative control that is the expected transport
+                    # state: a zero exit means the hidden oracle accepted the
+                    # deliberately invalid candidate.  Requiring ``failed``
+                    # also rejects impossible completed/non-zero test-double
+                    # receipts instead of normalizing them into proof.
+                    control_result.status == "failed"
                     and control_result.exit_code not in {None, 0}
                     and not control_result.timed_out
                     and control_result.orchestration_error is None

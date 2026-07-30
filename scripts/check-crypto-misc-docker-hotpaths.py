@@ -10,18 +10,28 @@ automatic challenge selection, or submission is involved.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from ctf_os.capabilities import inspect_pinned_capabilities
+from ctf_os.codex import Role
 from ctf_os.config import EngineConfig, RuntimeConfig
 from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.engine.managed_oracle_preissue import (
+    MANAGED_ORACLE_PREISSUE_PROTOCOL,
+    MANAGED_ORACLE_PREISSUE_STATE_KEY,
+)
 from ctf_os.images import validate_image_digest
+from ctf_os.managed import ManagedOrchestrator
 from ctf_os.models import (
+    ArtifactReference,
     CandidateStatus,
     ChallengeIdentity,
     FlagCandidate,
+    RunStatus,
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
@@ -128,6 +138,136 @@ def _add_candidate(
     engine.store.update(identity, mutate)
 
 
+def _capability(_digest: str) -> dict[str, object]:
+    return {"ok": True, "schema_version": 2, "capabilities": {}}
+
+
+def _execute_managed_builder_action(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    action: dict[str, object],
+    payloads: dict[str, bytes],
+    extra_write_locators: tuple[str, ...] = (),
+) -> tuple[object, object]:
+    """Drive the real Builder publish/register/dispatch path without a model."""
+
+    orchestrator = ManagedOrchestrator(
+        engine,
+        capability_probe=_capability,
+    )
+    _state, session_id = orchestrator._reserve_session(identity, None)
+    _state, cycle = orchestrator._reserve_cycle(identity, session_id)
+    _state, wave, role_runs = orchestrator._reserve_wave(
+        identity,
+        session_id,
+        cycle.id,
+        "attack",
+    )
+    builder_run_id = role_runs[Role.BUILDER]
+    paths = engine.store.challenge_paths(identity)
+    run_workspace = (
+        engine.store.run_paths(identity, run_id=builder_run_id).root
+        / "workspace"
+    )
+    run_workspace.mkdir(parents=True)
+    snapshots = paths.artifacts / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+
+    records: list[tuple[str, str, bytes, str]] = []
+    for ordinal, (locator, payload) in enumerate(
+        sorted(payloads.items()),
+        start=1,
+    ):
+        staged = run_workspace / locator
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(payload)
+        artifact_id = f"A-{builder_run_id}-release-{ordinal}"
+        relative = f"artifacts/snapshots/{artifact_id}.bin"
+        snapshot = paths.root / relative
+        snapshot.write_bytes(payload)
+        snapshot.chmod(0o400)
+        records.append((artifact_id, relative, payload, locator))
+
+    def seed(state) -> None:
+        run = next(
+            item for item in state.runs if item.id == builder_run_id
+        )
+        run.status = RunStatus.COMPLETED
+        run.result_path = f"runs/{builder_run_id}/result.json"
+        run.validation_path = f"runs/{builder_run_id}/validation.json"
+        run.extra["semantic_merge"] = True
+        for artifact_id, relative, payload, locator in records:
+            state.artifacts.append(
+                ArtifactReference(
+                    id=artifact_id,
+                    path=relative,
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                    source_run_id=builder_run_id,
+                    size=len(payload),
+                    extra={
+                        "reported_locator": locator,
+                        "purpose": "managed release gate input",
+                    },
+                )
+            )
+
+    engine.store.update(identity, seed)
+    output_actions = [
+        {
+            "kind": "write_artifact",
+            "description": "publish referenced deterministic tool",
+            "artifact_path": locator,
+        }
+        for locator in extra_write_locators
+    ]
+    output_actions.append(action)
+    result = SimpleNamespace(
+        invocation=SimpleNamespace(
+            role=Role.BUILDER,
+            run_id=builder_run_id,
+            contract_version=2,
+        ),
+        output={"hypotheses": [], "actions": output_actions},
+        attempts=(SimpleNamespace(),),
+    )
+    publication = orchestrator._apply_builder_publishes(
+        identity,
+        wave,
+        (result,),
+    )
+    if publication.rejection is not None:
+        raise AssertionError(publication.rejection)
+    registration = orchestrator._register_typed_gate_actions(
+        identity,
+        wave,
+        (result,),
+    )
+    if (
+        registration.rejection_code is not None
+        or len(registration.experiment_ids) != 1
+    ):
+        raise AssertionError(
+            registration.rejection_code or "typed gate was not registered"
+        )
+    experiment_id = registration.experiment_ids[0]
+    orchestrator._mark_action_selection(
+        identity,
+        session_id,
+        cycle.id,
+        (experiment_id,),
+    )
+    final = orchestrator._execute_selected_actions(
+        identity,
+        (experiment_id,),
+        record_stall=False,
+    )
+    experiment = next(
+        item for item in final.experiments if item.id == experiment_id
+    )
+    return final, experiment
+
+
 def _crypto(
     root: Path,
     image_digest: str,
@@ -167,10 +307,26 @@ def _crypto(
         encoding="utf-8",
     )
     (workspace / "original.json").write_bytes(CRYPTO_ORIGINAL)
-    (workspace / "variant.json").write_bytes(CRYPTO_VARIANT)
-    (workspace / "variant.out").write_bytes(
-        CRYPTO_VARIANT_OUTPUT
-    )
+    payloads = {
+        "solver.py": (workspace / "solver.py").read_bytes(),
+        "original.json": (workspace / "original.json").read_bytes(),
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="ctfos-release-operator-crypto-"
+    ) as operator_temporary:
+        operator_root = Path(operator_temporary)
+        variant_path = operator_root / "variant.json"
+        expected_path = operator_root / "variant.out"
+        variant_path.write_bytes(CRYPTO_VARIANT)
+        expected_path.write_bytes(CRYPTO_VARIANT_OUTPUT)
+        _state, preissue = engine.preissue_managed_crypto_oracle(
+            identity,
+            variant_parameters_path=variant_path,
+            variant_expected_output_path=expected_path,
+            mutation_id="release-smoke-rsa-parameter-variant",
+        )
+    (workspace / "solver.py").unlink()
+    (workspace / "original.json").unlink()
     _add_candidate(
         engine,
         identity,
@@ -178,15 +334,19 @@ def _crypto(
         value=CRYPTO_CANDIDATE,
     )
 
-    final, result = engine.prove_crypto_metamorphic_candidate(
+    final, experiment = _execute_managed_builder_action(
+        engine,
         identity,
-        f"C-crypto-docker-{runtime}",
-        solver_locator="solver.py",
-        original_parameters_locator="original.json",
-        variant_parameters_locator="variant.json",
-        variant_expected_output_locator="variant.out",
-        mutation_id="release-smoke-rsa-parameter-variant",
-        runtime=runtime,
+        action={
+            "kind": "prove_crypto_metamorphic",
+            "description": "run the managed 3+3 metamorphic oracle",
+            "candidate_id": f"C-crypto-docker-{runtime}",
+            "solver_artifact_path": "solver.py",
+            "original_parameters_artifact_path": "original.json",
+            "oracle_preissue_id": preissue["preissue_id"],
+            "runtime": runtime,
+        },
+        payloads=payloads,
     )
     candidate = next(
         item
@@ -198,13 +358,22 @@ def _crypto(
         for item in final.runs
         if item.id in candidate.proof_run_ids
     ]
+    binding = candidate.extra.get("crypto_metamorphic_proof")
+    preissue_state = final.extra[MANAGED_ORACLE_PREISSUE_STATE_KEY][
+        preissue["preissue_id"]
+    ]
     if (
-        result.passed is not True
-        or result.required_attempts != 6
-        or result.successful_attempts != 6
+        not isinstance(binding, dict)
+        or binding.get("passed") is not True
+        or binding.get("oracle_authority")
+        != MANAGED_ORACLE_PREISSUE_PROTOCOL
+        or experiment.result.get("passed") is not True
         or candidate.status is not CandidateStatus.READY_TO_SUBMIT
         or len(runs) != 6
         or any(item.role != "crypto_metamorphic_proof" for item in runs)
+        or preissue_state.get("status") != "consumed"
+        or not preissue_state.get("consumed_by_builder_run_id")
+        or not preissue_state.get("consumed_by_experiment_id")
         or final.submissions
     ):
         raise AssertionError(
@@ -213,9 +382,12 @@ def _crypto(
     return {
         "candidate_status": candidate.status.value,
         "network": "none",
+        "one_shot_consumed": True,
+        "oracle_authority": MANAGED_ORACLE_PREISSUE_PROTOCOL,
+        "oracle_preissue_status": preissue_state["status"],
         "runtime": runtime,
         "runs": len(runs),
-        "successful_attempts": result.successful_attempts,
+        "successful_attempts": 6,
         "submissions": len(final.submissions),
     }
 
@@ -244,16 +416,16 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         f"sys.stdout.write({MISC_CANDIDATE!r})\n",
         encoding="utf-8",
     )
-    (workspace / "verify.py").write_text(
+    verifier_bytes = (
         "import pathlib, sys\n"
         f"candidate = {MISC_CANDIDATE.encode('utf-8')!r}\n"
         f"source = {MISC_SOURCE!r}\n"
         "valid = (pathlib.Path(sys.argv[1]).read_bytes() == candidate "
         "and pathlib.Path(sys.argv[2]).read_bytes() == source)\n"
         "raise SystemExit(0 if valid else 42)\n",
-        encoding="utf-8",
     )
-    (workspace / "misc-spec.json").write_text(
+    verifier_bytes = "".join(verifier_bytes).encode("utf-8")
+    dag_spec = (
         json.dumps(
             {
                 "schema_version": 1,
@@ -271,17 +443,28 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
                     }
                 ],
                 "terminal_step_id": "extract",
-                "verifier": {
-                    "id": "original-condition",
-                    "oracle_id": "release-smoke-oracle-v1",
-                    "tool_locator": "verify.py",
-                },
             },
             separators=(",", ":"),
             sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+        )
+        + "\n"
+    ).encode("utf-8")
+    payloads = {
+        "misc-spec.json": dag_spec,
+        "transform.py": (workspace / "transform.py").read_bytes(),
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="ctfos-release-operator-misc-"
+    ) as operator_temporary:
+        verifier_path = Path(operator_temporary) / "verifier.py"
+        verifier_path.write_bytes(verifier_bytes)
+        _state, preissue = engine.preissue_managed_misc_oracle(
+            identity,
+            verifier_path=verifier_path,
+            verifier_id="original-condition",
+            oracle_id="release-smoke-oracle-v1",
+        )
+    (workspace / "transform.py").unlink()
     _add_candidate(
         engine,
         identity,
@@ -289,10 +472,18 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         value=MISC_CANDIDATE,
     )
 
-    final, evaluation = engine.evaluate_misc_transform_candidate(
+    final, experiment = _execute_managed_builder_action(
+        engine,
         identity,
-        "C-misc-docker",
-        spec_locator="misc-spec.json",
+        action={
+            "kind": "evaluate_misc_transform",
+            "description": "run the managed DAG and hidden original oracle",
+            "candidate_id": "C-misc-docker",
+            "spec_artifact_path": "misc-spec.json",
+            "oracle_preissue_id": preissue["preissue_id"],
+        },
+        payloads=payloads,
+        extra_write_locators=("transform.py",),
     )
     candidate = next(
         item
@@ -305,23 +496,114 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         if isinstance(binding, dict)
         else None
     )
-    if (
-        evaluation.passed is not True
-        or candidate.status is not CandidateStatus.OBSERVED_CANDIDATE
-        or candidate.proof_run_ids
-        or not isinstance(run_ids, list)
-        or len(run_ids) != 4
-        or final.submissions
-    ):
+    evaluation_id = (
+        binding.get("misc_evaluation_id")
+        if isinstance(binding, dict)
+        else None
+    )
+    physical_runs = [
+        item
+        for item in final.runs
+        if item.extra.get("misc_evaluation_id") == evaluation_id
+    ]
+    control_run_ids = (
+        binding.get("oracle_control_run_ids")
+        if isinstance(binding, dict)
+        else None
+    )
+    preissue_state = final.extra[MANAGED_ORACLE_PREISSUE_STATE_KEY][
+        preissue["preissue_id"]
+    ]
+    phases = [
+        item.extra.get("phase")
+        for item in physical_runs
+    ]
+    physical_details: list[dict[str, object]] = []
+    challenge_root = engine.store.challenge_paths(identity).root
+    for item in physical_runs:
+        result_payload: dict[str, object] = {}
+        if item.result_path:
+            loaded = json.loads(
+                (challenge_root / item.result_path).read_text(
+                    encoding="utf-8"
+                )
+            )
+            if isinstance(loaded, dict):
+                result_payload = loaded
+        physical_details.append(
+            {
+                "exit_code": result_payload.get("exit_code"),
+                "phase": item.extra.get("phase"),
+                "run_status": item.status.value,
+                "sandbox_status": result_payload.get("status"),
+                "timed_out": result_payload.get("timed_out"),
+            }
+        )
+    checks = {
+        "binding": isinstance(binding, dict),
+        "binding_passed": (
+            isinstance(binding, dict)
+            and binding.get("passed") is True
+        ),
+        "managed_authority": (
+            isinstance(binding, dict)
+            and binding.get("oracle_authority")
+            == MANAGED_ORACLE_PREISSUE_PROTOCOL
+        ),
+        "negative_control": (
+            isinstance(binding, dict)
+            and binding.get("oracle_control_status") == "passed"
+            and binding.get("oracle_negative_control_passed") is True
+        ),
+        "one_control_run": (
+            isinstance(control_run_ids, list)
+            and len(control_run_ids) == 1
+        ),
+        "experiment_passed": experiment.result.get("passed") is True,
+        "candidate_only": (
+            candidate.status is CandidateStatus.OBSERVED_CANDIDATE
+            and not candidate.proof_run_ids
+        ),
+        "logical_runs": (
+            isinstance(run_ids, list)
+            and len(run_ids) == 4
+        ),
+        "physical_runs": len(physical_runs) == 5,
+        "transform_runs": phases.count("transform") == 1,
+        "control_runs": phases.count("oracle-control") == 1,
+        "reverse_runs": phases.count("reverse") == 3,
+        "preissue_consumed": (
+            preissue_state.get("status") == "consumed"
+            and bool(preissue_state.get("consumed_by_builder_run_id"))
+            and bool(preissue_state.get("consumed_by_experiment_id"))
+        ),
+        "no_submissions": not final.submissions,
+    }
+    if not all(checks.values()):
         raise AssertionError(
-            "Misc ChallengeEngine Docker hot path did not prove DAG+3"
+            "Misc ChallengeEngine Docker hot path did not prove DAG+3: "
+            + json.dumps(
+                {
+                    "checks": checks,
+                    "logical_run_ids": run_ids,
+                    "physical_runs": physical_details,
+                },
+                sort_keys=True,
+            )
         )
     return {
+        "candidate_only": True,
         "candidate_status": candidate.status.value,
         "network": "none",
-        "runs": len(run_ids),
+        "one_shot_consumed": True,
+        "oracle_authority": MANAGED_ORACLE_PREISSUE_PROTOCOL,
+        "oracle_control_runs": len(control_run_ids),
+        "oracle_preissue_status": preissue_state["status"],
+        "runs": len(physical_runs),
         "submissions": len(final.submissions),
-        "transform_evidence_passed": evaluation.passed,
+        "transform_evidence_passed": binding["passed"],
+        "transform_runs": 1,
+        "verification_runs": 3,
     }
 
 

@@ -134,8 +134,11 @@ def _valid_summary(task_id: str) -> dict[str, object]:
         return {
             "crypto": {
                 runtime: {
-                    "candidate_status": "ready_to_submit",
+                    "candidate_status": "READY_TO_SUBMIT",
                     "network": "none",
+                    "one_shot_consumed": True,
+                    "oracle_authority": "managed_oracle_preissue_v1",
+                    "oracle_preissue_status": "consumed",
                     "runs": 6,
                     "runtime": runtime,
                     "submissions": 0,
@@ -145,11 +148,18 @@ def _valid_summary(task_id: str) -> dict[str, object]:
             },
             "image_digest": IMAGE_DIGEST,
             "misc": {
-                "candidate_status": "observed_candidate",
+                "candidate_only": True,
+                "candidate_status": "OBSERVED_CANDIDATE",
                 "network": "none",
-                "runs": 4,
+                "one_shot_consumed": True,
+                "oracle_authority": "managed_oracle_preissue_v1",
+                "oracle_control_runs": 1,
+                "oracle_preissue_status": "consumed",
+                "runs": 5,
                 "submissions": 0,
                 "transform_evidence_passed": True,
+                "transform_runs": 1,
+                "verification_runs": 3,
             },
             "ok": True,
         }
@@ -351,6 +361,43 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
                     capture,
                     IMAGE_DIGEST,
                 )
+
+    def test_crypto_misc_summary_requires_exact_managed_preissue_authority(
+        self,
+    ) -> None:
+        task = next(
+            item
+            for item in release.RELEASE_TASKS
+            if item.id == "crypto_metamorphic_and_misc_transform"
+        )
+        for mutate in (
+            lambda value: value["crypto"]["python"].__setitem__(
+                "oracle_authority",
+                "explicit_operator_input",
+            ),
+            lambda value: value["misc"].__setitem__(
+                "oracle_preissue_status",
+                "unused",
+            ),
+            lambda value: value["misc"].__setitem__("runs", 4),
+            lambda value: value["misc"].__setitem__("unexpected", True),
+        ):
+            with self.subTest(mutate=mutate):
+                summary = _valid_summary(task.id)
+                mutate(summary)
+                capture = release._BoundedCapture(limit_bytes=32_768)
+                capture.consume(
+                    io.BytesIO(
+                        json.dumps(summary, sort_keys=True).encode("ascii")
+                        + b"\n"
+                    )
+                )
+                with self.assertRaises(release.ReleaseMatrixError):
+                    release._validate_child_summary(
+                        task,
+                        capture,
+                        IMAGE_DIGEST,
+                    )
 
     def test_literal_ok_cannot_credit_any_category(self) -> None:
         for task in release.RELEASE_TASKS:

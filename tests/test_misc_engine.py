@@ -110,7 +110,7 @@ class MiscSandbox:
         stderr.write_bytes(b"")
         return SandboxResult(
             run_id=f"misc-sandbox-{number}",
-            status="completed",
+            status="completed" if exit_code == 0 else "failed",
             exit_code=exit_code,
             timed_out=False,
             duration_ms=2,

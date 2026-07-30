@@ -13,7 +13,7 @@ The runner executes this closed source-controlled gate inventory:
 | Web state/impact | Web role-separated state and differential impact | ephemeral Docker `--internal` targets |
 | Web active probe | Web race 3+3 and OOB 3+3 | ephemeral Docker `--internal` targets |
 | Rev accepted input | Rev original-binary positive 3 / negative 3 | `none` |
-| Crypto + Misc | Crypto metamorphic 3+3 and Misc transform DAG replay | `none` |
+| Crypto + Misc | managed Builder → operator-preissued hidden Crypto 3+3; managed Misc transform + negative control + 3 replays | `none` |
 | Forensic assertion | Forensic indexed, pointer-bound, cross-tool assertion | `none` |
 
 Each child command is fixed in the runner source and receives the same
@@ -22,6 +22,16 @@ an untracked or modified gate script, a missing image, a child with nonzero
 exit status, a missing/negative final gate summary, an image-binding mismatch,
 or source/image drift during the run. Model and credential-like environment
 variables are removed from child environments.
+
+The Crypto/Misc child is also an authority-bound release gate. The operator
+preissues variant parameters/expected output or the verifier from host files
+outside the challenge tree before the Builder run exists. The managed Builder
+publishes only the solver/original parameters or transform DAG/tool plus the
+opaque preissue ID. The child summary is rejected unless
+`oracle_authority=managed_oracle_preissue_v1`, that preissue was consumed
+exactly once, Crypto completed all six clean runs, and Misc completed exactly
+one transform, one rejecting negative control, and three verifier replays
+while remaining candidate-only. Neither path authorizes a submission.
 
 After building the release image and committing the exact source under test:
 

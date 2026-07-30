@@ -82,6 +82,8 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
             "action_kind",
             "artifact_path_fields",
             "public_oracle",
+            "oracle_authority",
+            "one_shot_consumed",
             "expected_oracle_runs",
             "state_authority",
             "unit_test",
@@ -91,6 +93,12 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
         for item in categories:
             self.assertEqual(set(item), expected_keys)
             self.assertGreaterEqual(item["expected_oracle_runs"], 2)
+            if item["category"] in {"crypto", "misc"}:
+                self.assertEqual(
+                    item["oracle_authority"],
+                    "managed_oracle_preissue_v1",
+                )
+                self.assertIs(item["one_shot_consumed"], True)
             for key in ("unit_test", "hostile_test"):
                 module_name, class_name, method_name = item[key].rsplit(
                     ".",
@@ -172,6 +180,16 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
             self.assertIsNone(
                 re.search(r"image_digest\s*=\s*[\"']ctfos:", source)
             )
+        crypto_misc = (
+            REPOSITORY
+            / "scripts"
+            / "check-crypto-misc-docker-hotpaths.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ManagedOrchestrator(", crypto_misc)
+        self.assertIn("preissue_managed_crypto_oracle(", crypto_misc)
+        self.assertIn("preissue_managed_misc_oracle(", crypto_misc)
+        self.assertNotIn("variant_parameters_locator=", crypto_misc)
+        self.assertNotIn("variant_expected_output_locator=", crypto_misc)
 
     @unittest.skipUnless(
         os.environ.get("CTFOS_RUN_MANAGED_CATEGORY_DOCKER") == "1",
@@ -212,7 +230,25 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
         self.assertTrue(crypto_misc["ok"])
         self.assertEqual(crypto_misc["crypto"]["python"]["runs"], 6)
         self.assertEqual(crypto_misc["crypto"]["sage"]["runs"], 6)
-        self.assertEqual(crypto_misc["misc"]["runs"], 4)
+        self.assertEqual(crypto_misc["misc"]["runs"], 5)
+        self.assertEqual(crypto_misc["misc"]["transform_runs"], 1)
+        self.assertEqual(crypto_misc["misc"]["oracle_control_runs"], 1)
+        self.assertEqual(crypto_misc["misc"]["verification_runs"], 3)
+        self.assertTrue(crypto_misc["misc"]["candidate_only"])
+        for result in (
+            crypto_misc["crypto"]["python"],
+            crypto_misc["crypto"]["sage"],
+            crypto_misc["misc"],
+        ):
+            self.assertEqual(
+                result["oracle_authority"],
+                "managed_oracle_preissue_v1",
+            )
+            self.assertEqual(
+                result["oracle_preissue_status"],
+                "consumed",
+            )
+            self.assertTrue(result["one_shot_consumed"])
         self.assertEqual(
             crypto_misc["crypto"]["python"]["submissions"],
             0,
