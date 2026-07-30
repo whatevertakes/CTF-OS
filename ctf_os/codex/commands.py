@@ -62,6 +62,14 @@ _EXTERNAL_TOOL_HARDENING = (
     "features.image_generation=false",
     "features.hooks=false",
 )
+_HARNESS_CONTINUITY = (
+    # Freeze the stable Codex mechanisms used to retain useful work across a
+    # long resumed thread without reverting to rolling truncation or repeatedly
+    # transferring the full request.  Independent role calls still receive
+    # CTF-OS's bounded evidence/failure capsules instead of shared reasoning.
+    "features.remote_compaction_v2=true",
+    "features.enable_request_compression=true",
+)
 
 
 def _isolated_tool_config_args(*, multi_agent: bool) -> list[str]:
@@ -81,6 +89,7 @@ def _isolated_tool_config_args(*, multi_agent: bool) -> list[str]:
         f"agents.enabled={'true' if multi_agent else 'false'}",
         "mcp_servers={}",
         "plugins={}",
+        *_HARNESS_CONTINUITY,
         *_EXTERNAL_TOOL_HARDENING,
     )
     arguments = ["--strict-config"]
