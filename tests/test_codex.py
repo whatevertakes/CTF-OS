@@ -353,10 +353,13 @@ class ContractTests(unittest.TestCase):
             item["properties"]["kind"]["enum"][0]: item
             for item in v2_schema["properties"]["actions"]["items"]["anyOf"]
         }
-        self.assertEqual(
-            action_variants["command"]["properties"]["command"],
-            {"type": "string", "minLength": 1},
-        )
+        command_schema = action_variants["command"]["properties"][
+            "command"
+        ]
+        self.assertEqual(command_schema["type"], "string")
+        self.assertEqual(command_schema["minLength"], 1)
+        self.assertIn("/bin/sh -lc <script>", command_schema["description"])
+        self.assertIn("not an argv", command_schema["description"])
         self.assertEqual(
             action_variants["command"]["properties"]["artifact_path"],
             {"type": "null"},

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shlex
 import unittest
 from unittest import mock
 
@@ -66,6 +67,7 @@ from ctf_os.models import (
 from ctf_os.engine.rev_proof import (
     parse_rev_proof_evaluation_evidence,
 )
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store.upgrades import upgrade_state
 
 
@@ -1400,6 +1402,65 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(state.runs.iterations, 1)
         self.assertEqual(state.receipts.iterations, 1)
         self.assertEqual(state.facts.iterations, 1)
+
+    def test_managed_shell_command_binding_is_canonical_and_source_bound(
+        self,
+    ) -> None:
+        state = new_challenge_state(
+            ChallengeIdentity("Demo", "misc", "managed-shell"),
+            schema_version=STATE_SCHEMA_VERSION,
+        )
+        state.runs.append(
+            RunReference(
+                id="R-managed-shell",
+                base_revision=0,
+                origin=RunOrigin.MANAGED_MODEL,
+            )
+        )
+        script = "set -u\nprintf '%s\\n' managed\n"
+        state.experiments.append(
+            Experiment(
+                id="E-managed-shell",
+                hypothesis_ids=[],
+                command=shlex.join(("/bin/sh", "-lc", script)),
+                expected_observation="bounded output",
+                keep_if="output exists",
+                drop_if="output is absent",
+                timeout_seconds=30,
+                kind=ExperimentKind.PROBE,
+                source_run_id="R-managed-shell",
+                extra={
+                    "managed_command_protocol": "posix_sh_lc_v1",
+                },
+            )
+        )
+        state.validate()
+
+        wrong_source = copy.deepcopy(state)
+        wrong_source.runs[0].origin = RunOrigin.OPERATOR_TOOL
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid managed POSIX shell command binding",
+        ):
+            wrong_source.validate()
+
+        noncanonical = copy.deepcopy(state)
+        noncanonical.experiments[0].command = (
+            "/bin/sh -lc " + shlex.quote(script) + " "
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid managed POSIX shell command binding",
+        ):
+            noncanonical.validate()
+
+        engine_owned = copy.deepcopy(state)
+        engine_owned.experiments[0].extra["engine_executor"] = "synthetic"
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "invalid managed POSIX shell command binding",
+        ):
+            engine_owned.validate()
 
     def test_experiment_rejects_non_object_non_null_proof_recipe(self) -> None:
         payload = Experiment(

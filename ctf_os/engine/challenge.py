@@ -215,6 +215,8 @@ from ctf_os.models import (
     GoalStatus,
     Hypothesis,
     HypothesisStatus,
+    MANAGED_SHELL_ARGV_PREFIX,
+    MANAGED_SHELL_COMMAND_PROTOCOL,
     MAX_MANAGED_PROOF_INPUT_BYTES,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
     ProgressMarker,
@@ -1178,6 +1180,16 @@ def _durable_remove_pwn_run_directory(
 def _record_id(kind: str, run_id: str, local: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "-", local).strip("-")
     return f"{kind}-{run_id}-{normalized or uuid.uuid4().hex[:8]}"
+
+
+def _managed_shell_argv(script: str) -> tuple[str, str, str]:
+    """Bind one exact model-authored POSIX script to the sandbox shell."""
+
+    if not isinstance(script, str) or not script.strip():
+        raise ValueError("managed shell script cannot be empty")
+    argv = (*MANAGED_SHELL_ARGV_PREFIX, script)
+    CommandSpec.create(argv)
+    return argv
 
 
 _ADAPTER_SEED_RUN_METADATA_KEYS = (
@@ -7827,6 +7839,29 @@ class ChallengeEngine:
                         ):
                             continue
                         command = str(action["command"])
+                        managed_model_script = command
+                        managed_model_command = (
+                            reservation is not None
+                            and reservation.origin
+                            is RunOrigin.MANAGED_MODEL
+                        )
+                        if managed_model_command:
+                            try:
+                                argv = _managed_shell_argv(command)
+                                ensure_foreground_command(argv)
+                            except (
+                                BackgroundJobUnsupported,
+                                TypeError,
+                                ValueError,
+                            ) as error:
+                                reject_model_item(
+                                    "rejected_actions",
+                                    "action",
+                                    index,
+                                    f"invalid managed command: {error}",
+                                )
+                                continue
+                            command = shlex.join(argv)
                         managed_action = (
                             result.invocation.contract_version
                             == MANAGED_ROLE_RESULT_SCHEMA_VERSION
@@ -7996,9 +8031,13 @@ class ChallengeEngine:
                                 self.config.runtime.command_timeout_s
                             )
                             resource_class = _infer_resource_class(
-                                command
+                                managed_model_script
                             )
                             action_extra = {}
+                        if managed_model_command:
+                            action_extra["managed_command_protocol"] = (
+                                MANAGED_SHELL_COMMAND_PROTOCOL
+                            )
                         state.experiments.append(
                             Experiment(
                                 id=_record_id("E", run_id, str(index)),
@@ -11959,6 +11998,77 @@ class ChallengeEngine:
             )
         return committed_state
 
+    @staticmethod
+    def _legacy_managed_shell_experiment(
+        experiment: Experiment,
+        runs: Mapping[str, RunReference],
+    ) -> bool:
+        source_run = (
+            runs.get(experiment.source_run_id)
+            if experiment.source_run_id is not None
+            else None
+        )
+        return (
+            experiment.status is ExperimentStatus.REGISTERED
+            and experiment.extra.get("managed_command_protocol") is None
+            and source_run is not None
+            and source_run.origin is RunOrigin.MANAGED_MODEL
+            and experiment.kind is not ExperimentKind.PROOF
+            and experiment.proof_recipe is None
+            and experiment.extra.get("engine_executor") is None
+            and experiment.extra.get("adapter_seed") is not True
+        )
+
+    def _retire_registered_legacy_managed_commands(
+        self,
+        identity: ChallengeIdentity,
+        state: ChallengeState,
+        *,
+        eligible_experiment_ids: Sequence[str],
+    ) -> ChallengeState:
+        """Retire selected legacy commands whose semantics were ambiguous."""
+
+        runs = {run.id: run for run in state.runs}
+        eligible_ids = set(eligible_experiment_ids)
+        legacy_ids = {
+            experiment.id
+            for experiment in state.experiments
+            if experiment.id in eligible_ids
+            and self._legacy_managed_shell_experiment(experiment, runs)
+        }
+        if not legacy_ids:
+            return state
+
+        def apply(current: ChallengeState) -> None:
+            current_runs = {run.id: run for run in current.runs}
+            current_legacy_ids = {
+                experiment.id
+                for experiment in current.experiments
+                if experiment.id in eligible_ids
+                and self._legacy_managed_shell_experiment(
+                    experiment,
+                    current_runs,
+                )
+            }
+            if current_legacy_ids != legacy_ids:
+                raise EngineError(
+                    "legacy managed command set changed during repair"
+                )
+            for experiment in current.experiments:
+                if experiment.id not in legacy_ids:
+                    continue
+                experiment.status = ExperimentStatus.CANCELLED
+                experiment.extra["cancelled_at"] = utc_now()
+                experiment.extra["cancelled_reason"] = (
+                    "legacy_managed_command_semantics_ambiguous"
+                )
+
+        return self.store.update(
+            identity,
+            apply,
+            expected_revision=state.revision,
+        )
+
     def execute_registered_experiments(
         self,
         identity: ChallengeIdentity,
@@ -12095,6 +12205,30 @@ class ChallengeEngine:
                 automated=_automated,
             )
             self._remaining_budget_seconds(state)
+        invocation_eligible_ids = tuple(
+            experiment.id
+            for experiment in state.experiments
+            if experiment.status is ExperimentStatus.REGISTERED
+            and (not selected_ids or experiment.id in selected_ids)
+            and (
+                selected_ids
+                or not bool(
+                    experiment.extra.get("requires_explicit_execution")
+                )
+            )
+        )[:maximum]
+        revision_before_legacy_retirement = state.revision
+        state = self._retire_registered_legacy_managed_commands(
+            identity,
+            state,
+            eligible_experiment_ids=invocation_eligible_ids,
+        )
+        if state.revision != revision_before_legacy_retirement:
+            # Retirement consumes this invocation's bounded execution slice.
+            # Re-slicing the now-shorter REGISTERED list can otherwise slide a
+            # second legacy command into ``pending`` and execute old argv
+            # semantics without first retiring it.
+            return state
         pending = [
             experiment
             for experiment in state.experiments

@@ -89,6 +89,8 @@ MAX_PROOF_POLICY_STRING_BYTES = 256
 MAX_PROOF_POLICY_NOTES_BYTES = 64 * 1024
 MAX_PROOF_DESTINATION_BYTES = 4096
 MAX_MANAGED_PROOF_INPUT_BYTES = 64 * 1024 * 1024
+MANAGED_SHELL_COMMAND_PROTOCOL = "posix_sh_lc_v1"
+MANAGED_SHELL_ARGV_PREFIX = ("/bin/sh", "-lc")
 
 JSONValue = (
     None
@@ -8552,6 +8554,40 @@ class ChallengeState:
                     f"experiment {experiment.id} references unknown run "
                     f"{experiment.source_run_id}"
                 )
+            managed_shell_protocol = experiment.extra.get(
+                "managed_command_protocol"
+            )
+            if managed_shell_protocol is not None:
+                source_run = (
+                    runs.get(experiment.source_run_id)
+                    if experiment.source_run_id is not None
+                    else None
+                )
+                try:
+                    managed_shell_argv = tuple(
+                        shlex.split(experiment.command)
+                    )
+                except ValueError:
+                    managed_shell_argv = ()
+                if (
+                    managed_shell_protocol
+                    != MANAGED_SHELL_COMMAND_PROTOCOL
+                    or source_run is None
+                    or source_run.origin is not RunOrigin.MANAGED_MODEL
+                    or experiment.kind is ExperimentKind.PROOF
+                    or experiment.proof_recipe is not None
+                    or experiment.extra.get("engine_executor") is not None
+                    or len(managed_shell_argv) != 3
+                    or managed_shell_argv[:2]
+                    != MANAGED_SHELL_ARGV_PREFIX
+                    or not managed_shell_argv[2].strip()
+                    or experiment.command
+                    != shlex.join(managed_shell_argv)
+                ):
+                    errors.append(
+                        f"experiment {experiment.id} has an invalid managed "
+                        "POSIX shell command binding"
+                    )
             evaluated_statuses = {
                 ExperimentStatus.KEPT,
                 ExperimentStatus.DROPPED,
@@ -10230,6 +10266,8 @@ __all__ = [
     "ModelValidationError",
     "ManagedCycle",
     "ManagedWave",
+    "MANAGED_SHELL_ARGV_PREFIX",
+    "MANAGED_SHELL_COMMAND_PROTOCOL",
     "MAX_MANAGED_PROOF_INPUT_BYTES",
     "ProgressMarker",
     "ProofPolicySnapshot",

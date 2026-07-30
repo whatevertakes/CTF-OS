@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import shlex
 import tempfile
 import threading
 import time
@@ -44,6 +45,7 @@ from ctf_os.models import (
     CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
+    Experiment,
     ExperimentKind,
     ExperimentStatus,
     Falsifier,
@@ -102,6 +104,7 @@ class ProbeRoleExecutor:
         proof_artifact_id: str | None = None,
         proof_artifact_purpose: str = "reproducer",
         proof_extra_action: bool = False,
+        command_by_role: dict[Role, str] | None = None,
     ) -> None:
         self.invalid_role = invalid_role
         self.invalid_command_role = invalid_command_role
@@ -113,6 +116,7 @@ class ProbeRoleExecutor:
         self.proof_artifact_id = proof_artifact_id
         self.proof_artifact_purpose = proof_artifact_purpose
         self.proof_extra_action = proof_extra_action
+        self.command_by_role = dict(command_by_role or {})
         self.lock = threading.Lock()
         self.active = 0
         self.max_active = 0
@@ -199,6 +203,11 @@ class ProbeRoleExecutor:
                             ),
                         }
                     )
+                    if (
+                        action.get("kind") == "command"
+                        and role in self.command_by_role
+                    ):
+                        action["command"] = self.command_by_role[role]
                 if (
                     role is Role.REPRODUCER
                     and self.proof_candidate_id is not None
@@ -2922,6 +2931,386 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
 
+    def test_managed_model_commands_preserve_exact_posix_shell_scripts(
+        self,
+    ) -> None:
+        heredoc = (
+            "cat <<'PY'\n"
+            "literal & data\n"
+            "$(sleep 60 &)\n"
+            "PY\n"
+        )
+        multiline = (
+            "set -u\n"
+            "value=managed\n"
+            "printf '%s\\n' \"$value\"\n"
+        )
+        executor = ProbeRoleExecutor(
+            command_by_role={
+                Role.CAPTAIN: heredoc,
+                Role.BUILDER: multiline,
+            }
+        )
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        runs = {run.id: run for run in state.runs}
+        managed_commands = [
+            experiment
+            for experiment in state.experiments
+            if (
+                experiment.source_run_id in runs
+                and runs[experiment.source_run_id].origin
+                is RunOrigin.MANAGED_MODEL
+                and experiment.extra.get("managed_command_protocol")
+                == "posix_sh_lc_v1"
+            )
+        ]
+        scripts = {
+            shlex.split(experiment.command)[2]
+            for experiment in managed_commands
+        }
+        self.assertIn(heredoc, scripts)
+        self.assertIn(multiline, scripts)
+        self.assertTrue(
+            all(
+                tuple(shlex.split(experiment.command)[:2])
+                == ("/bin/sh", "-lc")
+                and experiment.command
+                == shlex.join(tuple(shlex.split(experiment.command)))
+                for experiment in managed_commands
+            )
+        )
+        executed_scripts = {
+            spec.argv[2]
+            for sandbox in sandboxes
+            for spec in sandbox.specs
+            if spec.argv[:2] == ("/bin/sh", "-lc")
+        }
+        self.assertIn(heredoc, executed_scripts)
+        self.assertIn(multiline, executed_scripts)
+
+    def test_managed_model_background_script_is_rejected_before_registration(
+        self,
+    ) -> None:
+        executor = ProbeRoleExecutor(
+            command_by_role={
+                Role.CAPTAIN: "sh -c 'sleep 60 &'",
+                Role.BUILDER: "eval 'sleep 60 &'",
+                Role.FALSIFIER: 'x="$(sleep 60 &)"',
+                Role.REPRODUCER: (
+                    "cat <<EOF\n"
+                    "$(sleep 60 &)\n"
+                    "EOF\n"
+                ),
+            }
+        )
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        state = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        ).run_cycle(self.identity)
+
+        self.assertFalse(
+            any(
+                experiment.extra.get("managed_command_protocol")
+                == "posix_sh_lc_v1"
+                for experiment in state.experiments
+            )
+        )
+        rejected = [
+            rejection
+            for run in state.runs
+            if run.origin is RunOrigin.MANAGED_MODEL
+            for rejection in run.extra.get("rejected_actions", [])
+        ]
+        self.assertTrue(rejected)
+        self.assertTrue(
+            all(
+                "background" in str(item.get("reason", ""))
+                or "detached" in str(item.get("reason", ""))
+                or "foreground" in str(item.get("reason", ""))
+                for item in rejected
+            )
+        )
+
+    def test_legacy_managed_commands_retire_without_reinterpretation(
+        self,
+    ) -> None:
+        sandboxes: list[FakeSandbox] = []
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            sandbox = FakeSandbox(work)
+            sandboxes.append(sandbox)
+            return sandbox
+
+        engine = self.engine(
+            ProbeRoleExecutor(),
+            sandbox_factory=sandbox_factory,
+        )
+        self.add_v2(engine)
+        _state, operator_id = engine.register_experiment(
+            self.identity,
+            command=("python3", "-c", "print('operator argv')"),
+            expected_observation="operator output",
+            keep_if="output exists",
+            drop_if="output is absent",
+        )
+        legacy_script = (
+            "printf '%s' $(touch /work/legacy-side-effect)"
+        )
+        second_legacy_script = (
+            "printf '%s' $(touch /work/legacy-second-side-effect)"
+        )
+
+        def seed(current):
+            current.runs.append(
+                RunReference(
+                    id="R-legacy-managed-model",
+                    base_revision=current.revision,
+                    status=RunStatus.CREATED,
+                    origin=RunOrigin.MANAGED_MODEL,
+                    role="builder",
+                )
+            )
+            common = {
+                "hypothesis_ids": [],
+                "expected_observation": "bounded output",
+                "keep_if": "output exists",
+                "drop_if": "output is absent",
+                "timeout_seconds": 30,
+                "kind": ExperimentKind.PROBE,
+                "source_run_id": "R-legacy-managed-model",
+            }
+            current.experiments.extend(
+                [
+                    Experiment(
+                        id="E-legacy-managed",
+                        command=legacy_script,
+                        status=ExperimentStatus.REGISTERED,
+                        **common,
+                    ),
+                    Experiment(
+                        id="E-legacy-managed-second",
+                        command=second_legacy_script,
+                        status=ExperimentStatus.REGISTERED,
+                        **common,
+                    ),
+                    Experiment(
+                        id="E-invalid-unrelated-managed",
+                        command="invalid\x00legacy",
+                        status=ExperimentStatus.REGISTERED,
+                        **common,
+                    ),
+                    Experiment(
+                        id="E-running-managed",
+                        command="set -u\ntrue\n",
+                        status=ExperimentStatus.RUNNING,
+                        **common,
+                    ),
+                    Experiment(
+                        id="E-completed-managed",
+                        command="printf completed",
+                        status=ExperimentStatus.COMPLETED,
+                        **common,
+                    ),
+                    Experiment(
+                        id="E-engine-managed",
+                        command="ctfos-engine:synthetic",
+                        status=ExperimentStatus.REGISTERED,
+                        extra={"engine_executor": "synthetic_v1"},
+                        **common,
+                    ),
+                ]
+            )
+
+        seeded = engine.store.update(self.identity, seed)
+        adapter_before = {
+            item.id: item.command
+            for item in seeded.experiments
+            if item.extra.get("adapter_seed") is True
+        }
+        operator_before = next(
+            item.command
+            for item in seeded.experiments
+            if item.id == operator_id
+        )
+        operator_executed = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(operator_id,),
+        )
+        self.assertIs(
+            next(
+                item.status
+                for item in operator_executed.experiments
+                if item.id == "E-legacy-managed"
+            ),
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertIs(
+            next(
+                item.status
+                for item in operator_executed.experiments
+                if item.id == "E-invalid-unrelated-managed"
+            ),
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertIn(
+            ("python3", "-c", "print('operator argv')"),
+            [
+                spec.argv
+                for sandbox in sandboxes
+                for spec in sandbox.specs
+            ],
+        )
+        spec_count = sum(len(sandbox.specs) for sandbox in sandboxes)
+
+        retired = engine.execute_registered_experiments(
+            self.identity,
+            maximum=1,
+            experiment_ids=(
+                "E-legacy-managed",
+                "E-legacy-managed-second",
+            ),
+        )
+        legacy = next(
+            item
+            for item in retired.experiments
+            if item.id == "E-legacy-managed"
+        )
+        self.assertIs(legacy.status, ExperimentStatus.CANCELLED)
+        self.assertEqual(legacy.command, legacy_script)
+        self.assertEqual(
+            legacy.extra["cancelled_reason"],
+            "legacy_managed_command_semantics_ambiguous",
+        )
+        self.assertNotIn("managed_command_protocol", legacy.extra)
+        second_legacy = next(
+            item
+            for item in retired.experiments
+            if item.id == "E-legacy-managed-second"
+        )
+        self.assertIs(
+            second_legacy.status,
+            ExperimentStatus.REGISTERED,
+        )
+        self.assertEqual(second_legacy.command, second_legacy_script)
+        self.assertEqual(
+            sum(len(sandbox.specs) for sandbox in sandboxes),
+            spec_count,
+        )
+        self.assertFalse(
+            (engine._workspace(retired) / "legacy-side-effect").exists()
+        )
+        unchanged = engine._retire_registered_legacy_managed_commands(
+            self.identity,
+            retired,
+            eligible_experiment_ids=("E-legacy-managed",),
+        )
+        self.assertEqual(unchanged.revision, retired.revision)
+
+        second_retired = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=("E-legacy-managed-second",),
+        )
+        second_legacy = next(
+            item
+            for item in second_retired.experiments
+            if item.id == "E-legacy-managed-second"
+        )
+        self.assertIs(
+            second_legacy.status,
+            ExperimentStatus.CANCELLED,
+        )
+        self.assertEqual(
+            sum(len(sandbox.specs) for sandbox in sandboxes),
+            spec_count,
+        )
+
+        invalid_retired = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=("E-invalid-unrelated-managed",),
+        )
+        invalid = next(
+            item
+            for item in invalid_retired.experiments
+            if item.id == "E-invalid-unrelated-managed"
+        )
+        self.assertIs(invalid.status, ExperimentStatus.CANCELLED)
+        self.assertEqual(
+            invalid.extra["cancelled_reason"],
+            "legacy_managed_command_semantics_ambiguous",
+        )
+        self.assertEqual(
+            sum(len(sandbox.specs) for sandbox in sandboxes),
+            spec_count,
+        )
+
+        for experiment_id, expected in (
+            ("E-running-managed", "set -u\ntrue\n"),
+            ("E-completed-managed", "printf completed"),
+            ("E-engine-managed", "ctfos-engine:synthetic"),
+            (operator_id, operator_before),
+        ):
+            self.assertEqual(
+                next(
+                    item.command
+                    for item in invalid_retired.experiments
+                    if item.id == experiment_id
+                ),
+                expected,
+            )
+        self.assertEqual(
+            {
+                item.id: item.command
+                for item in invalid_retired.experiments
+                if item.extra.get("adapter_seed") is True
+            },
+            adapter_before,
+        )
+
+        proof_like = Experiment(
+            id="E-proof-boundary",
+            hypothesis_ids=[],
+            command="true",
+            expected_observation="proof",
+            keep_if="proof",
+            drop_if="not proof",
+            timeout_seconds=1,
+            kind=ExperimentKind.PROOF,
+            status=ExperimentStatus.REGISTERED,
+            source_run_id="R-legacy-managed-model",
+        )
+        self.assertFalse(
+            engine._legacy_managed_shell_experiment(
+                proof_like,
+                {
+                    "R-legacy-managed-model": next(
+                        run
+                        for run in invalid_retired.runs
+                        if run.id == "R-legacy-managed-model"
+                    )
+                },
+            )
+        )
+
     def test_managed_cycle_reserves_three_roles_and_runs_probe_lanes(self):
         executor = ProbeRoleExecutor()
         concurrency = ToolConcurrency(expected_lanes=3)
@@ -3967,6 +4356,10 @@ class ManagedV2Tests(unittest.TestCase):
                 == target.generation
                 and item.extra["configuration_epoch"]
                 == state.configuration_epoch
+                and item.extra["managed_command_protocol"]
+                == "posix_sh_lc_v1"
+                and tuple(shlex.split(item.command)[:2])
+                == ("/bin/sh", "-lc")
                 for item in managed_remote
             )
         )

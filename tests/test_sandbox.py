@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import ctf_os.sandbox.daemon as sandbox_daemon
 import ctf_os.sandbox.files as sandbox_files
+import ctf_os.sandbox.types as sandbox_types
 from ctf_os.container_tools import GPUPlan
 from ctf_os.director.resources import ResourceVector, tool_profile
 from ctf_os.engine.flags import (
@@ -1262,6 +1263,263 @@ class SandboxTests(unittest.TestCase):
         ensure_foreground_command(("ctf-jobs", "--json"))
         ensure_foreground_command(("ctf-log", "--json", "job-00000001"))
         ensure_foreground_command(("ctf-kill", "--json", "job-00000001"))
+
+    def test_shell_foreground_policy_respects_quotes_and_heredocs(self) -> None:
+        ensure_foreground_command(
+            (
+                "/bin/sh",
+                "-lc",
+                "printf '%s\\n' 'literal & data'",
+            )
+        )
+        ensure_foreground_command(
+            ("/bin/sh", "-lc", 'x="$(printf ok)"')
+        )
+        for arithmetic_script in (
+            "x=$((flags & 255))",
+            "x=$((flags | 1))",
+            "x=$(((flags & 255) | 1))",
+            'x="$(printf "%s" $((flags & 255)))"',
+            "cat <<EOF\n$((flags & 255))\nEOF\n",
+        ):
+            with self.subTest(arithmetic_script=arithmetic_script):
+                ensure_foreground_command(
+                    ("/bin/sh", "-lc", arithmetic_script)
+                )
+        ensure_foreground_command(
+            ("/bin/bash", "-lc", "./exploit &> out.log")
+        )
+        ensure_foreground_command(
+            ("/bin/bash", "-lc", "./exploit &>> out.log")
+        )
+        ensure_foreground_command(
+            (
+                "/usr/bin/env",
+                "-i",
+                "--",
+                "FLAGS=7",
+                "/bin/sh",
+                "-c",
+                "x=$((FLAGS & 3))",
+            )
+        )
+        ensure_foreground_command(
+            (
+                "/bin/sh",
+                "-lc",
+                "cat <<EOF\n$(printf ok)\nEOF\n",
+            )
+        )
+        for delimiter in ("'EOF'", "EOF"):
+            with self.subTest(nested_heredoc_delimiter=delimiter):
+                ensure_foreground_command(
+                    (
+                        "/bin/sh",
+                        "-lc",
+                        (
+                            f"x=$(cat <<{delimiter}\n"
+                            "literal ) & data\n"
+                            "EOF\n"
+                            ")\n"
+                            "printf '%s\\n' \"$x\"\n"
+                        ),
+                    )
+                )
+        ensure_foreground_command(
+            (
+                "/bin/sh",
+                "-lc",
+                (
+                    "cat <<'EOF'\n"
+                    "literal & data\n"
+                    "$(sleep 60 &)\n"
+                    "EOF\n"
+                ),
+            )
+        )
+        ensure_foreground_command(
+            (
+                "/bin/sh",
+                "-lc",
+                'cat <<"E\\OF"\nliteral & data\nE\\OF\n',
+            )
+        )
+        ensure_foreground_command(
+            (
+                "/bin/sh",
+                "-lc",
+                "cat <<E\\OF\nliteral & data\nEOF\n",
+            )
+        )
+        ensure_foreground_command(
+            ("/bin/sh", "-lc", "command -v nohup")
+        )
+        ensure_foreground_command(
+            ("/bin/sh", "-lc", "command -p printf ok")
+        )
+        for foreground_script in (
+            "time -p true",
+            "time -- true",
+            "true < /dev/null",
+            "(sleep 60)",
+            "test 1 '<' 2",
+            "printf '%s\\n' 'literal <(sleep 60) coproc sleep 60'",
+            (
+                "cat <<'EOF'\n"
+                "<(sleep 60)\n"
+                "coproc sleep 60\n"
+                "EOF\n"
+            ),
+        ):
+            with self.subTest(foreground_script=foreground_script):
+                ensure_foreground_command(
+                    ("/bin/sh", "-lc", foreground_script)
+                )
+
+        rejected = (
+            "sh -c 'sleep 60 &'",
+            "busybox ash -c 'sleep 60 &'",
+            "env sh -c 'sleep 60 &'",
+            "busybox env sh -c 'sleep 60 &'",
+            "busybox env -i -- FLAG=x busybox ash -c 'sleep 60 &'",
+            "command -- eval 'sleep 60 &'",
+            "command -p -- eval 'sleep 60 &'",
+            "builtin -- eval 'sleep 60 &'",
+            "bash -c \"builtin -- eval 'sleep 60 &'\"",
+            "exec -- nohup sleep 60",
+            "command -- exec -cl -- nohup sleep 60",
+            "time -p setsid -f sleep 60",
+            "time -p nohup sleep 60",
+            "time -- nohup sleep 60",
+            "time -q true",
+            "coproc sleep 60",
+            "bash -c 'coproc sleep 60'",
+            "true <(sleep 60)",
+            "cat >(sleep 60)",
+            "bash -c 'true <(sleep 60)'",
+            "true <(sleep 60",
+            "eval 'sleep 60 &'",
+            "x=$(sleep 60 &)",
+            'x="$(sleep 60 &)"',
+            "x=$((flags & 255)",
+            "x=$((flags | 1",
+            "x=$((1 + $(sleep 60 &)))",
+            'x="$(printf ok"',
+            "cat <<EOF\n$(sleep 60 &)\nEOF\n",
+            "x=$(cat <<EOF\n$(sleep 60 &)\nEOF\n)\n",
+            "x=`printf ok`",
+            "case x in x) true ;; esac; nohup sleep 60",
+            "if nohup sleep 60; then true; fi",
+            "while setsid sleep 60; do true; done",
+            'x="$(echo hi # )\nsleep 60 &\n)"',
+            (
+                'cat <<"E\\OF" >/dev/null\n'
+                "data\n"
+                "E\\OF\n"
+                "sleep 60 &\n"
+                "EOF\n"
+            ),
+        )
+        for script in rejected:
+            with (
+                self.subTest(script=script),
+                self.assertRaises(BackgroundJobUnsupported),
+            ):
+                ensure_foreground_command(("/bin/sh", "-lc", script))
+
+        for command in (
+            ("busybox", "sh", "-c", "sleep 60 &"),
+            ("/bin/busybox", "ash", "-c", "sleep 60 &"),
+            ("/usr/bin/env", "sh", "-c", "sleep 60 &"),
+            ("busybox", "env", "sh", "-c", "sleep 60 &"),
+            (
+                "busybox",
+                "env",
+                "-i",
+                "--",
+                "FLAG=x",
+                "busybox",
+                "ash",
+                "-c",
+                "sleep 60 &",
+            ),
+            ("/usr/bin/time", "-p", "nohup", "sleep", "60"),
+            ("coproc", "sleep", "60"),
+        ):
+            with (
+                self.subTest(command=command),
+                self.assertRaises(BackgroundJobUnsupported),
+            ):
+                ensure_foreground_command(command)
+
+    def test_shell_lexical_work_is_linearly_bounded(self) -> None:
+        class CountingTokens(list):
+            visits = 0
+
+            def __iter__(self):
+                for token in super().__iter__():
+                    self.visits += 1
+                    yield token
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    raise AssertionError(
+                        "heredoc association must not rescan suffix slices"
+                    )
+                return super().__getitem__(key)
+
+        tokens = CountingTokens(
+            [
+                *(
+                    token
+                    for _ in range(4096)
+                    for token in (
+                        sandbox_types._ShellToken("<<", operator=True),
+                        sandbox_types._ShellToken("EOF"),
+                    )
+                )
+            ]
+        )
+        delimiters = sandbox_types._shell_heredoc_delimiters(tokens)
+        self.assertEqual(len(delimiters), 4096)
+        self.assertEqual(tokens.visits, len(tokens))
+
+        exactly_at_limit = "true\n" * 32_768
+        ensure_foreground_command(
+            ("/bin/sh", "-lc", exactly_at_limit)
+        )
+        with self.assertRaisesRegex(
+            BackgroundJobUnsupported,
+            "lexical token limit",
+        ):
+            ensure_foreground_command(
+                ("/bin/sh", "-lc", exactly_at_limit + "true")
+            )
+        with self.assertRaisesRegex(
+            BackgroundJobUnsupported,
+            "wrapper chain",
+        ):
+            ensure_foreground_command(
+                (*(("env",) * 9), "true")
+            )
+        with self.assertRaisesRegex(
+            BackgroundJobUnsupported,
+            "wrapper chain",
+        ):
+            ensure_foreground_command(
+                (
+                    "/bin/sh",
+                    "-lc",
+                    ("command -- " * 9) + "true",
+                )
+            )
+
+        large_quoted_heredoc = (
+            "cat <<'EOF'\n" + ("literal ) & data " * 8192) + "\nEOF\n"
+        )
+        ensure_foreground_command(
+            ("/bin/sh", "-lc", large_quoted_heredoc)
+        )
 
     def test_foreground_run_uses_one_shot_container_supervision(self) -> None:
         calls: list[list[str]] = []

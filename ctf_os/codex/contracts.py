@@ -410,7 +410,16 @@ def role_output_schema(
             variant_properties = dict(action_properties)
             variant_properties["kind"] = {"enum": [action_kind]}
             variant_properties["command"] = (
-                {"type": "string", "minLength": 1}
+                {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Exact POSIX /bin/sh script executed as "
+                        "/bin/sh -lc <script>; detached/background jobs "
+                        "are forbidden. This is a script, not an argv "
+                        "serialization."
+                    ),
+                }
                 if action_kind == "command"
                 else {"type": "null"}
             )
