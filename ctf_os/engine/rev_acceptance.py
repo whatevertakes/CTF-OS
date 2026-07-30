@@ -62,6 +62,7 @@ _EXPECTATION_KEYS = frozenset(
     }
 )
 _CONTROL_KEYS = frozenset({"expectation", "mutation_id"})
+_EXPECTED_ORACLE_KEYS = frozenset({"accepted", "controls"})
 _OBSERVATION_KEYS = frozenset(
     {
         "capture_complete",
@@ -318,6 +319,70 @@ class RevAcceptanceOperatorSpec:
     @property
     def evidence_sha256(self) -> str:
         return sha256(canonical_json_bytes(self.to_dict()))
+
+    @property
+    def expected_oracle(self) -> dict[str, object]:
+        """Return the value-free oracle projection safe for managed state."""
+
+        return {
+            "accepted": self.accepted.to_dict(),
+            "controls": [
+                {
+                    "expectation": expectation.to_dict(),
+                    "mutation_id": mutation_id,
+                }
+                for mutation_id, expectation in self.controls
+            ],
+        }
+
+
+def validate_rev_acceptance_expected_oracle(
+    value: object,
+) -> dict[str, object]:
+    """Validate the exact hash/size-only oracle exposed to a Builder."""
+
+    item = _exact_dict(
+        value,
+        _EXPECTED_ORACLE_KEYS,
+        "expected_oracle_schema_invalid",
+    )
+    accepted = RevAcceptanceExpectation.from_mapping(item["accepted"])
+    raw_controls = item["controls"]
+    if type(raw_controls) is not list or len(raw_controls) != 3:
+        raise RevAcceptanceContractError(
+            "expected_oracle_controls_invalid"
+        )
+    controls: list[dict[str, object]] = []
+    for index, raw in enumerate(raw_controls):
+        control = _exact_dict(
+            raw,
+            _CONTROL_KEYS,
+            "expected_oracle_control_schema_invalid",
+        )
+        mutation_id = control["mutation_id"]
+        if mutation_id != REV_ACCEPTANCE_CONTROL_IDS[index]:
+            raise RevAcceptanceContractError(
+                "expected_oracle_control_order_invalid"
+            )
+        expectation = RevAcceptanceExpectation.from_mapping(
+            control["expectation"]
+        )
+        if expectation == accepted:
+            raise RevAcceptanceContractError(
+                "expected_oracle_control_does_not_reject"
+            )
+        controls.append(
+            {
+                "expectation": expectation.to_dict(),
+                "mutation_id": mutation_id,
+            }
+        )
+    normalized = {
+        "accepted": accepted.to_dict(),
+        "controls": controls,
+    }
+    canonical_json_bytes(normalized)
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,5 +699,6 @@ __all__ = [
     "evaluate_rev_acceptance",
     "rev_acceptance_plan_sha256",
     "sha256",
+    "validate_rev_acceptance_expected_oracle",
     "validate_rev_acceptance_evaluation",
 ]

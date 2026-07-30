@@ -554,7 +554,11 @@ def rev_acceptance_state_graph_errors(
                 if (
                     run is None
                     or run.status is not RunStatus.COMPLETED
-                    or run.origin is not RunOrigin.OPERATOR_TOOL
+                    or run.origin
+                    not in {
+                        RunOrigin.MANAGED_TOOL,
+                        RunOrigin.OPERATOR_TOOL,
+                    }
                     or run.role != "rev_acceptance_oracle"
                     or run.base_revision != binding["base_revision"]
                     or run.configuration_epoch

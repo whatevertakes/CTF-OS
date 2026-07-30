@@ -709,7 +709,11 @@ def execute_rev_acceptance_hotpath(
                     result_path=record["result_path"],
                     validation_path=record["validation_path"],
                     role="rev_acceptance_oracle",
-                    origin=RunOrigin.OPERATOR_TOOL,
+                    origin=(
+                        RunOrigin.MANAGED_TOOL
+                        if _session_owned
+                        else RunOrigin.OPERATOR_TOOL
+                    ),
                     configuration_epoch=configuration_epoch,
                     extra={
                         "experiment_id": experiment_id,

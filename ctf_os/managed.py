@@ -27,6 +27,7 @@ from ctf_os.codex.contracts import (
     MANAGED_MISC_TRANSFORM_ACTION_KIND,
     MANAGED_PWN_CRASH_ACTION_KIND,
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_TYPED_GATE_ACTION_KINDS,
     MANAGED_WEB_IMPACT_ACTION_KIND,
 )
@@ -55,6 +56,16 @@ from ctf_os.engine.failure_capsule import (
     bounded_pwn_crash_failure_reason,
     build_failure_capsule,
     selected_pwn_crash_failure_reason,
+)
+from ctf_os.engine.rev_acceptance import (
+    REV_ACCEPTANCE_MAX_INPUT_BYTES,
+    REV_ACCEPTANCE_MAX_SPEC_BYTES,
+    RevAcceptanceContractError,
+    RevAcceptanceOperatorSpec,
+    canonical_json_bytes as rev_canonical_json_bytes,
+    sha256 as rev_sha256,
+    validate_rev_acceptance_evaluation,
+    validate_rev_acceptance_expected_oracle,
 )
 from ctf_os.managed_continuity import (
     ManagedContinuityContractError,
@@ -99,7 +110,13 @@ from ctf_os.models import (
 )
 from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION, STATE_SCHEMA_VERSION
 from ctf_os.store import ChallengeLock, LockTimeout
-from ctf_os.store.atomic import atomic_write_json, read_json
+from ctf_os.sandbox.files import SafeFileError, read_bounded_regular
+from ctf_os.store.atomic import (
+    StrictJSONError,
+    atomic_write_json,
+    read_json,
+    strict_json_loads,
+)
 from ctf_os.workspace_publish import (
     WorkspacePublishProposalRejected,
     canonical_workspace_hash,
@@ -137,6 +154,7 @@ _MAX_MANAGED_REJECTED_ACTIONS = 64
 _MAX_MANAGED_TYPED_GATE_PATHS = 4
 _MANAGED_TYPED_GATE_CATEGORIES = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: "pwn",
+    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: "reversing",
     MANAGED_WEB_IMPACT_ACTION_KIND: "web",
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND: "crypto",
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND: "forensics",
@@ -145,6 +163,10 @@ _MANAGED_TYPED_GATE_CATEGORIES = {
 _MANAGED_TYPED_GATE_PATH_FIELDS = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: (
         "payload_artifact_path",
+    ),
+    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: (
+        "operator_spec_artifact_path",
+        "accepted_input_artifact_path",
     ),
     MANAGED_WEB_IMPACT_ACTION_KIND: (
         "operator_spec_artifact_path",
@@ -171,6 +193,17 @@ _MANAGED_TYPED_GATE_KEYS = {
             "parent_experiment_id",
             "payload_artifact_path",
             "timeout_seconds",
+        }
+    ),
+    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "operator_spec_artifact_path",
+            "operator_spec_sha256",
+            "accepted_input_artifact_path",
+            "accepted_input_sha256",
+            "declared_argv",
+            "expected_oracle",
         }
     ),
     MANAGED_WEB_IMPACT_ACTION_KIND: frozenset(
@@ -422,7 +455,10 @@ def _managed_typed_gate_action_shape_error(
         type(kind) is not str
         or kind not in MANAGED_TYPED_GATE_ACTION_KINDS
         or set(action) != _MANAGED_TYPED_GATE_KEYS[kind]
-        or type(action.get("description")) is not str
+        or (
+            kind != MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND
+            and type(action.get("description")) is not str
+        )
     ):
         return "typed_gate_action_invalid"
     locators = [
@@ -473,6 +509,40 @@ def _managed_typed_gate_action_shape_error(
         and action.get("runtime") not in {"python", "sage"}
     ):
         return "typed_gate_action_invalid"
+    if kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+        for field in (
+            "operator_spec_sha256",
+            "accepted_input_sha256",
+        ):
+            digest = action.get(field)
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+            ):
+                return "typed_gate_action_invalid"
+        declared_argv = action.get("declared_argv")
+        if (
+            type(declared_argv) is not list
+            or not 1 <= len(declared_argv) <= 16
+            or any(
+                type(argument) is not str
+                or not argument
+                or len(argument.encode("utf-8")) > 4096
+                or "\x00" in argument
+                for argument in declared_argv
+            )
+        ):
+            return "typed_gate_action_invalid"
+        try:
+            validate_rev_acceptance_expected_oracle(
+                action.get("expected_oracle")
+            )
+        except RevAcceptanceContractError:
+            return "typed_gate_action_invalid"
     return None
 
 
@@ -1737,6 +1807,130 @@ class ManagedOrchestrator:
         ).strip("_")
         return (normalized or "unspecified")[:128]
 
+    def _bind_managed_rev_accepted_input(
+        self,
+        identity: ChallengeIdentity,
+        state: ChallengeState,
+        declaration: Mapping[str, object],
+        artifact_bindings: Mapping[str, object],
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Bind value-free Builder declarations to current Rev evidence."""
+
+        expected_binding_fields = {
+            "operator_spec_artifact_path",
+            "accepted_input_artifact_path",
+        }
+        if set(artifact_bindings) != expected_binding_fields:
+            return None, "typed_gate_artifact_unbound"
+        spec_binding = artifact_bindings.get(
+            "operator_spec_artifact_path"
+        )
+        input_binding = artifact_bindings.get(
+            "accepted_input_artifact_path"
+        )
+        if type(spec_binding) is not dict or type(input_binding) is not dict:
+            return None, "typed_gate_artifact_unbound"
+        spec_locator = _safe_managed_artifact_locator(
+            spec_binding.get("locator")
+        )
+        input_locator = _safe_managed_artifact_locator(
+            input_binding.get("locator")
+        )
+        spec_digest = declaration.get("operator_spec_sha256")
+        input_digest = declaration.get("accepted_input_sha256")
+        if (
+            spec_locator is None
+            or input_locator is None
+            or spec_locator == input_locator
+            or type(spec_digest) is not str
+            or type(input_digest) is not str
+            or spec_binding.get("sha256") != spec_digest
+            or input_binding.get("sha256") != input_digest
+        ):
+            return None, "typed_gate_workspace_binding_changed"
+        spec_size = spec_binding.get("size_bytes")
+        input_size = input_binding.get("size_bytes")
+        if (
+            type(spec_size) is not int
+            or not 1 <= spec_size <= REV_ACCEPTANCE_MAX_SPEC_BYTES
+            or type(input_size) is not int
+            or not 0 <= input_size <= REV_ACCEPTANCE_MAX_INPUT_BYTES
+        ):
+            return None, "typed_gate_reference_invalid"
+        workspace = (
+            self.engine.store.challenge_paths(identity).artifacts
+            / "workspace"
+        )
+        try:
+            spec_payload = read_bounded_regular(
+                workspace,
+                spec_locator,
+                maximum_bytes=REV_ACCEPTANCE_MAX_SPEC_BYTES,
+                expected_sha256=spec_digest,
+                expected_size=spec_size,
+            )
+            spec = RevAcceptanceOperatorSpec.from_mapping(
+                strict_json_loads(
+                    spec_payload,
+                    max_bytes=REV_ACCEPTANCE_MAX_SPEC_BYTES,
+                )
+            )
+            expected_oracle = (
+                validate_rev_acceptance_expected_oracle(
+                    declaration.get("expected_oracle")
+                )
+            )
+        except (
+            OSError,
+            SafeFileError,
+            StrictJSONError,
+            RevAcceptanceContractError,
+            TypeError,
+            ValueError,
+        ):
+            return None, "typed_gate_reference_invalid"
+        if (
+            spec_payload != rev_canonical_json_bytes(spec.to_dict())
+            or spec.evidence_sha256 != spec_digest
+            or spec.accepted_input_locator != input_locator
+            or spec.expected_oracle != expected_oracle
+        ):
+            return None, "typed_gate_reference_invalid"
+        try:
+            binding, _inventory, _challenge_root = (
+                self.engine._resolve_rev_stdin_inventory_binding(
+                    state,
+                    allowed_run_origins=frozenset(
+                        {
+                            RunOrigin.MANAGED_TOOL,
+                            RunOrigin.OPERATOR_TOOL,
+                        }
+                    ),
+                )
+            )
+            expected_argv = list(
+                self.engine._rev_stdin_runner_argv(binding)
+            )
+        except Exception:
+            return None, "typed_gate_reference_invalid"
+        declared_argv = declaration.get("declared_argv")
+        if (
+            type(declared_argv) is not list
+            or declared_argv != expected_argv
+            or spec.source_locator
+            != binding.source_binding.get("path")
+        ):
+            return None, "typed_gate_reference_invalid"
+        return (
+            {
+                "accepted_input_sha256": input_digest,
+                "declared_argv": expected_argv,
+                "expected_oracle": expected_oracle,
+                "operator_spec_sha256": spec_digest,
+            },
+            None,
+        )
+
     def _execute_typed_gate_experiment(
         self,
         identity: ChallengeIdentity,
@@ -1856,6 +2050,26 @@ class ManagedOrchestrator:
                     "managed typed gate workspace binding changed"
                 )
             locators[field] = locator
+        if kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+            rev_reference, rev_error = (
+                self._bind_managed_rev_accepted_input(
+                    identity,
+                    current,
+                    request,
+                    bindings,
+                )
+            )
+            if (
+                rev_error is not None
+                or rev_reference is None
+                or any(
+                    request.get(field) != value
+                    for field, value in rev_reference.items()
+                )
+            ):
+                raise ManagedError(
+                    "managed Rev accepted-input declaration changed"
+                )
 
         def mark_running(state: ChallengeState) -> None:
             target = next(
@@ -1898,6 +2112,28 @@ class ManagedOrchestrator:
                 passed = bool(evaluation.exploit_effect_proven)
                 reason_codes = (str(evaluation.reason_code),)
                 evaluation_sha256 = str(evaluation.evidence_sha256)
+            elif kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+                _state, evaluation = (
+                    self.engine.prove_rev_accepted_input(
+                        identity,
+                        operator_spec_locator=locators[
+                            "operator_spec_artifact_path"
+                        ],
+                        timeout_seconds=int(request["timeout_seconds"]),
+                        _session_owned=True,
+                    )
+                )
+                normalized_evaluation = (
+                    validate_rev_acceptance_evaluation(evaluation)
+                )
+                passed = normalized_evaluation["passed"] is True
+                reason_codes = tuple(
+                    str(item)
+                    for item in normalized_evaluation["reason_codes"]
+                )
+                evaluation_sha256 = rev_sha256(
+                    rev_canonical_json_bytes(normalized_evaluation)
+                )
             elif kind == MANAGED_WEB_IMPACT_ACTION_KIND:
                 _state, evaluation = self.engine.prove_web_impact(
                     identity,
@@ -2745,9 +2981,17 @@ class ManagedOrchestrator:
                     return
                 artifact = matches[0]
                 publish = publishes[0]
+                minimum_size = (
+                    0
+                    if (
+                        kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND
+                        and field == "accepted_input_artifact_path"
+                    )
+                    else 1
+                )
                 if (
                     type(artifact.size) is not int
-                    or artifact.size <= 0
+                    or artifact.size < minimum_size
                     or artifact.size > self.engine.store.max_artifact_bytes
                     or artifact.sha256 != publish.sha256
                     or publish.extra.get("size") != artifact.size
@@ -2840,6 +3084,34 @@ class ManagedOrchestrator:
                     "timeout_seconds": self.engine._budget_command_timeout(
                         state,
                         timeout,
+                    ),
+                }
+            elif kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+                rev_reference, rev_error = (
+                    self._bind_managed_rev_accepted_input(
+                        identity,
+                        state,
+                        action,
+                        artifact_bindings,
+                    )
+                )
+                if rev_error is not None or rev_reference is None:
+                    reject(
+                        run,
+                        index,
+                        rev_error or "typed_gate_reference_invalid",
+                    )
+                    return
+                reference = {
+                    **rev_reference,
+                    "timeout_seconds": (
+                        self.engine._budget_command_timeout(
+                            state,
+                            min(
+                                300,
+                                self.engine.config.runtime.command_timeout_s,
+                            ),
+                        )
                     ),
                 }
             elif kind in {

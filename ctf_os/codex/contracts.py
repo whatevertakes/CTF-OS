@@ -172,12 +172,14 @@ ACTION_KIND_VALUES = ("command", "write_artifact", "research", "human_request", 
 MANAGED_PROOF_ACTION_KIND = "prove_candidate"
 MANAGED_PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
 MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND = "prove_pwn_exploit_effect"
+MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND = "rev_accepted_input"
 MANAGED_WEB_IMPACT_ACTION_KIND = "prove_web_impact"
 MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND = "prove_crypto_metamorphic"
 MANAGED_FORENSIC_ASSERTION_ACTION_KIND = "prove_forensic_assertion"
 MANAGED_MISC_TRANSFORM_ACTION_KIND = "evaluate_misc_transform"
 MANAGED_TYPED_GATE_ACTION_KINDS = (
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
+    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
     MANAGED_WEB_IMPACT_ACTION_KIND,
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
@@ -351,6 +353,70 @@ def role_output_schema(
             "uniqueItems": True,
             "items": managed_reference_schema,
         }
+        managed_sha256_schema = {
+            "type": "string",
+            "pattern": r"^[0-9a-f]{64}$",
+        }
+        managed_rev_expectation_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "exit_code",
+                "stderr_sha256",
+                "stderr_size_bytes",
+                "stdout_sha256",
+                "stdout_size_bytes",
+            ],
+            "properties": {
+                "exit_code": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 255,
+                },
+                "stderr_sha256": managed_sha256_schema,
+                "stderr_size_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 16 * 1024 * 1024,
+                },
+                "stdout_sha256": managed_sha256_schema,
+                "stdout_size_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 16 * 1024 * 1024,
+                },
+            },
+        }
+        managed_rev_expected_oracle_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["accepted", "controls"],
+            "properties": {
+                "accepted": managed_rev_expectation_schema,
+                "controls": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["expectation", "mutation_id"],
+                        "properties": {
+                            "expectation": (
+                                managed_rev_expectation_schema
+                            ),
+                            "mutation_id": {
+                                "enum": [
+                                    "xor-first-01",
+                                    "xor-last-80",
+                                    "truncate-last",
+                                ]
+                            },
+                        },
+                    },
+                },
+            },
+        }
         for action_kind in action_kinds:
             if action_kind == MANAGED_PWN_CRASH_ACTION_KIND:
                 action_variants.append(
@@ -409,6 +475,51 @@ def role_output_schema(
                                 "minimum": 1,
                                 "maximum": 3600,
                             },
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "operator_spec_artifact_path",
+                            "operator_spec_sha256",
+                            "accepted_input_artifact_path",
+                            "accepted_input_sha256",
+                            "declared_argv",
+                            "expected_oracle",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "operator_spec_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "operator_spec_sha256": (
+                                managed_sha256_schema
+                            ),
+                            "accepted_input_artifact_path": (
+                                managed_path_schema
+                            ),
+                            "accepted_input_sha256": (
+                                managed_sha256_schema
+                            ),
+                            "declared_argv": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 16,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 4096,
+                                },
+                            },
+                            "expected_oracle": (
+                                managed_rev_expected_oracle_schema
+                            ),
                         },
                     }
                 )
@@ -933,6 +1044,97 @@ def _valid_relative_path(value: str) -> bool:
     )
 
 
+_MANAGED_REV_EXPECTATION_KEYS = {
+    "exit_code",
+    "stderr_sha256",
+    "stderr_size_bytes",
+    "stdout_sha256",
+    "stdout_size_bytes",
+}
+_MANAGED_REV_CONTROL_IDS = (
+    "xor-first-01",
+    "xor-last-80",
+    "truncate-last",
+)
+
+
+def _validate_managed_rev_expected_oracle(
+    value: object,
+    path: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, Mapping):
+        errors.append(f"{path}: expected object")
+        return
+    _exact_keys(value, {"accepted", "controls"}, path, errors)
+
+    def validate_expectation(item: object, item_path: str) -> None:
+        if not isinstance(item, Mapping):
+            errors.append(f"{item_path}: expected object")
+            return
+        _exact_keys(
+            item,
+            _MANAGED_REV_EXPECTATION_KEYS,
+            item_path,
+            errors,
+        )
+        exit_code = item.get("exit_code")
+        if type(exit_code) is not int or not 0 <= exit_code <= 255:
+            errors.append(
+                f"{item_path}.exit_code: expected integer from 0 to 255"
+            )
+        for stream in ("stdout", "stderr"):
+            digest = item.get(f"{stream}_sha256")
+            size = item.get(f"{stream}_size_bytes")
+            if (
+                not isinstance(digest, str)
+                or _SHA256_RE.fullmatch(digest) is None
+            ):
+                errors.append(
+                    f"{item_path}.{stream}_sha256: invalid sha256"
+                )
+            if (
+                type(size) is not int
+                or not 0 <= size <= 16 * 1024 * 1024
+            ):
+                errors.append(
+                    f"{item_path}.{stream}_size_bytes: invalid size"
+                )
+
+    accepted = value.get("accepted")
+    validate_expectation(accepted, f"{path}.accepted")
+    controls = value.get("controls")
+    if not isinstance(controls, list) or len(controls) != 3:
+        errors.append(f"{path}.controls: expected exactly three controls")
+        return
+    for index, (control, mutation_id) in enumerate(
+        zip(controls, _MANAGED_REV_CONTROL_IDS, strict=True)
+    ):
+        control_path = f"{path}.controls[{index}]"
+        if not isinstance(control, Mapping):
+            errors.append(f"{control_path}: expected object")
+            continue
+        _exact_keys(
+            control,
+            {"expectation", "mutation_id"},
+            control_path,
+            errors,
+        )
+        if control.get("mutation_id") != mutation_id:
+            errors.append(
+                f"{control_path}.mutation_id: invalid fixed order"
+            )
+        expectation = control.get("expectation")
+        validate_expectation(
+            expectation,
+            f"{control_path}.expectation",
+        )
+        if isinstance(accepted, Mapping) and expectation == accepted:
+            errors.append(
+                f"{control_path}.expectation: control must reject"
+            )
+
+
 def validate_role_output(
     payload: str | bytes | Mapping[str, Any],
     role: Role,
@@ -1356,6 +1558,15 @@ def validate_role_output(
                         "payload_artifact_path",
                         "timeout_seconds",
                     },
+                    MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND: {
+                        "kind",
+                        "operator_spec_artifact_path",
+                        "operator_spec_sha256",
+                        "accepted_input_artifact_path",
+                        "accepted_input_sha256",
+                        "declared_argv",
+                        "expected_oracle",
+                    },
                     MANAGED_WEB_IMPACT_ACTION_KIND: {
                         "kind",
                         "description",
@@ -1394,7 +1605,10 @@ def validate_role_output(
                     errors.append(
                         f"{path}.kind: {kind} is restricted to the v2 builder"
                     )
-                if not isinstance(item.get("description"), str):
+                if (
+                    kind != MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND
+                    and not isinstance(item.get("description"), str)
+                ):
                     errors.append(f"{path}.description: expected string")
                 path_fields = {
                     field
@@ -1467,6 +1681,39 @@ def validate_role_output(
                     and item.get("runtime") not in {"python", "sage"}
                 ):
                     errors.append(f"{path}.runtime: invalid runtime")
+                if kind == MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND:
+                    for field in (
+                        "operator_spec_sha256",
+                        "accepted_input_sha256",
+                    ):
+                        digest = item.get(field)
+                        if (
+                            not isinstance(digest, str)
+                            or _SHA256_RE.fullmatch(digest) is None
+                        ):
+                            errors.append(
+                                f"{path}.{field}: invalid sha256"
+                            )
+                    declared_argv = item.get("declared_argv")
+                    if (
+                        not isinstance(declared_argv, list)
+                        or not 1 <= len(declared_argv) <= 16
+                        or any(
+                            not isinstance(argument, str)
+                            or not argument
+                            or len(argument.encode("utf-8")) > 4096
+                            or "\x00" in argument
+                            for argument in declared_argv
+                        )
+                    ):
+                        errors.append(
+                            f"{path}.declared_argv: invalid argv"
+                        )
+                    _validate_managed_rev_expected_oracle(
+                        item.get("expected_oracle"),
+                        f"{path}.expected_oracle",
+                        errors,
+                    )
                 continue
             _exact_keys(item, keys, path, errors)
             if kind not in ACTION_KIND_VALUES:
@@ -1792,8 +2039,13 @@ def role_prompt(role: Role, user_prompt: str) -> str:
                 "Supply only canonical candidate, experiment, and hypothesis "
                 "IDs already present in state or proposed by this run. Never "
                 "supply a verdict: the engine alone executes and reduces the "
-                "Pwn effect, Web impact, Crypto metamorphic, Forensic "
-                "assertion, or Misc DAG gate."
+                "Pwn effect, Rev accepted-input, Web impact, Crypto "
+                "metamorphic, Forensic assertion, or Misc DAG gate. For "
+                "rev_accepted_input, keep the accepted bytes only in the "
+                "reported artifact: output exactly its relative pointer and "
+                "SHA-256, the canonical operator-spec pointer and SHA-256, "
+                "the declared argv, and the hash/size-only expected oracle. "
+                "Never echo accepted bytes in output, state, or prose."
                 if role is Role.BUILDER
                 else ""
             ),
