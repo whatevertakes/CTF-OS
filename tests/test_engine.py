@@ -4398,6 +4398,65 @@ class EngineTests(unittest.TestCase):
             (),
         )
 
+    def test_filtered_raw_brace_marker_does_not_abort_batch_commit(
+        self,
+    ) -> None:
+        class NonFlagBraceExecutor:
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del inner_self, cwd, timeout
+                role = _role_for(command)
+                on_stdout_line(
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "text": (
+                                "generated code contains "
+                                "LIVE_T{trial} and FREED_T{trial}"
+                            ),
+                        }
+                    )
+                    + "\n"
+                )
+                _output_path(command).write_text(
+                    json.dumps(_payload(role)),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.0)
+
+        engine = self.engine_with_executor(NonFlagBraceExecutor())
+        engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            challenge_flag_format={
+                "alphabet": "printable",
+                "kind": "prefix_brace",
+                "max_inner": 512,
+                "min_inner": 1,
+                "prefix": "flag",
+            },
+        )
+
+        with mock.patch(
+            "ctf_os.engine.challenge.print_flag_candidate"
+        ) as printed:
+            outcome = engine.run_wave(self.identity, "discovery")
+
+        committed = engine.store.load(self.identity)
+        self.assertEqual(outcome.candidate_values, ())
+        self.assertEqual(committed.candidates, [])
+        self.assertEqual(
+            engine.store.load_candidate_intents(self.identity),
+            (),
+        )
+        printed.assert_not_called()
+
     def test_batch_intent_failure_aborts_wave_instead_of_losing_flag(
         self,
     ) -> None:

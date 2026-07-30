@@ -6594,12 +6594,16 @@ class ChallengeEngine:
         # and exposes them to the next Captain.
         if not semantic_barrier_failed:
             committed = self._record_stall_if_needed(committed)
+        committed_candidate_values = {
+            candidate.value for candidate in committed.candidates
+        }
         candidates = tuple(
             dict.fromkeys(
                 candidate.value
                 for result in results
                 for candidate in result.flag_candidates
                 if candidate_value_is_valid(candidate.value)
+                and candidate.value in committed_candidate_values
             )
         )
         return WaveOutcome(
@@ -8794,12 +8798,16 @@ class ChallengeEngine:
                 )
             raise
         pending_handoff.clear()
+        committed_candidate_values = {
+            candidate.value for candidate in committed.candidates
+        }
         self.store.clear_candidate_intents(
             base_state.identity,
             tuple(
                 candidate.value
                 for result in results
                 for candidate in result.flag_candidates
+                if candidate.value in committed_candidate_values
             ),
         )
         return committed
