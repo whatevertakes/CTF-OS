@@ -65,6 +65,14 @@ from ctf_os.models import (
     HypothesisStatus,
     Provenance,
 )
+from ctf_os.promotion_bundles import (
+    capture_promotion_session,
+    execution_fingerprint_report,
+    evaluate_promotion_bundles,
+    finalize_promotion_session,
+    freeze_promotion_manifest,
+    prepare_promotion_session,
+)
 from ctf_os.sandbox import NetworkTarget, SandboxError
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import StateStoreError
@@ -840,6 +848,104 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="strict JSON promotion evidence 파일(자동 승격에는 사용하지 않음)",
     )
+    promotion_freeze = benchmark_commands.add_parser(
+        "freeze",
+        help="paired challenge/session manifest를 실행 전에 고정",
+    )
+    promotion_freeze.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="strict pre-run session manifest",
+    )
+    promotion_freeze.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="새 frozen manifest 출력(기존 경로는 덮어쓰지 않음)",
+    )
+    promotion_capture = benchmark_commands.add_parser(
+        "capture",
+        help="사람이 연 정확히 한 challenge session을 evidence bundle로 캡처",
+    )
+    promotion_capture.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="ctfos benchmark freeze 출력",
+    )
+    promotion_capture.add_argument(
+        "--session",
+        required=True,
+        help="frozen manifest의 exact session_id",
+    )
+    promotion_capture.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="새 bundle directory(기존 경로는 덮어쓰지 않음)",
+    )
+    promotion_compare = benchmark_commands.add_parser(
+        "compare",
+        help="signed bundles를 재검증해 thin baseline과 CTF-OS를 비교",
+    )
+    promotion_compare.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="ctfos benchmark freeze 출력",
+    )
+    promotion_compare.add_argument(
+        "--bundle",
+        type=Path,
+        action="append",
+        default=[],
+        help="capture bundle directory; 모든 고정 session에 대해 반복",
+    )
+    benchmark_commands.add_parser(
+        "fingerprint",
+        help="현재 단일-model/tool/image 실행 fingerprint 출력",
+    )
+    promotion_prepare = benchmark_commands.add_parser(
+        "prepare",
+        help="아직 실행하지 않은 한 challenge state를 frozen session에 결속",
+    )
+    promotion_prepare.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="ctfos benchmark freeze 출력",
+    )
+    promotion_prepare.add_argument(
+        "--session",
+        required=True,
+        help="frozen manifest의 exact session_id",
+    )
+    promotion_finalize = benchmark_commands.add_parser(
+        "finalize",
+        help="capture 전에 사람 개입·leak counter를 명시적으로 확정",
+    )
+    promotion_finalize.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="ctfos benchmark freeze 출력",
+    )
+    promotion_finalize.add_argument(
+        "--session",
+        required=True,
+        help="frozen manifest의 exact session_id",
+    )
+    promotion_finalize.add_argument(
+        "--human-interventions",
+        type=int,
+        required=True,
+    )
+    promotion_finalize.add_argument(
+        "--secret-or-flag-leaks",
+        type=int,
+        required=True,
+    )
 
     leases = commands.add_parser("leases", help="도구/model 대기 상태")
     leases.add_argument("--json", action="store_true")
@@ -1275,24 +1381,77 @@ def main(
             return 0
 
         if args.command == "benchmark":
-            if args.benchmark_command != "promotion":
-                raise AssertionError(
-                    "처리되지 않은 benchmark 명령: "
-                    f"{args.benchmark_command}"
+            if args.benchmark_command == "promotion":
+                payload = _read_bounded_regular_bytes(
+                    args.evidence,
+                    maximum=MAX_PROMOTION_EVIDENCE_BYTES,
+                    label="promotion evidence",
                 )
-            payload = _read_bounded_regular_bytes(
-                args.evidence,
-                maximum=MAX_PROMOTION_EVIDENCE_BYTES,
-                label="promotion evidence",
-            )
-            evidence = BlindLivePromotionEvidence.from_dict(
-                strict_json_loads(
-                    payload,
-                    max_bytes=MAX_PROMOTION_EVIDENCE_BYTES,
+                evidence = BlindLivePromotionEvidence.from_dict(
+                    strict_json_loads(
+                        payload,
+                        max_bytes=MAX_PROMOTION_EVIDENCE_BYTES,
+                    )
                 )
+                _print_json(evaluate_blind_live_promotion(evidence))
+                return 0
+            if args.benchmark_command == "freeze":
+                _print_json(
+                    freeze_promotion_manifest(
+                        workspace,
+                        args.manifest,
+                        args.output,
+                    )
+                )
+                return 0
+            if args.benchmark_command == "capture":
+                _print_json(
+                    capture_promotion_session(
+                        workspace,
+                        args.manifest,
+                        session_id=args.session,
+                        output_directory=args.output,
+                    )
+                )
+                return 0
+            if args.benchmark_command == "fingerprint":
+                _print_json(execution_fingerprint_report(workspace))
+                return 0
+            if args.benchmark_command == "prepare":
+                _print_json(
+                    prepare_promotion_session(
+                        workspace,
+                        args.manifest,
+                        session_id=args.session,
+                    )
+                )
+                return 0
+            if args.benchmark_command == "finalize":
+                _print_json(
+                    finalize_promotion_session(
+                        workspace,
+                        args.manifest,
+                        session_id=args.session,
+                        human_interventions=args.human_interventions,
+                        secret_or_flag_leaks=(
+                            args.secret_or_flag_leaks
+                        ),
+                    )
+                )
+                return 0
+            if args.benchmark_command == "compare":
+                _print_json(
+                    evaluate_promotion_bundles(
+                        workspace,
+                        args.manifest,
+                        args.bundle,
+                    )
+                )
+                return 0
+            raise AssertionError(
+                "처리되지 않은 benchmark 명령: "
+                f"{args.benchmark_command}"
             )
-            _print_json(evaluate_blind_live_promotion(evidence))
-            return 0
 
         if args.command == "migrate":
             if args.migration_command in {"check", "plan"}:
