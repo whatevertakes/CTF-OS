@@ -51,6 +51,11 @@ readiness 병목과 그 수정, address-resolution advisory의 권한 경계를
 기록합니다. Pwn runtime readiness와 leak/N/A 해석은 17을 우선하되 solve
 성능은 여전히 측정 전입니다.
 
+18은 개선된 엔진으로 `zone` 한 cycle을 다시 실행해 all-Sol wave와 tool
+dispatch를 확인하고, stale adapter seed와 shell-text/direct-argv 계약
+불일치를 새 실전 병목으로 고정한 기록입니다. 성공 exit code가 곧 target
+관측 증거가 아니라는 판정은 18을 따릅니다.
+
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
 12는 확정 계약을 현재 증거로 수용할 수 있는지를 기록합니다. 운영 명령은
@@ -66,6 +71,7 @@ readiness 병목과 그 수정, address-resolution advisory의 권한 경계를
 - [15. NYU CTF Bench Pwn 부분 실측 중단 기록](15-nyu-pwn-current-baseline.md) — 개선된 working tree로 고정한 Pwn 10문제 중 실제 시작한 4문제의 부분 관측, 사전검증, 엔진 병목과 사용자 중단 상태를 보존합니다. 완성된 `0/10` baseline으로 해석하지 않습니다 (관측일 2026-07-30)
 - [16. Pwn crash 실행 게이트와 실패 재투입 구현 기록](16-pwn-crash-gate-and-failure-replay.md) — engine-owned 3+3 D→V oracle, stdout/stderr commit 재검증, typed non-pass failure capsule, 1,536-byte resume와 독립 평가 metric의 현재 구현 및 아직 남은 leak/primitive/exploit 경계를 기록합니다 (구현·검증일 2026-07-30)
 - [17. Pwn runtime readiness와 address-resolution advisory](17-pwn-runtime-readiness-and-address-advisory.md) — stale image와 piped core handler 병목을 닫고 실제 Docker 3+3 및 보안 반례를 검증한 결과, source/evidence-bound advisory가 global leak N/A나 stage pass 권한을 갖지 않는 경계를 기록합니다 (구현·검증일 2026-07-30)
+- [18. Zone one-cycle live diagnostic](18-zone-one-cycle-live-diagnostic.md) — 개선된 all-Sol 엔진으로 `zone` 한 cycle을 재실행해 stale adapter seed와 managed shell/argv 의미 불일치가 target 관측을 막는 실제 병목임을 고정합니다 (관측일 2026-07-30)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
