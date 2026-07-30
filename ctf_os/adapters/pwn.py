@@ -19,11 +19,21 @@ class PwnAdapter(GenericAdapter):
             ExperimentSpec(
                 "runtime_baseline",
                 "observe normal and malformed-input behavior",
-                ("ctfwrap", "--", "{primary}"),
-                "exit status, signal, and bounded stdout/stderr",
+                (
+                    "/bin/sh",
+                    "-lc",
+                    "set +e; /usr/bin/timeout --signal=TERM 3 "
+                    "\"$1\" </dev/null; rc=$?; "
+                    "printf 'ctfos_runtime_baseline_exit=%s\\n' "
+                    "\"$rc\"; exit 0",
+                    "ctfos-pwn-runtime-baseline",
+                    "{primary}",
+                ),
+                "bounded stdout/stderr and explicit child exit status",
                 "behavior is repeatable or a crash is observed",
-                "wrapper cannot execute the binary",
-                "standard",
+                "bounded runner cannot execute the binary",
+                "light",
+                15,
             ),
         )
 
@@ -67,4 +77,3 @@ class PwnAdapter(GenericAdapter):
             "capabilities as a set, not a mandatory linear ladder. Separate "
             "path validation from actually reading the intended flag."
         )
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from ctf_os.adapters import get_adapter
+from ctf_os.sandbox.types import CommandSpec, ensure_foreground_command
 
 
 class AdapterTests(unittest.TestCase):
@@ -24,6 +25,28 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("control", keys)
         self.assertIn("flag_read", keys)
         self.assertNotIn("ordered", adapter.captain_guidance().lower())
+
+    def test_pwn_runtime_baseline_is_bounded_and_path_safe(self) -> None:
+        baseline = next(
+            experiment
+            for experiment in get_adapter("pwn").initial_observations()
+            if experiment.id == "runtime_baseline"
+        )
+        primary = "/challenge/name with 'quotes' and $shell"
+        argv = tuple(
+            argument.replace("{primary}", primary)
+            for argument in baseline.command_template
+        )
+
+        self.assertEqual(argv[:2], ("/bin/sh", "-lc"))
+        self.assertEqual(argv[-1], primary)
+        self.assertEqual(argv[-2], "ctfos-pwn-runtime-baseline")
+        self.assertEqual(baseline.timeout_s, 15)
+        self.assertEqual(baseline.resource_class, "light")
+        self.assertNotIn(primary, argv[2])
+        self.assertIn("/usr/bin/timeout --signal=TERM 3", argv[2])
+        CommandSpec.create(argv)
+        ensure_foreground_command(argv)
 
     def test_web_intake_never_makes_an_implicit_remote_request(self) -> None:
         adapter = get_adapter("web")
