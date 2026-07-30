@@ -10368,6 +10368,1321 @@ def _crypto_metamorphic_state_errors(
     return errors
 
 
+_FORENSIC_INDEX_EXECUTION_PROTOCOL = (
+    "forensic_evidence_index_execution_v1"
+)
+_FORENSIC_INDEX_PROTOCOL = "forensic_evidence_index_v1"
+_FORENSIC_INDEX_EVALUATION_KEYS = frozenset(
+    {
+        "authorities",
+        "confirmed",
+        "envelope",
+        "envelope_sha256",
+        "protocol",
+        "reason_code",
+        "schema_version",
+        "semantic_evaluation",
+        "semantic_evaluation_sha256",
+        "verdict",
+    }
+)
+_FORENSIC_INDEX_AUTHORITY_KEYS = frozenset(
+    {
+        "automatic_submission_authorized",
+        "candidate_authorized",
+        "challenge_proof_satisfied",
+        "executed_evidence_index_fact_authorized",
+        "impact_proven",
+        "progress_marker_authorized",
+    }
+)
+_FORENSIC_INDEX_ENVELOPE_KEYS = frozenset(
+    {
+        "category",
+        "challenge_id",
+        "configuration_epoch",
+        "contest_id",
+        "experiment_id",
+        "image",
+        "prefix_coverage_ppm",
+        "protocol",
+        "receipt",
+        "request",
+        "run",
+        "schema_version",
+        "source",
+        "stdout_artifact",
+        "transport",
+    }
+)
+_FORENSIC_INDEX_SEMANTIC_KEYS = frozenset(
+    {
+        "claims",
+        "index_sha256",
+        "indexed_bytes",
+        "indexed_files",
+        "modality_counts",
+        "pointer_coverage_ppm",
+        "protocol",
+        "reason_code",
+        "schema_version",
+        "source_inventory_sha256",
+        "tree_sha256",
+        "verdict",
+    }
+)
+_FORENSIC_INDEX_SEED_COPY_KEYS = (
+    "adapter_name",
+    "adapter_seed",
+    "adapter_seed_contract_version",
+    "adapter_seed_order",
+    "adapter_spec_id",
+    "adapter_spec_sha256",
+    "adapter_spec_template_id",
+    "partial_oracle",
+    "requires_explicit_execution",
+    "source_binding",
+    "source_snapshot",
+)
+_FORENSIC_INDEX_RUN_EXTRA_KEYS = frozenset(
+    {
+        *_FORENSIC_INDEX_SEED_COPY_KEYS,
+        "experiment_id",
+        "forensic_index_execution",
+        "wall_seconds",
+    }
+)
+_FORENSIC_INDEX_RECEIPT_EXTRA_KEYS = frozenset(
+    {
+        "forensic_index_execution",
+        "line_count_basis",
+        "stream_evidence",
+    }
+)
+_FORENSIC_INDEX_SOURCE_BINDING_KEYS = frozenset(
+    {
+        "adapter_plan_sha256",
+        "manifest_sha256",
+        "path",
+        "schema_version",
+        "sha256",
+        "size_bytes",
+    }
+)
+_FORENSIC_INDEX_EXPERIMENT_RESULT_KEYS = frozenset(
+    {
+        "exit_code",
+        "forensic_index_evaluation_artifact_id",
+        "forensic_index_execution",
+        "receipt_id",
+        "run_id",
+        "timed_out",
+    }
+)
+_FORENSIC_INDEX_EVALUATION_ARTIFACT_EXTRA_KEYS = frozenset(
+    {
+        "context_visibility",
+        "evaluation_sha256",
+        "experiment_id",
+        "kind",
+        "protocol",
+    }
+)
+_FORENSIC_INDEX_MAX_EVALUATION_BYTES = 1024 * 1024
+_FORENSIC_INDEX_MAX_SOURCE_BYTES = 128 * 1024**3
+
+
+def _forensic_index_exact_dict(
+    value: object,
+    keys: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict or frozenset(value) != keys:
+        raise ModelValidationError(
+            f"{label} has missing or unknown fields"
+        )
+    return value
+
+
+def _forensic_index_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
+
+
+def _forensic_index_image_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    )
+
+
+def _forensic_index_identifier(value: object) -> bool:
+    return (
+        type(value) is str
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,511}",
+            value,
+        )
+        is not None
+    )
+
+
+def _forensic_index_locator(value: object) -> bool:
+    if (
+        type(value) is not str
+        or not value
+        or len(value.encode("utf-8", errors="strict")) > 4096
+        or "\\" in value
+    ):
+        return False
+    path = PurePosixPath(value)
+    return (
+        not path.is_absolute()
+        and all(part not in {"", ".", ".."} for part in path.parts)
+    )
+
+
+def _forensic_index_nonnegative_int(
+    value: object,
+    *,
+    maximum: int = 2**63 - 1,
+) -> bool:
+    return (
+        type(value) is int
+        and 0 <= value <= maximum
+    )
+
+
+def _forensic_index_bounded_text(
+    value: object,
+    *,
+    maximum_bytes: int = 512,
+) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return len(encoded) <= maximum_bytes and all(
+        character.isprintable() for character in value
+    )
+
+
+def _forensic_index_execution_from_mapping(
+    value: object,
+) -> tuple[object, bytes]:
+    """Reconstruct one exact raw-free execution evaluation mapping."""
+
+    try:
+        from ctf_os.engine.forensic_index import (
+            FORENSIC_INDEX_MAX_BYTES,
+            FORENSIC_INDEX_MAX_FILES,
+            ForensicIndexEvaluation,
+            ForensicIndexVerdict,
+        )
+        from ctf_os.engine.forensic_index_execution import (
+            FORENSIC_INDEX_EXECUTION_SCHEMA_VERSION,
+            FORENSIC_INDEX_REQUEST_MAX_BYTES,
+            ForensicIndexExecutionEnvelope,
+            ForensicIndexExecutionEvaluation,
+            ForensicIndexExecutionVerdict,
+        )
+    except (ImportError, ValueError) as error:
+        raise ModelValidationError(
+            f"Forensic index execution validator unavailable: {error}"
+        ) from error
+
+    document = _forensic_index_exact_dict(
+        value,
+        _FORENSIC_INDEX_EVALUATION_KEYS,
+        "Forensic index evaluation",
+    )
+    if (
+        document["protocol"] != _FORENSIC_INDEX_EXECUTION_PROTOCOL
+        or type(document["schema_version"]) is not int
+        or document["schema_version"]
+        != FORENSIC_INDEX_EXECUTION_SCHEMA_VERSION
+        or type(document["confirmed"]) is not bool
+        or not _forensic_index_bounded_text(document["reason_code"])
+    ):
+        raise ModelValidationError(
+            "Forensic index evaluation header is invalid"
+        )
+
+    raw_semantic = document["semantic_evaluation"]
+    semantic: object | None
+    if raw_semantic is None:
+        semantic = None
+        if document["semantic_evaluation_sha256"] is not None:
+            raise ModelValidationError(
+                "Forensic semantic hash exists without its evaluation"
+            )
+    else:
+        semantic_mapping = _forensic_index_exact_dict(
+            raw_semantic,
+            _FORENSIC_INDEX_SEMANTIC_KEYS,
+            "Forensic semantic evaluation",
+        )
+        claims = _forensic_index_exact_dict(
+            semantic_mapping["claims"],
+            frozenset(
+                {
+                    "candidate_ready",
+                    "challenge_proof_satisfied",
+                    "evidence_index_verified",
+                    "impact_proven",
+                }
+            ),
+            "Forensic semantic claims",
+        )
+        modalities = semantic_mapping["modality_counts"]
+        if (
+            semantic_mapping["protocol"] != _FORENSIC_INDEX_PROTOCOL
+            or type(semantic_mapping["schema_version"]) is not int
+            or semantic_mapping["schema_version"] != 1
+            or type(modalities) is not dict
+            or len(modalities) > 256
+            or any(
+                not _forensic_index_bounded_text(
+                    key,
+                    maximum_bytes=128,
+                )
+                or not _forensic_index_nonnegative_int(count)
+                for key, count in modalities.items()
+            )
+            or not _forensic_index_bounded_text(
+                semantic_mapping["reason_code"]
+            )
+            or not _forensic_index_sha256(
+                semantic_mapping["source_inventory_sha256"]
+            )
+            or not _forensic_index_nonnegative_int(
+                semantic_mapping["indexed_files"],
+                maximum=FORENSIC_INDEX_MAX_FILES,
+            )
+            or not _forensic_index_nonnegative_int(
+                semantic_mapping["indexed_bytes"],
+                maximum=_FORENSIC_INDEX_MAX_SOURCE_BYTES,
+            )
+            or not _forensic_index_nonnegative_int(
+                semantic_mapping["pointer_coverage_ppm"],
+                maximum=1_000_000,
+            )
+            or type(semantic_mapping["verdict"]) is not str
+        ):
+            raise ModelValidationError(
+                "Forensic semantic evaluation fields are invalid"
+            )
+        try:
+            semantic_verdict = ForensicIndexVerdict(
+                semantic_mapping["verdict"]
+            )
+        except (TypeError, ValueError) as error:
+            raise ModelValidationError(
+                "Forensic semantic verdict is invalid"
+            ) from error
+        verified = semantic_verdict is ForensicIndexVerdict.CONFIRMED
+        expected_claims = {
+            "candidate_ready": False,
+            "challenge_proof_satisfied": False,
+            "evidence_index_verified": verified,
+            "impact_proven": False,
+        }
+        if claims != expected_claims:
+            raise ModelValidationError(
+                "Forensic semantic claims widened authority"
+            )
+        if any(type(value) is not bool for value in claims.values()):
+            raise ModelValidationError(
+                "Forensic semantic claims are not exact booleans"
+            )
+        if verified:
+            if (
+                semantic_mapping["reason_code"]
+                != "complete_hash_bound_index"
+                or not _forensic_index_sha256(
+                    semantic_mapping["tree_sha256"]
+                )
+                or not _forensic_index_sha256(
+                    semantic_mapping["index_sha256"]
+                )
+                or semantic_mapping["pointer_coverage_ppm"]
+                != 1_000_000
+            ):
+                raise ModelValidationError(
+                    "confirmed Forensic semantic evaluation is incomplete"
+                )
+        elif (
+            semantic_mapping["tree_sha256"] is not None
+            or semantic_mapping["index_sha256"] is not None
+            or semantic_mapping["indexed_files"] != 0
+            or semantic_mapping["indexed_bytes"] != 0
+            or semantic_mapping["pointer_coverage_ppm"] != 0
+            or modalities
+        ):
+            raise ModelValidationError(
+                "rejected Forensic semantic evaluation retained authority"
+            )
+        semantic = ForensicIndexEvaluation(
+            verdict=semantic_verdict,
+            reason_code=semantic_mapping["reason_code"],
+            source_inventory_sha256=(
+                semantic_mapping["source_inventory_sha256"]
+            ),
+            tree_sha256=semantic_mapping["tree_sha256"],
+            index_sha256=semantic_mapping["index_sha256"],
+            indexed_files=semantic_mapping["indexed_files"],
+            indexed_bytes=semantic_mapping["indexed_bytes"],
+            pointer_coverage_ppm=(
+                semantic_mapping["pointer_coverage_ppm"]
+            ),
+            modality_counts=tuple(sorted(modalities.items())),
+        )
+        if (
+            semantic_mapping != semantic.to_dict()
+            or document["semantic_evaluation_sha256"]
+            != semantic.sha256
+        ):
+            raise ModelValidationError(
+                "Forensic semantic evaluation is not canonical"
+            )
+
+    raw_envelope = document["envelope"]
+    envelope: object | None
+    if raw_envelope is None:
+        envelope = None
+        if document["envelope_sha256"] is not None:
+            raise ModelValidationError(
+                "Forensic envelope hash exists without its envelope"
+            )
+    else:
+        envelope_mapping = _forensic_index_exact_dict(
+            raw_envelope,
+            _FORENSIC_INDEX_ENVELOPE_KEYS,
+            "Forensic index execution envelope",
+        )
+        image = _forensic_index_exact_dict(
+            envelope_mapping["image"],
+            frozenset({"digest", "name"}),
+            "Forensic image binding",
+        )
+        receipt = _forensic_index_exact_dict(
+            envelope_mapping["receipt"],
+            frozenset({"exit_code", "id", "outcome"}),
+            "Forensic receipt binding",
+        )
+        request = _forensic_index_exact_dict(
+            envelope_mapping["request"],
+            frozenset({"path", "sha256", "size_bytes"}),
+            "Forensic request binding",
+        )
+        run = _forensic_index_exact_dict(
+            envelope_mapping["run"],
+            frozenset(
+                {
+                    "id",
+                    "origin",
+                    "result_path",
+                    "status",
+                    "validation_path",
+                }
+            ),
+            "Forensic run binding",
+        )
+        source = _forensic_index_exact_dict(
+            envelope_mapping["source"],
+            frozenset(
+                {
+                    "file_count",
+                    "inventory_sha256",
+                    "manifest_sha256",
+                    "total_bytes",
+                }
+            ),
+            "Forensic source binding",
+        )
+        stdout = _forensic_index_exact_dict(
+            envelope_mapping["stdout_artifact"],
+            frozenset(
+                {
+                    "id",
+                    "path",
+                    "sha256",
+                    "size_bytes",
+                    "source_run_id",
+                }
+            ),
+            "Forensic stdout binding",
+        )
+        transport = _forensic_index_exact_dict(
+            envelope_mapping["transport"],
+            frozenset(
+                {
+                    "capture_complete",
+                    "coverage",
+                    "network",
+                    "truncated",
+                    "truncation_known",
+                }
+            ),
+            "Forensic transport binding",
+        )
+        if (
+            envelope_mapping["category"] != "forensics"
+            or envelope_mapping["protocol"]
+            != _FORENSIC_INDEX_EXECUTION_PROTOCOL
+            or type(envelope_mapping["schema_version"]) is not int
+            or envelope_mapping["schema_version"]
+            != FORENSIC_INDEX_EXECUTION_SCHEMA_VERSION
+            or not _forensic_index_bounded_text(
+                envelope_mapping["contest_id"]
+            )
+            or not _forensic_index_bounded_text(
+                envelope_mapping["challenge_id"]
+            )
+            or not _forensic_index_bounded_text(
+                envelope_mapping["experiment_id"]
+            )
+            or not _forensic_index_nonnegative_int(
+                envelope_mapping["configuration_epoch"]
+            )
+            or envelope_mapping["prefix_coverage_ppm"] != 1_000_000
+            or not _forensic_index_bounded_text(image["name"])
+            or not _forensic_index_image_digest(image["digest"])
+            or type(receipt["exit_code"]) is not int
+            or receipt["exit_code"] != 0
+            or type(receipt["outcome"]) is not str
+            or receipt["outcome"] != ReceiptOutcome.SUCCEEDED.value
+            or not _forensic_index_identifier(receipt["id"])
+            or not _forensic_index_locator(request["path"])
+            or not _forensic_index_sha256(request["sha256"])
+            or not _forensic_index_nonnegative_int(
+                request["size_bytes"],
+                maximum=FORENSIC_INDEX_REQUEST_MAX_BYTES,
+            )
+            or request["size_bytes"] < 1
+            or not _forensic_index_identifier(run["id"])
+            or type(run["origin"]) is not str
+            or run["origin"]
+            not in {
+                RunOrigin.MANAGED_TOOL.value,
+                RunOrigin.OPERATOR_TOOL.value,
+            }
+            or type(run["status"]) is not str
+            or run["status"] != RunStatus.COMPLETED.value
+            or not _forensic_index_locator(run["result_path"])
+            or not _forensic_index_locator(run["validation_path"])
+            or len(
+                {
+                    request["path"],
+                    run["result_path"],
+                    run["validation_path"],
+                }
+            )
+            != 3
+            or not _forensic_index_sha256(source["manifest_sha256"])
+            or not _forensic_index_sha256(source["inventory_sha256"])
+            or not _forensic_index_nonnegative_int(
+                source["file_count"],
+                maximum=FORENSIC_INDEX_MAX_FILES,
+            )
+            or not _forensic_index_nonnegative_int(
+                source["total_bytes"],
+                maximum=_FORENSIC_INDEX_MAX_SOURCE_BYTES,
+            )
+            or not _forensic_index_identifier(stdout["id"])
+            or not _forensic_index_locator(stdout["path"])
+            or not _forensic_index_sha256(stdout["sha256"])
+            or not _forensic_index_nonnegative_int(
+                stdout["size_bytes"],
+                maximum=FORENSIC_INDEX_MAX_BYTES,
+            )
+            or stdout["size_bytes"] < 1
+            or stdout["source_run_id"] != run["id"]
+            or any(
+                type(transport[field]) is not bool
+                for field in (
+                    "capture_complete",
+                    "truncated",
+                    "truncation_known",
+                )
+            )
+            or type(transport["coverage"]) is not str
+            or type(transport["network"]) is not str
+            or transport
+            != {
+                "capture_complete": True,
+                "coverage": "complete_stream",
+                "network": "none",
+                "truncated": False,
+                "truncation_known": True,
+            }
+        ):
+            raise ModelValidationError(
+                "Forensic execution envelope fields are invalid"
+            )
+        envelope = ForensicIndexExecutionEnvelope(
+            category=envelope_mapping["category"],
+            contest_id=envelope_mapping["contest_id"],
+            challenge_id=envelope_mapping["challenge_id"],
+            configuration_epoch=(
+                envelope_mapping["configuration_epoch"]
+            ),
+            experiment_id=envelope_mapping["experiment_id"],
+            run_id=run["id"],
+            run_origin=run["origin"],
+            request_path=request["path"],
+            request_sha256=request["sha256"],
+            request_size_bytes=request["size_bytes"],
+            result_path=run["result_path"],
+            validation_path=run["validation_path"],
+            receipt_id=receipt["id"],
+            image_name=image["name"],
+            image_digest=image["digest"],
+            source_manifest_sha256=source["manifest_sha256"],
+            source_inventory_sha256=source["inventory_sha256"],
+            source_file_count=source["file_count"],
+            source_total_bytes=source["total_bytes"],
+            prefix_coverage_ppm=(
+                envelope_mapping["prefix_coverage_ppm"]
+            ),
+            stdout_artifact_id=stdout["id"],
+            stdout_artifact_path=stdout["path"],
+            stdout_artifact_sha256=stdout["sha256"],
+            stdout_artifact_size_bytes=stdout["size_bytes"],
+        )
+        if (
+            envelope_mapping != envelope.to_dict()
+            or document["envelope_sha256"] != envelope.sha256
+        ):
+            raise ModelValidationError(
+                "Forensic execution envelope is not canonical"
+            )
+
+    if envelope is None and semantic is not None:
+        raise ModelValidationError(
+            "Forensic semantic evaluation lacks its execution envelope"
+        )
+    if envelope is not None and semantic is None:
+        raise ModelValidationError(
+            "Forensic execution envelope lacks its semantic evaluation"
+        )
+    if (
+        envelope is not None
+        and semantic is not None
+        and (
+            semantic.source_inventory_sha256
+            != envelope.source_inventory_sha256
+            or (
+                semantic.verdict is ForensicIndexVerdict.CONFIRMED
+                and (
+                    semantic.indexed_files != envelope.source_file_count
+                    or semantic.indexed_bytes
+                    != envelope.source_total_bytes
+                )
+            )
+        )
+    ):
+        raise ModelValidationError(
+            "Forensic semantic/source inventory binding is inconsistent"
+        )
+    try:
+        if type(document["verdict"]) is not str:
+            raise ModelValidationError(
+                "Forensic execution verdict is not an exact string"
+            )
+        evaluation = ForensicIndexExecutionEvaluation(
+            verdict=ForensicIndexExecutionVerdict(document["verdict"]),
+            reason_code=document["reason_code"],
+            envelope=envelope,
+            semantic_evaluation=semantic,
+        )
+    except (TypeError, ValueError) as error:
+        raise ModelValidationError(
+            "Forensic execution verdict is invalid"
+        ) from error
+    authorities = _forensic_index_exact_dict(
+        document["authorities"],
+        _FORENSIC_INDEX_AUTHORITY_KEYS,
+        "Forensic execution authorities",
+    )
+    expected_authorities = {
+        "automatic_submission_authorized": False,
+        "candidate_authorized": False,
+        "challenge_proof_satisfied": False,
+        "executed_evidence_index_fact_authorized": evaluation.confirmed,
+        "impact_proven": False,
+        "progress_marker_authorized": evaluation.confirmed,
+    }
+    if (
+        any(type(value) is not bool for value in authorities.values())
+        or authorities != expected_authorities
+        or document["confirmed"] is not evaluation.confirmed
+        or document != evaluation.to_dict()
+        or (
+            evaluation.confirmed
+            and evaluation.reason_code
+            != "complete_executed_evidence_index"
+        )
+        or (
+            evaluation.confirmed
+            and evaluation.verdict
+            is not ForensicIndexExecutionVerdict.CONFIRMED
+        )
+        or (
+            not evaluation.confirmed
+            and evaluation.verdict
+            is not ForensicIndexExecutionVerdict.REJECTED
+        )
+    ):
+        raise ModelValidationError(
+            "Forensic execution evaluation is inconsistent"
+        )
+    encoded = evaluation.canonical_bytes
+    if len(encoded) > _FORENSIC_INDEX_MAX_EVALUATION_BYTES:
+        raise ModelValidationError(
+            "Forensic execution evaluation exceeds its size bound"
+        )
+    return evaluation, encoded
+
+
+def _forensic_index_seed_binding_errors(
+    state: "ChallengeState",
+    experiment: Experiment,
+    run: RunReference,
+) -> list[str]:
+    errors: list[str] = []
+    label = f"Forensic index experiment {experiment.id}"
+    manifest = state.metadata.get("source_manifest_sha256")
+    source_binding = experiment.extra.get("source_binding")
+    if (
+        state.category != "forensics"
+        or experiment.kind is not ExperimentKind.PROBE
+        or experiment.hypothesis_ids
+        or experiment.extra.get("adapter_seed") is not True
+        or experiment.extra.get("adapter_name") != "forensics"
+        or type(
+            experiment.extra.get("adapter_seed_contract_version")
+        )
+        is not int
+        or experiment.extra.get("adapter_seed_contract_version") != 1
+        or type(experiment.extra.get("adapter_seed_order")) is not int
+        or experiment.extra.get("adapter_seed_order") != 0
+        or experiment.extra.get("adapter_spec_template_id")
+        != "file_inventory"
+        or experiment.extra.get("requires_explicit_execution") is not True
+        or experiment.extra.get("partial_oracle") is not None
+        or experiment.extra.get("source_snapshot") is not None
+        or not _forensic_index_sha256(
+            experiment.extra.get("adapter_spec_sha256")
+        )
+        or experiment.extra.get("adapter_spec_id")
+        != "file_inventory@"
+        + str(experiment.extra.get("adapter_spec_sha256"))
+        or not _forensic_index_sha256(manifest)
+        or type(source_binding) is not dict
+        or frozenset(source_binding)
+        != _FORENSIC_INDEX_SOURCE_BINDING_KEYS
+        or type(source_binding.get("schema_version")) is not int
+        or source_binding.get("schema_version") != 1
+        or source_binding.get("manifest_sha256") != manifest
+        or not _forensic_index_sha256(
+            source_binding.get("adapter_plan_sha256")
+        )
+        or state.metadata.get("adapter_seed_source_binding")
+        != source_binding
+        or state.metadata.get("adapter_seed_plan_sha256")
+        != source_binding.get("adapter_plan_sha256")
+        or (
+            source_binding.get("path") is not None
+            and type(source_binding.get("path")) is not str
+        )
+        or (
+            source_binding.get("sha256") is not None
+            and not _forensic_index_sha256(
+                source_binding.get("sha256")
+            )
+        )
+        or (
+            source_binding.get("size_bytes") is not None
+            and not _forensic_index_nonnegative_int(
+                source_binding.get("size_bytes"),
+                maximum=_FORENSIC_INDEX_MAX_SOURCE_BYTES,
+            )
+        )
+    ):
+        errors.append(f"{label} seed/source binding is invalid")
+        return errors
+    primary_path = source_binding.get("path")
+    if state.source_inventory:
+        matching = [
+            source
+            for source in state.source_inventory
+            if source.path == primary_path
+        ]
+        if (
+            len(matching) != 1
+            or source_binding.get("sha256") != matching[0].sha256
+            or source_binding.get("size_bytes") != matching[0].size
+        ):
+            errors.append(f"{label} primary source binding is invalid")
+    elif any(
+        source_binding.get(key) is not None
+        for key in ("path", "sha256", "size_bytes")
+    ):
+        errors.append(f"{label} empty source binding is invalid")
+    if (
+        run.extra.get("experiment_id") != experiment.id
+        or any(
+            run.extra.get(key) != experiment.extra.get(key)
+            for key in _FORENSIC_INDEX_SEED_COPY_KEYS
+        )
+    ):
+        errors.append(f"{label} run seed binding is invalid")
+    return errors
+
+
+def _forensic_index_execution_state_errors(
+    state: "ChallengeState",
+    *,
+    experiments: Mapping[str, Experiment],
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+) -> list[str]:
+    """Validate the exact durable Forensic index execution state graph."""
+
+    errors: list[str] = []
+    bindings_by_artifact: dict[str, dict[str, object]] = {}
+    bound_run_ids: set[str] = set()
+    bound_receipt_ids: set[str] = set()
+    bound_fact_ids: set[str] = set()
+    bound_progress_ids: set[str] = set()
+
+    global_owners: dict[str, list[str]] = {}
+    for collection_name, records in (
+        ("experiment", state.experiments),
+        ("run", state.runs),
+        ("receipt", state.receipts),
+        ("artifact", state.artifacts),
+        ("fact", state.facts),
+        ("progress", state.progress_markers),
+        ("hypothesis", state.hypotheses),
+        ("goal", state.goals),
+        ("candidate", state.candidates),
+        ("submission", state.submissions),
+        ("session", state.sessions),
+        ("cycle", state.cycles),
+        ("wave", state.waves),
+        ("checkpoint", state.checkpoints),
+        ("target", state.targets),
+        ("workspace_publish", state.workspace_publishes),
+    ):
+        for record in records:
+            global_owners.setdefault(record.id, []).append(
+                collection_name
+            )
+
+    for experiment in state.experiments:
+        result = experiment.result
+        has_execution = (
+            type(result) is dict
+            and (
+                "forensic_index_execution" in result
+                or "forensic_index_evaluation_artifact_id" in result
+            )
+        )
+        if not has_execution:
+            continue
+        label = f"Forensic index experiment {experiment.id}"
+        try:
+            result_mapping = _forensic_index_exact_dict(
+                result,
+                _FORENSIC_INDEX_EXPERIMENT_RESULT_KEYS,
+                f"{label} result",
+            )
+            run_id = result_mapping["run_id"]
+            receipt_id = result_mapping["receipt_id"]
+            evaluation_artifact_id = result_mapping[
+                "forensic_index_evaluation_artifact_id"
+            ]
+            if (
+                not _forensic_index_identifier(run_id)
+                or not _forensic_index_identifier(receipt_id)
+                or not _forensic_index_identifier(
+                    evaluation_artifact_id
+                )
+                or type(result_mapping["exit_code"]) is not int
+                or type(result_mapping["timed_out"]) is not bool
+            ):
+                raise ModelValidationError(
+                    "result run/receipt/transport fields are invalid"
+                )
+            if (
+                not _forensic_index_nonnegative_int(
+                    state.configuration_epoch
+                )
+                or not _forensic_index_sha256(
+                    state.metadata.get("source_manifest_sha256")
+                )
+                or any(
+                    type(source.path) is not str
+                    or not _forensic_index_locator(source.path)
+                    or not _forensic_index_sha256(source.sha256)
+                    or not _forensic_index_nonnegative_int(
+                        source.size,
+                        maximum=_FORENSIC_INDEX_MAX_SOURCE_BYTES,
+                    )
+                    or source.kind != "file"
+                    for source in state.source_inventory
+                )
+            ):
+                raise ModelValidationError(
+                    "canonical state source/configuration is invalid"
+                )
+            if evaluation_artifact_id in bindings_by_artifact:
+                raise ModelValidationError(
+                    "evaluation artifact is bound more than once"
+                )
+            run = runs.get(run_id)
+            receipt = receipts.get(receipt_id)
+            evaluation_artifact = artifacts.get(
+                evaluation_artifact_id
+            )
+            if (
+                run is None
+                or receipt is None
+                or evaluation_artifact is None
+            ):
+                raise ModelValidationError(
+                    "run, receipt, or evaluation artifact is missing"
+                )
+            evaluation, encoded = (
+                _forensic_index_execution_from_mapping(
+                    result_mapping["forensic_index_execution"]
+                )
+            )
+            evaluation_payload = evaluation.to_dict()
+            evaluation_sha256 = hashlib.sha256(encoded).hexdigest()
+            if (
+                run.extra.get("forensic_index_execution")
+                != evaluation_payload
+                or receipt.extra.get("forensic_index_execution")
+                != evaluation_payload
+                or frozenset(run.extra)
+                != _FORENSIC_INDEX_RUN_EXTRA_KEYS
+                or frozenset(receipt.extra)
+                != _FORENSIC_INDEX_RECEIPT_EXTRA_KEYS
+            ):
+                raise ModelValidationError(
+                    "evaluation copies were stripped or rebound"
+                )
+            errors.extend(
+                _forensic_index_seed_binding_errors(
+                    state,
+                    experiment,
+                    run,
+                )
+            )
+            expected_run_status = (
+                RunStatus.TIMED_OUT
+                if result_mapping["timed_out"]
+                else RunStatus.COMPLETED
+                if result_mapping["exit_code"] == 0
+                else RunStatus.FAILED
+            )
+            expected_receipt_outcome = (
+                ReceiptOutcome.TIMED_OUT
+                if result_mapping["timed_out"]
+                else ReceiptOutcome.SUCCEEDED
+                if result_mapping["exit_code"] == 0
+                else ReceiptOutcome.FAILED
+            )
+            stdout_artifact = artifacts.get(
+                receipt.stdout_artifact_id or ""
+            )
+            stderr_artifact = artifacts.get(
+                receipt.stderr_artifact_id or ""
+            )
+            stream_evidence = receipt.extra.get("stream_evidence")
+            stdout_stream = (
+                stream_evidence.get("stdout")
+                if type(stream_evidence) is dict
+                else None
+            )
+            stderr_stream = (
+                stream_evidence.get("stderr")
+                if type(stream_evidence) is dict
+                else None
+            )
+            if (
+                run.status is not expected_run_status
+                or run.role != "tool"
+                or run.origin
+                not in {
+                    RunOrigin.MANAGED_TOOL,
+                    RunOrigin.OPERATOR_TOOL,
+                }
+                or type(run.configuration_epoch) is not int
+                or run.configuration_epoch != state.configuration_epoch
+                or receipt.experiment_id != experiment.id
+                or receipt.run_id != run.id
+                or receipt.outcome is not expected_receipt_outcome
+                or type(receipt.exit_code) is not int
+                or receipt.exit_code != result_mapping["exit_code"]
+                or stdout_artifact is None
+                or stdout_artifact.source_run_id != run.id
+                or frozenset(stdout_artifact.extra)
+                != {"source_locator", "stream"}
+                or stdout_artifact.extra.get("stream") != "stdout"
+                or not _forensic_index_locator(
+                    stdout_artifact.extra.get("source_locator")
+                )
+                or PurePosixPath(
+                    stdout_artifact.extra["source_locator"]
+                ).name
+                != "stdout.log"
+                or type(stdout_artifact.size) is not int
+                or type(receipt.stdout_bytes) is not int
+                or stdout_artifact.size != receipt.stdout_bytes
+                or stderr_artifact is None
+                or stderr_artifact.source_run_id != run.id
+                or frozenset(stderr_artifact.extra)
+                != {"source_locator", "stream"}
+                or stderr_artifact.extra.get("stream") != "stderr"
+                or not _forensic_index_locator(
+                    stderr_artifact.extra.get("source_locator")
+                )
+                or PurePosixPath(
+                    stderr_artifact.extra["source_locator"]
+                ).name
+                != "stderr.log"
+                or type(stderr_artifact.size) is not int
+                or type(receipt.stderr_bytes) is not int
+                or stderr_artifact.size != receipt.stderr_bytes
+                or type(stream_evidence) is not dict
+                or frozenset(stream_evidence) != {"stdout", "stderr"}
+                or type(stdout_stream) is not dict
+                or type(stderr_stream) is not dict
+                or stdout_stream.get("artifact_id")
+                != stdout_artifact.id
+                or stdout_stream.get("path") != stdout_artifact.path
+                or stdout_stream.get("sha256")
+                != stdout_artifact.sha256
+                or stdout_stream.get("stored_bytes")
+                != stdout_artifact.size
+                or stdout_stream.get("drained_bytes")
+                != receipt.stdout_bytes
+                or stdout_stream.get("stream") != "stdout"
+                or stderr_stream.get("artifact_id")
+                != stderr_artifact.id
+                or stderr_stream.get("path") != stderr_artifact.path
+                or stderr_stream.get("sha256")
+                != stderr_artifact.sha256
+                or stderr_stream.get("stored_bytes")
+                != stderr_artifact.size
+                or stderr_stream.get("drained_bytes")
+                != receipt.stderr_bytes
+                or stderr_stream.get("stream") != "stderr"
+                or receipt.extra.get("line_count_basis")
+                != "transport_summary_tail"
+                or stdout_artifact.id not in experiment.artifact_ids
+                or run.id not in experiment.evidence_run_ids
+                or receipt.id not in experiment.evidence_receipt_ids
+            ):
+                raise ModelValidationError(
+                    "run/receipt/stdout state binding is invalid"
+                )
+            if (
+                type(run.extra.get("wall_seconds")) not in {int, float}
+                or isinstance(run.extra.get("wall_seconds"), bool)
+                or run.extra.get("wall_seconds") < 0
+                or type(receipt.wall_seconds) not in {int, float}
+                or isinstance(receipt.wall_seconds, bool)
+                or receipt.wall_seconds < 0
+                or run.extra.get("wall_seconds")
+                != receipt.wall_seconds
+            ):
+                raise ModelValidationError(
+                    "run/receipt wall time binding is invalid"
+                )
+            if (
+                experiment.evidence_run_ids != [run.id]
+                or experiment.evidence_receipt_ids != [receipt.id]
+                or experiment.artifact_ids
+                != [
+                    stdout_artifact.id,
+                    stderr_artifact.id,
+                    evaluation_artifact.id,
+                ]
+            ):
+                raise ModelValidationError(
+                    "experiment evidence references are not exact"
+                )
+            if (
+                evaluation_artifact.path
+                != (
+                    "artifacts/snapshots/"
+                    f"{evaluation_artifact.id}.json"
+                )
+                or evaluation_artifact.source_run_id != run.id
+                or evaluation_artifact.sha256 != evaluation_sha256
+                or type(evaluation_artifact.size) is not int
+                or evaluation_artifact.size != len(encoded)
+                or evaluation_artifact.extra
+                != {
+                    "context_visibility": "model_visible",
+                    "evaluation_sha256": evaluation_sha256,
+                    "experiment_id": experiment.id,
+                    "kind": (
+                        "forensic_index_execution_evaluation"
+                    ),
+                    "protocol": _FORENSIC_INDEX_EXECUTION_PROTOCOL,
+                    **(
+                        {"run_id": run.id}
+                        if "run_id" in evaluation_artifact.extra
+                        else {}
+                    ),
+                }
+                or frozenset(evaluation_artifact.extra)
+                not in {
+                    _FORENSIC_INDEX_EVALUATION_ARTIFACT_EXTRA_KEYS,
+                    _FORENSIC_INDEX_EVALUATION_ARTIFACT_EXTRA_KEYS
+                    | {"run_id"},
+                }
+            ):
+                raise ModelValidationError(
+                    "evaluation artifact binding is invalid"
+                )
+            expected_status = (
+                ExperimentStatus.COMPLETED
+                if evaluation.confirmed
+                else ExperimentStatus.FAILED
+            )
+            expected_reason = (
+                "forensic_index:"
+                f"{evaluation.verdict.value}:"
+                f"{evaluation.reason_code}"
+            )[:512]
+            if (
+                experiment.status is not expected_status
+                or experiment.evaluation_reason != expected_reason
+                or not _forensic_index_bounded_text(
+                    experiment.evaluated_at,
+                    maximum_bytes=128,
+                )
+            ):
+                raise ModelValidationError(
+                    "experiment status/evaluation binding is invalid"
+                )
+            envelope = evaluation.envelope
+            if envelope is not None:
+                if (
+                    result_mapping["exit_code"] != 0
+                    or result_mapping["timed_out"] is not False
+                    or run.status is not RunStatus.COMPLETED
+                    or receipt.outcome is not ReceiptOutcome.SUCCEEDED
+                    or receipt.exit_code != 0
+                    or envelope.contest_id != state.contest_id
+                    or envelope.challenge_id != state.challenge_id
+                    or envelope.experiment_id != experiment.id
+                    or envelope.configuration_epoch
+                    != state.configuration_epoch
+                    or envelope.run_id != run.id
+                    or envelope.run_origin != run.origin.value
+                    or envelope.request_path != run.request_path
+                    or envelope.result_path != run.result_path
+                    or envelope.validation_path != run.validation_path
+                    or envelope.receipt_id != receipt.id
+                    or envelope.source_manifest_sha256
+                    != state.metadata.get("source_manifest_sha256")
+                    or envelope.source_file_count
+                    != len(state.source_inventory)
+                    or envelope.source_total_bytes
+                    != sum(
+                        source.size for source in state.source_inventory
+                    )
+                    or envelope.stdout_artifact_id
+                    != stdout_artifact.id
+                    or envelope.stdout_artifact_path
+                    != stdout_artifact.path
+                    or envelope.stdout_artifact_sha256
+                    != stdout_artifact.sha256
+                    or envelope.stdout_artifact_size_bytes
+                    != stdout_artifact.size
+                ):
+                    raise ModelValidationError(
+                        "execution envelope was rebound to state"
+                    )
+            elif evaluation.confirmed:
+                raise ModelValidationError(
+                    "confirmed evaluation lacks its envelope"
+                )
+
+            reduction = evaluation.reduction_projection()
+            matching_facts = [
+                fact
+                for fact in state.facts
+                if "forensic_evidence_index" in fact.extra
+                and (
+                    fact.extra.get("forensic_evidence_index")
+                    == (
+                        reduction["executed_fact"] or {}
+                    ).get("extra", {}).get(
+                        "forensic_evidence_index"
+                    )
+                )
+            ]
+            matching_markers = [
+                marker
+                for marker in state.progress_markers
+                if "forensic_evidence_index" in marker.extra
+                and (
+                    marker.extra.get("forensic_evidence_index")
+                    == (
+                        reduction["progress"] or {}
+                    ).get("extra", {}).get(
+                        "forensic_evidence_index"
+                    )
+                )
+            ]
+            if evaluation.confirmed:
+                fact_payload = reduction["executed_fact"]
+                progress_payload = reduction["progress"]
+                if (
+                    type(fact_payload) is not dict
+                    or type(progress_payload) is not dict
+                    or len(matching_facts) != 1
+                    or len(matching_markers) != 1
+                ):
+                    raise ModelValidationError(
+                        "confirmed evaluation lacks exact fact/progress"
+                    )
+                fact = matching_facts[0]
+                marker = matching_markers[0]
+                if (
+                    fact.provenance is not Provenance.EXECUTED
+                    or fact.kind is not FactKind.OBSERVATION
+                    or fact.challenge_id != state.challenge_id
+                    or fact.statement != fact_payload["statement"]
+                    or fact.source_run_id
+                    != fact_payload["source_run_id"]
+                    or fact.artifact_id != fact_payload["artifact_id"]
+                    or fact.locator != fact_payload["locator"]
+                    or fact.extra != fact_payload["extra"]
+                    or fact.supersedes_id is not None
+                    or fact.supports
+                    or fact.contradicts
+                    or marker.statement
+                    != progress_payload["statement"]
+                    or marker.run_id != progress_payload["run_id"]
+                    or marker.artifact_ids
+                    != progress_payload["artifact_ids"]
+                    or marker.extra != progress_payload["extra"]
+                    or marker.goal_id is not None
+                    or marker.elapsed_seconds is not None
+                    or experiment.evidence_fact_ids != [fact.id]
+                ):
+                    raise ModelValidationError(
+                        "fact/progress reduction was stripped or rebound"
+                    )
+                bound_fact_ids.add(fact.id)
+                bound_progress_ids.add(marker.id)
+                graph_ids = {
+                    experiment.id,
+                    run.id,
+                    receipt.id,
+                    stdout_artifact.id,
+                    evaluation_artifact.id,
+                    stderr_artifact.id,
+                    fact.id,
+                    marker.id,
+                }
+            else:
+                if (
+                    matching_facts
+                    or matching_markers
+                    or experiment.evidence_fact_ids
+                ):
+                    raise ModelValidationError(
+                        "rejected evaluation retained fact/progress authority"
+                    )
+                graph_ids = {
+                    experiment.id,
+                    run.id,
+                    receipt.id,
+                    stdout_artifact.id,
+                    evaluation_artifact.id,
+                    stderr_artifact.id,
+                }
+            if len(graph_ids) != (
+                8 if evaluation.confirmed else 6
+            ) or any(
+                len(global_owners.get(record_id, [])) != 1
+                for record_id in graph_ids
+            ):
+                raise ModelValidationError(
+                    "Forensic graph ids are duplicated globally"
+                )
+            bindings_by_artifact[evaluation_artifact.id] = {
+                "experiment_id": experiment.id,
+                "evaluation_sha256": evaluation_sha256,
+                "run_id": run.id,
+            }
+            bound_run_ids.add(run.id)
+            bound_receipt_ids.add(receipt.id)
+        except (
+            KeyError,
+            ModelValidationError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} is invalid: {error}")
+
+    for artifact in state.artifacts:
+        if (
+            artifact.extra.get("kind")
+            == "forensic_index_execution_evaluation"
+            or artifact.extra.get("protocol")
+            == _FORENSIC_INDEX_EXECUTION_PROTOCOL
+        ) and artifact.id not in bindings_by_artifact:
+            errors.append(
+                f"orphan Forensic index evaluation artifact {artifact.id}"
+            )
+    for run in state.runs:
+        if (
+            "forensic_index_execution" in run.extra
+            and run.id not in bound_run_ids
+        ):
+            errors.append(f"orphan Forensic index run {run.id}")
+    for receipt in state.receipts:
+        if (
+            "forensic_index_execution" in receipt.extra
+            and receipt.id not in bound_receipt_ids
+        ):
+            errors.append(f"orphan Forensic index receipt {receipt.id}")
+    for fact in state.facts:
+        if (
+            "forensic_evidence_index" in fact.extra
+            and fact.id not in bound_fact_ids
+        ):
+            errors.append(f"orphan Forensic index fact {fact.id}")
+    for marker in state.progress_markers:
+        if (
+            "forensic_evidence_index" in marker.extra
+            and marker.id not in bound_progress_ids
+        ):
+            errors.append(
+                f"orphan Forensic index progress marker {marker.id}"
+            )
+    return errors
+
+
 _MISC_TRANSFORM_PROTOCOL = "misc_sandbox_transform_dag_reverse_v1"
 _MISC_TRANSFORM_BINDING_KEYS = frozenset(
     {
@@ -13343,6 +14658,16 @@ class ChallengeState:
                 )
             )
             errors.extend(
+                _forensic_index_execution_state_errors(
+                    self,
+                    experiments=experiments,
+                    runs=runs,
+                    receipts=receipts,
+                    artifacts=artifacts,
+                    facts=facts,
+                )
+            )
+            errors.extend(
                 _misc_transform_state_errors(
                     self,
                     runs=runs,
@@ -13353,6 +14678,33 @@ class ChallengeState:
             )
         if errors:
             raise ModelValidationError("; ".join(errors))
+
+
+def validate_forensic_index_execution_state_graph(
+    state: ChallengeState,
+) -> None:
+    """Validate only the durable Forensic evidence-index execution graph.
+
+    This public entry point is useful at explicit trust boundaries that already
+    hold a fully parsed ``ChallengeState``.  Normal persistence paths should
+    continue to call :meth:`ChallengeState.validate`, which includes this
+    contract plus every generic state invariant.
+    """
+
+    if type(state) is not ChallengeState:
+        raise ModelValidationError(
+            "Forensic index state graph requires ChallengeState"
+        )
+    errors = _forensic_index_execution_state_errors(
+        state,
+        experiments={item.id: item for item in state.experiments},
+        runs={item.id: item for item in state.runs},
+        receipts={item.id: item for item in state.receipts},
+        artifacts={item.id: item for item in state.artifacts},
+        facts={item.id: item for item in state.facts},
+    )
+    if errors:
+        raise ModelValidationError("; ".join(errors))
 
 
 def new_challenge_state(
@@ -13450,4 +14802,5 @@ __all__ = [
     "WorkspacePublish",
     "new_challenge_state",
     "utc_now",
+    "validate_forensic_index_execution_state_graph",
 ]
