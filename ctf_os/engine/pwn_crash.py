@@ -187,28 +187,57 @@ def _canonical_json_bytes(value: object) -> bytes:
 def _validate_json_tree(value: object) -> None:
     """Bound an untrusted decoded recipe before canonical serialization."""
 
-    pending: list[tuple[object, int]] = [(value, 1)]
+    pending: list[tuple[Iterable[object], int]] = [
+        (iter((value,)), 1)
+    ]
     nodes = 0
+    maximum_encoded_bytes = 0
     while pending:
-        current, depth = pending.pop()
+        iterator, depth = pending[-1]
+        try:
+            current = next(iterator)
+        except StopIteration:
+            pending.pop()
+            continue
         nodes += 1
         if depth > PWN_CRASH_MAX_JSON_DEPTH:
             raise PwnCrashRecipeError("recipe_depth_exceeded")
         if nodes > PWN_CRASH_MAX_JSON_NODES:
             raise PwnCrashRecipeError("recipe_node_limit_exceeded")
         if type(current) is dict:
+            values: list[object] = []
             for key, item in current.items():
                 if type(key) is not str:
                     raise PwnCrashRecipeError("invalid_recipe_schema")
-                pending.append((item, depth + 1))
+                if len(key) > PWN_CRASH_MAX_RECIPE_BYTES:
+                    raise PwnCrashRecipeError("recipe_size_exceeded")
+                maximum_encoded_bytes += (12 * len(key)) + 4
+                if maximum_encoded_bytes > PWN_CRASH_MAX_RECIPE_BYTES:
+                    raise PwnCrashRecipeError("recipe_size_exceeded")
+                values.append(item)
+                if len(values) > PWN_CRASH_MAX_JSON_NODES:
+                    raise PwnCrashRecipeError(
+                        "recipe_node_limit_exceeded"
+                    )
+            pending.append((iter(values), depth + 1))
         elif type(current) is list:
-            pending.extend((item, depth + 1) for item in current)
-        elif type(current) in {str, int, bool, type(None)}:
-            continue
+            pending.append((iter(current), depth + 1))
+        elif type(current) is str:
+            if len(current) > PWN_CRASH_MAX_RECIPE_BYTES:
+                raise PwnCrashRecipeError("recipe_size_exceeded")
+            maximum_encoded_bytes += (12 * len(current)) + 2
+        elif type(current) is int:
+            if current.bit_length() > PWN_CRASH_MAX_RECIPE_BYTES:
+                raise PwnCrashRecipeError("recipe_size_exceeded")
+            maximum_encoded_bytes += max(1, current.bit_length()) + 2
+        elif type(current) in {bool, type(None)}:
+            maximum_encoded_bytes += 5
         elif type(current) is float and math.isfinite(current):
-            continue
+            maximum_encoded_bytes += 32
         else:
             raise PwnCrashRecipeError("invalid_recipe_schema")
+        if maximum_encoded_bytes > PWN_CRASH_MAX_RECIPE_BYTES:
+            raise PwnCrashRecipeError("recipe_size_exceeded")
 
 
 def _exact_dict(
@@ -227,9 +256,14 @@ def _require_sha256(value: object, label: str) -> str:
 
 
 def _require_identifier(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise PwnCrashRecipeError(f"invalid_{label}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise PwnCrashRecipeError(f"invalid_{label}") from error
     if (
-        type(value) is not str
-        or len(value.encode("utf-8")) > PWN_CRASH_MAX_IDENTIFIER_BYTES
+        len(encoded) > PWN_CRASH_MAX_IDENTIFIER_BYTES
         or _IDENTIFIER.fullmatch(value) is None
     ):
         raise PwnCrashRecipeError(f"invalid_{label}")
@@ -779,9 +813,14 @@ class PwnCrashReceiptMetadata:
 
 
 def _receipt_identifier(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"invalid receipt {label}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"invalid receipt {label}") from error
     if (
-        type(value) is not str
-        or len(value.encode("utf-8")) > PWN_CRASH_MAX_IDENTIFIER_BYTES
+        len(encoded) > PWN_CRASH_MAX_IDENTIFIER_BYTES
         or _IDENTIFIER.fullmatch(value) is None
     ):
         raise ValueError(f"invalid receipt {label}")
@@ -789,10 +828,14 @@ def _receipt_identifier(value: object, label: str) -> str:
 
 
 def _receipt_text(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"invalid receipt {label}")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"invalid receipt {label}") from error
     if (
-        type(value) is not str
-        or not value
-        or len(value.encode("utf-8")) > PWN_CRASH_MAX_IDENTIFIER_BYTES
+        len(encoded) > PWN_CRASH_MAX_IDENTIFIER_BYTES
         or "\x00" in value
         or any(
             unicodedata.category(character).startswith("C")

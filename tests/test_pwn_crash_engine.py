@@ -317,6 +317,16 @@ class PwnCrashRecipeTests(unittest.TestCase):
         with self.assertRaises(PwnCrashRecipeError):
             PwnCrashRecipe.from_dict(fixed_tamper)
 
+        surrogate = copy.deepcopy(recipe.to_dict())
+        surrogate["experiment_id"] = "\ud800"
+        with self.assertRaises(PwnCrashRecipeError):
+            PwnCrashRecipe.from_dict(surrogate)
+
+        oversized_tree = copy.deepcopy(recipe.to_dict())
+        oversized_tree["runtime"]["attempt_plan"] = [None] * 100_000
+        with self.assertRaises(PwnCrashRecipeError):
+            PwnCrashRecipe.from_dict(oversized_tree)
+
     def test_constructor_rejects_unsafe_or_unbound_dynamic_fields(self) -> None:
         invalid = (
             ("configuration_epoch", True),
@@ -595,6 +605,11 @@ class PwnCrashEvidenceTests(unittest.TestCase):
         invalid_mapping["command"] = ["sh"]
         with self.assertRaisesRegex(ValueError, "schema"):
             PwnCrashReceiptMetadata.from_dict(invalid_mapping)
+
+        invalid_identifier = metadata[0].to_dict()
+        invalid_identifier["receipt_id"] = "\ud800"
+        with self.assertRaisesRegex(ValueError, "receipt_id"):
+            PwnCrashReceiptMetadata.from_dict(invalid_identifier)
 
 
 if __name__ == "__main__":
