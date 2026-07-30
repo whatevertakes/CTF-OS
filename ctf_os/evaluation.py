@@ -61,6 +61,12 @@ from ctf_os.engine.pwn_ip_control import (
     PwnIpControlResult,
     PwnIpControlStatus,
 )
+from ctf_os.engine.rev_proof import (
+    REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+    REV_STDIN_PROOF_MAX_EVIDENCE_BYTES,
+    REV_STDIN_PROOF_PROTOCOL,
+    verify_rev_proof_evaluation,
+)
 from ctf_os.director.resources import tool_profile
 from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION
 from ctf_os.store.atomic import canonical_json_bytes
@@ -116,6 +122,28 @@ _PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
 _CRYPTO_METAMORPHIC_PROTOCOL = (
     "crypto_solver_metamorphic_variant_v1"
 )
+_REV_PROOF_ENVELOPE_KEYS = {
+    "schema_version",
+    "protocol",
+    "recipe_sha256",
+    "policy_sha256",
+    "candidate_id",
+    "accepted_input_artifact_id",
+    "source_manifest_sha256",
+    "image_reference",
+    "oracle_binding",
+    "evaluation",
+    "evaluation_sha256",
+    "evaluation_artifact_id",
+    "deadline_guard",
+}
+_REV_PROOF_DEADLINE_GUARD_KEYS = {
+    "contract",
+    "budget_deadline_utc",
+    "attempt_deadlines_utc",
+    "evaluated_at_utc",
+    "commit_guard",
+}
 _PWN_CRASH_FLAG_PATTERNS_ENV = "CTF_WRAP_FLAG_PATTERNS_JSON"
 _PWN_CRASH_EVIDENCE_KEYS = {
     "schema_version",
@@ -1744,6 +1772,181 @@ def _parse_crypto_metamorphic_result(
     )
 
 
+def _parse_rev_stdin_result(
+    record: _LoadedState,
+    experiment: object,
+) -> _ProofObservation:
+    result = getattr(experiment, "result", None)
+    recipe = getattr(experiment, "proof_recipe", None)
+    if (
+        type(result) is not dict
+        or set(result) != {"proof_result", "rev_proof_evidence"}
+        or recipe is None
+    ):
+        raise EvaluationInputError(
+            "Rev stdin proof result schema is not exact"
+        )
+    envelope = result["rev_proof_evidence"]
+    if (
+        type(envelope) is not dict
+        or set(envelope) != _REV_PROOF_ENVELOPE_KEYS
+        or envelope.get("schema_version") != 1
+        or envelope.get("protocol") != REV_STDIN_PROOF_PROTOCOL
+        or len(recipe.inputs) != 1
+        or recipe.policy.oracle_protocol != REV_STDIN_PROOF_PROTOCOL
+        or envelope.get("recipe_sha256") != recipe.recipe_sha256
+        or envelope.get("policy_sha256")
+        != recipe.policy.policy_sha256
+        or envelope.get("candidate_id") != recipe.candidate_id
+        or envelope.get("accepted_input_artifact_id")
+        != recipe.inputs[0].artifact_id
+        or envelope.get("source_manifest_sha256")
+        != recipe.source_manifest_sha256
+        or envelope.get("image_reference") != recipe.image_reference
+        or envelope.get("oracle_binding")
+        != (
+            recipe.oracle_binding.to_dict()
+            if recipe.oracle_binding is not None
+            else None
+        )
+    ):
+        raise EvaluationInputError(
+            "Rev stdin proof envelope pins are inconsistent"
+        )
+
+    candidate = next(
+        (
+            item
+            for item in record.state.candidates
+            if item.id == recipe.candidate_id
+        ),
+        None,
+    )
+    accepted_artifact = next(
+        (
+            item
+            for item in record.state.artifacts
+            if item.id == envelope["accepted_input_artifact_id"]
+        ),
+        None,
+    )
+    evaluation_artifact = next(
+        (
+            item
+            for item in record.state.artifacts
+            if item.id == envelope["evaluation_artifact_id"]
+        ),
+        None,
+    )
+    if (
+        candidate is None
+        or accepted_artifact is None
+        or evaluation_artifact is None
+    ):
+        raise EvaluationInputError(
+            "Rev stdin proof artifact or candidate binding is absent"
+        )
+
+    accepted_input = _read_verified_reference(
+        record.root,
+        accepted_artifact,
+        maximum_bytes=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+        display_name="Rev accepted input artifact",
+    )
+    evaluation_payload = _read_verified_reference(
+        record.root,
+        evaluation_artifact,
+        maximum_bytes=REV_STDIN_PROOF_MAX_EVIDENCE_BYTES,
+        display_name="Rev proof evaluation artifact",
+    )
+    raw_evaluation = _strict_json_bytes(
+        evaluation_payload,
+        "Rev proof evaluation artifact",
+    )
+    try:
+        evaluation = verify_rev_proof_evaluation(
+            raw_evaluation,
+            accepted_input=accepted_input,
+        )
+    except (TypeError, ValueError) as error:
+        raise EvaluationInputError(
+            "Rev proof evaluation semantic replay failed"
+        ) from error
+    if (
+        raw_evaluation != envelope.get("evaluation")
+        or evaluation_payload != evaluation.canonical_bytes()
+        or envelope.get("evaluation_sha256")
+        != evaluation.evidence_sha256
+        or evaluation_artifact.sha256
+        != evaluation.evidence_sha256
+        or evaluation_artifact.extra
+        != {
+            "kind": "rev_proof_evaluation",
+            "experiment_id": getattr(experiment, "id", None),
+            "candidate_id": recipe.candidate_id,
+            "recipe_sha256": recipe.recipe_sha256,
+            "policy_sha256": recipe.policy.policy_sha256,
+            "protocol": REV_STDIN_PROOF_PROTOCOL,
+        }
+        or accepted_artifact.sha256 != recipe.inputs[0].sha256
+        or accepted_artifact.size != recipe.inputs[0].size
+        or evaluation.candidate != candidate.value
+        or evaluation.source_manifest_sha256
+        != recipe.source_manifest_sha256
+        or evaluation.accepted_input_sha256
+        != recipe.inputs[0].sha256
+        or evaluation.accepted_input_size_bytes
+        != recipe.inputs[0].size
+        or len(evaluation.plan) != 6
+        or len(evaluation.observations) != 6
+    ):
+        raise EvaluationInputError(
+            "Rev proof evaluation commitment is inconsistent"
+        )
+
+    proof_result = result["proof_result"]
+    expected_proof_result = {
+        "passed": evaluation.passed,
+        "candidate": evaluation.candidate,
+        "policy_mode": REV_STDIN_PROOF_PROTOCOL,
+        "successful_attempts": evaluation.positive_successes,
+        "required_attempts": 3,
+        "total_attempts": len(evaluation.observations),
+        "source_manifest_sha256": evaluation.source_manifest_sha256,
+        "failures": [
+            failure.token() for failure in evaluation.failures
+        ],
+        "run_ids": [
+            observation.run_id
+            for observation in evaluation.observations
+        ],
+    }
+    deadline_guard = envelope.get("deadline_guard")
+    completed_at = getattr(experiment, "evaluated_at", None)
+    if (
+        proof_result != expected_proof_result
+        or type(deadline_guard) is not dict
+        or set(deadline_guard) != _REV_PROOF_DEADLINE_GUARD_KEYS
+        or deadline_guard.get("contract")
+        != "ctfos_rev_proof_deadline_guard_v1"
+        or deadline_guard.get("commit_guard")
+        != "state_store_pre_replace_v1"
+        or deadline_guard.get("evaluated_at_utc") != completed_at
+        or type(completed_at) is not str
+        or not completed_at
+    ):
+        raise EvaluationInputError(
+            "Rev proof result or completion guard is inconsistent"
+        )
+    return _ProofObservation(
+        candidate_id=recipe.candidate_id,
+        passed=evaluation.passed,
+        successful_attempts=evaluation.positive_successes,
+        total_attempts=len(evaluation.observations),
+        completed_at=completed_at,
+    )
+
+
 def _proof_metrics(
     records: Sequence[_LoadedState],
     diagnostics: _Diagnostics,
@@ -1796,6 +1999,29 @@ def _proof_metrics(
                 diagnostics.add(
                     f"{record.state.identity.key}: Crypto metamorphic "
                     f"proof {candidate.id} ignored: {error}"
+                )
+                continue
+            observations.append((record, observation))
+        for experiment in record.state.experiments:
+            result = experiment.result
+            if (
+                type(result) is not dict
+                or "rev_proof_evidence" not in result
+            ):
+                continue
+            try:
+                observation = _parse_rev_stdin_result(
+                    record,
+                    experiment,
+                )
+            except (
+                EvaluationInputError,
+                OSError,
+            ) as error:
+                invalid += 1
+                diagnostics.add(
+                    f"{record.state.identity.key}: Rev stdin proof "
+                    f"{experiment.id} ignored: {error}"
                 )
                 continue
             observations.append((record, observation))

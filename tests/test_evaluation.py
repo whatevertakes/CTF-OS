@@ -44,6 +44,7 @@ from tests import (
     test_pwn_ip_control_lifecycle as pwn_ip_control_fixture,
 )
 from tests import test_crypto_engine as crypto_engine_fixture
+from tests import test_managed as managed_fixture
 
 
 def _later(timestamp: str, seconds: int) -> str:
@@ -871,6 +872,77 @@ class EvaluationTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "Crypto metamorphic proof" in diagnostic
+                for diagnostic in tampered.diagnostics
+            )
+        )
+
+    def test_rev_stdin_proof_enters_metrics_only_after_semantic_reread(
+        self,
+    ) -> None:
+        fixture = managed_fixture.ManagedV2Tests(
+            methodName=(
+                "test_rev_managed_stdin_proof_passes_six_clean_runs"
+            )
+        )
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        (
+            completed,
+            proof_experiment,
+            _candidate,
+            _sandbox,
+            _accepted_input,
+        ) = fixture.run_managed_rev_proof_fixture()
+
+        evaluated = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        )
+        reproduction = evaluated.metrics["clean_reproduction_rate"]
+        self.assertIn(reproduction.status, {"available", "partial"})
+        self.assertEqual(
+            reproduction.value["successful_attempts"],
+            3,
+        )
+        self.assertEqual(reproduction.value["total_attempts"], 6)
+        proof_pass = evaluated.metrics["proof_pass_rate"]
+        self.assertIn(proof_pass.status, {"available", "partial"})
+        self.assertEqual(proof_pass.value["passed_evaluations"], 1)
+        self.assertEqual(proof_pass.value["proof_evaluations"], 1)
+        self.assertEqual(proof_pass.value["rate"], 1.0)
+
+        envelope = proof_experiment.result["rev_proof_evidence"]
+        artifact = next(
+            item
+            for item in completed.artifacts
+            if item.id == envelope["evaluation_artifact_id"]
+        )
+        evaluation_path = (
+            StateStore(fixture.root).challenge_paths(
+                fixture.identity
+            ).root
+            / artifact.path
+        )
+        original = evaluation_path.read_bytes()
+        evaluation_path.chmod(0o600)
+        evaluation_path.write_bytes(original + b"\n")
+        evaluation_path.chmod(0o400)
+
+        tampered = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        )
+        self.assertEqual(
+            tampered.metrics["proof_pass_rate"].status,
+            "unavailable",
+        )
+        self.assertTrue(
+            any(
+                "Rev stdin proof" in diagnostic
                 for diagnostic in tampered.diagnostics
             )
         )
