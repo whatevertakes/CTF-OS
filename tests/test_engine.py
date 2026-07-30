@@ -9542,16 +9542,31 @@ class EngineTests(unittest.TestCase):
                 )
 
                 if stage == "post-evidence":
-                    patcher = _interrupt_on_source_line(
-                        ChallengeEngine.prove_candidate,
-                        "attempt = ProofAttempt(",
-                        interruption,
+                    # ProofAttempt construction is the semantic boundary after
+                    # the two evidence snapshots have been materialized.  Patch
+                    # that boundary directly instead of depending on an exact
+                    # assignment spelling in the implementation source.
+                    patcher = mock.patch(
+                        "ctf_os.engine.challenge.ProofAttempt",
+                        side_effect=interruption,
                     )
                 elif stage == "post-result":
-                    patcher = _interrupt_on_source_line(
-                        ChallengeEngine.prove_candidate,
-                        "attempt_run_reference = RunReference(",
-                        interruption,
+                    real_run_reference = RunReference
+
+                    def proof_run_reference_then_interrupt(
+                        *args,
+                        **kwargs,
+                    ):
+                        if kwargs.get("role") == "proof":
+                            raise interruption
+                        return real_run_reference(*args, **kwargs)
+
+                    # A proof RunReference is created only after the result
+                    # document has been durably written.  This keeps the
+                    # interruption stage exact without tracing a source line.
+                    patcher = mock.patch(
+                        "ctf_os.engine.challenge.RunReference",
+                        side_effect=proof_run_reference_then_interrupt,
                     )
                 elif stage.startswith("result-"):
                     real_write = engine.store.write_run_result
@@ -10968,12 +10983,6 @@ class EngineTests(unittest.TestCase):
                         "ctf_os.engine.challenge.ArtifactReference",
                         side_effect=artifact_then_interrupt,
                     )
-                elif stage == "duplicate-post-commit":
-                    patcher = _interrupt_on_source_line(
-                        ChallengeEngine.register_workspace_artifact,
-                        "if selected[0].id != artifact.id:",
-                        interruption,
-                    )
                 else:
                     real_update = engine.store.update
                     interrupted = False
@@ -10991,7 +11000,10 @@ class EngineTests(unittest.TestCase):
                             in getattr(mutator, "__qualname__", "")
                         ):
                             interrupted = True
-                            if stage == "commit-after":
+                            if stage in {
+                                "commit-after",
+                                "duplicate-post-commit",
+                            }:
                                 real_update(
                                     identity,
                                     mutator,
