@@ -12126,8 +12126,14 @@ class ChallengeEngine:
         _automated: bool = False,
         _pending_artifact_handoff: list[ArtifactReference] | None = None,
         _pending_tool_context: dict[str, Any] | None = None,
+        _record_stall: bool = True,
     ) -> ChallengeState:
-        """Execute already-registered local commands through the sandbox."""
+        """Execute already-registered local commands through the sandbox.
+
+        ``_record_stall`` is an internal orchestration boundary: callers may
+        defer the governor while a deterministic pre-model batch is still
+        incomplete.  Ordinary callers retain the historical eager behavior.
+        """
 
         if _pending_artifact_handoff is None:
             pending_artifact_handoff: list[ArtifactReference] = []
@@ -12142,6 +12148,7 @@ class ChallengeEngine:
                     _automated=_automated,
                     _pending_artifact_handoff=pending_artifact_handoff,
                     _pending_tool_context=pending_tool_context,
+                    _record_stall=_record_stall,
                 )
             except BaseException as execution_error:
                 if pending_tool_context:
@@ -12198,6 +12205,7 @@ class ChallengeEngine:
                             _pending_artifact_handoff
                         ),
                         _pending_tool_context=_pending_tool_context,
+                        _record_stall=_record_stall,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
@@ -13705,8 +13713,11 @@ class ChallengeEngine:
                     for detected in detected_flags[first_new_flag:]
                 ),
             )
-        return self._record_stall_if_needed(
-            self.store.load(identity)
+        completed = self.store.load(identity)
+        return (
+            self._record_stall_if_needed(completed)
+            if _record_stall
+            else completed
         )
 
     @staticmethod

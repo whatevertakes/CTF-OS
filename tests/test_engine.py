@@ -8152,6 +8152,62 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(len(holder["client"].specs), 3)
 
+    def test_registered_execution_can_defer_stall_without_changing_default(
+        self,
+    ) -> None:
+        holder: dict[str, FakeSandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state, policy
+            holder.setdefault("client", FakeSandbox(work))
+            return holder["client"]
+
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=sandbox_factory,
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+        engine.transition(self.identity, ChallengeStatus.TRIAGING)
+        engine.transition(self.identity, ChallengeStatus.ACTIVE)
+
+        for _number in range(3):
+            _state, experiment_id = engine.register_experiment(
+                self.identity,
+                command=("true",),
+                expected_observation="command exits",
+                keep_if="exit is zero",
+                drop_if="command fails",
+            )
+            state = engine.execute_registered_experiments(
+                self.identity,
+                experiment_ids=(experiment_id,),
+                _record_stall=False,
+            )
+            self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+
+        _state, experiment_id = engine.register_experiment(
+            self.identity,
+            command=("true",),
+            expected_observation="command exits",
+            keep_if="exit is zero",
+            drop_if="command fails",
+        )
+        state = engine.execute_registered_experiments(
+            self.identity,
+            experiment_ids=(experiment_id,),
+        )
+
+        self.assertEqual(state.status, ChallengeStatus.STALLED)
+        self.assertEqual(
+            state.metadata[GOVERNOR_METADATA_KEY]["signals"],
+            [StallSignal.REPEATED_COMMAND.value],
+        )
+        self.assertEqual(len(holder["client"].specs), 4)
+
     def test_clean_proof_gates_ready_and_human_submission_is_recorded(self) -> None:
         holder: dict[str, FakeSandbox] = {}
 

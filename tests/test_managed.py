@@ -3595,6 +3595,63 @@ class ManagedV2Tests(unittest.TestCase):
             )
         )
 
+    def test_initial_cartography_defers_stall_until_captain_runs(self):
+        executor = ProbeRoleExecutor()
+        engine = self.engine(executor)
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        observed_controls: list[tuple[bool, bool]] = []
+        observed_lock = threading.Lock()
+        original_execute = engine.execute_registered_experiments
+
+        def observe_execution(*args, **kwargs):
+            selected = tuple(kwargs.get("experiment_ids") or ())
+            if (
+                selected
+                and kwargs.get("_pending_artifact_handoff") is None
+            ):
+                current = engine.store.load(self.identity)
+                experiments = {
+                    item.id: item for item in current.experiments
+                }
+                with observed_lock:
+                    observed_controls.extend(
+                        (
+                            experiments[experiment_id].extra.get(
+                                "adapter_seed"
+                            )
+                            is True,
+                            kwargs.get("_record_stall", True),
+                        )
+                        for experiment_id in selected
+                    )
+            return original_execute(*args, **kwargs)
+
+        with mock.patch.object(
+            engine,
+            "execute_registered_experiments",
+            side_effect=observe_execution,
+        ):
+            state = orchestrator.run_cycle(self.identity)
+
+        self.assertIn(Role.CAPTAIN, executor.roles)
+        adapter_controls = {
+            record_stall
+            for adapter_seed, record_stall in observed_controls
+            if adapter_seed
+        }
+        model_controls = {
+            record_stall
+            for adapter_seed, record_stall in observed_controls
+            if not adapter_seed
+        }
+        self.assertEqual(adapter_controls, {False})
+        self.assertEqual(model_controls, {True})
+        self.assertNotEqual(state.status, ChallengeStatus.NEEDS_HUMAN)
+
     def test_managed_receipt_evidence_reaches_first_captain_safely(
         self,
     ):

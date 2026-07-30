@@ -1675,6 +1675,8 @@ class ManagedOrchestrator:
         self,
         identity: ChallengeIdentity,
         selected: Sequence[str],
+        *,
+        record_stall: bool = True,
     ) -> ChallengeState:
         """Run different role lanes concurrently while serializing each role."""
 
@@ -1735,6 +1737,7 @@ class ManagedOrchestrator:
                     experiment_ids=(experiment_id,),
                     _session_owned=True,
                     _automated=True,
+                    _record_stall=record_stall,
                 )
 
         if len(lanes) == 1:
@@ -2203,6 +2206,10 @@ class ManagedOrchestrator:
                 self._execute_selected_actions(
                     identity,
                     cartography_actions,
+                    # These bounded seeds form one pre-model evidence batch.
+                    # Let the Captain inspect the complete batch before any
+                    # governor decision can stop the managed session.
+                    record_stall=False,
                 )
                 self._rebase_created_run(
                     identity,
