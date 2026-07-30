@@ -94,6 +94,12 @@ from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_PROTOCOL,
     PwnCrashV1Verdict,
 )
+from ctf_os.contracts.pwn_runtime_snapshot_v1 import (
+    PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+    PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
+    PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL,
+    PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS,
+)
 from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceLimits, tool_profile
 from ctf_os.engine.context_archive import archive_context_pack
@@ -121,11 +127,29 @@ from ctf_os.engine.pwn_crash import (
     PWN_CRASH_PRODUCER_PATH,
     PWN_CRASH_SANDBOX_METHOD,
     PwnCrashCapabilityAttestation,
+    PwnCrashGateEvaluation,
     PwnCrashReceiptMetadata,
     PwnCrashRecipe,
     PwnCrashRecipeError,
     evaluate_pwn_crash_gate,
     normalize_pwn_crash_capability_attestation,
+)
+from ctf_os.engine.pwn_runtime_snapshot import (
+    PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
+    PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+    PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+    PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME,
+    PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256,
+    PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH,
+    PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+    PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+    PwnRuntimeSnapshotCapabilityAttestation,
+    PwnRuntimeSnapshotReceiptMetadata,
+    PwnRuntimeSnapshotRecipe,
+    PwnRuntimeSnapshotRecipeError,
+    evaluate_pwn_runtime_snapshot_gate,
+    normalize_pwn_runtime_snapshot_capability_attestation,
+    pwn_runtime_snapshot_child_experiment_id,
 )
 from ctf_os.engine.rev_proof import (
     REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT,
@@ -1219,6 +1243,21 @@ _PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES = (
     PWN_CRASH_V1_MAX_EVIDENCE_BYTES
     - (6 * PWN_CRASH_V1_MAX_DOCUMENT_BYTES)
 ) // 6
+_PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND = (
+    "ctfos-engine:pwn-runtime-snapshot-v1"
+)
+_PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR = "pwn_runtime_snapshot_v1"
+_PWN_RUNTIME_SNAPSHOT_RESULT_KEY = "pwn_runtime_snapshot_evidence"
+_PWN_RUNTIME_SNAPSHOT_STDERR_ARTIFACT_MAX_BYTES = 64 * 1024
+_PWN_RUNTIME_SNAPSHOT_EXPECTED_OBSERVATION = (
+    "capture exact registers and mappings at the confirmed crash signal"
+)
+_PWN_RUNTIME_SNAPSHOT_KEEP_CONDITION = (
+    "typed runtime snapshot result is CAPTURED"
+)
+_PWN_RUNTIME_SNAPSHOT_DROP_CONDITION = (
+    "typed runtime snapshot result is INCONCLUSIVE or ERROR"
+)
 
 
 def _pwn_crash_canonical_bytes(value: object) -> bytes:
@@ -9220,6 +9259,1057 @@ class ChallengeEngine:
                 f"{terminal_error}"
             )
 
+    def _pwn_runtime_snapshot_child_for_confirmed_crash(
+        self,
+        parent: Experiment,
+        recipe: PwnCrashRecipe,
+        payload: ArtifactReference,
+        *,
+        evaluation: Any,
+    ) -> Experiment:
+        """Mint the sole engine-owned diagnostic child after confirmation."""
+
+        semantic = evaluation.semantic_evaluation
+        counts = (
+            semantic.positive_signal_counts
+            if semantic is not None
+            else ()
+        )
+        maximum = max((count for _signal, count in counts), default=0)
+        signals = [
+            signal
+            for signal, count in counts
+            if count == maximum and count >= 2
+        ]
+        if (
+            evaluation.verdict is not PwnCrashV1Verdict.CONFIRMED
+            or len(signals) != 1
+            or payload.source_run_id != recipe.payload_source_run_id
+            or payload.size != recipe.payload_size_bytes
+        ):
+            raise EngineError(
+                "confirmed Pwn crash lacks one bound replay signal"
+            )
+        child_id = pwn_runtime_snapshot_child_experiment_id(parent.id)
+        snapshot_recipe = PwnRuntimeSnapshotRecipe(
+            configuration_epoch=recipe.configuration_epoch,
+            child_experiment_id=child_id,
+            parent_experiment_id=parent.id,
+            primary_elf_locator=recipe.primary_elf_locator,
+            source_manifest_sha256=recipe.source_manifest_sha256,
+            source_sha256=recipe.source_sha256,
+            source_size_bytes=recipe.source_size_bytes,
+            payload_artifact_id=payload.id,
+            payload_source_run_id=recipe.payload_source_run_id,
+            payload_artifact_locator=payload.path,
+            payload_sha256=recipe.payload_sha256,
+            payload_size_bytes=recipe.payload_size_bytes,
+            parent_crash_recipe_sha256=recipe.recipe_sha256,
+            parent_crash_evaluation_sha256=(
+                evaluation.evidence_sha256
+            ),
+            expected_signal_number=signals[0],
+            image_reference=recipe.image_reference,
+            image_digest=recipe.image_digest,
+            producer_file_sha256=(
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256
+            ),
+        )
+        snapshot_recipe.canonical_bytes()
+        return Experiment(
+            id=child_id,
+            hypothesis_ids=[],
+            command=_PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND,
+            expected_observation=(
+                _PWN_RUNTIME_SNAPSHOT_EXPECTED_OBSERVATION
+            ),
+            keep_if=_PWN_RUNTIME_SNAPSHOT_KEEP_CONDITION,
+            drop_if=_PWN_RUNTIME_SNAPSHOT_DROP_CONDITION,
+            timeout_seconds=max(
+                parent.timeout_seconds,
+                int(PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS) + 10,
+            ),
+            resource_class="standard",
+            kind=ExperimentKind.PROBE,
+            source_run_id=recipe.payload_source_run_id,
+            artifact_ids=[payload.id],
+            extra={
+                "managed_contract_version": 1,
+                "engine_executor": (
+                    _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                ),
+                "parent_experiment_id": parent.id,
+                "pwn_runtime_snapshot_recipe": snapshot_recipe.to_dict(),
+            },
+        )
+
+    def _pwn_runtime_snapshot_recipe_for_child(
+        self,
+        state: ChallengeState,
+        experiment: Experiment,
+        *,
+        required_status: ExperimentStatus,
+    ) -> tuple[
+        PwnRuntimeSnapshotRecipe,
+        ArtifactReference,
+        RunReference,
+    ]:
+        """Reconstruct an active diagnostic child from canonical parent proof."""
+
+        if (
+            state.schema_version < STATE_SCHEMA_VERSION
+            or str(get_adapter(state.category).name) != "pwn"
+            or experiment.status is not required_status
+            or experiment.kind is not ExperimentKind.PROBE
+            or experiment.command != _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+            or experiment.hypothesis_ids
+            or experiment.proof_recipe is not None
+            or experiment.extra.get("managed_contract_version") != 1
+            or experiment.extra.get("engine_executor")
+            != _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+            or set(experiment.extra)
+            != {
+                "managed_contract_version",
+                "engine_executor",
+                "parent_experiment_id",
+                "pwn_runtime_snapshot_recipe",
+            }
+        ):
+            raise EngineError(
+                "Pwn runtime snapshot child identity is not canonical"
+            )
+        try:
+            recipe = PwnRuntimeSnapshotRecipe.from_dict(
+                experiment.extra["pwn_runtime_snapshot_recipe"]
+            )
+        except (KeyError, PwnRuntimeSnapshotRecipeError) as error:
+            raise EngineError(
+                "Pwn runtime snapshot recipe is not canonical"
+            ) from error
+        parent = next(
+            (
+                item
+                for item in state.experiments
+                if item.id == recipe.parent_experiment_id
+            ),
+            None,
+        )
+        payload = next(
+            (
+                item
+                for item in state.artifacts
+                if item.id == recipe.payload_artifact_id
+            ),
+            None,
+        )
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id == recipe.payload_source_run_id
+            ),
+            None,
+        )
+        if (
+            parent is None
+            or parent.status is not ExperimentStatus.KEPT
+            or parent.extra.get("engine_executor")
+            != _PWN_CRASH_ENGINE_EXECUTOR
+            or experiment.extra.get("parent_experiment_id") != parent.id
+            or payload is None
+            or source_run is None
+            or source_run.status is not RunStatus.COMPLETED
+            or experiment.source_run_id != source_run.id
+            or experiment.artifact_ids != [payload.id]
+            or payload.source_run_id != source_run.id
+            or payload.path != recipe.payload_artifact_locator
+            or payload.sha256 != recipe.payload_sha256
+            or payload.size != recipe.payload_size_bytes
+        ):
+            raise EngineError(
+                "Pwn runtime snapshot child is not bound to its parent payload"
+            )
+        try:
+            parent_recipe = PwnCrashRecipe.from_dict(
+                parent.extra["pwn_crash_recipe"]
+            )
+            parent_evidence = parent.result["pwn_crash_evidence"]
+            parent_evaluation = PwnCrashGateEvaluation.from_dict(
+                parent_evidence["evaluation"]
+            )
+        except (
+            KeyError,
+            TypeError,
+            PwnCrashRecipeError,
+            ValueError,
+        ) as error:
+            raise EngineError(
+                "Pwn runtime snapshot parent evidence is not canonical"
+            ) from error
+        semantic = parent_evaluation.semantic_evaluation
+        if (
+            type(parent_evidence) is not dict
+            or parent_evidence.get("recipe_sha256")
+            != parent_recipe.recipe_sha256
+            or parent_evidence.get("evaluation_sha256")
+            != parent_evaluation.evidence_sha256
+            or parent_evaluation.verdict
+            is not PwnCrashV1Verdict.CONFIRMED
+            or semantic is None
+            or semantic.recipe_sha256 != parent_recipe.recipe_sha256
+            or semantic.source_manifest_sha256
+            != parent_recipe.source_manifest_sha256
+            or semantic.source_sha256 != parent_recipe.source_sha256
+            or semantic.source_size_bytes
+            != parent_recipe.source_size_bytes
+            or semantic.poc_sha256 != parent_recipe.payload_sha256
+            or semantic.poc_size_bytes
+            != parent_recipe.payload_size_bytes
+        ):
+            raise EngineError(
+                "Pwn runtime snapshot parent confirmation is inconsistent"
+            )
+        expected_child = (
+            self._pwn_runtime_snapshot_child_for_confirmed_crash(
+                parent,
+                parent_recipe,
+                payload,
+                evaluation=parent_evaluation,
+            )
+        )
+        expected_recipe = PwnRuntimeSnapshotRecipe.from_dict(
+            expected_child.extra["pwn_runtime_snapshot_recipe"]
+        )
+        if (
+            recipe != expected_recipe
+            or experiment.id != expected_child.id
+            or experiment.expected_observation
+            != expected_child.expected_observation
+            or experiment.keep_if != expected_child.keep_if
+            or experiment.drop_if != expected_child.drop_if
+            or experiment.timeout_seconds
+            != expected_child.timeout_seconds
+            or experiment.resource_class != expected_child.resource_class
+            or recipe.configuration_epoch != state.configuration_epoch
+            or self.config.runtime.image != recipe.image_reference
+            or self.config.runtime.image_digest != recipe.image_digest
+        ):
+            raise EngineError(
+                "Pwn runtime snapshot child recipe is stale or substituted"
+            )
+        source = next(
+            (
+                item
+                for item in state.source_inventory
+                if item.path == recipe.primary_elf_locator
+            ),
+            None,
+        )
+        if (
+            state.metadata.get("source_manifest_sha256")
+            != recipe.source_manifest_sha256
+            or source is None
+            or source.sha256 != recipe.source_sha256
+            or source.size != recipe.source_size_bytes
+        ):
+            raise EngineError(
+                "Pwn runtime snapshot immutable source binding is stale"
+            )
+        if (
+            experiment.result is not None
+            or experiment.evidence_fact_ids
+            or experiment.evidence_run_ids
+            or experiment.evidence_receipt_ids
+            or experiment.evaluation_reason is not None
+            or experiment.evaluated_at is not None
+        ):
+            raise EngineError(
+                "active Pwn runtime snapshot child retains terminal evidence"
+            )
+        return recipe, payload, source_run
+
+    def _probe_pwn_runtime_snapshot_capability(
+        self,
+        recipe: PwnRuntimeSnapshotRecipe,
+        *,
+        deadline_monotonic_seconds: float,
+    ) -> PwnRuntimeSnapshotCapabilityAttestation:
+        """Attest the exact pinned diagnostic producer."""
+
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Pwn runtime snapshot capability probe",
+        )
+        remaining = deadline_monotonic_seconds - time.monotonic()
+        if remaining <= 0:
+            raise _HardDeadlineExpired(
+                "challenge wall-clock budget expired before Pwn runtime "
+                "snapshot capability probe"
+            )
+        report = (
+            self._capability_probe(
+                recipe.image_digest,
+                timeout_seconds=min(30.0, remaining),
+            )
+            if self._capability_probe_accepts_timeout
+            else self._capability_probe(recipe.image_digest)
+        )
+        attestation = (
+            normalize_pwn_runtime_snapshot_capability_attestation(
+                dict(report),
+                image_digest=recipe.image_digest,
+                recipe_sha256=recipe.recipe_sha256,
+            )
+        )
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Pwn runtime snapshot capability probe",
+        )
+        return attestation
+
+    def _execute_pwn_runtime_snapshot(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        *,
+        automated: bool,
+        live_only: bool,
+    ) -> ChallengeState:
+        """Run one engine-owned clean replay for a confirmed Pwn crash."""
+
+        current = self.store.load(identity)
+        self._require_model_work_allowed(current, automated=automated)
+        experiment = next(
+            (
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if experiment is None:
+            raise EngineError(f"unknown experiment: {experiment_id}")
+        recipe, payload, source_run = (
+            self._pwn_runtime_snapshot_recipe_for_child(
+                current,
+                experiment,
+                required_status=ExperimentStatus.REGISTERED,
+            )
+        )
+
+        def mark_running(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            )
+            rebuilt, _payload, _source_run = (
+                self._pwn_runtime_snapshot_recipe_for_child(
+                    state,
+                    item,
+                    required_status=ExperimentStatus.REGISTERED,
+                )
+            )
+            if rebuilt != recipe:
+                raise EngineError(
+                    "Pwn runtime snapshot recipe changed before execution"
+                )
+            item.status = ExperimentStatus.RUNNING
+
+        running = self.store.update(
+            identity,
+            mark_running,
+            expected_revision=current.revision,
+        )
+        experiment = next(
+            item
+            for item in running.experiments
+            if item.id == experiment_id
+        )
+        workspace = self._workspace(running)
+        (
+            gate_deadline_monotonic,
+            _gate_deadline_epoch,
+        ) = self._budget_deadline_pair(
+            running,
+            experiment.timeout_seconds,
+        )
+        paths = self.store.challenge_paths(identity)
+        source_staging: tempfile.TemporaryDirectory[str] | None = None
+        input_staging: tempfile.TemporaryDirectory[str] | None = None
+        lease = None
+        pending_artifacts: list[ArtifactReference] = []
+        run_id: str | None = None
+        committed = False
+        started = time.monotonic()
+        flag_policy = resolve_flag_format(
+            running,
+            self.config.runtime.flag_patterns,
+        )
+        detected_snapshot_flags: list[DetectedFlag] = []
+
+        def receive_snapshot_flag(detected: DetectedFlag) -> None:
+            if (
+                run_id is None
+                or not candidate_value_is_valid(detected.value)
+            ):
+                return
+            self.store.record_candidate_intent(
+                identity,
+                value=detected.value,
+                source=detected.source,
+                source_run_id=run_id,
+                observed_at=detected.observed_at,
+                tier=flag_policy.tier_for(detected.value),
+                format_epoch=flag_policy.configuration_epoch,
+            )
+            detected_snapshot_flags.append(detected)
+            self._on_tool_flag(identity, detected)
+
+        snapshot_flag_detector = FlagDetector(
+            flag_policy.patterns,
+            callback=receive_snapshot_flag,
+        )
+        try:
+            (
+                source_staging,
+                challenge_root,
+                _source_snapshot,
+            ) = self._prepare_pwn_crash_source_snapshot(
+                running,
+                recipe,  # type: ignore[arg-type]
+            )
+            input_staging = tempfile.TemporaryDirectory(
+                prefix=".pwn-runtime-snapshot-input-",
+                dir=workspace,
+            )
+            input_root = Path(input_staging.name)
+            payload_snapshot = copy_bounded_regular(
+                paths.root,
+                payload.path,
+                input_root / "payload.bin",
+                maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
+                expected_sha256=recipe.payload_sha256,
+                expected_size=recipe.payload_size_bytes,
+                mode=0o400,
+            )
+            proof_input = ProofInput(
+                source_locator=payload_snapshot.path.relative_to(
+                    workspace
+                ).as_posix(),
+                destination_locator=(
+                    PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                ),
+                sha256=recipe.payload_sha256,
+                size_bytes=recipe.payload_size_bytes,
+            )
+            capability_attestation = (
+                self._probe_pwn_runtime_snapshot_capability(
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        gate_deadline_monotonic
+                    ),
+                )
+            )
+            evidence_root = ensure_private_directory(
+                paths.artifacts
+                / "snapshots"
+                / f"pwn-runtime-snapshot-{recipe.recipe_sha256}"
+            )
+            capability_path = (
+                evidence_root / "capability-attestation.json"
+            )
+            atomic_write_bytes(
+                capability_path,
+                capability_attestation.canonical_bytes(),
+                mode=0o400,
+            )
+            capability_artifact = ArtifactReference(
+                id=_record_id(
+                    "A",
+                    experiment_id,
+                    "pwn-runtime-snapshot-capability",
+                ),
+                path=capability_path.relative_to(paths.root).as_posix(),
+                sha256=capability_attestation.evidence_sha256,
+                source_run_id=None,
+                media_type="application/json",
+                size=len(capability_attestation.canonical_bytes()),
+                extra={
+                    "kind": (
+                        "pwn_runtime_snapshot_capability_attestation"
+                    ),
+                    "engine_executor": (
+                        _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                    ),
+                    "recipe_sha256": recipe.recipe_sha256,
+                },
+            )
+            pending_artifacts.append(capability_artifact)
+            request = tool_profile(
+                experiment.resource_class,
+                needs_kvm=False,
+                network=False,
+            )
+            if request.network != 0:
+                raise EngineError(
+                    "Pwn runtime snapshot must deny network"
+                )
+            latest = self.store.load(identity)
+            (
+                command_timeout,
+                command_deadline,
+            ) = self._budget_command_limits(
+                latest,
+                experiment.timeout_seconds,
+            )
+            lease = self.lease_broker.acquire(
+                request,
+                timeout=min(
+                    self._budget_wait_timeout(
+                        latest,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    max(
+                        0.0,
+                        gate_deadline_monotonic - time.monotonic(),
+                    ),
+                ),
+                owner=f"{identity.key}:{experiment_id}:snapshot",
+            )
+            if lease is None:
+                raise EngineError(
+                    "Pwn runtime snapshot resource lease unavailable"
+                )
+            command_deadline = min(
+                command_deadline,
+                gate_deadline_monotonic,
+            )
+            command_remaining = command_deadline - time.monotonic()
+            if command_remaining < 1:
+                raise _HardDeadlineExpired(
+                    "Pwn runtime snapshot has less than one second to run"
+                )
+            command_timeout = min(
+                command_timeout,
+                max(1, int(command_remaining)),
+            )
+            argv = recipe.argv()
+            execution_contract = {
+                "schema_version": 1,
+                "engine_executor": (
+                    _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                ),
+                "protocol": PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL,
+                "recipe_sha256": recipe.recipe_sha256,
+                "configuration_epoch": recipe.configuration_epoch,
+                "parent_experiment_id": (
+                    recipe.parent_experiment_id
+                ),
+                "child_experiment_id": (
+                    recipe.child_experiment_id
+                ),
+                "source": {
+                    "locator": recipe.primary_elf_locator,
+                    "manifest_sha256": (
+                        recipe.source_manifest_sha256
+                    ),
+                    "sha256": recipe.source_sha256,
+                    "size_bytes": recipe.source_size_bytes,
+                },
+                "payload": {
+                    "artifact_id": recipe.payload_artifact_id,
+                    "source_run_id": recipe.payload_source_run_id,
+                    "sha256": recipe.payload_sha256,
+                    "size_bytes": recipe.payload_size_bytes,
+                    "destination_locator": (
+                        PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                    ),
+                },
+                "argv": list(argv),
+                "sandbox": {
+                    "method": PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                    "one_shot": PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                    "outer_timeout_seconds": command_timeout,
+                    "resource_request": request.as_dict(),
+                    "image": {
+                        "reference": recipe.image_reference,
+                        "digest": recipe.image_digest,
+                    },
+                    "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                    "network_target": None,
+                },
+                "producer": {
+                    "interpreter_path": (
+                        PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH
+                    ),
+                    "path": PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+                    "capability_name": (
+                        PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                    ),
+                    "file_sha256": recipe.producer_file_sha256,
+                    "capability_attestation_artifact_id": (
+                        capability_artifact.id
+                    ),
+                    "capability_attestation_sha256": (
+                        capability_artifact.sha256
+                    ),
+                },
+            }
+            execution_contract_sha256 = hashlib.sha256(
+                _pwn_crash_canonical_bytes(execution_contract)
+            ).hexdigest()
+            run_id = _run_id(f"pwn-runtime-snapshot-{experiment.id}")
+            run_paths = self.store.create_run(
+                identity,
+                run_id=run_id,
+                request={
+                    "kind": "pwn_runtime_snapshot",
+                    "experiment_id": experiment.id,
+                    "execution_contract": execution_contract,
+                    "execution_contract_sha256": (
+                        execution_contract_sha256
+                    ),
+                },
+                base_revision=latest.revision,
+            )
+            issued_request = read_json(run_paths.request)
+            if type(issued_request) is not dict:
+                raise EngineError(
+                    "Pwn runtime snapshot request is not canonical"
+                )
+            request_sha256 = sha256_file(run_paths.request)
+            client = self.sandbox(
+                latest,
+                workspace_override=workspace,
+                challenge_dir_override=challenge_root,
+                network_policy_override=NetworkPolicy.deny_all(),
+            )
+            result = client.run_clean_proof(
+                CommandSpec.create(
+                    argv,
+                    timeout_seconds=command_timeout,
+                    deadline_monotonic_seconds=command_deadline,
+                    environment={},
+                    network_target=None,
+                    resource_request=request,
+                ),
+                proof_inputs=(proof_input,),
+            )
+            elapsed = time.monotonic() - started
+            artifact_records: dict[str, ArtifactReference] = {}
+            stream_payloads: dict[str, bytes] = {}
+            snapshot_failed: dict[str, bool] = {}
+            for stream, maximum_bytes in (
+                (
+                    "stdout",
+                    PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+                ),
+                (
+                    "stderr",
+                    _PWN_RUNTIME_SNAPSHOT_STDERR_ARTIFACT_MAX_BYTES,
+                ),
+            ):
+                artifact_id = _record_id("A", run_id, stream)
+                destination = evidence_root / f"{run_id}-{stream}.log"
+                snapshot = None
+                try:
+                    snapshot = self._snapshot_pwn_crash_stream(
+                        latest,
+                        client,
+                        workspace=workspace,
+                        locator=getattr(
+                            result,
+                            f"{stream}_path",
+                        ).removeprefix("/work/").lstrip("/"),
+                        destination=destination,
+                        maximum_bytes=maximum_bytes,
+                    )
+                except (EngineError, SandboxError, OSError, ValueError):
+                    snapshot = None
+                if snapshot is None:
+                    atomic_write_bytes(destination, b"", mode=0o400)
+                    stream_payload = b""
+                    stream_sha256 = hashlib.sha256(b"").hexdigest()
+                    stream_size = 0
+                    snapshot_failed[stream] = True
+                else:
+                    stream_payload = snapshot.path.read_bytes()
+                    stream_sha256 = snapshot.sha256
+                    stream_size = snapshot.size_bytes
+                    snapshot_failed[stream] = False
+                artifact = ArtifactReference(
+                    id=artifact_id,
+                    path=destination.relative_to(paths.root).as_posix(),
+                    sha256=stream_sha256,
+                    source_run_id=run_id,
+                    media_type=(
+                        "application/json"
+                        if stream == "stdout"
+                        else "text/plain"
+                    ),
+                    size=stream_size,
+                    extra={
+                        "stream": stream,
+                        "engine_executor": (
+                            _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                        ),
+                        "recipe_sha256": recipe.recipe_sha256,
+                        "capture_placeholder": (
+                            snapshot_failed[stream]
+                        ),
+                    },
+                )
+                pending_artifacts.append(artifact)
+                artifact_records[stream] = artifact
+                stream_payloads[stream] = stream_payload
+            snapshot_flag_detector.feed(
+                stream_payloads["stderr"][
+                    : self.config.runtime.flag_scan_max_bytes
+                ].decode("utf-8", errors="replace"),
+                source=f"tool:{run_id}:stderr",
+            )
+            timed_out = result.timed_out
+            outcome = (
+                "timed_out"
+                if timed_out
+                else "succeeded"
+                if (
+                    result.exit_code == 0
+                    and result.orchestration_error is None
+                )
+                else "failed"
+            )
+            stdout_artifact = artifact_records["stdout"]
+            stderr_artifact = artifact_records["stderr"]
+            receipt_id = _record_id("RCPT", run_id, "result")
+            stdout_stored = (
+                result.stdout_stored_bytes
+                if result.stdout_stored_bytes is not None
+                else stdout_artifact.size or 0
+            )
+            receipt_metadata = PwnRuntimeSnapshotReceiptMetadata(
+                receipt_id=receipt_id,
+                run_id=run_id,
+                outcome=outcome,
+                exit_code=result.exit_code,
+                timed_out=timed_out,
+                clean_workspace=True,
+                one_shot=PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                sandbox_method=PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                network=PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                configuration_epoch=recipe.configuration_epoch,
+                image_digest=recipe.image_digest,
+                recipe_sha256=recipe.recipe_sha256,
+                request_sha256=request_sha256,
+                execution_contract_sha256=(
+                    execution_contract_sha256
+                ),
+                capability_attestation_artifact_id=(
+                    capability_artifact.id
+                ),
+                capability_attestation_sha256=(
+                    capability_artifact.sha256
+                ),
+                producer_capability_name=(
+                    PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                ),
+                producer_file_sha256=recipe.producer_file_sha256,
+                stdout_artifact_id=stdout_artifact.id,
+                stdout_artifact_sha256=stdout_artifact.sha256,
+                stdout_artifact_size_bytes=stdout_artifact.size,
+                stderr_artifact_id=stderr_artifact.id,
+                stderr_artifact_sha256=stderr_artifact.sha256,
+                stderr_artifact_size_bytes=stderr_artifact.size,
+                stderr_capture_placeholder=(
+                    snapshot_failed["stderr"]
+                ),
+                stdout_drained_bytes=result.stdout_bytes,
+                stdout_stored_bytes=stdout_stored,
+                stdout_capture_complete=(
+                    result.stdout_capture_complete
+                    and not snapshot_failed["stdout"]
+                ),
+                stdout_truncation_known=(
+                    result.stdout_truncation_known
+                ),
+                stdout_truncated=result.stdout_truncated,
+                stdout_error=(
+                    "stdout_capture_error"
+                    if result.stdout_error is not None
+                    else None
+                ),
+                stream_capture_error=(
+                    "stream_capture_error"
+                    if result.stream_capture_error is not None
+                    or snapshot_failed["stdout"]
+                    else None
+                ),
+                orchestration_error=(
+                    "orchestration_error"
+                    if result.orchestration_error is not None
+                    else None
+                ),
+                durable_stdout_artifact_complete=(
+                    not snapshot_failed["stdout"]
+                    and stdout_artifact.size == result.stdout_bytes
+                    and stdout_artifact.size == stdout_stored
+                ),
+            )
+            evaluation = evaluate_pwn_runtime_snapshot_gate(
+                recipe,
+                stdout_payload=stream_payloads["stdout"],
+                receipt=receipt_metadata,
+            )
+            evaluation.canonical_bytes()
+            self._require_before_hard_deadline(
+                gate_deadline_monotonic,
+                "Pwn runtime snapshot semantic evaluation",
+            )
+            evaluated_at = utc_now()
+            snapshot_record = {
+                "recipe_sha256": recipe.recipe_sha256,
+                "request_sha256": request_sha256,
+                "execution_contract": copy.deepcopy(
+                    execution_contract
+                ),
+                "execution_contract_sha256": (
+                    execution_contract_sha256
+                ),
+                "receipt": receipt_metadata.to_dict(),
+            }
+            run_reference = RunReference(
+                id=run_id,
+                base_revision=int(issued_request["base_revision"]),
+                status=(
+                    RunStatus.TIMED_OUT
+                    if timed_out
+                    else RunStatus.COMPLETED
+                    if outcome == "succeeded"
+                    else RunStatus.FAILED
+                ),
+                request_path=run_paths.request.relative_to(
+                    paths.root
+                ).as_posix(),
+                result_path=run_paths.result.relative_to(
+                    paths.root
+                ).as_posix(),
+                validation_path=run_paths.validation.relative_to(
+                    paths.root
+                ).as_posix(),
+                role="pwn_runtime_snapshot",
+                origin=RunOrigin.MANAGED_TOOL,
+                session_id=source_run.session_id,
+                cycle_id=source_run.cycle_id,
+                wave_id=source_run.wave_id,
+                configuration_epoch=recipe.configuration_epoch,
+                extra={
+                    "experiment_id": experiment.id,
+                    "pwn_runtime_snapshot": copy.deepcopy(
+                        snapshot_record
+                    ),
+                },
+            )
+            execution_receipt = ExecutionReceipt(
+                id=receipt_id,
+                experiment_id=experiment.id,
+                run_id=run_id,
+                outcome=(
+                    ReceiptOutcome.TIMED_OUT
+                    if timed_out
+                    else ReceiptOutcome.SUCCEEDED
+                    if outcome == "succeeded"
+                    else ReceiptOutcome.FAILED
+                ),
+                exit_code=result.exit_code,
+                wall_seconds=elapsed,
+                stdout_artifact_id=stdout_artifact.id,
+                stderr_artifact_id=stderr_artifact.id,
+                stdout_bytes=result.stdout_bytes,
+                stderr_bytes=result.stderr_bytes,
+                stdout_lines=0,
+                stderr_lines=0,
+                preview=(
+                    "Pwn runtime snapshot "
+                    f"{evaluation.status.value}:"
+                    f"{evaluation.reason_code}"
+                )[:160],
+                extra={
+                    "pwn_runtime_snapshot": copy.deepcopy(
+                        snapshot_record
+                    )
+                },
+            )
+            result_payload = {
+                _PWN_RUNTIME_SNAPSHOT_RESULT_KEY: {
+                    "schema_version": 1,
+                    "protocol": PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL,
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "evaluated_at": evaluated_at,
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.evidence_sha256,
+                    "run_id": run_id,
+                    "receipt_id": receipt_id,
+                    "capability_attestation_artifact_id": (
+                        capability_artifact.id
+                    ),
+                    "stdout_artifact_id": stdout_artifact.id,
+                    "stderr_artifact_id": stderr_artifact.id,
+                }
+            }
+            self.store.write_run_result(
+                identity,
+                None,
+                None,
+                run_id,
+                {
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "duration_ms": result.duration_ms,
+                    "pwn_runtime_snapshot": copy.deepcopy(
+                        snapshot_record
+                    ),
+                    "artifacts": [
+                        stdout_artifact.to_dict(),
+                        stderr_artifact.to_dict(),
+                    ],
+                },
+            )
+            self.store.write_run_validation(
+                identity,
+                run_id,
+                {
+                    "ok": evaluation.transport_error is None,
+                    "pwn_runtime_snapshot": copy.deepcopy(
+                        snapshot_record
+                    ),
+                    "errors": (
+                        []
+                        if evaluation.transport_error is None
+                        else [evaluation.transport_error.code]
+                    ),
+                },
+            )
+
+            def finish(state: ChallengeState) -> None:
+                self._require_before_hard_deadline(
+                    gate_deadline_monotonic,
+                    "Pwn runtime snapshot canonical state reduction",
+                )
+                self._require_model_work_allowed(
+                    state,
+                    automated=automated,
+                )
+                if live_only:
+                    self._require_live_mutation_allowed(state)
+                item = next(
+                    value
+                    for value in state.experiments
+                    if value.id == experiment_id
+                )
+                rebuilt, _payload, _source_run = (
+                    self._pwn_runtime_snapshot_recipe_for_child(
+                        state,
+                        item,
+                        required_status=ExperimentStatus.RUNNING,
+                    )
+                )
+                if rebuilt != recipe:
+                    raise EngineError(
+                        "Pwn runtime snapshot recipe changed before commit"
+                    )
+                item.status = ExperimentStatus.COMPLETED
+                item.result = copy.deepcopy(result_payload)
+                item.evidence_run_ids = [run_id]
+                item.evidence_receipt_ids = [receipt_id]
+                item.artifact_ids = [
+                    recipe.payload_artifact_id,
+                    stdout_artifact.id,
+                    stderr_artifact.id,
+                ]
+                state.runs.append(run_reference)
+                state.receipts.append(execution_receipt)
+                state.artifacts.extend(
+                    [
+                        capability_artifact,
+                        stdout_artifact,
+                        stderr_artifact,
+                    ]
+                )
+                existing_candidate_values = {
+                    candidate.value for candidate in state.candidates
+                }
+                for index, detected in enumerate(
+                    detected_snapshot_flags,
+                    start=1,
+                ):
+                    if detected.value in existing_candidate_values:
+                        continue
+                    state.candidates.append(
+                        FlagCandidate(
+                            id=_record_id(
+                                "C",
+                                run_id,
+                                f"pwn-runtime-snapshot-{index}",
+                            ),
+                            value=detected.value,
+                            status=(
+                                CandidateStatus.OBSERVED_CANDIDATE
+                            ),
+                            source_run_id=run_id,
+                            locator=detected.source,
+                            created_at=detected.observed_at,
+                            tier=flag_policy.tier_for(detected.value),
+                            format_epoch=(
+                                flag_policy.configuration_epoch
+                            ),
+                        )
+                    )
+                    existing_candidate_values.add(detected.value)
+                state.budget.spent_seconds += max(
+                    0,
+                    int(time.monotonic() - started),
+                )
+
+            committed_state = self.store.update(identity, finish)
+            committed = True
+            try:
+                self.store.clear_candidate_intents(
+                    identity,
+                    tuple(
+                        detected.value
+                        for detected in detected_snapshot_flags
+                    ),
+                )
+            except Exception as cleanup_error:
+                print(
+                    "warning: Pwn runtime snapshot candidate intent "
+                    f"cleanup failed after canonical commit: {cleanup_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return committed_state
+        finally:
+            if lease is not None and not lease.released:
+                lease.release()
+            if input_staging is not None:
+                input_staging.cleanup()
+            if source_staging is not None:
+                source_staging.cleanup()
+            if not committed:
+                self._cleanup_uncommitted_artifacts(
+                    identity,
+                    pending_artifacts,
+                )
+                if run_id is not None:
+                    self._cleanup_uncommitted_pwn_crash_runs(
+                        identity,
+                        (run_id,),
+                    )
+
     def _execute_pwn_crash_differential(
         self,
         identity: ChallengeIdentity,
@@ -10057,6 +11147,16 @@ class ChallengeEngine:
                     ],
                 }
             }
+            snapshot_child = (
+                self._pwn_runtime_snapshot_child_for_confirmed_crash(
+                    experiment,
+                    recipe,
+                    payload,
+                    evaluation=evaluation,
+                )
+                if verdict is PwnCrashV1Verdict.CONFIRMED
+                else None
+            )
             guarded_states: list[ChallengeState] = []
 
             def finish(state: ChallengeState) -> None:
@@ -10182,6 +11282,16 @@ class ChallengeEngine:
                                 *stdout_artifact_ids,
                             ]
                         )
+                    )
+                    if snapshot_child is None or any(
+                        value.id == snapshot_child.id
+                        for value in state.experiments
+                    ):
+                        raise EngineError(
+                            "Pwn runtime snapshot child identity collided"
+                        )
+                    state.experiments.append(
+                        copy.deepcopy(snapshot_child)
                     )
                 elapsed = max(0, int(time.monotonic() - started_gate))
                 state.budget.spent_seconds += elapsed
@@ -10458,6 +11568,10 @@ class ChallengeEngine:
                     experiment.command == _PWN_CRASH_ENGINE_COMMAND
                     or experiment.extra.get("engine_executor")
                     == _PWN_CRASH_ENGINE_EXECUTOR
+                    or experiment.command
+                    == _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
                 )
                 and (
                     not selected_ids
@@ -10529,6 +11643,51 @@ class ChallengeEngine:
             )
             self._remaining_budget_seconds(latest_before_start)
             first_new_flag = len(detected_flags)
+            if (
+                experiment.command
+                == _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+                or experiment.extra.get("engine_executor")
+                == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+            ):
+                try:
+                    state = self._execute_pwn_runtime_snapshot(
+                        identity,
+                        experiment.id,
+                        automated=_automated,
+                        live_only=_live_only,
+                    )
+                except Exception as error:
+                    latest_after_error = self.store.load(
+                        identity,
+                        recover=False,
+                    )
+                    current_item = next(
+                        item
+                        for item in latest_after_error.experiments
+                        if item.id == experiment.id
+                    )
+                    if current_item.status in {
+                        ExperimentStatus.REGISTERED,
+                        ExperimentStatus.RUNNING,
+                    }:
+                        state = self._finish_tool_failure(
+                            identity,
+                            experiment.id,
+                            (
+                                "Pwn runtime snapshot failed closed: "
+                                f"{error}"
+                            ),
+                            _live_only=_live_only,
+                        )
+                    else:
+                        state = latest_after_error
+                        print(
+                            "warning: Pwn runtime snapshot raised after "
+                            f"terminal commit: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                continue
             if (
                 experiment.command == _PWN_CRASH_ENGINE_COMMAND
                 or experiment.extra.get("engine_executor")
@@ -17090,6 +18249,25 @@ class ChallengeEngine:
                     experiment.extra["orphan_recovered_at"] = recovered_at
                     experiment.extra["orphan_recovery"] = (
                         "retryable_without_canonical_outcome"
+                    )
+                    continue
+                if (
+                    experiment.command
+                    == _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                ):
+                    experiment.status = ExperimentStatus.FAILED
+                    experiment.result = {
+                        "error": (
+                            "Pwn runtime snapshot failed closed: orphaned "
+                            "execution recovered after the previous "
+                            "session owner exited"
+                        )
+                    }
+                    experiment.extra["orphan_recovered_at"] = recovered_at
+                    experiment.extra["orphan_recovery"] = (
+                        "failed_closed_without_canonical_evidence"
                     )
                     continue
                 if (

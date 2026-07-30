@@ -55,6 +55,7 @@ required=(
   ctf-os-image/templates/rev/safe_output.py
   ctf-os-image/templates/rev/stdin_exec.py
   ctf-os-image/tests/fixtures/pwn-crash-oracle.c
+  ctf-os-image/tests/fixtures/pwn-runtime-snapshot.c
   ctf-os-image/tests/fixtures/rev-stdin-oracle.c
   ctf-os-image/tests/test-capability-contract.py
   ctf-os-image/tests/test-pwn-crash-oracle.py
@@ -62,6 +63,7 @@ required=(
   ctf-os-image/tests/test-rev-inventory.py
   ctf-os-image/tests/test-rev-stdin-exec.py
   scripts/check-pwn-docker-crash.py
+  scripts/check-pwn-docker-snapshot.py
   scripts/check-rev-docker-proof.py
 )
 for path in "${required[@]}"; do
@@ -94,6 +96,7 @@ fi
 "${python_bin}" ctf-os-image/tests/test-rev-inventory.py
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-crash.py
+"${python_bin}" -m py_compile scripts/check-pwn-docker-snapshot.py
 "${python_bin}" -m py_compile scripts/check-rev-docker-proof.py
 
 for script in ctf-os-image/scripts/* ctf-os-image/tests/*.sh; do

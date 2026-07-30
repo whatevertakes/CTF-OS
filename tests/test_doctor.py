@@ -29,6 +29,7 @@ def capability_manifest(
         }
         if name not in missing and name in {
             "pwn_crash_v1",
+            "pwn_runtime_snapshot_v1",
             "rev_inventory_v2",
             "rev_safe_output",
             "rev_stdin_exec",

@@ -30,6 +30,10 @@ from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_MAX_SOURCE_BYTES,
     PWN_CRASH_V1_PROTOCOL,
 )
+from ctf_os.contracts.pwn_runtime_snapshot_v1 import (
+    PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL,
+    PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS,
+)
 from ctf_os.contracts.rev_inventory_v1 import (
     REV_INVENTORY_V1_CONTRACT_FINGERPRINT,
     REV_INVENTORY_V1_CONTRACT_ID,
@@ -6189,6 +6193,1045 @@ def _pwn_crash_state_errors(
     return errors
 
 
+_PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND = (
+    "ctfos-engine:pwn-runtime-snapshot-v1"
+)
+_PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR = "pwn_runtime_snapshot_v1"
+_PWN_RUNTIME_SNAPSHOT_RESULT_KEY = "pwn_runtime_snapshot_evidence"
+_PWN_RUNTIME_SNAPSHOT_EXPECTED_OBSERVATION = (
+    "capture exact registers and mappings at the confirmed crash signal"
+)
+_PWN_RUNTIME_SNAPSHOT_KEEP_CONDITION = (
+    "typed runtime snapshot result is CAPTURED"
+)
+_PWN_RUNTIME_SNAPSHOT_DROP_CONDITION = (
+    "typed runtime snapshot result is INCONCLUSIVE or ERROR"
+)
+_PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS = frozenset(
+    {
+        "managed_contract_version",
+        "engine_executor",
+        "parent_experiment_id",
+        "pwn_runtime_snapshot_recipe",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_RECOVERY_EXTRA_KEYS = frozenset(
+    {"orphan_recovered_at", "orphan_recovery"}
+)
+_PWN_RUNTIME_SNAPSHOT_RESULT_KEYS = frozenset(
+    {
+        "schema_version",
+        "protocol",
+        "recipe_sha256",
+        "evaluated_at",
+        "evaluation",
+        "evaluation_sha256",
+        "run_id",
+        "receipt_id",
+        "capability_attestation_artifact_id",
+        "stdout_artifact_id",
+        "stderr_artifact_id",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_RECORD_KEYS = frozenset(
+    {
+        "recipe_sha256",
+        "request_sha256",
+        "execution_contract",
+        "execution_contract_sha256",
+        "receipt",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_KEYS = frozenset(
+    {
+        "schema_version",
+        "engine_executor",
+        "protocol",
+        "recipe_sha256",
+        "configuration_epoch",
+        "parent_experiment_id",
+        "child_experiment_id",
+        "source",
+        "payload",
+        "argv",
+        "sandbox",
+        "producer",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_SOURCE_KEYS = frozenset(
+    {"locator", "manifest_sha256", "sha256", "size_bytes"}
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_PAYLOAD_KEYS = frozenset(
+    {
+        "artifact_id",
+        "source_run_id",
+        "sha256",
+        "size_bytes",
+        "destination_locator",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_SANDBOX_KEYS = frozenset(
+    {
+        "method",
+        "one_shot",
+        "outer_timeout_seconds",
+        "resource_request",
+        "image",
+        "network",
+        "network_target",
+    }
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_IMAGE_KEYS = frozenset(
+    {"reference", "digest"}
+)
+_PWN_RUNTIME_SNAPSHOT_EXECUTION_PRODUCER_KEYS = frozenset(
+    {
+        "interpreter_path",
+        "path",
+        "capability_name",
+        "file_sha256",
+        "capability_attestation_artifact_id",
+        "capability_attestation_sha256",
+    }
+)
+
+
+def _pwn_runtime_snapshot_experiment_marker(
+    experiment: Experiment,
+) -> bool:
+    result = experiment.result
+    return (
+        experiment.command == _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+        or experiment.extra.get("engine_executor")
+        == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+        or "pwn_runtime_snapshot_recipe" in experiment.extra
+        or (
+            isinstance(result, Mapping)
+            and _PWN_RUNTIME_SNAPSHOT_RESULT_KEY in result
+        )
+    )
+
+
+def _pwn_runtime_snapshot_run_marker(run: RunReference) -> bool:
+    return (
+        run.role == "pwn_runtime_snapshot"
+        or "pwn_runtime_snapshot" in run.extra
+    )
+
+
+def _pwn_runtime_snapshot_artifact_marker(
+    artifact: ArtifactReference,
+) -> bool:
+    return (
+        artifact.extra.get("engine_executor")
+        == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+        or artifact.extra.get("kind")
+        == "pwn_runtime_snapshot_capability_attestation"
+    )
+
+
+def _pwn_runtime_snapshot_recipe_binding(
+    state: "ChallengeState",
+    child: Experiment,
+    *,
+    experiments: Mapping[str, Experiment],
+    runs: Mapping[str, RunReference],
+    artifacts: Mapping[str, ArtifactReference],
+) -> tuple[Any | None, Experiment | None, ArtifactReference | None, list[str]]:
+    """Bind one diagnostic recipe to an unchanged confirmed crash graph."""
+
+    label = f"Pwn runtime snapshot experiment {child.id}"
+    errors: list[str] = []
+    if type(child.extra) is not dict:
+        return None, None, None, [
+            f"{label} has missing or unknown engine-owned fields"
+        ]
+    extra_keys = set(child.extra)
+    has_recovery = (
+        extra_keys
+        == (
+            _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
+            | _PWN_RUNTIME_SNAPSHOT_RECOVERY_EXTRA_KEYS
+        )
+    )
+    if (
+        not (
+            extra_keys
+            == _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
+            or has_recovery
+        )
+        or (
+            has_recovery
+            and (
+                child.status is not ExperimentStatus.FAILED
+                or type(child.result) is not dict
+                or set(child.result) != {"error"}
+                or type(child.result.get("error")) is not str
+                or not child.result["error"].startswith(
+                    "Pwn runtime snapshot failed closed: orphaned "
+                )
+                or not _proof_binding_utc_timestamp(
+                    child.extra.get("orphan_recovered_at")
+                )
+                or child.extra.get("orphan_recovery")
+                != "failed_closed_without_canonical_evidence"
+            )
+        )
+    ):
+        return None, None, None, [
+            f"{label} has missing or unknown engine-owned fields"
+        ]
+    raw_recipe = child.extra.get("pwn_runtime_snapshot_recipe")
+    try:
+        from ctf_os.engine.pwn_crash import (
+            PwnCrashGateEvaluation,
+            PwnCrashRecipe,
+        )
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256,
+            PwnRuntimeSnapshotRecipe,
+            pwn_runtime_snapshot_child_experiment_id,
+        )
+
+        if type(raw_recipe) is not dict:
+            raise ValueError("recipe is not an exact object")
+        recipe = PwnRuntimeSnapshotRecipe.from_dict(raw_recipe)
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        return None, None, None, [
+            f"{label} recipe is invalid: {error}"
+        ]
+
+    parent_id = child.extra.get("parent_experiment_id")
+    parent = (
+        experiments.get(parent_id)
+        if isinstance(parent_id, str)
+        else None
+    )
+    if (
+        state.schema_version < STATE_SCHEMA_VERSION
+        or state.category.strip().casefold() != "pwn"
+        or child.id
+        != pwn_runtime_snapshot_child_experiment_id(
+            recipe.parent_experiment_id
+        )
+        or parent_id != recipe.parent_experiment_id
+        or child.extra.get("managed_contract_version") != 1
+        or child.extra.get("engine_executor")
+        != _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+        or child.kind is not ExperimentKind.PROBE
+        or child.command != _PWN_RUNTIME_SNAPSHOT_ENGINE_COMMAND
+        or child.hypothesis_ids
+        or child.proof_recipe is not None
+        or child.expected_observation
+        != _PWN_RUNTIME_SNAPSHOT_EXPECTED_OBSERVATION
+        or child.keep_if != _PWN_RUNTIME_SNAPSHOT_KEEP_CONDITION
+        or child.drop_if != _PWN_RUNTIME_SNAPSHOT_DROP_CONDITION
+        or child.resource_class != "standard"
+        or child.evaluation_reason is not None
+        or child.evaluated_at is not None
+        or recipe.producer_file_sha256
+        != PWN_RUNTIME_SNAPSHOT_PRODUCER_FILE_SHA256
+        or recipe.configuration_epoch != state.configuration_epoch
+    ):
+        errors.append(f"{label} lacks its exact diagnostic identity")
+
+    if (
+        parent is None
+        or not _pwn_crash_experiment_marker(parent)
+        or parent.status is not ExperimentStatus.KEPT
+    ):
+        errors.append(
+            f"{label} does not bind one confirmed Pwn crash parent"
+        )
+        return recipe, parent, None, errors
+
+    expected_timeout = max(
+        parent.timeout_seconds,
+        int(PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS) + 10,
+    )
+    if child.timeout_seconds != expected_timeout:
+        errors.append(f"{label} timeout is not engine-derived")
+
+    parent_recipe = None
+    parent_evaluation = None
+    parent_evidence = (
+        parent.result.get(_PWN_CRASH_RESULT_KEY)
+        if type(parent.result) is dict
+        and set(parent.result) == {_PWN_CRASH_RESULT_KEY}
+        else None
+    )
+    try:
+        raw_parent_recipe = parent.extra.get("pwn_crash_recipe")
+        if type(raw_parent_recipe) is not dict:
+            raise ValueError("parent recipe is absent")
+        parent_recipe = PwnCrashRecipe.from_dict(raw_parent_recipe)
+        if (
+            type(parent_evidence) is not dict
+            or set(parent_evidence) != _PWN_CRASH_EVIDENCE_KEYS
+            or type(parent_evidence.get("evaluation")) is not dict
+        ):
+            raise ValueError("parent evidence is not canonical")
+        parent_evaluation = PwnCrashGateEvaluation.from_dict(
+            parent_evidence["evaluation"]
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        errors.append(f"{label} parent evidence is invalid: {error}")
+
+    payload = artifacts.get(recipe.payload_artifact_id)
+    source_run = runs.get(recipe.payload_source_run_id)
+    manifest = state.metadata.get("source_manifest_sha256")
+    primary_locator = state.metadata.get("adapter_primary_source")
+    matching_sources = [
+        source
+        for source in state.source_inventory
+        if source.path == primary_locator
+    ]
+    if (
+        payload is None
+        or source_run is None
+        or source_run.status is not RunStatus.COMPLETED
+        or source_run.origin is not RunOrigin.MANAGED_MODEL
+        or source_run.role != "builder"
+        or source_run.configuration_epoch != recipe.configuration_epoch
+        or source_run.extra.get("semantic_merge") is not True
+        or payload.source_run_id != source_run.id
+        or payload.path != recipe.payload_artifact_locator
+        or payload.sha256 != recipe.payload_sha256
+        or payload.size != recipe.payload_size_bytes
+        or child.source_run_id != source_run.id
+    ):
+        errors.append(f"{label} payload/Builder binding changed")
+    if (
+        not _proof_binding_sha256(manifest)
+        or not isinstance(primary_locator, str)
+        or len(matching_sources) != 1
+        or matching_sources[0].kind != "file"
+        or matching_sources[0].sha256 != recipe.source_sha256
+        or matching_sources[0].size != recipe.source_size_bytes
+        or recipe.primary_elf_locator != primary_locator
+        or recipe.source_manifest_sha256 != manifest
+    ):
+        errors.append(f"{label} immutable source binding changed")
+
+    if parent_recipe is not None and (
+        recipe.configuration_epoch != parent_recipe.configuration_epoch
+        or recipe.primary_elf_locator
+        != parent_recipe.primary_elf_locator
+        or recipe.source_manifest_sha256
+        != parent_recipe.source_manifest_sha256
+        or recipe.source_sha256 != parent_recipe.source_sha256
+        or recipe.source_size_bytes != parent_recipe.source_size_bytes
+        or recipe.payload_artifact_id
+        != parent_recipe.payload_artifact_id
+        or recipe.payload_source_run_id
+        != parent_recipe.payload_source_run_id
+        or recipe.payload_artifact_locator
+        != parent_recipe.payload_artifact_locator
+        or recipe.payload_sha256 != parent_recipe.payload_sha256
+        or recipe.payload_size_bytes
+        != parent_recipe.payload_size_bytes
+        or recipe.parent_crash_recipe_sha256
+        != parent_recipe.recipe_sha256
+        or recipe.image_reference != parent_recipe.image_reference
+        or recipe.image_digest != parent_recipe.image_digest
+    ):
+        errors.append(f"{label} parent recipe binding changed")
+
+    if parent_evaluation is not None:
+        semantic = parent_evaluation.semantic_evaluation
+        counts = (
+            semantic.positive_signal_counts
+            if semantic is not None
+            else ()
+        )
+        maximum = max((count for _signal, count in counts), default=0)
+        expected_signals = [
+            signal
+            for signal, count in counts
+            if count == maximum and count >= 2
+        ]
+        if (
+            parent_evaluation.verdict.value != "CONFIRMED"
+            or len(expected_signals) != 1
+            or recipe.expected_signal_number != expected_signals[0]
+            or recipe.parent_crash_evaluation_sha256
+            != parent_evaluation.evidence_sha256
+            or parent_evidence is None
+            or parent_evidence.get("evaluation_sha256")
+            != parent_evaluation.evidence_sha256
+        ):
+            errors.append(f"{label} parent gate binding changed")
+    return recipe, parent, payload, errors
+
+
+def _pwn_runtime_snapshot_canonical_sha256(
+    value: object,
+) -> str | None:
+    try:
+        encoded = (
+            json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (RecursionError, TypeError, UnicodeError, ValueError):
+        return None
+    if len(encoded) > 256 * 1024:
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pwn_runtime_snapshot_execution_contract_errors(
+    value: object,
+    *,
+    supplied_sha256: object,
+    child: Experiment,
+    recipe: Any,
+    capability: ArtifactReference,
+) -> list[str]:
+    """Reconstruct the fixed clean, networkless one-shot invocation."""
+
+    label = f"Pwn runtime snapshot experiment {child.id}"
+    if (
+        type(value) is not dict
+        or set(value) != _PWN_RUNTIME_SNAPSHOT_EXECUTION_KEYS
+    ):
+        return [f"{label} execution contract is not exact"]
+    source = value.get("source")
+    payload = value.get("payload")
+    sandbox = value.get("sandbox")
+    producer = value.get("producer")
+    image = (
+        sandbox.get("image")
+        if type(sandbox) is dict
+        else None
+    )
+    if (
+        type(source) is not dict
+        or set(source)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_SOURCE_KEYS
+        or type(payload) is not dict
+        or set(payload)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_PAYLOAD_KEYS
+        or type(sandbox) is not dict
+        or set(sandbox)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_SANDBOX_KEYS
+        or type(image) is not dict
+        or set(image) != _PWN_RUNTIME_SNAPSHOT_EXECUTION_IMAGE_KEYS
+        or type(producer) is not dict
+        or set(producer)
+        != _PWN_RUNTIME_SNAPSHOT_EXECUTION_PRODUCER_KEYS
+    ):
+        return [f"{label} execution contract nested schema is not exact"]
+    computed_sha256 = _pwn_runtime_snapshot_canonical_sha256(value)
+    if (
+        computed_sha256 is None
+        or not _proof_binding_sha256(supplied_sha256)
+        or supplied_sha256 != computed_sha256
+    ):
+        return [f"{label} execution contract hash does not match"]
+    try:
+        from ctf_os.director.resources import tool_profile
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
+            PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+            PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+            PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+        )
+
+        expected_resource = tool_profile(
+            child.resource_class,
+            needs_kvm=False,
+            network=False,
+        ).as_dict()
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        return [f"{label} execution policy cannot be rebuilt: {error}"]
+    outer_timeout = sandbox.get("outer_timeout_seconds")
+    expected = {
+        "schema_version": 1,
+        "engine_executor": _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR,
+        "protocol": PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL,
+        "recipe_sha256": recipe.recipe_sha256,
+        "configuration_epoch": recipe.configuration_epoch,
+        "parent_experiment_id": recipe.parent_experiment_id,
+        "child_experiment_id": recipe.child_experiment_id,
+        "source": {
+            "locator": recipe.primary_elf_locator,
+            "manifest_sha256": recipe.source_manifest_sha256,
+            "sha256": recipe.source_sha256,
+            "size_bytes": recipe.source_size_bytes,
+        },
+        "payload": {
+            "artifact_id": recipe.payload_artifact_id,
+            "source_run_id": recipe.payload_source_run_id,
+            "sha256": recipe.payload_sha256,
+            "size_bytes": recipe.payload_size_bytes,
+            "destination_locator": (
+                PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+            ),
+        },
+        "argv": list(recipe.argv()),
+        "sandbox": {
+            "method": PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+            "one_shot": PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+            "outer_timeout_seconds": outer_timeout,
+            "resource_request": expected_resource,
+            "image": {
+                "reference": recipe.image_reference,
+                "digest": recipe.image_digest,
+            },
+            "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+            "network_target": None,
+        },
+        "producer": {
+            "interpreter_path": (
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH
+            ),
+            "path": PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+            "capability_name": (
+                PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+            ),
+            "file_sha256": recipe.producer_file_sha256,
+            "capability_attestation_artifact_id": capability.id,
+            "capability_attestation_sha256": capability.sha256,
+        },
+    }
+    if (
+        type(outer_timeout) is not int
+        or not 1 <= outer_timeout <= child.timeout_seconds
+        or value != expected
+    ):
+        return [f"{label} execution policy binding changed"]
+    return []
+
+
+def _pwn_runtime_snapshot_terminal_errors(
+    child: Experiment,
+    *,
+    recipe: Any,
+    payload: ArtifactReference,
+    linked_runs: list[RunReference],
+    linked_receipts: list[ExecutionReceipt],
+    linked_artifacts: list[ArtifactReference],
+    source_run: RunReference,
+) -> tuple[list[str], set[str]]:
+    """Validate the one-run diagnostic graph and return its artifact ids."""
+
+    label = f"Pwn runtime snapshot experiment {child.id}"
+    errors: list[str] = []
+    result = child.result
+    evidence = (
+        result.get(_PWN_RUNTIME_SNAPSHOT_RESULT_KEY)
+        if type(result) is dict
+        and set(result) == {_PWN_RUNTIME_SNAPSHOT_RESULT_KEY}
+        else None
+    )
+    if (
+        type(evidence) is not dict
+        or set(evidence) != _PWN_RUNTIME_SNAPSHOT_RESULT_KEYS
+    ):
+        return [f"{label} result envelope is not exact"], set()
+    if len(linked_runs) != 1 or len(linked_receipts) != 1:
+        return [
+            f"{label} must own exactly one run and receipt"
+        ], set()
+    run = linked_runs[0]
+    receipt = linked_receipts[0]
+    stdout_id = evidence.get("stdout_artifact_id")
+    stderr_id = evidence.get("stderr_artifact_id")
+    capability_id = evidence.get(
+        "capability_attestation_artifact_id"
+    )
+    artifact_map = {artifact.id: artifact for artifact in linked_artifacts}
+    stdout = (
+        artifact_map.get(stdout_id)
+        if isinstance(stdout_id, str)
+        else None
+    )
+    stderr = (
+        artifact_map.get(stderr_id)
+        if isinstance(stderr_id, str)
+        else None
+    )
+    capability = (
+        artifact_map.get(capability_id)
+        if isinstance(capability_id, str)
+        else None
+    )
+    expected_ids = {
+        value
+        for value in (stdout_id, stderr_id, capability_id)
+        if isinstance(value, str)
+    }
+    if (
+        stdout is None
+        or stderr is None
+        or capability is None
+        or len(expected_ids) != 3
+        or {artifact.id for artifact in linked_artifacts}
+        != expected_ids
+    ):
+        return [
+            f"{label} does not own exact stdout/stderr/capability artifacts"
+        ], expected_ids
+
+    try:
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+            PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+            PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME,
+            PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+            PwnRuntimeSnapshotCapabilityAttestation,
+            PwnRuntimeSnapshotGateEvaluation,
+            PwnRuntimeSnapshotReceiptMetadata,
+        )
+
+        raw_evaluation = evidence.get("evaluation")
+        if type(raw_evaluation) is not dict:
+            raise ValueError("evaluation is not an exact object")
+        evaluation = PwnRuntimeSnapshotGateEvaluation.from_dict(
+            raw_evaluation,
+            recipe=recipe,
+        )
+        raw_run_record = run.extra.get("pwn_runtime_snapshot")
+        raw_receipt_record = receipt.extra.get(
+            "pwn_runtime_snapshot"
+        )
+        if (
+            type(raw_run_record) is not dict
+            or set(raw_run_record) != _PWN_RUNTIME_SNAPSHOT_RECORD_KEYS
+            or raw_receipt_record != raw_run_record
+        ):
+            raise ValueError("run/receipt record is not exact")
+        metadata = PwnRuntimeSnapshotReceiptMetadata.from_dict(
+            raw_run_record["receipt"]
+        )
+        expected_capability = PwnRuntimeSnapshotCapabilityAttestation(
+            image_digest=recipe.image_digest,
+            recipe_sha256=recipe.recipe_sha256,
+        )
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        return [f"{label} terminal contract is invalid: {error}"], expected_ids
+
+    evaluated_at = evidence.get("evaluated_at")
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("protocol") != PWN_RUNTIME_SNAPSHOT_V1_PROTOCOL
+        or evidence.get("recipe_sha256") != recipe.recipe_sha256
+        or not _proof_binding_utc_timestamp(evaluated_at)
+        or evidence.get("evaluation_sha256")
+        != evaluation.evidence_sha256
+        or evidence.get("run_id") != run.id
+        or evidence.get("receipt_id") != receipt.id
+        or child.status is not ExperimentStatus.COMPLETED
+        or child.result is not result
+        or child.artifact_ids
+        != [payload.id, stdout.id, stderr.id]
+        or child.evidence_run_ids != [run.id]
+        or child.evidence_receipt_ids != [receipt.id]
+        or child.evidence_fact_ids
+        or child.evaluation_reason is not None
+        or child.evaluated_at is not None
+    ):
+        errors.append(f"{label} result/evidence lists are inconsistent")
+
+    run_record = run.extra.get("pwn_runtime_snapshot")
+    assert isinstance(run_record, dict)
+    errors.extend(
+        _pwn_runtime_snapshot_execution_contract_errors(
+            run_record.get("execution_contract"),
+            supplied_sha256=run_record.get(
+                "execution_contract_sha256"
+            ),
+            child=child,
+            recipe=recipe,
+            capability=capability,
+        )
+    )
+    expected_run_extra = {
+        "experiment_id": child.id,
+        "pwn_runtime_snapshot": run_record,
+    }
+    if (
+        run.extra != expected_run_extra
+        or run.role != "pwn_runtime_snapshot"
+        or run.origin is not RunOrigin.MANAGED_TOOL
+        or run.configuration_epoch != recipe.configuration_epoch
+        or run.session_id != source_run.session_id
+        or run.cycle_id != source_run.cycle_id
+        or run.wave_id != source_run.wave_id
+        or not _pwn_crash_safe_locator(run.request_path)
+        or not _pwn_crash_safe_locator(run.result_path)
+        or not _pwn_crash_safe_locator(run.validation_path)
+        or run.model is not None
+        or run.context_hash is not None
+        or run.status
+        is not {
+            "succeeded": RunStatus.COMPLETED,
+            "failed": RunStatus.FAILED,
+            "timed_out": RunStatus.TIMED_OUT,
+        }.get(metadata.outcome)
+    ):
+        errors.append(f"{label} run identity/provenance is inconsistent")
+
+    expected_outcome = {
+        "succeeded": ReceiptOutcome.SUCCEEDED,
+        "failed": ReceiptOutcome.FAILED,
+        "timed_out": ReceiptOutcome.TIMED_OUT,
+    }.get(metadata.outcome)
+    if (
+        receipt.extra != {"pwn_runtime_snapshot": run_record}
+        or receipt.id != metadata.receipt_id
+        or receipt.run_id != metadata.run_id
+        or receipt.experiment_id != child.id
+        or receipt.outcome is not expected_outcome
+        or receipt.exit_code != metadata.exit_code
+        or receipt.stdout_artifact_id != stdout.id
+        or receipt.stderr_artifact_id != stderr.id
+        or receipt.stdout_bytes != metadata.stdout_drained_bytes
+        or receipt.stderr_bytes != stderr.size
+        or receipt.stdout_lines != 0
+        or receipt.stderr_lines != 0
+        or receipt.preview
+        != (
+            "Pwn runtime snapshot "
+            f"{evaluation.status.value}:{evaluation.reason_code}"
+        )[:160]
+        or metadata.timed_out
+        is not (metadata.outcome == "timed_out")
+        or metadata.recipe_sha256 != recipe.recipe_sha256
+        or metadata.request_sha256 != run_record.get("request_sha256")
+        or metadata.execution_contract_sha256
+        != run_record.get("execution_contract_sha256")
+        or metadata.configuration_epoch != recipe.configuration_epoch
+        or metadata.image_digest != recipe.image_digest
+        or metadata.clean_workspace is not True
+        or metadata.one_shot is not PWN_RUNTIME_SNAPSHOT_ONE_SHOT
+        or metadata.sandbox_method != PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD
+        or metadata.network != PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY
+        or metadata.producer_capability_name
+        != PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+        or metadata.producer_file_sha256
+        != recipe.producer_file_sha256
+        or metadata.capability_attestation_artifact_id != capability.id
+        or metadata.capability_attestation_sha256 != capability.sha256
+        or metadata.stdout_artifact_id != stdout.id
+        or metadata.stdout_artifact_sha256 != stdout.sha256
+        or metadata.stdout_artifact_size_bytes != stdout.size
+        or metadata.stderr_artifact_id != stderr.id
+        or metadata.stderr_artifact_sha256 != stderr.sha256
+        or metadata.stderr_artifact_size_bytes != stderr.size
+        or metadata.stderr_capture_placeholder
+        is not stderr.extra.get("capture_placeholder")
+    ):
+        errors.append(f"{label} receipt binding is inconsistent")
+
+    if (
+        capability.source_run_id is not None
+        or capability.sha256 != expected_capability.evidence_sha256
+        or capability.size != len(expected_capability.canonical_bytes())
+        or capability.media_type != "application/json"
+        or capability.extra
+        != {
+            "kind": "pwn_runtime_snapshot_capability_attestation",
+            "engine_executor": _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR,
+            "recipe_sha256": recipe.recipe_sha256,
+        }
+        or capability.id in child.artifact_ids
+    ):
+        errors.append(f"{label} capability artifact is invalid")
+    expected_root = (
+        "artifacts/snapshots/"
+        f"pwn-runtime-snapshot-{recipe.recipe_sha256}"
+    )
+    if capability.path != f"{expected_root}/capability-attestation.json":
+        errors.append(f"{label} capability artifact path is invalid")
+    for stream, artifact in (("stdout", stdout), ("stderr", stderr)):
+        placeholder = artifact.extra.get("capture_placeholder")
+        if (
+            artifact.source_run_id != run.id
+            or not _proof_binding_sha256(artifact.sha256)
+            or type(artifact.size) is not int
+            or artifact.size < 0
+            or type(placeholder) is not bool
+            or artifact.extra
+            != {
+                "stream": stream,
+                "engine_executor": (
+                    _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                ),
+                "recipe_sha256": recipe.recipe_sha256,
+                "capture_placeholder": placeholder,
+            }
+            or (placeholder and artifact.size != 0)
+            or (
+                placeholder
+                and artifact.sha256
+                != hashlib.sha256(b"").hexdigest()
+            )
+            or artifact.path
+            != f"{expected_root}/{run.id}-{stream}.log"
+            or artifact.media_type
+            != (
+                "application/json"
+                if stream == "stdout"
+                else "text/plain"
+            )
+        ):
+            errors.append(
+                f"{label} {stream} artifact binding is inconsistent"
+            )
+    if (
+        stdout.extra.get("capture_placeholder") is True
+        and (
+            metadata.durable_stdout_artifact_complete
+            or metadata.stdout_capture_complete
+            or metadata.stream_capture_error is None
+        )
+    ):
+        errors.append(
+            f"{label} stdout placeholder metadata is inconsistent"
+        )
+    semantic_result = evaluation.semantic_result
+    if semantic_result is not None:
+        semantic_bytes = semantic_result.canonical_bytes()
+        if (
+            metadata.outcome != "succeeded"
+            or metadata.exit_code != 0
+            or metadata.timed_out
+            or metadata.orchestration_error is not None
+            or not metadata.stdout_capture_complete
+            or not metadata.stdout_truncation_known
+            or metadata.stdout_truncated is not False
+            or metadata.stdout_error is not None
+            or metadata.stream_capture_error is not None
+            or not metadata.durable_stdout_artifact_complete
+            or stdout.extra.get("capture_placeholder") is not False
+            or stdout.sha256
+            != hashlib.sha256(semantic_bytes).hexdigest()
+            or stdout.size != len(semantic_bytes)
+            or metadata.stdout_drained_bytes != len(semantic_bytes)
+            or metadata.stdout_stored_bytes != len(semantic_bytes)
+        ):
+            errors.append(
+                f"{label} semantic gate/stdout binding is inconsistent"
+            )
+    return errors, expected_ids
+
+
+def _pwn_runtime_snapshot_state_errors(
+    state: "ChallengeState",
+    *,
+    experiments: Mapping[str, Experiment],
+    runs: Mapping[str, RunReference],
+    receipts: Mapping[str, ExecutionReceipt],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+    hypotheses: Mapping[str, Hypothesis],
+) -> list[str]:
+    """Validate diagnostic child identity and its isolated lifecycle."""
+
+    errors: list[str] = []
+    children = {
+        experiment.id: experiment
+        for experiment in state.experiments
+        if _pwn_runtime_snapshot_experiment_marker(experiment)
+    }
+    children_by_parent: dict[str, list[str]] = {}
+    claimed_artifact_ids: set[str] = set()
+
+    for child in children.values():
+        label = f"Pwn runtime snapshot experiment {child.id}"
+        recipe, parent, payload, binding_errors = (
+            _pwn_runtime_snapshot_recipe_binding(
+                state,
+                child,
+                experiments=experiments,
+                runs=runs,
+                artifacts=artifacts,
+            )
+        )
+        errors.extend(binding_errors)
+        if recipe is None or parent is None or payload is None:
+            continue
+        children_by_parent.setdefault(parent.id, []).append(child.id)
+
+        linked_runs = [
+            run
+            for run in state.runs
+            if run.extra.get("experiment_id") == child.id
+            or _pwn_runtime_snapshot_run_marker(run)
+            and run.extra.get("experiment_id") == child.id
+        ]
+        linked_receipts = [
+            receipt
+            for receipt in state.receipts
+            if receipt.experiment_id == child.id
+        ]
+        linked_artifacts = [
+            artifact
+            for artifact in state.artifacts
+            if (
+                artifact.source_run_id
+                in {run.id for run in linked_runs}
+                or (
+                    _pwn_runtime_snapshot_artifact_marker(artifact)
+                    and artifact.extra.get("recipe_sha256")
+                    == recipe.recipe_sha256
+                )
+            )
+        ]
+        if child.status in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            if (
+                child.result is not None
+                or child.artifact_ids != [payload.id]
+                or child.evidence_fact_ids
+                or child.evidence_run_ids
+                or child.evidence_receipt_ids
+                or linked_runs
+                or linked_receipts
+                or linked_artifacts
+            ):
+                errors.append(
+                    f"{label} active lifecycle/evidence is inconsistent"
+                )
+            continue
+        if child.status is ExperimentStatus.FAILED:
+            reason = (
+                child.result.get("error")
+                if type(child.result) is dict
+                and set(child.result) == {"error"}
+                else None
+            )
+            if (
+                type(reason) is not str
+                or not reason
+                or not reason.startswith(
+                    "Pwn runtime snapshot failed closed: "
+                )
+                or len(reason.encode("utf-8")) > 4096
+                or child.artifact_ids != [payload.id]
+                or child.evidence_fact_ids
+                or child.evidence_run_ids
+                or child.evidence_receipt_ids
+                or linked_runs
+                or linked_receipts
+                or linked_artifacts
+            ):
+                errors.append(
+                    f"{label} failed-closed lifecycle is inconsistent"
+                )
+            continue
+        if child.status is not ExperimentStatus.COMPLETED:
+            errors.append(
+                f"{label} has a non-canonical terminal status"
+            )
+            continue
+        source_run = runs.get(recipe.payload_source_run_id)
+        if source_run is None:
+            errors.append(f"{label} has no bound Builder run")
+            continue
+        terminal_errors, terminal_artifact_ids = (
+            _pwn_runtime_snapshot_terminal_errors(
+                child,
+                recipe=recipe,
+                payload=payload,
+                linked_runs=linked_runs,
+                linked_receipts=linked_receipts,
+                linked_artifacts=linked_artifacts,
+                source_run=source_run,
+            )
+        )
+        errors.extend(terminal_errors)
+        claimed_artifact_ids.update(terminal_artifact_ids)
+
+    for parent_id, child_ids in children_by_parent.items():
+        if len(child_ids) != 1:
+            errors.append(
+                f"Confirmed Pwn crash {parent_id} has duplicate runtime "
+                "snapshot children"
+            )
+
+    for run in state.runs:
+        if (
+            _pwn_runtime_snapshot_run_marker(run)
+            and run.extra.get("experiment_id") not in children
+        ):
+            errors.append(
+                f"Pwn runtime snapshot run {run.id} has no typed child"
+            )
+    for receipt in state.receipts:
+        if (
+            "pwn_runtime_snapshot" in receipt.extra
+            and receipt.experiment_id not in children
+        ):
+            errors.append(
+                f"Pwn runtime snapshot receipt {receipt.id} has no typed child"
+            )
+    snapshot_run_ids = {
+        run.id
+        for run in state.runs
+        if _pwn_runtime_snapshot_run_marker(run)
+    }
+    snapshot_artifact_ids = {
+        artifact.id
+        for artifact in state.artifacts
+        if _pwn_runtime_snapshot_artifact_marker(artifact)
+    }
+    for artifact in state.artifacts:
+        if (
+            _pwn_runtime_snapshot_artifact_marker(artifact)
+            and (
+                artifact.id not in claimed_artifact_ids
+                or (
+                    artifact.source_run_id is not None
+                    and artifact.source_run_id not in snapshot_run_ids
+                )
+            )
+        ):
+            errors.append(
+                f"Pwn runtime snapshot artifact {artifact.id} is orphaned"
+            )
+    for fact in facts.values():
+        if (
+            fact.source_run_id in snapshot_run_ids
+            or fact.artifact_id in snapshot_artifact_ids
+            or "pwn_runtime_snapshot" in fact.extra
+        ):
+            errors.append(
+                f"Pwn runtime snapshot cannot promote Fact {fact.id}"
+            )
+    for hypothesis in hypotheses.values():
+        if (
+            not set(hypothesis.evidence_run_ids).isdisjoint(
+                snapshot_run_ids
+            )
+            or not set(hypothesis.evidence_artifact_ids).isdisjoint(
+                snapshot_artifact_ids
+            )
+            or any(
+                receipt_id in receipts
+                and receipts[receipt_id].experiment_id in children
+                for receipt_id in hypothesis.evidence_receipt_ids
+            )
+        ):
+            errors.append(
+                f"Pwn runtime snapshot cannot promote Hypothesis "
+                f"{hypothesis.id}"
+            )
+    return errors
+
+
 _REV_PROOF_ENVELOPE_KEYS = frozenset(
     {
         "schema_version",
@@ -9091,6 +10134,17 @@ class ChallengeState:
             errors.extend(
                 _pwn_crash_state_errors(
                     self,
+                    runs=runs,
+                    receipts=receipts,
+                    artifacts=artifacts,
+                    facts=facts,
+                    hypotheses=hypotheses,
+                )
+            )
+            errors.extend(
+                _pwn_runtime_snapshot_state_errors(
+                    self,
+                    experiments=experiments,
                     runs=runs,
                     receipts=receipts,
                     artifacts=artifacts,

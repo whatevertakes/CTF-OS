@@ -216,6 +216,10 @@ _RECEIPT_KEYS = frozenset(
         "stdout_artifact_id",
         "stdout_artifact_sha256",
         "stdout_artifact_size_bytes",
+        "stderr_artifact_id",
+        "stderr_artifact_sha256",
+        "stderr_artifact_size_bytes",
+        "stderr_capture_placeholder",
         "stdout_drained_bytes",
         "stdout_stored_bytes",
         "stdout_capture_complete",
@@ -835,6 +839,10 @@ class PwnRuntimeSnapshotReceiptMetadata:
     stdout_artifact_id: str | None
     stdout_artifact_sha256: str | None
     stdout_artifact_size_bytes: int | None
+    stderr_artifact_id: str
+    stderr_artifact_sha256: str
+    stderr_artifact_size_bytes: int
+    stderr_capture_placeholder: bool
     stdout_drained_bytes: int
     stdout_stored_bytes: int
     stdout_capture_complete: bool
@@ -859,6 +867,7 @@ class PwnRuntimeSnapshotReceiptMetadata:
             "timed_out",
             "clean_workspace",
             "one_shot",
+            "stderr_capture_placeholder",
             "stdout_capture_complete",
             "stdout_truncation_known",
             "durable_stdout_artifact_complete",
@@ -900,6 +909,21 @@ class PwnRuntimeSnapshotReceiptMetadata:
             _receipt_sha(
                 self.stdout_artifact_sha256,
                 "stdout_artifact_sha256",
+            )
+        _receipt_identifier(
+            self.stderr_artifact_id,
+            "stderr_artifact_id",
+        )
+        _receipt_sha(
+            self.stderr_artifact_sha256,
+            "stderr_artifact_sha256",
+        )
+        if (
+            type(self.stderr_artifact_size_bytes) is not int
+            or self.stderr_artifact_size_bytes < 0
+        ):
+            raise ValueError(
+                "invalid receipt stderr_artifact_size_bytes"
             )
         for name in (
             "stdout_artifact_size_bytes",

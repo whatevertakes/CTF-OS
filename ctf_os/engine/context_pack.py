@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,123 @@ def _receipt_context_record(receipt: Any) -> str:
         line_count_basis=receipt.extra.get("line_count_basis"),
         streams=_compact_receipt_streams(receipt),
     )
+
+
+def _pwn_runtime_snapshot_context_records(
+    state: ChallengeState,
+) -> tuple[str, ...]:
+    """Project diagnostic registers and pointers without embedding raw maps."""
+
+    artifacts = {item.id: item for item in state.artifacts}
+    records: list[str] = []
+    for experiment in reversed(state.experiments):
+        if (
+            experiment.extra.get("engine_executor")
+            != "pwn_runtime_snapshot_v1"
+            or not isinstance(experiment.result, Mapping)
+        ):
+            continue
+        evidence = experiment.result.get(
+            "pwn_runtime_snapshot_evidence"
+        )
+        if not isinstance(evidence, Mapping):
+            continue
+        evaluation = evidence.get("evaluation")
+        if not isinstance(evaluation, Mapping):
+            continue
+        semantic = evaluation.get("semantic_result")
+        snapshot = (
+            semantic.get("snapshot")
+            if isinstance(semantic, Mapping)
+            else None
+        )
+        registers = (
+            snapshot.get("registers")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        maps = (
+            snapshot.get("maps")
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+        recipe = experiment.extra.get(
+            "pwn_runtime_snapshot_recipe"
+        )
+        parent = (
+            recipe.get("parent")
+            if isinstance(recipe, Mapping)
+            else None
+        )
+        pointers: list[dict[str, object]] = []
+        for label, key in (
+            ("stdout", "stdout_artifact_id"),
+            ("stderr", "stderr_artifact_id"),
+            (
+                "capability",
+                "capability_attestation_artifact_id",
+            ),
+        ):
+            artifact_id = evidence.get(key)
+            artifact = (
+                artifacts.get(artifact_id)
+                if isinstance(artifact_id, str)
+                else None
+            )
+            if artifact is None:
+                continue
+            pointers.append(
+                {
+                    "label": label,
+                    "artifact_id": artifact.id,
+                    "path": artifact.path,
+                    "sha256": artifact.sha256,
+                    "size": artifact.size,
+                }
+            )
+        records.append(
+            _record(
+                "pwn_runtime_snapshot",
+                trust="evidence",
+                diagnostic_only=True,
+                experiment_id=experiment.id,
+                parent_experiment_id=experiment.extra.get(
+                    "parent_experiment_id"
+                ),
+                status=evaluation.get("status"),
+                reason_code=evaluation.get("reason_code"),
+                expected_signal_number=(
+                    parent.get("expected_signal_number")
+                    if isinstance(parent, Mapping)
+                    else None
+                ),
+                rip=(
+                    registers.get("rip")
+                    if isinstance(registers, Mapping)
+                    else None
+                ),
+                rsp=(
+                    registers.get("rsp")
+                    if isinstance(registers, Mapping)
+                    else None
+                ),
+                maps=(
+                    {
+                        "sha256": maps.get("sha256"),
+                        "size_bytes": maps.get("size_bytes"),
+                        "line_count": maps.get("line_count"),
+                    }
+                    if isinstance(maps, Mapping)
+                    else None
+                ),
+                run_id=evidence.get("run_id"),
+                receipt_id=evidence.get("receipt_id"),
+                artifact_pointers=pointers,
+            )
+        )
+        if len(records) == 3:
+            break
+    return tuple(records)
 
 
 def _bounded_string_list(value: object) -> list[str]:
@@ -322,6 +440,10 @@ def build_context_pack(
         # inform the very first Captain without exposing transport tails.
         mandatory.append(_receipt_context_record(newest_receipts[0]))
     critical_groups = [
+        _Group(
+            "pwn_runtime_snapshots",
+            _pwn_runtime_snapshot_context_records(state),
+        ),
         _Group(
             "recent_receipts",
             tuple(

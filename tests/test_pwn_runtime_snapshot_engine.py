@@ -100,6 +100,10 @@ def receipt(
         stdout_artifact_id="A-snapshot-stdout",
         stdout_artifact_sha256=hashlib.sha256(payload).hexdigest(),
         stdout_artifact_size_bytes=len(payload),
+        stderr_artifact_id="A-snapshot-stderr",
+        stderr_artifact_sha256=hashlib.sha256(b"").hexdigest(),
+        stderr_artifact_size_bytes=0,
+        stderr_capture_placeholder=False,
         stdout_drained_bytes=len(payload),
         stdout_stored_bytes=len(payload),
         stdout_capture_complete=True,
@@ -352,6 +356,19 @@ class PwnRuntimeSnapshotEngineTests(unittest.TestCase):
             ),
             valid,
         )
+        for field, changed in (
+            ("stderr_artifact_id", "../stderr"),
+            ("stderr_artifact_sha256", "0"),
+            ("stderr_artifact_size_bytes", -1),
+            ("stderr_capture_placeholder", 0),
+        ):
+            with self.subTest(field=field):
+                tampered = valid.to_dict()
+                tampered[field] = changed
+                with self.assertRaises(ValueError):
+                    PwnRuntimeSnapshotReceiptMetadata.from_dict(
+                        tampered
+                    )
         image_changed = replace(
             valid,
             image_digest="sha256:" + ("a" * 64),
