@@ -228,18 +228,26 @@ def _evidence(
     )
 
 
-def _valid_evidence() -> tuple[
+def _valid_evidence(
+    *,
+    maps: bytes = BASE_MAPS,
+) -> tuple[
     PwnIpControlReplayEvidence,
     tuple[PwnIpControlReplayEvidence, ...],
 ]:
-    baseline = _evidence(ORIGINAL_PAYLOAD, ORIGINAL_RIP, 0)
+    baseline = _evidence(
+        ORIGINAL_PAYLOAD,
+        ORIGINAL_RIP,
+        0,
+        maps=maps,
+    )
     plan = derive_pwn_ip_control_plan(
         baseline.recipe,
         baseline.evaluation,
         baseline.payload,
     )
     replays = tuple(
-        _evidence(payload, target, ordinal)
+        _evidence(payload, target, ordinal, maps=maps)
         for ordinal, (payload, target) in enumerate(
             zip(plan.payloads, plan.targets, strict=True),
             start=1,
@@ -545,6 +553,38 @@ class PwnIpControlTests(unittest.TestCase):
             replays=(mapped, *replays[1:]),
         )
         self.assertEqual(result.reason_code, "target_address_mapped")
+
+    def test_real_proc_maps_alignment_is_accepted(self) -> None:
+        aligned_maps = (
+            b"0000000000400000-0000000000500000 r-xp "
+            b"0000000000000000 00:00 12345"
+            b"                  /challenge/bin\n"
+            b"00007f0000000000-0000800000000000 rw-p "
+            b"0000000000000000 00:00 0                 \n"
+        )
+        baseline, replays = _valid_evidence(maps=aligned_maps)
+
+        result = _evaluate(baseline=baseline, replays=replays)
+
+        self.assertEqual(result.status, PwnIpControlStatus.PROVEN)
+
+    def test_proc_maps_field_tabs_remain_invalid(self) -> None:
+        invalid_maps = BASE_MAPS.replace(b" r-xp ", b"\tr-xp ", 1)
+        baseline = _evidence(
+            ORIGINAL_PAYLOAD,
+            ORIGINAL_RIP,
+            0,
+            maps=invalid_maps,
+        )
+
+        with self.assertRaises(PwnIpControlPlanError) as raised:
+            derive_pwn_ip_control_plan(
+                baseline.recipe,
+                baseline.evaluation,
+                baseline.payload,
+            )
+
+        self.assertEqual(raised.exception.code, "baseline_maps_invalid")
 
     def test_parent_and_source_binding_cannot_change(self) -> None:
         baseline, replays = _valid_evidence()

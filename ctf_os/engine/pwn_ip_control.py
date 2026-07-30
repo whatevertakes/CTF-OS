@@ -68,11 +68,13 @@ PWN_IP_CONTROL_MAX_IDENTIFIER_BYTES = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}$")
 _MAP_LINE = re.compile(
-    rb"(?P<start>[0-9a-f]{1,16})-(?P<end>[0-9a-f]{1,16}) "
-    rb"(?P<permissions>[r-][w-][x-][ps]) "
-    rb"(?P<offset>[0-9a-f]{1,16}) "
-    rb"(?P<major>[0-9a-f]{1,8}):(?P<minor>[0-9a-f]{1,8}) "
-    rb"(?P<inode>[0-9]{1,20})(?: (?P<pathname>[\x20-\x7e]+))?"
+    rb"(?P<start>[0-9a-f]{1,16})-(?P<end>[0-9a-f]{1,16})[ ]+"
+    rb"(?P<permissions>[r-][w-][x-][ps])[ ]+"
+    rb"(?P<offset>[0-9a-f]{1,16})[ ]+"
+    rb"(?P<major>[0-9a-f]{1,8}):(?P<minor>[0-9a-f]{1,8})[ ]+"
+    rb"(?P<inode>[0-9]{1,20})"
+    rb"(?:[ ]+(?P<pathname>[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?))?"
+    rb"[ ]*"
 )
 
 _AUTHORITIES_FALSE = {
