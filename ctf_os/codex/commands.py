@@ -7,8 +7,10 @@ import json
 import math
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 from ctf_os.store.atomic import canonical_json_bytes
 
@@ -184,6 +186,34 @@ class BatchInvocation:
 class BuiltCommand:
     argv: tuple[str, ...]
     stdin: str
+    environment: Mapping[str, str] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.environment is None:
+            return
+        copied: dict[str, str] = {}
+        for key, value in self.environment.items():
+            if (
+                type(key) is not str
+                or not key
+                or "\x00" in key
+                or "=" in key
+                or type(value) is not str
+                or "\x00" in value
+            ):
+                raise ValueError(
+                    "command environment must contain valid string entries"
+                )
+            copied[key] = value
+        object.__setattr__(
+            self,
+            "environment",
+            MappingProxyType(copied),
+        )
 
 
 class BatchCommandBuilder:
@@ -430,7 +460,12 @@ class LiveCommandBuilder:
         )
         return args
 
-    def command_contract_sha256(self, session: LiveSession) -> str:
+    def command_contract_sha256(
+        self,
+        session: LiveSession,
+        *,
+        headless: bool = False,
+    ) -> str:
         """Hash the stable execution surface without challenge paths or prompt.
 
         Evaluation identity and source hashes bind the challenge-specific
@@ -452,6 +487,12 @@ class LiveCommandBuilder:
             "max_concurrent_threads": (
                 1 + len(session.logical_worker_roles)
             ),
+            "execution_transport": (
+                "headless_jsonl" if headless else "interactive_tui"
+            ),
+            "usage_attestation": (
+                "codex_jsonl_events" if headless else "unavailable"
+            ),
             "multi_agent": multi_agent,
             "host_shell": False,
             "sandbox": "workspace-write",
@@ -467,6 +508,53 @@ class LiveCommandBuilder:
         return hashlib.sha256(
             canonical_json_bytes(contract)
         ).hexdigest()
+
+    def headless(
+        self,
+        session: LiveSession,
+        schema_path: Path,
+        output_path: Path,
+    ) -> BuiltCommand:
+        """Build one JSONL-emitting, usage-attested thin evaluation turn."""
+
+        if session.scaffold != LIVE_THIN_SCAFFOLD:
+            raise ValueError(
+                "headless Live execution is reserved for the thin scaffold"
+            )
+        model_id = session.model_id or self.models.resolve(ModelFamily.SOL)
+        argv = [
+            self.executable,
+            "exec",
+            "--json",
+            "--color",
+            "never",
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(output_path),
+            "--model",
+            model_id,
+            "-c",
+            f'model_reasoning_effort="{session.reasoning_effort.value}"',
+            "-c",
+            "agents.max_concurrent_threads_per_session=1",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "-C",
+            str(session.working_directory),
+        ]
+        argv.extend(self._live_config_args(session))
+        argv.extend(self._live_mcp_config_args())
+        for directory in session.additional_directories:
+            argv.extend(("--add-dir", str(directory)))
+        argv.append("-")
+        return BuiltCommand(
+            tuple(argv),
+            self._delegation_prompt(session),
+        )
 
     def _live_mcp_config_args(self) -> list[str]:
         prefix = f"mcp_servers.{_LIVE_MCP_SERVER_NAME}"

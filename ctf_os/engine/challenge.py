@@ -46,6 +46,7 @@ from ctf_os.codex import (
     BatchRunner,
     BatchWave,
     BatchWaveRunner,
+    BuiltCommand,
     FileFifoModelCallLimiter,
     LIVE_FULL_SCAFFOLD,
     LIVE_THIN_SCAFFOLD,
@@ -430,6 +431,53 @@ class PreparedLiveSession:
     session_context: Path
     scaffold: str
     command_contract_sha256: str
+
+
+class _ThinEvaluationCommandBuilder:
+    """Adapt the scoped Live MCP surface to BatchRunner's JSONL capture."""
+
+    def __init__(
+        self,
+        live_builder: LiveCommandBuilder,
+        environment: Mapping[str, str],
+    ) -> None:
+        self.live_builder = live_builder
+        self.environment = environment
+
+    def build(
+        self,
+        invocation: BatchInvocation,
+        schema_path: Path,
+        output_path: Path,
+        *,
+        resume_thread_id: str | None = None,
+        correction: str | None = None,
+    ) -> BuiltCommand:
+        if resume_thread_id is not None or correction is not None:
+            raise EngineError(
+                "thin evaluation permits one fresh model turn only"
+            )
+        session = LiveSession(
+            session_key=invocation.run_id,
+            working_directory=invocation.working_directory,
+            prompt=invocation.prompt,
+            model_id=invocation.model_id,
+            reasoning_effort=(
+                invocation.reasoning_effort or ReasoningEffort.ULTRA
+            ),
+            logical_worker_roles=(),
+            scaffold=LIVE_THIN_SCAFFOLD,
+        )
+        built = self.live_builder.headless(
+            session,
+            schema_path,
+            output_path,
+        )
+        return BuiltCommand(
+            built.argv,
+            built.stdin,
+            self.environment,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -6013,12 +6061,21 @@ class ChallengeEngine:
         resume_thread_id: str | None = None,
         broker_directory: Path | None = None,
         scaffold: str = LIVE_FULL_SCAFFOLD,
+        headless: bool = False,
     ) -> PreparedLiveSession:
         if scaffold not in {
             LIVE_FULL_SCAFFOLD,
             LIVE_THIN_SCAFFOLD,
         }:
             raise EngineError("unsupported Live scaffold")
+        if headless and scaffold != LIVE_THIN_SCAFFOLD:
+            raise EngineError(
+                "headless Live execution is reserved for thin evaluation"
+            )
+        if headless and resume_thread_id is not None:
+            raise EngineError(
+                "headless thin evaluation cannot resume a model thread"
+            )
         self._require_model_work_allowed(self.store.load(identity))
         state = self.refresh_ingest(identity)
         self._require_model_work_allowed(state)
@@ -6096,11 +6153,18 @@ class ChallengeEngine:
             scaffold=scaffold,
             broker_directory=broker_directory,
         )
-        built = (
-            self.live_builder.resume(session, resume_thread_id)
-            if resume_thread_id is not None
-            else self.live_builder.start(session)
-        )
+        if headless:
+            built = self.live_builder.headless(
+                session,
+                workspace / ".ctfos-headless-schema.json",
+                workspace / ".ctfos-headless-output.json",
+            )
+        else:
+            built = (
+                self.live_builder.resume(session, resume_thread_id)
+                if resume_thread_id is not None
+                else self.live_builder.start(session)
+            )
         environment = {
             **os.environ,
             "CTFOS_WORKSPACE_ROOT": str(self.config.workspace_root),
@@ -6148,7 +6212,10 @@ class ChallengeEngine:
             raise EngineError(
                 "Live command builder does not expose an execution contract"
             )
-        command_contract_sha256 = contract_builder(session)
+        command_contract_sha256 = contract_builder(
+            session,
+            headless=headless,
+        )
         return PreparedLiveSession(
             identity,
             built.argv,
@@ -6219,6 +6286,428 @@ class ChallengeEngine:
             expected_revision=current.revision,
         )
 
+    def _commit_thin_evaluation_result(
+        self,
+        identity: ChallengeIdentity,
+        result: BatchResult,
+        *,
+        prepared: PreparedLiveSession,
+        launch_record: Mapping[str, object],
+        launch_binding_sha256: str,
+        evaluation_session_id: str,
+    ) -> ChallengeState:
+        """Persist usage/capture evidence without trusting model semantics."""
+
+        current = self.store.load(identity)
+        if (
+            current.metadata.get(SCAFFOLD_LAUNCH_METADATA_KEY)
+            != launch_record
+            or current.metadata.get("evaluation_session_id")
+            != evaluation_session_id
+        ):
+            raise EngineError(
+                "thin evaluation binding changed before result commit"
+            )
+        run_id = result.invocation.run_id
+        run_paths = self.store.run_paths(identity, run_id=run_id)
+        challenge_root = self.store.challenge_paths(identity).root
+        evidence_sources: list[tuple[str, Path, str]] = [
+            (
+                "output-schema",
+                run_paths.root / "output-schema.json",
+                "application/schema+json",
+            )
+        ]
+        for attempt in result.attempts:
+            evidence_sources.extend(
+                (
+                    (
+                        f"attempt-{attempt.number}-jsonl",
+                        attempt.raw_jsonl_path,
+                        "application/x-ndjson",
+                    ),
+                    (
+                        f"attempt-{attempt.number}-stderr",
+                        attempt.stderr_path,
+                        "text/plain",
+                    ),
+                    (
+                        f"attempt-{attempt.number}-output",
+                        attempt.output_path,
+                        "application/json",
+                    ),
+                    (
+                        f"attempt-{attempt.number}-capture",
+                        attempt.capture_metadata_path,
+                        "application/json",
+                    ),
+                )
+            )
+        artifacts: list[ArtifactReference] = []
+        artifact_rows: list[dict[str, object]] = []
+        capture_complete = bool(result.attempts)
+        seen_paths: set[Path] = set()
+        for label, path, media_type in evidence_sources:
+            if path in seen_paths or not path.is_file() or path.is_symlink():
+                if "capture" in label or "jsonl" in label:
+                    capture_complete = False
+                continue
+            seen_paths.add(path)
+            try:
+                relative = path.relative_to(challenge_root).as_posix()
+            except ValueError as error:
+                raise EngineError(
+                    "thin evaluation evidence escaped its challenge"
+                ) from error
+            digest = sha256_file(path)
+            size = path.stat(follow_symlinks=False).st_size
+            artifact_id = _record_id("A", run_id, label)
+            artifacts.append(
+                ArtifactReference(
+                    id=artifact_id,
+                    path=relative,
+                    sha256=digest,
+                    source_run_id=run_id,
+                    media_type=media_type,
+                    size=size,
+                )
+            )
+            artifact_rows.append(
+                {
+                    "artifact_id": artifact_id,
+                    "path": relative,
+                    "sha256": digest,
+                    "size_bytes": size,
+                }
+            )
+            if "capture" in label:
+                try:
+                    capture = read_json(path)
+                    stdout = (
+                        capture.get("stdout_jsonl")
+                        if isinstance(capture, Mapping)
+                        else None
+                    )
+                    stderr = (
+                        capture.get("stderr")
+                        if isinstance(capture, Mapping)
+                        else None
+                    )
+                    capture_complete = bool(
+                        capture_complete
+                        and isinstance(stdout, Mapping)
+                        and stdout.get("capture_complete") is True
+                        and isinstance(stderr, Mapping)
+                        and stderr.get("capture_complete") is True
+                    )
+                except (OSError, ValueError):
+                    capture_complete = False
+        usage_event_observed = any(
+            event.event_type == "turn.completed"
+            and isinstance(event.payload.get("usage"), Mapping)
+            for event in result.events
+        )
+        usage = result.usage
+        token_total = usage.input_tokens + usage.output_tokens
+        thread_digest = (
+            thread_id_sha256(result.thread_id)
+            if valid_thread_id(result.thread_id)
+            else None
+        )
+        attestation_ok = bool(
+            result.attempts
+            and capture_complete
+            and usage_event_observed
+            and token_total > 0
+            and thread_digest is not None
+        )
+        status = self._batch_result_run_status(result)
+        if status is RunStatus.COMPLETED and not attestation_ok:
+            status = RunStatus.INVALID
+        result_pointer = run_paths.result.relative_to(
+            challenge_root
+        ).as_posix()
+        validation_pointer = run_paths.validation.relative_to(
+            challenge_root
+        ).as_posix()
+        request_pointer = run_paths.request.relative_to(
+            challenge_root
+        ).as_posix()
+        self.store.write_run_result(
+            identity,
+            run_id,
+            {
+                "schema_version": 1,
+                "base_revision": current.revision,
+                "status": status.value,
+                "evaluation_scaffold": LIVE_THIN_SCAFFOLD,
+                "semantic_output_committed": False,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "reasoning_output_tokens": (
+                        usage.reasoning_output_tokens
+                    ),
+                },
+                "usage_event_observed": usage_event_observed,
+                "capture_complete": capture_complete,
+                "thread_id_sha256": thread_digest,
+                "evidence": artifact_rows,
+                "automatic_submission": False,
+            },
+        )
+        self.store.write_run_validation(
+            identity,
+            run_id,
+            {
+                "schema_version": 1,
+                "base_revision": current.revision,
+                "ok": attestation_ok,
+                "errors": (
+                    []
+                    if attestation_ok
+                    else [
+                        "thin model usage/capture attestation incomplete"
+                    ]
+                ),
+            },
+        )
+
+        def apply(state: ChallengeState) -> None:
+            if (
+                state.metadata.get(SCAFFOLD_LAUNCH_METADATA_KEY)
+                != launch_record
+                or state.configuration_epoch
+                != current.configuration_epoch
+            ):
+                raise EngineError(
+                    "thin evaluation state changed during result commit"
+                )
+            if any(run.id == run_id for run in state.runs):
+                raise EngineError("thin evaluation run already exists")
+            state.artifacts.extend(artifacts)
+            state.runs.append(
+                RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=status,
+                    request_path=request_pointer,
+                    result_path=result_pointer,
+                    validation_path=validation_pointer,
+                    role=Role.CAPTAIN.value,
+                    model=result.invocation.model_id,
+                    context_hash=self._request_context_hash(
+                        run_paths.request
+                    ),
+                    origin=RunOrigin.ASSISTED_MODEL,
+                    idempotency_key=(
+                        "evaluation-thin:" + launch_binding_sha256
+                    ),
+                    session_id=evaluation_session_id,
+                    configuration_epoch=state.configuration_epoch,
+                    extra={
+                        "evaluation_scaffold": LIVE_THIN_SCAFFOLD,
+                        "execution_transport": "headless_jsonl",
+                        "usage_attestation": "codex_jsonl_events",
+                        "usage_attestation_valid": attestation_ok,
+                        "semantic_output_committed": False,
+                        "command_contract_sha256": (
+                            prepared.command_contract_sha256
+                        ),
+                        "launch_binding_sha256": (
+                            launch_binding_sha256
+                        ),
+                        "logical_model_count": 1,
+                        "logical_worker_roles": [],
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "cached_input_tokens": (
+                                usage.cached_input_tokens
+                            ),
+                            "output_tokens": usage.output_tokens,
+                            "reasoning_output_tokens": (
+                                usage.reasoning_output_tokens
+                            ),
+                        },
+                        "produced_thread_id_sha256": thread_digest,
+                        "capture_complete": capture_complete,
+                        "attempt_count": len(result.attempts),
+                        "evidence_artifact_ids": [
+                            artifact.id for artifact in artifacts
+                        ],
+                        "contract_errors": list(
+                            result.validation.errors
+                        ),
+                        "failures": [
+                            {
+                                "kind": failure.kind,
+                                "message": failure.message,
+                                "retryable": failure.retryable,
+                            }
+                            for failure in result.failures
+                        ],
+                    },
+                )
+            )
+
+        self.store.update(
+            identity,
+            apply,
+            expected_revision=current.revision,
+        )
+        return self._reconcile_candidate_intents_and_notify(identity)
+
+    def _run_thin_evaluation(
+        self,
+        identity: ChallengeIdentity,
+        prepared: PreparedLiveSession,
+        *,
+        on_prepared: Callable[[PreparedLiveSession], None] | None,
+    ) -> int:
+        """Run and attest one fresh, headless, single-model baseline turn."""
+
+        state = self.store.load(identity)
+        if (
+            state.metadata.get("evaluation_prepared") is not True
+            or state.metadata.get("evaluation_system")
+            != LIVE_THIN_SCAFFOLD
+            or prepared.scaffold != LIVE_THIN_SCAFFOLD
+        ):
+            raise EngineError(
+                "headless thin execution requires the exact frozen thin arm"
+            )
+        if state.schema_version < STATE_SCHEMA_VERSION:
+            raise EngineError(
+                "thin evaluation usage attestation requires current state "
+                "schema; migrate this challenge first"
+            )
+        (
+            deadline_monotonic_seconds,
+            deadline_epoch_seconds,
+        ) = self._budget_deadline_pair(state, 8 * 60 * 60)
+        invocation = self._make_invocation(
+            state,
+            Role.CAPTAIN,
+            prefix="evaluation-thin",
+            instruction=(
+                "This is the same-model thin baseline. Work as one frontier "
+                "model with no subagents, named roles, or parallel model "
+                "conversations. Use the scoped ctfos_live tools directly in "
+                "an observe-act-inspect loop. Record every candidate through "
+                "agent.flag and never submit it."
+            ),
+            deadline_monotonic_seconds=deadline_monotonic_seconds,
+            deadline_epoch_seconds=deadline_epoch_seconds,
+        )
+        invocation = replace(
+            invocation,
+            working_directory=prepared.working_directory,
+            timeout_seconds=max(
+                0.001,
+                deadline_monotonic_seconds - time.monotonic(),
+            ),
+        )
+        run_paths = self.store.run_paths(
+            identity,
+            run_id=invocation.run_id,
+        )
+        request = read_json(run_paths.request)
+        if not isinstance(request, dict):
+            raise EngineError("thin evaluation request must be an object")
+        request.update(
+            {
+                "evaluation_scaffold": LIVE_THIN_SCAFFOLD,
+                "execution_transport": "headless_jsonl",
+                "usage_attestation": "codex_jsonl_events",
+                "command_contract_sha256": (
+                    prepared.command_contract_sha256
+                ),
+            }
+        )
+        atomic_write_json(run_paths.request, request)
+        launch_record = state.metadata.get(
+            SCAFFOLD_LAUNCH_METADATA_KEY
+        )
+        if not isinstance(launch_record, Mapping):
+            raise EngineError(
+                "thin evaluation launch binding is unavailable"
+            )
+        launch_binding_sha256 = launch_record.get("binding_sha256")
+        if (
+            type(launch_binding_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", launch_binding_sha256) is None
+        ):
+            raise EngineError(
+                "thin evaluation launch binding hash is invalid"
+            )
+        evaluation_session_id = state.metadata.get(
+            "evaluation_session_id"
+        )
+        if type(evaluation_session_id) is not str:
+            raise EngineError(
+                "thin evaluation session identity is unavailable"
+            )
+
+        adapter = _ThinEvaluationCommandBuilder(
+            self.live_builder,
+            prepared.environment,
+        )
+        preview = adapter.build(
+            invocation,
+            run_paths.root / "output-schema.json",
+            run_paths.root / "attempt-1-output.json",
+        )
+        prepared = replace(prepared, command=preview.argv)
+        if on_prepared is not None:
+            on_prepared(prepared)
+        result = self.batch_runner.run(
+            invocation,
+            on_flag=lambda candidate: self._print_codex_flag(
+                identity,
+                candidate,
+            ),
+            before_provider_start=lambda: self._before_provider_start(
+                identity,
+            ),
+            command_builder=adapter,
+        )
+        committed = self._commit_thin_evaluation_result(
+            identity,
+            result,
+            prepared=prepared,
+            launch_record=launch_record,
+            launch_binding_sha256=launch_binding_sha256,
+            evaluation_session_id=evaluation_session_id,
+        )
+        run = next(
+            (
+                item
+                for item in committed.runs
+                if item.id == invocation.run_id
+            ),
+            None,
+        )
+        if run is None or run.status in {
+            RunStatus.CREATED,
+            RunStatus.RUNNING,
+        }:
+            raise EngineError(
+                "thin evaluation model run was not terminally attested"
+            )
+        if run.status is not RunStatus.COMPLETED:
+            return (
+                result.attempts[-1].returncode
+                if result.attempts
+                and result.attempts[-1].returncode != 0
+                else 2
+            )
+        return (
+            result.attempts[-1].returncode
+            if result.attempts
+            else 1
+        )
+
     def launch_live(
         self,
         identity: ChallengeIdentity,
@@ -6243,6 +6732,7 @@ class ChallengeEngine:
         try:
             initial_state = self.store.load(identity)
             self._require_model_work_allowed(initial_state)
+            evaluation_headless = False
             if initial_state.metadata.get("evaluation_prepared") is True:
                 if scaffold != LIVE_THIN_SCAFFOLD:
                     raise EngineError(
@@ -6262,6 +6752,12 @@ class ChallengeEngine:
                         "prepared thin evaluations cannot resume a thread "
                         "that may contain prior challenge exposure"
                     )
+                if runner is not None:
+                    raise EngineError(
+                        "prepared thin evaluation cannot use an injected "
+                        "runner because model usage would be unattested"
+                    )
+                evaluation_headless = True
             if prompt is not None:
                 self.update_prompt(
                     identity,
@@ -6280,6 +6776,7 @@ class ChallengeEngine:
                     resume_thread_id=resume_thread_id,
                     broker_directory=broker_directory,
                     scaffold=scaffold,
+                    headless=evaluation_headless,
                 )
                 from ctf_os.sandbox.daemon import CapabilityAuthority
 
@@ -6315,12 +6812,22 @@ class ChallengeEngine:
                     atomic_write_json(
                         owner_path,
                         {
-                            "delegation_owner": "native",
+                            "delegation_owner": (
+                                "thin_headless"
+                                if evaluation_headless
+                                else "native"
+                            ),
                             "pid": os.getpid(),
                             "acquired_at": utc_now(),
                             **identity.to_dict(),
                         },
                     )
+                    if evaluation_headless:
+                        return self._run_thin_evaluation(
+                            identity,
+                            prepared,
+                            on_prepared=on_prepared,
+                        )
                     if on_prepared is not None:
                         on_prepared(prepared)
                     latest_before_launch = self.store.load(identity)
@@ -7867,6 +8374,19 @@ class ChallengeEngine:
                         existing_run.origin is RunOrigin.MANAGED_MODEL
                     ):
                         completed_run.extra.pop("thread_id", None)
+                    if (
+                        existing_run.extra.get("evaluation_scaffold")
+                        == LIVE_THIN_SCAFFOLD
+                    ):
+                        raw_thread_id = completed_run.extra.pop(
+                            "thread_id",
+                            None,
+                        )
+                        if valid_thread_id(raw_thread_id):
+                            assert type(raw_thread_id) is str
+                            completed_run.extra[
+                                "produced_thread_id_sha256"
+                            ] = thread_id_sha256(raw_thread_id)
                     state.runs[state.runs.index(existing_run)] = completed_run
                     run_record = completed_run
 

@@ -5,12 +5,14 @@ import unittest
 from pathlib import Path
 
 from ctf_os.codex.commands import (
+    BuiltCommand,
     LIVE_FULL_SCAFFOLD,
     LIVE_THIN_SCAFFOLD,
     LiveCommandBuilder,
     LiveSession,
 )
 from ctf_os.codex.contracts import ModelCatalog, ReasoningEffort, Role
+from ctf_os.codex.runner import SubprocessExecutor
 
 
 class ThinLiveScaffoldTests(unittest.TestCase):
@@ -139,6 +141,66 @@ class ThinLiveScaffoldTests(unittest.TestCase):
             resumed.argv,
         )
         self.assertNotIn("Maintain these logical worker roles", resumed.argv[-1])
+
+    def test_headless_thin_emits_jsonl_and_usage_bound_contract(self) -> None:
+        session = LiveSession(
+            "thin",
+            Path("/challenge"),
+            "solve",
+            logical_worker_roles=(),
+            scaffold=LIVE_THIN_SCAFFOLD,
+        )
+        built = self.builder.headless(
+            session,
+            Path("/run/schema.json"),
+            Path("/run/output.json"),
+        )
+        self.assertEqual(built.argv[:3], ("codex", "exec", "--json"))
+        self.assertIn("--output-schema", built.argv)
+        self.assertIn("--output-last-message", built.argv)
+        self.assertIn("features.multi_agent=false", built.argv)
+        self.assertIn("agents.enabled=false", built.argv)
+        self.assertEqual(built.argv[-1], "-")
+        self.assertIn("sole frontier agent", built.stdin)
+        self.assertNotEqual(
+            self.builder.command_contract_sha256(session),
+            self.builder.command_contract_sha256(
+                session,
+                headless=True,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "thin scaffold"):
+            self.builder.headless(
+                LiveSession("full", Path("/challenge"), "solve"),
+                Path("/run/schema.json"),
+                Path("/run/output.json"),
+            )
+
+    def test_built_command_passes_scoped_environment_without_repr_leak(
+        self,
+    ) -> None:
+        observed: list[str | bytes] = []
+        command = BuiltCommand(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import os;"
+                    "print(os.environ['CTFOS_TEST_SCOPE'], flush=True)"
+                ),
+            ),
+            "",
+            {"CTFOS_TEST_SCOPE": "bound-secret"},
+        )
+        self.assertNotIn("bound-secret", repr(command))
+        outcome = SubprocessExecutor().run(
+            command,
+            cwd=Path.cwd(),
+            timeout=5,
+            on_stdout_line=observed.append,
+        )
+        self.assertEqual(outcome.returncode, 0)
+        self.assertIn(b"bound-secret", b"".join(observed))
 
 
 if __name__ == "__main__":

@@ -149,6 +149,19 @@ class ProcessExecutor(Protocol):
         ...
 
 
+class CommandBuilder(Protocol):
+    def build(
+        self,
+        invocation: BatchInvocation,
+        schema_path: Path,
+        output_path: Path,
+        *,
+        resume_thread_id: str | None = None,
+        correction: str | None = None,
+    ) -> BuiltCommand:
+        ...
+
+
 class _ProcessPumpControl:
     """Coordinate sole stream owners with concurrent process cancellation."""
 
@@ -863,6 +876,7 @@ class SubprocessExecutor:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=command.environment,
                 text=False,
                 bufsize=0,
                 start_new_session=True,
@@ -2061,6 +2075,7 @@ class BatchRunner:
         before_provider_start: Callable[[], None] | None = None,
         session_created_at: float | None = None,
         _cancel_event: threading.Event | None = None,
+        command_builder: CommandBuilder | None = None,
     ) -> BatchResult:
         run_started_monotonic = time.monotonic()
         run_started_at = time.time()
@@ -2129,7 +2144,7 @@ class BatchRunner:
             output_path = output_directory / f"attempt-{attempt_number}-output.json"
             capture_metadata_path = raw_directory / f"attempt-{attempt_number}-capture.json"
             output_path.unlink(missing_ok=True)
-            command = self.command_builder.build(
+            command = (command_builder or self.command_builder).build(
                 invocation,
                 schema_path,
                 output_path,

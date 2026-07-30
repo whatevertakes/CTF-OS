@@ -773,7 +773,11 @@ class EngineTests(unittest.TestCase):
             config=config,
             sandbox_factory=lambda state, work, policy: FakeSandbox(work),
         )
-        added = engine.add_challenge(self.identity, prompt="solve")
+        added = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
 
         def digest(value: bytes) -> str:
             return hashlib.sha256(value).hexdigest()
@@ -841,6 +845,150 @@ class EngineTests(unittest.TestCase):
                 self.identity,
                 runner=lambda *args, **kwargs: None,
             )
+
+    def test_prepared_thin_headless_run_attests_exact_model_usage(self) -> None:
+        class ThinUsageExecutor:
+            def __init__(inner_self) -> None:
+                inner_self.commands: list[BuiltCommand] = []
+
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                del cwd, timeout
+                inner_self.commands.append(command)
+                self.assertEqual(command.argv[:3], ("codex", "exec", "--json"))
+                self.assertIn("features.multi_agent=false", command.argv)
+                self.assertIsNotNone(command.environment)
+                assert command.environment is not None
+                self.assertIn(
+                    "CTFOS_SCOPE_CAPABILITY",
+                    command.environment,
+                )
+                self.assertIn("CTFOS_LIVE_SESSION", command.environment)
+                on_stdout_line(
+                    json.dumps(
+                        {
+                            "type": "thread.started",
+                            "thread_id": "thin-thread-1",
+                        }
+                    )
+                    + "\n"
+                )
+                on_stdout_line(
+                    json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "usage": {
+                                "input_tokens": 101,
+                                "cached_input_tokens": 41,
+                                "output_tokens": 29,
+                                "reasoning_output_tokens": 17,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                _output_path(command).write_text(
+                    json.dumps(_payload(Role.CAPTAIN)),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        image_digest = "sha256:" + hashlib.sha256(b"image").hexdigest()
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=image_digest,
+            ),
+        )
+        executor = ThinUsageExecutor()
+        batch_runner = BatchRunner(
+            process_executor=executor,
+            limiter=FifoModelCallLimiter(1),
+            limiter_wait_timeout=2,
+            max_schema_retries=0,
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=batch_runner,
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        added = engine.add_challenge(
+            self.identity,
+            prompt="solve",
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+
+        def digest(value: bytes) -> str:
+            return hashlib.sha256(value).hexdigest()
+
+        def prepare(state: ChallengeState) -> None:
+            state.metadata.update(
+                {
+                    "evaluation_prepared": True,
+                    "evaluation_system": THIN_SCAFFOLD,
+                    "evaluation_benchmark_id": "blind-release",
+                    "evaluation_case_id": "case-one",
+                    "evaluation_session_id": "case-one-thin-1",
+                    "evaluation_manifest_sha256": digest(b"manifest"),
+                    "evaluation_model": config.models.captain,
+                    "evaluation_image_sha256": (
+                        image_digest.removeprefix("sha256:")
+                    ),
+                    "evaluation_tool_manifest_sha256": digest(b"tools"),
+                    "evaluation_model_config_sha256": digest(b"models"),
+                }
+            )
+
+        engine.store.update(
+            self.identity,
+            prepare,
+            expected_revision=added.revision,
+        )
+        announced = []
+        status = engine.launch_live(
+            self.identity,
+            scaffold=THIN_SCAFFOLD,
+            on_prepared=announced.append,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(announced), 1)
+        self.assertEqual(len(executor.commands), 1)
+        state = engine.store.load(self.identity)
+        model_runs = [
+            run for run in state.runs if run.model is not None
+        ]
+        self.assertEqual(len(model_runs), 1)
+        run = model_runs[0]
+        self.assertIs(run.status, RunStatus.COMPLETED)
+        self.assertIs(run.origin, models_module.RunOrigin.ASSISTED_MODEL)
+        self.assertEqual(run.extra["evaluation_scaffold"], THIN_SCAFFOLD)
+        self.assertEqual(run.extra["execution_transport"], "headless_jsonl")
+        self.assertEqual(
+            run.extra["usage"],
+            {
+                "input_tokens": 101,
+                "cached_input_tokens": 41,
+                "output_tokens": 29,
+                "reasoning_output_tokens": 17,
+            },
+        )
+        self.assertNotIn("thread_id", run.extra)
+        self.assertEqual(
+            run.extra["produced_thread_id_sha256"],
+            hashlib.sha256(b"thin-thread-1").hexdigest(),
+        )
+        self.assertEqual(state.candidates, [])
+        self.assertEqual(state.submissions, [])
+        self.assertIn(SCAFFOLD_LAUNCH_METADATA_KEY, state.metadata)
 
     def test_adapter_initial_plan_is_registered_once_and_never_auto_runs(
         self,
