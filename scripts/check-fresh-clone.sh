@@ -85,6 +85,10 @@ fi
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 
 for script in ctf-os-image/scripts/* ctf-os-image/tests/*.sh; do
+  if [[ ! -f "${script}" ]]; then
+    continue
+  fi
+  shebang=
   IFS= read -r shebang <"${script}" || true
   case "${shebang}" in
     *"bash"*|*"/sh"*)
