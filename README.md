@@ -47,6 +47,22 @@ ctfos --help
 DOCKER_BUILDKIT=1 docker build -t ctf-os:core ./ctf-os-image
 ```
 
+Managed 실행에 쓰는 이미지는 tag가 아니라 exact local image ID로 고정합니다.
+릴리스 순서는 `build → exact-ID smoke → pin → doctor → challenge
+preflight`입니다. tag를 다시 빌드하는 것만으로 이미 고정된 실행 참조가
+바뀌지는 않습니다.
+
+```sh
+CTFOS_RELEASE_IMAGE_ID="$(
+  docker image inspect --format '{{.Id}}' ctf-os:core
+)"
+.venv/bin/python scripts/check-rev-docker-proof.py \
+  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
+ctfos pin-image
+ctfos doctor
+ctfos preflight 'Demo CTF' rev 'Example'
+```
+
 GPU를 쓸 호스트에서 NVIDIA Container Toolkit이 아직 없다면
 `scripts/setup-nvidia-container-toolkit`을 별도로 실행할 수 있습니다. 이
 스크립트는 호스트 패키지와 Docker 설정을 변경하므로 내용을 확인한 뒤
@@ -414,6 +430,35 @@ evaluation은 다음 context의 최우선 evidence가 되지만 다음 cycle을 
 hard barrier는 X-22를 통과하기 전에는 활성화하지 않습니다. `solve`의
 기본값 역시 canary 승격 기준을 통과하기 전까지 assisted로 유지됩니다.
 
+### Managed Rev executable oracle
+
+로컬 Rev 문제에는 설명문이 아니라 원본 바이너리의 stdin 판정을 사용하는
+첫 번째 완전한 managed proof 경로가 연결돼 있습니다. Reproducer가 proof
+wave에서 durable candidate 하나와 canonical artifact 하나를
+`accepted_input`으로 지정하면, 모델이 runner argv나 반복 횟수를 고르는 대신
+엔진이 다음 계약을 강제합니다.
+
+- 현재 source snapshot과 정확히 하나의 `CONFIRMED` inventory-v2 evidence,
+  exact image ID, 설정 epoch, 요청 hash와 전체 deadline을 묶습니다.
+- 입력은 최대 1 MiB이고 candidate literal을 포함할 수 없습니다.
+- 고정 runner
+  `/usr/bin/python3 /opt/ctf-templates/rev/stdin_exec.py`로 원본 바이너리를
+  network-none clean container에서 실행합니다.
+- 동일 입력 positive 3회 뒤 `xor-first`, `xor-last`, `truncate` control을
+  각각 한 번 실행합니다. 빈 입력은 `00`, `0a`, `ff` control을 씁니다.
+- positive의 engine-owned stdout/stderr에 exact candidate가 매번 있어야
+  하고, 세 control에는 없어야 합니다. 정상적인 nonzero control exit은
+  transport failure가 아닙니다.
+- control이 candidate를 출력하면 가설을 반증해 proof experiment를
+  `COMPLETED`로 닫습니다. timeout, exit 125, capture 불완전, stale pin 같은
+  구조적 오류는 `FAILED`입니다. 여섯 실행을 모두 통과한 경우만 candidate를
+  `READY_TO_SUBMIT`으로 올립니다.
+
+각 attempt는 서로 다른 clean workspace를 쓰고 bounded raw stream, 요약,
+SHA-256과 exact artifact pointer를 보존합니다. 어느 경우에도 CTF
+사이트로 자동 제출하지 않습니다. 현재 이 계약은 local standalone Linux
+ELF stdin oracle에만 적용됩니다.
+
 진행 중 세션을 운영자가 끝내려면 이유와 목표 상태를 명시합니다.
 
 ```sh
@@ -734,6 +779,13 @@ ctfos prove \
   -- python3 solve.py
 ```
 
+이 명령은 운영자가 argv와 반복 정책을 선택하는 generic proof 경로입니다.
+위의 managed Rev proof-wave는 별도 엔진 소유 경로입니다. Reproducer는
+candidate와 `accepted_input` artifact만 참조할 수 있고, runner argv,
+positive/control 수, mutation 종류, network 정책은 바꿀 수 없습니다.
+managed 결과는 canonical proof envelope와 여섯 run별 raw
+stdout/stderr artifact pointer가 모두 맞아야 state에 반영됩니다.
+
 Live/Builder가 등록한 workspace artifact는 mutable workspace path를 상태에
 직접 신뢰하지 않습니다. regular file을 안전하게 열어 size/hash를 확인한
 뒤 read-only `artifacts/snapshots/` 사본을 만들고 그 사본만 evidence로
@@ -814,18 +866,20 @@ invalid contract와 사람이 기록한 점수를 계산하며, 근거가 없는
 ```
 
 최종 수용 기준 인터프리터는 Python `3.13.14`다. Freeze source
-`09641f4466b30add7d18d6239a6ff73fb9afa8baccf2fb2d49b2ce5c55a8d96b`
-에서 전체 679개 테스트가 83.750초에 통과했다(측정 wall 81.85초).
-다른 인터프리터 결과는 최종 gate에 사용하지 않는다. 같은 freeze에 대한
-세 축 감사와 수정 후 독립 delta 재검토, Claude CLI Opus read-only 검토도
-미해결 P0/P1/P2 없이 통과했다.
+`79cbc53`에서 전체 901개 테스트가 175.985초에 통과했다(측정 wall
+173.51초). 같은 source의 fresh-clone 검증은 901개 테스트와 capability,
+tool manifest, browser safety, Rev inventory/stdin runner, shell syntax를
+모두 통과해 174.631초가 걸렸다(측정 wall 173.83초). 다른 인터프리터
+결과는 최종 gate에 사용하지 않는다.
 
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
 동작을 검증하지만 실제 Codex 계정과 실제 대회 서버를 사용하는 end-to-end
 성공을 보증하지 않습니다. Luna의 좁은 `agent.flag` model probe는 통과했지만
 configured Sol/Terra/Luna 전체 solve와 실제 Sol Live TUI/native worker
 E2E는 호출하지 않았습니다. 이미지 내부 lifecycle은
-`ctf-os-image/tests/`의 별도 테스트 대상입니다.
+`ctf-os-image/tests/`의 별도 테스트 대상입니다. 실제 Docker Rev proof는
+opt-in `scripts/check-rev-docker-proof.py --image-digest sha256:...`로
+positive 3회와 negative control 3회를 exact pinned image에서 추가 검증합니다.
 
 ## 안전상 중요한 현재 제한
 
@@ -906,6 +960,14 @@ E2E는 호출하지 않았습니다. 이미지 내부 lifecycle은
   exact output 반복을 증명합니다. 사람이 선택한 proof command의 원인성이나
   의도적으로 hardcode한 flag까지 일반적으로 판별하지는 못하며 이는
   operator trust 경계입니다.
+- Managed Rev executable oracle의 현재 범위는 network-none local standalone
+  Linux ELF와 stdin input 하나입니다. 원격 Rev, argv protocol, 여러 입력
+  파일, non-native target과 이미지에 없는 dynamic library는 지원하지 않고
+  fail-closed합니다. mutation control을 모두 거부하지 않는 의도적으로
+  관대한 parser도 proof를 통과하지 못할 수 있습니다.
+- Local Pwn impact, Web multi-user impact, Crypto metamorphic variant,
+  Forensic evidence hash-chain과 Misc transform-DAG의 managed proof oracle은
+  아직 구현되지 않았으며 해당 조합은 proof 등록 단계에서 fail-closed합니다.
 - image digest가 설정되지 않아도 실행은 가능하며 `doctor`가 경고합니다.
 - `work_tree_max_bytes`와 canonical artifact 합계 cap은 문제 디렉터리 전체의
   disk quota가 아닙니다. 누적 `runs/` raw, contest

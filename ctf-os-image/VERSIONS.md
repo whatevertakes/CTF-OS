@@ -1,6 +1,7 @@
 # CTF-OS 버전 검증
 
-검증일: 2026-07-27 (Asia/Seoul)
+초기 검증일: 2026-07-27 (Asia/Seoul)
+Managed Rev 재빌드 검증일: 2026-07-30 (Asia/Seoul)
 
 GitHub 항목은 각 저장소의 `GET /repos/{owner}/{repo}/releases/latest` 응답에서
 `draft=false`, `prerelease=false`인 릴리스와 실제 자산명을 확인했다. 아래 직접
@@ -289,6 +290,63 @@ Playwright headless Chromium을 실제 실행했다. 별도 새 컨테이너 회
 - 최종 이미지의 `/usr/local/bin` 배포 스크립트와
   `/opt/ctf-templates`가 현재 `scripts/`, `templates/` 소스와 byte-for-byte
   일치
+
+위 `sha256:114d...` 기록은 2026-07-27 이미지의 역사적 측정값이며 아래
+Managed Rev primitive 재빌드로 대체됐다.
+
+## 2026-07-30 Managed Rev proof 재빌드
+
+`inventory_v2.py`, 그 publication dependency인 `safe_output.py`, 고정
+`stdin_exec.py`를 managed capability contract에 포함한 뒤 `ctf-os:core`를
+다시 빌드했다. 여기 적은 값은 registry manifest digest가 아니라 이 호스트에서
+Docker가 반환한 exact local image ID다. CTF-OS의
+`runtime.image_digest`도 이 값을 그대로 실행 참조로 사용한다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:bc3d595abd832e5c2e9802ad78e793ca57b94aca6135a4aa58998051970d0ba6` |
+| 생성 시각 | `2026-07-30T09:47:41.419652441+09:00` |
+| Docker inspect Size | 12,512,518,103 bytes |
+| 병합 루트 전개 크기 | **26,249,244,672 bytes** |
+| 도구 manifest | schema v1, 182개 중 182개 사용 가능, failed 0 |
+| capability manifest | schema v2, 8개 중 8개 사용 가능 |
+| 카테고리 수 | crypto 25, forensic 46, korean 1, misc 17, orchestration 9, pwn 28, rev 28, system 10, web 18 |
+
+Managed Rev attestation은 다음 exact file identity를 요구한다.
+
+| capability | contract | SHA-256 |
+|---|---|---|
+| `rev_inventory_v2` | `ctfos.rev.inventory` v2 | `782d41566f3a288b458ae3fdbb04a0684f281158b14286739ea3cc1ecc39daee` |
+| `rev_safe_output` | `ctfos.rev.safe_output` v1 | `24fbff27464dc2ff12a754831ec87a1a8e9a0ffb4dde790bb738f83d97852951` |
+| `rev_stdin_exec` | `ctfos.rev.stdin_exec` v1 | `036edb158461aa32c6688a7f33f3d523f593202409b62377288c8c8e54b45610` |
+
+host source와 이미지 안 세 파일의 hash가 일치함을 확인했다. network-none,
+read-only root, capability drop, no-new-privileges, non-root UID/GID,
+read-only `/challenge`, tmpfs `/work` 조건에서 inventory v2의 stdout과
+published artifact가 byte-for-byte 같았고, stdin runner가 seal한 exact
+bytes를 `/challenge/cat`에 전달했다.
+
+이미지 안 lifecycle shell tests 전체와 browser/tool/capability smoke가
+통과했다. 추적 C fixture를 host에서 컴파일한 뒤 실제
+`DockerSandboxBackend.run_clean_proof`로 서로 다른 clean workspace 여섯
+개를 실행해 다음도 확인했다.
+
+- 동일 accepted input positive 3회는 exit 0과 exact candidate를 보존
+- `xor-first`, `xor-last`, `truncate` control은 exit 7, `rejected`이고
+  candidate가 없음
+- 여섯 run 모두 network `none`, complete/non-truncated stdout/stderr,
+  null capture/orchestration error와 exact stored byte metadata
+- `.proof-live` residue 없음
+
+`.venv/bin/python -m ctf_os pin-image` 뒤 ignored local
+`.ctfos/engine.toml`에 위 exact ID가 기록됐다. `ctfos doctor`는
+`pin_status: matched`, warning 없음이었고 host capability preflight도
+필수 8개, 누락 0, attestation error 0으로 통과했다.
+
+이 local ID pin은 이미 빌드된 runtime의 반복 실행을 고정한다. Ubuntu apt,
+upstream download와 일부 mutable build input까지 content-addressed하게
+고정한 globally reproducible build를 뜻하지는 않는다. tag를 다시 빌드하면
+exact ID smoke, pin과 preflight를 다시 수행해야 한다.
 
 ## 보장 범위
 
