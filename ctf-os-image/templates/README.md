@@ -12,7 +12,7 @@ python3 /work/pwn-template/solve.py /challenge/chall
 
 | 카테고리 | 파일 | 용도 |
 |---|---|---|
-| `web` | `request.py`, `browser.py` | 크기·전체 deadline 제한을 둔 HTTP 요청과 headless Chromium 렌더링 |
+| `web` | `request.py`, `browser.py`, `active_probe.py` | 크기·전체 deadline 제한 HTTP/browser 및 bounded race/OOB transport |
 | `pwn` | `inspect.sh`, `solve.py` | ELF 기본 점검과 payload/transcript 크기·수신 deadline을 둔 pwntools 골격 |
 | `rev` | `analyze.sh`, `angr_solve.py` | 문자열·한글·바이너리 메타데이터 수집과 심볼릭 stdin 탐색 |
 | `crypto` | `rsa.sage` | JSON RSA 매개변수로 개인 지수/정확한 저지수 근 공격 시도 |
@@ -28,6 +28,8 @@ python3 /opt/ctf-templates/web/request.py \
   --max-request-bytes 16777216
 ctf-browser 'http://target:8080/' --session attacker \
   --timeout 20 --screenshot
+ctf-web-probe race 'http://target:8080/claim' --session attacker \
+  --data-file /challenge/request.bin --concurrency 4 --attempts 2
 
 bash /opt/ctf-templates/pwn/inspect.sh /challenge/chall
 python3 /opt/ctf-templates/pwn/solve.py /challenge/chall \

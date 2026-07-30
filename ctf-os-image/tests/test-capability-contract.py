@@ -21,6 +21,9 @@ catalog_source = (REPO_ROOT / "scripts" / "gen-manifest.sh").read_text(
 browser_source = (REPO_ROOT / "templates" / "web" / "browser.py").read_text(
     encoding="utf-8"
 )
+active_probe_source = (
+    REPO_ROOT / "templates" / "web" / "active_probe.py"
+).read_text(encoding="utf-8")
 forensic_index_source = (
     REPO_ROOT / "templates" / "forensic" / "evidence_index.py"
 ).read_text(encoding="utf-8")
@@ -88,6 +91,7 @@ required_catalog_names = {
     "bkcrack",
     "crypto-python",
     "ctf-browser",
+    "ctf-web-probe",
     "evtxexport",
     "fls",
     "frida-trace",
@@ -113,6 +117,11 @@ assert "sqlmap" not in {name.casefold() for name in catalog_names}
 
 ast.parse(browser_source, filename="templates/web/browser.py")
 assert browser_source.startswith("#!/opt/venvs/pw/bin/python\n")
+ast.parse(
+    active_probe_source,
+    filename="templates/web/active_probe.py",
+)
+assert active_probe_source.startswith("#!/usr/bin/env python3\n")
 ast.parse(
     forensic_index_source,
     filename="templates/forensic/evidence_index.py",

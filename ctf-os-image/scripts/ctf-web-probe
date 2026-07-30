@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+template=/opt/ctf-templates/web/active_probe.py
+if [ ! -x "${template}" ]; then
+    printf 'ctf-web-probe: template is unavailable: %s\n' "${template}" >&2
+    exit 127
+fi
+exec /opt/venvs/main/bin/python "${template}" "$@"

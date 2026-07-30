@@ -1067,6 +1067,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web_prove.add_argument("--timeout", type=int, default=900)
 
+    web_active = commands.add_parser(
+        "web-prove-active",
+        help=(
+            "운영자 Web race/OOB spec과 concrete driver를 사전 발행한 "
+            "뒤 vulnerable 3회 + control 3회로 실행 검증"
+        ),
+    )
+    _identity_values(web_active)
+    web_active.add_argument("--spec", required=True)
+    web_active.add_argument("--driver", required=True)
+    web_active.add_argument(
+        "--hypothesis",
+        action="append",
+        default=[],
+    )
+    web_active.add_argument("--timeout", type=int, default=900)
+
+    web_active_query = commands.add_parser(
+        "web-active-query",
+        help="저장된 Web race/OOB 증거를 원본 byte에서 다시 검증",
+    )
+    _identity_values(web_active_query)
+    web_active_query.add_argument("--attempt")
+
     forensic_prove = commands.add_parser(
         "forensic-prove",
         help=(
@@ -2056,6 +2080,39 @@ def main(
                 }
             )
             return 0 if result.confirmed else 1
+
+        if args.command == "web-prove-active":
+            state, result = engine.prove_web_active_probe(
+                _identity(args),
+                operator_spec_locator=args.spec,
+                driver_locator=args.driver,
+                hypothesis_ids=tuple(args.hypothesis),
+                timeout_seconds=args.timeout,
+            )
+            _print_json(
+                {
+                    "authorities": result["authorities"],
+                    "confirmed": result["confirmed"],
+                    "evaluation_sha256": result[
+                        "evaluation_sha256"
+                    ],
+                    "mode": result["mode"],
+                    "reason_codes": result["reason_codes"],
+                    "replay_count": len(
+                        result["record_commitments"]
+                    ),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0 if result["confirmed"] else 1
+
+        if args.command == "web-active-query":
+            result = engine.query_web_active_probe(
+                _identity(args),
+                attempt_id=args.attempt,
+            )
+            _print_json(result)
+            return 0 if result["ok"] else 1
 
         if args.command == "forensic-prove":
             state, result = engine.prove_forensic_assertion(

@@ -896,7 +896,8 @@ RUN rm -rf /root/.cache /root/.cargo/registry /root/.cargo/git \
 
 # 래퍼·인덱스·잡 시스템 (별도 산출물)
 #   ctfwrap, ctf-bg, ctf-jobs, ctf-log, ctf-kill, ctf-idle, ctf-tools,
-#   ctf-flag, ctf-browser, ktext, ghidra-decompile, entrypoint.sh
+#   ctf-flag, ctf-browser, ctf-web-probe, ktext, ghidra-decompile,
+#   entrypoint.sh
 COPY scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/ctf* /usr/local/bin/ktext /usr/local/bin/ghidra-decompile \
              /usr/local/bin/entrypoint.sh /usr/local/bin/gen-manifest.sh
@@ -916,7 +917,7 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
       and (.failed | type == "array" and length == 0) \
       and (.tools | type == "array" and length > 0) \
       and all(.tools[]; .available == true and (.path | startswith("/"))) \
-      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
+      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ctf-web-probe", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
       /tools/manifest.json >/dev/null \
  && python3 /usr/local/bin/ctf-tools --render-md > /tools/TOOLS.md \
  && python3 /usr/local/bin/ctf-tools --json --info ctfwrap \

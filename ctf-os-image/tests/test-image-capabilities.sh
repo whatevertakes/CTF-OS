@@ -47,7 +47,8 @@ jq -e '
 ' "${test_root}/managed-capabilities.json" >/dev/null
 
 required_tools=(
-    bkcrack crypto-python ctf-browser evtxexport fls frida-trace hash_extender
+    bkcrack crypto-python ctf-browser ctf-web-probe evtxexport fls
+    frida-trace hash_extender
     msoffcrypto-tool pahole pdfimages playwright pw-python qemu-img
     qemu-system-aarch64 rabin2 ropr sage-python uncompyle6 unsquashfs
     wasm2wat web-python wine wine64
@@ -279,7 +280,7 @@ assert_noarg_exit_2() {
 }
 
 for tool in \
-    crypto-python ctf-browser pw-python qemu-system-mips \
+    crypto-python ctf-browser ctf-web-probe pw-python qemu-system-mips \
     qemu-system-x86_64 sage-python web-python wine wine64
 do
     assert_noarg_exit_2 "${tool}"

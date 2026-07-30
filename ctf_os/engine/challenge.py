@@ -24927,6 +24927,68 @@ class ChallengeEngine:
             _session_owned=_session_owned,
         )
 
+    def prove_web_active_probe(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        operator_spec_locator: str,
+        driver_locator: str,
+        hypothesis_ids: Sequence[str] = (),
+        timeout_seconds: int = 900,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, dict[str, object]]:
+        """Run one bounded Web race/OOB vulnerable3-control3 matrix."""
+
+        from ctf_os.engine.web_active_probe_hotpath import (
+            prove_web_active_probe,
+        )
+
+        return prove_web_active_probe(
+            self,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            driver_locator=driver_locator,
+            hypothesis_ids=tuple(hypothesis_ids),
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
+    def query_web_active_probe(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        attempt_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return a raw-free Web active-probe capsule after byte checks."""
+
+        from ctf_os.engine.web_active_probe_query import (
+            query_web_active_probe,
+        )
+
+        return query_web_active_probe(
+            self,
+            identity,
+            attempt_id=attempt_id,
+        )
+
+    def validate_web_active_probe(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        attempt_id: str | None = None,
+    ) -> dict[str, object]:
+        """Physically revalidate one Web race/OOB proof graph."""
+
+        from ctf_os.engine.web_active_probe_query import (
+            validate_web_active_probe_query,
+        )
+
+        return validate_web_active_probe_query(
+            self,
+            identity,
+            attempt_id=attempt_id,
+        )
+
     def prove_forensic_assertion(
         self,
         identity: ChallengeIdentity,

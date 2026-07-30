@@ -14984,6 +14984,18 @@ class ChallengeState:
 
             errors.extend(web_impact_state_graph_errors(self))
 
+            # Bounded race and sandbox-local OOB probes own an exact six-run
+            # vulnerable3/control3 graph.  Revalidate its preissued
+            # identities and all raw-free record links on every state load so
+            # a copied or rehashed marker cannot create executed authority.
+            from ctf_os.engine.web_active_probe_state import (
+                web_active_probe_state_graph_errors,
+            )
+
+            errors.extend(
+                web_active_probe_state_graph_errors(self)
+            )
+
             # As above, the Forensic projection uses model types while its
             # exact validator owns the authorized multi-receipt graph and
             # raw-free executed assertion Fact.  Generic exceptions are

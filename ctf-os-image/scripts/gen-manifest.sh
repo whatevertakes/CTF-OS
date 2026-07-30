@@ -199,6 +199,7 @@ system|xxd|xxd|Hex dump and binary patch utility||hex
 system|yara|yara|Pattern matching for files and processes||signature
 web|curl|curl|HTTP and general protocol client||http
 web|ctf-browser|ctf-browser|Bounded headless Chromium navigation and artifact capture|browser|browser,automation
+web|ctf-web-probe|ctf-web-probe|Bounded race and sandbox-local OOB callback probe||race,oob,http
 web|dalfox|dalfox|XSS parameter analysis and scanner||xss
 web|feroxbuster|feroxbuster|Recursive HTTP content discovery||fuzzing
 web|ffuf|ffuf|Fast web fuzzer||fuzzing
