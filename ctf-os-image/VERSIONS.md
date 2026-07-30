@@ -473,10 +473,44 @@ proof, 원격 portability, challenge solve, 자동 제출 권한을 부여하지
 실제 엔진은 3 positive/3 negative 결과를 preissued state identity와
 별도로 결속해야 한다.
 
+## 2026-07-31 Web active-probe 최종 release 이미지
+
+브라우저/HTTP 상태 timeline에 더해 race와 challenge-scoped OOB 효과를
+실제 internal Docker target에서 반복하는 `ctf-web-probe`를 포함해 최종
+release 이미지를 다시 빌드하고 pin했다.
+
+| 검증 | 결과 |
+|---|---:|
+| exact local image ID | `sha256:82ef8c155a8bbe9cfe33ce1a475425c77097b6fcefc32b678da1b14bf9c8339a` |
+| 생성 시각 | `2026-07-31T06:43:19.033337823+09:00` |
+| Docker inspect Size | 12,512,621,382 bytes |
+| 도구 manifest | schema v1, 183개 중 183개 사용 가능, failed 0 |
+| managed capability manifest | schema v2, 11개 중 11개 사용 가능 |
+
+같은 exact image와 engine hot path를 사용한 실제 Docker smoke에서 다음을
+확인했다.
+
+- race vulnerable/control을 각각 6회 실행하고 실제 최대 동시성 2와
+  role-separated request timeline을 재계산
+- OOB vulnerable 3회는 callback을 관측하고 control 3회는 callback 0회
+- 총 29개/26개의 bounded physical artifact와 각 hash를 canonical state에
+  결속
+- Web impact vulnerable/control은 각각 18개 target request와 6개 replay로
+  200/403 differential을 재현
+- source-to-sink는 실행 관측이 없는 fixture에서 `false`로 유지하고,
+  모델·copied trace·observer 자기 보고로 승격할 수 없음을 확인
+- 모든 target은 ephemeral `--internal` Docker network에 한정하고 외부 CTF
+  요청, flag candidate, 자동 제출은 0개
+
+`ctfos doctor`는 이 이미지의 exact pin match, capability attestation error
+0, warning 0, GPU와 KVM 준비 상태를 확인했다. 이 release smoke는 로컬
+결정적 Web gate의 실행과 증거 결속을 보장할 뿐 live Web solve, 원격
+portability 또는 source-to-sink 관측을 주장하지 않는다.
+
 ## 보장 범위
 
 위 검증은 이미지 빌드, catalog 노출, 무인 실행 계약, 그리고 대표 기능 경로를
-보장한다. 182개 도구의 모든 옵션과 지원 파일 형식을 실제 CTF 샘플로 전수
+보장한다. 183개 도구의 모든 옵션과 지원 파일 형식을 실제 CTF 샘플로 전수
 검증했다는 뜻은 아니다. GPU는 호스트 NVIDIA 런타임, KVM 가속은 `/dev/kvm`,
 디버깅은 ptrace 권한, 네트워크 도구는 대상 연결과 필요한 capability가 별도로
 있어야 한다. 이 외부 조건이 없을 때도 이미지 자체의 catalog와 무인 실행
