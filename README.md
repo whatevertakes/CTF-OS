@@ -47,22 +47,6 @@ ctfos --help
 DOCKER_BUILDKIT=1 docker build -t ctf-os:core ./ctf-os-image
 ```
 
-Managed 실행에 쓰는 이미지는 tag가 아니라 exact local image ID로 고정합니다.
-릴리스 순서는 `build → exact-ID smoke → pin → doctor → challenge
-preflight`입니다. tag를 다시 빌드하는 것만으로 이미 고정된 실행 참조가
-바뀌지는 않습니다.
-
-```sh
-CTFOS_RELEASE_IMAGE_ID="$(
-  docker image inspect --format '{{.Id}}' ctf-os:core
-)"
-.venv/bin/python scripts/check-rev-docker-proof.py \
-  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
-ctfos pin-image
-ctfos doctor
-ctfos preflight 'Demo CTF' rev 'Example'
-```
-
 GPU를 쓸 호스트에서 NVIDIA Container Toolkit이 아직 없다면
 `scripts/setup-nvidia-container-toolkit`을 별도로 실행할 수 있습니다. 이
 스크립트는 호스트 패키지와 Docker 설정을 변경하므로 내용을 확인한 뒤
@@ -74,8 +58,6 @@ GPU를 쓸 호스트에서 NVIDIA Container Toolkit이 아직 없다면
 
 ```sh
 ctfos init
-ctfos pin-image
-ctfos doctor
 ```
 
 설정은 `.ctfos/engine.toml`에 생성됩니다. 기본 model ID 라우팅은
@@ -95,6 +77,22 @@ proof는 같은 exact image ID를 실행합니다. 이미지를 다시 빌드했
 읽기 전용으로 보고합니다. `doctor --calibrate`도 설정을 자동 변경하지 않고
 권장값만 출력합니다. `ok: true`만 보지 말고 `warnings`에서 이미지 부재와
 image digest 미고정 여부도 확인하십시오.
+
+Managed 실행에 쓰는 이미지는 tag가 아니라 exact local image ID로 고정합니다.
+최초 `ctfos init` 뒤의 릴리스 순서는
+`build → exact-ID smoke → pin → doctor → challenge preflight`입니다.
+tag를 다시 빌드하는 것만으로 이미 고정된 실행 참조가 바뀌지는 않습니다.
+
+```sh
+CTFOS_RELEASE_IMAGE_ID="$(
+  docker image inspect --format '{{.Id}}' ctf-os:core
+)"
+uv run python scripts/check-rev-docker-proof.py \
+  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
+ctfos pin-image
+ctfos doctor
+ctfos preflight 'Demo CTF' rev 'Example'
+```
 
 Batch의 논리적 worker 수와 실제 provider 호출 상한은 서로 다른 값입니다.
 
