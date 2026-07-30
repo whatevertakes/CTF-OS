@@ -107,7 +107,11 @@ from ctf_os.contracts.pwn_runtime_snapshot_v1 import (
     PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS,
 )
 from ctf_os.director.leases import LeaseBroker
-from ctf_os.director.resources import ResourceLimits, tool_profile
+from ctf_os.director.resources import (
+    ResourceLimits,
+    ResourceVector,
+    tool_profile,
+)
 from ctf_os.engine.context_archive import archive_context_pack
 from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.engine.crypto_metamorphic import (
@@ -202,6 +206,22 @@ from ctf_os.engine.pwn_ip_control import (
     evaluate_pwn_ip_control,
     pwn_ip_control_child_experiment_id,
     validate_pwn_ip_control_plan_document,
+)
+from ctf_os.engine.pwn_leak import (
+    PWN_LEAK_MAX_RESULT_BYTES,
+    PWN_LEAK_MIN_NONCE_BYTES,
+    PWN_LEAK_REPLAY_COUNT,
+    PwnLeakPlan,
+    PwnLeakPreissuedReplayIdentity,
+    PwnLeakReplayEvidence,
+    PwnLeakResult,
+    PwnLeakStatus,
+    PwnLeakTrustedReplayExpectation,
+    build_pwn_leak_trusted_replay_expectation,
+    derive_pwn_leak_plan,
+    evaluate_pwn_leak,
+    pwn_leak_child_experiment_id,
+    validate_pwn_leak_plan_document,
 )
 from ctf_os.engine.pwn_runtime_snapshot import (
     PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR,
@@ -432,6 +452,30 @@ class _PwnIpControlCanonicalInputs:
     baseline_evidence: PwnIpControlReplayEvidence
     plan: PwnIpControlPlan
     variant_artifacts: tuple[ArtifactReference, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PwnLeakCanonicalInputs:
+    """Canonical preissued inputs for one three-replay leak proof."""
+
+    child_experiment_id: str
+    baseline_experiment_id: str
+    disclosure: _PwnDisclosureCanonicalInputs
+    disclosure_result: PwnDisclosureResult
+    baseline_payload: bytes
+    plan: PwnLeakPlan
+    expectation: PwnLeakTrustedReplayExpectation
+    transport_recipes: tuple[PwnRuntimeSnapshotRecipe, ...]
+    variant_artifacts: tuple[ArtifactReference, ...]
+    capability_artifacts: tuple[ArtifactReference, ...]
+    request_documents: tuple[dict[str, Any], ...]
+    request_paths: tuple[str, ...]
+    request_sha256s: tuple[str, ...]
+    run_ids: tuple[str, ...]
+    receipt_ids: tuple[str, ...]
+    stdout_artifact_ids: tuple[str, ...]
+    stderr_artifact_ids: tuple[str, ...]
+    execution_contract_sha256s: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1394,6 +1438,25 @@ _PWN_IP_CONTROL_KEEP_CONDITION = (
 )
 _PWN_IP_CONTROL_DROP_CONDITION = (
     "any replay, binding, signal, RIP, or maps check is unverifiable"
+)
+_PWN_LEAK_ENGINE_COMMAND = "ctfos-engine:pwn-leak-v1"
+_PWN_LEAK_ENGINE_EXECUTOR = "pwn_leak_v1"
+_PWN_LEAK_RESULT_KEY = "pwn_leak_evidence"
+_PWN_LEAK_PROTOCOL = "pwn_leak_runtime_replay_v1"
+_PWN_LEAK_TIMEOUT_SECONDS = 120
+_PWN_LEAK_REPLAY_TIMEOUT_SECONDS = int(
+    PWN_RUNTIME_SNAPSHOT_V1_TARGET_TIMEOUT_SECONDS
+) + 10
+_PWN_LEAK_EXPECTED_OBSERVATION = (
+    "three preissued clean replays reproduce one map-relative runtime "
+    "address disclosure at an exact output locus"
+)
+_PWN_LEAK_KEEP_CONDITION = (
+    "typed result proves only leak_proven after exact recomputation"
+)
+_PWN_LEAK_DROP_CONDITION = (
+    "any request, receipt, input, source, image, mapping, or locus check "
+    "is unverifiable"
 )
 
 
@@ -8741,6 +8804,2253 @@ class ChallengeEngine:
         )
         return committed
 
+    def _pwn_leak_baseline(
+        self,
+        state: ChallengeState,
+        baseline: Experiment,
+    ) -> tuple[
+        _PwnDisclosureCanonicalInputs,
+        PwnDisclosureResult,
+        bytes,
+        PwnLeakPlan,
+    ]:
+        """Recompute one complete disclosure and derive its exact replay plan."""
+
+        disclosure_inputs = self._pwn_disclosure_inputs_from_state(
+            state,
+            baseline,
+        )
+        envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            baseline.extra["pwn_disclosure"]
+        )
+        expectation = envelope.trusted_receipt_expectation
+        if (
+            envelope.phase is not PwnDisclosurePhase.COMPLETE
+            or envelope.result is None
+            or expectation is None
+        ):
+            raise EngineError(
+                "Pwn leak proof requires a complete disclosure reduction"
+            )
+        disclosure_result = self._recompute_pwn_disclosure_result(
+            state,
+            disclosure_inputs,
+            expectation,
+        )
+        if (
+            disclosure_result != envelope.result
+            or disclosure_result.evidence_sha256
+            != envelope.result_sha256
+        ):
+            raise EngineError("Pwn leak disclosure result changed")
+        candidates = tuple(
+            item
+            for item in disclosure_result.candidates
+            if item.usable
+        )
+        if not candidates:
+            raise ValueError("disclosure_not_eligible")
+        candidate = candidates[0]
+        payload = self._read_pwn_disclosure_artifact(
+            state,
+            disclosure_inputs.payload_artifact,
+            maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
+        )
+        if len(payload) < PWN_LEAK_MIN_NONCE_BYTES:
+            raise ValueError("plan_binding_mismatch")
+        plan = derive_pwn_leak_plan(
+            disclosure_result,
+            disclosure_inputs.snapshot_recipe,
+            payload,
+            candidate_byte_offset=candidate.byte_offset,
+            candidate_hex_width=candidate.hex_width,
+            nonce_offset=len(payload) - PWN_LEAK_MIN_NONCE_BYTES,
+            nonce_width_bytes=PWN_LEAK_MIN_NONCE_BYTES,
+        )
+        validate_pwn_leak_plan_document(plan.to_dict())
+        return disclosure_inputs, disclosure_result, payload, plan
+
+    @staticmethod
+    def _pwn_leak_transport_recipe(
+        disclosure: _PwnDisclosureCanonicalInputs,
+        artifact: ArtifactReference,
+        *,
+        run_id: str,
+    ) -> PwnRuntimeSnapshotRecipe:
+        baseline = disclosure.snapshot_recipe
+        return PwnRuntimeSnapshotRecipe(
+            configuration_epoch=baseline.configuration_epoch,
+            child_experiment_id=baseline.child_experiment_id,
+            parent_experiment_id=baseline.parent_experiment_id,
+            primary_elf_locator=baseline.primary_elf_locator,
+            source_manifest_sha256=baseline.source_manifest_sha256,
+            source_sha256=baseline.source_sha256,
+            source_size_bytes=baseline.source_size_bytes,
+            payload_artifact_id=artifact.id,
+            payload_source_run_id=run_id,
+            payload_artifact_locator=artifact.path,
+            payload_sha256=artifact.sha256,
+            payload_size_bytes=int(artifact.size or 0),
+            parent_crash_recipe_sha256=(
+                baseline.parent_crash_recipe_sha256
+            ),
+            parent_crash_evaluation_sha256=(
+                baseline.parent_crash_evaluation_sha256
+            ),
+            expected_signal_number=baseline.expected_signal_number,
+            image_reference=baseline.image_reference,
+            image_digest=baseline.image_digest,
+            producer_file_sha256=baseline.producer_file_sha256,
+        )
+
+    @staticmethod
+    def _pwn_leak_execution_contract(
+        *,
+        child_id: str,
+        baseline_id: str,
+        ordinal: int,
+        plan: PwnLeakPlan,
+        recipe: PwnRuntimeSnapshotRecipe,
+        capability_artifact: ArtifactReference,
+        receipt_id: str,
+        stdout_artifact_id: str,
+        stderr_artifact_id: str,
+        request: ResourceVector,
+    ) -> dict[str, Any]:
+        argv = recipe.argv()
+        return {
+            "schema_version": 1,
+            "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+            "protocol": _PWN_LEAK_PROTOCOL,
+            "plan_recipe_sha256": plan.recipe_sha256,
+            "ordinal": ordinal,
+            "baseline_experiment_id": baseline_id,
+            "leak_experiment_id": child_id,
+            "transport_recipe_sha256": recipe.recipe_sha256,
+            "configuration_epoch": recipe.configuration_epoch,
+            "preissued": {
+                "receipt_id": receipt_id,
+                "capability_attestation_artifact_id": (
+                    capability_artifact.id
+                ),
+                "stdout_artifact_id": stdout_artifact_id,
+                "output_artifact_id": stderr_artifact_id,
+            },
+            "source": {
+                "locator": recipe.primary_elf_locator,
+                "manifest_sha256": recipe.source_manifest_sha256,
+                "sha256": recipe.source_sha256,
+                "size_bytes": recipe.source_size_bytes,
+            },
+            "payload": {
+                "artifact_id": recipe.payload_artifact_id,
+                "source_run_id": recipe.payload_source_run_id,
+                "sha256": recipe.payload_sha256,
+                "size_bytes": recipe.payload_size_bytes,
+                "destination_locator": (
+                    PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                ),
+            },
+            "argv": list(argv),
+            "sandbox": {
+                "method": PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                "one_shot": PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                "outer_timeout_seconds": (
+                    _PWN_LEAK_REPLAY_TIMEOUT_SECONDS
+                ),
+                "resource_request": request.as_dict(),
+                "image": {
+                    "reference": recipe.image_reference,
+                    "digest": recipe.image_digest,
+                },
+                "network": PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                "network_target": None,
+            },
+            "producer": {
+                "interpreter_path": (
+                    PWN_RUNTIME_SNAPSHOT_PRODUCER_INTERPRETER_PATH
+                ),
+                "path": PWN_RUNTIME_SNAPSHOT_PRODUCER_PATH,
+                "capability_name": (
+                    PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                ),
+                "file_sha256": recipe.producer_file_sha256,
+                "capability_attestation_artifact_id": (
+                    capability_artifact.id
+                ),
+                "capability_attestation_sha256": (
+                    capability_artifact.sha256
+                ),
+            },
+        }
+
+    def _pwn_leak_require_fresh_source(
+        self,
+        state: ChallengeState,
+        plan: PwnLeakPlan,
+        recipe: PwnRuntimeSnapshotRecipe,
+    ) -> None:
+        """Fail closed when incoming bytes, image, or config epoch drift."""
+
+        inventory = inventory_challenge(self.challenge_input(state.identity))
+        current_files = tuple(
+            (item.path, item.sha256, item.size)
+            for item in inventory.files
+        )
+        expected_files = tuple(
+            (item.path, item.sha256, item.size)
+            for item in state.source_inventory
+        )
+        source = next(
+            (
+                item
+                for item in inventory.files
+                if item.path == recipe.primary_elf_locator
+            ),
+            None,
+        )
+        if (
+            inventory.manifest_sha256 != plan.source_manifest_sha256
+            or state.metadata.get("source_manifest_sha256")
+            != plan.source_manifest_sha256
+            or current_files != expected_files
+            or source is None
+            or source.sha256 != plan.source_sha256
+            or source.size != plan.source_size_bytes
+            or state.configuration_epoch != recipe.configuration_epoch
+            or self.config.runtime.image != recipe.image_reference
+            or self.config.runtime.image_digest != recipe.image_digest
+        ):
+            raise EngineError(
+                "Pwn leak source, image, or configuration binding changed"
+            )
+
+    def _register_pwn_leak_child_if_applicable(
+        self,
+        identity: ChallengeIdentity,
+        state: ChallengeState,
+    ) -> ChallengeState:
+        """Preissue one complete temporal replay contract per disclosure."""
+
+        existing_baselines = {
+            item.extra.get("baseline_experiment_id")
+            for item in state.experiments
+            if item.extra.get("engine_executor")
+            == _PWN_LEAK_ENGINE_EXECUTOR
+        }
+        eligible = [
+            item
+            for item in state.experiments
+            if (
+                item.status is ExperimentStatus.COMPLETED
+                and item.extra.get("managed_contract_version") == 2
+                and item.extra.get("engine_executor")
+                == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
+                and item.id not in existing_baselines
+            )
+        ]
+        if not eligible:
+            return state
+        baseline = eligible[0]
+        try:
+            (
+                disclosure,
+                disclosure_result,
+                baseline_payload,
+                plan,
+            ) = self._pwn_leak_baseline(state, baseline)
+        except ValueError:
+            return state
+        child_id = pwn_leak_child_experiment_id(baseline.id)
+        paths = self.store.challenge_paths(identity)
+        root = ensure_private_directory(
+            paths.artifacts
+            / "snapshots"
+            / f"pwn-leak-{plan.recipe_sha256}"
+        )
+        request_profile = tool_profile(
+            "light",
+            needs_kvm=False,
+            network=False,
+        )
+        if request_profile.network != 0:
+            raise EngineError("Pwn leak proof must deny network")
+        deadline, _deadline_epoch = self._budget_deadline_pair(
+            state,
+            _PWN_LEAK_TIMEOUT_SECONDS,
+        )
+        preexisting_artifact_ids = tuple(
+            sorted(item.id for item in state.artifacts)
+        )
+        variant_artifacts: list[ArtifactReference] = []
+        capability_artifacts: list[ArtifactReference] = []
+        transport_recipes: list[PwnRuntimeSnapshotRecipe] = []
+        request_documents: list[dict[str, Any]] = []
+        request_paths: list[str] = []
+        request_sha256s: list[str] = []
+        execution_contract_sha256s: list[str] = []
+        run_ids: list[str] = []
+        receipt_ids: list[str] = []
+        stdout_artifact_ids: list[str] = []
+        stderr_artifact_ids: list[str] = []
+        preissued_identities: list[PwnLeakPreissuedReplayIdentity] = []
+        run_references: list[RunReference] = []
+        created_run_ids: list[str] = []
+        pending_artifacts: list[ArtifactReference] = []
+        source_run = next(
+            (
+                item
+                for item in state.runs
+                if item.id
+                == disclosure.crash_recipe.payload_source_run_id
+            ),
+            None,
+        )
+        if source_run is None:
+            raise EngineError("Pwn leak source Builder run is unavailable")
+        try:
+            for ordinal, payload in enumerate(plan.payloads, start=1):
+                run_id = _run_id(f"pwn-leak-{ordinal}")
+                receipt_id = _record_id("RCPT", run_id, "result")
+                capability_id = _record_id(
+                    "A",
+                    run_id,
+                    "capability",
+                )
+                stdout_id = _record_id("A", run_id, "stdout")
+                stderr_id = _record_id("A", run_id, "stderr")
+                payload_path = root / f"{ordinal:02d}-payload.bin"
+                atomic_write_bytes(payload_path, payload, mode=0o400)
+                variant = ArtifactReference(
+                    id=_record_id("A", run_id, "input"),
+                    path=payload_path.relative_to(paths.root).as_posix(),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                    source_run_id=run_id,
+                    media_type="application/octet-stream",
+                    size=len(payload),
+                    extra={
+                        "kind": "pwn_leak_variant_payload",
+                        "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                        "plan_recipe_sha256": plan.recipe_sha256,
+                        "ordinal": ordinal,
+                        "context_visibility": "engine_private",
+                    },
+                )
+                pending_artifacts.append(variant)
+                recipe = self._pwn_leak_transport_recipe(
+                    disclosure,
+                    variant,
+                    run_id=run_id,
+                )
+                capability = self._probe_pwn_runtime_snapshot_capability(
+                    recipe,
+                    deadline_monotonic_seconds=deadline,
+                )
+                capability_path = (
+                    root / f"{ordinal:02d}-capability-attestation.json"
+                )
+                capability_bytes = capability.canonical_bytes()
+                atomic_write_bytes(
+                    capability_path,
+                    capability_bytes,
+                    mode=0o400,
+                )
+                capability_artifact = ArtifactReference(
+                    id=capability_id,
+                    path=capability_path.relative_to(paths.root).as_posix(),
+                    sha256=capability.evidence_sha256,
+                    source_run_id=None,
+                    media_type="application/json",
+                    size=len(capability_bytes),
+                    extra={
+                        "kind": "pwn_leak_capability_attestation",
+                        "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                        "plan_recipe_sha256": plan.recipe_sha256,
+                        "transport_recipe_sha256": recipe.recipe_sha256,
+                        "ordinal": ordinal,
+                        "context_visibility": "engine_private",
+                    },
+                )
+                pending_artifacts.append(capability_artifact)
+                contract = self._pwn_leak_execution_contract(
+                    child_id=child_id,
+                    baseline_id=baseline.id,
+                    ordinal=ordinal,
+                    plan=plan,
+                    recipe=recipe,
+                    capability_artifact=capability_artifact,
+                    receipt_id=receipt_id,
+                    stdout_artifact_id=stdout_id,
+                    stderr_artifact_id=stderr_id,
+                    request=request_profile,
+                )
+                contract_sha256 = hashlib.sha256(
+                    _pwn_crash_canonical_bytes(contract)
+                ).hexdigest()
+                run_paths = self.store.create_run(
+                    identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "pwn_leak_replay",
+                        "experiment_id": child_id,
+                        "ordinal": ordinal,
+                        "preissued": copy.deepcopy(
+                            contract["preissued"]
+                        ),
+                        "execution_contract": contract,
+                        "execution_contract_sha256": contract_sha256,
+                    },
+                    base_revision=state.revision,
+                )
+                created_run_ids.append(run_id)
+                request_document = read_json(run_paths.request)
+                if type(request_document) is not dict:
+                    raise EngineError(
+                        "Pwn leak request is not canonical"
+                    )
+                request_sha256 = sha256_file(run_paths.request)
+                preissued_identities.append(
+                    PwnLeakPreissuedReplayIdentity(
+                        ordinal=ordinal,
+                        run_id=run_id,
+                        receipt_id=receipt_id,
+                        request_sha256=request_sha256,
+                        execution_contract_sha256=contract_sha256,
+                        capability_attestation_artifact_id=capability_id,
+                        stdout_artifact_id=stdout_id,
+                        output_artifact_id=stderr_id,
+                    )
+                )
+                run_references.append(
+                    RunReference(
+                        id=run_id,
+                        base_revision=state.revision,
+                        status=RunStatus.CREATED,
+                        request_path=run_paths.request.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        result_path=run_paths.result.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        validation_path=run_paths.validation.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        role="pwn_leak",
+                        origin=RunOrigin.MANAGED_TOOL,
+                        session_id=source_run.session_id,
+                        cycle_id=source_run.cycle_id,
+                        wave_id=source_run.wave_id,
+                        configuration_epoch=recipe.configuration_epoch,
+                        extra={
+                            "experiment_id": child_id,
+                            "pwn_leak_preissued": {
+                                "schema_version": 1,
+                                "ordinal": ordinal,
+                                "plan_recipe_sha256": plan.recipe_sha256,
+                                "request_sha256": request_sha256,
+                                "execution_contract_sha256": (
+                                    contract_sha256
+                                ),
+                            },
+                        },
+                    )
+                )
+                variant_artifacts.append(variant)
+                capability_artifacts.append(capability_artifact)
+                transport_recipes.append(recipe)
+                request_documents.append(request_document)
+                request_paths.append(
+                    run_paths.request.relative_to(paths.root).as_posix()
+                )
+                request_sha256s.append(request_sha256)
+                execution_contract_sha256s.append(contract_sha256)
+                run_ids.append(run_id)
+                receipt_ids.append(receipt_id)
+                stdout_artifact_ids.append(stdout_id)
+                stderr_artifact_ids.append(stderr_id)
+
+            expectation = build_pwn_leak_trusted_replay_expectation(
+                replay_recipes=tuple(transport_recipes),
+                preissued_identities=tuple(preissued_identities),
+                preexisting_artifact_ids=preexisting_artifact_ids,
+            )
+            child = Experiment(
+                id=child_id,
+                hypothesis_ids=list(baseline.hypothesis_ids),
+                command=_PWN_LEAK_ENGINE_COMMAND,
+                expected_observation=_PWN_LEAK_EXPECTED_OBSERVATION,
+                keep_if=_PWN_LEAK_KEEP_CONDITION,
+                drop_if=_PWN_LEAK_DROP_CONDITION,
+                timeout_seconds=_PWN_LEAK_TIMEOUT_SECONDS,
+                resource_class="light",
+                kind=ExperimentKind.PROBE,
+                status=ExperimentStatus.REGISTERED,
+                source_run_id=(
+                    disclosure.crash_recipe.payload_source_run_id
+                ),
+                artifact_ids=[
+                    *[item.id for item in variant_artifacts],
+                    *[item.id for item in capability_artifacts],
+                ],
+                extra={
+                    "managed_contract_version": 1,
+                    "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                    "baseline_experiment_id": baseline.id,
+                    "pwn_leak_plan": plan.to_dict(),
+                    "trusted_replay_expectation": expectation.to_dict(),
+                    "trusted_replay_expectation_sha256": (
+                        expectation.evidence_sha256
+                    ),
+                    "expectation_source_state_revision": state.revision,
+                    "preissued_requests": copy.deepcopy(
+                        request_documents
+                    ),
+                    "request_paths": list(request_paths),
+                    "request_sha256s": list(request_sha256s),
+                    "execution_contract_sha256s": list(
+                        execution_contract_sha256s
+                    ),
+                    "run_ids": list(run_ids),
+                    "receipt_ids": list(receipt_ids),
+                    "stdout_artifact_ids": list(stdout_artifact_ids),
+                    "stderr_artifact_ids": list(stderr_artifact_ids),
+                },
+            )
+
+            def verify_preissue() -> None:
+                (
+                    _disclosure,
+                    current_result,
+                    current_payload,
+                    current_plan,
+                ) = self._pwn_leak_baseline(state, baseline)
+                if (
+                    current_result != disclosure_result
+                    or current_payload != baseline_payload
+                    or current_plan != plan
+                ):
+                    raise EngineError(
+                        "Pwn leak baseline changed before preissue commit"
+                    )
+                self._pwn_leak_require_fresh_source(
+                    state,
+                    plan,
+                    transport_recipes[0],
+                )
+                for artifact, expected in zip(
+                    variant_artifacts,
+                    plan.payloads,
+                    strict=True,
+                ):
+                    observed = read_bounded_regular(
+                        paths.root,
+                        artifact.path,
+                        maximum_bytes=(
+                            PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+                        ),
+                        expected_sha256=artifact.sha256,
+                        expected_size=artifact.size,
+                    )
+                    if observed != expected:
+                        raise EngineError(
+                            "Pwn leak variant changed before preissue commit"
+                        )
+                for ordinal, (
+                    artifact,
+                    recipe,
+                    request_path,
+                    request_document,
+                    request_sha256,
+                    contract_sha256,
+                ) in enumerate(
+                    zip(
+                        capability_artifacts,
+                        transport_recipes,
+                        request_paths,
+                        request_documents,
+                        request_sha256s,
+                        execution_contract_sha256s,
+                        strict=True,
+                    ),
+                    start=1,
+                ):
+                    expected_capability = (
+                        PwnRuntimeSnapshotCapabilityAttestation(
+                            image_digest=recipe.image_digest,
+                            recipe_sha256=recipe.recipe_sha256,
+                        ).canonical_bytes()
+                    )
+                    observed_capability = read_bounded_regular(
+                        paths.root,
+                        artifact.path,
+                        maximum_bytes=64 * 1024,
+                        expected_sha256=artifact.sha256,
+                        expected_size=artifact.size,
+                    )
+                    observed_request = read_bounded_regular(
+                        paths.root,
+                        request_path,
+                        maximum_bytes=256 * 1024,
+                        expected_sha256=request_sha256,
+                        expected_size=len(
+                            canonical_json_bytes(request_document)
+                        ),
+                    )
+                    parsed_request = strict_json_loads(
+                        observed_request,
+                        max_bytes=256 * 1024,
+                    )
+                    if (
+                        observed_capability != expected_capability
+                        or parsed_request != request_document
+                        or request_document.get("ordinal") != ordinal
+                        or request_document.get(
+                            "execution_contract_sha256"
+                        )
+                        != contract_sha256
+                    ):
+                        raise EngineError(
+                            "Pwn leak preissued request changed"
+                        )
+
+            def register(current: ChallengeState) -> None:
+                if (
+                    tuple(sorted(item.id for item in current.artifacts))
+                    != expectation.preexisting_artifact_ids
+                    or any(
+                        item.id == child.id
+                        for item in current.experiments
+                    )
+                ):
+                    raise EngineError(
+                        "Pwn leak preexisting identity snapshot changed"
+                    )
+                latest_baseline = next(
+                    item
+                    for item in current.experiments
+                    if item.id == baseline.id
+                )
+                (
+                    _latest_disclosure,
+                    latest_result,
+                    latest_payload,
+                    latest_plan,
+                ) = self._pwn_leak_baseline(
+                    current,
+                    latest_baseline,
+                )
+                if (
+                    latest_result != disclosure_result
+                    or latest_payload != baseline_payload
+                    or latest_plan != plan
+                ):
+                    raise EngineError(
+                        "Pwn leak baseline changed before registration"
+                    )
+                current.artifacts.extend(copy.deepcopy(pending_artifacts))
+                current.runs.extend(copy.deepcopy(run_references))
+                current.experiments.append(copy.deepcopy(child))
+
+            committed = self.store.update(
+                identity,
+                register,
+                expected_revision=state.revision,
+                commit_guard=verify_preissue,
+                pre_replace_guard=verify_preissue,
+            )
+            return committed
+        except BaseException:
+            canonical_run_ids: set[str] = set()
+            canonical_artifact_ids: set[str] = set()
+            try:
+                canonical = self.store.load(identity, recover=False)
+                canonical_run_ids = {item.id for item in canonical.runs}
+                canonical_artifact_ids = {
+                    item.id for item in canonical.artifacts
+                }
+            except BaseException:
+                raise
+            if not (
+                canonical_run_ids.intersection(created_run_ids)
+                or canonical_artifact_ids.intersection(
+                    item.id for item in pending_artifacts
+                )
+            ):
+                self._cleanup_uncommitted_artifacts(
+                    identity,
+                    pending_artifacts,
+                )
+                self._cleanup_uncommitted_pwn_crash_runs(
+                    identity,
+                    created_run_ids,
+                )
+            raise
+
+    def _pwn_leak_inputs_from_state(
+        self,
+        state: ChallengeState,
+        child: Experiment,
+        *,
+        required_status: ExperimentStatus | None = None,
+    ) -> _PwnLeakCanonicalInputs:
+        """Rebuild a leak replay only from its prior canonical preissue."""
+
+        required_extra = {
+            "managed_contract_version",
+            "engine_executor",
+            "baseline_experiment_id",
+            "pwn_leak_plan",
+            "trusted_replay_expectation",
+            "trusted_replay_expectation_sha256",
+            "expectation_source_state_revision",
+            "preissued_requests",
+            "request_paths",
+            "request_sha256s",
+            "execution_contract_sha256s",
+            "run_ids",
+            "receipt_ids",
+            "stdout_artifact_ids",
+            "stderr_artifact_ids",
+        }
+        if (
+            str(get_adapter(state.category).name) != "pwn"
+            or child.command != _PWN_LEAK_ENGINE_COMMAND
+            or child.extra.get("managed_contract_version") != 1
+            or child.extra.get("engine_executor")
+            != _PWN_LEAK_ENGINE_EXECUTOR
+            or set(child.extra) != required_extra
+            or child.kind is not ExperimentKind.PROBE
+            or child.resource_class != "light"
+            or child.timeout_seconds != _PWN_LEAK_TIMEOUT_SECONDS
+            or (
+                required_status is not None
+                and child.status is not required_status
+            )
+        ):
+            raise EngineError("Pwn leak child binding is invalid")
+        baseline_id = child.extra.get("baseline_experiment_id")
+        if type(baseline_id) is not str:
+            raise EngineError("Pwn leak baseline id is invalid")
+        baseline = next(
+            (
+                item
+                for item in state.experiments
+                if item.id == baseline_id
+            ),
+            None,
+        )
+        if baseline is None:
+            raise EngineError("Pwn leak baseline is unavailable")
+        (
+            disclosure,
+            disclosure_result,
+            baseline_payload,
+            plan,
+        ) = self._pwn_leak_baseline(state, baseline)
+        raw_plan = child.extra.get("pwn_leak_plan")
+        raw_expectation = child.extra.get(
+            "trusted_replay_expectation"
+        )
+        try:
+            validate_pwn_leak_plan_document(raw_plan)
+            expectation = PwnLeakTrustedReplayExpectation.from_dict(
+                raw_expectation
+            )
+        except (TypeError, ValueError) as error:
+            raise EngineError(
+                "Pwn leak plan or expectation is invalid"
+            ) from error
+        arrays: dict[str, list[object]] = {}
+        for name in (
+            "preissued_requests",
+            "request_paths",
+            "request_sha256s",
+            "execution_contract_sha256s",
+            "run_ids",
+            "receipt_ids",
+            "stdout_artifact_ids",
+            "stderr_artifact_ids",
+        ):
+            value = child.extra.get(name)
+            if (
+                type(value) is not list
+                or len(value) != PWN_LEAK_REPLAY_COUNT
+            ):
+                raise EngineError(
+                    f"Pwn leak {name} is not an exact replay array"
+                )
+            arrays[name] = value
+        if (
+            child.id != pwn_leak_child_experiment_id(baseline_id)
+            or raw_plan != plan.to_dict()
+            or child.extra.get("trusted_replay_expectation_sha256")
+            != expectation.evidence_sha256
+            or type(
+                child.extra.get("expectation_source_state_revision")
+            )
+            is not int
+            or child.extra["expectation_source_state_revision"] < 0
+            or child.source_run_id
+            != disclosure.crash_recipe.payload_source_run_id
+            or len(child.artifact_ids) < 2 * PWN_LEAK_REPLAY_COUNT
+        ):
+            raise EngineError("Pwn leak preissue binding changed")
+        artifact_index = {item.id: item for item in state.artifacts}
+        variants: list[ArtifactReference] = []
+        capabilities: list[ArtifactReference] = []
+        recipes: list[PwnRuntimeSnapshotRecipe] = []
+        request_documents: list[dict[str, Any]] = []
+        request_paths: list[str] = []
+        request_sha256s: list[str] = []
+        execution_hashes: list[str] = []
+        run_ids: list[str] = []
+        receipt_ids: list[str] = []
+        stdout_ids: list[str] = []
+        stderr_ids: list[str] = []
+        request_profile = tool_profile(
+            child.resource_class,
+            needs_kvm=False,
+            network=False,
+        )
+        run_index = {item.id: item for item in state.runs}
+        for ordinal in range(1, PWN_LEAK_REPLAY_COUNT + 1):
+            variant_id = child.artifact_ids[ordinal - 1]
+            capability_id = child.artifact_ids[
+                PWN_LEAK_REPLAY_COUNT + ordinal - 1
+            ]
+            variant = artifact_index.get(variant_id)
+            capability = artifact_index.get(capability_id)
+            run_id = arrays["run_ids"][ordinal - 1]
+            receipt_id = arrays["receipt_ids"][ordinal - 1]
+            stdout_id = arrays["stdout_artifact_ids"][ordinal - 1]
+            stderr_id = arrays["stderr_artifact_ids"][ordinal - 1]
+            request_path = arrays["request_paths"][ordinal - 1]
+            request_sha256 = arrays["request_sha256s"][ordinal - 1]
+            execution_hash = arrays[
+                "execution_contract_sha256s"
+            ][ordinal - 1]
+            request_document = arrays["preissued_requests"][
+                ordinal - 1
+            ]
+            if (
+                variant is None
+                or capability is None
+                or type(run_id) is not str
+                or type(receipt_id) is not str
+                or type(stdout_id) is not str
+                or type(stderr_id) is not str
+                or type(request_path) is not str
+                or type(request_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", request_sha256)
+                is None
+                or type(execution_hash) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", execution_hash)
+                is None
+                or type(request_document) is not dict
+                or variant.source_run_id != run_id
+                or variant.sha256
+                != hashlib.sha256(plan.payloads[ordinal - 1]).hexdigest()
+                or variant.size != len(plan.payloads[ordinal - 1])
+                or variant.extra
+                != {
+                    "kind": "pwn_leak_variant_payload",
+                    "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                    "plan_recipe_sha256": plan.recipe_sha256,
+                    "ordinal": ordinal,
+                    "context_visibility": "engine_private",
+                }
+            ):
+                raise EngineError(
+                    "Pwn leak variant or preissued identity changed"
+                )
+            recipe = self._pwn_leak_transport_recipe(
+                disclosure,
+                variant,
+                run_id=run_id,
+            )
+            expected_capability = (
+                PwnRuntimeSnapshotCapabilityAttestation(
+                    image_digest=recipe.image_digest,
+                    recipe_sha256=recipe.recipe_sha256,
+                )
+            )
+            try:
+                observed_variant = read_bounded_regular(
+                    self.store.challenge_paths(state.identity).root,
+                    variant.path,
+                    maximum_bytes=(
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+                    ),
+                    expected_sha256=variant.sha256,
+                    expected_size=variant.size,
+                )
+                observed_capability = read_bounded_regular(
+                    self.store.challenge_paths(state.identity).root,
+                    capability.path,
+                    maximum_bytes=64 * 1024,
+                    expected_sha256=capability.sha256,
+                    expected_size=capability.size,
+                )
+                observed_request_bytes = read_bounded_regular(
+                    self.store.challenge_paths(state.identity).root,
+                    request_path,
+                    maximum_bytes=256 * 1024,
+                    expected_sha256=request_sha256,
+                    expected_size=len(
+                        canonical_json_bytes(request_document)
+                    ),
+                )
+                observed_request = strict_json_loads(
+                    observed_request_bytes,
+                    max_bytes=256 * 1024,
+                )
+            except (
+                OSError,
+                SafeFileError,
+                StrictJSONError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "Pwn leak preissued artifact reread failed closed"
+                ) from error
+            if (
+                observed_variant != plan.payloads[ordinal - 1]
+                or observed_capability
+                != expected_capability.canonical_bytes()
+                or observed_request != request_document
+                or capability.id != expectation.replays[
+                    ordinal - 1
+                ].capability_attestation_artifact_id
+                or capability.source_run_id is not None
+                or capability.sha256
+                != expected_capability.evidence_sha256
+                or capability.size
+                != len(expected_capability.canonical_bytes())
+                or capability.extra
+                != {
+                    "kind": "pwn_leak_capability_attestation",
+                    "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                    "plan_recipe_sha256": plan.recipe_sha256,
+                    "transport_recipe_sha256": recipe.recipe_sha256,
+                    "ordinal": ordinal,
+                    "context_visibility": "engine_private",
+                }
+            ):
+                raise EngineError(
+                    "Pwn leak capability binding changed"
+                )
+            contract = self._pwn_leak_execution_contract(
+                child_id=child.id,
+                baseline_id=baseline_id,
+                ordinal=ordinal,
+                plan=plan,
+                recipe=recipe,
+                capability_artifact=capability,
+                receipt_id=receipt_id,
+                stdout_artifact_id=stdout_id,
+                stderr_artifact_id=stderr_id,
+                request=request_profile,
+            )
+            expected_contract_sha256 = hashlib.sha256(
+                _pwn_crash_canonical_bytes(contract)
+            ).hexdigest()
+            expected_request_keys = {
+                "schema_version",
+                "contest_id",
+                "category",
+                "challenge_id",
+                "run_id",
+                "base_revision",
+                "created_at",
+                "kind",
+                "experiment_id",
+                "ordinal",
+                "preissued",
+                "execution_contract",
+                "execution_contract_sha256",
+            }
+            run = run_index.get(run_id)
+            if (
+                expected_contract_sha256 != execution_hash
+                or set(request_document) != expected_request_keys
+                or type(request_document.get("schema_version")) is not int
+                or request_document.get("schema_version")
+                != RUN_ENVELOPE_SCHEMA_VERSION
+                or request_document.get("contest_id") != state.contest_id
+                or request_document.get("category") != state.category
+                or request_document.get("challenge_id")
+                != state.challenge_id
+                or request_document.get("run_id") != run_id
+                or type(request_document.get("base_revision")) is not int
+                or request_document.get("base_revision")
+                != child.extra["expectation_source_state_revision"]
+                or type(request_document.get("created_at")) is not str
+                or request_document.get("kind") != "pwn_leak_replay"
+                or request_document.get("experiment_id") != child.id
+                or type(request_document.get("ordinal")) is not int
+                or request_document.get("ordinal") != ordinal
+                or request_document.get("preissued")
+                != contract["preissued"]
+                or request_document.get("execution_contract") != contract
+                or request_document.get("execution_contract_sha256")
+                != execution_hash
+                or run is None
+                or run.request_path != request_path
+                or run.base_revision
+                != child.extra["expectation_source_state_revision"]
+                or run.origin is not RunOrigin.MANAGED_TOOL
+                or run.role != "pwn_leak"
+                or run.configuration_epoch
+                != recipe.configuration_epoch
+            ):
+                raise EngineError(
+                    "Pwn leak canonical request binding changed"
+                )
+            trusted = expectation.replays[ordinal - 1]
+            if (
+                trusted.ordinal != ordinal
+                or trusted.input_artifact_id != variant.id
+                or trusted.input_sha256 != variant.sha256
+                or trusted.input_size_bytes != variant.size
+                or trusted.recipe_sha256 != recipe.recipe_sha256
+                or trusted.run_id != run_id
+                or trusted.receipt_id != receipt_id
+                or trusted.request_sha256 != request_sha256
+                or trusted.execution_contract_sha256 != execution_hash
+                or trusted.stdout_artifact_id != stdout_id
+                or trusted.output_artifact_id != stderr_id
+            ):
+                raise EngineError(
+                    "Pwn leak trusted expectation binding changed"
+                )
+            variants.append(variant)
+            capabilities.append(capability)
+            recipes.append(recipe)
+            request_documents.append(request_document)
+            request_paths.append(request_path)
+            request_sha256s.append(request_sha256)
+            execution_hashes.append(execution_hash)
+            run_ids.append(run_id)
+            receipt_ids.append(receipt_id)
+            stdout_ids.append(stdout_id)
+            stderr_ids.append(stderr_id)
+        if (
+            expectation.preexisting_artifact_ids
+            != tuple(sorted(expectation.preexisting_artifact_ids))
+            or not set(expectation.preexisting_artifact_ids).issubset(
+                artifact_index
+            )
+            or set(expectation.preexisting_artifact_ids).intersection(
+                {
+                    *[item.id for item in variants],
+                    *[item.id for item in capabilities],
+                    *stdout_ids,
+                    *stderr_ids,
+                }
+            )
+        ):
+            raise EngineError(
+                "Pwn leak preexisting artifact snapshot changed"
+            )
+        return _PwnLeakCanonicalInputs(
+            child_experiment_id=child.id,
+            baseline_experiment_id=baseline_id,
+            disclosure=disclosure,
+            disclosure_result=disclosure_result,
+            baseline_payload=baseline_payload,
+            plan=plan,
+            expectation=expectation,
+            transport_recipes=tuple(recipes),
+            variant_artifacts=tuple(variants),
+            capability_artifacts=tuple(capabilities),
+            request_documents=tuple(request_documents),
+            request_paths=tuple(request_paths),
+            request_sha256s=tuple(request_sha256s),
+            run_ids=tuple(run_ids),
+            receipt_ids=tuple(receipt_ids),
+            stdout_artifact_ids=tuple(stdout_ids),
+            stderr_artifact_ids=tuple(stderr_ids),
+            execution_contract_sha256s=tuple(execution_hashes),
+        )
+
+    def _recompute_pwn_leak_result(
+        self,
+        state: ChallengeState,
+        child: Experiment,
+        *,
+        stdout_artifacts: tuple[ArtifactReference, ...],
+        stderr_artifacts: tuple[ArtifactReference, ...],
+        receipt_metadata: tuple[
+            PwnRuntimeSnapshotReceiptMetadata,
+            ...,
+        ],
+    ) -> tuple[_PwnLeakCanonicalInputs, PwnLeakResult]:
+        """Reread every byte and independently recompute the aggregate gate."""
+
+        inputs = self._pwn_leak_inputs_from_state(
+            state,
+            child,
+            required_status=ExperimentStatus.RUNNING,
+        )
+        if (
+            len(stdout_artifacts) != PWN_LEAK_REPLAY_COUNT
+            or len(stderr_artifacts) != PWN_LEAK_REPLAY_COUNT
+            or len(receipt_metadata) != PWN_LEAK_REPLAY_COUNT
+        ):
+            raise EngineError("Pwn leak replay evidence is incomplete")
+        self._pwn_leak_require_fresh_source(
+            state,
+            inputs.plan,
+            inputs.transport_recipes[0],
+        )
+        paths = self.store.challenge_paths(state.identity)
+        replay_evidence: list[PwnLeakReplayEvidence] = []
+        for ordinal, (
+            recipe,
+            payload,
+            stdout_artifact,
+            stderr_artifact,
+            metadata,
+        ) in enumerate(
+            zip(
+                inputs.transport_recipes,
+                inputs.plan.payloads,
+                stdout_artifacts,
+                stderr_artifacts,
+                receipt_metadata,
+                strict=True,
+            ),
+            start=1,
+        ):
+            if (
+                stdout_artifact.id
+                != inputs.stdout_artifact_ids[ordinal - 1]
+                or stderr_artifact.id
+                != inputs.stderr_artifact_ids[ordinal - 1]
+                or stdout_artifact.source_run_id
+                != inputs.run_ids[ordinal - 1]
+                or stderr_artifact.source_run_id
+                != inputs.run_ids[ordinal - 1]
+                or metadata.receipt_id
+                != inputs.receipt_ids[ordinal - 1]
+                or metadata.run_id != inputs.run_ids[ordinal - 1]
+                or metadata.request_sha256
+                != inputs.request_sha256s[ordinal - 1]
+                or metadata.execution_contract_sha256
+                != inputs.execution_contract_sha256s[ordinal - 1]
+                or metadata.capability_attestation_artifact_id
+                != inputs.capability_artifacts[ordinal - 1].id
+            ):
+                raise EngineError(
+                    "Pwn leak replay identity is not preissued"
+                )
+            try:
+                stdout = read_bounded_regular(
+                    paths.root,
+                    stdout_artifact.path,
+                    maximum_bytes=(
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES
+                    ),
+                    expected_sha256=stdout_artifact.sha256,
+                    expected_size=stdout_artifact.size,
+                )
+                stderr = read_bounded_regular(
+                    paths.root,
+                    stderr_artifact.path,
+                    maximum_bytes=PWN_DISCLOSURE_MAX_STREAM_BYTES,
+                    expected_sha256=stderr_artifact.sha256,
+                    expected_size=stderr_artifact.size,
+                )
+            except (OSError, SafeFileError, ValueError) as error:
+                raise EngineError(
+                    "Pwn leak replay artifact reread failed closed"
+                ) from error
+            evaluation = evaluate_pwn_runtime_snapshot_gate(
+                recipe,
+                stdout_payload=stdout,
+                receipt=metadata,
+            )
+            evaluation.canonical_bytes()
+            replay_evidence.append(
+                PwnLeakReplayEvidence(
+                    ordinal=ordinal,
+                    payload=payload,
+                    recipe=recipe,
+                    evaluation=evaluation,
+                    receipt=metadata,
+                    stdout_payload=stdout,
+                    stderr_payload=stderr,
+                )
+            )
+        result = evaluate_pwn_leak(
+            disclosure=inputs.disclosure_result,
+            baseline_snapshot_recipe=(
+                inputs.disclosure.snapshot_recipe
+            ),
+            baseline_payload=inputs.baseline_payload,
+            plan=inputs.plan,
+            trusted_replay_expectation=inputs.expectation,
+            replays=tuple(replay_evidence),
+        )
+        result.canonical_bytes()
+        return inputs, result
+
+    def _terminalize_pwn_leak_interruption(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        error: BaseException,
+        *,
+        live_only: bool,
+    ) -> None:
+        """Make a preissued RUNNING leak replay terminal after interruption."""
+
+        try:
+            current = self.store.load(identity, recover=False)
+            child = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+        except BaseException as inspection_error:
+            error.add_note(
+                "Pwn leak interruption inspection failed: "
+                f"{inspection_error}"
+            )
+            return
+        if child.status not in {
+            ExperimentStatus.REGISTERED,
+            ExperimentStatus.RUNNING,
+        }:
+            return
+        # The state store validates every canonical artifact before replacing
+        # state.  Repair only the exact deterministic engine-private preissued
+        # files so a byte-tamper can be recorded as FAILED instead of pinning
+        # the child forever in REGISTERED/RUNNING.
+        try:
+            baseline_id = child.extra.get("baseline_experiment_id")
+            baseline = next(
+                item
+                for item in current.experiments
+                if item.id == baseline_id
+            )
+            disclosure, _result, _payload, plan = (
+                self._pwn_leak_baseline(current, baseline)
+            )
+            run_ids = child.extra.get("run_ids")
+            artifacts = {item.id: item for item in current.artifacts}
+            paths = self.store.challenge_paths(identity)
+            if (
+                type(run_ids) is list
+                and len(run_ids) == PWN_LEAK_REPLAY_COUNT
+                and len(child.artifact_ids)
+                >= 2 * PWN_LEAK_REPLAY_COUNT
+            ):
+                for ordinal, (run_id, payload) in enumerate(
+                    zip(run_ids, plan.payloads, strict=True),
+                    start=1,
+                ):
+                    variant = artifacts.get(
+                        child.artifact_ids[ordinal - 1]
+                    )
+                    capability = artifacts.get(
+                        child.artifact_ids[
+                            PWN_LEAK_REPLAY_COUNT + ordinal - 1
+                        ]
+                    )
+                    expected_root = (
+                        paths.artifacts
+                        / "snapshots"
+                        / f"pwn-leak-{plan.recipe_sha256}"
+                    )
+                    expected_variant_path = (
+                        expected_root / f"{ordinal:02d}-payload.bin"
+                    ).relative_to(paths.root).as_posix()
+                    expected_capability_path = (
+                        expected_root
+                        / f"{ordinal:02d}-capability-attestation.json"
+                    ).relative_to(paths.root).as_posix()
+                    if (
+                        type(run_id) is not str
+                        or variant is None
+                        or capability is None
+                        or variant.id
+                        != _record_id("A", run_id, "input")
+                        or variant.sha256
+                        != hashlib.sha256(payload).hexdigest()
+                        or variant.size != len(payload)
+                        or variant.path != expected_variant_path
+                        or variant.extra.get("engine_executor")
+                        != _PWN_LEAK_ENGINE_EXECUTOR
+                        or variant.extra.get("context_visibility")
+                        != "engine_private"
+                    ):
+                        continue
+                    recipe = self._pwn_leak_transport_recipe(
+                        disclosure,
+                        variant,
+                        run_id=run_id,
+                    )
+                    expected_capability = (
+                        PwnRuntimeSnapshotCapabilityAttestation(
+                            image_digest=recipe.image_digest,
+                            recipe_sha256=recipe.recipe_sha256,
+                        ).canonical_bytes()
+                    )
+                    if (
+                        capability.id
+                        != _record_id("A", run_id, "capability")
+                        or capability.sha256
+                        != hashlib.sha256(
+                            expected_capability
+                        ).hexdigest()
+                        or capability.size != len(expected_capability)
+                        or capability.path != expected_capability_path
+                        or capability.extra.get("engine_executor")
+                        != _PWN_LEAK_ENGINE_EXECUTOR
+                        or capability.extra.get("context_visibility")
+                        != "engine_private"
+                    ):
+                        continue
+                    atomic_write_bytes(
+                        paths.root / variant.path,
+                        payload,
+                        mode=0o400,
+                    )
+                    atomic_write_bytes(
+                        paths.root / capability.path,
+                        expected_capability,
+                        mode=0o400,
+                    )
+        except BaseException as repair_error:
+            error.add_note(
+                "Pwn leak deterministic preissue repair failed: "
+                f"{repair_error}"
+            )
+        reason = (
+            "Pwn leak proof failed closed: interrupted by "
+            f"{type(error).__name__}: {error}"
+        )
+
+        def terminalize(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            )
+            if item.status not in {
+                ExperimentStatus.REGISTERED,
+                ExperimentStatus.RUNNING,
+            }:
+                return
+            item.status = ExperimentStatus.FAILED
+            item.result = {"error": reason}
+            item.evaluation_reason = reason
+            item.evaluated_at = utc_now()
+            preissued_ids = set(item.extra.get("run_ids", []))
+            for run in state.runs:
+                if run.id in preissued_ids and run.status is RunStatus.CREATED:
+                    run.status = RunStatus.FAILED
+
+        try:
+            self.store.update(
+                identity,
+                terminalize,
+                expected_revision=current.revision,
+            )
+        except BaseException as terminal_error:
+            error.add_note(
+                "Pwn leak interruption terminalization failed: "
+                f"{terminal_error}"
+            )
+
+    def _execute_pwn_leak(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        *,
+        automated: bool,
+        live_only: bool,
+    ) -> ChallengeState:
+        """Consume exactly three preissued clean runtime-snapshot requests."""
+
+        current = self.store.load(identity)
+        self._require_model_work_allowed(current, automated=automated)
+        child = next(
+            (
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            ),
+            None,
+        )
+        if child is None:
+            raise EngineError(f"unknown experiment: {experiment_id}")
+        preissued = self._pwn_leak_inputs_from_state(
+            current,
+            child,
+            required_status=ExperimentStatus.REGISTERED,
+        )
+
+        def mark_running(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            item = next(
+                value
+                for value in state.experiments
+                if value.id == experiment_id
+            )
+            rebuilt = self._pwn_leak_inputs_from_state(
+                state,
+                item,
+                required_status=ExperimentStatus.REGISTERED,
+            )
+            if rebuilt != preissued:
+                raise EngineError(
+                    "Pwn leak preissue changed before execution"
+                )
+            self._pwn_leak_require_fresh_source(
+                state,
+                rebuilt.plan,
+                rebuilt.transport_recipes[0],
+            )
+            item.status = ExperimentStatus.RUNNING
+
+        running = self.store.update(
+            identity,
+            mark_running,
+            expected_revision=current.revision,
+        )
+        child = next(
+            item for item in running.experiments if item.id == experiment_id
+        )
+        inputs = self._pwn_leak_inputs_from_state(
+            running,
+            child,
+            required_status=ExperimentStatus.RUNNING,
+        )
+        paths = self.store.challenge_paths(identity)
+        workspace = self._workspace(running)
+        source_staging: tempfile.TemporaryDirectory[str] | None = None
+        input_staging: tempfile.TemporaryDirectory[str] | None = None
+        lease = None
+        output_artifacts: list[ArtifactReference] = []
+        stdout_artifacts: list[ArtifactReference] = []
+        stderr_artifacts: list[ArtifactReference] = []
+        metadata_records: list[PwnRuntimeSnapshotReceiptMetadata] = []
+        execution_receipts: list[ExecutionReceipt] = []
+        terminal_runs: list[RunReference] = []
+        run_result_documents: list[dict[str, Any]] = []
+        run_validation_documents: list[dict[str, Any]] = []
+        result_artifact: ArtifactReference | None = None
+        committed = False
+        started = time.monotonic()
+        deadline, _deadline_epoch = self._budget_deadline_pair(
+            running,
+            child.timeout_seconds,
+        )
+        flag_policy = resolve_flag_format(
+            running,
+            self.config.runtime.flag_patterns,
+        )
+
+        def receive_diagnostic_flag(detected: DetectedFlag) -> None:
+            if candidate_value_is_valid(detected.value):
+                self._on_tool_flag(identity, detected)
+
+        detector = FlagDetector(
+            flag_policy.patterns,
+            callback=receive_diagnostic_flag,
+        )
+        try:
+            (
+                source_staging,
+                challenge_root,
+                _source_snapshot,
+            ) = self._prepare_pwn_crash_source_snapshot(
+                running,
+                inputs.transport_recipes[0],  # type: ignore[arg-type]
+            )
+            input_staging = tempfile.TemporaryDirectory(
+                prefix=".pwn-leak-input-",
+                dir=workspace,
+            )
+            input_root = Path(input_staging.name)
+            proof_inputs: list[ProofInput] = []
+            for ordinal, (artifact, payload) in enumerate(
+                zip(
+                    inputs.variant_artifacts,
+                    inputs.plan.payloads,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                snapshot = copy_bounded_regular(
+                    paths.root,
+                    artifact.path,
+                    input_root / f"payload-{ordinal}.bin",
+                    maximum_bytes=(
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES
+                    ),
+                    expected_sha256=artifact.sha256,
+                    expected_size=artifact.size,
+                    mode=0o400,
+                )
+                if snapshot.path.read_bytes() != payload:
+                    raise EngineError("Pwn leak staged input changed")
+                proof_inputs.append(
+                    ProofInput(
+                        source_locator=snapshot.path.relative_to(
+                            workspace
+                        ).as_posix(),
+                        destination_locator=(
+                            PWN_RUNTIME_SNAPSHOT_INPUT_DESTINATION_LOCATOR
+                        ),
+                        sha256=artifact.sha256,
+                        size_bytes=int(artifact.size or 0),
+                    )
+                )
+            request_profile = tool_profile(
+                child.resource_class,
+                needs_kvm=False,
+                network=False,
+            )
+            if request_profile.network != 0:
+                raise EngineError("Pwn leak proof must deny network")
+            lease = self.lease_broker.acquire(
+                request_profile,
+                timeout=min(
+                    self._budget_wait_timeout(
+                        running,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    max(0.0, deadline - time.monotonic()),
+                ),
+                owner=f"{identity.key}:{experiment_id}:pwn-leak",
+            )
+            if lease is None:
+                raise EngineError("Pwn leak resource lease unavailable")
+            client = self.sandbox(
+                running,
+                workspace_override=workspace,
+                challenge_dir_override=challenge_root,
+                network_policy_override=NetworkPolicy.deny_all(),
+            )
+            source_run = next(
+                item
+                for item in running.runs
+                if item.id
+                == inputs.disclosure.crash_recipe.payload_source_run_id
+            )
+            for ordinal, (recipe, proof_input) in enumerate(
+                zip(
+                    inputs.transport_recipes,
+                    proof_inputs,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                self._require_before_hard_deadline(
+                    deadline,
+                    f"Pwn leak replay {ordinal}",
+                )
+                latest = self.store.load(identity, recover=False)
+                latest_child = next(
+                    item
+                    for item in latest.experiments
+                    if item.id == experiment_id
+                )
+                latest_inputs = self._pwn_leak_inputs_from_state(
+                    latest,
+                    latest_child,
+                    required_status=ExperimentStatus.RUNNING,
+                )
+                if latest_inputs != inputs:
+                    raise EngineError(
+                        "Pwn leak preissue changed during execution"
+                    )
+                self._pwn_leak_require_fresh_source(
+                    latest,
+                    inputs.plan,
+                    recipe,
+                )
+                remaining = deadline - time.monotonic()
+                if remaining < 1:
+                    raise _HardDeadlineExpired(
+                        "Pwn leak has less than one second to run"
+                    )
+                run_id = inputs.run_ids[ordinal - 1]
+                run_paths = self.store.run_paths(
+                    identity,
+                    run_id=run_id,
+                )
+                request_bytes = read_bounded_regular(
+                    paths.root,
+                    inputs.request_paths[ordinal - 1],
+                    maximum_bytes=256 * 1024,
+                    expected_sha256=inputs.request_sha256s[ordinal - 1],
+                    expected_size=len(
+                        canonical_json_bytes(
+                            inputs.request_documents[ordinal - 1]
+                        )
+                    ),
+                )
+                if (
+                    strict_json_loads(
+                        request_bytes,
+                        max_bytes=256 * 1024,
+                    )
+                    != inputs.request_documents[ordinal - 1]
+                ):
+                    raise EngineError(
+                        "Pwn leak issued request changed before replay"
+                    )
+                replay_started = time.monotonic()
+                sandbox_result = client.run_clean_proof(
+                    CommandSpec.create(
+                        recipe.argv(),
+                        timeout_seconds=(
+                            _PWN_LEAK_REPLAY_TIMEOUT_SECONDS
+                        ),
+                        deadline_monotonic_seconds=deadline,
+                        environment={},
+                        network_target=None,
+                        resource_request=request_profile,
+                    ),
+                    proof_inputs=(proof_input,),
+                )
+                stream_records: dict[str, ArtifactReference] = {}
+                stream_payloads: dict[str, bytes] = {}
+                snapshot_failed: dict[str, bool] = {}
+                for stream, maximum_bytes in (
+                    (
+                        "stdout",
+                        PWN_RUNTIME_SNAPSHOT_V1_MAX_DOCUMENT_BYTES,
+                    ),
+                    ("stderr", PWN_DISCLOSURE_MAX_STREAM_BYTES),
+                ):
+                    artifact_id = (
+                        inputs.stdout_artifact_ids[ordinal - 1]
+                        if stream == "stdout"
+                        else inputs.stderr_artifact_ids[ordinal - 1]
+                    )
+                    destination = (
+                        paths.artifacts
+                        / "snapshots"
+                        / f"pwn-leak-{inputs.plan.recipe_sha256}"
+                        / f"{ordinal:02d}-{run_id}-{stream}.log"
+                    )
+                    try:
+                        snapshot = self._snapshot_pwn_crash_stream(
+                            latest,
+                            client,
+                            workspace=workspace,
+                            locator=getattr(
+                                sandbox_result,
+                                f"{stream}_path",
+                            ).removeprefix("/work/").lstrip("/"),
+                            destination=destination,
+                            maximum_bytes=maximum_bytes,
+                        )
+                    except (
+                        EngineError,
+                        SandboxError,
+                        OSError,
+                        ValueError,
+                    ):
+                        snapshot = None
+                    if snapshot is None:
+                        atomic_write_bytes(destination, b"", mode=0o400)
+                        payload = b""
+                        sha256 = hashlib.sha256(b"").hexdigest()
+                        size = 0
+                        snapshot_failed[stream] = True
+                    else:
+                        payload = snapshot.path.read_bytes()
+                        sha256 = snapshot.sha256
+                        size = snapshot.size_bytes
+                        snapshot_failed[stream] = False
+                    artifact = ArtifactReference(
+                        id=artifact_id,
+                        path=destination.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        sha256=sha256,
+                        source_run_id=run_id,
+                        media_type=(
+                            "application/json"
+                            if stream == "stdout"
+                            else "text/plain"
+                        ),
+                        size=size,
+                        extra={
+                            "kind": "pwn_leak_replay_stream",
+                            "stream": stream,
+                            "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                            "plan_recipe_sha256": (
+                                inputs.plan.recipe_sha256
+                            ),
+                            "transport_recipe_sha256": (
+                                recipe.recipe_sha256
+                            ),
+                            "ordinal": ordinal,
+                            "capture_placeholder": (
+                                snapshot_failed[stream]
+                            ),
+                            "context_visibility": "engine_private",
+                        },
+                    )
+                    output_artifacts.append(artifact)
+                    stream_records[stream] = artifact
+                    stream_payloads[stream] = payload
+                detector.feed(
+                    stream_payloads["stderr"][
+                        : self.config.runtime.flag_scan_max_bytes
+                    ].decode("utf-8", errors="replace"),
+                    source=f"tool:{run_id}:stderr",
+                )
+                stdout_artifact = stream_records["stdout"]
+                stderr_artifact = stream_records["stderr"]
+                timed_out = sandbox_result.timed_out
+                outcome = (
+                    "timed_out"
+                    if timed_out
+                    else "succeeded"
+                    if (
+                        sandbox_result.exit_code == 0
+                        and sandbox_result.orchestration_error is None
+                    )
+                    else "failed"
+                )
+                stdout_stored = (
+                    sandbox_result.stdout_stored_bytes
+                    if sandbox_result.stdout_stored_bytes is not None
+                    else int(stdout_artifact.size or 0)
+                )
+                metadata = PwnRuntimeSnapshotReceiptMetadata(
+                    receipt_id=inputs.receipt_ids[ordinal - 1],
+                    run_id=run_id,
+                    outcome=outcome,
+                    exit_code=sandbox_result.exit_code,
+                    timed_out=timed_out,
+                    clean_workspace=True,
+                    one_shot=PWN_RUNTIME_SNAPSHOT_ONE_SHOT,
+                    sandbox_method=PWN_RUNTIME_SNAPSHOT_SANDBOX_METHOD,
+                    network=PWN_RUNTIME_SNAPSHOT_NETWORK_POLICY,
+                    configuration_epoch=recipe.configuration_epoch,
+                    image_digest=recipe.image_digest,
+                    recipe_sha256=recipe.recipe_sha256,
+                    request_sha256=inputs.request_sha256s[ordinal - 1],
+                    execution_contract_sha256=(
+                        inputs.execution_contract_sha256s[ordinal - 1]
+                    ),
+                    capability_attestation_artifact_id=(
+                        inputs.capability_artifacts[ordinal - 1].id
+                    ),
+                    capability_attestation_sha256=(
+                        inputs.capability_artifacts[ordinal - 1].sha256
+                    ),
+                    producer_capability_name=(
+                        PWN_RUNTIME_SNAPSHOT_PRODUCER_CAPABILITY_NAME
+                    ),
+                    producer_file_sha256=recipe.producer_file_sha256,
+                    stdout_artifact_id=stdout_artifact.id,
+                    stdout_artifact_sha256=stdout_artifact.sha256,
+                    stdout_artifact_size_bytes=stdout_artifact.size,
+                    stderr_artifact_id=stderr_artifact.id,
+                    stderr_artifact_sha256=stderr_artifact.sha256,
+                    stderr_artifact_size_bytes=stderr_artifact.size,
+                    stderr_capture_placeholder=snapshot_failed["stderr"],
+                    stdout_drained_bytes=sandbox_result.stdout_bytes,
+                    stdout_stored_bytes=stdout_stored,
+                    stdout_capture_complete=(
+                        sandbox_result.stdout_capture_complete
+                        and not snapshot_failed["stdout"]
+                    ),
+                    stdout_truncation_known=(
+                        sandbox_result.stdout_truncation_known
+                    ),
+                    stdout_truncated=sandbox_result.stdout_truncated,
+                    stdout_error=(
+                        "stdout_capture_error"
+                        if sandbox_result.stdout_error is not None
+                        else None
+                    ),
+                    stream_capture_error=(
+                        "stream_capture_error"
+                        if sandbox_result.stream_capture_error is not None
+                        or snapshot_failed["stdout"]
+                        else None
+                    ),
+                    orchestration_error=(
+                        "orchestration_error"
+                        if sandbox_result.orchestration_error is not None
+                        else None
+                    ),
+                    durable_stdout_artifact_complete=(
+                        not snapshot_failed["stdout"]
+                        and stdout_artifact.size
+                        == sandbox_result.stdout_bytes
+                        and stdout_artifact.size == stdout_stored
+                    ),
+                )
+                evaluation = evaluate_pwn_runtime_snapshot_gate(
+                    recipe,
+                    stdout_payload=stream_payloads["stdout"],
+                    receipt=metadata,
+                )
+                record = {
+                    "schema_version": 1,
+                    "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                    "ordinal": ordinal,
+                    "transport_recipe": recipe.to_dict(),
+                    "request_sha256": inputs.request_sha256s[
+                        ordinal - 1
+                    ],
+                    "execution_contract_sha256": (
+                        inputs.execution_contract_sha256s[ordinal - 1]
+                    ),
+                    "receipt": metadata.to_dict(),
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.evidence_sha256,
+                }
+                run = next(
+                    item for item in running.runs if item.id == run_id
+                )
+                terminal_runs.append(
+                    replace(
+                        run,
+                        status=(
+                            RunStatus.TIMED_OUT
+                            if timed_out
+                            else RunStatus.COMPLETED
+                            if outcome == "succeeded"
+                            else RunStatus.FAILED
+                        ),
+                        extra={
+                            "experiment_id": experiment_id,
+                            "pwn_leak_replay": copy.deepcopy(record),
+                        },
+                    )
+                )
+                receipt = ExecutionReceipt(
+                    id=inputs.receipt_ids[ordinal - 1],
+                    experiment_id=experiment_id,
+                    run_id=run_id,
+                    outcome=(
+                        ReceiptOutcome.TIMED_OUT
+                        if timed_out
+                        else ReceiptOutcome.SUCCEEDED
+                        if outcome == "succeeded"
+                        else ReceiptOutcome.FAILED
+                    ),
+                    exit_code=sandbox_result.exit_code,
+                    wall_seconds=time.monotonic() - replay_started,
+                    stdout_artifact_id=stdout_artifact.id,
+                    stderr_artifact_id=stderr_artifact.id,
+                    stdout_bytes=sandbox_result.stdout_bytes,
+                    stderr_bytes=sandbox_result.stderr_bytes,
+                    preview=(
+                        f"Pwn leak replay {ordinal} "
+                        f"{evaluation.status.value}:"
+                        f"{evaluation.reason_code}"
+                    )[:160],
+                    extra={"pwn_leak_replay": copy.deepcopy(record)},
+                )
+                run_result_document = {
+                    "schema_version": WORKER_RESULT_SCHEMA_VERSION,
+                    "contest_id": identity.contest_id,
+                    "category": identity.category,
+                    "challenge_id": identity.challenge_id,
+                    "run_id": run_id,
+                    "status": sandbox_result.status,
+                    "exit_code": sandbox_result.exit_code,
+                    "timed_out": sandbox_result.timed_out,
+                    "duration_ms": sandbox_result.duration_ms,
+                    "pwn_leak_replay": copy.deepcopy(record),
+                    "artifacts": [
+                        stdout_artifact.to_dict(),
+                        stderr_artifact.to_dict(),
+                    ],
+                }
+                run_validation_document = {
+                    "run_id": run_id,
+                    "validated_at": utc_now(),
+                    "ok": evaluation.transport_error is None,
+                    "pwn_leak_replay": copy.deepcopy(record),
+                    "errors": (
+                        []
+                        if evaluation.transport_error is None
+                        else [evaluation.transport_error.code]
+                    ),
+                }
+                self.store.write_run_result(
+                    identity,
+                    None,
+                    None,
+                    run_id,
+                    run_result_document,
+                )
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    run_validation_document,
+                )
+                run_result_documents.append(run_result_document)
+                run_validation_documents.append(
+                    run_validation_document
+                )
+                stdout_artifacts.append(stdout_artifact)
+                stderr_artifacts.append(stderr_artifact)
+                metadata_records.append(metadata)
+                execution_receipts.append(receipt)
+
+            _rebuilt_inputs, result = self._recompute_pwn_leak_result(
+                running,
+                child,
+                stdout_artifacts=tuple(stdout_artifacts),
+                stderr_artifacts=tuple(stderr_artifacts),
+                receipt_metadata=tuple(metadata_records),
+            )
+            result_bytes = result.canonical_bytes()
+            result_path = (
+                paths.artifacts
+                / "snapshots"
+                / f"pwn-leak-{inputs.plan.recipe_sha256}"
+                / "result.json"
+            )
+            atomic_write_bytes(result_path, result_bytes, mode=0o400)
+            result_artifact = ArtifactReference(
+                id=_record_id("A", experiment_id, "result"),
+                path=result_path.relative_to(paths.root).as_posix(),
+                sha256=result.evidence_sha256,
+                source_run_id=inputs.run_ids[-1],
+                media_type="application/json",
+                size=len(result_bytes),
+                extra={
+                    "kind": "pwn_leak_result",
+                    "engine_executor": _PWN_LEAK_ENGINE_EXECUTOR,
+                    "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                    "result_sha256": result.evidence_sha256,
+                    "context_visibility": "model_visible",
+                },
+            )
+            evaluated_at = utc_now()
+            result_envelope = {
+                "schema_version": 1,
+                "baseline_experiment_id": inputs.baseline_experiment_id,
+                "plan_recipe_sha256": inputs.plan.recipe_sha256,
+                "trusted_replay_expectation_sha256": (
+                    inputs.expectation.evidence_sha256
+                ),
+                "evaluated_at": evaluated_at,
+                "result": result.to_dict(),
+                "result_sha256": result.evidence_sha256,
+                "run_ids": list(inputs.run_ids),
+                "receipt_ids": list(inputs.receipt_ids),
+                "result_artifact_id": result_artifact.id,
+            }
+
+            def verify_transport_journals() -> None:
+                if (
+                    len(terminal_runs) != PWN_LEAK_REPLAY_COUNT
+                    or len(execution_receipts)
+                    != PWN_LEAK_REPLAY_COUNT
+                    or len(run_result_documents)
+                    != PWN_LEAK_REPLAY_COUNT
+                    or len(run_validation_documents)
+                    != PWN_LEAK_REPLAY_COUNT
+                ):
+                    raise EngineError(
+                        "Pwn leak transport journal is incomplete"
+                    )
+                for ordinal, (
+                    run,
+                    receipt,
+                    metadata,
+                    stdout_artifact,
+                    stderr_artifact,
+                    result_document,
+                    validation_document,
+                ) in enumerate(
+                    zip(
+                        terminal_runs,
+                        execution_receipts,
+                        metadata_records,
+                        stdout_artifacts,
+                        stderr_artifacts,
+                        run_result_documents,
+                        run_validation_documents,
+                        strict=True,
+                    ),
+                    start=1,
+                ):
+                    expected_result_bytes = canonical_json_bytes(
+                        result_document
+                    )
+                    expected_validation_bytes = canonical_json_bytes(
+                        validation_document
+                    )
+                    observed_result_bytes = read_bounded_regular(
+                        paths.root,
+                        run.result_path or "",
+                        maximum_bytes=512 * 1024,
+                        expected_sha256=hashlib.sha256(
+                            expected_result_bytes
+                        ).hexdigest(),
+                        expected_size=len(expected_result_bytes),
+                    )
+                    observed_validation_bytes = read_bounded_regular(
+                        paths.root,
+                        run.validation_path or "",
+                        maximum_bytes=512 * 1024,
+                        expected_sha256=hashlib.sha256(
+                            expected_validation_bytes
+                        ).hexdigest(),
+                        expected_size=len(expected_validation_bytes),
+                    )
+                    if (
+                        observed_result_bytes != expected_result_bytes
+                        or observed_validation_bytes
+                        != expected_validation_bytes
+                        or run.id != inputs.run_ids[ordinal - 1]
+                        or run.status
+                        not in {
+                            RunStatus.COMPLETED,
+                            RunStatus.FAILED,
+                            RunStatus.TIMED_OUT,
+                        }
+                        or run.request_path
+                        != inputs.request_paths[ordinal - 1]
+                        or run.extra.get("pwn_leak_replay")
+                        != result_document["pwn_leak_replay"]
+                        or receipt.id
+                        != inputs.receipt_ids[ordinal - 1]
+                        or receipt.run_id != run.id
+                        or receipt.experiment_id != experiment_id
+                        or receipt.stdout_artifact_id
+                        != stdout_artifact.id
+                        or receipt.stderr_artifact_id
+                        != stderr_artifact.id
+                        or receipt.extra.get("pwn_leak_replay")
+                        != result_document["pwn_leak_replay"]
+                        or metadata.receipt_id != receipt.id
+                        or metadata.run_id != run.id
+                    ):
+                        raise EngineError(
+                            "Pwn leak run/receipt journal changed"
+                        )
+
+            def verify_terminal() -> None:
+                verify_transport_journals()
+                current_running = self.store.load(
+                    identity,
+                    recover=False,
+                )
+                current_child = next(
+                    item
+                    for item in current_running.experiments
+                    if item.id == experiment_id
+                )
+                rebuilt, recomputed = self._recompute_pwn_leak_result(
+                    current_running,
+                    current_child,
+                    stdout_artifacts=tuple(stdout_artifacts),
+                    stderr_artifacts=tuple(stderr_artifacts),
+                    receipt_metadata=tuple(metadata_records),
+                )
+                observed_result = read_bounded_regular(
+                    paths.root,
+                    result_artifact.path,
+                    maximum_bytes=PWN_LEAK_MAX_RESULT_BYTES,
+                    expected_sha256=result_artifact.sha256,
+                    expected_size=result_artifact.size,
+                )
+                if (
+                    rebuilt != inputs
+                    or recomputed != result
+                    or observed_result != result_bytes
+                ):
+                    raise EngineError(
+                        "Pwn leak result changed before state replacement"
+                    )
+
+            def finish(state: ChallengeState) -> None:
+                self._require_before_hard_deadline(
+                    deadline,
+                    "Pwn leak canonical state reduction",
+                )
+                item = next(
+                    value
+                    for value in state.experiments
+                    if value.id == experiment_id
+                )
+                rebuilt, recomputed = self._recompute_pwn_leak_result(
+                    state,
+                    item,
+                    stdout_artifacts=tuple(stdout_artifacts),
+                    stderr_artifacts=tuple(stderr_artifacts),
+                    receipt_metadata=tuple(metadata_records),
+                )
+                if rebuilt != inputs or recomputed != result:
+                    raise EngineError(
+                        "Pwn leak evidence changed before commit"
+                    )
+                verify_transport_journals()
+                item.status = ExperimentStatus.COMPLETED
+                item.result = {
+                    _PWN_LEAK_RESULT_KEY: copy.deepcopy(
+                        result_envelope
+                    )
+                }
+                item.evidence_run_ids = list(inputs.run_ids)
+                # Generic state permits one top-level receipt per experiment.
+                # All three exact typed transport receipts remain bound in the
+                # three run records and aggregate result; the final receipt is
+                # the single experiment-level pointer.
+                item.evidence_receipt_ids = [inputs.receipt_ids[-1]]
+                item.artifact_ids = [
+                    *[value.id for value in inputs.variant_artifacts],
+                    *[
+                        value.id
+                        for value in inputs.capability_artifacts
+                    ],
+                    *[value.id for value in output_artifacts],
+                    result_artifact.id,
+                ]
+                terminal_by_id = {
+                    value.id: value for value in terminal_runs
+                }
+                for index, run in enumerate(state.runs):
+                    replacement = terminal_by_id.get(run.id)
+                    if replacement is not None:
+                        state.runs[index] = copy.deepcopy(replacement)
+                state.receipts.append(
+                    copy.deepcopy(execution_receipts[-1])
+                )
+                state.artifacts.extend(
+                    copy.deepcopy(
+                        [*output_artifacts, result_artifact]
+                    )
+                )
+                if result.status is PwnLeakStatus.PROVEN:
+                    binding = {
+                        "experiment_id": experiment_id,
+                        "baseline_experiment_id": (
+                            inputs.baseline_experiment_id
+                        ),
+                        "plan_recipe_sha256": (
+                            inputs.plan.recipe_sha256
+                        ),
+                        "trusted_replay_expectation_sha256": (
+                            inputs.expectation.evidence_sha256
+                        ),
+                        "result_sha256": result.evidence_sha256,
+                        "replay_count": PWN_LEAK_REPLAY_COUNT,
+                        "authority": "leak_proven",
+                    }
+                    fact_id = _record_id(
+                        "F",
+                        experiment_id,
+                        "leak-proven",
+                    )
+                    progress_id = _record_id(
+                        "P",
+                        experiment_id,
+                        "leak-proven",
+                    )
+                    state.facts.append(
+                        Fact(
+                            id=fact_id,
+                            statement=(
+                                "Engine-owned differential replays proved "
+                                "one map-relative runtime address disclosure "
+                                "at a stable output locus."
+                            ),
+                            provenance=Provenance.EXECUTED,
+                            challenge_id=state.challenge_id,
+                            source_run_id=inputs.run_ids[-1],
+                            artifact_id=result_artifact.id,
+                            locator=result_artifact.path,
+                            extra={
+                                "pwn_leak": copy.deepcopy(binding)
+                            },
+                        )
+                    )
+                    item.evidence_fact_ids = [fact_id]
+                    state.progress_markers.append(
+                        ProgressMarker(
+                            id=progress_id,
+                            statement=(
+                                "Pwn leak provenance reproduced in three "
+                                "clean preissued replays"
+                            ),
+                            run_id=inputs.run_ids[-1],
+                            artifact_ids=[result_artifact.id],
+                            extra={
+                                "pwn_leak": copy.deepcopy(binding)
+                            },
+                        )
+                    )
+                state.budget.spent_seconds += max(
+                    0,
+                    int(time.monotonic() - started),
+                )
+
+            self.store.update(
+                identity,
+                finish,
+                expected_revision=running.revision,
+                commit_guard=verify_terminal,
+                pre_replace_guard=verify_terminal,
+            )
+            committed = True
+            return self.store.load(identity, recover=False)
+        except BaseException as error:
+            self._terminalize_pwn_leak_interruption(
+                identity,
+                experiment_id,
+                error,
+                live_only=live_only,
+            )
+            raise
+        finally:
+            if lease is not None and not lease.released:
+                lease.release()
+            if input_staging is not None:
+                input_staging.cleanup()
+            if source_staging is not None:
+                source_staging.cleanup()
+            if not committed:
+                # The preissued request directories and input/capability
+                # artifacts are canonical and intentionally retained.  Remove
+                # only exact uncommitted replay streams/result files.
+                canonical_artifacts: set[str] = set()
+                try:
+                    canonical = self.store.load(identity, recover=False)
+                    canonical_artifacts = {
+                        item.id for item in canonical.artifacts
+                    }
+                except BaseException:
+                    canonical_artifacts = {
+                        item.id
+                        for item in output_artifacts
+                        if False
+                    }
+                cleanup = [
+                    *output_artifacts,
+                    *([result_artifact] if result_artifact else []),
+                ]
+                if not any(
+                    item.id in canonical_artifacts for item in cleanup
+                ):
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        cleanup,
+                    )
+
     def _effective_committed_batch_results(
         self,
         committed: ChallengeState,
@@ -14245,6 +16555,10 @@ class ChallengeEngine:
             state = self._advance_pwn_runtime_snapshot_disclosures(
                 identity
             )
+            state = self._register_pwn_leak_child_if_applicable(
+                identity,
+                state,
+            )
             state = self._register_pwn_ip_control_child_if_applicable(
                 identity,
                 state,
@@ -14374,6 +16688,51 @@ class ChallengeEngine:
             )
             self._remaining_budget_seconds(latest_before_start)
             first_new_flag = len(detected_flags)
+            if (
+                experiment.command == _PWN_LEAK_ENGINE_COMMAND
+                or experiment.extra.get("engine_executor")
+                == _PWN_LEAK_ENGINE_EXECUTOR
+            ):
+                try:
+                    state = self._execute_pwn_leak(
+                        identity,
+                        experiment.id,
+                        automated=_automated,
+                        live_only=_live_only,
+                    )
+                except Exception as error:
+                    latest_after_error = self.store.load(
+                        identity,
+                        recover=False,
+                    )
+                    current_item = next(
+                        item
+                        for item in latest_after_error.experiments
+                        if item.id == experiment.id
+                    )
+                    if current_item.status in {
+                        ExperimentStatus.REGISTERED,
+                        ExperimentStatus.RUNNING,
+                    }:
+                        self._terminalize_pwn_leak_interruption(
+                            identity,
+                            experiment.id,
+                            error,
+                            live_only=_live_only,
+                        )
+                        state = self.store.load(
+                            identity,
+                            recover=False,
+                        )
+                    else:
+                        state = latest_after_error
+                        print(
+                            "warning: Pwn leak proof raised after terminal "
+                            f"commit: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                continue
             if (
                 experiment.command == _PWN_IP_CONTROL_ENGINE_COMMAND
                 or experiment.extra.get("engine_executor")
@@ -24100,6 +26459,29 @@ class ChallengeEngine:
                     experiment.extra["orphan_recovery"] = (
                         "retryable_without_canonical_outcome"
                     )
+                    continue
+                if (
+                    experiment.command == _PWN_LEAK_ENGINE_COMMAND
+                    or experiment.extra.get("engine_executor")
+                    == _PWN_LEAK_ENGINE_EXECUTOR
+                ):
+                    experiment.status = ExperimentStatus.FAILED
+                    experiment.result = {
+                        "error": (
+                            "Pwn leak proof failed closed: orphaned "
+                            "execution recovered after the previous "
+                            "session owner exited"
+                        )
+                    }
+                    preissued_ids = set(
+                        experiment.extra.get("run_ids", [])
+                    )
+                    for run in current.runs:
+                        if (
+                            run.id in preissued_ids
+                            and run.status is RunStatus.CREATED
+                        ):
+                            run.status = RunStatus.FAILED
                     continue
                 if (
                     experiment.command

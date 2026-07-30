@@ -389,6 +389,19 @@ def _candidate_sha256(candidate: PwnDisclosureCandidate) -> str:
     ).hexdigest()
 
 
+def pwn_leak_child_experiment_id(
+    baseline_experiment_id: str,
+) -> str:
+    """Return the only leak-proof child id for one runtime snapshot."""
+
+    if not _identifier(baseline_experiment_id):
+        raise ValueError("invalid Pwn leak baseline experiment id")
+    digest = hashlib.sha256(
+        baseline_experiment_id.encode("utf-8")
+    ).hexdigest()
+    return f"E-pwn-leak-v1-{digest}"
+
+
 class PwnLeakStatus(str, Enum):
     PROVEN = "PROVEN"
     UNVERIFIABLE = "UNVERIFIABLE"
@@ -2381,6 +2394,7 @@ __all__ = [
     "derive_pwn_leak_plan",
     "evaluate_pwn_leak",
     "evaluate_pwn_leak_strategy_advisory",
+    "pwn_leak_child_experiment_id",
     "pwn_leak_contract_descriptor",
     "validate_pwn_leak_plan_document",
     "validate_pwn_leak_result",
