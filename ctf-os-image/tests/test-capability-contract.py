@@ -121,17 +121,29 @@ assert {
     "z3",
     "ortools",
     "angr_python",
+    "pwn_crash_v1",
     "rev_inventory_v2",
     "rev_safe_output",
     "rev_stdin_exec",
 }
-rev_attestations = {
+managed_attestations = {
     item["name"]: item
     for item in managed_manifest["capabilities"]
     if item["name"]
-    in {"rev_inventory_v2", "rev_safe_output", "rev_stdin_exec"}
+    in {
+        "pwn_crash_v1",
+        "rev_inventory_v2",
+        "rev_safe_output",
+        "rev_stdin_exec",
+    }
 }
-expected_rev_attestations = {
+expected_managed_attestations = {
+    "pwn_crash_v1": {
+        "path": "/opt/ctf-templates/pwn/crash_oracle.py",
+        "source": REPO_ROOT / "templates" / "pwn" / "crash_oracle.py",
+        "contract_id": "ctfos.pwn.crash",
+        "contract_version": 1,
+    },
     "rev_inventory_v2": {
         "path": "/opt/ctf-templates/rev/inventory_v2.py",
         "source": REPO_ROOT / "templates" / "rev" / "inventory_v2.py",
@@ -156,8 +168,8 @@ probe_namespace = runpy.run_path(
     run_name="ctf_capabilities_under_test",
 )
 probe_file = probe_namespace["_probe"]
-for name, expected in expected_rev_attestations.items():
-    record = rev_attestations[name]
+for name, expected in expected_managed_attestations.items():
+    record = managed_attestations[name]
     assert record["kind"] == "file_sha256"
     assert record["path"] == expected["path"]
     assert record["attestation_schema_version"] == 1
@@ -179,10 +191,10 @@ for name, expected in expected_rev_attestations.items():
     }
 
 with tempfile.TemporaryDirectory() as temporary:
-    changed = pathlib.Path(temporary) / "inventory_v2.py"
-    inventory = expected_rev_attestations["rev_inventory_v2"]["source"]
-    changed.write_bytes(inventory.read_bytes() + b"\n")
-    changed_record = dict(rev_attestations["rev_inventory_v2"])
+    changed = pathlib.Path(temporary) / "crash_oracle.py"
+    crash_oracle = expected_managed_attestations["pwn_crash_v1"]["source"]
+    changed.write_bytes(crash_oracle.read_bytes() + b"\n")
+    changed_record = dict(managed_attestations["pwn_crash_v1"])
     changed_record["path"] = str(changed)
     changed_observation = probe_file(changed_record)
     assert changed_observation["available"] is False
@@ -191,7 +203,7 @@ with tempfile.TemporaryDirectory() as temporary:
         != changed_record["sha256"]
     )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
-assert "(.capabilities | length == 8)" in dockerfile
+assert "(.capabilities | length == 9)" in dockerfile
 assert "--network" not in managed_probe_source
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source

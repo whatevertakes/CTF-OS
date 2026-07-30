@@ -8,6 +8,7 @@ from pathlib import Path
 from ctf_os.capabilities import (
     CapabilityError,
     REQUIRED_MANAGED_ATTESTATIONS,
+    REQUIRED_MANAGED_CAPABILITIES,
     inspect_pinned_capabilities,
     normalize_capability_manifest,
 )
@@ -23,20 +24,23 @@ GENERIC_CAPABILITIES = (
 )
 
 
-def capability_payload(*, include_rev: bool = True) -> dict[str, object]:
+def capability_payload(
+    *,
+    excluded_attestations: frozenset[str] = frozenset(),
+) -> dict[str, object]:
     records: list[dict[str, object]] = [
         {"name": name, "available": True}
         for name in GENERIC_CAPABILITIES
     ]
-    if include_rev:
-        records.extend(
-            {
-                "name": name,
-                "available": True,
-                "attestation": dict(attestation),
-            }
-            for name, attestation in REQUIRED_MANAGED_ATTESTATIONS.items()
-        )
+    records.extend(
+        {
+            "name": name,
+            "available": True,
+            "attestation": dict(attestation),
+        }
+        for name, attestation in REQUIRED_MANAGED_ATTESTATIONS.items()
+        if name not in excluded_attestations
+    )
     return {"schema_version": 2, "capabilities": records}
 
 
@@ -48,6 +52,13 @@ class CapabilityTests(unittest.TestCase):
                 / "ctf-os-image"
                 / "capabilities.v2.json"
             ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {
+                record["name"]
+                for record in manifest["capabilities"]
+            },
+            REQUIRED_MANAGED_CAPABILITIES,
         )
         observed = {}
         for record in manifest["capabilities"]:
@@ -139,14 +150,18 @@ class CapabilityTests(unittest.TestCase):
         )
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
 
-    def test_old_v2_image_without_rev_attestations_fails_closed(self):
+    def test_old_v2_image_without_managed_attestations_fails_closed(self):
         def runner(argv, **kwargs):
             del kwargs
             return subprocess.CompletedProcess(
                 argv,
                 0,
                 json.dumps(
-                    capability_payload(include_rev=False)
+                    capability_payload(
+                        excluded_attestations=frozenset(
+                            REQUIRED_MANAGED_ATTESTATIONS
+                        )
+                    )
                 ).encode(),
                 b"",
             )
@@ -156,6 +171,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "pwn_crash_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
                 "rev_stdin_exec",
@@ -163,7 +179,26 @@ class CapabilityTests(unittest.TestCase):
         )
         self.assertEqual(report["attestations"], {})
 
-    def test_rev_fingerprint_or_version_mismatch_fails_closed(self):
+    def test_pwn_crash_capability_missing_fails_closed(self):
+        def runner(argv, **kwargs):
+            del kwargs
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    capability_payload(
+                        excluded_attestations=frozenset({"pwn_crash_v1"})
+                    )
+                ).encode(),
+                b"",
+            )
+
+        report = inspect_pinned_capabilities(DIGEST, runner=runner)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["missing"], ["pwn_crash_v1"])
+        self.assertNotIn("pwn_crash_v1", report["attestations"])
+
+    def test_managed_fingerprint_or_version_mismatch_fails_closed(self):
         payload = capability_payload()
         records = payload["capabilities"]
         self.assertIsInstance(records, list)
@@ -187,6 +222,12 @@ class CapabilityTests(unittest.TestCase):
         safe_output["attestation"]["path"] = (
             "/opt/ctf-templates/rev/stale_output.py"
         )
+        pwn_crash = next(
+            item
+            for item in records
+            if item["name"] == "pwn_crash_v1"
+        )
+        pwn_crash["attestation"]["sha256"] = "f" * 64
 
         def runner(argv, **kwargs):
             del kwargs
@@ -202,6 +243,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "pwn_crash_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
                 "rev_stdin_exec",
@@ -210,6 +252,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             set(report["attestation_errors"]),
             {
+                "pwn_crash_v1",
                 "rev_inventory_v2",
                 "rev_safe_output",
                 "rev_stdin_exec",

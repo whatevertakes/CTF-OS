@@ -49,11 +49,13 @@ required=(
   ctf-os-image/scripts/entrypoint.sh
   ctf-os-image/scripts/gen-manifest.sh
   ctf-os-image/templates/README.md
+  ctf-os-image/templates/pwn/crash_oracle.py
   ctf-os-image/templates/rev/inventory_v2.py
   ctf-os-image/templates/rev/safe_output.py
   ctf-os-image/templates/rev/stdin_exec.py
   ctf-os-image/tests/fixtures/rev-stdin-oracle.c
   ctf-os-image/tests/test-capability-contract.py
+  ctf-os-image/tests/test-pwn-crash-oracle.py
   ctf-os-image/tests/test-rev-inventory.py
   ctf-os-image/tests/test-rev-stdin-exec.py
   scripts/check-rev-docker-proof.py
@@ -83,6 +85,7 @@ fi
 "${python_bin}" ctf-os-image/tests/test-capability-contract.py
 "${python_bin}" ctf-os-image/tests/test-tool-manifest.py
 "${python_bin}" ctf-os-image/tests/test-browser-safety.py
+"${python_bin}" ctf-os-image/tests/test-pwn-crash-oracle.py
 "${python_bin}" ctf-os-image/tests/test-rev-inventory.py
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 "${python_bin}" -m py_compile scripts/check-rev-docker-proof.py
