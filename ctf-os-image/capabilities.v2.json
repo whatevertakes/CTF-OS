@@ -38,7 +38,16 @@
       "attestation_schema_version": 1,
       "contract_id": "ctfos.pwn.crash",
       "contract_version": 1,
-      "sha256": "0ce31429a3fb8ffe32367650d5fb58a076bf445fcb2d9ef33bc1cb69643a4482"
+      "sha256": "ea0b580f549fc796dc814b08dc8e035d702b3fc148109dd8bbfca0250d856e7e"
+    },
+    {
+      "name": "pwn_runtime_snapshot_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/pwn/runtime_snapshot.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.pwn.runtime_snapshot",
+      "contract_version": 1,
+      "sha256": "e350f9cac577b3201a5f28b04e456200c3fc41424616e32cca3dfa2b75f60289"
     },
     {
       "name": "rev_inventory_v2",

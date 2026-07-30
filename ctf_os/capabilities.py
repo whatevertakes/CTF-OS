@@ -26,6 +26,7 @@ REQUIRED_MANAGED_CAPABILITIES = frozenset(
         "ortools",
         "angr_python",
         "pwn_crash_v1",
+        "pwn_runtime_snapshot_v1",
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
@@ -38,8 +39,18 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "contract_version": 1,
         "path": "/opt/ctf-templates/pwn/crash_oracle.py",
         "sha256": (
-            "0ce31429a3fb8ffe32367650d5fb58a0"
-            "76bf445fcb2d9ef33bc1cb69643a4482"
+            "ea0b580f549fc796dc814b08dc8e035d"
+            "702b3fc148109dd8bbfca0250d856e7e"
+        ),
+    },
+    "pwn_runtime_snapshot_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.pwn.runtime_snapshot",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/pwn/runtime_snapshot.py",
+        "sha256": (
+            "e350f9cac577b3201a5f28b04e456200"
+            "c3fc41424616e32cca3dfa2b75f60289"
         ),
     },
     "rev_inventory_v2": {

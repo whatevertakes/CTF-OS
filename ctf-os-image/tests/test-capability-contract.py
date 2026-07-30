@@ -113,6 +113,7 @@ assert browser_source.startswith("#!/opt/venvs/pw/bin/python\n")
 ast.parse(managed_probe_source, filename="scripts/ctf-capabilities")
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2
+assert len(managed_manifest["capabilities"]) == 10
 assert {
     item["name"] for item in managed_manifest["capabilities"]
 } == {
@@ -122,6 +123,7 @@ assert {
     "ortools",
     "angr_python",
     "pwn_crash_v1",
+    "pwn_runtime_snapshot_v1",
     "rev_inventory_v2",
     "rev_safe_output",
     "rev_stdin_exec",
@@ -132,6 +134,7 @@ managed_attestations = {
     if item["name"]
     in {
         "pwn_crash_v1",
+        "pwn_runtime_snapshot_v1",
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
@@ -142,6 +145,14 @@ expected_managed_attestations = {
         "path": "/opt/ctf-templates/pwn/crash_oracle.py",
         "source": REPO_ROOT / "templates" / "pwn" / "crash_oracle.py",
         "contract_id": "ctfos.pwn.crash",
+        "contract_version": 1,
+    },
+    "pwn_runtime_snapshot_v1": {
+        "path": "/opt/ctf-templates/pwn/runtime_snapshot.py",
+        "source": (
+            REPO_ROOT / "templates" / "pwn" / "runtime_snapshot.py"
+        ),
+        "contract_id": "ctfos.pwn.runtime_snapshot",
         "contract_version": 1,
     },
     "rev_inventory_v2": {
@@ -203,7 +214,8 @@ with tempfile.TemporaryDirectory() as temporary:
         != changed_record["sha256"]
     )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
-assert "(.capabilities | length == 9)" in dockerfile
+assert "(.capabilities | length == 10)" in dockerfile
+assert 'or .name == "pwn_runtime_snapshot_v1"' in dockerfile
 assert "--network" not in managed_probe_source
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source

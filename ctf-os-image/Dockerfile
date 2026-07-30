@@ -921,14 +921,15 @@ RUN /usr/local/bin/gen-manifest.sh > /tools/manifest.json \
       | jq -e '.found == true and .tool.available == true' >/dev/null \
  && /usr/local/bin/ctf-capabilities --json \
       | jq -e '.schema_version == 2 \
-          and (.capabilities | length == 9) \
+          and (.capabilities | length == 10) \
           and all(.capabilities[]; .available == true) \
           and ([.capabilities[] \
               | select(.name == "pwn_crash_v1" \
+                  or .name == "pwn_runtime_snapshot_v1" \
                   or .name == "rev_inventory_v2" \
                   or .name == "rev_safe_output" \
                   or .name == "rev_stdin_exec") \
-              | .attestation.schema_version] == [1, 1, 1, 1])' >/dev/null \
+              | .attestation.schema_version] == [1, 1, 1, 1, 1])' >/dev/null \
  && rm -f /tools/failed.txt
 
 # 실행 환경
