@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import ctf_os.engine.challenge as challenge_module
 import ctf_os.migration as migration_module
 from ctf_os.adapters import get_adapter
 from ctf_os.codex import (
@@ -68,6 +69,7 @@ from tests.test_engine import (
     FakeSandbox,
     _output_path,
     _payload,
+    _rev_inventory_payload,
     _role_for,
 )
 
@@ -88,6 +90,7 @@ class ProbeRoleExecutor:
         captain_stage: str = "attack",
         proof_candidate_id: str | None = None,
         proof_artifact_id: str | None = None,
+        proof_artifact_purpose: str = "reproducer",
         proof_extra_action: bool = False,
     ) -> None:
         self.invalid_role = invalid_role
@@ -97,6 +100,7 @@ class ProbeRoleExecutor:
         self.captain_stage = captain_stage
         self.proof_candidate_id = proof_candidate_id
         self.proof_artifact_id = proof_artifact_id
+        self.proof_artifact_purpose = proof_artifact_purpose
         self.proof_extra_action = proof_extra_action
         self.lock = threading.Lock()
         self.active = 0
@@ -201,7 +205,9 @@ class ProbeRoleExecutor:
                                         "artifact_id": (
                                             self.proof_artifact_id
                                         ),
-                                        "purpose": "reproducer",
+                                        "purpose": (
+                                            self.proof_artifact_purpose
+                                        ),
                                     }
                                 ]
                                 if self.proof_artifact_id is not None
@@ -326,6 +332,162 @@ class AlwaysReplaySandbox(ReplaySandbox):
 
     def run_clean_proof(self, spec, **kwargs):
         return FakeSandbox.run_clean_proof(self, spec, **kwargs)
+
+
+class RevManagedProofSandbox(FakeSandbox):
+    """Complete v2 inventory, source, and six-run Rev proof double."""
+
+    def __init__(
+        self,
+        work: Path,
+        source: bytes,
+        *,
+        accepted_input: bytes,
+        negative_emits_flag: bool = False,
+        transport_exit_ordinal: int | None = None,
+        orchestration_error_ordinal: int | None = None,
+    ) -> None:
+        super().__init__(work)
+        self.source = source
+        self.accepted_input = accepted_input
+        self.negative_emits_flag = negative_emits_flag
+        self.transport_exit_ordinal = transport_exit_ordinal
+        self.orchestration_error_ordinal = (
+            orchestration_error_ordinal
+        )
+        self.tool_calls = 0
+
+    @staticmethod
+    def _result(
+        *,
+        run_id: str,
+        stdout: Path,
+        stderr: Path,
+        stdout_path: str,
+        stderr_path: str,
+        exit_code: int = 0,
+    ) -> SandboxResult:
+        stdout_size = stdout.stat().st_size
+        stderr_size = stderr.stat().st_size
+        return SandboxResult(
+            run_id=run_id,
+            status="completed" if exit_code == 0 else "failed",
+            exit_code=exit_code,
+            timed_out=False,
+            duration_ms=5,
+            stdout_summary=stdout.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ),
+            stderr_summary=stderr.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ),
+            stdout_bytes=stdout_size,
+            stderr_bytes=stderr_size,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            stdout_stored_bytes=stdout_size,
+            stderr_stored_bytes=stderr_size,
+            stdout_limit_bytes=16 * 1024 * 1024,
+            stderr_limit_bytes=16 * 1024 * 1024,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            stdout_truncation_known=True,
+            stderr_truncation_known=True,
+            stdout_capture_complete=True,
+            stderr_capture_complete=True,
+            stdout_summary_truncated=False,
+            stderr_summary_truncated=False,
+            stdout_error=None,
+            stderr_error=None,
+            stream_capture_error=None,
+            orchestration_error=None,
+        )
+
+    def run(self, spec):
+        self.specs.append(spec)
+        self.tool_calls += 1
+        relative = Path("raw") / f"managed-{self.tool_calls}"
+        directory = self.work / relative
+        directory.mkdir(parents=True, exist_ok=False)
+        stdout = directory / "stdout.log"
+        stderr = directory / "stderr.log"
+        if "/opt/ctf-templates/rev/inventory_v2.py" in spec.argv:
+            stdout.write_bytes(_rev_inventory_payload(self.source))
+        else:
+            stdout.write_bytes(b"answer KCTF{rev_proof_flag}\n")
+        stderr.write_bytes(b"")
+        return self._result(
+            run_id=f"managed-{self.tool_calls}",
+            stdout=stdout,
+            stderr=stderr,
+            stdout_path=f"/work/{relative.as_posix()}/stdout.log",
+            stderr_path=f"/work/{relative.as_posix()}/stderr.log",
+        )
+
+    def run_clean_proof(
+        self,
+        spec,
+        *,
+        input_locators=(),
+        proof_inputs=(),
+    ):
+        del input_locators
+        self.proof_specs.append(spec)
+        self.proof_calls += 1
+        self.assert_no_network(spec)
+        captured_inputs = []
+        for item in proof_inputs:
+            payload = (self.work / item.source_locator).read_bytes()
+            self.assert_input_binding(item, payload)
+            captured_inputs.append((item.destination_locator, payload))
+        self.proof_input_calls.append(tuple(captured_inputs))
+        payload = captured_inputs[0][1]
+        if self.orchestration_error_ordinal == self.proof_calls:
+            raise RuntimeError("synthetic Rev sandbox orchestration error")
+        positive = payload == self.accepted_input
+        relative = Path("proof") / f"rev-clean-{self.proof_calls}"
+        directory = self.work / relative
+        directory.mkdir(parents=True, exist_ok=False)
+        stdout = directory / "stdout.log"
+        stderr = directory / "stderr.log"
+        if positive or (
+            self.negative_emits_flag and self.proof_calls == 4
+        ):
+            stdout.write_bytes(b"KCTF{rev_proof_flag}\n")
+        else:
+            stdout.write_bytes(b"rejected\n")
+        stderr.write_bytes(b"")
+        exit_code = (
+            125
+            if self.transport_exit_ordinal == self.proof_calls
+            else 7
+            if not positive
+            else 0
+        )
+        return self._result(
+            run_id=f"rev-proof-{self.proof_calls}",
+            stdout=stdout,
+            stderr=stderr,
+            stdout_path=f"/work/{relative.as_posix()}/stdout.log",
+            stderr_path=f"/work/{relative.as_posix()}/stderr.log",
+            exit_code=exit_code,
+        )
+
+    @staticmethod
+    def assert_no_network(spec) -> None:
+        if spec.network_target is not None:
+            raise AssertionError("Rev proof unexpectedly enabled network")
+
+    @staticmethod
+    def assert_input_binding(item, payload: bytes) -> None:
+        if hashlib.sha256(payload).hexdigest() != item.sha256:
+            raise AssertionError("Rev proof input hash mismatch")
+        if len(payload) != item.size_bytes:
+            raise AssertionError("Rev proof input size mismatch")
+        if item.destination_locator != "oracle/accepted-input.bin":
+            raise AssertionError("Rev proof input destination changed")
 
 
 class ReceiptCanarySandbox(FakeSandbox):
@@ -536,6 +698,680 @@ class ManagedV2Tests(unittest.TestCase):
             session_id,
             status=SessionStatus.COMPLETED,
             reason="managed source replay fixture completed",
+        )
+
+    def run_managed_rev_proof_fixture(
+        self,
+        *,
+        negative_emits_flag: bool = False,
+        transport_exit_ordinal: int | None = None,
+        orchestration_error_ordinal: int | None = None,
+        proof_execution_hook=None,
+    ):
+        source = (
+            self.root
+            / "incoming"
+            / self.identity.contest_id
+            / self.identity.category
+            / self.identity.challenge_id
+            / "challenge.bin"
+        ).read_bytes()
+        accepted_input = b"OPEN-SESAME\n"
+        executor = ProbeRoleExecutor(
+            captain_stage="proof",
+            proof_artifact_purpose="accepted_input",
+        )
+        sandboxes_by_work: dict[Path, RevManagedProofSandbox] = {}
+
+        def sandbox_factory(state, work, policy):
+            del state
+            if policy.allow_targets:
+                raise AssertionError(
+                    "managed Rev proof sandbox must deny network"
+                )
+            key = work.resolve()
+            sandbox = sandboxes_by_work.get(key)
+            if sandbox is None:
+                sandbox = RevManagedProofSandbox(
+                    work,
+                    source,
+                    accepted_input=accepted_input,
+                    negative_emits_flag=negative_emits_flag,
+                    transport_exit_ordinal=transport_exit_ordinal,
+                    orchestration_error_ordinal=(
+                        orchestration_error_ordinal
+                    ),
+                )
+                sandboxes_by_work[key] = sandbox
+            return sandbox
+
+        engine = self.engine(
+            executor,
+            sandbox_factory=sandbox_factory,
+        )
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        state = self.add_v2(engine)
+        inventory_experiment = next(
+            item
+            for item in state.experiments
+            if item.extra.get("adapter_spec_template_id")
+            == "inventory_observation"
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            self.identity,
+            inventory_experiment.id,
+        )
+        state = engine.store.load(self.identity)
+        accepted_path = engine._workspace(state) / "accepted-input.bin"
+        accepted_path.write_bytes(accepted_input)
+        _state, accepted_artifact = engine.register_workspace_artifact(
+            self.identity,
+            "accepted-input.bin",
+        )
+        _state, source_experiment_id = engine.register_experiment(
+            self.identity,
+            command=("/bin/true",),
+            expected_observation="the tool emits the solved candidate",
+            keep_if="the candidate is present in durable stdout",
+            drop_if="the candidate is absent",
+        )
+        self.execute_managed_source_fixture(
+            orchestrator,
+            engine,
+            self.identity,
+            source_experiment_id,
+        )
+        state = engine.store.load(self.identity)
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.value == "KCTF{rev_proof_flag}"
+        )
+        executor.proof_candidate_id = candidate.id
+        executor.proof_artifact_id = accepted_artifact.id
+
+        execute_proof = lambda: orchestrator.run_cycle(self.identity)
+        committed = (
+            proof_execution_hook(engine, execute_proof)
+            if proof_execution_hook is not None
+            else execute_proof()
+        )
+        proof_experiment = next(
+            item
+            for item in committed.experiments
+            if item.kind is ExperimentKind.PROOF
+        )
+        sandbox = sandboxes_by_work[
+            engine._workspace(committed).resolve()
+        ]
+        return (
+            committed,
+            proof_experiment,
+            candidate,
+            sandbox,
+            accepted_input,
+        )
+
+    def test_rev_managed_stdin_proof_passes_six_clean_runs(self):
+        (
+            state,
+            proof_experiment,
+            candidate,
+            sandbox,
+            accepted_input,
+        ) = self.run_managed_rev_proof_fixture()
+
+        self.assertEqual(state.status, ChallengeStatus.READY_TO_SUBMIT)
+        self.assertEqual(state.submissions, [])
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        result = proof_experiment.result
+        self.assertTrue(result["proof_result"]["passed"])
+        envelope = result["rev_proof_evidence"]
+        self.assertEqual(
+            envelope["protocol"],
+            "rev_original_binary_stdin_candidate_v1",
+        )
+        self.assertEqual(
+            envelope["evaluation_sha256"],
+            next(
+                item
+                for item in state.artifacts
+                if item.id == envelope["evaluation_artifact_id"]
+            ).sha256,
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.READY_TO_SUBMIT,
+        )
+        proof_runs = [
+            item
+            for item in state.runs
+            if item.origin is RunOrigin.PROOF
+        ]
+        self.assertEqual(len(proof_runs), 6)
+        self.assertTrue(
+            all(item.status is RunStatus.COMPLETED for item in proof_runs)
+        )
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(
+            [call[0][1] for call in sandbox.proof_input_calls[:3]],
+            [accepted_input] * 3,
+        )
+        self.assertEqual(
+            [call[0][0] for call in sandbox.proof_input_calls],
+            ["oracle/accepted-input.bin"] * 6,
+        )
+        self.assertEqual(
+            [call[0][1] for call in sandbox.proof_input_calls[3:]],
+            [
+                bytes((accepted_input[0] ^ 0x01,))
+                + accepted_input[1:],
+                accepted_input[:-1]
+                + bytes((accepted_input[-1] ^ 0x80,)),
+                accepted_input[:-1],
+            ],
+        )
+        recipe = proof_experiment.proof_recipe
+        self.assertIsNotNone(recipe)
+        assert recipe is not None
+        self.assertEqual(
+            recipe.argv,
+            (
+                "/usr/bin/python3",
+                "/opt/ctf-templates/rev/stdin_exec.py",
+                "--binary",
+                "/challenge/challenge.bin",
+                "--input",
+                "/work/oracle/accepted-input.bin",
+            ),
+        )
+        state.validate()
+
+    def test_rev_managed_stdin_semantic_falsification_completes(self):
+        state, proof_experiment, candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                negative_emits_flag=True,
+            )
+        )
+
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        self.assertFalse(
+            proof_experiment.result["proof_result"]["passed"]
+        )
+        self.assertIn(
+            "negative_flag_candidate_observed",
+            proof_experiment.result["rev_proof_evidence"][
+                "evaluation"
+            ]["failure_codes"],
+        )
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(state.submissions, [])
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_rev_managed_stdin_exit_125_is_structural_failure(self):
+        state, proof_experiment, _candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                transport_exit_ordinal=2,
+            )
+        )
+
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        failure_codes = proof_experiment.result[
+            "rev_proof_evidence"
+        ]["evaluation"]["failure_codes"]
+        self.assertIn("target_transport_exit_125", failure_codes)
+        self.assertEqual(sandbox.proof_calls, 6)
+        proof_runs = [
+            item
+            for item in state.runs
+            if item.origin is RunOrigin.PROOF
+        ]
+        self.assertIs(proof_runs[1].status, RunStatus.FAILED)
+
+    def test_rev_managed_stdin_orchestration_error_is_evidenced(self):
+        state, proof_experiment, _candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                orchestration_error_ordinal=2,
+            )
+        )
+
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        evaluation = proof_experiment.result[
+            "rev_proof_evidence"
+        ]["evaluation"]
+        self.assertIn(
+            "orchestration_incomplete",
+            evaluation["failure_codes"],
+        )
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(len(proof_experiment.artifact_ids), 14)
+        failed_run = [
+            item
+            for item in state.runs
+            if item.origin is RunOrigin.PROOF
+        ][1]
+        self.assertIs(failed_run.status, RunStatus.FAILED)
+        failed_artifacts = [
+            item
+            for item in state.artifacts
+            if item.source_run_id == failed_run.id
+        ]
+        self.assertEqual(len(failed_artifacts), 2)
+        self.assertTrue(
+            all(
+                item.size == 0
+                and item.extra.get("capture_placeholder") is True
+                for item in failed_artifacts
+            )
+        )
+        state.validate()
+
+    def test_rev_managed_stdin_final_guard_rejects_late_deadline(self):
+        expired = False
+        final_revalidations = 0
+
+        def expire_after_final_streams(engine, execute_proof):
+            original_revalidate = (
+                engine._revalidate_rev_proof_attempt
+            )
+            original_deadline_gate = (
+                engine._require_before_hard_deadline
+            )
+
+            def revalidate_then_expire(*args, **kwargs):
+                nonlocal expired, final_revalidations
+                result = original_revalidate(*args, **kwargs)
+                if kwargs.get("revalidate_external_pins") is False:
+                    final_revalidations += 1
+                    if final_revalidations == 6:
+                        expired = True
+                return result
+
+            def deadline_gate(deadline, operation):
+                if expired:
+                    raise challenge_module._HardDeadlineExpired(
+                        "synthetic deadline after final stream rescan"
+                    )
+                return original_deadline_gate(deadline, operation)
+
+            with (
+                mock.patch.object(
+                    engine,
+                    "_revalidate_rev_proof_attempt",
+                    side_effect=revalidate_then_expire,
+                ),
+                mock.patch.object(
+                    engine,
+                    "_require_before_hard_deadline",
+                    side_effect=deadline_gate,
+                ),
+            ):
+                return execute_proof()
+
+        state, proof_experiment, candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=expire_after_final_streams,
+            )
+        )
+
+        self.assertTrue(expired)
+        self.assertEqual(final_revalidations, 6)
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_rev_managed_stdin_final_guard_rejects_source_toctou(self):
+        source_changed = False
+        final_revalidations = 0
+
+        def mutate_after_final_streams(engine, execute_proof):
+            original_revalidate = (
+                engine._revalidate_rev_proof_attempt
+            )
+
+            def revalidate_then_mutate(*args, **kwargs):
+                nonlocal source_changed, final_revalidations
+                result = original_revalidate(*args, **kwargs)
+                if kwargs.get("revalidate_external_pins") is False:
+                    final_revalidations += 1
+                    if final_revalidations == 6:
+                        source = (
+                            engine.challenge_input(self.identity)
+                            / "challenge.bin"
+                        )
+                        source.write_bytes(b"\x7fELFchanged-after-scan")
+                        source_changed = True
+                return result
+
+            with mock.patch.object(
+                engine,
+                "_revalidate_rev_proof_attempt",
+                side_effect=revalidate_then_mutate,
+            ):
+                return execute_proof()
+
+        state, proof_experiment, candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=mutate_after_final_streams,
+            )
+        )
+
+        self.assertTrue(source_changed)
+        self.assertEqual(final_revalidations, 6)
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_rev_managed_stdin_final_guard_rejects_config_toctou(self):
+        config_changed = False
+        final_revalidations = 0
+
+        def mutate_after_final_streams(engine, execute_proof):
+            original_revalidate = (
+                engine._revalidate_rev_proof_attempt
+            )
+
+            def revalidate_then_mutate(*args, **kwargs):
+                nonlocal config_changed, final_revalidations
+                result = original_revalidate(*args, **kwargs)
+                if kwargs.get("revalidate_external_pins") is False:
+                    final_revalidations += 1
+                    if final_revalidations == 6:
+                        engine.config = replace(
+                            engine.config,
+                            runtime=replace(
+                                engine.config.runtime,
+                                image_digest=(
+                                    "sha256:" + "c" * 64
+                                ),
+                            ),
+                        )
+                        config_changed = True
+                return result
+
+            with mock.patch.object(
+                engine,
+                "_revalidate_rev_proof_attempt",
+                side_effect=revalidate_then_mutate,
+            ):
+                return execute_proof()
+
+        state, proof_experiment, candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=mutate_after_final_streams,
+            )
+        )
+
+        self.assertTrue(config_changed)
+        self.assertEqual(final_revalidations, 6)
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_rev_managed_stdin_pre_replace_deadline_is_atomic(self):
+        final_margin_checks = 0
+
+        def expire_at_pre_replace(engine, execute_proof):
+            original_deadline_gate = (
+                engine._require_before_hard_deadline
+            )
+
+            def deadline_gate(deadline, operation):
+                nonlocal final_margin_checks
+                if (
+                    operation
+                    == "Rev proof final pre-replace safety margin"
+                ):
+                    final_margin_checks += 1
+                    if final_margin_checks == 2:
+                        raise challenge_module._HardDeadlineExpired(
+                            "synthetic atomic pre-replace deadline"
+                        )
+                return original_deadline_gate(deadline, operation)
+
+            with mock.patch.object(
+                engine,
+                "_require_before_hard_deadline",
+                side_effect=deadline_gate,
+            ):
+                return execute_proof()
+
+        state, proof_experiment, candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=expire_at_pre_replace,
+            )
+        )
+
+        self.assertEqual(final_margin_checks, 2)
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertEqual(state.status, ChallengeStatus.ACTIVE)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.FAILED,
+        )
+        self.assertEqual(
+            next(
+                item
+                for item in state.candidates
+                if item.id == candidate.id
+            ).status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_rev_managed_stdin_interrupt_cleans_pending_streams(self):
+        captured_engines = []
+
+        def interrupt_scan(engine, execute_proof):
+            captured_engines.append(engine)
+            with mock.patch.object(
+                engine,
+                "_scan_rev_proof_stream_artifacts",
+                side_effect=KeyboardInterrupt(
+                    "synthetic Rev stream-scan interruption"
+                ),
+            ):
+                return execute_proof()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=interrupt_scan,
+            )
+
+        engine = captured_engines[0]
+        state = engine.store.load(self.identity)
+        paths = engine.store.challenge_paths(self.identity)
+        canonical_paths = {
+            paths.root / artifact.path
+            for artifact in state.artifacts
+        }
+        proof_files = {
+            path
+            for path in paths.proof.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(proof_files - canonical_paths, set())
+        self.assertFalse(
+            any(
+                path.name in {"stdout.log", "stderr.log"}
+                for path in proof_files
+            )
+        )
+
+    def test_rev_managed_stdin_interrupt_cleans_pending_evaluation(self):
+        captured_engines = []
+        original_atomic_write = challenge_module.atomic_write_bytes
+
+        def interrupt_evaluation_write(path, payload, *, mode=0o600):
+            original_atomic_write(path, payload, mode=mode)
+            if Path(path).name == "evaluation.json":
+                raise KeyboardInterrupt(
+                    "synthetic Rev evaluation-write interruption"
+                )
+
+        def interrupt_evaluation(engine, execute_proof):
+            captured_engines.append(engine)
+            with mock.patch.object(
+                challenge_module,
+                "atomic_write_bytes",
+                side_effect=interrupt_evaluation_write,
+            ):
+                return execute_proof()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=interrupt_evaluation,
+            )
+
+        engine = captured_engines[0]
+        state = engine.store.load(self.identity)
+        paths = engine.store.challenge_paths(self.identity)
+        canonical_paths = {
+            paths.root / artifact.path
+            for artifact in state.artifacts
+        }
+        proof_files = {
+            path
+            for path in paths.proof.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(proof_files - canonical_paths, set())
+        self.assertFalse(
+            any(path.name == "evaluation.json" for path in proof_files)
+        )
+
+    def test_rev_managed_stdin_interrupt_after_commit_preserves_evidence(
+        self,
+    ):
+        captured_engines = []
+
+        def interrupt_after_commit(engine, execute_proof):
+            captured_engines.append(engine)
+            original_update = engine.store.update
+            interrupted = False
+
+            def update_then_interrupt(*args, **kwargs):
+                nonlocal interrupted
+                committed = original_update(*args, **kwargs)
+                if (
+                    not interrupted
+                    and any(
+                        isinstance(experiment.result, dict)
+                        and "rev_proof_evidence"
+                        in experiment.result
+                        for experiment in committed.experiments
+                    )
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt(
+                        "synthetic Rev post-commit interruption"
+                    )
+                return committed
+
+            with mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=update_then_interrupt,
+            ):
+                return execute_proof()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=interrupt_after_commit,
+            )
+
+        engine = captured_engines[0]
+        state = engine.store.load(self.identity)
+        paths = engine.store.challenge_paths(self.identity)
+        canonical_paths = {
+            paths.root / artifact.path
+            for artifact in state.artifacts
+        }
+        proof_files = {
+            path
+            for path in paths.proof.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(proof_files - canonical_paths, set())
+        self.assertEqual(state.status, ChallengeStatus.PAUSED)
+        self.assertEqual(
+            state.resume_status,
+            ChallengeStatus.READY_TO_SUBMIT,
+        )
+        proof_experiment = next(
+            item
+            for item in state.experiments
+            if item.kind is ExperimentKind.PROOF
+        )
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        self.assertTrue(
+            any(path.name == "evaluation.json" for path in proof_files)
         )
 
     def test_proof_wave_records_remote_replay_without_full_proof_or_submission(

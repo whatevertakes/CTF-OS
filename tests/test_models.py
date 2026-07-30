@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import unittest
 from unittest import mock
 
 import ctf_os.models as models_module
 from ctf_os.contracts.rev_inventory_v2 import (
     REV_INVENTORY_V2_MAX_SOURCE_BYTES,
+    REV_INVENTORY_V2_CONTRACT_FINGERPRINT,
+    REV_INVENTORY_V2_CONTRACT_ID,
+    REV_INVENTORY_V2_CONTRACT_VERSION,
     REV_INVENTORY_V2_SEED_DROP_CONDITION,
     REV_INVENTORY_V2_SEED_EXPECTED_OBSERVATION,
     REV_INVENTORY_V2_SEED_KEEP_CONDITION,
@@ -22,6 +27,7 @@ from ctf_os.models import (
     MAX_RECORDS_PER_COLLECTION,
     MAX_REPEATED_FIELD_ITEMS,
     ArtifactReference,
+    CandidateStatus,
     ChallengeIdentity,
     ChallengeStatus,
     Experiment,
@@ -32,6 +38,7 @@ from ctf_os.models import (
     Falsifier,
     FlagCandidate,
     Goal,
+    GoalStatus,
     Hypothesis,
     HypothesisStatus,
     MAX_EXPERIMENT_TIMEOUT_SECONDS,
@@ -41,9 +48,16 @@ from ctf_os.models import (
     ProofRecipeInput,
     Provenance,
     ReceiptOutcome,
+    RevStdinOracleBinding,
     RunReference,
+    RunOrigin,
     RunStatus,
+    SubmissionReference,
+    SubmissionStatus,
     new_challenge_state,
+)
+from ctf_os.engine.rev_proof import (
+    parse_rev_proof_evaluation_evidence,
 )
 from ctf_os.store.upgrades import upgrade_state
 
@@ -222,7 +236,486 @@ def _canonical_rev_inventory_error_records(
     return experiment, run, receipt, artifact
 
 
+def _managed_rev_proof_state(
+    *,
+    negative_emits_flag: bool = False,
+):
+    """Return a detached real managed-proof state for model tamper tests."""
+
+    from tests.test_managed import ManagedV2Tests
+
+    fixture = ManagedV2Tests(
+        "test_rev_managed_stdin_proof_passes_six_clean_runs"
+    )
+    fixture.setUp()
+    try:
+        state, _experiment, _candidate, _sandbox, _accepted = (
+            fixture.run_managed_rev_proof_fixture(
+                negative_emits_flag=negative_emits_flag,
+            )
+        )
+        return copy.deepcopy(state)
+    finally:
+        fixture.tearDown()
+
+
+def _duplicate_passing_rev_candidate(state):
+    """Add a second independently linked copy of a passing Rev proof."""
+
+    original_experiment = next(
+        item
+        for item in state.experiments
+        if item.kind is ExperimentKind.PROOF
+        and item.result["rev_proof_evidence"]["evaluation"]["passed"]
+    )
+    original_recipe = original_experiment.proof_recipe
+    assert original_recipe is not None
+    original_candidate = next(
+        item
+        for item in state.candidates
+        if item.id == original_recipe.candidate_id
+    )
+    second_candidate = copy.deepcopy(original_candidate)
+    second_candidate.id = f"{original_candidate.id}-second"
+    second_candidate.proof_run_ids = []
+
+    second_experiment_id = f"{original_experiment.id}-second"
+    second_recipe = ProofRecipe.create(
+        candidate_id=second_candidate.id,
+        source_experiment_id=original_recipe.source_experiment_id,
+        source_run_id=original_recipe.source_run_id,
+        argv=original_recipe.argv,
+        inputs=original_recipe.inputs,
+        network_target_id=original_recipe.network_target_id,
+        network_target_generation=(
+            original_recipe.network_target_generation
+        ),
+        network_endpoint=original_recipe.network_endpoint,
+        configuration_epoch=original_recipe.configuration_epoch,
+        source_manifest_sha256=(
+            original_recipe.source_manifest_sha256
+        ),
+        source_request_sha256=original_recipe.source_request_sha256,
+        image_reference=original_recipe.image_reference,
+        policy=original_recipe.policy,
+        oracle_binding=original_recipe.oracle_binding,
+    )
+
+    original_envelope = original_experiment.result[
+        "rev_proof_evidence"
+    ]
+    evaluation_mapping = copy.deepcopy(
+        original_envelope["evaluation"]
+    )
+    run_id_map: dict[str, str] = {}
+    artifact_id_map: dict[str, str] = {}
+    for observation in evaluation_mapping["observations"]:
+        original_run_id = observation["run_id"]
+        second_run_id = f"{original_run_id}-second"
+        run_id_map[original_run_id] = second_run_id
+        observation["run_id"] = second_run_id
+        for stream_name in ("stdout", "stderr"):
+            stream = observation[stream_name]
+            original_artifact_id = stream["artifact_id"]
+            second_artifact_id = f"{original_artifact_id}-second"
+            artifact_id_map[original_artifact_id] = second_artifact_id
+            stream["artifact_id"] = second_artifact_id
+    parsed_evaluation = parse_rev_proof_evaluation_evidence(
+        evaluation_mapping
+    )
+    second_run_ids = [
+        observation.run_id
+        for observation in parsed_evaluation.observations
+    ]
+    second_candidate.proof_run_ids = list(second_run_ids)
+
+    original_runs = {
+        item.id: item
+        for item in state.runs
+        if item.id in run_id_map
+    }
+    second_runs = []
+    for observation in parsed_evaluation.observations:
+        original_run_id = next(
+            old_id
+            for old_id, new_id in run_id_map.items()
+            if new_id == observation.run_id
+        )
+        second_run = copy.deepcopy(original_runs[original_run_id])
+        second_run.id = observation.run_id
+        second_run.request_path = (
+            f"runs/{observation.run_id}/request.json"
+        )
+        second_run.result_path = (
+            f"runs/{observation.run_id}/result.json"
+        )
+        second_run.validation_path = (
+            f"runs/{observation.run_id}/validation.json"
+        )
+        second_run.extra["experiment_id"] = second_experiment_id
+        second_run.extra["rev_proof_recipe_sha256"] = (
+            second_recipe.recipe_sha256
+        )
+        second_run.extra["rev_proof_observation"] = (
+            observation.to_dict()
+        )
+        second_runs.append(second_run)
+
+    original_artifacts = {
+        item.id: item
+        for item in state.artifacts
+        if item.id in artifact_id_map
+    }
+    second_stream_artifacts = []
+    for original_id, second_id in artifact_id_map.items():
+        artifact = copy.deepcopy(original_artifacts[original_id])
+        artifact.id = second_id
+        artifact.path = f"{artifact.path}.second"
+        assert artifact.source_run_id is not None
+        artifact.source_run_id = run_id_map[artifact.source_run_id]
+        artifact.extra["experiment_id"] = second_experiment_id
+        second_stream_artifacts.append(artifact)
+
+    second_evaluation_artifact_id = (
+        f"{original_envelope['evaluation_artifact_id']}-second"
+    )
+    original_evaluation_artifact = next(
+        item
+        for item in state.artifacts
+        if item.id == original_envelope["evaluation_artifact_id"]
+    )
+    second_evaluation_artifact = copy.deepcopy(
+        original_evaluation_artifact
+    )
+    second_evaluation_artifact.id = second_evaluation_artifact_id
+    second_evaluation_artifact.path = (
+        f"{original_evaluation_artifact.path}.second"
+    )
+    second_evaluation_artifact.sha256 = (
+        parsed_evaluation.evidence_sha256
+    )
+    second_evaluation_artifact.size = len(
+        parsed_evaluation.canonical_bytes()
+    )
+    second_evaluation_artifact.extra = {
+        "kind": "rev_proof_evaluation",
+        "experiment_id": second_experiment_id,
+        "candidate_id": second_candidate.id,
+        "recipe_sha256": second_recipe.recipe_sha256,
+        "policy_sha256": second_recipe.policy.policy_sha256,
+        "protocol": parsed_evaluation.protocol,
+    }
+
+    second_envelope = copy.deepcopy(original_envelope)
+    second_envelope["candidate_id"] = second_candidate.id
+    second_envelope["recipe_sha256"] = second_recipe.recipe_sha256
+    second_envelope["evaluation"] = parsed_evaluation.to_dict()
+    second_envelope["evaluation_sha256"] = (
+        parsed_evaluation.evidence_sha256
+    )
+    second_envelope["evaluation_artifact_id"] = (
+        second_evaluation_artifact_id
+    )
+    second_proof_result = copy.deepcopy(
+        original_experiment.result["proof_result"]
+    )
+    second_proof_result["run_ids"] = list(second_run_ids)
+
+    second_experiment = copy.deepcopy(original_experiment)
+    second_experiment.id = second_experiment_id
+    second_experiment.proof_recipe = second_recipe
+    second_experiment.evidence_run_ids = list(second_run_ids)
+    ordered_stream_ids: list[str] = []
+    for observation in parsed_evaluation.observations:
+        assert observation.stdout.artifact_id is not None
+        assert observation.stderr.artifact_id is not None
+        ordered_stream_ids.extend(
+            (
+                observation.stdout.artifact_id,
+                observation.stderr.artifact_id,
+            )
+        )
+    second_experiment.artifact_ids = [
+        second_recipe.inputs[0].artifact_id,
+        *ordered_stream_ids,
+        second_evaluation_artifact_id,
+    ]
+    second_experiment.result = {
+        "proof_result": second_proof_result,
+        "rev_proof_evidence": second_envelope,
+    }
+
+    state.candidates.append(second_candidate)
+    state.experiments.append(second_experiment)
+    state.runs.extend(second_runs)
+    state.artifacts.extend(second_stream_artifacts)
+    state.artifacts.append(second_evaluation_artifact)
+    return original_candidate, second_candidate
+
+
 class ModelTests(unittest.TestCase):
+    def test_persisted_rev_proof_rejects_hash_and_run_slice_tamper(
+        self,
+    ) -> None:
+        state = _managed_rev_proof_state()
+        state.validate()
+
+        hash_tampered = copy.deepcopy(state)
+        proof = next(
+            item
+            for item in hash_tampered.experiments
+            if item.kind is ExperimentKind.PROOF
+        )
+        proof.result["rev_proof_evidence"][
+            "evaluation_sha256"
+        ] = "0" * 64
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "proof evaluation",
+        ):
+            hash_tampered.validate()
+
+        slice_tampered = copy.deepcopy(state)
+        candidate = next(
+            item
+            for item in slice_tampered.candidates
+            if item.status is CandidateStatus.READY_TO_SUBMIT
+        )
+        candidate.proof_run_ids[-6], candidate.proof_run_ids[-5] = (
+            candidate.proof_run_ids[-5],
+            candidate.proof_run_ids[-6],
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "contiguous evaluation",
+        ):
+            slice_tampered.validate()
+
+    def test_latest_failed_rev_evaluation_cannot_promote_ready(
+        self,
+    ) -> None:
+        state = _managed_rev_proof_state(
+            negative_emits_flag=True,
+        )
+        candidate = next(
+            item
+            for item in state.candidates
+            if item.proof_run_ids
+        )
+        self.assertIs(
+            candidate.status,
+            CandidateStatus.OBSERVED_CANDIDATE,
+        )
+        candidate.status = CandidateStatus.READY_TO_SUBMIT
+        state.status = ChallengeStatus.READY_TO_SUBMIT
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "latest passing evaluation",
+        ):
+            state.validate()
+
+    def test_solved_candidate_can_coexist_with_other_ready_rev_candidate(
+        self,
+    ) -> None:
+        state = _managed_rev_proof_state()
+        accepted_candidate, ready_candidate = (
+            _duplicate_passing_rev_candidate(state)
+        )
+        state.validate()
+        self.assertIs(
+            ready_candidate.status,
+            CandidateStatus.READY_TO_SUBMIT,
+        )
+
+        accepted_candidate.status = CandidateStatus.ACCEPTED
+        state.status = ChallengeStatus.SOLVED
+        if state.active_goal_id is not None:
+            active_goal = next(
+                item
+                for item in state.goals
+                if item.id == state.active_goal_id
+            )
+            active_goal.status = GoalStatus.DONE
+            state.active_goal_id = None
+        state.submissions.append(
+            SubmissionReference(
+                id="SUB-manual-accepted",
+                candidate_id=accepted_candidate.id,
+                status=SubmissionStatus.ACCEPTED,
+                submitted_at="2026-07-30T00:00:00Z",
+                response="accepted",
+                proof_passed=True,
+                format_ok=True,
+            )
+        )
+
+        state.validate()
+        self.assertIs(
+            ready_candidate.status,
+            CandidateStatus.READY_TO_SUBMIT,
+        )
+
+    def test_rev_stdin_oracle_binding_is_exact_and_immutable(
+        self,
+    ) -> None:
+        source_binding = build_rev_inventory_v2_source_binding(
+            manifest_generation=1,
+            manifest_sha256="a" * 64,
+            path="chall",
+            source_sha256="b" * 64,
+            source_size_bytes=83,
+        )
+        source_snapshot = build_rev_inventory_v2_source_snapshot(
+            source_binding
+        )
+        binding = RevStdinOracleBinding.create(
+            protocol="rev_original_binary_stdin_candidate_v1",
+            inventory_contract_id=REV_INVENTORY_V2_CONTRACT_ID,
+            inventory_contract_version=REV_INVENTORY_V2_CONTRACT_VERSION,
+            inventory_contract_fingerprint=(
+                REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+            ),
+            inventory_experiment_id="E-inventory",
+            inventory_run_id="R-inventory",
+            inventory_stdout_artifact_id="A-inventory-stdout",
+            inventory_stdout_sha256="c" * 64,
+            inventory_stdout_size_bytes=128,
+            source_binding=source_binding,
+            source_snapshot=source_snapshot,
+            budget_deadline_utc="2026-01-01T00:00:00Z",
+        )
+        self.assertEqual(
+            RevStdinOracleBinding.from_dict(binding.to_dict()),
+            binding,
+        )
+        cloned_binding = copy.deepcopy(binding)
+        self.assertIs(cloned_binding, binding)
+        with self.assertRaises(TypeError):
+            binding.source_binding["path"] = "other"  # type: ignore[index]
+        policy = ProofPolicySnapshot.create(
+            mode="deterministic",
+            oracle_protocol="rev_original_binary_stdin_candidate_v1",
+            clean_repetitions=3,
+            remote_repetitions=0,
+            trial_count=0,
+            negative_control_repetitions=3,
+            negative_control_timeout_seconds=30,
+            minimum_success_rate=None,
+            notes="Rev original-binary stdin oracle",
+        )
+        recipe = ProofRecipe.create(
+            candidate_id="C-1",
+            source_experiment_id="E-source",
+            source_run_id="R-source",
+            argv=(
+                "/usr/bin/python3",
+                "/opt/ctf-templates/rev/stdin_exec.py",
+                "--binary",
+                "/challenge/chall",
+                "--input",
+                "/work/oracle/accepted-input.bin",
+            ),
+            inputs=(),
+            network_target_id=None,
+            network_target_generation=None,
+            network_endpoint=None,
+            configuration_epoch=0,
+            source_manifest_sha256="a" * 64,
+            source_request_sha256="d" * 64,
+            image_reference="sha256:" + "e" * 64,
+            policy=policy,
+            oracle_binding=binding,
+        )
+        state = new_challenge_state(
+            ChallengeIdentity("Demo", "misc", "Deepcopy")
+        )
+        state.extra["detached_recipe"] = recipe
+        cloned_state = copy.deepcopy(state)
+        self.assertIs(
+            cloned_state.extra["detached_recipe"].oracle_binding,
+            binding,
+        )
+        with self.assertRaises(TypeError):
+            cloned_state.extra["detached_recipe"].oracle_binding.source_snapshot[
+                "id"
+            ] = "other"
+
+        for field, value in (
+            ("schema_version", True),
+            ("kind", "other"),
+            ("protocol", "other"),
+            ("inventory_contract_version", True),
+            ("inventory_contract_fingerprint", "0" * 64),
+            ("inventory_stdout_size_bytes", True),
+            ("budget_deadline_utc", "2026-01-01T00:00:00"),
+        ):
+            payload = binding.to_dict()
+            payload[field] = value
+            with (
+                self.subTest(field=field),
+                self.assertRaises(ModelValidationError),
+            ):
+                RevStdinOracleBinding.from_dict(payload)
+        payload = binding.to_dict()
+        payload["source_binding"] = dict(source_binding)
+        payload["source_binding"]["path"] = "alternate"
+        with self.assertRaises(ModelValidationError):
+            RevStdinOracleBinding.from_dict(payload)
+
+    def test_legacy_pwn_recipe_omits_binding_and_keeps_its_hash(
+        self,
+    ) -> None:
+        policy = ProofPolicySnapshot.create(
+            mode="success_distribution",
+            oracle_protocol="remote_pwn_replay_negative_control_v1",
+            clean_repetitions=0,
+            remote_repetitions=0,
+            trial_count=10,
+            negative_control_repetitions=1,
+            negative_control_timeout_seconds=30,
+            minimum_success_rate=0.7,
+            notes="remote pwn replay",
+        )
+        recipe = ProofRecipe.create(
+            candidate_id="C-1",
+            source_experiment_id="E-source",
+            source_run_id="R-source",
+            argv=("python3", "solver.py"),
+            inputs=(),
+            network_target_id="T-1",
+            network_target_generation=1,
+            network_endpoint="https://pwn.example:443",
+            configuration_epoch=1,
+            source_manifest_sha256="b" * 64,
+            source_request_sha256="c" * 64,
+            image_reference="sha256:" + "d" * 64,
+            policy=policy,
+        )
+        payload = recipe.to_dict()
+        self.assertNotIn("oracle_binding", payload)
+        unsigned = dict(payload)
+        unsigned.pop("recipe_sha256")
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(recipe.recipe_sha256, expected_hash)
+        self.assertEqual(
+            ProofRecipe.from_dict(payload).to_dict(),
+            payload,
+        )
+        payload["oracle_binding"] = None
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "oracle_binding must be a canonical object",
+        ):
+            ProofRecipe.from_dict(payload)
+
     def test_rev_inventory_source_binding_enforces_oracle_source_limit(
         self,
     ) -> None:
@@ -378,6 +871,10 @@ class ModelTests(unittest.TestCase):
             source_request_sha256="c" * 64,
             image_reference="sha256:" + "d" * 64,
             policy=policy,
+        )
+        self.assertEqual(
+            recipe.recipe_sha256,
+            "190dddfcf1a4c08ee300503731a3601d683706ac7e0697c01d4e71a45c908686",
         )
         mutations = (
             ("candidate id bool", ("candidate_id",), True),

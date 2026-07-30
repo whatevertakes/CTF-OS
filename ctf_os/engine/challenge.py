@@ -98,6 +98,25 @@ from ctf_os.engine.proof import (
     evaluate_proof,
     write_proof_result,
 )
+from ctf_os.engine.rev_proof import (
+    REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT,
+    REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+    REV_STDIN_PROOF_MAX_CANDIDATE_BYTES,
+    REV_STDIN_PROOF_MAX_CANDIDATE_CHARS,
+    REV_STDIN_PROOF_MAX_EVIDENCE_BYTES,
+    REV_STDIN_PROOF_MAX_FLAG_BYTES,
+    REV_STDIN_PROOF_MAX_FLAG_CHARS,
+    REV_STDIN_PROOF_MAX_FLAG_VALUES,
+    REV_STDIN_PROOF_MAX_STREAM_BYTES,
+    REV_STDIN_PROOF_PROTOCOL,
+    RevProofEvaluation,
+    RevProofInput,
+    RevProofObservation,
+    RevProofStreamEvidence,
+    build_rev_stdin_proof_plan,
+    evaluate_rev_stdin_proof,
+    verify_rev_proof_evaluation,
+)
 from ctf_os.engine.receipt_summary import (
     ReceiptSummaryError,
     build_receipt_preview,
@@ -149,6 +168,7 @@ from ctf_os.models import (
     RunOrigin,
     RunReference,
     RunStatus,
+    RevStdinOracleBinding,
     SessionStatus,
     SourceFile,
     SubmissionOverride,
@@ -208,6 +228,7 @@ from ctf_os.store import (
 )
 from ctf_os.store.atomic import (
     StrictJSONError,
+    atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     read_json,
@@ -933,6 +954,23 @@ _REV_SOURCE_SNAPSHOT_DIRECTORY_MODE = (
 _REV_INVENTORY_TEMPLATE_ID = REV_INVENTORY_V2_SEED_TEMPLATE_ID
 _REV_INVENTORY_STATE_RESULT_SCHEMA_VERSION = 2
 _REV_INVENTORY_REQUEST_MAX_BYTES = 1024 * 1024
+_REV_STDIN_ACCEPTED_INPUT_DESTINATION = "oracle/accepted-input.bin"
+_REV_STDIN_RUNNER_PREFIX = (
+    "/usr/bin/python3",
+    "/opt/ctf-templates/rev/stdin_exec.py",
+    "--binary",
+)
+_REV_STDIN_RUNNER_INPUT_SUFFIX = (
+    "--input",
+    "/work/oracle/accepted-input.bin",
+)
+_REV_STDIN_PRE_REPLACE_SAFETY_SECONDS = 0.05
+_REV_STDIN_SEMANTIC_FAILURE_CODES = frozenset(
+    {
+        "negative_flag_candidate_observed",
+        "selected_candidate_not_direct",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -981,6 +1019,18 @@ class _RevInventoryOracleOutcome:
             ),
             "evaluated_at": self.evaluated_at,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedRevProofAttempt:
+    """One committed Rev proof attempt and its immutable evidence pins."""
+
+    observation: RevProofObservation
+    artifacts: tuple[ArtifactReference, ...]
+    detected_flags: tuple[DetectedFlag, ...]
+    attempt_deadline_utc: str
+    deadline_monotonic_seconds: float
+    transport_valid: bool
 
 
 def _adapter_seed_run_metadata(
@@ -3078,6 +3128,21 @@ class ChallengeEngine:
         """Mint the non-model proof policy supported by this vertical slice."""
 
         adapter = get_adapter(state.category)
+        if adapter.name == "reversing" and not remote:
+            return ProofPolicySnapshot.create(
+                mode="deterministic",
+                oracle_protocol=REV_STDIN_PROOF_PROTOCOL,
+                clean_repetitions=3,
+                remote_repetitions=0,
+                trial_count=0,
+                negative_control_repetitions=3,
+                negative_control_timeout_seconds=30,
+                minimum_success_rate=None,
+                notes=(
+                    "three clean original-binary stdin repetitions followed "
+                    "by xor-first, xor-last, and truncate negative controls"
+                ),
+            )
         if adapter.name != "pwn" or not remote:
             category_note = {
                 "pwn": (
@@ -3088,9 +3153,9 @@ class ChallengeEngine:
                     "Crypto managed proof remains fail-closed until the "
                     "metamorphic-variant oracle runner is implemented"
                 ),
-                "rev": (
-                    "Rev managed proof remains fail-closed until the "
-                    "original-binary executable oracle runner is implemented"
+                "reversing": (
+                    "Remote Rev managed proof is forbidden; the executable "
+                    "oracle is local and network-denied"
                 ),
                 "web": (
                     "Web managed proof remains fail-closed until the "
@@ -3286,11 +3351,30 @@ class ChallengeEngine:
             source_experiment,
             source_run,
         )
+        is_rev_stdin = (
+            recipe.policy.oracle_protocol == REV_STDIN_PROOF_PROTOCOL
+        )
         if (
             source_experiment.id != recipe.source_experiment_id
             or source_run.id != recipe.source_run_id
-            or replay_argv != recipe.argv
         ):
+            raise EngineError(
+                "managed proof recipe no longer matches its source replay"
+            )
+        if is_rev_stdin:
+            binding, _inventory_experiment, _challenge_root = (
+                self._resolve_rev_stdin_inventory_binding(state)
+            )
+            if (
+                recipe.oracle_binding is None
+                or recipe.oracle_binding != binding
+                or recipe.argv != self._rev_stdin_runner_argv(binding)
+            ):
+                raise EngineError(
+                    "managed Rev proof recipe no longer matches its "
+                    "inventory oracle"
+                )
+        elif replay_argv != recipe.argv or recipe.oracle_binding is not None:
             raise EngineError(
                 "managed proof recipe no longer matches its source replay"
             )
@@ -3386,6 +3470,30 @@ class ChallengeEngine:
                 raise EngineError(
                     "managed proof input artifact binding is stale: "
                     f"{proof_input.artifact_id}"
+                )
+        if is_rev_stdin:
+            if (
+                len(recipe.inputs) != 1
+                or recipe.inputs[0].purpose != "accepted_input"
+                or recipe.inputs[0].destination
+                != _REV_STDIN_ACCEPTED_INPUT_DESTINATION
+                or recipe.inputs[0].size
+                > REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                or any(item is not None for item in target_fields)
+            ):
+                raise EngineError(
+                    "managed Rev proof accepted-input or network binding is "
+                    "invalid"
+                )
+            accepted_artifact = artifacts[recipe.inputs[0].artifact_id]
+            if self._canonical_artifact_contains_bytes(
+                state,
+                accepted_artifact,
+                candidate.value.encode("utf-8"),
+            ):
+                raise EngineError(
+                    "managed Rev proof accepted input embeds the exact "
+                    "candidate bytes"
                 )
         return candidate, source_experiment, source_run
 
@@ -3828,6 +3936,298 @@ class ChallengeEngine:
                 "Rev adapter source snapshot lock is unavailable"
             ) from error
         return challenge_root, verified
+
+    @staticmethod
+    def _rev_stdin_runner_argv(
+        binding: RevStdinOracleBinding,
+    ) -> tuple[str, ...]:
+        source_locator = binding.source_binding.get("path")
+        if not isinstance(source_locator, str):
+            raise EngineError("Rev stdin oracle source path is invalid")
+        return (
+            *_REV_STDIN_RUNNER_PREFIX,
+            f"/challenge/{source_locator}",
+            *_REV_STDIN_RUNNER_INPUT_SUFFIX,
+        )
+
+    def _resolve_rev_stdin_inventory_binding(
+        self,
+        state: ChallengeState,
+    ) -> tuple[RevStdinOracleBinding, Experiment, Path]:
+        """Resolve the one current CONFIRMED v2 inventory proof anchor."""
+
+        if get_adapter(state.category).name != "reversing":
+            raise EngineError(
+                "Rev stdin oracle requires a reversing challenge"
+            )
+        manifest = state.metadata.get("source_manifest_sha256")
+        primary_source = state.metadata.get("adapter_primary_source")
+        budget_deadline_utc = state.budget.deadline_utc
+        image_reference = self.config.runtime.image_digest
+        if (
+            not isinstance(manifest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest)
+            or not isinstance(primary_source, str)
+            or not primary_source
+            or not isinstance(budget_deadline_utc, str)
+            or deadline_epoch(budget_deadline_utc) is None
+            or not isinstance(image_reference, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_reference)
+        ):
+            raise EngineError(
+                "Rev stdin oracle requires current source, budget, and "
+                "digest-pinned image bindings"
+            )
+
+        runs = {item.id: item for item in state.runs}
+        artifacts = {item.id: item for item in state.artifacts}
+        receipts = {item.id: item for item in state.receipts}
+        facts = {item.id: item for item in state.facts}
+        matches: list[
+            tuple[Experiment, RunReference, ArtifactReference]
+        ] = []
+        for experiment in state.experiments:
+            if (
+                not self._is_rev_inventory_oracle_experiment(
+                    state,
+                    experiment,
+                )
+                or experiment.status is not ExperimentStatus.COMPLETED
+                or not isinstance(experiment.result, Mapping)
+            ):
+                continue
+            source_binding = experiment.extra.get("source_binding")
+            source_snapshot = experiment.extra.get("source_snapshot")
+            outcome = experiment.result.get("partial_oracle")
+            if (
+                not isinstance(source_binding, Mapping)
+                or not isinstance(source_snapshot, Mapping)
+                or source_binding.get("manifest_sha256") != manifest
+                or source_binding.get("path") != primary_source
+                or not isinstance(outcome, Mapping)
+                or outcome.get("schema_version")
+                != _REV_INVENTORY_STATE_RESULT_SCHEMA_VERSION
+                or outcome.get("transport_succeeded") is not True
+                or outcome.get("evaluation_status") != "evaluated"
+                or outcome.get("rejection_code") is not None
+                or outcome.get("source_binding") != source_binding
+                or outcome.get("image_reference") != image_reference
+            ):
+                continue
+            semantic = outcome.get("result")
+            execution_binding = outcome.get("execution_binding")
+            expected_image_binding = {
+                "digest": image_reference,
+                "name": self.config.runtime.image,
+                "reference": image_reference,
+            }
+            if (
+                not isinstance(semantic, Mapping)
+                or semantic.get("verdict")
+                != RevInventoryV2Verdict.CONFIRMED.value
+                or semantic.get("oracle_id")
+                != REV_INVENTORY_V2_CONTRACT_ID
+                or semantic.get("oracle_version")
+                != REV_INVENTORY_V2_CONTRACT_VERSION
+                or semantic.get("contract_fingerprint")
+                != REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+                or semantic.get("source_sha256")
+                != source_binding.get("sha256")
+                or semantic.get("source_size_bytes")
+                != source_binding.get("size_bytes")
+                or not isinstance(execution_binding, Mapping)
+                or execution_binding.get("image")
+                != expected_image_binding
+            ):
+                continue
+            run_id = experiment.result.get("run_id")
+            receipt_id = experiment.result.get("receipt_id")
+            stdout_artifact_id = outcome.get("stdout_artifact_id")
+            run = runs.get(run_id) if isinstance(run_id, str) else None
+            receipt = (
+                receipts.get(receipt_id)
+                if isinstance(receipt_id, str)
+                else None
+            )
+            stdout_artifact = (
+                artifacts.get(stdout_artifact_id)
+                if isinstance(stdout_artifact_id, str)
+                else None
+            )
+            linked_facts = [
+                facts.get(fact_id)
+                for fact_id in experiment.evidence_fact_ids
+            ]
+            if (
+                run is None
+                or run.status is not RunStatus.COMPLETED
+                or run.origin is not RunOrigin.MANAGED_TOOL
+                or run.extra.get("experiment_id") != experiment.id
+                or receipt is None
+                or receipt.outcome is not ReceiptOutcome.SUCCEEDED
+                or receipt.experiment_id != experiment.id
+                or receipt.run_id != run.id
+                or receipt.stdout_artifact_id != stdout_artifact_id
+                or stdout_artifact is None
+                or stdout_artifact.source_run_id != run.id
+                or stdout_artifact.size is None
+                or not linked_facts
+                or any(fact is None for fact in linked_facts)
+                or not any(
+                    fact is not None
+                    and fact.source_run_id == run.id
+                    and fact.artifact_id == stdout_artifact.id
+                    and fact.extra.get("receipt_id") == receipt.id
+                    for fact in linked_facts
+                )
+            ):
+                continue
+            matches.append((experiment, run, stdout_artifact))
+
+        if len(matches) != 1:
+            raise EngineError(
+                "Rev stdin oracle requires exactly one current CONFIRMED "
+                "v2 inventory evidence chain"
+            )
+        experiment, run, stdout_artifact = matches[0]
+        source_binding = experiment.extra["source_binding"]
+        source_snapshot = experiment.extra["source_snapshot"]
+        assert isinstance(source_binding, Mapping)
+        assert isinstance(source_snapshot, Mapping)
+        try:
+            binding = RevStdinOracleBinding.create(
+                protocol=REV_STDIN_PROOF_PROTOCOL,
+                inventory_contract_id=REV_INVENTORY_V2_CONTRACT_ID,
+                inventory_contract_version=(
+                    REV_INVENTORY_V2_CONTRACT_VERSION
+                ),
+                inventory_contract_fingerprint=(
+                    REV_INVENTORY_V2_CONTRACT_FINGERPRINT
+                ),
+                inventory_experiment_id=experiment.id,
+                inventory_run_id=run.id,
+                inventory_stdout_artifact_id=stdout_artifact.id,
+                inventory_stdout_sha256=stdout_artifact.sha256.lower(),
+                inventory_stdout_size_bytes=stdout_artifact.size,
+                source_binding=source_binding,
+                source_snapshot=source_snapshot,
+                budget_deadline_utc=budget_deadline_utc,
+            )
+        except (TypeError, ValueError) as error:
+            raise EngineError(
+                "Rev stdin inventory binding is not canonical"
+            ) from error
+        prepared = self._prepare_rev_adapter_source_snapshot(
+            state,
+            experiment,
+        )
+        if prepared is None:
+            raise EngineError(
+                "Rev stdin inventory source snapshot is unavailable"
+            )
+        challenge_root, verified_source = prepared
+        if (
+            verified_source.source_locator
+            != binding.source_binding.get("path")
+            or verified_source.sha256
+            != binding.source_binding.get("sha256")
+            or verified_source.size_bytes
+            != binding.source_binding.get("size_bytes")
+        ):
+            raise EngineError(
+                "Rev stdin source snapshot does not match its binding"
+            )
+        return binding, experiment, challenge_root
+
+    def _require_rev_stdin_external_pins(
+        self,
+        state: ChallengeState,
+        recipe: ProofRecipe,
+        *,
+        deadline_monotonic_seconds: float | None,
+        accepted_artifact: ArtifactReference | None = None,
+    ) -> tuple[Experiment, Path]:
+        """Re-read immutable source/config/input pins before one replacement."""
+
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Rev proof commit guard",
+        )
+        self._remaining_budget_seconds(state)
+        binding, inventory_experiment, challenge_root = (
+            self._resolve_rev_stdin_inventory_binding(state)
+        )
+        if (
+            recipe.oracle_binding is None
+            or binding != recipe.oracle_binding
+            or state.configuration_epoch != recipe.configuration_epoch
+            or state.budget.deadline_utc
+            != recipe.oracle_binding.budget_deadline_utc
+            or self.config.runtime.image_digest
+            != recipe.image_reference
+        ):
+            raise EngineError(
+                "Rev proof source, image, configuration, or budget pin "
+                "changed"
+            )
+        try:
+            live_inventory = inventory_challenge(
+                self.challenge_input(state.identity)
+            )
+        except (OSError, ValueError) as error:
+            raise EngineError(
+                "Rev proof live source inventory is unavailable"
+            ) from error
+        source_locator = binding.source_binding.get("path")
+        live_source = next(
+            (
+                item
+                for item in live_inventory.files
+                if item.path == source_locator
+            ),
+            None,
+        )
+        if (
+            live_inventory.manifest_sha256
+            != recipe.source_manifest_sha256
+            or live_source is None
+            or live_source.sha256
+            != binding.source_binding.get("sha256")
+            or live_source.size
+            != binding.source_binding.get("size_bytes")
+        ):
+            raise EngineError(
+                "Rev proof live source changed before commit"
+            )
+        if accepted_artifact is not None:
+            paths = self.store.challenge_paths(state.identity)
+            paths.runtime.mkdir(parents=True, exist_ok=True)
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix=".ctfos-rev-proof-input-guard-",
+                    dir=paths.runtime,
+                ) as temporary:
+                    guarded_input = copy_bounded_regular(
+                        paths.root,
+                        accepted_artifact.path,
+                        Path(temporary) / "accepted-input.bin",
+                        maximum_bytes=(
+                            REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                        ),
+                        expected_sha256=accepted_artifact.sha256,
+                        expected_size=accepted_artifact.size,
+                        mode=0o400,
+                    )
+                    guarded_input.path.read_bytes()
+            except (OSError, SafeFileError, ValueError) as error:
+                raise EngineError(
+                    "Rev proof accepted input changed before commit"
+                ) from error
+        self._require_before_hard_deadline(
+            deadline_monotonic_seconds,
+            "Rev proof source/input revalidation",
+        )
+        return inventory_experiment, challenge_root
 
     @staticmethod
     def _is_rev_inventory_oracle_experiment(
@@ -4331,9 +4731,10 @@ class ChallengeEngine:
         *,
         workspace_override: Path | None = None,
         challenge_dir_override: Path | None = None,
+        network_policy_override: NetworkPolicy | None = None,
     ) -> ChallengeSandboxClient:
         workspace = workspace_override or self._workspace(state)
-        policy = self._network_policy(state)
+        policy = network_policy_override or self._network_policy(state)
         if self._sandbox_factory is not None:
             return self._sandbox_factory(state, workspace, policy)
         scope = ChallengeScope(
@@ -6195,6 +6596,10 @@ class ChallengeEngine:
                                     source_experiment,
                                     source_tool_run,
                                 )
+                                rev_stdin_proof = (
+                                    get_adapter(base_state.category).name
+                                    == "reversing"
+                                )
                                 input_values = action.get("inputs")
                                 if (
                                     not isinstance(input_values, list)
@@ -6203,6 +6608,11 @@ class ChallengeEngine:
                                     raise EngineError(
                                         "proof inputs must be an array of at "
                                         "most 256 canonical artifacts"
+                                    )
+                                if rev_stdin_proof and len(input_values) != 1:
+                                    raise EngineError(
+                                        "Rev stdin proof requires exactly one "
+                                        "accepted_input artifact"
                                     )
                                 proof_inputs: list[ProofRecipeInput] = []
                                 input_ids: set[str] = set()
@@ -6230,12 +6640,17 @@ class ChallengeEngine:
                                             "proof input artifact ids must "
                                             "be valid and unique"
                                         )
-                                    if purpose not in {
-                                        "reproducer",
-                                        "fixture",
-                                        "variant_generator",
-                                        "verifier",
-                                    }:
+                                    allowed_purposes = (
+                                        {"accepted_input"}
+                                        if rev_stdin_proof
+                                        else {
+                                            "reproducer",
+                                            "fixture",
+                                            "variant_generator",
+                                            "verifier",
+                                        }
+                                    )
+                                    if purpose not in allowed_purposes:
                                         raise EngineError(
                                             "proof input purpose is invalid"
                                         )
@@ -6248,7 +6663,11 @@ class ChallengeEngine:
                                         or isinstance(artifact.size, bool)
                                         or artifact.size < 0
                                         or artifact.size
-                                        > MAX_MANAGED_PROOF_INPUT_BYTES
+                                        > (
+                                            REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                                            if rev_stdin_proof
+                                            else MAX_MANAGED_PROOF_INPUT_BYTES
+                                        )
                                         or len(artifact.sha256) != 64
                                     ):
                                         raise EngineError(
@@ -6258,7 +6677,11 @@ class ChallengeEngine:
                                         )
                                     total_input_bytes += artifact.size
                                     if total_input_bytes > min(
-                                        MAX_MANAGED_PROOF_INPUT_BYTES,
+                                        (
+                                            REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                                            if rev_stdin_proof
+                                            else MAX_MANAGED_PROOF_INPUT_BYTES
+                                        ),
                                         self.store.max_artifact_bytes,
                                     ):
                                         raise EngineError(
@@ -6268,15 +6691,23 @@ class ChallengeEngine:
                                     source_locator = artifact.extra.get(
                                         "source_locator"
                                     )
-                                    if not isinstance(
-                                        source_locator, str
+                                    if (
+                                        not rev_stdin_proof
+                                        and not isinstance(
+                                            source_locator, str
+                                        )
                                     ):
                                         raise EngineError(
                                             "managed proof input artifact "
                                             "lacks an engine-owned source "
                                             f"destination: {artifact_id}"
                                         )
-                                    destination = source_locator
+                                    destination = (
+                                        _REV_STDIN_ACCEPTED_INPUT_DESTINATION
+                                        if rev_stdin_proof
+                                        else source_locator
+                                    )
+                                    assert isinstance(destination, str)
                                     if (
                                         destination in destinations
                                         or not _valid_proof_destination(
@@ -6420,13 +6851,41 @@ class ChallengeEngine:
                                         "source request target does not "
                                         "match its experiment pin"
                                     )
+                                oracle_binding: (
+                                    RevStdinOracleBinding | None
+                                ) = None
+                                proof_argv = replay_argv
+                                if rev_stdin_proof:
+                                    if (
+                                        target_id is not None
+                                        or target_generation is not None
+                                        or target_endpoint is not None
+                                    ):
+                                        raise EngineError(
+                                            "Rev stdin proof is local-only"
+                                        )
+                                    (
+                                        oracle_binding,
+                                        _inventory_experiment,
+                                        _challenge_root,
+                                    ) = (
+                                        self
+                                        ._resolve_rev_stdin_inventory_binding(
+                                            base_state
+                                        )
+                                    )
+                                    proof_argv = (
+                                        self._rev_stdin_runner_argv(
+                                            oracle_binding
+                                        )
+                                    )
                                 recipe = ProofRecipe.create(
                                     candidate_id=candidate.id,
                                     source_experiment_id=(
                                         source_experiment.id
                                     ),
                                     source_run_id=source_tool_run.id,
-                                    argv=replay_argv,
+                                    argv=proof_argv,
                                     inputs=proof_inputs,
                                     network_target_id=(
                                         str(target_id)
@@ -6448,6 +6907,7 @@ class ChallengeEngine:
                                     ),
                                     image_reference=image_reference,
                                     policy=proof_policy,
+                                    oracle_binding=oracle_binding,
                                 )
                             except (
                                 BackgroundJobUnsupported,
@@ -6472,16 +6932,41 @@ class ChallengeEngine:
                                     hypothesis_ids=[],
                                     command=shlex.join(recipe.argv),
                                     expected_observation=(
-                                        "engine-owned remote replay "
-                                        "reproduces the exact candidate"
+                                        (
+                                            "the original binary accepts the "
+                                            "input in three clean runs and "
+                                            "rejects all three deterministic "
+                                            "mutations"
+                                        )
+                                        if rev_stdin_proof
+                                        else (
+                                            "engine-owned remote replay "
+                                            "reproduces the exact candidate"
+                                        )
                                     ),
                                     keep_if=(
-                                        "the engine ProofResult passes its "
-                                        "pinned replay policy"
+                                        (
+                                            "the independent executable "
+                                            "oracle confirms the six-run "
+                                            "stdin proof"
+                                        )
+                                        if rev_stdin_proof
+                                        else (
+                                            "the engine ProofResult passes "
+                                            "its pinned replay policy"
+                                        )
                                     ),
                                     drop_if=(
-                                        "the engine ProofResult fails its "
-                                        "pinned replay policy"
+                                        (
+                                            "a clean mutation falsifies the "
+                                            "candidate or transport evidence "
+                                            "is incomplete"
+                                        )
+                                        if rev_stdin_proof
+                                        else (
+                                            "the engine ProofResult fails "
+                                            "its pinned replay policy"
+                                        )
                                     ),
                                     timeout_seconds=(
                                         self._budget_command_timeout(
@@ -6508,7 +6993,15 @@ class ChallengeEngine:
                                             recipe.configuration_epoch
                                         ),
                                         "source_replay_binding": (
-                                            "completed_tool_exact_replay_v1"
+                                            (
+                                                "rev_inventory_v2_"
+                                                "original_binary_stdin_v1"
+                                            )
+                                            if rev_stdin_proof
+                                            else (
+                                                "completed_tool_"
+                                                "exact_replay_v1"
+                                            )
                                         ),
                                     },
                                 )
@@ -8690,22 +9183,24 @@ class ChallengeEngine:
                     int(accounted_elapsed),
                 )
 
+            canonical_deadline_guard = (
+                lambda: self._require_before_hard_deadline(
+                    command_deadline_monotonic,
+                    (
+                        "Rev inventory canonical state commit"
+                        if rev_inventory_oracle_outcome is not None
+                        else "tool canonical state commit"
+                    ),
+                )
+                if result.exit_code == 0 and not result.timed_out
+                else None
+            )
             try:
                 state = self.store.update(
                     identity,
                     finish,
-                    commit_guard=(
-                        lambda: self._require_before_hard_deadline(
-                            command_deadline_monotonic,
-                            (
-                                "Rev inventory canonical state commit"
-                                if rev_inventory_oracle_outcome is not None
-                                else "tool canonical state commit"
-                            ),
-                        )
-                        if result.exit_code == 0 and not result.timed_out
-                        else None
-                    ),
+                    commit_guard=canonical_deadline_guard,
+                    pre_replace_guard=canonical_deadline_guard,
                 )
             except _HardDeadlineExpired as deadline_error:
                 try:
@@ -10561,6 +11056,1585 @@ class ChallengeEngine:
 
         return self.store.update(identity, apply)
 
+    @classmethod
+    def _rev_proof_attempt_limits(
+        cls,
+        state: ChallengeState,
+        configured_seconds: int,
+    ) -> tuple[int, float, str]:
+        """Anchor one command timeout and both views of its hard deadline."""
+
+        now_monotonic = time.monotonic()
+        now_epoch = time.time()
+        remaining = cls._remaining_budget_seconds(
+            state,
+            now_epoch=now_epoch,
+        )
+        window = (
+            float(configured_seconds)
+            if remaining is None
+            else min(float(configured_seconds), remaining)
+        )
+        bounded_timeout = min(configured_seconds, int(window))
+        if bounded_timeout < 1:
+            raise EngineError(
+                "challenge wall-clock budget has less than one second left"
+            )
+        return (
+            bounded_timeout,
+            now_monotonic + window,
+            deadline_utc_after(window, now_epoch=now_epoch),
+        )
+
+    def _scan_rev_proof_stream_artifacts(
+        self,
+        state: ChallengeState,
+        artifacts: Sequence[ArtifactReference],
+        *,
+        candidate: str,
+        patterns: Sequence[str],
+    ) -> tuple[tuple[str, ...], bool, bool, bool]:
+        """Re-read and exact-scan bounded durable stdout/stderr artifacts."""
+
+        by_stream = {
+            artifact.extra.get("stream"): artifact
+            for artifact in artifacts
+            if artifact.extra.get("stream") in {"stdout", "stderr"}
+        }
+        scan_complete = (
+            len(artifacts) == 2
+            and set(by_stream) == {"stdout", "stderr"}
+        )
+        found: list[str] = []
+        detector = FlagDetector(
+            patterns,
+            callback=lambda detected: found.append(detected.value),
+            candidate_limit=REV_STDIN_PROOF_MAX_FLAG_VALUES + 1,
+            candidate_chars_limit=REV_STDIN_PROOF_MAX_FLAG_CHARS + 1,
+        )
+        candidate_bytes = candidate.encode("utf-8", errors="strict")
+        selected_direct = False
+        paths = self.store.challenge_paths(state.identity)
+        paths.runtime.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".ctfos-rev-proof-stream-scan-",
+                dir=paths.runtime,
+            ) as temporary:
+                temporary_root = Path(temporary)
+                for stream in ("stdout", "stderr"):
+                    artifact = by_stream.get(stream)
+                    if (
+                        artifact is None
+                        or artifact.size is None
+                        or isinstance(artifact.size, bool)
+                        or not 0
+                        <= artifact.size
+                        <= REV_STDIN_PROOF_MAX_STREAM_BYTES
+                    ):
+                        scan_complete = False
+                        continue
+                    try:
+                        copied = copy_bounded_regular(
+                            paths.root,
+                            artifact.path,
+                            temporary_root / f"{stream}.bin",
+                            maximum_bytes=(
+                                REV_STDIN_PROOF_MAX_STREAM_BYTES
+                            ),
+                            expected_sha256=artifact.sha256,
+                            expected_size=artifact.size,
+                            mode=0o400,
+                        )
+                        raw = copied.path.read_bytes()
+                        selected_direct = (
+                            selected_direct or candidate_bytes in raw
+                        )
+                        detector.scan_file(
+                            copied.path,
+                            source=f"rev-proof:{stream}",
+                            max_bytes=max(1, copied.size_bytes),
+                        )
+                    except (OSError, SafeFileError, ValueError):
+                        scan_complete = False
+        except OSError:
+            scan_complete = False
+
+        values: list[str] = []
+        seen: set[str] = set()
+        total_chars = 0
+        total_bytes = 0
+        overflow = detector.suppressed_matches > 0
+        for value in found:
+            if value in seen:
+                continue
+            try:
+                encoded = value.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                overflow = True
+                continue
+            if (
+                not value
+                or len(value) > REV_STDIN_PROOF_MAX_CANDIDATE_CHARS
+                or len(encoded) > REV_STDIN_PROOF_MAX_CANDIDATE_BYTES
+                or not all(character.isprintable() for character in value)
+                or len(values) >= REV_STDIN_PROOF_MAX_FLAG_VALUES
+                or total_chars + len(value)
+                > REV_STDIN_PROOF_MAX_FLAG_CHARS
+                or total_bytes + len(encoded)
+                > REV_STDIN_PROOF_MAX_FLAG_BYTES
+            ):
+                overflow = True
+                continue
+            values.append(value)
+            seen.add(value)
+            total_chars += len(value)
+            total_bytes += len(encoded)
+        return tuple(values), selected_direct, overflow, scan_complete
+
+    @staticmethod
+    def _rev_proof_stream_evidence(
+        result: SandboxResult | None,
+        artifact: ArtifactReference | None,
+        *,
+        stream: str,
+        snapshot_failed: bool,
+    ) -> RevProofStreamEvidence:
+        if stream not in {"stdout", "stderr"}:
+            raise ValueError("invalid Rev proof stream")
+        capture_complete = (
+            getattr(result, f"{stream}_capture_complete", False) is True
+            if result is not None
+            else False
+        )
+        truncation_known = (
+            getattr(result, f"{stream}_truncation_known", False) is True
+            if result is not None
+            else False
+        )
+        truncated_value = (
+            getattr(result, f"{stream}_truncated", None)
+            if result is not None
+            else None
+        )
+        truncated = (
+            truncated_value if type(truncated_value) is bool else None
+        )
+        capture_error_value = (
+            getattr(result, f"{stream}_error", None)
+            if result is not None
+            else "result_unavailable"
+        )
+        stored_bytes = (
+            getattr(result, f"{stream}_stored_bytes", None)
+            if result is not None
+            else None
+        )
+        total_bytes = (
+            getattr(result, f"{stream}_bytes", None)
+            if result is not None
+            else None
+        )
+        metadata_matches = (
+            artifact is not None
+            and type(stored_bytes) is int
+            and type(total_bytes) is int
+            and stored_bytes == artifact.size
+            and total_bytes == artifact.size
+        )
+        capture_error = (
+            None
+            if (
+                capture_error_value is None
+                and not snapshot_failed
+                and metadata_matches
+            )
+            else "stream_capture_incomplete"
+        )
+        return RevProofStreamEvidence(
+            artifact_id=artifact.id if artifact is not None else None,
+            artifact_sha256=(
+                artifact.sha256 if artifact is not None else None
+            ),
+            artifact_size_bytes=(
+                artifact.size if artifact is not None else None
+            ),
+            capture_complete=capture_complete,
+            truncation_known=truncation_known,
+            truncated=truncated,
+            capture_error=capture_error,
+            durable_artifact_complete=artifact is not None,
+        )
+
+    @staticmethod
+    def _rev_proof_observation_transport_valid(
+        observation: RevProofObservation,
+    ) -> bool:
+        exits = (
+            observation.target_exit_code,
+            observation.runner_exit_code,
+            observation.ctfwrap_exit_code,
+        )
+        streams = (observation.stdout, observation.stderr)
+        return (
+            observation.clean_workspace is True
+            and observation.timed_out is False
+            and observation.orchestration_status == "completed"
+            and observation.orchestration_error is None
+            and observation.stream_capture_error is None
+            and all(
+                type(exit_code) is int
+                and 0 <= exit_code <= 255
+                and exit_code != 125
+                for exit_code in exits
+            )
+            and exits[0] == exits[1] == exits[2]
+            and all(
+                stream.capture_complete is True
+                and stream.truncation_known is True
+                and stream.truncated is False
+                and stream.capture_error is None
+                and stream.durable_artifact_complete is True
+                and stream.artifact_id is not None
+                and stream.artifact_sha256 is not None
+                and type(stream.artifact_size_bytes) is int
+                for stream in streams
+            )
+            and observation.flag_scanner_contract
+            == REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT
+            and observation.flag_scan_complete is True
+            and observation.flag_scan_error is None
+            and observation.flag_values_overflow is False
+        )
+
+    def _revalidate_rev_proof_attempt(
+        self,
+        state: ChallengeState,
+        recipe: ProofRecipe,
+        accepted_artifact: ArtifactReference,
+        attempt: _ManagedRevProofAttempt,
+        *,
+        patterns: Sequence[str],
+        deadline_override_monotonic_seconds: float | None = None,
+        revalidate_external_pins: bool = True,
+    ) -> None:
+        """Apply the attempt's source/input/deadline and raw-scan guard."""
+
+        effective_deadline = (
+            attempt.deadline_monotonic_seconds
+            if deadline_override_monotonic_seconds is None
+            else deadline_override_monotonic_seconds
+        )
+        values, direct, overflow, scan_complete = (
+            self._scan_rev_proof_stream_artifacts(
+                state,
+                attempt.artifacts,
+                candidate=next(
+                    item.value
+                    for item in state.candidates
+                    if item.id == recipe.candidate_id
+                ),
+                patterns=patterns,
+            )
+        )
+        observation = attempt.observation
+        if (
+            values != observation.flag_values
+            or direct
+            is not observation.selected_candidate_direct_output
+            or overflow is not observation.flag_values_overflow
+            or scan_complete is not observation.flag_scan_complete
+        ):
+            raise EngineError(
+                "Rev proof durable stream rescan changed before commit"
+            )
+        artifact_by_id = {
+            artifact.id: artifact for artifact in attempt.artifacts
+        }
+        for stream in (observation.stdout, observation.stderr):
+            if stream.artifact_id is None:
+                continue
+            artifact = artifact_by_id.get(stream.artifact_id)
+            if (
+                artifact is None
+                or artifact.sha256 != stream.artifact_sha256
+                or artifact.size != stream.artifact_size_bytes
+            ):
+                raise EngineError(
+                    "Rev proof stream identity changed before commit"
+                )
+        if revalidate_external_pins:
+            self._require_rev_stdin_external_pins(
+                state,
+                recipe,
+                deadline_monotonic_seconds=effective_deadline,
+                accepted_artifact=accepted_artifact,
+            )
+        self._require_before_hard_deadline(
+            effective_deadline,
+            "Rev proof attempt evidence revalidation",
+        )
+
+    def _execute_managed_rev_stdin_proof(
+        self,
+        identity: ChallengeIdentity,
+        experiment_id: str,
+        recipe: ProofRecipe,
+        *,
+        managed_context: Mapping[str, object],
+        _pending_artifact_handoff: list[ArtifactReference] | None = None,
+    ) -> tuple[ChallengeState, ProofResult]:
+        """Execute the sealed six-run Rev original-binary stdin protocol."""
+
+        if _pending_artifact_handoff is None:
+            pending_artifact_handoff: list[ArtifactReference] = []
+            try:
+                return self._execute_managed_rev_stdin_proof(
+                    identity,
+                    experiment_id,
+                    recipe,
+                    managed_context=managed_context,
+                    _pending_artifact_handoff=(
+                        pending_artifact_handoff
+                    ),
+                )
+            except BaseException as proof_error:
+                if pending_artifact_handoff:
+                    self._handle_proof_interruption(
+                        identity,
+                        pending_artifact_handoff,
+                        proof_error,
+                    )
+                raise
+
+        pending_artifact_handoff = _pending_artifact_handoff
+        if (
+            recipe.policy.oracle_protocol != REV_STDIN_PROOF_PROTOCOL
+            or recipe.oracle_binding is None
+            or len(recipe.inputs) != 1
+        ):
+            raise EngineError("managed Rev stdin proof recipe is invalid")
+
+        state = self.store.load(identity)
+        candidate, _source_experiment, _source_run = (
+            self._require_managed_proof_recipe_current(state, recipe)
+        )
+        accepted_input_binding = recipe.inputs[0]
+        accepted_artifact = next(
+            (
+                item
+                for item in state.artifacts
+                if item.id == accepted_input_binding.artifact_id
+            ),
+            None,
+        )
+        if accepted_artifact is None:
+            raise EngineError("Rev proof accepted input artifact is missing")
+
+        def enter_proving(current: ChallengeState) -> None:
+            current_experiment = next(
+                item
+                for item in current.experiments
+                if item.id == experiment_id
+            )
+            if (
+                current_experiment.status
+                is not ExperimentStatus.RUNNING
+                or current_experiment.proof_recipe != recipe
+            ):
+                raise EngineError(
+                    "managed Rev proof experiment changed before execution"
+                )
+            self._require_managed_proof_recipe_current(current, recipe)
+            current_candidate = next(
+                item
+                for item in current.candidates
+                if item.id == recipe.candidate_id
+            )
+            if current_candidate.status in {
+                CandidateStatus.REJECTED,
+                CandidateStatus.ACCEPTED,
+            }:
+                raise EngineError(
+                    "managed Rev proof cannot replace a manual outcome"
+                )
+            if current.status in {
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+                ChallengeStatus.PAUSED,
+            }:
+                raise EngineError(
+                    "managed Rev proof cannot run in the current state"
+                )
+            if current.status is ChallengeStatus.READY_TO_SUBMIT:
+                validate_transition(
+                    current.status,
+                    ChallengeStatus.ACTIVE,
+                    evidence=TransitionEvidence(
+                        operator_outcome="proof_invalidated"
+                    ),
+                )
+                current.status = ChallengeStatus.ACTIVE
+                current_candidate.status = (
+                    CandidateStatus.OBSERVED_CANDIDATE
+                )
+            if current.status in {
+                ChallengeStatus.TRIAGING,
+                ChallengeStatus.STALLED,
+                ChallengeStatus.NEEDS_RESEARCH,
+                ChallengeStatus.NEEDS_HUMAN,
+            }:
+                validate_transition(
+                    current.status,
+                    ChallengeStatus.ACTIVE,
+                )
+                current.status = ChallengeStatus.ACTIVE
+            if current.status is ChallengeStatus.ACTIVE:
+                validate_transition(
+                    current.status,
+                    ChallengeStatus.PROVING,
+                )
+                current.status = ChallengeStatus.PROVING
+            if current.status is not ChallengeStatus.PROVING:
+                raise EngineError(
+                    "managed Rev proof could not enter PROVING"
+                )
+
+        state = self.store.update(
+            identity,
+            enter_proving,
+            expected_revision=state.revision,
+        )
+        paths = self.store.challenge_paths(identity)
+        proof_evaluation_id = _run_id("rev-proof-evaluation")
+        result_directory = ensure_private_directory(
+            paths.proof / recipe.candidate_id / proof_evaluation_id
+        )
+        workspace = self._workspace(state)
+        workspace.mkdir(parents=True, exist_ok=True)
+        patterns = tuple(
+            resolve_flag_format(
+                state,
+                self.config.runtime.flag_patterns,
+            ).patterns
+        )
+        expected_config = (
+            self.config.runtime.image,
+            self.config.runtime.image_digest,
+            tuple(self.config.runtime.flag_patterns),
+            patterns,
+        )
+
+        def require_expected_config(
+            current: ChallengeState,
+            operation: str,
+        ) -> None:
+            if expected_config != (
+                self.config.runtime.image,
+                self.config.runtime.image_digest,
+                tuple(self.config.runtime.flag_patterns),
+                tuple(
+                    resolve_flag_format(
+                        current,
+                        self.config.runtime.flag_patterns,
+                    ).patterns
+                ),
+            ):
+                raise EngineError(
+                    "Rev proof runtime configuration changed before "
+                    f"{operation}"
+                )
+
+        def require_pre_replace_margin(
+            deadline_monotonic_seconds: float,
+            operation: str,
+        ) -> None:
+            self._require_before_hard_deadline(
+                deadline_monotonic_seconds
+                - _REV_STDIN_PRE_REPLACE_SAFETY_SECONDS,
+                operation,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix=".ctfos-rev-proof-inputs-",
+            dir=workspace,
+        ) as staging_name:
+            staging_root = Path(staging_name)
+            accepted_snapshot = copy_bounded_regular(
+                paths.root,
+                accepted_artifact.path,
+                staging_root / "accepted-input.bin",
+                maximum_bytes=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
+                expected_sha256=accepted_input_binding.sha256,
+                expected_size=accepted_input_binding.size,
+                mode=0o400,
+            )
+            accepted_input = accepted_snapshot.path.read_bytes()
+            plan = build_rev_stdin_proof_plan(
+                candidate.value,
+                accepted_input,
+            )
+            staged_inputs: dict[int, ProofInput] = {}
+            for planned in plan:
+                staged_path = staging_root / (
+                    f"attempt-{planned.ordinal:02d}.bin"
+                )
+                atomic_write_bytes(
+                    staged_path,
+                    planned.payload,
+                    mode=0o400,
+                )
+                staged_inputs[planned.ordinal] = ProofInput(
+                    source_locator=staged_path.relative_to(
+                        workspace
+                    ).as_posix(),
+                    destination_locator=(
+                        _REV_STDIN_ACCEPTED_INPUT_DESTINATION
+                    ),
+                    sha256=planned.sha256,
+                    size_bytes=planned.size_bytes,
+                )
+
+            attempts: list[_ManagedRevProofAttempt] = []
+            attempt_deadlines_utc: list[str] = []
+            for planned in plan:
+                current = self.store.load(identity)
+                current_experiment = next(
+                    item
+                    for item in current.experiments
+                    if item.id == experiment_id
+                )
+                if (
+                    current.status is not ChallengeStatus.PROVING
+                    or current_experiment.status
+                    is not ExperimentStatus.RUNNING
+                ):
+                    raise EngineError(
+                        "managed Rev proof changed during execution"
+                    )
+                self._require_managed_proof_recipe_current(
+                    current,
+                    recipe,
+                )
+                _inventory_experiment, challenge_root = (
+                    self._require_rev_stdin_external_pins(
+                        current,
+                        recipe,
+                        deadline_monotonic_seconds=None,
+                        accepted_artifact=accepted_artifact,
+                    )
+                )
+                request = tool_profile("standard", network=False)
+                lease = self.lease_broker.acquire(
+                    request,
+                    timeout=self._budget_wait_timeout(
+                        current,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    owner=(
+                        f"{identity.key}:rev-proof:"
+                        f"{recipe.candidate_id}:{planned.ordinal}"
+                    ),
+                )
+                if lease is None:
+                    raise EngineError(
+                        "timed out waiting for Rev proof sandbox resources"
+                    )
+
+                result: SandboxResult | None = None
+                orchestration_failed = False
+                try:
+                    current = self.store.load(identity)
+                    self._require_managed_proof_recipe_current(
+                        current,
+                        recipe,
+                    )
+                    _inventory_experiment, challenge_root = (
+                        self._require_rev_stdin_external_pins(
+                            current,
+                            recipe,
+                            deadline_monotonic_seconds=None,
+                            accepted_artifact=accepted_artifact,
+                        )
+                    )
+                    (
+                        attempt_timeout,
+                        attempt_deadline_monotonic,
+                        attempt_deadline_utc,
+                    ) = self._rev_proof_attempt_limits(
+                        current,
+                        (
+                            self.config.runtime.command_timeout_s
+                            if planned.phase == "positive"
+                            else recipe.policy
+                            .negative_control_timeout_seconds
+                        ),
+                    )
+                    run_id = _run_id(
+                        "rev-proof-"
+                        f"{recipe.candidate_id}-{planned.ordinal}"
+                    )
+                    run_paths = self.store.create_run(
+                        identity,
+                        run_id=run_id,
+                        base_revision=current.revision,
+                        request={
+                            "kind": "proof",
+                            "experiment_id": experiment_id,
+                            "candidate_id": recipe.candidate_id,
+                            "recipe_sha256": recipe.recipe_sha256,
+                            "policy_sha256": (
+                                recipe.policy.policy_sha256
+                            ),
+                            "protocol": REV_STDIN_PROOF_PROTOCOL,
+                            "attempt_ordinal": planned.ordinal,
+                            "phase": planned.phase,
+                            "mutation_id": planned.mutation_id,
+                            "input_sha256": planned.sha256,
+                            "input_size_bytes": planned.size_bytes,
+                            "attempt_deadline_utc": (
+                                attempt_deadline_utc
+                            ),
+                            "argv": list(recipe.argv),
+                            "image": self.config.runtime.image,
+                            "image_digest": (
+                                self.config.runtime.image_digest
+                            ),
+                            "image_reference": recipe.image_reference,
+                            "network_target": None,
+                            "configuration_epoch": (
+                                recipe.configuration_epoch
+                            ),
+                            "resource_request": request.as_dict(),
+                        },
+                    )
+                    client = self.sandbox(
+                        current,
+                        challenge_dir_override=challenge_root,
+                        network_policy_override=(
+                            NetworkPolicy.deny_all()
+                        ),
+                    )
+                    try:
+                        result = client.run_clean_proof(
+                            CommandSpec.create(
+                                recipe.argv,
+                                timeout_seconds=attempt_timeout,
+                                deadline_monotonic_seconds=(
+                                    attempt_deadline_monotonic
+                                ),
+                                environment={
+                                    FLAG_PATTERNS_ENV: json.dumps(
+                                        patterns,
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    )
+                                },
+                                network_target=None,
+                                resource_request=request,
+                            ),
+                            proof_inputs=(
+                                staged_inputs[planned.ordinal],
+                            ),
+                        )
+                    except Exception:
+                        orchestration_failed = True
+                finally:
+                    lease.release()
+
+                attempt_deadlines_utc.append(attempt_deadline_utc)
+                artifact_records: list[ArtifactReference] = []
+                attempt_pending_artifacts: list[
+                    ArtifactReference
+                ] = []
+                snapshot_failures: dict[str, bool] = {
+                    "stdout": result is None,
+                    "stderr": result is None,
+                }
+                evidence_directory = ensure_private_directory(
+                    result_directory / "evidence" / run_id
+                )
+                for stream, locator in (
+                    (
+                        "stdout",
+                        result.stdout_path
+                        if result is not None
+                        else None,
+                    ),
+                    (
+                        "stderr",
+                        result.stderr_path
+                        if result is not None
+                        else None,
+                    ),
+                ):
+                    artifact_id = _record_id(
+                        "A",
+                        run_id,
+                        stream,
+                    )
+                    destination = (
+                        evidence_directory / f"{stream}.log"
+                    )
+                    pending_artifact = ArtifactReference(
+                        id=artifact_id,
+                        path=destination.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        sha256="0" * 64,
+                        source_run_id=run_id,
+                    )
+                    pending_artifact_handoff.append(
+                        pending_artifact
+                    )
+                    attempt_pending_artifacts.append(
+                        pending_artifact
+                    )
+                    relative_locator = (
+                        locator.removeprefix("/work/").lstrip("/")
+                        if isinstance(locator, str)
+                        else None
+                    )
+                    try:
+                        if relative_locator is None:
+                            raise EngineError(
+                                f"Rev proof {stream} result is unavailable"
+                            )
+                        snapshot = self._snapshot_workspace_file(
+                            current,
+                            client,
+                            relative_locator,
+                            destination,
+                        )
+                        if (
+                            snapshot.size_bytes
+                            > REV_STDIN_PROOF_MAX_STREAM_BYTES
+                        ):
+                            raise EngineError(
+                                "Rev proof stream exceeds its bound"
+                            )
+                    except (EngineError, OSError, ValueError) as error:
+                        self._cleanup_uncommitted_proof_files(
+                            identity,
+                            (pending_artifact,),
+                            cause=error,
+                        )
+                        atomic_write_bytes(
+                            destination,
+                            b"",
+                            mode=0o400,
+                        )
+                        snapshot_failures[stream] = True
+                        artifact_path = destination
+                        artifact_sha256 = hashlib.sha256(
+                            b""
+                        ).hexdigest()
+                        artifact_size = 0
+                        capture_placeholder = True
+                    else:
+                        snapshot_failures[stream] = False
+                        artifact_path = snapshot.path
+                        artifact_sha256 = snapshot.sha256
+                        artifact_size = snapshot.size_bytes
+                        capture_placeholder = False
+                    artifact_extra: dict[str, Any] = {
+                        "stream": stream,
+                        "rev_proof_protocol": (
+                            REV_STDIN_PROOF_PROTOCOL
+                        ),
+                        "experiment_id": experiment_id,
+                        "rev_proof_attempt_ordinal": (
+                            planned.ordinal
+                        ),
+                        "capture_placeholder": (
+                            capture_placeholder
+                        ),
+                    }
+                    if relative_locator is not None:
+                        artifact_extra["source_locator"] = (
+                            relative_locator
+                        )
+                    artifact_records.append(
+                        ArtifactReference(
+                            id=artifact_id,
+                            path=artifact_path.relative_to(
+                                paths.root
+                            ).as_posix(),
+                            sha256=artifact_sha256,
+                            source_run_id=run_id,
+                            size=artifact_size,
+                            extra=artifact_extra,
+                        )
+                    )
+
+                (
+                    flag_values,
+                    selected_direct,
+                    flag_values_overflow,
+                    flag_scan_complete,
+                ) = self._scan_rev_proof_stream_artifacts(
+                    current,
+                    artifact_records,
+                    candidate=candidate.value,
+                    patterns=patterns,
+                )
+                detected_flags = tuple(
+                    DetectedFlag(
+                        value=value,
+                        source=(
+                            f"rev-proof:{run_id}:durable-stream"
+                        ),
+                        observed_at=utc_now(),
+                    )
+                    for value in flag_values
+                )
+                flag_policy = resolve_flag_format(
+                    current,
+                    self.config.runtime.flag_patterns,
+                )
+                for detected in detected_flags:
+                    self.store.record_candidate_intent(
+                        identity,
+                        value=detected.value,
+                        source=detected.source,
+                        source_run_id=run_id,
+                        observed_at=detected.observed_at,
+                        tier=flag_policy.tier_for(detected.value),
+                        format_epoch=flag_policy.configuration_epoch,
+                    )
+                    self._on_tool_flag(identity, detected)
+
+                artifact_by_stream = {
+                    artifact.extra.get("stream"): artifact
+                    for artifact in artifact_records
+                }
+                exit_code = (
+                    result.exit_code
+                    if result is not None
+                    and type(result.exit_code) is int
+                    and 0 <= result.exit_code <= 255
+                    else None
+                )
+                transparent_status = (
+                    result is not None
+                    and result.timed_out is False
+                    and result.orchestration_error is None
+                    and not orchestration_failed
+                )
+                stdout_evidence = self._rev_proof_stream_evidence(
+                    result,
+                    artifact_by_stream.get("stdout"),
+                    stream="stdout",
+                    snapshot_failed=snapshot_failures["stdout"],
+                )
+                stderr_evidence = self._rev_proof_stream_evidence(
+                    result,
+                    artifact_by_stream.get("stderr"),
+                    stream="stderr",
+                    snapshot_failed=snapshot_failures["stderr"],
+                )
+                stream_capture_error = (
+                    None
+                    if result is not None
+                    and result.stream_capture_error is None
+                    and not any(snapshot_failures.values())
+                    else "stream_capture_incomplete"
+                )
+                observation = RevProofObservation(
+                    run_id=run_id,
+                    phase=planned.phase,
+                    mutation_id=planned.mutation_id,
+                    input_sha256=planned.sha256,
+                    input_size_bytes=planned.size_bytes,
+                    source_manifest_sha256=(
+                        recipe.source_manifest_sha256
+                    ),
+                    clean_workspace=True,
+                    target_exit_code=exit_code,
+                    runner_exit_code=exit_code,
+                    ctfwrap_exit_code=exit_code,
+                    timed_out=(
+                        result.timed_out
+                        if result is not None
+                        else False
+                    ),
+                    orchestration_status=(
+                        "completed"
+                        if transparent_status
+                        else "incomplete"
+                    ),
+                    orchestration_error=(
+                        None
+                        if transparent_status
+                        else "orchestration_incomplete"
+                    ),
+                    stream_capture_error=stream_capture_error,
+                    stdout=stdout_evidence,
+                    stderr=stderr_evidence,
+                    flag_scanner_contract=(
+                        REV_STDIN_PROOF_FLAG_SCANNER_CONTRACT
+                    ),
+                    flag_scan_complete=flag_scan_complete,
+                    flag_scan_error=(
+                        None
+                        if flag_scan_complete
+                        else "flag_scan_incomplete"
+                    ),
+                    flag_values_overflow=flag_values_overflow,
+                    flag_values=flag_values,
+                    selected_candidate_direct_output=selected_direct,
+                )
+                transport_valid = (
+                    self._rev_proof_observation_transport_valid(
+                        observation
+                    )
+                )
+                attempt = _ManagedRevProofAttempt(
+                    observation=observation,
+                    artifacts=tuple(artifact_records),
+                    detected_flags=detected_flags,
+                    attempt_deadline_utc=attempt_deadline_utc,
+                    deadline_monotonic_seconds=(
+                        attempt_deadline_monotonic
+                    ),
+                    transport_valid=transport_valid,
+                )
+                self.store.write_run_result(
+                    identity,
+                    None,
+                    None,
+                    run_id,
+                    {
+                        "status": (
+                            result.status
+                            if result is not None
+                            else "orchestration_error"
+                        ),
+                        "exit_code": exit_code,
+                        "timed_out": observation.timed_out,
+                        "rev_proof_observation": (
+                            observation.to_dict()
+                        ),
+                        "artifacts": [
+                            artifact.to_dict()
+                            for artifact in artifact_records
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    None,
+                    None,
+                    run_id,
+                    {
+                        "status": (
+                            "valid_transport"
+                            if transport_valid
+                            else "structural_failure"
+                        ),
+                        "rev_proof_observation": (
+                            observation.to_dict()
+                        ),
+                    },
+                )
+                run_reference = RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if observation.timed_out
+                        else RunStatus.COMPLETED
+                        if transport_valid
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="proof",
+                    origin=RunOrigin.PROOF,
+                    session_id=(
+                        str(managed_context["session_id"])
+                        if isinstance(
+                            managed_context.get("session_id"),
+                            str,
+                        )
+                        else None
+                    ),
+                    cycle_id=(
+                        str(managed_context["cycle_id"])
+                        if isinstance(
+                            managed_context.get("cycle_id"),
+                            str,
+                        )
+                        else None
+                    ),
+                    wave_id=(
+                        str(managed_context["wave_id"])
+                        if isinstance(
+                            managed_context.get("wave_id"),
+                            str,
+                        )
+                        else None
+                    ),
+                    configuration_epoch=recipe.configuration_epoch,
+                    extra={
+                        "experiment_id": experiment_id,
+                        "rev_proof_protocol": (
+                            REV_STDIN_PROOF_PROTOCOL
+                        ),
+                        "rev_proof_recipe_sha256": (
+                            recipe.recipe_sha256
+                        ),
+                        "rev_proof_attempt_ordinal": planned.ordinal,
+                        "rev_proof_phase": planned.phase,
+                        "rev_proof_mutation_id": planned.mutation_id,
+                        "rev_proof_input_sha256": planned.sha256,
+                        "rev_proof_input_size_bytes": (
+                            planned.size_bytes
+                        ),
+                        "rev_proof_attempt_deadline_utc": (
+                            attempt_deadline_utc
+                        ),
+                        "rev_proof_observation": (
+                            observation.to_dict()
+                        ),
+                    },
+                )
+                before_commit = self.store.load(identity)
+                guarded_state: list[ChallengeState] = []
+
+                def record_attempt(
+                    latest: ChallengeState,
+                ) -> None:
+                    latest_experiment = next(
+                        item
+                        for item in latest.experiments
+                        if item.id == experiment_id
+                    )
+                    if (
+                        latest.status is not ChallengeStatus.PROVING
+                        or latest_experiment.status
+                        is not ExperimentStatus.RUNNING
+                        or latest_experiment.proof_recipe != recipe
+                    ):
+                        raise EngineError(
+                            "managed Rev proof changed before attempt commit"
+                        )
+                    self._require_managed_proof_recipe_current(
+                        latest,
+                        recipe,
+                    )
+                    latest.runs.append(run_reference)
+                    latest.artifacts.extend(artifact_records)
+                    latest_candidate = next(
+                        item
+                        for item in latest.candidates
+                        if item.id == recipe.candidate_id
+                    )
+                    latest_candidate.proof_run_ids.append(run_id)
+                    existing_values = {
+                        item.value for item in latest.candidates
+                    }
+                    for index, detected in enumerate(
+                        detected_flags,
+                        start=1,
+                    ):
+                        if detected.value in existing_values:
+                            continue
+                        latest.candidates.append(
+                            FlagCandidate(
+                                id=_record_id(
+                                    "C",
+                                    run_id,
+                                    f"rev-proof-{index}",
+                                ),
+                                value=detected.value,
+                                status=(
+                                    CandidateStatus.OBSERVED_CANDIDATE
+                                ),
+                                source_run_id=run_id,
+                                locator=detected.source,
+                                tier=flag_policy.tier_for(
+                                    detected.value
+                                ),
+                                format_epoch=(
+                                    flag_policy.configuration_epoch
+                                ),
+                            )
+                        )
+                        existing_values.add(detected.value)
+                    guarded_state.append(latest)
+
+                def attempt_commit_guard() -> None:
+                    if len(guarded_state) != 1:
+                        raise EngineError(
+                            "Rev proof attempt guard state is unavailable"
+                        )
+                    require_expected_config(
+                        guarded_state[0],
+                        "attempt commit",
+                    )
+                    self._revalidate_rev_proof_attempt(
+                        guarded_state[0],
+                        recipe,
+                        accepted_artifact,
+                        attempt,
+                        patterns=patterns,
+                    )
+                    require_expected_config(
+                        guarded_state[0],
+                        "attempt replacement",
+                    )
+                    require_pre_replace_margin(
+                        attempt.deadline_monotonic_seconds,
+                        "Rev proof attempt pre-replace safety margin",
+                    )
+
+                def attempt_pre_replace_guard() -> None:
+                    if len(guarded_state) != 1:
+                        raise EngineError(
+                            "Rev proof attempt pre-replace state is "
+                            "unavailable"
+                        )
+                    require_expected_config(
+                        guarded_state[0],
+                        "attempt pre-replace",
+                    )
+                    self._require_rev_stdin_external_pins(
+                        guarded_state[0],
+                        recipe,
+                        deadline_monotonic_seconds=(
+                            attempt.deadline_monotonic_seconds
+                        ),
+                        accepted_artifact=accepted_artifact,
+                    )
+                    require_expected_config(
+                        guarded_state[0],
+                        "attempt pre-replace completion",
+                    )
+                    require_pre_replace_margin(
+                        attempt.deadline_monotonic_seconds,
+                        "Rev proof attempt pre-replace safety margin",
+                    )
+
+                try:
+                    self.store.update(
+                        identity,
+                        record_attempt,
+                        expected_revision=before_commit.revision,
+                        commit_guard=attempt_commit_guard,
+                        pre_replace_guard=attempt_pre_replace_guard,
+                    )
+                except BaseException as update_error:
+                    self._handle_proof_interruption(
+                        identity,
+                        artifact_records,
+                        update_error,
+                    )
+                    raise
+                for pending_artifact in attempt_pending_artifacts:
+                    pending_artifact_handoff.remove(
+                        pending_artifact
+                    )
+                self.store.clear_candidate_intents(
+                    identity,
+                    tuple(flag_values),
+                )
+                attempts.append(attempt)
+
+            observations = tuple(
+                attempt.observation for attempt in attempts
+            )
+            proof_result, evaluation = evaluate_rev_stdin_proof(
+                candidate.value,
+                accepted_input,
+                recipe.source_manifest_sha256,
+                observations,
+            )
+            verified_evaluation = verify_rev_proof_evaluation(
+                evaluation.to_dict(),
+                accepted_input=accepted_input,
+            )
+            if (
+                verified_evaluation.canonical_bytes()
+                != evaluation.canonical_bytes()
+                or verified_evaluation.evidence_sha256
+                != evaluation.evidence_sha256
+            ):
+                raise EngineError(
+                    "Rev proof evaluation did not round-trip canonically"
+                )
+            if len(attempts) != 6:
+                raise EngineError(
+                    "Rev proof did not produce exactly six attempts"
+                )
+            last_deadline_monotonic = attempts[
+                -1
+            ].deadline_monotonic_seconds
+            self._require_before_hard_deadline(
+                last_deadline_monotonic,
+                "Rev proof evaluation",
+            )
+            evaluated_at_utc = utc_now()
+            budget_deadline_epoch = deadline_epoch(
+                recipe.oracle_binding.budget_deadline_utc
+            )
+            evaluated_at_epoch = deadline_epoch(evaluated_at_utc)
+            if (
+                budget_deadline_epoch is None
+                or evaluated_at_epoch is None
+                or evaluated_at_epoch > budget_deadline_epoch
+                or any(
+                    (
+                        deadline_epoch(value) is None
+                        or deadline_epoch(value)
+                        > budget_deadline_epoch
+                    )
+                    for value in attempt_deadlines_utc
+                )
+            ):
+                raise EngineError(
+                    "Rev proof deadline evidence exceeds its budget pin"
+                )
+
+            evaluation_artifact_id = _record_id(
+                "A",
+                recipe.candidate_id,
+                f"rev-proof-evaluation-{proof_evaluation_id}",
+            )
+            evaluation_path = result_directory / "evaluation.json"
+            pending_evaluation_artifact = ArtifactReference(
+                id=evaluation_artifact_id,
+                path=evaluation_path.relative_to(
+                    paths.root
+                ).as_posix(),
+                sha256="0" * 64,
+                source_run_id=None,
+            )
+            pending_artifact_handoff.append(
+                pending_evaluation_artifact
+            )
+            atomic_write_bytes(
+                evaluation_path,
+                evaluation.canonical_bytes(),
+                mode=0o400,
+            )
+            evaluation_artifact = ArtifactReference(
+                id=evaluation_artifact_id,
+                path=evaluation_path.relative_to(paths.root).as_posix(),
+                sha256=evaluation.evidence_sha256,
+                source_run_id=None,
+                size=evaluation_path.stat().st_size,
+                extra={
+                    "kind": "rev_proof_evaluation",
+                    "experiment_id": experiment_id,
+                    "candidate_id": recipe.candidate_id,
+                    "recipe_sha256": recipe.recipe_sha256,
+                    "policy_sha256": recipe.policy.policy_sha256,
+                    "protocol": REV_STDIN_PROOF_PROTOCOL,
+                },
+            )
+            deadline_guard = {
+                "contract": "ctfos_rev_proof_deadline_guard_v1",
+                "budget_deadline_utc": (
+                    recipe.oracle_binding.budget_deadline_utc
+                ),
+                "attempt_deadlines_utc": list(
+                    attempt_deadlines_utc
+                ),
+                "evaluated_at_utc": evaluated_at_utc,
+                "commit_guard": "state_store_pre_replace_v1",
+            }
+            envelope = {
+                "schema_version": 1,
+                "protocol": REV_STDIN_PROOF_PROTOCOL,
+                "recipe_sha256": recipe.recipe_sha256,
+                "policy_sha256": recipe.policy.policy_sha256,
+                "candidate_id": recipe.candidate_id,
+                "accepted_input_artifact_id": (
+                    accepted_artifact.id
+                ),
+                "source_manifest_sha256": (
+                    recipe.source_manifest_sha256
+                ),
+                "image_reference": recipe.image_reference,
+                "oracle_binding": recipe.oracle_binding.to_dict(),
+                "evaluation": evaluation.to_dict(),
+                "evaluation_sha256": evaluation.evidence_sha256,
+                "evaluation_artifact_id": evaluation_artifact.id,
+                "deadline_guard": deadline_guard,
+            }
+            structural_failure_codes = (
+                set(evaluation.failure_codes)
+                - _REV_STDIN_SEMANTIC_FAILURE_CODES
+            )
+            semantic_falsification = (
+                not proof_result.passed
+                and not structural_failure_codes
+            )
+            final_base = self.store.load(identity)
+            guarded_final_state: list[ChallengeState] = []
+
+            def apply_rev_result(latest: ChallengeState) -> None:
+                latest_candidate = next(
+                    item
+                    for item in latest.candidates
+                    if item.id == recipe.candidate_id
+                )
+                latest_experiment = next(
+                    item
+                    for item in latest.experiments
+                    if item.id == experiment_id
+                )
+                if (
+                    latest.status is not ChallengeStatus.PROVING
+                    or latest_experiment.status
+                    is not ExperimentStatus.RUNNING
+                    or latest_experiment.proof_recipe != recipe
+                ):
+                    raise EngineError(
+                        "managed Rev proof changed before final commit"
+                    )
+                self._require_managed_proof_recipe_current(
+                    latest,
+                    recipe,
+                )
+                expected_run_ids = [
+                    attempt.observation.run_id
+                    for attempt in attempts
+                ]
+                if any(
+                    not any(run.id == run_id for run in latest.runs)
+                    for run_id in expected_run_ids
+                ):
+                    raise EngineError(
+                        "managed Rev proof attempt chain is incomplete"
+                    )
+                latest.artifacts.append(evaluation_artifact)
+                latest_experiment.status = (
+                    ExperimentStatus.COMPLETED
+                    if proof_result.passed or semantic_falsification
+                    else ExperimentStatus.FAILED
+                )
+                latest_experiment.result = {
+                    "proof_result": proof_result.to_dict(),
+                    "rev_proof_evidence": envelope,
+                }
+                latest_experiment.artifact_ids = list(
+                    dict.fromkeys(
+                        (
+                            *latest_experiment.artifact_ids,
+                            *(
+                                artifact.id
+                                for attempt in attempts
+                                for artifact in attempt.artifacts
+                            ),
+                            evaluation_artifact.id,
+                        )
+                    )
+                )
+                latest_experiment.evidence_run_ids = list(
+                    dict.fromkeys(
+                        (
+                            *latest_experiment.evidence_run_ids,
+                            *expected_run_ids,
+                        )
+                    )
+                )
+                latest_experiment.evaluated_at = evaluated_at_utc
+                latest_experiment.evaluation_reason = (
+                    None
+                    if proof_result.passed
+                    else (
+                        "rev_proof:"
+                        + (
+                            "semantic_falsification"
+                            if semantic_falsification
+                            else "structural_failure"
+                        )
+                        + ":"
+                        + ",".join(evaluation.failure_codes)
+                    )[:512]
+                )
+                if proof_result.passed:
+                    validate_transition(
+                        latest.status,
+                        ChallengeStatus.READY_TO_SUBMIT,
+                        evidence=TransitionEvidence(
+                            proof_passed=True
+                        ),
+                    )
+                    latest_candidate.status = (
+                        CandidateStatus.READY_TO_SUBMIT
+                    )
+                    latest.status = ChallengeStatus.READY_TO_SUBMIT
+                else:
+                    validate_transition(
+                        latest.status,
+                        ChallengeStatus.ACTIVE,
+                    )
+                    latest.status = ChallengeStatus.ACTIVE
+                guarded_final_state.append(latest)
+
+            def final_commit_guard() -> None:
+                if len(guarded_final_state) != 1:
+                    raise EngineError(
+                        "Rev proof final guard state is unavailable"
+                    )
+                require_expected_config(
+                    guarded_final_state[0],
+                    "final commit",
+                )
+                for attempt in attempts:
+                    self._revalidate_rev_proof_attempt(
+                        guarded_final_state[0],
+                        recipe,
+                        accepted_artifact,
+                        attempt,
+                        patterns=patterns,
+                        deadline_override_monotonic_seconds=(
+                            last_deadline_monotonic
+                        ),
+                        revalidate_external_pins=False,
+                    )
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix=".ctfos-rev-evaluation-guard-",
+                        dir=paths.runtime,
+                    ) as temporary:
+                        guarded_input = copy_bounded_regular(
+                            paths.root,
+                            accepted_artifact.path,
+                            Path(temporary) / "accepted-input.bin",
+                            maximum_bytes=(
+                                REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                            ),
+                            expected_sha256=accepted_artifact.sha256,
+                            expected_size=accepted_artifact.size,
+                            mode=0o400,
+                        )
+                        guarded_accepted_input = (
+                            guarded_input.path.read_bytes()
+                        )
+                        if guarded_accepted_input != accepted_input:
+                            raise ValueError(
+                                "accepted input bytes changed"
+                            )
+                        copied = copy_bounded_regular(
+                            paths.root,
+                            evaluation_artifact.path,
+                            Path(temporary) / "evaluation.json",
+                            maximum_bytes=(
+                                REV_STDIN_PROOF_MAX_EVIDENCE_BYTES
+                            ),
+                            expected_sha256=(
+                                evaluation_artifact.sha256
+                            ),
+                            expected_size=evaluation_artifact.size,
+                            mode=0o400,
+                        )
+                        persisted = verify_rev_proof_evaluation(
+                            strict_json_loads(
+                                copied.path.read_bytes(),
+                                max_bytes=(
+                                    REV_STDIN_PROOF_MAX_EVIDENCE_BYTES
+                                ),
+                            ),
+                            accepted_input=guarded_accepted_input,
+                        )
+                except (
+                    OSError,
+                    SafeFileError,
+                    StrictJSONError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    raise EngineError(
+                        "Rev proof evaluation changed before commit"
+                    ) from error
+                if (
+                    persisted.canonical_bytes()
+                    != evaluation.canonical_bytes()
+                    or persisted.evidence_sha256
+                    != envelope["evaluation_sha256"]
+                ):
+                    raise EngineError(
+                        "Rev proof evaluation crosslink changed before "
+                        "commit"
+                    )
+                self._require_rev_stdin_external_pins(
+                    guarded_final_state[0],
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        last_deadline_monotonic
+                    ),
+                    accepted_artifact=accepted_artifact,
+                )
+                require_expected_config(
+                    guarded_final_state[0],
+                    "final replacement",
+                )
+                self._require_before_hard_deadline(
+                    last_deadline_monotonic,
+                    "Rev proof final evidence revalidation",
+                )
+                require_pre_replace_margin(
+                    last_deadline_monotonic,
+                    "Rev proof final pre-replace safety margin",
+                )
+
+            def final_pre_replace_guard() -> None:
+                if len(guarded_final_state) != 1:
+                    raise EngineError(
+                        "Rev proof final pre-replace state is unavailable"
+                    )
+                require_expected_config(
+                    guarded_final_state[0],
+                    "final pre-replace",
+                )
+                self._require_rev_stdin_external_pins(
+                    guarded_final_state[0],
+                    recipe,
+                    deadline_monotonic_seconds=(
+                        last_deadline_monotonic
+                    ),
+                    accepted_artifact=accepted_artifact,
+                )
+                require_expected_config(
+                    guarded_final_state[0],
+                    "final pre-replace completion",
+                )
+                require_pre_replace_margin(
+                    last_deadline_monotonic,
+                    "Rev proof final pre-replace safety margin",
+                )
+
+            try:
+                committed = self.store.update(
+                    identity,
+                    apply_rev_result,
+                    expected_revision=final_base.revision,
+                    commit_guard=final_commit_guard,
+                    pre_replace_guard=final_pre_replace_guard,
+                )
+            except BaseException as update_error:
+                self._handle_proof_interruption(
+                    identity,
+                    (evaluation_artifact,),
+                    update_error,
+                )
+                raise
+            pending_artifact_handoff.remove(
+                pending_evaluation_artifact
+            )
+            return committed, proof_result
+
     def execute_proof_experiment(
         self,
         identity: ChallengeIdentity,
@@ -10648,6 +12722,9 @@ class ChallengeEngine:
                 "Reproducer"
             )
         artifacts = {item.id: item for item in state.artifacts}
+        rev_stdin_proof = (
+            recipe.policy.oracle_protocol == REV_STDIN_PROOF_PROTOCOL
+        )
         total_input_bytes = 0
         for proof_input in recipe.inputs:
             artifact = artifacts[proof_input.artifact_id]
@@ -10663,8 +12740,10 @@ class ChallengeEngine:
                 raise EngineError(
                     "managed proof inputs exceed the aggregate byte limit"
                 )
-            if artifact.extra.get("source_locator") != (
-                proof_input.destination
+            if (
+                not rev_stdin_proof
+                and artifact.extra.get("source_locator")
+                != proof_input.destination
             ):
                 raise EngineError(
                     "managed proof input destination no longer matches its "
@@ -10716,6 +12795,13 @@ class ChallengeEngine:
             "wave_id": proposal_run.wave_id,
         }
         try:
+            if rev_stdin_proof:
+                return self._execute_managed_rev_stdin_proof(
+                    identity,
+                    experiment_id,
+                    recipe,
+                    managed_context=managed_context,
+                )
             return self.prove_candidate(
                 identity,
                 recipe.candidate_id,
