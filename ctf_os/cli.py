@@ -911,6 +911,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="python",
     )
 
+    misc_prove = commands.add_parser(
+        "misc-prove",
+        help=(
+            "운영자 JSON DAG의 변환과 original-condition oracle를 "
+            "network-denied clean sandbox에서 실행 (flag proof/제출 아님)"
+        ),
+    )
+    _identity_values(misc_prove)
+    misc_prove.add_argument("--candidate", required=True)
+    misc_prove.add_argument("--spec", required=True)
+
     submit = commands.add_parser(
         "submit",
         help="flag를 표시하거나 사람이 제출한 결과만 기록",
@@ -1712,6 +1723,16 @@ def main(
                 mutation_id=args.mutation_id,
                 runtime=args.runtime,
             )
+            _print_json(result.to_dict())
+            return 0 if result.passed else 1
+
+        if args.command == "misc-prove":
+            state, result = engine.evaluate_misc_transform_candidate(
+                _identity(args),
+                args.candidate,
+                spec_locator=args.spec,
+            )
+            del state
             _print_json(result.to_dict())
             return 0 if result.passed else 1
 

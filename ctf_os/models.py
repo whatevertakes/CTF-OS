@@ -10368,6 +10368,585 @@ def _crypto_metamorphic_state_errors(
     return errors
 
 
+_MISC_TRANSFORM_PROTOCOL = "misc_sandbox_transform_dag_reverse_v1"
+_MISC_TRANSFORM_BINDING_KEYS = frozenset(
+    {
+        "artifact_id",
+        "automatic_submission_authorized",
+        "candidate_sha256",
+        "evaluation",
+        "evaluation_sha256",
+        "misc_evaluation_id",
+        "oracle_authority",
+        "passed",
+        "plan_sha256",
+        "protocol",
+        "run_ids",
+        "source_manifest_sha256",
+    }
+)
+
+
+def _misc_transform_state_errors(
+    state: "ChallengeState",
+    *,
+    runs: Mapping[str, RunReference],
+    artifacts: Mapping[str, ArtifactReference],
+    facts: Mapping[str, Fact],
+    candidates: Mapping[str, FlagCandidate],
+) -> list[str]:
+    """Validate the durable executable Misc receipt graph.
+
+    Failed/interrupted attempts may retain input artifacts and terminal runs.
+    A finalized evaluation, especially a passed one, is accepted only when its
+    candidate, immutable sources, ordered run matrix, exact record copies,
+    evaluation artifact, fact, and progress marker all remain bound.
+    """
+
+    errors: list[str] = []
+    try:
+        from ctf_os.engine.misc_transform import (
+            MISC_TRANSFORM_MAX_EVIDENCE_BYTES,
+            MISC_TRANSFORM_SCHEMA_VERSION,
+            MISC_TRANSFORM_VERIFICATION_REPEATS,
+            misc_transform_canonical_json_bytes,
+        )
+    except (ImportError, ValueError) as error:
+        return [f"Misc transform validator unavailable: {error}"]
+
+    bindings: dict[str, tuple[FlagCandidate, Mapping[str, object]]] = {}
+    for candidate in state.candidates:
+        raw = candidate.extra.get("misc_transform_evidence")
+        if raw is None:
+            continue
+        label = f"Misc candidate {candidate.id} transform evidence"
+        if not isinstance(raw, Mapping):
+            errors.append(f"{label} must be an object")
+            continue
+        evaluation_id = raw.get("misc_evaluation_id")
+        if type(evaluation_id) is not str or not evaluation_id:
+            errors.append(f"{label} has an invalid evaluation id")
+            continue
+        if evaluation_id in bindings:
+            errors.append(
+                f"Misc evaluation id {evaluation_id} is bound more than once"
+            )
+            continue
+        bindings[evaluation_id] = (candidate, raw)
+
+    for evaluation_id, (candidate, binding) in bindings.items():
+        label = f"Misc evaluation {evaluation_id}"
+        try:
+            if frozenset(binding) != _MISC_TRANSFORM_BINDING_KEYS:
+                raise ModelValidationError(
+                    "binding has unknown or missing fields"
+                )
+            evaluation = binding["evaluation"]
+            run_ids = binding["run_ids"]
+            if (
+                binding["protocol"] != _MISC_TRANSFORM_PROTOCOL
+                or binding["oracle_authority"]
+                != "explicit_operator_exit_status"
+                or binding["automatic_submission_authorized"] is not False
+                or type(binding["passed"]) is not bool
+                or type(binding["evaluation_sha256"]) is not str
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    binding["evaluation_sha256"],
+                )
+                or type(binding["plan_sha256"]) is not str
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    binding["plan_sha256"],
+                )
+                or type(binding["candidate_sha256"]) is not str
+                or binding["candidate_sha256"]
+                != hashlib.sha256(
+                    candidate.value.encode("utf-8", errors="strict")
+                ).hexdigest()
+                or type(binding["source_manifest_sha256"]) is not str
+                or binding["source_manifest_sha256"]
+                != state.metadata.get("source_manifest_sha256")
+                or type(run_ids) is not list
+                or not run_ids
+                or any(type(run_id) is not str for run_id in run_ids)
+                or len(set(run_ids)) != len(run_ids)
+                or not isinstance(evaluation, Mapping)
+            ):
+                raise ModelValidationError("binding fields are inconsistent")
+            expected_evaluation_keys = frozenset(
+                {
+                    "authorities",
+                    "failure_codes",
+                    "passed",
+                    "plan",
+                    "plan_sha256",
+                    "protocol",
+                    "reverse_verifications",
+                    "schema_version",
+                    "transform_nodes",
+                }
+            )
+            if frozenset(evaluation) != expected_evaluation_keys:
+                raise ModelValidationError(
+                    "evaluation has unknown or missing fields"
+                )
+            if (
+                evaluation["protocol"] != _MISC_TRANSFORM_PROTOCOL
+                or evaluation["schema_version"]
+                != MISC_TRANSFORM_SCHEMA_VERSION
+                or evaluation["passed"] is not binding["passed"]
+                or evaluation["plan_sha256"] != binding["plan_sha256"]
+                or not isinstance(evaluation["plan"], Mapping)
+                or type(evaluation["failure_codes"]) is not list
+                or any(
+                    type(code) is not str
+                    for code in evaluation["failure_codes"]
+                )
+                or type(evaluation["transform_nodes"]) is not list
+                or type(evaluation["reverse_verifications"]) is not list
+                or evaluation["authorities"]
+                != {
+                    "automatic_submission_authorized": False,
+                    "candidate_original_condition_verified": (
+                        binding["passed"]
+                    ),
+                }
+            ):
+                raise ModelValidationError("evaluation fields are inconsistent")
+            encoded = misc_transform_canonical_json_bytes(evaluation)
+            if (
+                len(encoded) > MISC_TRANSFORM_MAX_EVIDENCE_BYTES
+                or hashlib.sha256(encoded).hexdigest()
+                != binding["evaluation_sha256"]
+            ):
+                raise ModelValidationError(
+                    "evaluation canonical hash does not match"
+                )
+            plan = evaluation["plan"]
+            assert isinstance(plan, Mapping)
+            if (
+                plan.get("protocol") != _MISC_TRANSFORM_PROTOCOL
+                or plan.get("candidate_sha256")
+                != binding["candidate_sha256"]
+                or plan.get("candidate_size_bytes")
+                != len(candidate.value.encode("utf-8", errors="strict"))
+                or plan.get("source_manifest_sha256")
+                != binding["source_manifest_sha256"]
+                or hashlib.sha256(
+                    misc_transform_canonical_json_bytes(plan)
+                ).hexdigest()
+                != binding["plan_sha256"]
+                or type(plan.get("sources")) is not list
+                or not plan["sources"]
+                or type(plan.get("steps")) is not list
+                or not plan["steps"]
+                or plan.get("verification_repeats")
+                != MISC_TRANSFORM_VERIFICATION_REPEATS
+            ):
+                raise ModelValidationError("plan binding is inconsistent")
+
+            for source in plan["sources"]:
+                if (
+                    not isinstance(source, Mapping)
+                    or frozenset(source)
+                    != {"artifact_id", "sha256", "size_bytes"}
+                    or type(source["artifact_id"]) is not str
+                    or source["artifact_id"] not in artifacts
+                ):
+                    raise ModelValidationError(
+                        "source artifact binding is invalid"
+                    )
+                artifact = artifacts[source["artifact_id"]]
+                incoming_path = artifact.extra.get("incoming_path")
+                incoming = next(
+                    (
+                        item
+                        for item in state.source_inventory
+                        if item.path == incoming_path
+                    ),
+                    None,
+                )
+                if (
+                    artifact.sha256 != source["sha256"]
+                    or artifact.size != source["size_bytes"]
+                    or artifact.extra.get("kind")
+                    != "misc_transform_input"
+                    or artifact.extra.get("purpose") != "source"
+                    or artifact.extra.get("protocol")
+                    != _MISC_TRANSFORM_PROTOCOL
+                    or artifact.extra.get("misc_evaluation_id")
+                    != evaluation_id
+                    or artifact.extra.get("immutable_incoming") is not True
+                    or incoming is None
+                    or incoming.sha256 != artifact.sha256
+                    or incoming.size != artifact.size
+                ):
+                    raise ModelValidationError(
+                        "source artifact was stripped or rebound"
+                    )
+
+            for step in plan["steps"]:
+                if (
+                    not isinstance(step, Mapping)
+                    or type(step.get("step_id")) is not str
+                    or type(step.get("tool_artifact_sha256")) is not str
+                ):
+                    raise ModelValidationError(
+                        "transform tool plan binding is invalid"
+                    )
+                matching_tools = [
+                    artifact
+                    for artifact in state.artifacts
+                    if (
+                        artifact.extra.get("kind")
+                        == "misc_transform_input"
+                        and artifact.extra.get("purpose")
+                        == "transform_tool"
+                        and artifact.extra.get("logical_id")
+                        == step["step_id"]
+                        and artifact.extra.get("protocol")
+                        == _MISC_TRANSFORM_PROTOCOL
+                        and artifact.extra.get("misc_evaluation_id")
+                        == evaluation_id
+                    )
+                ]
+                if (
+                    len(matching_tools) != 1
+                    or matching_tools[0].sha256
+                    != step["tool_artifact_sha256"]
+                    or matching_tools[0].size is None
+                ):
+                    raise ModelValidationError(
+                        "transform tool artifact was stripped or rebound"
+                    )
+            verifier = plan.get("verifier")
+            if not isinstance(verifier, Mapping):
+                raise ModelValidationError(
+                    "verifier tool plan binding is invalid"
+                )
+            matching_verifiers = [
+                artifact
+                for artifact in state.artifacts
+                if (
+                    artifact.extra.get("kind")
+                    == "misc_transform_input"
+                    and artifact.extra.get("purpose") == "verifier_tool"
+                    and artifact.extra.get("logical_id")
+                    == verifier.get("verifier_id")
+                    and artifact.extra.get("protocol")
+                    == _MISC_TRANSFORM_PROTOCOL
+                    and artifact.extra.get("misc_evaluation_id")
+                    == evaluation_id
+                )
+            ]
+            if (
+                len(matching_verifiers) != 1
+                or matching_verifiers[0].sha256
+                != verifier.get("tool_artifact_sha256")
+                or matching_verifiers[0].size is None
+            ):
+                raise ModelValidationError(
+                    "verifier tool artifact was stripped or rebound"
+                )
+            operator_specs = [
+                artifact
+                for artifact in state.artifacts
+                if (
+                    artifact.extra.get("kind")
+                    == "misc_transform_input"
+                    and artifact.extra.get("purpose") == "operator_spec"
+                    and artifact.extra.get("protocol")
+                    == _MISC_TRANSFORM_PROTOCOL
+                    and artifact.extra.get("misc_evaluation_id")
+                    == evaluation_id
+                )
+            ]
+            input_manifests = [
+                artifact
+                for artifact in state.artifacts
+                if (
+                    artifact.extra.get("kind")
+                    == "misc_transform_input_manifest"
+                    and artifact.extra.get("protocol")
+                    == _MISC_TRANSFORM_PROTOCOL
+                    and artifact.extra.get("misc_evaluation_id")
+                    == evaluation_id
+                )
+            ]
+            if (
+                len(operator_specs) != 1
+                or len(input_manifests) != 2
+                or {
+                    artifact.extra.get("purpose")
+                    for artifact in input_manifests
+                }
+                != {"operator_spec", "payloads"}
+            ):
+                raise ModelValidationError(
+                    "operator spec or input manifests were stripped"
+                )
+
+            records = [
+                *evaluation["transform_nodes"],
+                *evaluation["reverse_verifications"],
+            ]
+            if len(run_ids) != len(records):
+                raise ModelValidationError(
+                    "run ids do not match evaluation records"
+                )
+            marked_run_ids = [
+                run.id
+                for run in state.runs
+                if (
+                    run.extra.get("misc_transform_protocol")
+                    == _MISC_TRANSFORM_PROTOCOL
+                    and run.extra.get("misc_evaluation_id")
+                    == evaluation_id
+                )
+            ]
+            if marked_run_ids != run_ids:
+                raise ModelValidationError(
+                    "evaluation run set was stripped, reordered, or extended"
+                )
+            for run_id, record in zip(run_ids, records, strict=True):
+                if run_id not in runs or not isinstance(record, Mapping):
+                    raise ModelValidationError(
+                        "evaluation references an unknown run or record"
+                    )
+                run = runs[run_id]
+                if (
+                    run.role != "misc_transform"
+                    or run.origin is not RunOrigin.PROOF
+                    or type(run.configuration_epoch) is not int
+                    or run.extra.get("misc_transform_protocol")
+                    != _MISC_TRANSFORM_PROTOCOL
+                    or run.extra.get("misc_evaluation_id") != evaluation_id
+                    or run.extra.get("plan_sha256")
+                    != binding["plan_sha256"]
+                    or run.extra.get("misc_transform_record") != record
+                    or record.get("run_id") != run_id
+                    or record.get("plan_sha256")
+                    != binding["plan_sha256"]
+                    or record.get("source_manifest_sha256")
+                    != binding["source_manifest_sha256"]
+                ):
+                    raise ModelValidationError(
+                        "run record was stripped or rebound"
+                    )
+                for stream_name in ("stdout", "stderr"):
+                    stream = record.get(stream_name)
+                    if not isinstance(stream, Mapping):
+                        raise ModelValidationError(
+                            "stream evidence is not an object"
+                        )
+                    artifact_id = stream.get("artifact_id")
+                    if (
+                        type(artifact_id) is not str
+                        or artifact_id not in artifacts
+                    ):
+                        raise ModelValidationError(
+                            "stream artifact is missing"
+                        )
+                    artifact = artifacts[artifact_id]
+                    if (
+                        artifact.source_run_id != run_id
+                        or artifact.sha256
+                        != stream.get("artifact_sha256")
+                        or artifact.size
+                        != stream.get("artifact_size_bytes")
+                        or artifact.extra.get("kind")
+                        != "misc_transform_stream"
+                        or artifact.extra.get("misc_evaluation_id")
+                        != evaluation_id
+                        or artifact.extra.get("plan_sha256")
+                        != binding["plan_sha256"]
+                    ):
+                        raise ModelValidationError(
+                            "stream artifact was stripped or rebound"
+                        )
+                output = record.get(
+                    "output_artifact",
+                    record.get("result_artifact"),
+                )
+                if output is not None:
+                    if (
+                        not isinstance(output, Mapping)
+                        or type(output.get("artifact_id")) is not str
+                        or output["artifact_id"] not in artifacts
+                    ):
+                        raise ModelValidationError(
+                            "output artifact is missing"
+                        )
+                    artifact = artifacts[output["artifact_id"]]
+                    if (
+                        artifact.source_run_id != run_id
+                        or artifact.sha256 != output.get("sha256")
+                        or artifact.size != output.get("size_bytes")
+                        or artifact.extra.get("misc_evaluation_id")
+                        != evaluation_id
+                        or artifact.extra.get("plan_sha256")
+                        != binding["plan_sha256"]
+                    ):
+                        raise ModelValidationError(
+                            "output artifact was stripped or rebound"
+                        )
+
+            evaluation_artifact_id = binding["artifact_id"]
+            if (
+                type(evaluation_artifact_id) is not str
+                or evaluation_artifact_id not in artifacts
+            ):
+                raise ModelValidationError("evaluation artifact is missing")
+            evaluation_artifact = artifacts[evaluation_artifact_id]
+            if (
+                evaluation_artifact.sha256
+                != binding["evaluation_sha256"]
+                or evaluation_artifact.size != len(encoded)
+                or evaluation_artifact.extra
+                != {
+                    "kind": "misc_transform_evaluation",
+                    "protocol": _MISC_TRANSFORM_PROTOCOL,
+                    "misc_evaluation_id": evaluation_id,
+                    "candidate_id": candidate.id,
+                    "plan_sha256": binding["plan_sha256"],
+                    "evaluation_sha256": (
+                        binding["evaluation_sha256"]
+                    ),
+                }
+                or evaluation_artifact.source_run_id
+                != run_ids[-1]
+            ):
+                raise ModelValidationError(
+                    "evaluation artifact was stripped or rebound"
+                )
+
+            passed = binding["passed"] is True
+            if passed:
+                if (
+                    candidate.status
+                    is CandidateStatus.READY_TO_SUBMIT
+                    or evaluation["failure_codes"]
+                    or len(evaluation["transform_nodes"])
+                    != len(plan["steps"])
+                    or len(evaluation["reverse_verifications"])
+                    != MISC_TRANSFORM_VERIFICATION_REPEATS
+                    or any(
+                        not isinstance(record, Mapping)
+                        or record.get("accepted") is not True
+                        for record in records
+                    )
+                    or any(
+                        runs[run_id].status is not RunStatus.COMPLETED
+                        for run_id in run_ids
+                    )
+                ):
+                    raise ModelValidationError(
+                        "passed evaluation is incomplete or promoted as proof"
+                    )
+                matching_facts = [
+                    fact
+                    for fact in state.facts
+                    if (
+                        isinstance(
+                            fact.extra.get("misc_transform_evidence"),
+                            Mapping,
+                        )
+                        and fact.extra["misc_transform_evidence"].get(
+                            "misc_evaluation_id"
+                        )
+                        == evaluation_id
+                    )
+                ]
+                if (
+                    len(matching_facts) != 1
+                    or matching_facts[0].provenance
+                    is not Provenance.EXECUTED
+                    or matching_facts[0].source_run_id != run_ids[-1]
+                    or matching_facts[0].artifact_id
+                    != evaluation_artifact_id
+                    or matching_facts[0].locator
+                    != evaluation_artifact.path
+                    or matching_facts[0].extra
+                    != {
+                        "misc_transform_evidence": {
+                            "candidate_id": candidate.id,
+                            "evaluation_sha256": (
+                                binding["evaluation_sha256"]
+                            ),
+                            "misc_evaluation_id": evaluation_id,
+                            "plan_sha256": binding["plan_sha256"],
+                            "protocol": _MISC_TRANSFORM_PROTOCOL,
+                        }
+                    }
+                ):
+                    raise ModelValidationError(
+                        "passed evaluation lacks its exact executed fact"
+                    )
+                matching_markers = [
+                    marker
+                    for marker in state.progress_markers
+                    if marker.extra.get("misc_evaluation_id")
+                    == evaluation_id
+                ]
+                if (
+                    len(matching_markers) != 1
+                    or matching_markers[0].run_id != run_ids[-1]
+                    or matching_markers[0].artifact_ids
+                    != [evaluation_artifact_id]
+                    or matching_markers[0].extra
+                    != {
+                        "adapter_marker": (
+                            "misc_original_condition_verified"
+                        ),
+                        "candidate_id": candidate.id,
+                        "evaluation_sha256": (
+                            binding["evaluation_sha256"]
+                        ),
+                        "misc_evaluation_id": evaluation_id,
+                        "plan_sha256": binding["plan_sha256"],
+                        "protocol": _MISC_TRANSFORM_PROTOCOL,
+                        "automatic_submission_authorized": False,
+                    }
+                ):
+                    raise ModelValidationError(
+                        "passed evaluation lacks its exact progress marker"
+                    )
+        except (
+            KeyError,
+            ModelValidationError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            errors.append(f"{label} is invalid: {error}")
+
+    for artifact in state.artifacts:
+        if (
+            artifact.extra.get("kind") == "misc_transform_evaluation"
+            and artifact.extra.get("protocol") == _MISC_TRANSFORM_PROTOCOL
+            and artifact.extra.get("misc_evaluation_id") not in bindings
+        ):
+            errors.append(
+                f"orphan Misc transform evaluation artifact {artifact.id}"
+            )
+    for fact in state.facts:
+        marker = fact.extra.get("misc_transform_evidence")
+        if (
+            isinstance(marker, Mapping)
+            and marker.get("protocol") == _MISC_TRANSFORM_PROTOCOL
+            and marker.get("misc_evaluation_id") not in bindings
+        ):
+            errors.append(f"orphan Misc transform fact {fact.id}")
+    for marker in state.progress_markers:
+        if (
+            marker.extra.get("protocol") == _MISC_TRANSFORM_PROTOCOL
+            and marker.extra.get("misc_evaluation_id") not in bindings
+        ):
+            errors.append(f"orphan Misc transform progress marker {marker.id}")
+    return errors
+
+
 @dataclass
 class ChallengeState:
     contest_id: str
@@ -12760,6 +13339,15 @@ class ChallengeState:
                     self,
                     runs=runs,
                     artifacts=artifacts,
+                    candidates=candidates,
+                )
+            )
+            errors.extend(
+                _misc_transform_state_errors(
+                    self,
+                    runs=runs,
+                    artifacts=artifacts,
+                    facts=facts,
                     candidates=candidates,
                 )
             )

@@ -124,6 +124,29 @@ from ctf_os.engine.flags import (
     FlagLogTailer,
     print_flag_candidate,
 )
+from ctf_os.engine.misc_execution import (
+    MISC_EXECUTION_MAX_SPEC_BYTES,
+    MISC_EXECUTION_RUNTIME,
+    MISC_EXECUTION_TRANSFORM_INTERFACE,
+    MISC_EXECUTION_VERIFIER_INTERFACE,
+    MiscExecutionSpecError,
+    parse_misc_execution_spec,
+)
+from ctf_os.engine.misc_transform import (
+    MISC_TRANSFORM_PROTOCOL,
+    MISC_TRANSFORM_VERIFICATION_REPEATS,
+    MiscArtifactRef,
+    MiscReverseVerificationObservation,
+    MiscStreamEvidence,
+    MiscTransformObservation,
+    MiscTransformStepSpec,
+    MiscVerifierSpec,
+    build_misc_transform_plan,
+    evaluate_misc_transform_receipts,
+    expected_misc_reverse_result_artifact,
+    misc_transform_canonical_json_bytes,
+    misc_transform_node_commitment_sha256,
+)
 from ctf_os.engine.proof import (
     ProofAttempt,
     ProofResult,
@@ -3958,8 +3981,9 @@ class ChallengeEngine:
                     "evidence hash-chain oracle runner is implemented"
                 ),
                 "misc": (
-                    "Misc managed proof remains fail-closed until the "
-                    "transform-DAG reverse oracle runner is implemented"
+                    "Misc managed proof remains fail-closed; the executable "
+                    "transform-DAG original-condition runner is an explicit "
+                    "operator path and never promotes flag proof"
                 ),
             }.get(
                 adapter.name,
@@ -19234,6 +19258,1647 @@ class ChallengeEngine:
                     f"{recovery_error}"
                 )
             raise
+
+    def evaluate_misc_transform_candidate(
+        self,
+        identity: ChallengeIdentity,
+        candidate_id: str,
+        *,
+        spec_locator: str,
+    ) -> tuple[ChallengeState, object]:
+        """Execute one operator-declared Misc DAG and original-condition oracle.
+
+        This local hot path never selects another challenge, enables network
+        access, promotes a candidate to proof, or submits it.  Each Python
+        transform and each of the three verifier replays receives only typed,
+        hash-bound inputs in a new clean sandbox.  A verifier exit status of
+        zero is an explicit operator oracle, not proof that a flag is correct.
+        """
+
+        paths = self.store.challenge_paths(identity)
+        try:
+            session_lock = ChallengeLock(
+                paths.runtime / "session.lock",
+                timeout=0,
+            ).acquire()
+        except LockTimeout as error:
+            raise SessionAlreadyRunning(
+                f"another session already owns {identity.key}"
+            ) from error
+
+        preparations: list[_ProofInputPreparation] = []
+        source_staging: tempfile.TemporaryDirectory[str] | None = None
+        committed_inputs = False
+        cleanup_error: BaseException | None = None
+        try:
+            self._recover_session_boundary(identity)
+            state = self.refresh_ingest(identity)
+            if get_adapter(state.category).name != "misc":
+                raise EngineError(
+                    "Misc transform evaluation requires a Misc challenge"
+                )
+            if state.schema_version < STATE_SCHEMA_VERSION:
+                raise EngineError(
+                    "Misc transform evaluation requires the current state schema"
+                )
+            if state.primary_target_id is not None:
+                raise EngineError(
+                    "Misc transform evaluation is local and network-denied"
+                )
+            if state.status in {
+                ChallengeStatus.NEW,
+                ChallengeStatus.PAUSED,
+                ChallengeStatus.SOLVED,
+                ChallengeStatus.ABANDONED,
+                ChallengeStatus.PROVING,
+                ChallengeStatus.READY_TO_SUBMIT,
+            }:
+                raise EngineError(
+                    "Misc transform evaluation cannot start in "
+                    f"{state.status.value}"
+                )
+            candidate = next(
+                (item for item in state.candidates if item.id == candidate_id),
+                None,
+            )
+            if candidate is None:
+                raise EngineError(f"unknown candidate: {candidate_id}")
+            if candidate.status is not CandidateStatus.OBSERVED_CANDIDATE:
+                raise EngineError(
+                    "Misc transform evaluation requires a non-terminal candidate"
+                )
+            if "misc_transform_evidence" in candidate.extra:
+                raise EngineError(
+                    "Misc transform evaluation cannot replace existing evidence"
+                )
+            manifest = state.metadata.get("source_manifest_sha256")
+            if (
+                type(manifest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", manifest) is None
+            ):
+                raise EngineError("source manifest is unavailable")
+            image_reference = self.config.runtime.image_digest
+            if (
+                type(image_reference) is not str
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", image_reference)
+                is None
+            ):
+                raise EngineError(
+                    "Misc transform evaluation requires a digest-pinned image"
+                )
+            configuration_epoch = state.configuration_epoch
+            client = self.sandbox(state)
+            evaluation_id = _run_id("misc-transform")
+            result_directory = (
+                paths.proof / candidate_id / evaluation_id
+            )
+
+            spec_preparation = self._prepare_proof_inputs(
+                state,
+                client,
+                (spec_locator,),
+                result_directory / "spec",
+                f"{evaluation_id}-spec",
+                input_destinations=("engine/spec.json",),
+                pending_handoff=preparations,
+            )
+            spec_entry = spec_preparation.manifest["inputs"][0]
+            spec_snapshot = paths.root / str(spec_entry["snapshot_path"])
+            try:
+                spec_payload = read_bounded_regular(
+                    paths.root,
+                    spec_snapshot.relative_to(paths.root).as_posix(),
+                    maximum_bytes=MISC_EXECUTION_MAX_SPEC_BYTES,
+                    expected_sha256=str(spec_entry["sha256"]),
+                    expected_size=int(spec_entry["size_bytes"]),
+                )
+                raw_spec = strict_json_loads(
+                    spec_payload.decode("utf-8", errors="strict")
+                )
+                execution_spec = parse_misc_execution_spec(raw_spec)
+            except (
+                OSError,
+                UnicodeError,
+                SafeFileError,
+                StrictJSONError,
+                MiscExecutionSpecError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "Misc execution spec is not strict bounded v1 JSON"
+                ) from error
+
+            inventory_by_path = {
+                item.path: item for item in state.source_inventory
+            }
+            if any(
+                source.locator not in inventory_by_path
+                for source in execution_spec.sources
+            ):
+                raise EngineError(
+                    "every Misc source must name an immutable incoming file"
+                )
+            source_staging = tempfile.TemporaryDirectory(
+                prefix=".ctfos-misc-incoming-",
+                dir=self._workspace(state),
+            )
+            source_staging_root = Path(source_staging.name)
+            staged_source_locators: list[str] = []
+            for index, source in enumerate(
+                execution_spec.sources,
+                start=1,
+            ):
+                inventory_entry = inventory_by_path[source.locator]
+                staged = copy_bounded_regular(
+                    self.challenge_input(identity),
+                    source.locator,
+                    source_staging_root / f"source-{index:03d}.bin",
+                    maximum_bytes=min(
+                        DEFAULT_SNAPSHOT_MAX_BYTES,
+                        self.store.max_artifact_bytes,
+                    ),
+                    expected_sha256=inventory_entry.sha256,
+                    expected_size=inventory_entry.size,
+                    mode=0o400,
+                )
+                staged_source_locators.append(
+                    staged.path.relative_to(
+                        self._workspace(state)
+                    ).as_posix()
+                )
+            all_locators = (
+                *staged_source_locators,
+                *(item.tool_locator for item in execution_spec.steps),
+                execution_spec.verifier.tool_locator,
+            )
+            destinations = (
+                *(
+                    f"sources/{index:03d}.bin"
+                    for index in range(1, len(execution_spec.sources) + 1)
+                ),
+                *(
+                    f"tools/{index:03d}.py"
+                    for index in range(1, len(execution_spec.steps) + 1)
+                ),
+                "oracle/verifier.py",
+            )
+            payload_preparation = self._prepare_proof_inputs(
+                state,
+                client,
+                all_locators,
+                result_directory / "payloads",
+                f"{evaluation_id}-payloads",
+                input_destinations=destinations,
+                pending_handoff=preparations,
+            )
+            entries = payload_preparation.manifest["inputs"]
+            source_count = len(execution_spec.sources)
+            step_count = len(execution_spec.steps)
+            if len(entries) != source_count + step_count + 1:
+                raise EngineError("Misc execution input manifest is incomplete")
+
+            spec_artifacts = (
+                ArtifactReference(
+                    id=_record_id("A", evaluation_id, "operator-spec"),
+                    path=str(spec_entry["snapshot_path"]),
+                    sha256=str(spec_entry["sha256"]),
+                    size=int(spec_entry["size_bytes"]),
+                    extra={
+                        "kind": "misc_transform_input",
+                        "purpose": "operator_spec",
+                        "protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "context_visibility": "engine_private",
+                    },
+                ),
+                ArtifactReference(
+                    id=_record_id("A", evaluation_id, "spec-manifest"),
+                    path=spec_preparation.manifest_path.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    sha256=spec_preparation.manifest_sha256,
+                    size=spec_preparation.manifest_path.stat().st_size,
+                    extra={
+                        "kind": "misc_transform_input_manifest",
+                        "purpose": "operator_spec",
+                        "protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "context_visibility": "engine_private",
+                    },
+                ),
+            )
+            payload_artifacts: list[ArtifactReference] = []
+            for index, entry in enumerate(entries):
+                if index < source_count:
+                    purpose = "source"
+                    logical_id = execution_spec.sources[index].source_id
+                elif index < source_count + step_count:
+                    purpose = "transform_tool"
+                    logical_id = execution_spec.steps[
+                        index - source_count
+                    ].step_id
+                else:
+                    purpose = "verifier_tool"
+                    logical_id = execution_spec.verifier.verifier_id
+                payload_artifacts.append(
+                    ArtifactReference(
+                        id=_record_id(
+                            "A",
+                            evaluation_id,
+                            f"input-{index + 1:03d}",
+                        ),
+                        path=str(entry["snapshot_path"]),
+                        sha256=str(entry["sha256"]),
+                        size=int(entry["size_bytes"]),
+                        extra={
+                            "kind": "misc_transform_input",
+                            "purpose": purpose,
+                            "logical_id": logical_id,
+                            "protocol": MISC_TRANSFORM_PROTOCOL,
+                            "misc_evaluation_id": evaluation_id,
+                            "context_visibility": (
+                                "engine_private"
+                                if purpose != "source"
+                                else "model_visible"
+                            ),
+                            **(
+                                {
+                                    "immutable_incoming": True,
+                                    "incoming_path": (
+                                        execution_spec.sources[index].locator
+                                    ),
+                                }
+                                if purpose == "source"
+                                else {}
+                            ),
+                        },
+                    )
+                )
+            payload_manifest_artifact = ArtifactReference(
+                id=_record_id("A", evaluation_id, "payload-manifest"),
+                path=payload_preparation.manifest_path.relative_to(
+                    paths.root
+                ).as_posix(),
+                sha256=payload_preparation.manifest_sha256,
+                size=payload_preparation.manifest_path.stat().st_size,
+                extra={
+                    "kind": "misc_transform_input_manifest",
+                    "purpose": "payloads",
+                    "protocol": MISC_TRANSFORM_PROTOCOL,
+                    "misc_evaluation_id": evaluation_id,
+                    "context_visibility": "engine_private",
+                },
+            )
+            input_artifacts = (
+                *spec_artifacts,
+                *payload_artifacts,
+                payload_manifest_artifact,
+            )
+            source_refs = tuple(
+                MiscArtifactRef(
+                    artifact_id=payload_artifacts[index].id,
+                    sha256=payload_artifacts[index].sha256,
+                    size_bytes=int(payload_artifacts[index].size or 0),
+                )
+                for index in range(source_count)
+            )
+            source_plan_ids = {
+                source.source_id: source_refs[index].artifact_id
+                for index, source in enumerate(execution_spec.sources)
+            }
+
+            def contract_sha256(value: object) -> str:
+                return hashlib.sha256(
+                    misc_transform_canonical_json_bytes(value)
+                ).hexdigest()
+
+            step_specs = tuple(
+                MiscTransformStepSpec(
+                    ordinal=ordinal,
+                    step_id=step.step_id,
+                    parent_ids=tuple(
+                        source_plan_ids.get(parent_id, parent_id)
+                        for parent_id in step.parent_ids
+                    ),
+                    tool_id=f"python:{step.step_id}",
+                    tool_artifact_sha256=payload_artifacts[
+                        source_count + ordinal - 1
+                    ].sha256,
+                    argv_contract_sha256=contract_sha256(
+                        {
+                            "interface": MISC_EXECUTION_TRANSFORM_INTERFACE,
+                            "parent_count": len(step.parent_ids),
+                            "runtime": MISC_EXECUTION_RUNTIME,
+                            "step_id": step.step_id,
+                        }
+                    ),
+                    execution_contract_sha256=contract_sha256(
+                        {
+                            "clean_workspace": True,
+                            "image_reference": image_reference,
+                            "network": "none",
+                            "timeout_policy": "challenge-budget-clamped",
+                        }
+                    ),
+                )
+                for ordinal, step in enumerate(
+                    execution_spec.steps,
+                    start=1,
+                )
+            )
+            verifier_tool_artifact = payload_artifacts[-1]
+            verifier_spec = MiscVerifierSpec(
+                verifier_id=execution_spec.verifier.verifier_id,
+                tool_artifact_sha256=verifier_tool_artifact.sha256,
+                argv_contract_sha256=contract_sha256(
+                    {
+                        "interface": MISC_EXECUTION_VERIFIER_INTERFACE,
+                        "runtime": MISC_EXECUTION_RUNTIME,
+                        "source_count": source_count,
+                    }
+                ),
+                execution_contract_sha256=contract_sha256(
+                    {
+                        "clean_workspace": True,
+                        "image_reference": image_reference,
+                        "network": "none",
+                        "timeout_policy": "challenge-budget-clamped",
+                    }
+                ),
+                oracle_contract_sha256=contract_sha256(
+                    {
+                        "authority": "explicit_operator_exit_status",
+                        "oracle_id": execution_spec.verifier.oracle_id,
+                    }
+                ),
+            )
+            try:
+                plan = build_misc_transform_plan(
+                    candidate.value,
+                    manifest,
+                    source_refs,
+                    step_specs,
+                    terminal_step_id=execution_spec.terminal_step_id,
+                    verifier=verifier_spec,
+                )
+            except ValueError as error:
+                raise EngineError(
+                    "Misc execution DAG failed deterministic preflight"
+                ) from error
+
+            input_base = self.store.load(identity)
+
+            def commit_inputs(latest: ChallengeState) -> None:
+                latest_candidate = next(
+                    (
+                        item
+                        for item in latest.candidates
+                        if item.id == candidate_id
+                    ),
+                    None,
+                )
+                if (
+                    get_adapter(latest.category).name != "misc"
+                    or latest.configuration_epoch != configuration_epoch
+                    or latest.metadata.get("source_manifest_sha256")
+                    != manifest
+                    or latest_candidate is None
+                    or latest_candidate.status
+                    is not CandidateStatus.OBSERVED_CANDIDATE
+                    or "misc_transform_evidence"
+                    in latest_candidate.extra
+                ):
+                    raise EngineError(
+                        "Misc transform binding changed before input commit"
+                    )
+                latest.artifacts.extend(input_artifacts)
+
+            try:
+                self.store.update(
+                    identity,
+                    commit_inputs,
+                    expected_revision=input_base.revision,
+                )
+            except BaseException as error:
+                self._handle_proof_interruption(
+                    identity,
+                    input_artifacts,
+                    error,
+                )
+                raise
+            committed_inputs = True
+
+            source_proof_inputs = tuple(
+                ProofInput(
+                    source_locator=payload_preparation.prepared_inputs[
+                        index
+                    ].source_locator,
+                    destination_locator=f"unused/source-{index + 1:03d}",
+                    sha256=source_refs[index].sha256,
+                    size_bytes=source_refs[index].size_bytes,
+                )
+                for index in range(source_count)
+            )
+            transform_tool_inputs = tuple(
+                payload_preparation.prepared_inputs[
+                    source_count + index
+                ]
+                for index in range(step_count)
+            )
+            verifier_tool_input = payload_preparation.prepared_inputs[-1]
+            known_inputs: dict[
+                str,
+                tuple[MiscArtifactRef, str, str],
+            ] = {
+                source_refs[index].artifact_id: (
+                    source_refs[index],
+                    source_refs[index].commitment_sha256,
+                    source_proof_inputs[index].source_locator,
+                )
+                for index, source in enumerate(execution_spec.sources)
+            }
+            transform_observations: list[MiscTransformObservation] = []
+            reverse_observations: list[
+                MiscReverseVerificationObservation
+            ] = []
+            evidence_artifacts: list[ArtifactReference] = []
+            run_ids: list[str] = []
+
+            def require_current(latest: ChallengeState) -> FlagCandidate:
+                latest_candidate = next(
+                    (
+                        item
+                        for item in latest.candidates
+                        if item.id == candidate_id
+                    ),
+                    None,
+                )
+                if (
+                    get_adapter(latest.category).name != "misc"
+                    or latest.configuration_epoch != configuration_epoch
+                    or latest.metadata.get("source_manifest_sha256")
+                    != manifest
+                    or latest_candidate is None
+                    or latest_candidate.status
+                    is not CandidateStatus.OBSERVED_CANDIDATE
+                    or "misc_transform_evidence"
+                    in latest_candidate.extra
+                    or latest.status
+                    in {
+                        ChallengeStatus.PAUSED,
+                        ChallengeStatus.SOLVED,
+                        ChallengeStatus.ABANDONED,
+                        ChallengeStatus.PROVING,
+                        ChallengeStatus.READY_TO_SUBMIT,
+                    }
+                ):
+                    raise EngineError(
+                        "Misc transform binding changed during evaluation"
+                    )
+                return latest_candidate
+
+            def terminalize_run(
+                current: ChallengeState,
+                run_id: str,
+                run_paths: RunPaths,
+                *,
+                phase: str,
+                ordinal: int,
+                error: BaseException,
+            ) -> None:
+                status = (
+                    RunStatus.FAILED
+                    if isinstance(error, Exception)
+                    else RunStatus.INTERRUPTED
+                )
+                payload = {
+                    "status": status.value,
+                    "error": "misc_transform_sandbox_execution_failed",
+                    "error_type": type(error).__name__[:128],
+                    "phase": phase,
+                    "ordinal": ordinal,
+                    "protocol": MISC_TRANSFORM_PROTOCOL,
+                    "plan_sha256": plan.sha256,
+                    "misc_evaluation_id": evaluation_id,
+                }
+                self.store.write_run_result(identity, run_id, payload)
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    {"ok": False, **payload},
+                )
+                reference = RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=status,
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="misc_transform",
+                    origin=RunOrigin.PROOF,
+                    configuration_epoch=configuration_epoch,
+                    extra={
+                        "misc_transform_protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "plan_sha256": plan.sha256,
+                        "phase": phase,
+                        "ordinal": ordinal,
+                        "terminalized": True,
+                    },
+                )
+
+                def apply_failure(latest: ChallengeState) -> None:
+                    require_current(latest)
+                    latest.runs.append(reference)
+
+                self.store.update(
+                    identity,
+                    apply_failure,
+                    expected_revision=current.revision,
+                )
+
+            def run_clean(
+                *,
+                phase: str,
+                ordinal: int,
+                command: tuple[str, ...],
+                proof_inputs: tuple[ProofInput, ...],
+                request_extra: Mapping[str, object],
+            ) -> tuple[ChallengeState, str, RunPaths, SandboxResult]:
+                current = self.store.load(identity)
+                require_current(current)
+                self._remaining_budget_seconds(current)
+                run_id = _run_id(
+                    f"misc-{phase}-{candidate_id}-{ordinal}"
+                )
+                run_paths = self.store.create_run(
+                    identity,
+                    run_id=run_id,
+                    request={
+                        "kind": "misc_transform",
+                        "candidate_id": candidate_id,
+                        "protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "plan_sha256": plan.sha256,
+                        "phase": phase,
+                        "ordinal": ordinal,
+                        "command": list(command),
+                        "network_target": None,
+                        "source_manifest_sha256": manifest,
+                        "image_reference": image_reference,
+                        **dict(request_extra),
+                    },
+                    base_revision=current.revision,
+                )
+                lease_request = tool_profile("standard", network=False)
+                lease = self.lease_broker.acquire(
+                    lease_request,
+                    timeout=self._budget_wait_timeout(
+                        current,
+                        self.config.resources.lease_wait_timeout_s,
+                    ),
+                    owner=f"{identity.key}:misc-transform:{candidate_id}",
+                )
+                if lease is None:
+                    error = EngineError(
+                        "timed out waiting for Misc sandbox resources"
+                    )
+                    terminalize_run(
+                        current,
+                        run_id,
+                        run_paths,
+                        phase=phase,
+                        ordinal=ordinal,
+                        error=error,
+                    )
+                    raise error
+                failure: BaseException | None = None
+                result: SandboxResult | None = None
+                try:
+                    timeout, deadline = self._budget_command_limits(
+                        current,
+                        self.config.runtime.command_timeout_s,
+                    )
+                    result = client.run_clean_proof(
+                        CommandSpec.create(
+                            command,
+                            timeout_seconds=timeout,
+                            deadline_monotonic_seconds=deadline,
+                            network_target=None,
+                            resource_request=lease_request,
+                        ),
+                        proof_inputs=proof_inputs,
+                    )
+                except BaseException as error:
+                    failure = error
+                finally:
+                    lease.release()
+                if failure is not None:
+                    terminalize_run(
+                        current,
+                        run_id,
+                        run_paths,
+                        phase=phase,
+                        ordinal=ordinal,
+                        error=failure,
+                    )
+                    raise failure
+                assert result is not None
+                return current, run_id, run_paths, result
+
+            def snapshot_run(
+                current: ChallengeState,
+                run_id: str,
+                result: SandboxResult,
+                *,
+                phase: str,
+                ordinal: int,
+                include_output: bool,
+            ) -> tuple[
+                tuple[ArtifactReference, ...],
+                ImmutableFile,
+                ImmutableFile,
+                ImmutableFile | None,
+            ]:
+                directory = ensure_private_directory(
+                    result_directory / "evidence" / run_id
+                )
+                try:
+                    stdout = self._snapshot_workspace_file(
+                        current,
+                        client,
+                        result.stdout_path.removeprefix("/work/").lstrip("/"),
+                        directory / "stdout.log",
+                    )
+                    stderr = self._snapshot_workspace_file(
+                        current,
+                        client,
+                        result.stderr_path.removeprefix("/work/").lstrip("/"),
+                        directory / "stderr.log",
+                    )
+                    output = (
+                        self._snapshot_workspace_file(
+                            current,
+                            client,
+                            result.stdout_path.removeprefix(
+                                "/work/"
+                            ).lstrip("/"),
+                            directory / "output.bin",
+                        )
+                        if include_output
+                        else None
+                    )
+                except BaseException as error:
+                    self._handle_proof_interruption(
+                        identity,
+                        (),
+                        error,
+                        companion_paths=tuple(
+                            (
+                                _record_id(
+                                    "A",
+                                    run_id,
+                                    f"pending-{name}",
+                                ),
+                                directory / filename,
+                            )
+                            for name, filename in (
+                                ("stdout", "stdout.log"),
+                                ("stderr", "stderr.log"),
+                                ("output", "output.bin"),
+                            )
+                        ),
+                    )
+                    raise
+                artifacts = [
+                    ArtifactReference(
+                        id=_record_id("A", run_id, "stdout"),
+                        path=stdout.path.relative_to(paths.root).as_posix(),
+                        sha256=stdout.sha256,
+                        size=stdout.size_bytes,
+                        source_run_id=run_id,
+                        extra={
+                            "kind": "misc_transform_stream",
+                            "stream": "stdout",
+                            "phase": phase,
+                            "ordinal": ordinal,
+                            "protocol": MISC_TRANSFORM_PROTOCOL,
+                            "misc_evaluation_id": evaluation_id,
+                            "plan_sha256": plan.sha256,
+                        },
+                    ),
+                    ArtifactReference(
+                        id=_record_id("A", run_id, "stderr"),
+                        path=stderr.path.relative_to(paths.root).as_posix(),
+                        sha256=stderr.sha256,
+                        size=stderr.size_bytes,
+                        source_run_id=run_id,
+                        extra={
+                            "kind": "misc_transform_stream",
+                            "stream": "stderr",
+                            "phase": phase,
+                            "ordinal": ordinal,
+                            "protocol": MISC_TRANSFORM_PROTOCOL,
+                            "misc_evaluation_id": evaluation_id,
+                            "plan_sha256": plan.sha256,
+                        },
+                    ),
+                ]
+                if output is not None:
+                    artifacts.append(
+                        ArtifactReference(
+                            id=_record_id("A", run_id, "output"),
+                            path=output.path.relative_to(
+                                paths.root
+                            ).as_posix(),
+                            sha256=output.sha256,
+                            size=output.size_bytes,
+                            source_run_id=run_id,
+                            extra={
+                                "kind": "misc_transform_output",
+                                "phase": phase,
+                                "ordinal": ordinal,
+                                "protocol": MISC_TRANSFORM_PROTOCOL,
+                                "misc_evaluation_id": evaluation_id,
+                                "plan_sha256": plan.sha256,
+                            },
+                        )
+                    )
+                return tuple(artifacts), stdout, stderr, output
+
+            def stream_evidence(
+                artifact: ArtifactReference,
+                result: SandboxResult,
+                *,
+                stdout: bool,
+            ) -> MiscStreamEvidence:
+                return MiscStreamEvidence(
+                    artifact_id=artifact.id,
+                    artifact_sha256=artifact.sha256,
+                    artifact_size_bytes=artifact.size,
+                    capture_complete=(
+                        result.stdout_capture_complete
+                        if stdout
+                        else result.stderr_capture_complete
+                    ),
+                    truncation_known=(
+                        result.stdout_truncation_known
+                        if stdout
+                        else result.stderr_truncation_known
+                    ),
+                    truncated=(
+                        result.stdout_truncated
+                        if stdout
+                        else result.stderr_truncated
+                    ),
+                    capture_error=(
+                        result.stream_capture_error
+                        or (
+                            result.stdout_error
+                            if stdout
+                            else result.stderr_error
+                        )
+                    ),
+                    durable_artifact_complete=(
+                        artifact.size
+                        == (
+                            result.stdout_stored_bytes
+                            if stdout
+                            else result.stderr_stored_bytes
+                        )
+                        == (
+                            result.stdout_bytes
+                            if stdout
+                            else result.stderr_bytes
+                        )
+                    ),
+                )
+
+            stop_transform = False
+            for ordinal, (step, step_spec) in enumerate(
+                zip(execution_spec.steps, step_specs, strict=True),
+                start=1,
+            ):
+                parents = [
+                    known_inputs.get(parent_id)
+                    for parent_id in step_spec.parent_ids
+                ]
+                if any(parent is None for parent in parents):
+                    stop_transform = True
+                    break
+                resolved = [
+                    parent for parent in parents if parent is not None
+                ]
+                tool_prepared = transform_tool_inputs[ordinal - 1]
+                tool_input = ProofInput(
+                    source_locator=tool_prepared.source_locator,
+                    destination_locator="tool/transform.py",
+                    sha256=tool_prepared.sha256,
+                    size_bytes=tool_prepared.size_bytes,
+                )
+                parent_inputs = tuple(
+                    ProofInput(
+                        source_locator=parent[2],
+                        destination_locator=f"inputs/{index:03d}.bin",
+                        sha256=parent[0].sha256,
+                        size_bytes=parent[0].size_bytes,
+                    )
+                    for index, parent in enumerate(resolved, start=1)
+                )
+                command = (
+                    MISC_EXECUTION_RUNTIME,
+                    "/work/tool/transform.py",
+                    *(
+                        f"/work/inputs/{index:03d}.bin"
+                        for index in range(1, len(parent_inputs) + 1)
+                    ),
+                )
+                current, run_id, run_paths, result = run_clean(
+                    phase="transform",
+                    ordinal=ordinal,
+                    command=command,
+                    proof_inputs=(tool_input, *parent_inputs),
+                    request_extra={"step_id": step.step_id},
+                )
+                try:
+                    (
+                        artifacts_for_run,
+                        stdout,
+                        stderr,
+                        output,
+                    ) = snapshot_run(
+                        current,
+                        run_id,
+                        result,
+                        phase="transform",
+                        ordinal=ordinal,
+                        include_output=True,
+                    )
+                except BaseException as error:
+                    terminalize_run(
+                        current,
+                        run_id,
+                        run_paths,
+                        phase="transform",
+                        ordinal=ordinal,
+                        error=error,
+                    )
+                    raise
+                assert output is not None
+                output_ref = MiscArtifactRef(
+                    artifact_id=artifacts_for_run[2].id,
+                    sha256=output.sha256,
+                    size_bytes=output.size_bytes,
+                )
+                observation = MiscTransformObservation(
+                    run_id=run_id,
+                    ordinal=ordinal,
+                    step_id=step.step_id,
+                    plan_sha256=plan.sha256,
+                    source_manifest_sha256=manifest,
+                    parent_node_sha256s=tuple(
+                        parent[1] for parent in resolved
+                    ),
+                    input_artifacts=tuple(
+                        parent[0] for parent in resolved
+                    ),
+                    tool_id=step_spec.tool_id,
+                    tool_artifact_sha256=(
+                        step_spec.tool_artifact_sha256
+                    ),
+                    argv_contract_sha256=(
+                        step_spec.argv_contract_sha256
+                    ),
+                    execution_contract_sha256=(
+                        step_spec.execution_contract_sha256
+                    ),
+                    clean_workspace=True,
+                    network_denied=True,
+                    target_exit_code=result.exit_code,
+                    runner_exit_code=result.exit_code,
+                    ctfwrap_exit_code=result.exit_code,
+                    timed_out=result.timed_out,
+                    orchestration_status=(
+                        "completed"
+                        if result.status == "completed"
+                        and result.orchestration_error is None
+                        else "failed"
+                    ),
+                    output_artifact=output_ref,
+                    stdout=stream_evidence(
+                        artifacts_for_run[0],
+                        result,
+                        stdout=True,
+                    ),
+                    stderr=stream_evidence(
+                        artifacts_for_run[1],
+                        result,
+                        stdout=False,
+                    ),
+                )
+                transform_observations.append(observation)
+                structurally_accepted = True
+                try:
+                    node_sha256 = misc_transform_node_commitment_sha256(
+                        observation
+                    )
+                except ValueError:
+                    structurally_accepted = False
+                    node_sha256 = ""
+                self.store.write_run_result(
+                    identity,
+                    run_id,
+                    {
+                        "status": result.status,
+                        "exit_code": result.exit_code,
+                        "timed_out": result.timed_out,
+                        "phase": "transform",
+                        "ordinal": ordinal,
+                        "step_id": step.step_id,
+                        "plan_sha256": plan.sha256,
+                        "output_artifact": output_ref.to_dict(),
+                        "artifacts": [
+                            item.to_dict() for item in artifacts_for_run
+                        ],
+                    },
+                )
+                self.store.write_run_validation(
+                    identity,
+                    run_id,
+                    {
+                        "ok": structurally_accepted,
+                        "phase": "transform",
+                        "ordinal": ordinal,
+                        "protocol": MISC_TRANSFORM_PROTOCOL,
+                        "plan_sha256": plan.sha256,
+                    },
+                )
+                reference = RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=(
+                        RunStatus.TIMED_OUT
+                        if result.timed_out
+                        else RunStatus.COMPLETED
+                        if structurally_accepted
+                        else RunStatus.FAILED
+                    ),
+                    request_path=run_paths.request.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    result_path=run_paths.result.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    validation_path=run_paths.validation.relative_to(
+                        paths.root
+                    ).as_posix(),
+                    role="misc_transform",
+                    origin=RunOrigin.PROOF,
+                    configuration_epoch=configuration_epoch,
+                    extra={
+                        "misc_transform_protocol": MISC_TRANSFORM_PROTOCOL,
+                        "misc_evaluation_id": evaluation_id,
+                        "plan_sha256": plan.sha256,
+                        "phase": "transform",
+                        "ordinal": ordinal,
+                        "step_id": step.step_id,
+                    },
+                )
+
+                def commit_transform(latest: ChallengeState) -> None:
+                    require_current(latest)
+                    latest.runs.append(reference)
+                    latest.artifacts.extend(artifacts_for_run)
+
+                try:
+                    self.store.update(
+                        identity,
+                        commit_transform,
+                        expected_revision=current.revision,
+                    )
+                except BaseException as error:
+                    self._handle_proof_interruption(
+                        identity,
+                        artifacts_for_run,
+                        error,
+                    )
+                    raise
+                evidence_artifacts.extend(artifacts_for_run)
+                run_ids.append(run_id)
+                if not structurally_accepted:
+                    stop_transform = True
+                    break
+                known_inputs[step.step_id] = (
+                    output_ref,
+                    node_sha256,
+                    result.stdout_path.removeprefix(
+                        "/work/"
+                    ).lstrip("/"),
+                )
+
+            terminal = known_inputs.get(plan.terminal_step_id)
+            if not stop_transform and terminal is not None:
+                for ordinal in range(
+                    1,
+                    MISC_TRANSFORM_VERIFICATION_REPEATS + 1,
+                ):
+                    verifier_input = ProofInput(
+                        source_locator=(
+                            verifier_tool_input.source_locator
+                        ),
+                        destination_locator="oracle/verifier.py",
+                        sha256=verifier_tool_input.sha256,
+                        size_bytes=verifier_tool_input.size_bytes,
+                    )
+                    candidate_input = ProofInput(
+                        source_locator=terminal[2],
+                        destination_locator="candidate/candidate.bin",
+                        sha256=terminal[0].sha256,
+                        size_bytes=terminal[0].size_bytes,
+                    )
+                    original_inputs = tuple(
+                        ProofInput(
+                            source_locator=source_proof_inputs[
+                                index
+                            ].source_locator,
+                            destination_locator=(
+                                f"sources/{index + 1:03d}.bin"
+                            ),
+                            sha256=source_refs[index].sha256,
+                            size_bytes=source_refs[index].size_bytes,
+                        )
+                        for index in range(source_count)
+                    )
+                    command = (
+                        MISC_EXECUTION_RUNTIME,
+                        "/work/oracle/verifier.py",
+                        "/work/candidate/candidate.bin",
+                        *(
+                            f"/work/sources/{index:03d}.bin"
+                            for index in range(1, source_count + 1)
+                        ),
+                    )
+                    current, run_id, run_paths, result = run_clean(
+                        phase="reverse",
+                        ordinal=ordinal,
+                        command=command,
+                        proof_inputs=(
+                            verifier_input,
+                            candidate_input,
+                            *original_inputs,
+                        ),
+                        request_extra={
+                            "verifier_id": verifier_spec.verifier_id,
+                            "oracle_authority": (
+                                "explicit_operator_exit_status"
+                            ),
+                        },
+                    )
+                    try:
+                        (
+                            stream_artifacts,
+                            stdout,
+                            stderr,
+                            _unused,
+                        ) = snapshot_run(
+                            current,
+                            run_id,
+                            result,
+                            phase="reverse",
+                            ordinal=ordinal,
+                            include_output=False,
+                        )
+                    except BaseException as error:
+                        terminalize_run(
+                            current,
+                            run_id,
+                            run_paths,
+                            phase="reverse",
+                            ordinal=ordinal,
+                            error=error,
+                        )
+                        raise
+                    normalized_artifact: ArtifactReference | None = None
+                    normalized_ref: MiscArtifactRef | None = None
+                    verifier_accepts = (
+                        result.status == "completed"
+                        and result.exit_code == 0
+                        and not result.timed_out
+                        and result.orchestration_error is None
+                        and stdout.size_bytes == 0
+                    )
+                    if verifier_accepts:
+                        expected = expected_misc_reverse_result_artifact(
+                            plan,
+                            terminal[1],
+                            ordinal,
+                            artifact_id=_record_id(
+                                "A",
+                                run_id,
+                                "normalized-result",
+                            ),
+                        )
+                        normalized_payload = (
+                            misc_transform_canonical_json_bytes(
+                                {
+                                    "accepted": True,
+                                    "candidate_sha256": (
+                                        plan.candidate_sha256
+                                    ),
+                                    "candidate_size_bytes": (
+                                        plan.candidate_size_bytes
+                                    ),
+                                    "oracle_contract_sha256": (
+                                        plan.verifier
+                                        .oracle_contract_sha256
+                                    ),
+                                    "ordinal": ordinal,
+                                    "original_sources": [
+                                        item.to_dict()
+                                        for item in plan.sources
+                                    ],
+                                    "plan_sha256": plan.sha256,
+                                    "terminal_node_sha256": terminal[1],
+                                }
+                            )
+                        )
+                        normalized_path = (
+                            result_directory
+                            / "evidence"
+                            / run_id
+                            / "normalized-result.json"
+                        )
+                        atomic_write_bytes(
+                            normalized_path,
+                            normalized_payload,
+                            mode=0o400,
+                        )
+                        if (
+                            hashlib.sha256(normalized_payload).hexdigest()
+                            != expected.sha256
+                            or len(normalized_payload)
+                            != expected.size_bytes
+                        ):
+                            raise EngineError(
+                                "Misc normalized verifier result diverged"
+                            )
+                        normalized_ref = expected
+                        normalized_artifact = ArtifactReference(
+                            id=expected.artifact_id,
+                            path=normalized_path.relative_to(
+                                paths.root
+                            ).as_posix(),
+                            sha256=expected.sha256,
+                            size=expected.size_bytes,
+                            source_run_id=run_id,
+                            extra={
+                                "kind": (
+                                    "misc_transform_normalized_result"
+                                ),
+                                "phase": "reverse",
+                                "ordinal": ordinal,
+                                "protocol": MISC_TRANSFORM_PROTOCOL,
+                                "misc_evaluation_id": evaluation_id,
+                                "plan_sha256": plan.sha256,
+                                "oracle_authority": (
+                                    "explicit_operator_exit_status"
+                                ),
+                            },
+                        )
+                    artifacts_for_run = (
+                        *stream_artifacts,
+                        *(
+                            (normalized_artifact,)
+                            if normalized_artifact is not None
+                            else ()
+                        ),
+                    )
+                    observation = MiscReverseVerificationObservation(
+                        run_id=run_id,
+                        ordinal=ordinal,
+                        plan_sha256=plan.sha256,
+                        source_manifest_sha256=manifest,
+                        terminal_node_sha256=terminal[1],
+                        candidate_artifact=terminal[0],
+                        source_artifacts=source_refs,
+                        verifier_id=verifier_spec.verifier_id,
+                        tool_artifact_sha256=(
+                            verifier_spec.tool_artifact_sha256
+                        ),
+                        argv_contract_sha256=(
+                            verifier_spec.argv_contract_sha256
+                        ),
+                        execution_contract_sha256=(
+                            verifier_spec.execution_contract_sha256
+                        ),
+                        oracle_contract_sha256=(
+                            verifier_spec.oracle_contract_sha256
+                        ),
+                        clean_workspace=True,
+                        network_denied=True,
+                        target_exit_code=result.exit_code,
+                        runner_exit_code=result.exit_code,
+                        ctfwrap_exit_code=result.exit_code,
+                        timed_out=result.timed_out,
+                        orchestration_status=(
+                            "completed"
+                            if result.status == "completed"
+                            and result.orchestration_error is None
+                            else "failed"
+                        ),
+                        result_artifact=normalized_ref,
+                        stdout=stream_evidence(
+                            stream_artifacts[0],
+                            result,
+                            stdout=True,
+                        ),
+                        stderr=stream_evidence(
+                            stream_artifacts[1],
+                            result,
+                            stdout=False,
+                        ),
+                    )
+                    reverse_observations.append(observation)
+                    structural_success = (
+                        verifier_accepts
+                        and normalized_artifact is not None
+                        and result.stdout_capture_complete is True
+                        and result.stderr_capture_complete is True
+                        and result.stdout_truncation_known is True
+                        and result.stderr_truncation_known is True
+                        and result.stdout_truncated is False
+                        and result.stderr_truncated is False
+                    )
+                    self.store.write_run_result(
+                        identity,
+                        run_id,
+                        {
+                            "status": result.status,
+                            "exit_code": result.exit_code,
+                            "timed_out": result.timed_out,
+                            "phase": "reverse",
+                            "ordinal": ordinal,
+                            "plan_sha256": plan.sha256,
+                            "verifier_accepts": verifier_accepts,
+                            "artifacts": [
+                                item.to_dict()
+                                for item in artifacts_for_run
+                            ],
+                        },
+                    )
+                    self.store.write_run_validation(
+                        identity,
+                        run_id,
+                        {
+                            "ok": structural_success,
+                            "phase": "reverse",
+                            "ordinal": ordinal,
+                            "protocol": MISC_TRANSFORM_PROTOCOL,
+                            "plan_sha256": plan.sha256,
+                        },
+                    )
+                    reference = RunReference(
+                        id=run_id,
+                        base_revision=current.revision,
+                        status=(
+                            RunStatus.TIMED_OUT
+                            if result.timed_out
+                            else RunStatus.COMPLETED
+                            if structural_success
+                            else RunStatus.FAILED
+                        ),
+                        request_path=run_paths.request.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        result_path=run_paths.result.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        validation_path=run_paths.validation.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        role="misc_transform",
+                        origin=RunOrigin.PROOF,
+                        configuration_epoch=configuration_epoch,
+                        extra={
+                            "misc_transform_protocol": (
+                                MISC_TRANSFORM_PROTOCOL
+                            ),
+                            "misc_evaluation_id": evaluation_id,
+                            "plan_sha256": plan.sha256,
+                            "phase": "reverse",
+                            "ordinal": ordinal,
+                            "verifier_id": verifier_spec.verifier_id,
+                            "oracle_authority": (
+                                "explicit_operator_exit_status"
+                            ),
+                        },
+                    )
+
+                    def commit_reverse(latest: ChallengeState) -> None:
+                        require_current(latest)
+                        latest.runs.append(reference)
+                        latest.artifacts.extend(artifacts_for_run)
+
+                    try:
+                        self.store.update(
+                            identity,
+                            commit_reverse,
+                            expected_revision=current.revision,
+                        )
+                    except BaseException as error:
+                        self._handle_proof_interruption(
+                            identity,
+                            artifacts_for_run,
+                            error,
+                        )
+                        raise
+                    evidence_artifacts.extend(artifacts_for_run)
+                    run_ids.append(run_id)
+                    if not structural_success:
+                        break
+
+            latest_inventory = inventory_challenge(
+                self.challenge_input(identity)
+            )
+            if latest_inventory.manifest_sha256 != manifest:
+                raise EngineError(
+                    "immutable incoming changed during Misc evaluation; "
+                    "frozen inputs and completed run pointers were retained"
+                )
+            evaluation = evaluate_misc_transform_receipts(
+                candidate.value,
+                manifest,
+                source_refs,
+                step_specs,
+                terminal_step_id=execution_spec.terminal_step_id,
+                verifier=verifier_spec,
+                transform_observations=tuple(transform_observations),
+                reverse_observations=tuple(reverse_observations),
+            )
+            evaluation_path = result_directory / "evaluation.json"
+            atomic_write_bytes(
+                evaluation_path,
+                evaluation.canonical_bytes,
+                mode=0o400,
+            )
+            evaluation_artifact = ArtifactReference(
+                id=_record_id("A", evaluation_id, "evaluation"),
+                path=evaluation_path.relative_to(paths.root).as_posix(),
+                sha256=evaluation.sha256,
+                size=len(evaluation.canonical_bytes),
+                source_run_id=(
+                    run_ids[-1] if run_ids else None
+                ),
+                extra={
+                    "kind": "misc_transform_evaluation",
+                    "protocol": MISC_TRANSFORM_PROTOCOL,
+                    "misc_evaluation_id": evaluation_id,
+                    "candidate_id": candidate_id,
+                    "plan_sha256": plan.sha256,
+                    "evaluation_sha256": evaluation.sha256,
+                },
+            )
+            final_base = self.store.load(identity)
+            expected_run_count = (
+                len(step_specs) + MISC_TRANSFORM_VERIFICATION_REPEATS
+            )
+            semantic_artifact_ids = {
+                terminal[0].artifact_id if terminal is not None else "",
+                *(
+                    artifact.id
+                    for artifact in evidence_artifacts
+                    if artifact.extra.get("kind")
+                    == "misc_transform_normalized_result"
+                ),
+            }
+            final_pin_artifacts = (
+                *input_artifacts,
+                *(
+                    artifact
+                    for artifact in evidence_artifacts
+                    if artifact.id in semantic_artifact_ids
+                ),
+                evaluation_artifact,
+            )
+
+            def require_final_external_pins() -> None:
+                if self.config.runtime.image_digest != image_reference:
+                    raise EngineError(
+                        "Misc runtime image changed before final commit"
+                    )
+                self._remaining_budget_seconds(final_base)
+                fresh_inventory = inventory_challenge(
+                    self.challenge_input(identity)
+                )
+                if fresh_inventory.manifest_sha256 != manifest:
+                    raise EngineError(
+                        "immutable incoming changed before final Misc commit"
+                    )
+                try:
+                    for artifact in final_pin_artifacts:
+                        payload = read_bounded_regular(
+                            paths.root,
+                            artifact.path,
+                            maximum_bytes=max(
+                                int(artifact.size or 0),
+                                1,
+                            ),
+                            expected_sha256=artifact.sha256,
+                            expected_size=int(artifact.size or 0),
+                        )
+                        if (
+                            artifact.id == evaluation_artifact.id
+                            and payload != evaluation.canonical_bytes
+                        ):
+                            raise SafeFileError(
+                                "Misc evaluation bytes changed"
+                            )
+                except (OSError, SafeFileError, ValueError) as error:
+                    raise EngineError(
+                        "Misc semantic evidence changed before final commit"
+                    ) from error
+
+            def apply_evaluation(latest: ChallengeState) -> None:
+                latest_candidate = require_current(latest)
+                if [run.id for run in latest.runs if run.id in run_ids] != run_ids:
+                    raise EngineError(
+                        "Misc transform run order changed before final commit"
+                    )
+                latest.artifacts.append(evaluation_artifact)
+                binding = {
+                    "artifact_id": evaluation_artifact.id,
+                    "automatic_submission_authorized": False,
+                    "candidate_sha256": plan.candidate_sha256,
+                    "evaluation": evaluation.to_dict(),
+                    "evaluation_sha256": evaluation.sha256,
+                    "misc_evaluation_id": evaluation_id,
+                    "oracle_authority": (
+                        "explicit_operator_exit_status"
+                    ),
+                    "passed": evaluation.passed,
+                    "plan_sha256": plan.sha256,
+                    "protocol": MISC_TRANSFORM_PROTOCOL,
+                    "run_ids": list(run_ids),
+                    "source_manifest_sha256": manifest,
+                }
+                latest_candidate.extra["misc_transform_evidence"] = binding
+                records = (
+                    list(evaluation.transform_nodes)
+                    + list(evaluation.reverse_verifications)
+                )
+                for run_id, record in zip(run_ids, records, strict=False):
+                    run = next(
+                        item for item in latest.runs if item.id == run_id
+                    )
+                    run.extra["misc_transform_record"] = record.to_dict()
+                if evaluation.passed:
+                    if len(run_ids) != expected_run_count:
+                        raise EngineError(
+                            "passed Misc evaluation has an incomplete run matrix"
+                        )
+                    latest.facts.append(
+                        Fact(
+                            id=_record_id(
+                                "F",
+                                evaluation_id,
+                                "original-condition",
+                            ),
+                            statement=(
+                                "A Misc transform candidate satisfied an "
+                                "explicit operator original-condition oracle "
+                                "in three clean network-denied replays; this "
+                                "is not flag proof"
+                            ),
+                            provenance=Provenance.EXECUTED,
+                            challenge_id=latest.challenge_id,
+                            source_run_id=run_ids[-1],
+                            artifact_id=evaluation_artifact.id,
+                            locator=evaluation_artifact.path,
+                            extra={
+                                "misc_transform_evidence": {
+                                    "candidate_id": candidate_id,
+                                    "evaluation_sha256": evaluation.sha256,
+                                    "misc_evaluation_id": evaluation_id,
+                                    "plan_sha256": plan.sha256,
+                                    "protocol": MISC_TRANSFORM_PROTOCOL,
+                                }
+                            },
+                        )
+                    )
+                    latest.progress_markers.append(
+                        ProgressMarker(
+                            id=_record_id(
+                                "P",
+                                evaluation_id,
+                                "original-condition",
+                            ),
+                            statement=(
+                                "Misc original-condition oracle passed; "
+                                "candidate remains unproved and unsubmitted"
+                            ),
+                            run_id=run_ids[-1],
+                            artifact_ids=[evaluation_artifact.id],
+                            extra={
+                                "adapter_marker": (
+                                    "misc_original_condition_verified"
+                                ),
+                                "candidate_id": candidate_id,
+                                "evaluation_sha256": evaluation.sha256,
+                                "misc_evaluation_id": evaluation_id,
+                                "plan_sha256": plan.sha256,
+                                "protocol": MISC_TRANSFORM_PROTOCOL,
+                                "automatic_submission_authorized": False,
+                            },
+                        )
+                    )
+
+            try:
+                committed = self.store.update(
+                    identity,
+                    apply_evaluation,
+                    expected_revision=final_base.revision,
+                    commit_guard=require_final_external_pins,
+                    pre_replace_guard=require_final_external_pins,
+                )
+            except BaseException as error:
+                self._handle_proof_interruption(
+                    identity,
+                    (evaluation_artifact,),
+                    error,
+                )
+                raise
+            return committed, evaluation
+        finally:
+            active_error = sys.exception()
+            if source_staging is not None:
+                try:
+                    source_staging.cleanup()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            "Misc incoming staging cleanup also failed: "
+                            f"{error}"
+                        )
+            for preparation in reversed(preparations):
+                try:
+                    preparation.staging.cleanup()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    elif active_error is not None:
+                        active_error.add_note(
+                            f"Misc proof staging cleanup also failed: {error}"
+                        )
+            if not committed_inputs:
+                companions = tuple(
+                    (
+                        _record_id(
+                            "A",
+                            "misc-uncommitted",
+                            str(index),
+                        ),
+                        path,
+                    )
+                    for index, preparation in enumerate(preparations)
+                    for path in preparation.created_paths
+                )
+                if companions:
+                    try:
+                        self._cleanup_uncommitted_proof_files(
+                            identity,
+                            (),
+                            companion_paths=companions,
+                        )
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+            try:
+                session_lock.release()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                elif active_error is not None:
+                    active_error.add_note(
+                        f"Misc proof lock cleanup also failed: {error}"
+                    )
+            if cleanup_error is not None:
+                if active_error is not None and not isinstance(
+                    active_error,
+                    Exception,
+                ):
+                    active_error.add_note(
+                        f"Misc proof cleanup failed: {cleanup_error}"
+                    )
+                else:
+                    raise cleanup_error
 
     def prove_crypto_metamorphic_candidate(
         self,
