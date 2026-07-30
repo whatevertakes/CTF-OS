@@ -38,14 +38,14 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     captain: str = "gpt-5.6-sol"
-    recon: str = "gpt-5.6-terra"
-    specialist: str = "gpt-5.6-terra"
+    recon: str = "gpt-5.6-sol"
+    specialist: str = "gpt-5.6-sol"
     builder: str = "gpt-5.6-sol"
     falsifier: str = "gpt-5.6-sol"
-    extractor: str = "gpt-5.6-luna"
-    reproducer: str = "gpt-5.6-terra"
+    extractor: str = "gpt-5.6-sol"
+    reproducer: str = "gpt-5.6-sol"
     validator: str = "gpt-5.6-sol"
-    evidence_auditor: str = "gpt-5.6-luna"
+    evidence_auditor: str = "gpt-5.6-sol"
     captain_effort: str = "ultra"
     worker_effort: str = "max"
 
@@ -327,14 +327,14 @@ def default_config_text() -> str:
 # Logical wave width is independent of provider call concurrency.
 [models]
 captain = "gpt-5.6-sol"
-recon = "gpt-5.6-terra"
-specialist = "gpt-5.6-terra"
+recon = "gpt-5.6-sol"
+specialist = "gpt-5.6-sol"
 builder = "gpt-5.6-sol"
 falsifier = "gpt-5.6-sol"
-extractor = "gpt-5.6-luna"
-reproducer = "gpt-5.6-terra"
+extractor = "gpt-5.6-sol"
+reproducer = "gpt-5.6-sol"
 validator = "gpt-5.6-sol"
-evidence_auditor = "gpt-5.6-luna"
+evidence_auditor = "gpt-5.6-sol"
 captain_effort = "ultra"
 worker_effort = "max"
 

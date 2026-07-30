@@ -38,7 +38,21 @@ class ConfigTests(unittest.TestCase):
             config.resources.remote_command_min_interval_s,
             1.0,
         )
-        self.assertEqual(config.models.extractor, "gpt-5.6-luna")
+        model_roles = (
+            "captain",
+            "recon",
+            "specialist",
+            "builder",
+            "falsifier",
+            "extractor",
+            "reproducer",
+            "validator",
+            "evidence_auditor",
+        )
+        self.assertEqual(
+            {getattr(config.models, role) for role in model_roles},
+            {"gpt-5.6-sol"},
+        )
         self.assertEqual(config.runtime.network_default, "none")
         self.assertEqual(
             config.runtime.work_tree_max_bytes,
@@ -57,6 +71,9 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("not an HTTP request limiter", text)
         self.assertIn("command_timeout_s = 900\n", text)
         self.assertNotIn("command_timeout_s = 900.0", text)
+        self.assertEqual(text.count('= "gpt-5.6-sol"'), 9)
+        self.assertNotIn("gpt-5.6-terra", text)
+        self.assertNotIn("gpt-5.6-luna", text)
 
     def test_remote_command_interval_accepts_zero_and_is_bounded(self) -> None:
         self.write_config(

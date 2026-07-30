@@ -60,13 +60,12 @@ GPU를 쓸 호스트에서 NVIDIA Container Toolkit이 아직 없다면
 ctfos init
 ```
 
-설정은 `.ctfos/engine.toml`에 생성됩니다. 기본 model ID 라우팅은
-Captain/Builder/Falsifier/Validator에 Sol,
-Recon/Specialist/Reproducer에 Terra, Extractor/Evidence Auditor에 Luna를
-배정합니다. 이는 설정과 local
-fixture에서 검증한 라우팅입니다. 실제 `gpt-5.6-luna`의 좁은 Live MCP
-`agent.flag` 경로는 검증했지만, 실제 계정으로 세 모델의 전체 solve
-end-to-end를 검증했다는 뜻은 아닙니다.
+설정은 `.ctfos/engine.toml`에 생성됩니다. 기본 model ID는 모든 논리 역할에
+동일한 `gpt-5.6-sol`을 배정합니다. 역할 차이는 약한 모델 라우팅이 아니라
+artifact 계약으로 유지하며 Captain은 `ultra`, worker는 `max` reasoning
+effort를 사용합니다. provider 한도는 호출을 대기시킬 뿐 역할이나 wave 폭을
+줄이지 않습니다. 이 기본값은 설정과 local fixture에서 검증했지만, 실제
+계정으로 전체 solve end-to-end를 검증했다는 뜻은 아닙니다.
 
 `pin-image`는 현재 `runtime.image`가 가리키는 로컬 Docker image ID를
 `runtime.image_digest`에 원자적으로 기록합니다. 이후 일반 도구와 clean
@@ -288,7 +287,7 @@ ctfos solve \
   --prompt-file ./prompts/example.txt
 ```
 
-Live의 설정 기본값은 Sol Ultra Captain과
+Live의 설정 기본값은 Sol Ultra Captain과 동일한 Sol 모델의
 Recon/Specialist/Falsifier 세 논리 역할입니다. 문제별 `SESSION.md`와
 `AGENTS.md`를 생성해 interactive Codex를 시작하며, 같은 문제에서는
 `runtime/session.lock` 때문에 Live와 Batch 소유자가 동시에 실행되지
@@ -1022,8 +1021,8 @@ local image
 이 테스트는 상태, 역할 계약, limiter, sandbox argv/권한, proof 정책과 CLI
 동작을 검증하지만 실제 Codex 계정과 실제 대회 서버를 사용하는 end-to-end
 성공을 보증하지 않습니다. Luna의 좁은 `agent.flag` model probe는 통과했지만
-configured Sol/Terra/Luna 전체 solve와 실제 Sol Live TUI/native worker
-E2E는 호출하지 않았습니다. 이미지 내부 lifecycle은
+현재 기본값인 all-Sol 전체 solve와 실제 Sol Live TUI/native worker E2E는
+호출하지 않았습니다. 이미지 내부 lifecycle은
 `ctf-os-image/tests/`의 별도 테스트 대상입니다. 실제 Docker Rev proof는
 opt-in `scripts/check-rev-docker-proof.py --image-digest sha256:...`로
 positive 3회와 negative control 3회를 exact pinned image에서 추가 검증합니다.
