@@ -62,6 +62,11 @@ artifact를 만들었지만 sandbox-local locator 충돌이 false stall을 만�
 새 병목과, 아직 semantic evaluation 전이므로 solve로 집계할 수 없다는
 경계를 기록합니다.
 
+20은 2026-07-28~29 OpenAI 공식 글의 external oracle, append-only prompt
+prefix, retained reasoning, compaction 결과를 현재 코드와 대조합니다.
+ARC-AGI-3의 3배 수치를 CTF로 일반화하지 않고 fresh thread / Captain-only
+continuation / per-role continuation의 X-26 A/B로 바꾼 기록입니다.
+
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
 12는 확정 계약을 현재 증거로 수용할 수 있는지를 기록합니다. 운영 명령은
@@ -79,6 +84,7 @@ artifact를 만들었지만 sandbox-local locator 충돌이 false stall을 만�
 - [17. Pwn runtime readiness와 address-resolution advisory](17-pwn-runtime-readiness-and-address-advisory.md) — stale image와 piped core handler 병목을 닫고 실제 Docker 3+3 및 보안 반례를 검증한 결과, source/evidence-bound advisory가 global leak N/A나 stage pass 권한을 갖지 않는 경계를 기록합니다 (구현·검증일 2026-07-30)
 - [18. Zone one-cycle live diagnostic](18-zone-one-cycle-live-diagnostic.md) — 개선된 all-Sol 엔진으로 `zone` 한 cycle을 재실행해 stale adapter seed와 managed shell/argv 의미 불일치가 target 관측을 막는 실제 병목임을 고정합니다 (관측일 2026-07-30)
 - [19. Zone shell-contract live regression](19-zone-shell-contract-live-regression.md) — stale action retirement와 managed shell contract가 실제 bounded output을 만든 회귀, sandbox-local artifact locator 충돌의 false stall, semantic evaluation 전 결과를 solve로 세지 않는 경계를 기록합니다 (관측일 2026-07-30)
+- [20. OpenAI 2026 agent harness 운용 delta](20-openai-agent-harness-2026-delta.md) — external oracle, bounded append-only context, retained reasoning과 compaction의 최신 공식 근거를 현재 Batch runner에 대입하고 X-26 role-continuity A/B로 제한합니다 (검토일 2026-07-31)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
