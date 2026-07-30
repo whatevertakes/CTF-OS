@@ -56,6 +56,11 @@ from ctf_os.engine.pwn_crash import (
     PwnCrashRecipe,
     evaluate_pwn_crash_gate,
 )
+from ctf_os.engine.pwn_ip_control import (
+    PWN_IP_CONTROL_MAX_RESULT_BYTES,
+    PwnIpControlResult,
+    PwnIpControlStatus,
+)
 from ctf_os.director.resources import tool_profile
 from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION
 from ctf_os.store.upgrades import UnsupportedSchemaVersion, upgrade_state
@@ -104,6 +109,8 @@ _PROOF_RESULT_KEYS = {
 _PWN_CRASH_ENGINE_COMMAND = "ctfos-engine:pwn-crash-v1"
 _PWN_CRASH_ENGINE_EXECUTOR = "pwn_crash_differential_v1"
 _PWN_CRASH_ACTION_KIND = "verify_pwn_crash"
+_PWN_IP_CONTROL_ENGINE_EXECUTOR = "pwn_ip_control_v1"
+_PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
 _PWN_CRASH_FLAG_PATTERNS_ENV = "CTF_WRAP_FLAG_PATTERNS_JSON"
 _PWN_CRASH_EVIDENCE_KEYS = {
     "schema_version",
@@ -257,9 +264,10 @@ class EvaluationReport:
                     "model-claimed and is not an executable primitive proof"
                 ),
                 "first_verified_primitive": (
-                    "unavailable until an engine-owned executable primitive "
-                    "stage gate is recorded; progress marker text and extra "
-                    "fields are never accepted as that gate"
+                    "earliest independently re-read, hash-validated, "
+                    "engine-owned Pwn instruction-pointer-control result; "
+                    "progress marker text and arbitrary extra fields are "
+                    "never accepted as that gate"
                 ),
                 "human_interventions": (
                     "explicit state.metadata.human_intervention_count only"
@@ -2667,13 +2675,124 @@ def _first_primitive_metric(
     states_with_claimed_markers = sum(
         bool(record.state.progress_markers) for record in records
     )
-    return _unavailable(
-        _NO_EXECUTABLE_PRIMITIVE_GATE_REASON,
-        evidence={
-            "states_with_claimed_progress_markers": (
-                states_with_claimed_markers
+    values: list[float] = []
+    typed_gates = 0
+    proven_gates = 0
+    invalid_artifacts = 0
+    missing_times = 0
+    for record in records:
+        artifacts = {
+            artifact.id: artifact for artifact in record.state.artifacts
+        }
+        state_values: list[float] = []
+        for experiment in record.state.experiments:
+            if (
+                experiment.extra.get("engine_executor")
+                != _PWN_IP_CONTROL_ENGINE_EXECUTOR
+            ):
+                continue
+            typed_gates += 1
+            envelope = (
+                experiment.result.get(_PWN_IP_CONTROL_RESULT_KEY)
+                if experiment.status is ExperimentStatus.COMPLETED
+                and type(experiment.result) is dict
+                else None
             )
-        },
+            if type(envelope) is not dict:
+                continue
+            try:
+                result = PwnIpControlResult.from_dict(
+                    envelope.get("result")
+                )
+            except (TypeError, ValueError):
+                # Current-schema state validation rejects this before metrics
+                # are evaluated.  Keep this defensive branch for upgraded
+                # records and future schema migrations.
+                invalid_artifacts += 1
+                continue
+            if result.status is not PwnIpControlStatus.PROVEN:
+                continue
+            proven_gates += 1
+            result_artifact_id = envelope.get("result_artifact_id")
+            artifact = (
+                artifacts.get(result_artifact_id)
+                if isinstance(result_artifact_id, str)
+                else None
+            )
+            if artifact is None:
+                invalid_artifacts += 1
+                continue
+            try:
+                payload = _read_verified_reference(
+                    record.root,
+                    artifact,
+                    maximum_bytes=PWN_IP_CONTROL_MAX_RESULT_BYTES,
+                    display_name="Pwn IP-control result artifact",
+                )
+            except (EvaluationInputError, OSError):
+                invalid_artifacts += 1
+                continue
+            canonical = result.canonical_bytes()
+            if (
+                payload != canonical
+                or envelope.get("result_sha256")
+                != result.evidence_sha256
+                or artifact.sha256 != result.evidence_sha256
+                or artifact.size != len(canonical)
+            ):
+                invalid_artifacts += 1
+                continue
+            elapsed = _elapsed_seconds(
+                record.state.created_at,
+                envelope.get("evaluated_at"),
+            )
+            if elapsed is None:
+                missing_times += 1
+                continue
+            state_values.append(elapsed)
+        if state_values:
+            values.append(min(state_values))
+
+    evidence = {
+        "engine_owned_gate": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
+        "typed_gates": typed_gates,
+        "proven_gates": proven_gates,
+        "independently_verified_gates": len(values),
+        "invalid_or_unreadable_result_artifacts": invalid_artifacts,
+        "states_with_claimed_progress_markers": (
+            states_with_claimed_markers
+        ),
+    }
+    reason_parts: list[str] = []
+    if invalid_artifacts:
+        reason_parts.append(
+            f"{invalid_artifacts} proven gate result artifact(s) failed "
+            "bounded independent verification"
+        )
+    if missing_times:
+        reason_parts.append(
+            f"{missing_times} verified gate(s) lack a usable completion time"
+        )
+    reason = "; ".join(reason_parts) or None
+    if not values:
+        return _unavailable(
+            _combine_reasons(
+                (
+                    _NO_EXECUTABLE_PRIMITIVE_GATE_REASON
+                    if typed_gates == 0
+                    else "no engine-owned primitive gate has independently "
+                    "verified result bytes and a usable completion time"
+                ),
+                reason,
+            )
+            or _NO_EXECUTABLE_PRIMITIVE_GATE_REASON,
+            evidence=evidence,
+        )
+    return _metric(
+        _time_summary(values),
+        len(values),
+        partial_reason=reason,
+        evidence=evidence,
     )
 
 

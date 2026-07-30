@@ -16,6 +16,12 @@ from unittest.mock import patch
 import ctf_os.evaluation as evaluation_module
 from ctf_os import cli
 from ctf_os.engine.resume_capsule import render_resume_capsule
+from ctf_os.engine.pwn_ip_control import (
+    pwn_ip_control_child_experiment_id,
+)
+from ctf_os.engine.pwn_runtime_snapshot import (
+    pwn_runtime_snapshot_child_experiment_id,
+)
 from ctf_os.evaluation import EvaluationError, evaluate_workspace
 from ctf_os.models import (
     ArtifactReference,
@@ -34,6 +40,9 @@ from ctf_os.models import (
 from ctf_os.store import StateStore, sha256_file
 from ctf_os.store.atomic import atomic_write_bytes, atomic_write_json
 from tests import test_pwn_crash_execution as pwn_execution_fixture
+from tests import (
+    test_pwn_ip_control_lifecycle as pwn_ip_control_fixture,
+)
 
 
 def _later(timestamp: str, seconds: int) -> str:
@@ -705,6 +714,93 @@ class EvaluationTests(unittest.TestCase):
         )
         self.assertEqual(
             verified.evidence["states_with_claimed_progress_markers"],
+            1,
+        )
+
+    def test_pwn_ip_control_result_is_independently_reread_for_metric(
+        self,
+    ) -> None:
+        lifecycle = pwn_ip_control_fixture.PwnIpControlLifecycleTests(
+            methodName=(
+                "test_confirmed_snapshot_proves_only_ip_control_in_three_replays"
+            )
+        )
+        fixture, _coordinator, engine, parent_id, _payload = (
+            lifecycle._fixture()
+        )
+        self.addCleanup(lifecycle.doCleanups)
+        fixture._execute(engine, parent_id)
+        snapshot_id = pwn_runtime_snapshot_child_experiment_id(parent_id)
+        engine._capability_probe = lifecycle._snapshot_capability
+        engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(snapshot_id,),
+        )
+        control_id = pwn_ip_control_child_experiment_id(snapshot_id)
+        completed = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(control_id,),
+        )
+
+        metric = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        ).metrics["time_to_first_primitive"]
+        self.assertEqual(metric.status, "available")
+        self.assertEqual(metric.sample_size, 1)
+        self.assertEqual(metric.value["count"], 1)
+        self.assertEqual(
+            metric.evidence["engine_owned_gate"],
+            "pwn_ip_control_v1",
+        )
+        self.assertEqual(metric.evidence["typed_gates"], 1)
+        self.assertEqual(metric.evidence["proven_gates"], 1)
+        self.assertEqual(
+            metric.evidence["invalid_or_unreadable_result_artifacts"],
+            0,
+        )
+
+        child = next(
+            item
+            for item in completed.experiments
+            if item.id == control_id
+        )
+        envelope = child.result["pwn_ip_control_evidence"]
+        artifact = next(
+            item
+            for item in completed.artifacts
+            if item.id == envelope["result_artifact_id"]
+        )
+        result_path = (
+            engine.store.challenge_paths(fixture.identity).root
+            / artifact.path
+        )
+        original = result_path.read_bytes()
+        result_path.chmod(0o600)
+        result_path.write_bytes(original + b"\n")
+        result_path.chmod(0o400)
+
+        tampered = evaluate_workspace(
+            fixture.root,
+            contest_id=fixture.identity.contest_id,
+            category=fixture.identity.category,
+            challenge_id=fixture.identity.challenge_id,
+        ).metrics["time_to_first_primitive"]
+        self.assertEqual(tampered.status, "unavailable")
+        self.assertIn(
+            "failed bounded independent verification",
+            tampered.reason,
+        )
+        self.assertEqual(
+            tampered.evidence[
+                "invalid_or_unreadable_result_artifacts"
+            ],
             1,
         )
 
