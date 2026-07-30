@@ -283,6 +283,43 @@ class PwnCrashV1ContractTests(unittest.TestCase):
         self.assertIs(missing.verdict, PwnCrashV1Verdict.ERROR)
         self.assertIn("attempt_count_mismatch", missing.failure_codes)
 
+    def test_unsafe_core_contexts_are_finite_producer_errors(
+        self,
+    ) -> None:
+        reasons = (
+            "caught_or_ignored_core_signal_unsupported",
+            "multithreaded_core_signal_unsupported",
+            "non_root_core_signal_unsupported",
+            "seccomp_filter_unavailable",
+            "unobserved_core_signal_termination",
+        )
+        for reason in reasons:
+            values = list(
+                payloads(
+                    (
+                        SIGSEGV,
+                        SIGSEGV,
+                        SIGSEGV,
+                        NORMAL,
+                        NORMAL,
+                        NORMAL,
+                    )
+                )
+            )
+            failed = document(1)
+            failed["status"] = "error"
+            failed["reason_code"] = reason
+            failed["target"] = None
+            values[0] = pwn_crash_v1_canonical_json_bytes(failed)
+            result = evaluate(tuple(values))
+            with self.subTest(reason=reason):
+                self.assertIs(result.verdict, PwnCrashV1Verdict.ERROR)
+                self.assertEqual(result.reason_code, "producer_error")
+                self.assertEqual(
+                    result.failures[0].producer_reason,
+                    reason,
+                )
+
     def test_parser_rejects_noncanonical_duplicate_and_oversized_json(
         self,
     ) -> None:
@@ -351,10 +388,71 @@ class PwnCrashV1ContractTests(unittest.TestCase):
         self.assertEqual(
             descriptor["target_status"],
             (
-                "direct-child-wait-status-only;"
+                "single-thread-root-terminal-wait-status-or-"
+                "default-core-signal-stop;"
                 "numeric-exit-is-never-a-signal"
             ),
         )
+        execution = descriptor["execution_profile"]
+        self.assertIsInstance(execution, dict)
+        self.assertNotIn("core_pattern_path", execution)
+        self.assertEqual(
+            execution["core_dumps"],
+            (
+                "rlimit-zero-verified;"
+                "core-generating-signals-never-delivered;"
+                "single-thread-root-default-core-stop-recorded;"
+                "all-other-core-stops-error;"
+                "unobserved-core-terminal-error"
+            ),
+        )
+        self.assertEqual(
+            execution["seccomp_clone_filter"],
+            {
+                "architecture_mismatch": "errno:ENOSYS",
+                "architectures": [
+                    {
+                        "audit_arch": 3221225655,
+                        "clone_syscall": 220,
+                        "machine": "aarch64",
+                    },
+                    {
+                        "audit_arch": 3221225534,
+                        "clone_syscall": 56,
+                        "machine": "x86_64",
+                    },
+                ],
+                "clone3": {
+                    "action": "errno:ENOSYS",
+                    "syscall": 435,
+                },
+                "high_syscall_bit": {
+                    "action": "errno:ENOSYS",
+                    "mask": 1073741824,
+                },
+                "clone_flags": {
+                    "clone_sighand": 2048,
+                    "clone_thread": 65536,
+                    "clone_untraced": 8388608,
+                    "cross_tgid_clone_sighand": "errno:EPERM",
+                    "pthread_clone": "allow",
+                },
+                "install": (
+                    "pre-exec-no-new-privs;"
+                    "filter-mode-runtime-verified;"
+                    "source-sha256-attested"
+                ),
+            },
+        )
+        self.assertEqual(
+            execution["trace"],
+            (
+                "fixed-ptrace-traceme;"
+                "initial-and-later-exec-events-distinguished;"
+                "exitkill-enabled"
+            ),
+        )
+        self.assertEqual(execution["traced_task_limit"], 64)
 
 
 if __name__ == "__main__":

@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,10 +63,58 @@ class PwnCrashOracleSourceTests(unittest.TestCase):
         source = self.root / "target.c"
         source.write_text(
             """
+#define _GNU_SOURCE
+#include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif
+static volatile sig_atomic_t caught_signal = 0;
+static unsigned char clone_stack[65536];
+static void mark_caught(int signo) {
+    caught_signal = signo;
+}
+static void *thread_returns(void *unused) {
+    (void)unused;
+    return NULL;
+}
+static void *fault_in_thread(void *unused) {
+    volatile int *invalid = (volatile int *)0;
+    (void)unused;
+    *invalid = 1;
+    return NULL;
+}
+static int clone_returns(void *unused) {
+    (void)unused;
+    return 0;
+}
+static int blocked_clone_result(int flags) {
+    pid_t child;
+    int status = 0;
+    errno = 0;
+    child = clone(
+        clone_returns,
+        clone_stack + sizeof(clone_stack),
+        flags,
+        NULL
+    );
+    if (child < 0) return errno == EPERM ? 0 : 92;
+    dprintf(
+        STDERR_FILENO,
+        "unexpected-clone-child=%ld\\n",
+        (long)child
+    );
+    if (waitpid(child, &status, 0) != child) return 93;
+    return 94;
+}
 int main(int argc, char **argv) {
     unsigned char value = 0;
     ssize_t count;
@@ -72,10 +122,83 @@ int main(int argc, char **argv) {
     if (argc != 1) return 77;
     count = read(STDIN_FILENO, &value, 1);
     if (count == 1 && value == 'S') {
-        raise(SIGTERM);
+        volatile int *invalid = (volatile int *)0;
+        *invalid = 1;
+        return 80;
     }
     if (count == 1 && value == 'E') {
-        return 143;
+        return 139;
+    }
+    if (count == 1 && value == 'C') {
+        struct sigaction action = {0};
+        action.sa_handler = mark_caught;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGSEGV, &action, NULL) != 0) return 81;
+        raise(SIGSEGV);
+        return caught_signal == SIGSEGV ? 42 : 82;
+    }
+    if (count == 1 && value == 'I') {
+        if (signal(SIGSEGV, SIG_IGN) == SIG_ERR) return 83;
+        raise(SIGSEGV);
+        return 43;
+    }
+    if (count == 1 && value == 'X') {
+        execl("/proc/self/exe", argv[0], (char *)NULL);
+        return 84;
+    }
+    if (count == 1 && value == 'H') {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, fault_in_thread, NULL) != 0) {
+            return 85;
+        }
+        if (pthread_join(thread, NULL) != 0) return 86;
+        return 87;
+    }
+    if (count == 1 && value == 'P') {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, thread_returns, NULL) != 0) {
+            return 95;
+        }
+        return pthread_join(thread, NULL) == 0 ? 0 : 96;
+    }
+    if (count == 1 && value == 'U') {
+        return blocked_clone_result(CLONE_UNTRACED | SIGCHLD);
+    }
+    if (count == 1 && value == 'Q') {
+        return blocked_clone_result(
+            CLONE_VM | CLONE_SIGHAND | SIGCHLD
+        );
+    }
+    if (count == 1 && value == 'Z') {
+        long result;
+        errno = 0;
+        result = syscall(SYS_clone3, NULL, 0);
+        return result == -1 && errno == ENOSYS ? 0 : 97;
+    }
+    if (count == 1 && value == 'W') {
+        long result;
+        errno = 0;
+        result = syscall(
+            ((unsigned long)SYS_clone) | 0x40000000UL,
+            (unsigned long)SIGCHLD,
+            NULL,
+            NULL,
+            NULL,
+            0
+        );
+        return result == -1 && errno == ENOSYS ? 0 : 98;
+    }
+    if (count == 1 && value == 'K') {
+        int status = 0;
+        pid_t child = fork();
+        if (child < 0) return 88;
+        if (child == 0) {
+            volatile int *invalid = (volatile int *)0;
+            *invalid = 1;
+            _exit(89);
+        }
+        if (waitpid(child, &status, 0) != child) return 90;
+        return WIFSIGNALED(status) ? 0 : 91;
     }
     if (count == 1 && value == 'F') {
         char path[128];
@@ -110,7 +233,7 @@ int main(int argc, char **argv) {
         )
         target = self.challenge / "target"
         compiled = subprocess.run(
-            (compiler, str(source), "-o", str(target)),
+            (compiler, str(source), "-pthread", "-o", str(target)),
             capture_output=True,
             check=False,
         )
@@ -130,8 +253,6 @@ int main(int argc, char **argv) {
     ) -> subprocess.CompletedProcess[bytes]:
         input_path = self.work / f"input-{ordinal}.bin"
         input_path.write_bytes(payload)
-        core_pattern_path = self.root / "safe-core-pattern"
-        core_pattern_path.write_bytes(b"core\n")
         actual_source_sha256 = hashlib.sha256(
             self.target.read_bytes()
         ).hexdigest()
@@ -149,8 +270,7 @@ int main(int argc, char **argv) {
             "binding,sys.argv[3],sys.argv[4],"
             "challenge_root=pathlib.Path(sys.argv[1]),"
             "work_root=pathlib.Path(sys.argv[2]),"
-            "timeout_seconds=float(sys.argv[13]),"
-            "core_pattern_path=pathlib.Path(sys.argv[14]));"
+            "timeout_seconds=float(sys.argv[13]));"
             "sys.stdout.buffer.write(c.canonical_json_bytes(document))"
         )
         environment = {
@@ -177,7 +297,6 @@ int main(int argc, char **argv) {
                 str(len(payload)),
                 RECIPE_SHA256,
                 str(timeout_seconds),
-                str(core_pattern_path),
             ),
             capture_output=True,
             env=environment,
@@ -218,17 +337,162 @@ int main(int argc, char **argv) {
             signal_document["target"],
             {
                 "exit_code": None,
-                "signal_number": 15,
+                "signal_number": 11,
                 "termination": "signaled",
             },
         )
         self.assertEqual(
             exit_document["target"],
             {
-                "exit_code": 143,
+                "exit_code": 139,
                 "signal_number": None,
                 "termination": "exited",
             },
+        )
+
+    def test_caught_and_ignored_core_signals_are_finite_errors(
+        self,
+    ) -> None:
+        caught = self._invoke(
+            b"C",
+            ordinal=1,
+            phase="positive",
+        )
+        ignored = self._invoke(
+            b"I",
+            ordinal=2,
+            phase="positive",
+        )
+        self.assertEqual(caught.returncode, 0, caught.stderr)
+        self.assertEqual(ignored.returncode, 0, ignored.stderr)
+        for result in (caught, ignored):
+            document = json.loads(result.stdout)
+            self.assertEqual(document["status"], "error")
+            self.assertEqual(
+                document["reason_code"],
+                "caught_or_ignored_core_signal_unsupported",
+            )
+            self.assertIsNone(document["target"])
+
+    def test_later_exec_trap_is_not_reported_as_a_fault(self) -> None:
+        result = self._invoke(
+            b"X",
+            ordinal=1,
+            phase="positive",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["target"],
+            {
+                "exit_code": 0,
+                "signal_number": None,
+                "termination": "exited",
+            },
+        )
+
+    def test_root_thread_group_fault_is_a_finite_error(
+        self,
+    ) -> None:
+        result = self._invoke(
+            b"H",
+            ordinal=1,
+            phase="positive",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["status"], "error")
+        self.assertEqual(
+            document["reason_code"],
+            "multithreaded_core_signal_unsupported",
+        )
+        self.assertIsNone(document["target"])
+
+    def test_forked_child_fault_is_not_promoted_to_root_fault(
+        self,
+    ) -> None:
+        result = self._invoke(
+            b"K",
+            ordinal=1,
+            phase="positive",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["status"], "error")
+        self.assertEqual(
+            document["reason_code"],
+            "non_root_core_signal_unsupported",
+        )
+        self.assertIsNone(document["target"])
+
+    def test_seccomp_clone_policy_blocks_bypasses_but_allows_pthread(
+        self,
+    ) -> None:
+        cases = (
+            (b"U", 1),
+            (b"Q", 2),
+            (b"Z", 3),
+            (b"W", 2),
+            (b"P", 1),
+        )
+        for payload, ordinal in cases:
+            with self.subTest(payload=payload):
+                result = self._invoke(
+                    payload,
+                    ordinal=ordinal,
+                    phase="positive",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(
+                    b"unexpected-clone-child=",
+                    result.stderr,
+                )
+                document = json.loads(result.stdout)
+                self.assertEqual(document["status"], "ok")
+                self.assertEqual(
+                    document["target"],
+                    {
+                        "exit_code": 0,
+                        "signal_number": None,
+                        "termination": "exited",
+                    },
+                )
+
+    def test_seccomp_bpf_has_signal_free_fail_closed_targets(
+        self,
+    ) -> None:
+        profile = crash_oracle._SECCOMP_ARCHITECTURES["x86_64"]
+        instructions = crash_oracle._clone_seccomp_instructions(
+            profile["audit_arch"],
+            profile["clone_syscall"],
+        )
+        self.assertEqual(len(instructions), 14)
+        enosys = crash_oracle._SECCOMP_RET_ERRNO | errno.ENOSYS
+        self.assertEqual(instructions[2].k, enosys)
+        self.assertEqual(instructions[4].k, 0x40000000)
+        self.assertEqual(
+            instructions[4 + 1 + instructions[4].jt].k,
+            enosys,
+        )
+        self.assertEqual(
+            instructions[5 + 1 + instructions[5].jt].k,
+            enosys,
+        )
+        self.assertNotIn(
+            0x80000000,
+            tuple(instruction.k for instruction in instructions),
+        )
+
+    def test_unobserved_terminal_core_signal_cannot_be_success(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            crash_oracle.CrashOracleError,
+            "unobserved_core_signal_termination",
+        ):
+            crash_oracle._terminal_signal_result(signal.SIGSEGV)
+        self.assertEqual(
+            crash_oracle._terminal_signal_result(signal.SIGTERM),
+            ("signaled", None, signal.SIGTERM),
         )
 
     def test_empty_control_and_all_bindings_are_canonical(self) -> None:
@@ -280,12 +544,12 @@ int main(int argc, char **argv) {
         )
         self.assertIs(
             evaluation.verdict,
-            PwnCrashV1Verdict.INCONCLUSIVE,
+            PwnCrashV1Verdict.CONFIRMED,
         )
-        self.assertEqual(evaluation.positive_signal_counts, ())
+        self.assertEqual(evaluation.positive_signal_counts, ((11, 3),))
         self.assertEqual(
             evaluation.reason_code,
-            "no_positive_fault_observed",
+            "reproducible_input_triggered_fault_signal",
         )
 
     def test_target_output_cannot_forge_canonical_stdout_document(
@@ -321,38 +585,30 @@ int main(int argc, char **argv) {
         child_pid = int(child_lines[0].split("=", 1)[1])
         self.assertFalse(Path(f"/proc/{child_pid}").exists())
 
-    def test_piped_core_handler_fails_closed_before_execution(
+    def test_piped_host_core_pattern_does_not_block_fault_observation(
         self,
     ) -> None:
-        pipe_pattern = self.root / "pipe-core-pattern"
-        pipe_pattern.write_bytes(b"|/outside/collector %p\n")
-        input_path = self.work / "pipe-check.bin"
-        input_path.write_bytes(b"")
-        source = self.target.read_bytes()
-        binding = crash_oracle.RequestBinding(
-            ordinal=4,
-            phase="control",
-            source_manifest_sha256=MANIFEST_SHA256,
-            source_sha256=hashlib.sha256(source).hexdigest(),
-            source_size_bytes=len(source),
-            input_sha256=hashlib.sha256(b"").hexdigest(),
-            input_size_bytes=0,
-            recipe_sha256=RECIPE_SHA256,
+        try:
+            pattern = Path("/proc/sys/kernel/core_pattern").read_bytes()
+        except OSError:
+            self.skipTest("host core_pattern is unavailable")
+        if not pattern.startswith(b"|"):
+            self.skipTest("host does not use a piped core handler")
+        result = self._invoke(
+            b"S",
+            ordinal=1,
+            phase="positive",
         )
-
-        document = crash_oracle.produce_document(
-            binding,
-            "/challenge/target",
-            "/work/pipe-check.bin",
-            challenge_root=self.challenge,
-            work_root=self.work,
-            core_pattern_path=pipe_pattern,
-        )
-
-        self.assertEqual(document["status"], "error")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["status"], "ok")
         self.assertEqual(
-            document["reason_code"],
-            "piped_core_handler_forbidden",
+            document["target"],
+            {
+                "exit_code": None,
+                "signal_number": 11,
+                "termination": "signaled",
+            },
         )
 
     def test_source_input_mismatch_and_timeout_are_finite_errors(

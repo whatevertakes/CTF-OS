@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observe one direct ELF target's exact wait status for the Pwn v1 gate.
+"""Observe one direct ELF target's fault status for the Pwn v1 gate.
 
 This deliberately narrow producer executes one descriptor-bound ELF with one
 descriptor-bound file copied to a sealed, read-only memfd as standard input.
@@ -10,8 +10,12 @@ document.  The outer ``ctfwrap`` therefore preserves bounded target output
 without allowing it to forge the oracle document.
 
 The producer never propagates the target status through its own exit code.
-Instead, it records whether the direct child exited or was signaled.  Thus an
-ordinary ``exit(139)`` remains different from a direct ``SIGSEGV``.
+Instead, a fixed ptrace loop distinguishes the exec trap from later signal
+delivery stops.  Default core-generating signals are recorded and suppressed
+before delivery, so a host-configured piped core handler cannot run.  Caught,
+ignored, non-root, and multithreaded core-signal stops fail closed without
+delivering the signal.  Thus an ordinary ``exit(139)`` remains different from
+a supported direct ``SIGSEGV``.
 """
 
 from __future__ import annotations
@@ -25,8 +29,8 @@ import os
 import resource
 import signal
 import stat
-import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +45,9 @@ MAX_DOCUMENT_BYTES = 16 * 1024
 MAX_ARGUMENT_BYTES = 4096
 MAX_COMPONENT_BYTES = 255
 TARGET_TIMEOUT_SECONDS = 5.0
-CORE_PATTERN_PATH = Path("/proc/sys/kernel/core_pattern")
 READ_CHUNK_BYTES = 64 * 1024
+MAX_PROC_STATUS_BYTES = 64 * 1024
+MAX_TRACED_TASKS = 64
 SCHEMA_VERSION = 1
 CONTRACT_ID = "ctfos.pwn.crash"
 CONTRACT_VERSION = 1
@@ -85,9 +90,9 @@ PRODUCER_ERROR_REASONS = frozenset(
         "binary_privilege_bits_forbidden",
         "binary_root_not_directory",
         "binary_root_unavailable",
+        "caught_or_ignored_core_signal_unsupported",
         "core_limit_not_enforced",
         "core_limit_unavailable",
-        "core_pattern_unavailable",
         "input_ancestor_not_directory",
         "input_ancestor_unavailable",
         "input_changed_during_read",
@@ -113,16 +118,24 @@ PRODUCER_ERROR_REASONS = frozenset(
         "input_snapshot_size_mismatch",
         "input_snapshot_write_failed",
         "linux_proc_descriptor_exec_unavailable",
+        "multithreaded_core_signal_unsupported",
+        "non_root_core_signal_unsupported",
         "nofollow_open_unavailable",
-        "piped_core_handler_forbidden",
+        "ptrace_protocol_invalid",
+        "ptrace_unavailable",
         "producer_process_protection_unavailable",
+        "seccomp_filter_unavailable",
+        "signal_disposition_unavailable",
         "source_hash_mismatch",
         "source_read_failed",
         "source_size_limit_exceeded",
         "source_size_mismatch",
         "target_exec_failed",
         "target_process_group_cleanup_failed",
+        "target_reap_failed",
+        "target_task_limit_exceeded",
         "target_timeout",
+        "unobserved_core_signal_termination",
         "wait_status_invalid",
     }
 )
@@ -138,6 +151,89 @@ _F_SEAL_GROW = getattr(fcntl, "F_SEAL_GROW", 0x0004)
 _F_SEAL_WRITE = getattr(fcntl, "F_SEAL_WRITE", 0x0008)
 _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
+_PR_GET_SECCOMP = 21
+_PR_SET_SECCOMP = 22
+_PR_SET_NO_NEW_PRIVS = 38
+_PR_GET_NO_NEW_PRIVS = 39
+_SECCOMP_MODE_FILTER = 2
+_SECCOMP_RET_ERRNO = 0x00050000
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+_BPF_LD_W_ABS = 0x20
+_BPF_JMP_JEQ_K = 0x15
+_BPF_JMP_JSET_K = 0x45
+_BPF_RET_K = 0x06
+_SECCOMP_DATA_NR_OFFSET = 0
+_SECCOMP_DATA_ARCH_OFFSET = 4
+_SECCOMP_DATA_ARG0_LOW_OFFSET = 16
+_CLONE_SIGHAND = 0x00000800
+_CLONE_THREAD = 0x00010000
+_CLONE_UNTRACED = 0x00800000
+_HIGH_SYSCALL_BIT = 0x40000000
+_CLONE3_SYSCALL = 435
+_SECCOMP_ARCHITECTURES = {
+    "aarch64": {
+        "audit_arch": 0xC00000B7,
+        "clone_syscall": 220,
+    },
+    "x86_64": {
+        "audit_arch": 0xC000003E,
+        "clone_syscall": 56,
+    },
+}
+_PTRACE_TRACEME = 0
+_PTRACE_CONT = 7
+_PTRACE_SETOPTIONS = 0x4200
+_PTRACE_GETEVENTMSG = 0x4201
+_PTRACE_EVENT_FORK = 1
+_PTRACE_EVENT_VFORK = 2
+_PTRACE_EVENT_CLONE = 3
+_PTRACE_EVENT_EXEC = 4
+_PTRACE_O_TRACEFORK = 1 << 1
+_PTRACE_O_TRACEVFORK = 1 << 2
+_PTRACE_O_TRACECLONE = 1 << 3
+_PTRACE_O_TRACEEXEC = 1 << 4
+_PTRACE_O_EXITKILL = 1 << 20
+_PTRACE_OPTIONS = (
+    _PTRACE_O_TRACEFORK
+    | _PTRACE_O_TRACEVFORK
+    | _PTRACE_O_TRACECLONE
+    | _PTRACE_O_TRACEEXEC
+    | _PTRACE_O_EXITKILL
+)
+_WAIT_ALL_TRACED = 0x40000000
+_CHILD_SETUP_PTRACE_FAILED = b"P"
+_CHILD_SETUP_EXEC_FAILED = b"E"
+_CHILD_SETUP_SECCOMP_FAILED = b"S"
+_CORE_DUMP_SIGNALS = frozenset(
+    {
+        signal.SIGQUIT,
+        signal.SIGILL,
+        signal.SIGTRAP,
+        signal.SIGABRT,
+        signal.SIGBUS,
+        signal.SIGFPE,
+        signal.SIGSEGV,
+        signal.SIGSYS,
+        signal.SIGXCPU,
+        signal.SIGXFSZ,
+    }
+)
+
+
+class _SockFilter(ctypes.Structure):
+    _fields_ = (
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint),
+    )
+
+
+class _SockFprog(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ushort),
+        ("filters", ctypes.POINTER(_SockFilter)),
+    )
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -196,22 +292,70 @@ def contract_descriptor() -> dict[str, object]:
         "document_transport": DOCUMENT_TRANSPORT,
         "execution_profile": {
             "core_dumps": (
-                "rlimit-zero-verified-and-piped-handler-rejected"
+                "rlimit-zero-verified;"
+                "core-generating-signals-never-delivered;"
+                "single-thread-root-default-core-stop-recorded;"
+                "all-other-core-stops-error;"
+                "unobserved-core-terminal-error"
             ),
-            "core_pattern_path": str(CORE_PATTERN_PATH),
             "environment": dict(FIXED_ENVIRONMENT),
             "network": "outer-challenge-sandbox-none",
             "process_containment": (
                 "one-shot-clean-sandbox-required;"
-                "session-process-group-best-effort-reap"
+                "fork-vfork-clone-exec-traced;"
+                "session-process-group-and-tracee-reap"
             ),
             "producer_process": "pr-set-dumpable-zero-verified",
+            "seccomp_clone_filter": {
+                "architectures": [
+                    {
+                        "audit_arch": profile["audit_arch"],
+                        "clone_syscall": profile["clone_syscall"],
+                        "machine": machine,
+                    }
+                    for machine, profile in sorted(
+                        _SECCOMP_ARCHITECTURES.items()
+                    )
+                ],
+                "architecture_mismatch": "errno:ENOSYS",
+                "clone3": {
+                    "action": "errno:ENOSYS",
+                    "syscall": _CLONE3_SYSCALL,
+                },
+                "high_syscall_bit": {
+                    "action": "errno:ENOSYS",
+                    "mask": _HIGH_SYSCALL_BIT,
+                },
+                "clone_flags": {
+                    "clone_sighand": _CLONE_SIGHAND,
+                    "clone_thread": _CLONE_THREAD,
+                    "clone_untraced": _CLONE_UNTRACED,
+                    "cross_tgid_clone_sighand": "errno:EPERM",
+                    "pthread_clone": "allow",
+                },
+                "install": (
+                    "pre-exec-no-new-privs;"
+                    "filter-mode-runtime-verified;"
+                    "source-sha256-attested"
+                ),
+            },
+            "signal_disposition": (
+                "stopped-proc-status-SigCgt-SigIgn;"
+                "caught-or-ignored-core-signal-error;"
+                "core-signal-never-delivered"
+            ),
             "source_execution": "descriptor-bound-procfd",
             "stdin": "sealed-read-only-memfd",
             "target_arguments": "argv0-only-no-user-arguments",
             "target_shell": False,
             "target_stdout_stderr": "inherited-through-producer-stderr",
             "target_timeout_seconds": TARGET_TIMEOUT_SECONDS,
+            "trace": (
+                "fixed-ptrace-traceme;"
+                "initial-and-later-exec-events-distinguished;"
+                "exitkill-enabled"
+            ),
+            "traced_task_limit": MAX_TRACED_TASKS,
             "transport_validation": (
                 "receipt-success-complete-nontruncated;"
                 "exact-whole-canonical-stdout"
@@ -234,7 +378,8 @@ def contract_descriptor() -> dict[str, object]:
         "schema_version": SCHEMA_VERSION,
         "source_max_bytes": MAX_SOURCE_BYTES,
         "target_status": (
-            "direct-child-wait-status-only;"
+            "single-thread-root-terminal-wait-status-or-"
+            "default-core-signal-stop;"
             "numeric-exit-is-never-a-signal"
         ),
     }
@@ -774,30 +919,168 @@ def _disable_core_dumps() -> None:
         raise CrashOracleError("core_limit_not_enforced")
 
 
-def _reject_piped_core_handler(
-    core_pattern_path: Path = CORE_PATTERN_PATH,
-) -> None:
-    descriptor = -1
+def _seccomp_profile() -> tuple[int, int]:
     try:
-        descriptor = os.open(
-            core_pattern_path,
-            os.O_RDONLY
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0),
+        machine = os.uname().machine
+    except (AttributeError, OSError) as error:
+        raise CrashOracleError("seccomp_filter_unavailable") from error
+    profile = _SECCOMP_ARCHITECTURES.get(machine)
+    if (
+        sys.byteorder != "little"
+        or profile is None
+        or type(profile.get("audit_arch")) is not int
+        or type(profile.get("clone_syscall")) is not int
+    ):
+        raise CrashOracleError("seccomp_filter_unavailable")
+    return profile["audit_arch"], profile["clone_syscall"]
+
+
+def _raw_prctl(
+    option: int,
+    argument_2: int = 0,
+    argument_3: int = 0,
+    argument_4: int = 0,
+    argument_5: int = 0,
+) -> tuple[int, int]:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
         )
-        payload = os.read(descriptor, 4097)
-    except OSError as error:
-        raise CrashOracleError("core_pattern_unavailable") from error
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-    if not payload or len(payload) > 4096 or b"\x00" in payload:
-        raise CrashOracleError("core_pattern_unavailable")
-    if payload.startswith(b"|"):
-        raise CrashOracleError("piped_core_handler_forbidden")
+        prctl.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = prctl(
+            option,
+            argument_2,
+            argument_3,
+            argument_4,
+            argument_5,
+        )
+        return int(result), ctypes.get_errno()
+    except (AttributeError, TypeError, ValueError):
+        return -1, errno.ENOSYS
+
+
+def _clone_seccomp_instructions(
+    audit_arch: int,
+    clone_syscall: int,
+) -> tuple[_SockFilter, ...]:
+    return (
+        _SockFilter(
+            _BPF_LD_W_ABS,
+            0,
+            0,
+            _SECCOMP_DATA_ARCH_OFFSET,
+        ),
+        _SockFilter(_BPF_JMP_JEQ_K, 1, 0, audit_arch),
+        _SockFilter(
+            _BPF_RET_K,
+            0,
+            0,
+            _SECCOMP_RET_ERRNO | errno.ENOSYS,
+        ),
+        _SockFilter(
+            _BPF_LD_W_ABS,
+            0,
+            0,
+            _SECCOMP_DATA_NR_OFFSET,
+        ),
+        _SockFilter(
+            _BPF_JMP_JSET_K,
+            7,
+            0,
+            _HIGH_SYSCALL_BIT,
+        ),
+        _SockFilter(
+            _BPF_JMP_JEQ_K,
+            6,
+            0,
+            _CLONE3_SYSCALL,
+        ),
+        _SockFilter(_BPF_JMP_JEQ_K, 0, 6, clone_syscall),
+        _SockFilter(
+            _BPF_LD_W_ABS,
+            0,
+            0,
+            _SECCOMP_DATA_ARG0_LOW_OFFSET,
+        ),
+        _SockFilter(
+            _BPF_JMP_JSET_K,
+            2,
+            0,
+            _CLONE_UNTRACED,
+        ),
+        _SockFilter(
+            _BPF_JMP_JSET_K,
+            0,
+            3,
+            _CLONE_SIGHAND,
+        ),
+        _SockFilter(
+            _BPF_JMP_JSET_K,
+            2,
+            0,
+            _CLONE_THREAD,
+        ),
+        _SockFilter(
+            _BPF_RET_K,
+            0,
+            0,
+            _SECCOMP_RET_ERRNO | errno.EPERM,
+        ),
+        _SockFilter(
+            _BPF_RET_K,
+            0,
+            0,
+            _SECCOMP_RET_ERRNO | errno.ENOSYS,
+        ),
+        _SockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_ALLOW),
+    )
+
+
+def _install_clone_seccomp_filter(
+    audit_arch: int,
+    clone_syscall: int,
+) -> bool:
+    """Install and verify the fixed pre-exec clone safety filter."""
+
+    try:
+        instructions = _clone_seccomp_instructions(
+            audit_arch,
+            clone_syscall,
+        )
+        filters = (_SockFilter * len(instructions))(*instructions)
+        program = _SockFprog(
+            len(instructions),
+            ctypes.cast(filters, ctypes.POINTER(_SockFilter)),
+        )
+        no_new_privs, _error_number = _raw_prctl(
+            _PR_SET_NO_NEW_PRIVS,
+            1,
+        )
+        if no_new_privs != 0:
+            return False
+        observed_no_new_privs, _error_number = _raw_prctl(
+            _PR_GET_NO_NEW_PRIVS
+        )
+        if observed_no_new_privs != 1:
+            return False
+        installed, _error_number = _raw_prctl(
+            _PR_SET_SECCOMP,
+            _SECCOMP_MODE_FILTER,
+            ctypes.addressof(program),
+        )
+        if installed != 0:
+            return False
+        observed_mode, _error_number = _raw_prctl(_PR_GET_SECCOMP)
+        return observed_mode == _SECCOMP_MODE_FILTER
+    except (OverflowError, TypeError, ValueError):
+        return False
 
 
 def _protect_producer_process() -> None:
@@ -825,9 +1108,243 @@ def _protect_producer_process() -> None:
         ) from error
 
 
-def _reap_target_process_group(process: subprocess.Popen[bytes]) -> None:
+def _raw_ptrace(
+    request: int,
+    pid: int,
+    address: int = 0,
+    data: int = 0,
+) -> tuple[int, int]:
+    """Call Linux ptrace without exposing libc diagnostics."""
+
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        libc = ctypes.CDLL(None, use_errno=True)
+        ptrace = libc.ptrace
+        ptrace.argtypes = (
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+        ptrace.restype = ctypes.c_long
+        ctypes.set_errno(0)
+        result = ptrace(
+            request,
+            pid,
+            ctypes.c_void_p(address),
+            ctypes.c_void_p(data),
+        )
+        return int(result), ctypes.get_errno()
+    except (AttributeError, TypeError, ValueError):
+        return -1, errno.ENOSYS
+
+
+def _ptrace(
+    request: int,
+    pid: int,
+    address: int = 0,
+    data: int = 0,
+    *,
+    unavailable: bool = False,
+) -> None:
+    result, _error_number = _raw_ptrace(
+        request,
+        pid,
+        address,
+        data,
+    )
+    if result == -1:
+        raise CrashOracleError(
+            "ptrace_unavailable"
+            if unavailable
+            else "ptrace_protocol_invalid"
+        )
+
+
+def _ptrace_event_pid(pid: int) -> int:
+    message = ctypes.c_ulong(0)
+    try:
+        address = ctypes.addressof(message)
+    except (TypeError, ValueError) as error:
+        raise CrashOracleError("ptrace_protocol_invalid") from error
+    _ptrace(_PTRACE_GETEVENTMSG, pid, 0, address)
+    observed = int(message.value)
+    if observed <= 0:
+        raise CrashOracleError("ptrace_protocol_invalid")
+    return observed
+
+
+def _read_tracee_status(
+    pid: int,
+    signal_number: int,
+) -> tuple[int, bool, bool]:
+    """Read Tgid and signal masks while one known tracee is stopped."""
+
+    if not 1 <= signal_number <= 64:
+        raise CrashOracleError("signal_disposition_unavailable")
+    descriptor = -1
+    chunks: list[bytes] = []
+    observed = 0
+    try:
+        descriptor = os.open(
+            f"/proc/{pid}/status",
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        while observed <= MAX_PROC_STATUS_BYTES:
+            requested = min(
+                READ_CHUNK_BYTES,
+                MAX_PROC_STATUS_BYTES + 1 - observed,
+            )
+            chunk = os.read(descriptor, requested)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+    except OSError as error:
+        raise CrashOracleError(
+            "signal_disposition_unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if observed > MAX_PROC_STATUS_BYTES:
+        raise CrashOracleError("signal_disposition_unavailable")
+    fields: dict[bytes, int] = {}
+    for line in b"".join(chunks).splitlines():
+        name, separator, raw_value = line.partition(b":")
+        if name not in {b"Tgid", b"SigCgt", b"SigIgn"}:
+            continue
+        if separator != b":" or name in fields:
+            raise CrashOracleError("signal_disposition_unavailable")
+        raw_value = raw_value.strip()
+        if name == b"Tgid":
+            if (
+                not raw_value
+                or len(raw_value) > 20
+                or not raw_value.isdigit()
+            ):
+                raise CrashOracleError(
+                    "signal_disposition_unavailable"
+                )
+            fields[name] = int(raw_value, 10)
+            continue
+        if not raw_value or len(raw_value) > 32 or any(
+            byte not in b"0123456789abcdefABCDEF"
+            for byte in raw_value
+        ):
+            raise CrashOracleError("signal_disposition_unavailable")
+        fields[name] = int(raw_value, 16)
+    if (
+        set(fields) != {b"Tgid", b"SigCgt", b"SigIgn"}
+        or fields[b"Tgid"] <= 0
+    ):
+        raise CrashOracleError("signal_disposition_unavailable")
+    mask = 1 << (signal_number - 1)
+    return (
+        fields[b"Tgid"],
+        bool(fields[b"SigCgt"] & mask),
+        bool(fields[b"SigIgn"] & mask),
+    )
+
+
+def _write_child_setup_error(descriptor: int, value: bytes) -> None:
+    try:
+        os.write(descriptor, value)
+    except OSError:
+        pass
+
+
+def _spawn_traced_target(
+    binary_argument: str,
+    binary_descriptor: int,
+    stdin_descriptor: int,
+) -> tuple[int, int]:
+    """Fork one tracee and return ``(pid, setup_error_read_fd)``."""
+
+    audit_arch, clone_syscall = _seccomp_profile()
+    try:
+        read_descriptor, write_descriptor = os.pipe2(
+            os.O_CLOEXEC | os.O_NONBLOCK
+        )
+    except (AttributeError, OSError) as error:
+        raise CrashOracleError("target_exec_failed") from error
+    try:
+        pid = os.fork()
+    except OSError as error:
+        os.close(read_descriptor)
+        os.close(write_descriptor)
+        raise CrashOracleError("target_exec_failed") from error
+    if pid != 0:
+        os.close(write_descriptor)
+        return pid, read_descriptor
+
+    try:
+        os.close(read_descriptor)
+        try:
+            os.setsid()
+            os.dup2(stdin_descriptor, 0, inheritable=True)
+            os.dup2(2, 1, inheritable=True)
+        except (OSError, TypeError):
+            _write_child_setup_error(
+                write_descriptor,
+                _CHILD_SETUP_EXEC_FAILED,
+            )
+            os._exit(_RUNNER_ERROR)
+        if not _install_clone_seccomp_filter(
+            audit_arch,
+            clone_syscall,
+        ):
+            _write_child_setup_error(
+                write_descriptor,
+                _CHILD_SETUP_SECCOMP_FAILED,
+            )
+            os._exit(_RUNNER_ERROR)
+        result, _error_number = _raw_ptrace(_PTRACE_TRACEME, 0)
+        if result == -1:
+            _write_child_setup_error(
+                write_descriptor,
+                _CHILD_SETUP_PTRACE_FAILED,
+            )
+            os._exit(_RUNNER_ERROR)
+        try:
+            os.execve(
+                f"/proc/self/fd/{binary_descriptor}",
+                (binary_argument,),
+                dict(FIXED_ENVIRONMENT),
+            )
+        except OSError:
+            _write_child_setup_error(
+                write_descriptor,
+                _CHILD_SETUP_EXEC_FAILED,
+            )
+            os._exit(_RUNNER_ERROR)
+    finally:
+        os._exit(_RUNNER_ERROR)
+
+
+def _child_setup_failure(descriptor: int) -> str | None:
+    try:
+        payload = os.read(descriptor, 2)
+    except BlockingIOError:
+        return None
+    except OSError as error:
+        raise CrashOracleError("target_exec_failed") from error
+    if payload == _CHILD_SETUP_PTRACE_FAILED:
+        return "ptrace_unavailable"
+    if payload == _CHILD_SETUP_SECCOMP_FAILED:
+        return "seccomp_filter_unavailable"
+    if payload:
+        return "target_exec_failed"
+    return None
+
+
+def _kill_target_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         return
     except OSError as error:
@@ -838,64 +1355,245 @@ def _reap_target_process_group(process: subprocess.Popen[bytes]) -> None:
         ) from error
 
 
+def _kill_tracees(tracees: set[int]) -> None:
+    for pid in tuple(tracees):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except OSError as error:
+            if error.errno != errno.ESRCH:
+                raise CrashOracleError(
+                    "target_process_group_cleanup_failed"
+                ) from error
+
+
+def _reap_tracees(tracees: set[int], *, deadline: float) -> None:
+    while tracees and time.monotonic() < deadline:
+        try:
+            pid, status = os.waitpid(
+                -1,
+                os.WNOHANG | os.WUNTRACED | _WAIT_ALL_TRACED,
+            )
+        except ChildProcessError:
+            tracees.clear()
+            return
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            raise CrashOracleError("target_reap_failed") from error
+        if pid == 0:
+            time.sleep(0.002)
+            continue
+        tracees.add(pid)
+        if os.WIFSTOPPED(status):
+            try:
+                _ptrace(_PTRACE_CONT, pid, 0, signal.SIGKILL)
+            except CrashOracleError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            continue
+        tracees.discard(pid)
+    if tracees:
+        raise CrashOracleError("target_reap_failed")
+
+
+def _terminal_signal_result(
+    signal_number: int,
+) -> tuple[str, None, int]:
+    if not 1 <= signal_number <= 64:
+        raise CrashOracleError("wait_status_invalid")
+    if signal_number in _CORE_DUMP_SIGNALS:
+        raise CrashOracleError(
+            "unobserved_core_signal_termination"
+        )
+    return "signaled", None, signal_number
+
+
 def _execute_target(
     binary_argument: str,
     binary_descriptor: int,
     stdin_descriptor: int,
     *,
     timeout_seconds: float,
-    core_pattern_path: Path = CORE_PATTERN_PATH,
 ) -> tuple[str, int | None, int | None]:
-    executable = f"/proc/self/fd/{binary_descriptor}"
-    _reject_piped_core_handler(core_pattern_path)
     _disable_core_dumps()
     _protect_producer_process()
+    process_pid, setup_descriptor = _spawn_traced_target(
+        binary_argument,
+        binary_descriptor,
+        stdin_descriptor,
+    )
+    tracees = {process_pid}
+    initial_stops = {process_pid}
+    root_thread_observed = False
+    root_result: tuple[str, int | None, int | None] | None = None
+    deadline = time.monotonic() + timeout_seconds
     try:
-        process = subprocess.Popen(
-            (binary_argument,),
-            executable=executable,
-            stdin=stdin_descriptor,
-            stdout=sys.stderr.buffer,
-            stderr=sys.stderr.buffer,
-            env=dict(FIXED_ENVIRONMENT),
-            close_fds=True,
-            pass_fds=(binary_descriptor,),
-            shell=False,
-            start_new_session=True,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise CrashOracleError("target_exec_failed") from error
-    try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as error:
+        while root_result is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CrashOracleError("target_timeout")
+            try:
+                pid, status = os.waitpid(
+                    -1,
+                    os.WNOHANG | os.WUNTRACED | _WAIT_ALL_TRACED,
+                )
+            except ChildProcessError as error:
+                failure = _child_setup_failure(setup_descriptor)
+                raise CrashOracleError(
+                    failure or "ptrace_protocol_invalid"
+                ) from error
+            except OSError as error:
+                if error.errno == errno.EINTR:
+                    continue
+                raise CrashOracleError(
+                    "ptrace_protocol_invalid"
+                ) from error
+            if pid == 0:
+                time.sleep(min(0.002, remaining))
+                continue
+            if pid not in tracees:
+                raise CrashOracleError("ptrace_protocol_invalid")
+            if os.WIFEXITED(status):
+                tracees.discard(pid)
+                if pid == process_pid:
+                    failure = _child_setup_failure(setup_descriptor)
+                    if failure is not None:
+                        raise CrashOracleError(failure)
+                    root_result = ("exited", os.WEXITSTATUS(status), None)
+                continue
+            if os.WIFSIGNALED(status):
+                tracees.discard(pid)
+                signal_number = os.WTERMSIG(status)
+                terminal_result = _terminal_signal_result(
+                    signal_number
+                )
+                if pid == process_pid:
+                    root_result = terminal_result
+                continue
+            if not os.WIFSTOPPED(status):
+                raise CrashOracleError("wait_status_invalid")
+
+            signal_number = os.WSTOPSIG(status)
+            event = status >> 16
+            if pid in initial_stops:
+                initial_stops.remove(pid)
+                if pid == process_pid:
+                    if signal_number != signal.SIGTRAP or event != 0:
+                        raise CrashOracleError(
+                            "ptrace_protocol_invalid"
+                        )
+                    failure = _child_setup_failure(setup_descriptor)
+                    if failure is not None:
+                        raise CrashOracleError(failure)
+                    _ptrace(
+                        _PTRACE_SETOPTIONS,
+                        pid,
+                        0,
+                        _PTRACE_OPTIONS,
+                        unavailable=True,
+                    )
+                elif signal_number not in {
+                    signal.SIGSTOP,
+                    signal.SIGTRAP,
+                }:
+                    raise CrashOracleError(
+                        "ptrace_protocol_invalid"
+                    )
+                _ptrace(_PTRACE_CONT, pid)
+                continue
+
+            if event in {
+                _PTRACE_EVENT_FORK,
+                _PTRACE_EVENT_VFORK,
+                _PTRACE_EVENT_CLONE,
+            }:
+                child_pid = _ptrace_event_pid(pid)
+                if child_pid in tracees:
+                    raise CrashOracleError(
+                        "ptrace_protocol_invalid"
+                    )
+                if len(tracees) >= MAX_TRACED_TASKS:
+                    raise CrashOracleError(
+                        "target_task_limit_exceeded"
+                    )
+                child_tgid, _caught, _ignored = _read_tracee_status(
+                    child_pid,
+                    signal.SIGKILL,
+                )
+                if child_tgid == process_pid:
+                    root_thread_observed = True
+                tracees.add(child_pid)
+                initial_stops.add(child_pid)
+                _ptrace(_PTRACE_CONT, pid)
+                continue
+            if event == _PTRACE_EVENT_EXEC:
+                former_pid = _ptrace_event_pid(pid)
+                if former_pid != pid:
+                    tracees.discard(former_pid)
+                    initial_stops.discard(former_pid)
+                    tracees.add(pid)
+                _ptrace(_PTRACE_CONT, pid)
+                continue
+            if event != 0:
+                raise CrashOracleError("ptrace_protocol_invalid")
+
+            if signal_number in _CORE_DUMP_SIGNALS:
+                tgid, caught, ignored = _read_tracee_status(
+                    pid,
+                    signal_number,
+                )
+                if caught or ignored:
+                    raise CrashOracleError(
+                        "caught_or_ignored_core_signal_unsupported"
+                    )
+                if tgid != process_pid:
+                    raise CrashOracleError(
+                        "non_root_core_signal_unsupported"
+                    )
+                if root_thread_observed:
+                    raise CrashOracleError(
+                        "multithreaded_core_signal_unsupported"
+                    )
+                _ptrace(
+                    _PTRACE_CONT,
+                    pid,
+                    0,
+                    signal.SIGKILL,
+                )
+                root_result = (
+                    "signaled",
+                    None,
+                    signal_number,
+                )
+                continue
+            _ptrace(_PTRACE_CONT, pid, 0, signal_number)
+    except CrashOracleError:
         try:
-            _reap_target_process_group(process)
+            _kill_target_process_group(process_pid)
+            _kill_tracees(tracees)
+            _reap_tracees(
+                tracees,
+                deadline=time.monotonic() + 1.0,
+            )
         except CrashOracleError:
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=1.0)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            raise
-        try:
-            process.wait(timeout=1.0)
-        except (OSError, subprocess.TimeoutExpired):
             pass
-        raise CrashOracleError("target_timeout") from error
-    _reap_target_process_group(process)
-    if type(returncode) is not int:
+        raise
+    finally:
+        try:
+            os.close(setup_descriptor)
+        except OSError:
+            pass
+
+    _kill_target_process_group(process_pid)
+    _kill_tracees(tracees)
+    _reap_tracees(tracees, deadline=time.monotonic() + 1.0)
+    if root_result is None:
         raise CrashOracleError("wait_status_invalid")
-    if returncode < 0:
-        signal_number = -returncode
-        if not 1 <= signal_number <= 64:
-            raise CrashOracleError("wait_status_invalid")
-        return "signaled", None, signal_number
-    if not 0 <= returncode <= 255:
-        raise CrashOracleError("wait_status_invalid")
-    return "exited", returncode, None
+    return root_result
 
 
 def produce_document(
@@ -906,7 +1604,6 @@ def produce_document(
     challenge_root: Path = CHALLENGE_ROOT,
     work_root: Path = WORK_ROOT,
     timeout_seconds: float = TARGET_TIMEOUT_SECONDS,
-    core_pattern_path: Path = CORE_PATTERN_PATH,
 ) -> dict[str, object]:
     """Produce one complete observation or one finite error document."""
 
@@ -984,7 +1681,6 @@ def produce_document(
                     binary_descriptor,
                     stdin_descriptor,
                     timeout_seconds=timeout_seconds,
-                    core_pattern_path=core_pattern_path,
                 )
             if _stable_identity(
                 os.fstat(binary_descriptor)

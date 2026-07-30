@@ -38,8 +38,8 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "contract_version": 1,
         "path": "/opt/ctf-templates/pwn/crash_oracle.py",
         "sha256": (
-            "88fdeadce5c6a7787c50e7a442e9a799"
-            "e9b30aff059876645252912b3e54e82f"
+            "0ce31429a3fb8ffe32367650d5fb58a0"
+            "76bf445fcb2d9ef33bc1cb69643a4482"
         ),
     },
     "rev_inventory_v2": {

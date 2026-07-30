@@ -4,12 +4,16 @@ The execution layer produces six small canonical observation documents:
 three executions with one exact non-empty PoC and three executions with an
 empty standard-input control.  This module contains no sandbox or state-store
 code.  It validates the complete source/input/recipe bindings and classifies
-only direct target wait status.
+only the single-thread root target's terminal status or its default
+core-generating signal delivery stop.
 
 Exit codes, output strings, sanitizer text, and core-file presence are never
-treated as crashes.  A v1 crash is a direct target termination by one of the
-finite Linux fault signals below, reproduced with the same signal in at least
-two of three positive attempts while every control exits normally.
+treated as crashes.  A v1 crash is a default fault signal observed before
+delivery in a single-thread root target (and suppressed to prevent a piped
+host core handler), reproduced with the same signal in at least two of three
+positive attempts while every control exits normally.  Core-generating
+signals are never delivered: caught/ignored, non-root, and root-multithreaded
+stops are finite producer errors.
 
 Once persisted, this module is append-only.  Semantic changes belong in a new
 versioned module selected by an exact id/version/fingerprint tuple.
@@ -42,6 +46,16 @@ PWN_CRASH_V1_POSITIVE_ATTEMPTS = 3
 PWN_CRASH_V1_CONTROL_ATTEMPTS = 3
 PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES = 2
 PWN_CRASH_V1_TARGET_TIMEOUT_SECONDS = 5.0
+PWN_CRASH_V1_MAX_TRACED_TASKS = 64
+PWN_CRASH_V1_CLONE_SIGHAND = 0x00000800
+PWN_CRASH_V1_CLONE_THREAD = 0x00010000
+PWN_CRASH_V1_CLONE_UNTRACED = 0x00800000
+PWN_CRASH_V1_HIGH_SYSCALL_BIT = 0x40000000
+PWN_CRASH_V1_CLONE3_SYSCALL = 435
+PWN_CRASH_V1_SECCOMP_ARCHITECTURES = (
+    ("aarch64", 0xC00000B7, 220),
+    ("x86_64", 0xC000003E, 56),
+)
 PWN_CRASH_V1_FIXED_ENVIRONMENT = (
     ("HOME", "/nonexistent"),
     ("LANG", "C.UTF-8"),
@@ -73,9 +87,9 @@ PWN_CRASH_V1_PRODUCER_ERROR_REASONS = frozenset(
         "binary_privilege_bits_forbidden",
         "binary_root_not_directory",
         "binary_root_unavailable",
+        "caught_or_ignored_core_signal_unsupported",
         "core_limit_not_enforced",
         "core_limit_unavailable",
-        "core_pattern_unavailable",
         "input_ancestor_not_directory",
         "input_ancestor_unavailable",
         "input_changed_during_read",
@@ -101,16 +115,24 @@ PWN_CRASH_V1_PRODUCER_ERROR_REASONS = frozenset(
         "input_snapshot_size_mismatch",
         "input_snapshot_write_failed",
         "linux_proc_descriptor_exec_unavailable",
+        "multithreaded_core_signal_unsupported",
+        "non_root_core_signal_unsupported",
         "nofollow_open_unavailable",
-        "piped_core_handler_forbidden",
+        "ptrace_protocol_invalid",
+        "ptrace_unavailable",
         "producer_process_protection_unavailable",
+        "seccomp_filter_unavailable",
+        "signal_disposition_unavailable",
         "source_hash_mismatch",
         "source_read_failed",
         "source_size_limit_exceeded",
         "source_size_mismatch",
         "target_exec_failed",
         "target_process_group_cleanup_failed",
+        "target_reap_failed",
+        "target_task_limit_exceeded",
         "target_timeout",
+        "unobserved_core_signal_termination",
         "wait_status_invalid",
     }
 )
@@ -236,16 +258,60 @@ def pwn_crash_v1_contract_descriptor() -> dict[str, object]:
         "document_transport": PWN_CRASH_V1_DOCUMENT_TRANSPORT,
         "execution_profile": {
             "core_dumps": (
-                "rlimit-zero-verified-and-piped-handler-rejected"
+                "rlimit-zero-verified;"
+                "core-generating-signals-never-delivered;"
+                "single-thread-root-default-core-stop-recorded;"
+                "all-other-core-stops-error;"
+                "unobserved-core-terminal-error"
             ),
-            "core_pattern_path": "/proc/sys/kernel/core_pattern",
             "environment": dict(PWN_CRASH_V1_FIXED_ENVIRONMENT),
             "network": "outer-challenge-sandbox-none",
             "process_containment": (
                 "one-shot-clean-sandbox-required;"
-                "session-process-group-best-effort-reap"
+                "fork-vfork-clone-exec-traced;"
+                "session-process-group-and-tracee-reap"
             ),
             "producer_process": "pr-set-dumpable-zero-verified",
+            "seccomp_clone_filter": {
+                "architectures": [
+                    {
+                        "audit_arch": audit_arch,
+                        "clone_syscall": clone_syscall,
+                        "machine": machine,
+                    }
+                    for (
+                        machine,
+                        audit_arch,
+                        clone_syscall,
+                    ) in PWN_CRASH_V1_SECCOMP_ARCHITECTURES
+                ],
+                "architecture_mismatch": "errno:ENOSYS",
+                "clone3": {
+                    "action": "errno:ENOSYS",
+                    "syscall": PWN_CRASH_V1_CLONE3_SYSCALL,
+                },
+                "high_syscall_bit": {
+                    "action": "errno:ENOSYS",
+                    "mask": PWN_CRASH_V1_HIGH_SYSCALL_BIT,
+                },
+                "clone_flags": {
+                    "clone_sighand": PWN_CRASH_V1_CLONE_SIGHAND,
+                    "clone_thread": PWN_CRASH_V1_CLONE_THREAD,
+                    "clone_untraced": PWN_CRASH_V1_CLONE_UNTRACED,
+                    "cross_tgid_clone_sighand": "errno:EPERM",
+                    "pthread_clone": "allow",
+                },
+                "install": (
+                    "pre-exec-no-new-privs;"
+                    "filter-mode-runtime-verified;"
+                    "source-sha256-attested"
+                ),
+            },
+            "signal_disposition": (
+                "stopped-proc-status-SigCgt-SigIgn;"
+                "caught-or-ignored-core-signal-error;"
+                "core-signal-never-delivered"
+            ),
             "source_execution": "descriptor-bound-procfd",
             "stdin": "sealed-read-only-memfd",
             "target_arguments": "argv0-only-no-user-arguments",
@@ -254,6 +320,12 @@ def pwn_crash_v1_contract_descriptor() -> dict[str, object]:
             "target_timeout_seconds": (
                 PWN_CRASH_V1_TARGET_TIMEOUT_SECONDS
             ),
+            "trace": (
+                "fixed-ptrace-traceme;"
+                "initial-and-later-exec-events-distinguished;"
+                "exitkill-enabled"
+            ),
+            "traced_task_limit": PWN_CRASH_V1_MAX_TRACED_TASKS,
             "transport_validation": (
                 "receipt-success-complete-nontruncated;"
                 "exact-whole-canonical-stdout"
@@ -280,7 +352,8 @@ def pwn_crash_v1_contract_descriptor() -> dict[str, object]:
         "schema_version": PWN_CRASH_V1_SCHEMA_VERSION,
         "source_max_bytes": PWN_CRASH_V1_MAX_SOURCE_BYTES,
         "target_status": (
-            "direct-child-wait-status-only;"
+            "single-thread-root-terminal-wait-status-or-"
+            "default-core-signal-stop;"
             "numeric-exit-is-never-a-signal"
         ),
     }
@@ -1002,21 +1075,28 @@ def evaluate_pwn_crash_v1(
 __all__ = [
     "PWN_CRASH_V1_ALLOWED_SIGNALS",
     "PWN_CRASH_V1_ATTEMPT_COUNT",
+    "PWN_CRASH_V1_CLONE3_SYSCALL",
+    "PWN_CRASH_V1_CLONE_SIGHAND",
+    "PWN_CRASH_V1_CLONE_THREAD",
+    "PWN_CRASH_V1_CLONE_UNTRACED",
     "PWN_CRASH_V1_CONTRACT_FINGERPRINT",
     "PWN_CRASH_V1_CONTRACT_ID",
     "PWN_CRASH_V1_CONTRACT_VERSION",
     "PWN_CRASH_V1_CONTROL_ATTEMPTS",
     "PWN_CRASH_V1_DOCUMENT_TRANSPORT",
     "PWN_CRASH_V1_FAILURE_CODES",
+    "PWN_CRASH_V1_HIGH_SYSCALL_BIT",
     "PWN_CRASH_V1_MAX_DOCUMENT_BYTES",
     "PWN_CRASH_V1_MAX_EVIDENCE_BYTES",
     "PWN_CRASH_V1_MAX_INPUT_BYTES",
+    "PWN_CRASH_V1_MAX_TRACED_TASKS",
     "PWN_CRASH_V1_MAX_SOURCE_BYTES",
     "PWN_CRASH_V1_POSITIVE_ATTEMPTS",
     "PWN_CRASH_V1_PRODUCER_ERROR_REASONS",
     "PWN_CRASH_V1_PROTOCOL",
     "PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES",
     "PWN_CRASH_V1_SCHEMA_VERSION",
+    "PWN_CRASH_V1_SECCOMP_ARCHITECTURES",
     "PWN_CRASH_V1_TARGET_TIMEOUT_SECONDS",
     "PwnCrashV1ContractError",
     "PwnCrashV1Evaluation",
