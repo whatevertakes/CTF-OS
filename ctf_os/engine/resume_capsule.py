@@ -993,7 +993,9 @@ def _pwn_failure_run_priority(
         and run.extra.get("experiment_id")
         in selected_pwn_experiment_ids
     )
-    if run.role == "pwn_crash_gate" and not selected_pwn:
+    if run.extra.get("managed_rejection_v1") is not None:
+        priority = 0
+    elif run.role == "pwn_crash_gate" and not selected_pwn:
         priority = 4
     elif run.status in {
         RunStatus.INVALID,

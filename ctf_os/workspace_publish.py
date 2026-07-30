@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -22,6 +23,21 @@ from ctf_os.store.locks import FileLock
 MAX_PUBLISH_BYTES = 256 * 1024 * 1024
 
 
+class WorkspacePublishProposalRejected(EngineError):
+    """A Builder-controlled staged source cannot be published safely.
+
+    Only failures attributable to the model's concrete publication proposal
+    use this exception.  Canonical workspace conflicts, intent/ledger
+    recovery failures, store errors, and unexpected operating-system failures
+    retain their original exception types and remain fatal to managed
+    execution.
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 def _safe_relative(value: str) -> Path:
     pure = PurePosixPath(value)
     if (
@@ -33,21 +49,41 @@ def _safe_relative(value: str) -> Path:
     return Path(*pure.parts)
 
 
-def _hash_descriptor(descriptor: int) -> tuple[str, int, os.stat_result]:
+def _hash_descriptor(
+    descriptor: int,
+    *,
+    builder_source: bool = False,
+) -> tuple[str, int, os.stat_result]:
     before = os.fstat(descriptor)
     if not stat.S_ISREG(before.st_mode):
+        if builder_source:
+            raise WorkspacePublishProposalRejected(
+                "artifact_source_unsafe"
+            )
         raise EngineError("workspace publish source must be a regular file")
     if before.st_size > MAX_PUBLISH_BYTES:
+        if builder_source:
+            raise WorkspacePublishProposalRejected(
+                "artifact_size_limit_exceeded"
+            )
         raise EngineError("workspace publish source exceeds byte limit")
     digest = hashlib.sha256()
     total = 0
     while total < before.st_size:
         block = os.read(descriptor, min(1024 * 1024, before.st_size - total))
         if not block:
+            if builder_source:
+                raise WorkspacePublishProposalRejected(
+                    "artifact_source_changed"
+                )
             raise EngineError("workspace publish source was truncated")
         digest.update(block)
         total += len(block)
     if os.read(descriptor, 1):
+        if builder_source:
+            raise WorkspacePublishProposalRejected(
+                "artifact_source_changed"
+            )
         raise EngineError("workspace publish source grew while hashing")
     after = os.fstat(descriptor)
     if (
@@ -56,18 +92,23 @@ def _hash_descriptor(descriptor: int) -> tuple[str, int, os.stat_result]:
         or before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
     ):
+        if builder_source:
+            raise WorkspacePublishProposalRejected(
+                "artifact_source_changed"
+            )
         raise EngineError("workspace publish source changed while hashing")
     return digest.hexdigest(), total, before
 
 
-def _hash_file(path: Path) -> str | None:
+def _hash_file_at(directory_descriptor: int, name: str) -> str | None:
     try:
         descriptor = os.open(
-            path,
+            name,
             os.O_RDONLY
             | os.O_CLOEXEC
             | os.O_NONBLOCK
             | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
         )
     except FileNotFoundError:
         return None
@@ -78,15 +119,144 @@ def _hash_file(path: Path) -> str | None:
         os.close(descriptor)
 
 
+def _canonical_parent_descriptor(
+    root: Path,
+    relative_parent: Path,
+    *,
+    create: bool,
+) -> int | None:
+    """Open one canonical parent without following mutable symlinks."""
+
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        directory_descriptor = os.open(root, directory_flags)
+    except FileNotFoundError:
+        if not create:
+            return None
+        raise
+    try:
+        for component in relative_parent.parts:
+            if component in {"", "."}:
+                continue
+            if create:
+                try:
+                    os.mkdir(
+                        component,
+                        mode=0o700,
+                        dir_fd=directory_descriptor,
+                    )
+                except FileExistsError:
+                    pass
+            try:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                if not create:
+                    return None
+                raise
+            os.close(directory_descriptor)
+            directory_descriptor = child_descriptor
+        result = directory_descriptor
+        directory_descriptor = -1
+        return result
+    finally:
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
+def _raise_builder_stage_open_rejection(error: OSError) -> None:
+    """Project only expected model-controlled stage lookup failures."""
+
+    if error.errno == errno.ENOENT:
+        raise WorkspacePublishProposalRejected(
+            "artifact_source_missing"
+        ) from error
+    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+        raise WorkspacePublishProposalRejected(
+            "artifact_source_unsafe"
+        ) from error
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        raise WorkspacePublishProposalRejected(
+            "artifact_source_unopenable"
+        ) from error
+    raise error
+
+
+def _open_builder_stage(root: Path, relative: Path) -> int:
+    """Open a staged file without following any model-controlled symlink."""
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    # The run workspace root is engine-owned.  Failure to open it is an
+    # infrastructure/integrity error and therefore remains a raw OSError.
+    directory_descriptor = os.open(root, directory_flags)
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                child_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as error:
+                _raise_builder_stage_open_rejection(error)
+                raise AssertionError("unreachable")
+            os.close(directory_descriptor)
+            directory_descriptor = child_descriptor
+        file_flags = (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            return os.open(
+                relative.parts[-1],
+                file_flags,
+                dir_fd=directory_descriptor,
+            )
+        except OSError as error:
+            _raise_builder_stage_open_rejection(error)
+            raise AssertionError("unreachable")
+    finally:
+        os.close(directory_descriptor)
+
+
 def canonical_workspace_hash(
     engine: ChallengeEngine,
     identity: ChallengeIdentity,
     destination: str,
 ) -> str | None:
     paths = engine.store.challenge_paths(identity)
-    return _hash_file(
-        paths.artifacts / "workspace" / _safe_relative(destination)
+    destination_relative = _safe_relative(destination)
+    parent_descriptor = _canonical_parent_descriptor(
+        paths.artifacts / "workspace",
+        destination_relative.parent,
+        create=False,
     )
+    if parent_descriptor is None:
+        return None
+    try:
+        return _hash_file_at(
+            parent_descriptor,
+            destination_relative.name,
+        )
+    finally:
+        os.close(parent_descriptor)
 
 
 def _publish_builder_file_locked(
@@ -113,33 +283,54 @@ def _publish_builder_file_locked(
         raise EngineError("canonical workspace revision changed")
 
     paths = engine.store.challenge_paths(identity)
-    source_relative = _safe_relative(staged_path)
+    try:
+        source_relative = _safe_relative(staged_path)
+    except EngineError as error:
+        raise WorkspacePublishProposalRejected(
+            "artifact_source_unsafe"
+        ) from error
     destination_relative = _safe_relative(destination)
-    source = paths.runs / run_id / "workspace" / source_relative
-    canonical_root = paths.artifacts / "workspace"
-    canonical_root.mkdir(parents=True, exist_ok=True)
-    target = canonical_root / destination_relative
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if _hash_file(target) != base_sha256:
-        raise EngineError("workspace publish base hash changed")
-
-    flags = (
-        os.O_RDONLY
-        | os.O_CLOEXEC
-        | os.O_NONBLOCK
-        | getattr(os, "O_NOFOLLOW", 0)
+    source_root = paths.runs / run_id / "workspace"
+    source_descriptor = _open_builder_stage(
+        source_root,
+        source_relative,
     )
+    parent_descriptor: int | None = None
+    temporary_name: str | None = None
     try:
-        source_descriptor = os.open(source, flags)
-    except OSError as error:
-        raise EngineError(f"cannot open Builder stage: {error}") from error
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.publish")
-    publish_id = f"WP-{uuid.uuid4().hex[:20]}"
-    intent = paths.runtime / "workspace-publish-intents" / f"{publish_id}.json"
-    try:
-        digest, size, source_metadata = _hash_descriptor(source_descriptor)
+        # Complete all downgradeable source validation before creating any
+        # canonical destination directory or durable publication intent.
+        digest, size, source_metadata = _hash_descriptor(
+            source_descriptor,
+            builder_source=True,
+        )
         os.lseek(source_descriptor, 0, os.SEEK_SET)
-        if source_metadata.st_dev != target.parent.stat().st_dev:
+        canonical_root = paths.artifacts / "workspace"
+        parent_descriptor = _canonical_parent_descriptor(
+            canonical_root,
+            destination_relative.parent,
+            create=True,
+        )
+        assert parent_descriptor is not None
+        if (
+            _hash_file_at(
+                parent_descriptor,
+                destination_relative.name,
+            )
+            != base_sha256
+        ):
+            raise EngineError("workspace publish base hash changed")
+        temporary_name = (
+            f".{destination_relative.name}."
+            f"{uuid.uuid4().hex}.publish"
+        )
+        publish_id = f"WP-{uuid.uuid4().hex[:20]}"
+        intent = (
+            paths.runtime
+            / "workspace-publish-intents"
+            / f"{publish_id}.json"
+        )
+        if source_metadata.st_dev != os.fstat(parent_descriptor).st_dev:
             raise EngineError("workspace publish must remain on one filesystem")
         record = WorkspacePublish(
             id=publish_id,
@@ -154,15 +345,19 @@ def _publish_builder_file_locked(
         )
         atomic_write_json(intent, record.to_dict())
         target_descriptor = os.open(
-            temporary,
+            temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
             0o600,
+            dir_fd=parent_descriptor,
         )
         try:
             remaining = size
             while remaining:
                 block = os.read(source_descriptor, min(1024 * 1024, remaining))
                 if not block:
+                    # An intent already exists at this point.  Keep this fatal
+                    # so the normal reconciliation path, rather than managed
+                    # rejection recovery, owns the ambiguous publication.
                     raise EngineError("Builder stage was truncated during copy")
                 view = memoryview(block)
                 while view:
@@ -174,7 +369,7 @@ def _publish_builder_file_locked(
             os.fsync(target_descriptor)
         finally:
             os.close(target_descriptor)
-        if _hash_file(temporary) != digest:
+        if _hash_file_at(parent_descriptor, temporary_name) != digest:
             raise EngineError("workspace publish temporary hash mismatch")
         after = os.fstat(source_descriptor)
         if (
@@ -183,16 +378,16 @@ def _publish_builder_file_locked(
             or after.st_size != source_metadata.st_size
             or after.st_mtime_ns != source_metadata.st_mtime_ns
         ):
+            # The prepared intent is durable.  This cannot be downgraded to a
+            # model repair without first proving durable intent cleanup.
             raise EngineError("Builder stage changed during publish")
-        os.replace(temporary, target)
-        directory_descriptor = os.open(
-            target.parent,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        os.replace(
+            temporary_name,
+            destination_relative.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
         )
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        os.fsync(parent_descriptor)
 
         current = engine.store.load(identity)
         if current.workspace_revision != base_workspace_revision:
@@ -218,10 +413,16 @@ def _publish_builder_file_locked(
         return record
     finally:
         os.close(source_descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if parent_descriptor is not None and temporary_name is not None:
+            try:
+                os.unlink(
+                    temporary_name,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                pass
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def publish_builder_file(
@@ -284,12 +485,14 @@ def _reconcile_workspace_publishes_locked(
             intent.unlink()
             reconciled.append(record.id)
             continue
-        destination = (
-            paths.artifacts
-            / "workspace"
-            / _safe_relative(record.destination)
-        )
-        if _hash_file(destination) != record.sha256:
+        if (
+            canonical_workspace_hash(
+                engine,
+                identity,
+                record.destination,
+            )
+            != record.sha256
+        ):
             raise EngineError(
                 f"workspace publish destination is incomplete: {record.id}"
             )
@@ -334,6 +537,7 @@ def reconcile_workspace_publishes(
 
 __all__ = [
     "MAX_PUBLISH_BYTES",
+    "WorkspacePublishProposalRejected",
     "canonical_workspace_hash",
     "publish_builder_file",
     "reconcile_workspace_publishes",

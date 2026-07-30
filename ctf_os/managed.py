@@ -21,6 +21,14 @@ from ctf_os.capabilities import (
 )
 from ctf_os.codex import Role
 from ctf_os.codex.contracts import MANAGED_PWN_CRASH_ACTION_KIND
+from ctf_os.contracts.managed_rejection_v1 import (
+    MANAGED_REJECTION_V1_MAX_ATTEMPT,
+    MANAGED_REJECTION_V1_MAX_ISSUES,
+    MANAGED_REJECTION_V1_MAX_OMITTED,
+    ManagedRejectionV1ContractError,
+    build_managed_rejection_v1,
+    validate_managed_rejection_v1_mapping,
+)
 from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_CONTRACT_FINGERPRINT,
     PWN_CRASH_V1_CONTRACT_ID,
@@ -67,6 +75,7 @@ from ctf_os.schema import RUN_ENVELOPE_SCHEMA_VERSION, STATE_SCHEMA_VERSION
 from ctf_os.store import ChallengeLock, LockTimeout
 from ctf_os.store.atomic import atomic_write_json, read_json
 from ctf_os.workspace_publish import (
+    WorkspacePublishProposalRejected,
     canonical_workspace_hash,
     publish_builder_file,
     reconcile_workspace_publishes,
@@ -127,6 +136,115 @@ class PreflightReport:
             "checks": dict(self.checks),
             "issues": list(self.issues),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class BuilderPublishRejection:
+    run_id: str
+    proposal_ordinal: int
+    code: str
+
+
+@dataclass(frozen=True, slots=True)
+class BuilderPublishOutcome:
+    published_count: int
+    rejection: BuilderPublishRejection | None = None
+
+
+def _managed_rejection_issue_sort_key(
+    issue: Mapping[str, object],
+) -> tuple[object, ...]:
+    kind = issue.get("kind")
+    if kind == "role_output":
+        return (0, issue.get("pointer"), issue.get("code"))
+    if kind == "reported_artifact":
+        return (1, issue.get("pointer"), issue.get("code"))
+    return (
+        2,
+        issue.get("proposal_ordinal"),
+        issue.get("code"),
+    )
+
+
+def _merge_builder_publish_rejection(
+    existing: object,
+    *,
+    attempt: int,
+    proposal_ordinal: int,
+    code: str,
+) -> dict[str, object]:
+    publication = build_managed_rejection_v1(
+        role=Role.BUILDER.value,
+        attempt=attempt,
+        artifact_publication_rejections=(
+            {
+                "code": code,
+                "kind": "artifact_publication",
+                "proposal_ordinal": proposal_ordinal,
+            },
+        ),
+    )
+    if existing is None:
+        return publication
+    current = validate_managed_rejection_v1_mapping(existing)
+    if current["role"] != Role.BUILDER.value:
+        raise ManagedRejectionV1ContractError(
+            "Builder rejection role does not match its run"
+        )
+    new_issue = publication["issues"][0]
+    assert isinstance(new_issue, dict)
+    current_issues = current["issues"]
+    assert isinstance(current_issues, list)
+    combined = [
+        issue
+        for issue in current_issues
+        if not (
+            isinstance(issue, Mapping)
+            and issue.get("kind") == "artifact_publication"
+            and issue.get("proposal_ordinal") == proposal_ordinal
+        )
+    ]
+    combined.append(new_issue)
+    unique: dict[tuple[object, ...], dict[str, object]] = {}
+    for issue in combined:
+        assert isinstance(issue, dict)
+        unique.setdefault(
+            _managed_rejection_issue_sort_key(issue),
+            dict(issue),
+        )
+    ordered = sorted(
+        unique.values(),
+        key=_managed_rejection_issue_sort_key,
+    )
+    selected = ordered[:MANAGED_REJECTION_V1_MAX_ISSUES]
+    new_identity = _managed_rejection_issue_sort_key(new_issue)
+    if (
+        len(ordered) > MANAGED_REJECTION_V1_MAX_ISSUES
+        and all(
+            _managed_rejection_issue_sort_key(issue) != new_identity
+            for issue in selected
+        )
+    ):
+        selected = sorted(
+            [
+                *selected[: MANAGED_REJECTION_V1_MAX_ISSUES - 1],
+                new_issue,
+            ],
+            key=_managed_rejection_issue_sort_key,
+        )
+    merged = {
+        "attempt": max(int(current["attempt"]), attempt),
+        "authority": publication["authority"],
+        "issues": selected,
+        "omitted_count": min(
+            MANAGED_REJECTION_V1_MAX_OMITTED,
+            int(current["omitted_count"])
+            + max(0, len(ordered) - len(selected)),
+        ),
+        "role": Role.BUILDER.value,
+        "schema_version": publication["schema_version"],
+    }
+    return validate_managed_rejection_v1_mapping(merged)
 
 
 def _stable_id(prefix: str, *parts: object) -> str:
@@ -831,11 +949,12 @@ class ManagedOrchestrator:
     def _apply_builder_publishes(
         self,
         identity: ChallengeIdentity,
+        wave: ManagedWave,
         results: Sequence[Any],
-    ) -> None:
+    ) -> BuilderPublishOutcome:
         """Promote only explicit Builder ``write_artifact`` proposals."""
 
-        proposals: list[tuple[str, str]] = []
+        proposals: list[tuple[str, str, int, int]] = []
         for result in results:
             if result.invocation.role is not Role.BUILDER:
                 continue
@@ -847,32 +966,153 @@ class ManagedOrchestrator:
             )
             if not isinstance(actions, list):
                 continue
+            proposal_ordinal = 0
             for action in actions:
                 if (
                     isinstance(action, Mapping)
                     and action.get("kind") == "write_artifact"
                     and isinstance(action.get("artifact_path"), str)
                 ):
+                    proposal_ordinal += 1
                     proposals.append(
-                        (result.invocation.run_id, action["artifact_path"])
+                        (
+                            result.invocation.run_id,
+                            action["artifact_path"],
+                            proposal_ordinal,
+                            max(
+                                1,
+                                min(
+                                    MANAGED_REJECTION_V1_MAX_ATTEMPT,
+                                    len(result.attempts),
+                                ),
+                            ),
+                        )
                     )
         if len(proposals) > 8:
             raise ManagedError("Builder proposed too many workspace publishes")
-        for run_id, relative in proposals:
+        published_count = 0
+        for run_id, relative, proposal_ordinal, attempt in proposals:
             state = self.engine.store.load(identity)
-            publish_builder_file(
-                self.engine,
-                identity,
-                run_id=run_id,
-                staged_path=relative,
-                destination=relative,
-                base_workspace_revision=state.workspace_revision,
-                base_sha256=canonical_workspace_hash(
+            try:
+                publish_builder_file(
                     self.engine,
                     identity,
-                    relative,
-                ),
-            )
+                    run_id=run_id,
+                    staged_path=relative,
+                    destination=relative,
+                    base_workspace_revision=state.workspace_revision,
+                    base_sha256=canonical_workspace_hash(
+                        self.engine,
+                        identity,
+                        relative,
+                    ),
+                )
+            except WorkspacePublishProposalRejected as error:
+                rejection = BuilderPublishRejection(
+                    run_id=run_id,
+                    proposal_ordinal=proposal_ordinal,
+                    code=error.code,
+                )
+                current = self.engine.store.load(identity)
+
+                def record_rejection(latest: ChallengeState) -> None:
+                    self._require_epoch(latest, wave.session_id)
+                    canonical_wave = next(
+                        (
+                            item
+                            for item in latest.waves
+                            if item.id == wave.id
+                        ),
+                        None,
+                    )
+                    if (
+                        canonical_wave is None
+                        or canonical_wave.cycle_id != wave.cycle_id
+                        or canonical_wave.role_run_ids
+                        != wave.role_run_ids
+                        or run_id
+                        != canonical_wave.role_run_ids.get(
+                            Role.BUILDER.value
+                        )
+                    ):
+                        raise ManagedError(
+                            "Builder publication rejection lost its "
+                            "canonical wave binding"
+                        )
+                    builder_run = next(
+                        (
+                            run
+                            for run in latest.runs
+                            if run.id == run_id
+                        ),
+                        None,
+                    )
+                    if (
+                        builder_run is None
+                        or builder_run.role != Role.BUILDER.value
+                        or builder_run.status is not RunStatus.COMPLETED
+                        or builder_run.origin
+                        is not RunOrigin.MANAGED_MODEL
+                    ):
+                        raise ManagedError(
+                            "Builder publication rejection lost its "
+                            "canonical run binding"
+                        )
+                    try:
+                        builder_run.extra["managed_rejection_v1"] = (
+                            _merge_builder_publish_rejection(
+                                builder_run.extra.get(
+                                    "managed_rejection_v1"
+                                ),
+                                attempt=attempt,
+                                proposal_ordinal=proposal_ordinal,
+                                code=error.code,
+                            )
+                        )
+                    except ManagedRejectionV1ContractError as contract_error:
+                        raise ManagedError(
+                            "Builder publication rejection could not be "
+                            "represented safely"
+                        ) from contract_error
+                    cycle = next(
+                        (
+                            item
+                            for item in latest.cycles
+                            if item.id == canonical_wave.cycle_id
+                        ),
+                        None,
+                    )
+                    if cycle is None:
+                        raise ManagedError(
+                            "Builder publication rejection lost its cycle"
+                        )
+                    cycle.selected_action_ids = []
+                    wave_run_ids = set(
+                        canonical_wave.role_run_ids.values()
+                    )
+                    for experiment in latest.experiments:
+                        if (
+                            experiment.source_run_id in wave_run_ids
+                            and experiment.status
+                            is ExperimentStatus.REGISTERED
+                        ):
+                            experiment.status = ExperimentStatus.CANCELLED
+                            experiment.extra["cancelled_at"] = utc_now()
+                            experiment.extra["cancelled_reason"] = (
+                                "builder_publish_rejected"
+                            )
+
+                self.engine.store.update(
+                    identity,
+                    record_rejection,
+                    expected_revision=current.revision,
+                )
+                return BuilderPublishOutcome(
+                    published_count=published_count,
+                    rejection=rejection,
+                )
+            published_count += 1
+        return BuilderPublishOutcome(published_count=published_count)
 
     def _register_pwn_crash_actions(
         self,
@@ -1937,7 +2177,22 @@ class ManagedOrchestrator:
                     ),
                     note=note,
                 )
-            self._apply_builder_publishes(identity, outcome.results)
+            publish_outcome = self._apply_builder_publishes(
+                identity,
+                wave,
+                outcome.results,
+            )
+            if publish_outcome.rejection is not None:
+                return self._checkpoint_invalid_cycle(
+                    identity,
+                    selected_session,
+                    cycle.id,
+                    reason_code="builder_publish_rejected",
+                    reason=(
+                        "Builder artifact publication proposal was rejected"
+                    ),
+                    note=note,
+                )
             self._register_pwn_crash_actions(
                 identity,
                 wave,
