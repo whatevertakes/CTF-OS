@@ -22,24 +22,37 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, NoReturn
 
 from ctf_os.capabilities import REQUIRED_MANAGED_ATTESTATIONS
 from ctf_os.contracts.pwn_crash_v1 import (
+    PWN_CRASH_V1_ALLOWED_SIGNALS,
     PWN_CRASH_V1_ATTEMPT_COUNT,
     PWN_CRASH_V1_CONTRACT_FINGERPRINT,
     PWN_CRASH_V1_CONTRACT_ID,
     PWN_CRASH_V1_CONTRACT_VERSION,
     PWN_CRASH_V1_CONTROL_ATTEMPTS,
     PWN_CRASH_V1_DOCUMENT_TRANSPORT,
+    PWN_CRASH_V1_FAILURE_CODES,
     PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES,
     PWN_CRASH_V1_MAX_INPUT_BYTES,
     PWN_CRASH_V1_MAX_SOURCE_BYTES,
     PWN_CRASH_V1_POSITIVE_ATTEMPTS,
+    PWN_CRASH_V1_PRODUCER_ERROR_REASONS,
     PWN_CRASH_V1_PROTOCOL,
+    PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES,
+    PWN_CRASH_V1_SCHEMA_VERSION,
+    PWN_CRASH_V1_SEMANTIC_REASONS,
     PWN_CRASH_V1_TARGET_TIMEOUT_SECONDS,
     PwnCrashV1Evaluation,
+    PwnCrashV1Failure,
+    PwnCrashV1Observation,
+    PwnCrashV1PlanInput,
+    PwnCrashV1Verdict,
     evaluate_pwn_crash_v1,
+    parse_pwn_crash_v1_observation,
+    pwn_crash_v1_canonical_json_bytes,
     pwn_crash_v1_contract_descriptor,
 )
 
@@ -58,16 +71,48 @@ PWN_CRASH_NETWORK_POLICY = "none"
 PWN_CRASH_INPUT_DESTINATION_LOCATOR = "pwn-crash-v1/input.bin"
 PWN_CRASH_INPUT_ARGUMENT = f"/work/{PWN_CRASH_INPUT_DESTINATION_LOCATOR}"
 PWN_CRASH_ONE_SHOT = True
+PWN_CRASH_CAPABILITY_PROBE_CONTRACT = (
+    "ctfos.inspect_pinned_capabilities.v1"
+)
+PWN_CRASH_GATE_EVALUATION_SCHEMA_VERSION = 1
 PWN_CRASH_MAX_RECIPE_BYTES = 64 * 1024
 PWN_CRASH_MAX_IDENTIFIER_BYTES = 512
 PWN_CRASH_MAX_LOCATOR_BYTES = 4096
 PWN_CRASH_MAX_IMAGE_REFERENCE_BYTES = 512
 PWN_CRASH_MAX_JSON_DEPTH = 16
 PWN_CRASH_MAX_JSON_NODES = 2048
+PWN_CRASH_MAX_GATE_EVALUATION_BYTES = (
+    PWN_CRASH_V1_MAX_EVIDENCE_BYTES + (64 * 1024)
+)
+PWN_CRASH_ARGV_TEMPLATE = (
+    PWN_CRASH_PRODUCER_INTERPRETER_PATH,
+    PWN_CRASH_PRODUCER_PATH,
+    "--binary",
+    "/challenge/{primary_elf_locator}",
+    "--input",
+    "{input_argument}",
+    "--ordinal",
+    "{ordinal}",
+    "--phase",
+    "{phase}",
+    "--source-manifest-sha256",
+    "{source_manifest_sha256}",
+    "--source-sha256",
+    "{source_sha256}",
+    "--source-size-bytes",
+    "{source_size_bytes}",
+    "--input-sha256",
+    "{input_sha256}",
+    "--input-size-bytes",
+    "{input_size_bytes}",
+    "--recipe-sha256",
+    "{recipe_sha256}",
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}$")
+_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _RECIPE_TOP_LEVEL_KEYS = frozenset(
     {
@@ -100,10 +145,13 @@ _RECIPE_PAYLOAD_KEYS = frozenset(
 _RECIPE_RUNTIME_KEYS = frozenset(
     {
         "attempt_plan",
+        "argv_template",
         "control_attempts",
         "document_transport",
         "execution_profile",
         "image",
+        "input_argument",
+        "input_destination_locator",
         "network",
         "one_shot",
         "positive_attempts",
@@ -130,10 +178,14 @@ _RECEIPT_KEYS = frozenset(
         "outcome",
         "producer_capability_name",
         "producer_file_sha256",
+        "request_sha256",
         "receipt_id",
         "recipe_sha256",
         "run_id",
         "sandbox_method",
+        "execution_contract_sha256",
+        "capability_attestation_artifact_id",
+        "capability_attestation_sha256",
         "stdout_artifact_id",
         "stdout_artifact_sha256",
         "stdout_artifact_size_bytes",
@@ -146,6 +198,84 @@ _RECEIPT_KEYS = frozenset(
         "stream_capture_error",
         "timed_out",
     }
+)
+_CAPABILITY_ATTESTATION_KEYS = frozenset(
+    {
+        "attestation",
+        "capability_name",
+        "image_digest",
+        "probe_contract",
+        "recipe_sha256",
+        "schema_version",
+    }
+)
+_CAPABILITY_ATTESTATION_VALUE_KEYS = frozenset(
+    {
+        "contract_id",
+        "contract_version",
+        "path",
+        "schema_version",
+        "sha256",
+    }
+)
+_GATE_EVALUATION_KEYS = frozenset(
+    {
+        "failures",
+        "passed",
+        "reason_code",
+        "schema_version",
+        "semantic_evaluation",
+        "transport_error",
+        "verdict",
+    }
+)
+_GATE_FAILURE_KEYS = frozenset(
+    {"attempt_ordinal", "code", "producer_reason"}
+)
+_GATE_TRANSPORT_ERROR_KEYS = frozenset({"code", "ordinal"})
+_SEMANTIC_EVALUATION_KEYS = frozenset(
+    {
+        "binding",
+        "contract",
+        "failure_codes",
+        "failures",
+        "observations",
+        "passed",
+        "plan",
+        "protocol",
+        "reason_code",
+        "schema_version",
+        "stats",
+        "verdict",
+    }
+)
+_SEMANTIC_BINDING_KEYS = frozenset(
+    {
+        "poc_sha256",
+        "poc_size_bytes",
+        "recipe_sha256",
+        "source_manifest_sha256",
+        "source_sha256",
+        "source_size_bytes",
+    }
+)
+_SEMANTIC_CONTRACT_KEYS = frozenset(
+    {"fingerprint", "id", "version"}
+)
+_SEMANTIC_PLAN_KEYS = frozenset(
+    {"input_sha256", "input_size_bytes", "ordinal", "phase"}
+)
+_SEMANTIC_STATS_KEYS = frozenset(
+    {
+        "control_abnormal_terminations",
+        "control_attempts",
+        "positive_attempts",
+        "positive_signal_counts",
+        "required_positive_successes",
+    }
+)
+_SEMANTIC_SIGNAL_COUNT_KEYS = frozenset(
+    {"count", "signal_number"}
 )
 _RECEIPT_OUTCOMES = frozenset(
     {"succeeded", "failed", "timed_out", "cancelled", "interrupted"}
@@ -171,6 +301,22 @@ class PwnCrashTransportError(ValueError):
         self.ordinal = ordinal
 
 
+class PwnCrashCapabilityAttestationError(ValueError):
+    """A capability report cannot attest the pinned Pwn crash producer."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class PwnCrashGateEvaluationError(ValueError):
+    """A persisted aggregate gate evaluation is not canonical."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return (
         json.dumps(
@@ -182,6 +328,153 @@ def _canonical_json_bytes(value: object) -> bytes:
         )
         + "\n"
     ).encode("ascii")
+
+
+def _expected_producer_attestation() -> dict[str, object]:
+    raw = REQUIRED_MANAGED_ATTESTATIONS.get(
+        PWN_CRASH_PRODUCER_CAPABILITY_NAME
+    )
+    if type(raw) is not dict:
+        raise AssertionError("Pwn crash producer attestation is unavailable")
+    return dict(raw)
+
+
+@dataclass(frozen=True, slots=True)
+class PwnCrashCapabilityAttestation:
+    """Canonical durable subset of one successful pinned-image probe."""
+
+    image_digest: str
+    recipe_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.image_digest) is not str
+            or _IMAGE_DIGEST.fullmatch(self.image_digest) is None
+        ):
+            raise PwnCrashCapabilityAttestationError(
+                "invalid_image_digest"
+            )
+        if (
+            type(self.recipe_sha256) is not str
+            or _SHA256.fullmatch(self.recipe_sha256) is None
+        ):
+            raise PwnCrashCapabilityAttestationError(
+                "invalid_recipe_sha256"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "attestation": _expected_producer_attestation(),
+            "capability_name": PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+            "image_digest": self.image_digest,
+            "probe_contract": PWN_CRASH_CAPABILITY_PROBE_CONTRACT,
+            "recipe_sha256": self.recipe_sha256,
+            "schema_version": 1,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.to_dict())
+
+    @property
+    def evidence_sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> "PwnCrashCapabilityAttestation":
+        if type(value) is not dict or set(value) != (
+            _CAPABILITY_ATTESTATION_KEYS
+        ):
+            raise PwnCrashCapabilityAttestationError(
+                "invalid_attestation_schema"
+            )
+        attestation = value.get("attestation")
+        if (
+            type(attestation) is not dict
+            or set(attestation) != _CAPABILITY_ATTESTATION_VALUE_KEYS
+            or attestation != _expected_producer_attestation()
+            or type(value.get("schema_version")) is not int
+            or value.get("schema_version") != 1
+            or value.get("probe_contract")
+            != PWN_CRASH_CAPABILITY_PROBE_CONTRACT
+            or value.get("capability_name")
+            != PWN_CRASH_PRODUCER_CAPABILITY_NAME
+        ):
+            raise PwnCrashCapabilityAttestationError(
+                "attestation_contract_mismatch"
+            )
+        try:
+            result = cls(
+                image_digest=value["image_digest"],
+                recipe_sha256=value["recipe_sha256"],
+            )
+        except KeyError as error:
+            raise PwnCrashCapabilityAttestationError(
+                "invalid_attestation_schema"
+            ) from error
+        if _canonical_json_bytes(value) != result.canonical_bytes():
+            raise PwnCrashCapabilityAttestationError(
+                "attestation_contract_mismatch"
+            )
+        return result
+
+
+def normalize_pwn_crash_capability_attestation(
+    report: Mapping[str, object],
+    *,
+    image_digest: str,
+    recipe_sha256: str,
+) -> PwnCrashCapabilityAttestation:
+    """Validate a live managed-capability report and retain its exact subset."""
+
+    try:
+        normalized = PwnCrashCapabilityAttestation(
+            image_digest=image_digest,
+            recipe_sha256=recipe_sha256,
+        )
+    except PwnCrashCapabilityAttestationError:
+        raise
+    if type(report) is not dict:
+        raise PwnCrashCapabilityAttestationError(
+            "invalid_capability_report"
+        )
+    if report.get("ok") is not True:
+        raise PwnCrashCapabilityAttestationError(
+            "capability_probe_failed"
+        )
+    if report.get("image_digest") != image_digest:
+        raise PwnCrashCapabilityAttestationError(
+            "capability_image_mismatch"
+        )
+    available = report.get("available")
+    if (
+        type(available) is not list
+        or any(type(item) is not str for item in available)
+        or PWN_CRASH_PRODUCER_CAPABILITY_NAME not in available
+    ):
+        raise PwnCrashCapabilityAttestationError(
+            "capability_unavailable"
+        )
+    attestations = report.get("attestations")
+    if (
+        type(attestations) is not dict
+        or attestations.get(PWN_CRASH_PRODUCER_CAPABILITY_NAME)
+        != _expected_producer_attestation()
+    ):
+        raise PwnCrashCapabilityAttestationError(
+            "capability_attestation_mismatch"
+        )
+    errors = report.get("attestation_errors")
+    if (
+        type(errors) is not dict
+        or PWN_CRASH_PRODUCER_CAPABILITY_NAME in errors
+    ):
+        raise PwnCrashCapabilityAttestationError(
+            "capability_attestation_error"
+        )
+    return normalized
 
 
 def _validate_json_tree(value: object) -> None:
@@ -483,6 +776,7 @@ class PwnCrashRecipe:
                     self.payload_sha256,
                     self.payload_size_bytes,
                 ),
+                "argv_template": list(PWN_CRASH_ARGV_TEMPLATE),
                 "control_attempts": PWN_CRASH_V1_CONTROL_ATTEMPTS,
                 "document_transport": PWN_CRASH_V1_DOCUMENT_TRANSPORT,
                 "execution_profile": _execution_profile(),
@@ -490,6 +784,10 @@ class PwnCrashRecipe:
                     "digest": self.image_digest,
                     "reference": self.image_reference,
                 },
+                "input_argument": PWN_CRASH_INPUT_ARGUMENT,
+                "input_destination_locator": (
+                    PWN_CRASH_INPUT_DESTINATION_LOCATOR
+                ),
                 "network": PWN_CRASH_NETWORK_POLICY,
                 "one_shot": PWN_CRASH_ONE_SHOT,
                 "positive_attempts": PWN_CRASH_V1_POSITIVE_ATTEMPTS,
@@ -629,30 +927,27 @@ class PwnCrashRecipe:
         """Generate the only producer argv accepted for this recipe."""
 
         binding = self.attempt_input_binding(ordinal)
-        return (
-            PWN_CRASH_PRODUCER_INTERPRETER_PATH,
-            PWN_CRASH_PRODUCER_PATH,
-            "--binary",
-            f"/challenge/{self.primary_elf_locator}",
-            "--input",
-            PWN_CRASH_INPUT_ARGUMENT,
-            "--ordinal",
-            str(binding["ordinal"]),
-            "--phase",
-            str(binding["phase"]),
-            "--source-manifest-sha256",
-            self.source_manifest_sha256,
-            "--source-sha256",
-            self.source_sha256,
-            "--source-size-bytes",
-            str(self.source_size_bytes),
-            "--input-sha256",
-            str(binding["input_sha256"]),
-            "--input-size-bytes",
-            str(binding["input_size_bytes"]),
-            "--recipe-sha256",
-            self.recipe_sha256,
-        )
+        values = {
+            "input_argument": PWN_CRASH_INPUT_ARGUMENT,
+            "input_sha256": str(binding["input_sha256"]),
+            "input_size_bytes": str(binding["input_size_bytes"]),
+            "ordinal": str(binding["ordinal"]),
+            "phase": str(binding["phase"]),
+            "primary_elf_locator": self.primary_elf_locator,
+            "recipe_sha256": self.recipe_sha256,
+            "source_manifest_sha256": self.source_manifest_sha256,
+            "source_sha256": self.source_sha256,
+            "source_size_bytes": str(self.source_size_bytes),
+        }
+        try:
+            return tuple(
+                token.format_map(values)
+                for token in PWN_CRASH_ARGV_TEMPLATE
+            )
+        except (KeyError, ValueError) as error:
+            raise AssertionError(
+                "invalid engine-owned Pwn crash argv template"
+            ) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,6 +967,10 @@ class PwnCrashReceiptMetadata:
     configuration_epoch: int
     image_digest: str
     recipe_sha256: str
+    request_sha256: str
+    execution_contract_sha256: str
+    capability_attestation_artifact_id: str
+    capability_attestation_sha256: str
     producer_capability_name: str
     producer_file_sha256: str
     stdout_artifact_id: str | None
@@ -731,10 +1030,20 @@ class PwnCrashReceiptMetadata:
             or _IMAGE_DIGEST.fullmatch(self.image_digest) is None
         ):
             raise ValueError("invalid receipt image_digest")
-        for name in ("recipe_sha256", "producer_file_sha256"):
+        for name in (
+            "recipe_sha256",
+            "request_sha256",
+            "execution_contract_sha256",
+            "capability_attestation_sha256",
+            "producer_file_sha256",
+        ):
             value = getattr(self, name)
             if type(value) is not str or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"invalid receipt {name}")
+        _receipt_identifier(
+            self.capability_attestation_artifact_id,
+            "capability_attestation_artifact_id",
+        )
         _receipt_text(
             self.producer_capability_name,
             "producer_capability_name",
@@ -775,6 +1084,15 @@ class PwnCrashReceiptMetadata:
                 self.durable_stdout_artifact_complete
             ),
             "exit_code": self.exit_code,
+            "execution_contract_sha256": (
+                self.execution_contract_sha256
+            ),
+            "capability_attestation_artifact_id": (
+                self.capability_attestation_artifact_id
+            ),
+            "capability_attestation_sha256": (
+                self.capability_attestation_sha256
+            ),
             "image_digest": self.image_digest,
             "network": self.network,
             "one_shot": self.one_shot,
@@ -785,6 +1103,7 @@ class PwnCrashReceiptMetadata:
             "producer_file_sha256": self.producer_file_sha256,
             "receipt_id": self.receipt_id,
             "recipe_sha256": self.recipe_sha256,
+            "request_sha256": self.request_sha256,
             "run_id": self.run_id,
             "sandbox_method": self.sandbox_method,
             "stdout_artifact_id": self.stdout_artifact_id,
@@ -907,6 +1226,13 @@ def evaluate_pwn_crash_evidence(
     run_ids: set[str] = set()
     receipt_ids: set[str] = set()
     artifact_ids: set[str] = set()
+    request_hashes: set[str] = set()
+    execution_contract_hashes: set[str] = set()
+    capability_binding: tuple[str, str] | None = None
+    expected_capability_sha256 = PwnCrashCapabilityAttestation(
+        image_digest=recipe.image_digest,
+        recipe_sha256=recipe.recipe_sha256,
+    ).evidence_sha256
     for ordinal, (payload, receipt) in enumerate(
         zip(payload_values, normalized_receipts, strict=True),
         start=1,
@@ -938,6 +1264,38 @@ def evaluate_pwn_crash_evidence(
             )
         run_ids.add(receipt.run_id)
         receipt_ids.add(receipt.receipt_id)
+        if receipt.request_sha256 in request_hashes:
+            raise PwnCrashTransportError(
+                "duplicate_request_sha256",
+                ordinal=ordinal,
+            )
+        if (
+            receipt.execution_contract_sha256
+            in execution_contract_hashes
+        ):
+            raise PwnCrashTransportError(
+                "duplicate_execution_contract_sha256",
+                ordinal=ordinal,
+            )
+        request_hashes.add(receipt.request_sha256)
+        execution_contract_hashes.add(
+            receipt.execution_contract_sha256
+        )
+        current_capability_binding = (
+            receipt.capability_attestation_artifact_id,
+            receipt.capability_attestation_sha256,
+        )
+        if capability_binding is None:
+            capability_binding = current_capability_binding
+        if (
+            current_capability_binding != capability_binding
+            or receipt.capability_attestation_sha256
+            != expected_capability_sha256
+        ):
+            raise PwnCrashTransportError(
+                "capability_attestation_binding_mismatch",
+                ordinal=ordinal,
+            )
 
         if receipt.outcome != "succeeded" or receipt.exit_code != 0:
             raise PwnCrashTransportError(
@@ -1072,7 +1430,749 @@ def evaluate_pwn_crash_evidence(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PwnCrashGateFailure:
+    """One stable failure entry in an aggregate gate evaluation."""
+
+    code: str
+    attempt_ordinal: int | None = None
+    producer_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.code) is not str
+            or _REASON_CODE.fullmatch(self.code) is None
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_code"
+            )
+        if self.attempt_ordinal is not None and (
+            type(self.attempt_ordinal) is not int
+            or not 1
+            <= self.attempt_ordinal
+            <= PWN_CRASH_V1_ATTEMPT_COUNT
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_ordinal"
+            )
+        if self.producer_reason is not None and (
+            type(self.producer_reason) is not str
+            or self.producer_reason
+            not in PWN_CRASH_V1_PRODUCER_ERROR_REASONS
+            or self.code != "producer_error"
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_producer_reason"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "attempt_ordinal": self.attempt_ordinal,
+            "code": self.code,
+            "producer_reason": self.producer_reason,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> "PwnCrashGateFailure":
+        if type(value) is not dict or set(value) != _GATE_FAILURE_KEYS:
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_schema"
+            )
+        try:
+            result = cls(
+                code=value["code"],
+                attempt_ordinal=value["attempt_ordinal"],
+                producer_reason=value["producer_reason"],
+            )
+        except KeyError as error:
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_schema"
+            ) from error
+        if _canonical_json_bytes(value) != _canonical_json_bytes(
+            result.to_dict()
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_failure_schema"
+            )
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class PwnCrashGateTransportError:
+    """Stable, non-producer-controlled transport error projection."""
+
+    code: str
+    ordinal: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.code) is not str
+            or _REASON_CODE.fullmatch(self.code) is None
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_transport_error_code"
+            )
+        if self.ordinal is not None and (
+            type(self.ordinal) is not int
+            or not 1 <= self.ordinal <= PWN_CRASH_V1_ATTEMPT_COUNT
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_transport_error_ordinal"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {"code": self.code, "ordinal": self.ordinal}
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> "PwnCrashGateTransportError":
+        if (
+            type(value) is not dict
+            or set(value) != _GATE_TRANSPORT_ERROR_KEYS
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_transport_error_schema"
+            )
+        try:
+            result = cls(
+                code=value["code"],
+                ordinal=value["ordinal"],
+            )
+        except KeyError as error:
+            raise PwnCrashGateEvaluationError(
+                "invalid_transport_error_schema"
+            ) from error
+        if _canonical_json_bytes(value) != _canonical_json_bytes(
+            result.to_dict()
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_transport_error_schema"
+            )
+        return result
+
+
+def _gate_fail(code: str) -> NoReturn:
+    raise PwnCrashGateEvaluationError(code)
+
+
+def _gate_exact_dict(
+    value: object,
+    keys: frozenset[str],
+    code: str,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != keys:
+        _gate_fail(code)
+    return value
+
+
+def _gate_sha256(value: object, code: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        _gate_fail(code)
+    return value
+
+
+def _gate_size(value: object, maximum: int, code: str) -> int:
+    if type(value) is not int or not 0 <= value <= maximum:
+        _gate_fail(code)
+    return value
+
+
+def _validate_gate_tree(value: object) -> None:
+    pending: list[tuple[object, int]] = [(value, 1)]
+    nodes = 0
+    text_units = 0
+    while pending:
+        current, depth = pending.pop()
+        nodes += 1
+        if depth > 24 or nodes > 16_384:
+            _gate_fail("gate_evaluation_structure_exceeded")
+        if type(current) is dict:
+            for key, item in current.items():
+                if type(key) is not str:
+                    _gate_fail("invalid_gate_evaluation_schema")
+                text_units += len(key)
+                pending.append((item, depth + 1))
+        elif type(current) is list:
+            pending.extend((item, depth + 1) for item in current)
+        elif type(current) is str:
+            text_units += len(current)
+        elif type(current) not in {int, bool, type(None)}:
+            _gate_fail("invalid_gate_evaluation_schema")
+        if text_units > PWN_CRASH_MAX_GATE_EVALUATION_BYTES:
+            _gate_fail("gate_evaluation_size_exceeded")
+
+
+def _semantic_failure_from_dict(
+    value: object,
+) -> PwnCrashV1Failure:
+    raw = _gate_exact_dict(
+        value,
+        _GATE_FAILURE_KEYS,
+        "invalid_semantic_failure_schema",
+    )
+    code = raw.get("code")
+    ordinal = raw.get("attempt_ordinal")
+    producer_reason = raw.get("producer_reason")
+    if type(code) is not str or code not in PWN_CRASH_V1_FAILURE_CODES:
+        _gate_fail("invalid_semantic_failure_code")
+    if ordinal is not None and (
+        type(ordinal) is not int
+        or not 1 <= ordinal <= PWN_CRASH_V1_ATTEMPT_COUNT
+    ):
+        _gate_fail("invalid_semantic_failure_ordinal")
+    if producer_reason is not None and (
+        type(producer_reason) is not str
+        or producer_reason not in PWN_CRASH_V1_PRODUCER_ERROR_REASONS
+        or code != "producer_error"
+    ):
+        _gate_fail("invalid_semantic_producer_reason")
+    return PwnCrashV1Failure(
+        code=code,
+        attempt_ordinal=ordinal,
+        producer_reason=producer_reason,
+    )
+
+
+def _parse_semantic_evaluation(
+    value: object,
+) -> PwnCrashV1Evaluation:
+    root = _gate_exact_dict(
+        value,
+        _SEMANTIC_EVALUATION_KEYS,
+        "invalid_semantic_evaluation_schema",
+    )
+    binding = _gate_exact_dict(
+        root.get("binding"),
+        _SEMANTIC_BINDING_KEYS,
+        "invalid_semantic_binding_schema",
+    )
+    contract = _gate_exact_dict(
+        root.get("contract"),
+        _SEMANTIC_CONTRACT_KEYS,
+        "invalid_semantic_contract_schema",
+    )
+    stats = _gate_exact_dict(
+        root.get("stats"),
+        _SEMANTIC_STATS_KEYS,
+        "invalid_semantic_stats_schema",
+    )
+    if (
+        type(root.get("schema_version")) is not int
+        or root.get("schema_version") != PWN_CRASH_V1_SCHEMA_VERSION
+        or root.get("protocol") != PWN_CRASH_V1_PROTOCOL
+        or contract
+        != {
+            "fingerprint": PWN_CRASH_V1_CONTRACT_FINGERPRINT,
+            "id": PWN_CRASH_V1_CONTRACT_ID,
+            "version": PWN_CRASH_V1_CONTRACT_VERSION,
+        }
+    ):
+        _gate_fail("semantic_contract_mismatch")
+
+    source_manifest_sha256 = _gate_sha256(
+        binding.get("source_manifest_sha256"),
+        "invalid_semantic_source_manifest_sha256",
+    )
+    source_sha256 = _gate_sha256(
+        binding.get("source_sha256"),
+        "invalid_semantic_source_sha256",
+    )
+    source_size_bytes = _gate_size(
+        binding.get("source_size_bytes"),
+        PWN_CRASH_V1_MAX_SOURCE_BYTES,
+        "invalid_semantic_source_size_bytes",
+    )
+    poc_sha256 = _gate_sha256(
+        binding.get("poc_sha256"),
+        "invalid_semantic_poc_sha256",
+    )
+    poc_size_bytes = _gate_size(
+        binding.get("poc_size_bytes"),
+        PWN_CRASH_V1_MAX_INPUT_BYTES,
+        "invalid_semantic_poc_size_bytes",
+    )
+    if poc_size_bytes == 0:
+        _gate_fail("invalid_semantic_poc_size_bytes")
+    recipe_sha256 = _gate_sha256(
+        binding.get("recipe_sha256"),
+        "invalid_semantic_recipe_sha256",
+    )
+
+    plan_value = root.get("plan")
+    if (
+        type(plan_value) is not list
+        or len(plan_value) != PWN_CRASH_V1_ATTEMPT_COUNT
+    ):
+        _gate_fail("invalid_semantic_plan")
+    plan: list[PwnCrashV1PlanInput] = []
+    for ordinal, item in enumerate(plan_value, start=1):
+        raw = _gate_exact_dict(
+            item,
+            _SEMANTIC_PLAN_KEYS,
+            "invalid_semantic_plan",
+        )
+        expected_phase = "positive" if ordinal <= 3 else "control"
+        expected_sha256 = (
+            poc_sha256 if ordinal <= 3 else _EMPTY_SHA256
+        )
+        expected_size = poc_size_bytes if ordinal <= 3 else 0
+        if (
+            type(raw.get("ordinal")) is not int
+            or raw.get("ordinal") != ordinal
+            or raw.get("phase") != expected_phase
+            or raw.get("input_sha256") != expected_sha256
+            or type(raw.get("input_size_bytes")) is not int
+            or raw.get("input_size_bytes") != expected_size
+        ):
+            _gate_fail("invalid_semantic_plan")
+        plan.append(
+            PwnCrashV1PlanInput(
+                ordinal=ordinal,
+                phase=expected_phase,
+                input_sha256=expected_sha256,
+                input_size_bytes=expected_size,
+            )
+        )
+
+    observations_value = root.get("observations")
+    if (
+        type(observations_value) is not list
+        or len(observations_value) > PWN_CRASH_V1_ATTEMPT_COUNT
+    ):
+        _gate_fail("invalid_semantic_observations")
+    observations: list[PwnCrashV1Observation] = []
+    for item in observations_value:
+        try:
+            observation = parse_pwn_crash_v1_observation(
+                pwn_crash_v1_canonical_json_bytes(item)
+            )
+        except (TypeError, ValueError) as error:
+            raise PwnCrashGateEvaluationError(
+                "invalid_semantic_observation"
+            ) from error
+        if observation.to_dict() != item:
+            _gate_fail("invalid_semantic_observation")
+        observations.append(observation)
+
+    failures_value = root.get("failures")
+    if type(failures_value) is not list or len(failures_value) > 64:
+        _gate_fail("invalid_semantic_failures")
+    failures = tuple(
+        _semantic_failure_from_dict(item)
+        for item in failures_value
+    )
+    failure_codes = root.get("failure_codes")
+    expected_failure_codes = list(
+        dict.fromkeys(item.code for item in failures)
+    )
+    if (
+        type(failure_codes) is not list
+        or any(type(item) is not str for item in failure_codes)
+        or failure_codes != expected_failure_codes
+    ):
+        _gate_fail("invalid_semantic_failure_codes")
+
+    verdict_value = root.get("verdict")
+    try:
+        verdict = PwnCrashV1Verdict(verdict_value)
+    except (TypeError, ValueError) as error:
+        raise PwnCrashGateEvaluationError(
+            "invalid_semantic_verdict"
+        ) from error
+    reason_code = root.get("reason_code")
+    if (
+        type(reason_code) is not str
+        or (
+            reason_code not in PWN_CRASH_V1_FAILURE_CODES
+            and reason_code not in PWN_CRASH_V1_SEMANTIC_REASONS
+        )
+    ):
+        _gate_fail("invalid_semantic_reason_code")
+    if (
+        type(root.get("passed")) is not bool
+        or root.get("passed")
+        is not (verdict is PwnCrashV1Verdict.CONFIRMED)
+    ):
+        _gate_fail("invalid_semantic_passed")
+
+    if (
+        type(stats.get("control_attempts")) is not int
+        or stats.get("control_attempts")
+        != PWN_CRASH_V1_CONTROL_ATTEMPTS
+        or type(stats.get("positive_attempts")) is not int
+        or stats.get("positive_attempts")
+        != PWN_CRASH_V1_POSITIVE_ATTEMPTS
+        or type(stats.get("required_positive_successes")) is not int
+        or stats.get("required_positive_successes")
+        != PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES
+    ):
+        _gate_fail("invalid_semantic_stats")
+    control_abnormal = stats.get("control_abnormal_terminations")
+    if (
+        type(control_abnormal) is not int
+        or not 0 <= control_abnormal <= PWN_CRASH_V1_CONTROL_ATTEMPTS
+    ):
+        _gate_fail("invalid_semantic_stats")
+    counts_value = stats.get("positive_signal_counts")
+    if type(counts_value) is not list:
+        _gate_fail("invalid_semantic_stats")
+    counts: list[tuple[int, int]] = []
+    for item in counts_value:
+        raw = _gate_exact_dict(
+            item,
+            _SEMANTIC_SIGNAL_COUNT_KEYS,
+            "invalid_semantic_stats",
+        )
+        signal_number = raw.get("signal_number")
+        count = raw.get("count")
+        if (
+            type(signal_number) is not int
+            or signal_number not in PWN_CRASH_V1_ALLOWED_SIGNALS
+            or type(count) is not int
+            or not 1 <= count <= PWN_CRASH_V1_POSITIVE_ATTEMPTS
+        ):
+            _gate_fail("invalid_semantic_stats")
+        counts.append((signal_number, count))
+    if counts != sorted(set(counts)):
+        _gate_fail("invalid_semantic_stats")
+
+    result = PwnCrashV1Evaluation(
+        source_manifest_sha256=source_manifest_sha256,
+        source_sha256=source_sha256,
+        source_size_bytes=source_size_bytes,
+        poc_sha256=poc_sha256,
+        poc_size_bytes=poc_size_bytes,
+        recipe_sha256=recipe_sha256,
+        plan=tuple(plan),
+        observations=tuple(observations),
+        failures=failures,
+        verdict=verdict,
+        reason_code=reason_code,
+        positive_signal_counts=tuple(counts),
+        control_abnormal_terminations=control_abnormal,
+    )
+    if result.to_dict() != root:
+        _gate_fail("semantic_evaluation_not_reconstructable")
+    if failures:
+        if (
+            verdict is not PwnCrashV1Verdict.ERROR
+            or reason_code != failures[0].code
+            or counts
+            or control_abnormal != 0
+        ):
+            _gate_fail("invalid_semantic_error_evaluation")
+    else:
+        if (
+            verdict is PwnCrashV1Verdict.ERROR
+            or len(observations) != PWN_CRASH_V1_ATTEMPT_COUNT
+        ):
+            _gate_fail("invalid_semantic_evaluation")
+        derived_counts: dict[int, int] = {}
+        derived_control_abnormal = 0
+        for ordinal, observation in enumerate(observations, start=1):
+            expected = plan[ordinal - 1]
+            if (
+                observation.status != "ok"
+                or observation.target is None
+                or observation.ordinal != expected.ordinal
+                or observation.phase != expected.phase
+                or observation.input_sha256 != expected.input_sha256
+                or observation.input_size_bytes
+                != expected.input_size_bytes
+                or observation.source_manifest_sha256
+                != source_manifest_sha256
+                or observation.source_sha256 != source_sha256
+                or observation.source_size_bytes != source_size_bytes
+                or observation.recipe_sha256 != recipe_sha256
+            ):
+                _gate_fail("invalid_semantic_evaluation")
+            target = observation.target
+            if observation.phase == "control":
+                if target.termination != "exited":
+                    derived_control_abnormal += 1
+            elif (
+                target.termination == "signaled"
+                and target.signal_number in PWN_CRASH_V1_ALLOWED_SIGNALS
+            ):
+                signal_number = target.signal_number
+                assert signal_number is not None
+                derived_counts[signal_number] = (
+                    derived_counts.get(signal_number, 0) + 1
+                )
+        ordered_counts = tuple(sorted(derived_counts.items()))
+        positive_total = sum(derived_counts.values())
+        maximum_same_signal = max(derived_counts.values(), default=0)
+        if derived_control_abnormal:
+            expected_verdict = PwnCrashV1Verdict.INCONCLUSIVE
+            expected_reason = "control_abnormal_termination_observed"
+        elif positive_total == 0:
+            expected_verdict = PwnCrashV1Verdict.INCONCLUSIVE
+            expected_reason = "no_positive_fault_observed"
+        elif positive_total < PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES:
+            expected_verdict = PwnCrashV1Verdict.INCONCLUSIVE
+            expected_reason = "positive_fault_threshold_not_met"
+        elif maximum_same_signal < (
+            PWN_CRASH_V1_REQUIRED_POSITIVE_SUCCESSES
+        ):
+            expected_verdict = PwnCrashV1Verdict.INCONCLUSIVE
+            expected_reason = "positive_fault_signature_not_reproduced"
+        else:
+            expected_verdict = PwnCrashV1Verdict.CONFIRMED
+            expected_reason = "reproducible_input_triggered_fault_signal"
+        if (
+            verdict is not expected_verdict
+            or reason_code != expected_reason
+            or tuple(counts) != ordered_counts
+            or control_abnormal != derived_control_abnormal
+        ):
+            _gate_fail("invalid_semantic_evaluation")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class PwnCrashGateEvaluation:
+    """Canonical aggregate of semantic evidence or a transport failure."""
+
+    verdict: PwnCrashV1Verdict
+    reason_code: str
+    failures: tuple[PwnCrashGateFailure, ...]
+    semantic_evaluation: PwnCrashV1Evaluation | None
+    transport_error: PwnCrashGateTransportError | None
+
+    def __post_init__(self) -> None:
+        if type(self.verdict) is not PwnCrashV1Verdict:
+            raise PwnCrashGateEvaluationError("invalid_gate_verdict")
+        if (
+            type(self.reason_code) is not str
+            or _REASON_CODE.fullmatch(self.reason_code) is None
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_gate_reason_code"
+            )
+        if (
+            type(self.failures) is not tuple
+            or any(
+                type(item) is not PwnCrashGateFailure
+                for item in self.failures
+            )
+        ):
+            raise PwnCrashGateEvaluationError(
+                "invalid_gate_failures"
+            )
+        semantic = self.semantic_evaluation
+        transport = self.transport_error
+        if (semantic is None) == (transport is None):
+            raise PwnCrashGateEvaluationError(
+                "invalid_gate_evaluation_branch"
+            )
+        if semantic is not None:
+            if type(semantic) is not PwnCrashV1Evaluation:
+                raise PwnCrashGateEvaluationError(
+                    "invalid_semantic_evaluation"
+                )
+            expected_failures = tuple(
+                PwnCrashGateFailure(
+                    code=item.code,
+                    attempt_ordinal=item.attempt_ordinal,
+                    producer_reason=item.producer_reason,
+                )
+                for item in semantic.failures
+            )
+            if (
+                self.verdict is not semantic.verdict
+                or self.reason_code != semantic.reason_code
+                or self.failures != expected_failures
+            ):
+                raise PwnCrashGateEvaluationError(
+                    "semantic_gate_projection_mismatch"
+                )
+        else:
+            if type(transport) is not PwnCrashGateTransportError:
+                raise PwnCrashGateEvaluationError(
+                    "invalid_transport_error"
+                )
+            expected_failure = PwnCrashGateFailure(
+                code=transport.code,
+                attempt_ordinal=transport.ordinal,
+            )
+            if (
+                self.verdict is not PwnCrashV1Verdict.ERROR
+                or self.reason_code != f"transport_{transport.code}"
+                or self.failures != (expected_failure,)
+            ):
+                raise PwnCrashGateEvaluationError(
+                    "transport_gate_projection_mismatch"
+                )
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict is PwnCrashV1Verdict.CONFIRMED
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "failures": [item.to_dict() for item in self.failures],
+            "passed": self.passed,
+            "reason_code": self.reason_code,
+            "schema_version": PWN_CRASH_GATE_EVALUATION_SCHEMA_VERSION,
+            "semantic_evaluation": (
+                self.semantic_evaluation.to_dict()
+                if self.semantic_evaluation is not None
+                else None
+            ),
+            "transport_error": (
+                self.transport_error.to_dict()
+                if self.transport_error is not None
+                else None
+            ),
+            "verdict": self.verdict.value,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        payload = _canonical_json_bytes(self.to_dict())
+        if len(payload) > PWN_CRASH_MAX_GATE_EVALUATION_BYTES:
+            raise PwnCrashGateEvaluationError(
+                "gate_evaluation_size_exceeded"
+            )
+        return payload
+
+    @property
+    def evidence_sha256(self) -> str:
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> "PwnCrashGateEvaluation":
+        _validate_gate_tree(value)
+        try:
+            encoded = _canonical_json_bytes(value)
+        except (RecursionError, TypeError, ValueError) as error:
+            raise PwnCrashGateEvaluationError(
+                "invalid_gate_evaluation_schema"
+            ) from error
+        if len(encoded) > PWN_CRASH_MAX_GATE_EVALUATION_BYTES:
+            _gate_fail("gate_evaluation_size_exceeded")
+        root = _gate_exact_dict(
+            value,
+            _GATE_EVALUATION_KEYS,
+            "invalid_gate_evaluation_schema",
+        )
+        if (
+            type(root.get("schema_version")) is not int
+            or root.get("schema_version")
+            != PWN_CRASH_GATE_EVALUATION_SCHEMA_VERSION
+        ):
+            _gate_fail("invalid_gate_evaluation_schema_version")
+        try:
+            verdict = PwnCrashV1Verdict(root.get("verdict"))
+        except (TypeError, ValueError) as error:
+            raise PwnCrashGateEvaluationError(
+                "invalid_gate_verdict"
+            ) from error
+        if (
+            type(root.get("passed")) is not bool
+            or root.get("passed")
+            is not (verdict is PwnCrashV1Verdict.CONFIRMED)
+        ):
+            _gate_fail("invalid_gate_passed")
+        reason_code = root.get("reason_code")
+        if (
+            type(reason_code) is not str
+            or _REASON_CODE.fullmatch(reason_code) is None
+        ):
+            _gate_fail("invalid_gate_reason_code")
+        failures_value = root.get("failures")
+        if type(failures_value) is not list or len(failures_value) > 64:
+            _gate_fail("invalid_gate_failures")
+        failures = tuple(
+            PwnCrashGateFailure.from_dict(item)
+            for item in failures_value
+        )
+        semantic_value = root.get("semantic_evaluation")
+        transport_value = root.get("transport_error")
+        if (semantic_value is None) == (transport_value is None):
+            _gate_fail("invalid_gate_evaluation_branch")
+        semantic = (
+            _parse_semantic_evaluation(semantic_value)
+            if semantic_value is not None
+            else None
+        )
+        transport = (
+            PwnCrashGateTransportError.from_dict(transport_value)
+            if transport_value is not None
+            else None
+        )
+        result = cls(
+            verdict=verdict,
+            reason_code=reason_code,
+            failures=failures,
+            semantic_evaluation=semantic,
+            transport_error=transport,
+        )
+        if encoded != result.canonical_bytes():
+            _gate_fail("gate_evaluation_not_reconstructable")
+        return result
+
+
+def evaluate_pwn_crash_gate(
+    recipe: PwnCrashRecipe,
+    *,
+    poc_input: bytes,
+    stdout_payloads: Iterable[bytes],
+    receipts: Iterable[PwnCrashReceiptMetadata | Mapping[str, object]],
+) -> PwnCrashGateEvaluation:
+    """Return one canonical envelope for semantic and transport outcomes."""
+
+    try:
+        semantic = evaluate_pwn_crash_evidence(
+            recipe,
+            poc_input=poc_input,
+            stdout_payloads=stdout_payloads,
+            receipts=receipts,
+        )
+    except PwnCrashTransportError as error:
+        transport = PwnCrashGateTransportError(
+            code=error.code,
+            ordinal=error.ordinal,
+        )
+        return PwnCrashGateEvaluation(
+            verdict=PwnCrashV1Verdict.ERROR,
+            reason_code=f"transport_{error.code}",
+            failures=(
+                PwnCrashGateFailure(
+                    code=error.code,
+                    attempt_ordinal=error.ordinal,
+                ),
+            ),
+            semantic_evaluation=None,
+            transport_error=transport,
+        )
+    return PwnCrashGateEvaluation(
+        verdict=semantic.verdict,
+        reason_code=semantic.reason_code,
+        failures=tuple(
+            PwnCrashGateFailure(
+                code=item.code,
+                attempt_ordinal=item.attempt_ordinal,
+                producer_reason=item.producer_reason,
+            )
+            for item in semantic.failures
+        ),
+        semantic_evaluation=semantic,
+        transport_error=None,
+    )
+
+
 __all__ = [
+    "PWN_CRASH_ARGV_TEMPLATE",
+    "PWN_CRASH_CAPABILITY_PROBE_CONTRACT",
+    "PWN_CRASH_GATE_EVALUATION_SCHEMA_VERSION",
     "PWN_CRASH_INPUT_ARGUMENT",
     "PWN_CRASH_INPUT_DESTINATION_LOCATOR",
     "PWN_CRASH_NETWORK_POLICY",
@@ -1083,9 +2183,17 @@ __all__ = [
     "PWN_CRASH_PRODUCER_PATH",
     "PWN_CRASH_RECIPE_SCHEMA_VERSION",
     "PWN_CRASH_SANDBOX_METHOD",
+    "PwnCrashCapabilityAttestation",
+    "PwnCrashCapabilityAttestationError",
+    "PwnCrashGateEvaluation",
+    "PwnCrashGateEvaluationError",
+    "PwnCrashGateFailure",
+    "PwnCrashGateTransportError",
     "PwnCrashReceiptMetadata",
     "PwnCrashRecipe",
     "PwnCrashRecipeError",
     "PwnCrashTransportError",
     "evaluate_pwn_crash_evidence",
+    "evaluate_pwn_crash_gate",
+    "normalize_pwn_crash_capability_attestation",
 ]

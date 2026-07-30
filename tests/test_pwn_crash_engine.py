@@ -6,6 +6,7 @@ import json
 import unittest
 from dataclasses import replace
 
+from ctf_os.capabilities import REQUIRED_MANAGED_ATTESTATIONS
 from ctf_os.contracts.pwn_crash_v1 import (
     PWN_CRASH_V1_CONTRACT_FINGERPRINT,
     PWN_CRASH_V1_CONTRACT_ID,
@@ -17,6 +18,9 @@ from ctf_os.contracts.pwn_crash_v1 import (
     pwn_crash_v1_contract_descriptor,
 )
 from ctf_os.engine.pwn_crash import (
+    PWN_CRASH_ARGV_TEMPLATE,
+    PWN_CRASH_CAPABILITY_PROBE_CONTRACT,
+    PWN_CRASH_INPUT_DESTINATION_LOCATOR,
     PWN_CRASH_INPUT_ARGUMENT,
     PWN_CRASH_NETWORK_POLICY,
     PWN_CRASH_PRODUCER_CAPABILITY_NAME,
@@ -24,11 +28,17 @@ from ctf_os.engine.pwn_crash import (
     PWN_CRASH_PRODUCER_INTERPRETER_PATH,
     PWN_CRASH_PRODUCER_PATH,
     PWN_CRASH_SANDBOX_METHOD,
+    PwnCrashCapabilityAttestation,
+    PwnCrashCapabilityAttestationError,
+    PwnCrashGateEvaluation,
+    PwnCrashGateEvaluationError,
     PwnCrashReceiptMetadata,
     PwnCrashRecipe,
     PwnCrashRecipeError,
     PwnCrashTransportError,
     evaluate_pwn_crash_evidence,
+    evaluate_pwn_crash_gate,
+    normalize_pwn_crash_capability_attestation,
 )
 
 
@@ -135,6 +145,10 @@ def receipts(
     recipe: PwnCrashRecipe,
     payloads: tuple[bytes, ...],
 ) -> tuple[PwnCrashReceiptMetadata, ...]:
+    capability = PwnCrashCapabilityAttestation(
+        image_digest=recipe.image_digest,
+        recipe_sha256=recipe.recipe_sha256,
+    )
     return tuple(
         PwnCrashReceiptMetadata(
             ordinal=ordinal,
@@ -150,6 +164,16 @@ def receipts(
             configuration_epoch=recipe.configuration_epoch,
             image_digest=recipe.image_digest,
             recipe_sha256=recipe.recipe_sha256,
+            request_sha256=hashlib.sha256(
+                f"request-{ordinal}".encode("ascii")
+            ).hexdigest(),
+            execution_contract_sha256=hashlib.sha256(
+                f"execution-contract-{ordinal}".encode("ascii")
+            ).hexdigest(),
+            capability_attestation_artifact_id=(
+                "A-pwn-crash-capability"
+            ),
+            capability_attestation_sha256=capability.evidence_sha256,
             producer_capability_name=(
                 PWN_CRASH_PRODUCER_CAPABILITY_NAME
             ),
@@ -223,6 +247,18 @@ class PwnCrashRecipeTests(unittest.TestCase):
         assert isinstance(runtime, dict)
         self.assertEqual(runtime["network"], "none")
         self.assertIs(runtime["one_shot"], True)
+        self.assertEqual(
+            runtime["argv_template"],
+            list(PWN_CRASH_ARGV_TEMPLATE),
+        )
+        self.assertEqual(
+            runtime["input_destination_locator"],
+            PWN_CRASH_INPUT_DESTINATION_LOCATOR,
+        )
+        self.assertEqual(
+            runtime["input_argument"],
+            PWN_CRASH_INPUT_ARGUMENT,
+        )
         self.assertEqual(runtime["sandbox_method"], "run_clean_proof")
         self.assertEqual(runtime["positive_attempts"], 3)
         self.assertEqual(runtime["control_attempts"], 3)
@@ -399,6 +435,102 @@ class PwnCrashRecipeTests(unittest.TestCase):
                     recipe.argv_for_attempt(invalid)
 
 
+class PwnCrashCapabilityAttestationTests(unittest.TestCase):
+    def _report(self) -> dict[str, object]:
+        return {
+            "attestation_errors": {},
+            "attestations": {
+                PWN_CRASH_PRODUCER_CAPABILITY_NAME: copy.deepcopy(
+                    REQUIRED_MANAGED_ATTESTATIONS[
+                        PWN_CRASH_PRODUCER_CAPABILITY_NAME
+                    ]
+                )
+            },
+            "available": [PWN_CRASH_PRODUCER_CAPABILITY_NAME],
+            "image_digest": IMAGE_DIGEST,
+            "ok": True,
+        }
+
+    def test_live_probe_normalizes_to_exact_canonical_record(self) -> None:
+        recipe = make_recipe()
+        result = normalize_pwn_crash_capability_attestation(
+            self._report(),
+            image_digest=recipe.image_digest,
+            recipe_sha256=recipe.recipe_sha256,
+        )
+
+        self.assertEqual(
+            result.to_dict(),
+            {
+                "attestation": REQUIRED_MANAGED_ATTESTATIONS[
+                    PWN_CRASH_PRODUCER_CAPABILITY_NAME
+                ],
+                "capability_name": PWN_CRASH_PRODUCER_CAPABILITY_NAME,
+                "image_digest": recipe.image_digest,
+                "probe_contract": PWN_CRASH_CAPABILITY_PROBE_CONTRACT,
+                "recipe_sha256": recipe.recipe_sha256,
+                "schema_version": 1,
+            },
+        )
+        self.assertEqual(
+            result.canonical_bytes(),
+            canonical_bytes(result.to_dict()),
+        )
+        self.assertEqual(
+            result.evidence_sha256,
+            hashlib.sha256(result.canonical_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            PwnCrashCapabilityAttestation.from_dict(
+                result.to_dict()
+            ),
+            result,
+        )
+        hash(result)
+
+    def test_probe_and_persisted_record_fail_closed(self) -> None:
+        recipe = make_recipe()
+        cases: tuple[tuple[str, object], ...] = (
+            ("ok", False),
+            ("image_digest", "sha256:" + ("2" * 64)),
+            ("available", []),
+            ("attestations", {}),
+            (
+                "attestation_errors",
+                {PWN_CRASH_PRODUCER_CAPABILITY_NAME: "changed"},
+            ),
+        )
+        for field, replacement in cases:
+            report = self._report()
+            report[field] = replacement
+            with self.subTest(field=field):
+                with self.assertRaises(
+                    PwnCrashCapabilityAttestationError
+                ):
+                    normalize_pwn_crash_capability_attestation(
+                        report,
+                        image_digest=recipe.image_digest,
+                        recipe_sha256=recipe.recipe_sha256,
+                    )
+
+        valid = PwnCrashCapabilityAttestation(
+            image_digest=recipe.image_digest,
+            recipe_sha256=recipe.recipe_sha256,
+        ).to_dict()
+        for field, replacement in (
+            ("probe_contract", "other"),
+            ("recipe_sha256", "2" * 63),
+            ("capability_name", "other"),
+        ):
+            altered = copy.deepcopy(valid)
+            altered[field] = replacement
+            with self.subTest(persisted_field=field):
+                with self.assertRaises(
+                    PwnCrashCapabilityAttestationError
+                ):
+                    PwnCrashCapabilityAttestation.from_dict(altered)
+
+
 class PwnCrashEvidenceTests(unittest.TestCase):
     def test_six_transport_complete_attempts_delegate_to_semantics(self) -> None:
         recipe = make_recipe()
@@ -551,6 +683,38 @@ class PwnCrashEvidenceTests(unittest.TestCase):
                 {"run_id": base[0].run_id},
                 "duplicate_run_id",
             ),
+            (
+                "duplicate request",
+                1,
+                {"request_sha256": base[0].request_sha256},
+                "duplicate_request_sha256",
+            ),
+            (
+                "duplicate execution contract",
+                1,
+                {
+                    "execution_contract_sha256": (
+                        base[0].execution_contract_sha256
+                    )
+                },
+                "duplicate_execution_contract_sha256",
+            ),
+            (
+                "different capability artifact",
+                1,
+                {
+                    "capability_attestation_artifact_id": (
+                        "A-other-capability"
+                    )
+                },
+                "capability_attestation_binding_mismatch",
+            ),
+            (
+                "wrong capability hash",
+                0,
+                {"capability_attestation_sha256": "2" * 64},
+                "capability_attestation_binding_mismatch",
+            ),
         )
         for label, index, changes, code in cases:
             altered = list(base)
@@ -610,6 +774,105 @@ class PwnCrashEvidenceTests(unittest.TestCase):
         invalid_identifier["receipt_id"] = "\ud800"
         with self.assertRaisesRegex(ValueError, "receipt_id"):
             PwnCrashReceiptMetadata.from_dict(invalid_identifier)
+
+
+class PwnCrashGateEvaluationTests(unittest.TestCase):
+    def test_semantic_result_has_stable_roundtrip_and_hash(self) -> None:
+        recipe = make_recipe()
+        values = confirming_payloads(recipe)
+        result = evaluate_pwn_crash_gate(
+            recipe,
+            poc_input=POC,
+            stdout_payloads=values,
+            receipts=receipts(recipe, values),
+        )
+
+        self.assertIs(result.verdict, PwnCrashV1Verdict.CONFIRMED)
+        self.assertTrue(result.passed)
+        self.assertIsNotNone(result.semantic_evaluation)
+        self.assertIsNone(result.transport_error)
+        self.assertEqual(result.failures, ())
+        self.assertEqual(
+            PwnCrashGateEvaluation.from_dict(result.to_dict()),
+            result,
+        )
+        self.assertEqual(
+            result.evidence_sha256,
+            hashlib.sha256(result.canonical_bytes()).hexdigest(),
+        )
+        hash(result)
+
+    def test_transport_failure_is_an_error_envelope(self) -> None:
+        recipe = make_recipe()
+        values = confirming_payloads(recipe)
+        metadata = list(receipts(recipe, values))
+        metadata[0] = replace(
+            metadata[0],
+            outcome="failed",
+            exit_code=1,
+        )
+
+        result = evaluate_pwn_crash_gate(
+            recipe,
+            poc_input=POC,
+            stdout_payloads=values,
+            receipts=metadata,
+        )
+
+        self.assertIs(result.verdict, PwnCrashV1Verdict.ERROR)
+        self.assertFalse(result.passed)
+        self.assertEqual(
+            result.reason_code,
+            "transport_producer_execution_unsuccessful",
+        )
+        self.assertIsNone(result.semantic_evaluation)
+        assert result.transport_error is not None
+        self.assertEqual(
+            result.transport_error.code,
+            "producer_execution_unsuccessful",
+        )
+        self.assertEqual(result.transport_error.ordinal, 1)
+        self.assertEqual(
+            PwnCrashGateEvaluation.from_dict(result.to_dict()),
+            result,
+        )
+
+    def test_untrusted_gate_state_rejects_projection_tampering(self) -> None:
+        recipe = make_recipe()
+        values = confirming_payloads(recipe)
+        result = evaluate_pwn_crash_gate(
+            recipe,
+            poc_input=POC,
+            stdout_payloads=values,
+            receipts=receipts(recipe, values),
+        )
+        valid = result.to_dict()
+
+        cases: list[dict[str, object]] = []
+        extra = copy.deepcopy(valid)
+        extra["evidence_sha256"] = result.evidence_sha256
+        cases.append(extra)
+        wrong_passed = copy.deepcopy(valid)
+        wrong_passed["passed"] = False
+        cases.append(wrong_passed)
+        both_branches = copy.deepcopy(valid)
+        both_branches["transport_error"] = {
+            "code": "transport_error",
+            "ordinal": 1,
+        }
+        cases.append(both_branches)
+        wrong_stats = copy.deepcopy(valid)
+        semantic = wrong_stats["semantic_evaluation"]
+        assert isinstance(semantic, dict)
+        stats = semantic["stats"]
+        assert isinstance(stats, dict)
+        stats["control_abnormal_terminations"] = 1
+        cases.append(wrong_stats)
+
+        for index, altered in enumerate(cases):
+            with self.subTest(index=index):
+                with self.assertRaises(PwnCrashGateEvaluationError):
+                    PwnCrashGateEvaluation.from_dict(altered)
 
 
 if __name__ == "__main__":
