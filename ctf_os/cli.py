@@ -16,6 +16,7 @@ from typing import Any
 
 from ctf_os.benchmark import (
     BlindLivePromotionEvidence,
+    THIN_SCAFFOLD,
     evaluate_blind_live_promotion,
 )
 from ctf_os.config import (
@@ -76,6 +77,10 @@ from ctf_os.promotion_bundles import (
 )
 from ctf_os.sandbox import NetworkTarget, SandboxError
 from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.scaffold_binding import (
+    ScaffoldBindingError,
+    solve_mode_arm,
+)
 from ctf_os.store import StateStoreError
 from ctf_os.store.atomic import (
     atomic_write_json,
@@ -765,7 +770,9 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument("--prompt-file", type=Path)
     solve.add_argument("--resume-thread")
     solve.add_argument(
-        "--mode", choices=("managed", "assisted"), default="assisted"
+        "--mode",
+        choices=("managed", "assisted", "thin"),
+        default="assisted",
     )
     solve.add_argument("--max-cycles", type=int, default=8)
     solve.add_argument(
@@ -1726,6 +1733,12 @@ def main(
                     state_schema_version=STATE_SCHEMA_VERSION,
                 )
             )
+            try:
+                solve_mode_arm(state.metadata, args.mode)
+            except ScaffoldBindingError as error:
+                raise CLIError(
+                    f"평가 scaffold 선택이 고정 manifest와 다릅니다: {error}"
+                ) from error
             effective_prompt = prompt if prompt else state.prompt
             if not effective_prompt.strip():
                 raise CLIError(
@@ -1756,17 +1769,38 @@ def main(
                     "--thread-continuity is available only in managed mode"
                 )
 
-            def announce_live_session(_prepared: object) -> None:
-                print(
-                    "Live 세션 생성 완료. 세 논리 역할은 유지되며 계정 "
-                    "한도에 걸린 실제 모델 호출만 대기할 수 있습니다.",
-                    flush=True,
+            if (
+                args.mode == "thin"
+                and args.resume_thread is not None
+                and state.metadata.get("evaluation_prepared") is True
+            ):
+                raise CLIError(
+                    "준비된 thin 평가는 이전 노출이 섞일 수 있는 thread를 "
+                    "resume할 수 없습니다."
                 )
+
+            def announce_live_session(_prepared: object) -> None:
+                if args.mode == "thin":
+                    message = (
+                        "Thin Live 세션 생성 완료. frontier model 1개, "
+                        "logical worker/delegation 0개로 실행합니다."
+                    )
+                else:
+                    message = (
+                        "Live 세션 생성 완료. 세 논리 역할은 유지되며 계정 "
+                        "한도에 걸린 실제 모델 호출만 대기할 수 있습니다."
+                    )
+                print(message, flush=True)
 
             return engine.launch_live(
                 identity,
                 prompt=prompt if prompt else None,
                 resume_thread_id=args.resume_thread,
+                scaffold=(
+                    THIN_SCAFFOLD
+                    if args.mode == "thin"
+                    else "ctf_os"
+                ),
                 on_prepared=announce_live_session,
             )
 

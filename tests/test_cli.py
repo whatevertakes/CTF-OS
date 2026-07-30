@@ -228,6 +228,27 @@ class CLITests(unittest.TestCase):
         self.assertIn("세 논리 역할", output)
         launch.assert_called_once()
 
+    def test_thin_solve_selects_one_model_scaffold(self) -> None:
+        self.add()
+
+        def launch(*args, **kwargs):
+            kwargs["on_prepared"](object())
+            return 0
+
+        with patch(
+            "ctf_os.engine.challenge.ChallengeEngine.launch_live",
+            side_effect=launch,
+        ) as launch_mock:
+            status, output, errors = self.run_cli(
+                ["solve", *self.identity, "--mode", "thin"]
+            )
+        self.assertEqual(status, 0, errors)
+        self.assertIn("frontier model 1개", output)
+        self.assertEqual(
+            launch_mock.call_args.kwargs["scaffold"],
+            "thin_scaffold",
+        )
+
     def test_competing_session_commands_do_not_replace_prompt_before_lock(
         self,
     ) -> None:

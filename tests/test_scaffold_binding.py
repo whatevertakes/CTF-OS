@@ -8,6 +8,7 @@ from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.scaffold_binding import (
     ScaffoldBindingError,
     build_scaffold_launch_binding,
+    managed_command_contract_sha256,
     parse_scaffold_launch_record,
     solve_mode_arm,
     validate_scaffold_launch_record,
@@ -39,6 +40,57 @@ def prepared_metadata(arm: str = THIN_SCAFFOLD) -> dict[str, object]:
 
 
 class ScaffoldBindingTests(unittest.TestCase):
+    def test_managed_contract_binds_policy_model_and_effort(self) -> None:
+        base = managed_command_contract_sha256(
+            model_id="frontier-model",
+            captain_effort="ultra",
+            worker_effort="max",
+            thread_continuity_policy="fresh",
+        )
+        self.assertEqual(
+            base,
+            managed_command_contract_sha256(
+                model_id="frontier-model",
+                captain_effort="ultra",
+                worker_effort="max",
+                thread_continuity_policy="fresh",
+            ),
+        )
+        for changed in (
+            {
+                "model_id": "other-model",
+                "captain_effort": "ultra",
+                "worker_effort": "max",
+                "thread_continuity_policy": "fresh",
+            },
+            {
+                "model_id": "frontier-model",
+                "captain_effort": "max",
+                "worker_effort": "max",
+                "thread_continuity_policy": "fresh",
+            },
+            {
+                "model_id": "frontier-model",
+                "captain_effort": "ultra",
+                "worker_effort": "max",
+                "thread_continuity_policy": "captain_lane",
+            },
+        ):
+            self.assertNotEqual(
+                base,
+                managed_command_contract_sha256(**changed),
+            )
+        with self.assertRaisesRegex(
+            ScaffoldBindingError,
+            "continuity",
+        ):
+            managed_command_contract_sha256(
+                model_id="frontier-model",
+                captain_effort="ultra",
+                worker_effort="max",
+                thread_continuity_policy="unbound",
+            )
+
     def test_prepared_arm_requires_the_exact_solve_scaffold(self) -> None:
         thin = prepared_metadata()
         self.assertEqual(solve_mode_arm(thin, "thin"), THIN_SCAFFOLD)

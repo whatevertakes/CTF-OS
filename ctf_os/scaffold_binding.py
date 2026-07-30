@@ -28,10 +28,75 @@ _ARMS = frozenset({THIN_SCAFFOLD, CTF_OS_SYSTEM})
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _MAX_TEXT_BYTES = 512
+_MANAGED_CONTINUITY_POLICIES = frozenset(
+    {"fresh", "captain_lane", "role_lane"}
+)
 
 
 class ScaffoldBindingError(ValueError):
     """A prepared evaluation state and requested scaffold do not agree."""
+
+
+def managed_command_contract_sha256(
+    *,
+    model_id: str,
+    captain_effort: str,
+    worker_effort: str,
+    thread_continuity_policy: str,
+) -> str:
+    """Hash the stable managed Captain/wave execution contract.
+
+    Runtime image, tool manifest, model configuration, challenge identity and
+    fixed budget are independently frozen by the promotion manifest and launch
+    binding.  This digest covers the orchestration surface that distinguishes
+    the full system from the one-agent thin scaffold.
+    """
+
+    selected_model = _bounded_text(model_id, "model_id")
+    captain = _bounded_text(captain_effort, "captain_effort")
+    worker = _bounded_text(worker_effort, "worker_effort")
+    continuity = _bounded_text(
+        thread_continuity_policy,
+        "thread_continuity_policy",
+    )
+    if continuity not in _MANAGED_CONTINUITY_POLICIES:
+        raise ScaffoldBindingError(
+            "unsupported managed thread continuity policy"
+        )
+    contract = {
+        "schema_version": 1,
+        "protocol": "ctfos.managed_command.v1",
+        "scaffold": CTF_OS_SYSTEM,
+        "model_id": selected_model,
+        "captain_effort": captain,
+        "worker_effort": worker,
+        "thread_continuity_policy": continuity,
+        "captain_count_per_cycle": 1,
+        "wave_width": 3,
+        "provider_limits_narrow_wave": False,
+        "waves": {
+            "discovery": ["recon", "specialist", "extractor"],
+            "attack": ["builder", "falsifier", "reproducer"],
+            "proof": [
+                "validator",
+                "reproducer",
+                "evidence_auditor",
+            ],
+        },
+        "typed_actions": [
+            "crypto_metamorphic",
+            "forensic_assertion",
+            "misc_transform",
+            "pwn_crash",
+            "pwn_exploit_effect",
+            "web_impact",
+        ],
+        "state_writer": "engine_store_only",
+        "raw_output_transport": "bounded_artifact_pointer",
+        "automatic_submission": False,
+        "automatic_challenge_switch": False,
+    }
+    return hashlib.sha256(canonical_json_bytes(contract)).hexdigest()
 
 
 def _bounded_text(value: object, label: str) -> str:
@@ -411,6 +476,7 @@ __all__ = [
     "ScaffoldLaunchBinding",
     "THIN_SOLVE_MODE",
     "build_scaffold_launch_binding",
+    "managed_command_contract_sha256",
     "parse_scaffold_launch_record",
     "solve_mode_arm",
     "validate_scaffold_launch_record",

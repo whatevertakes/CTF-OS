@@ -24,6 +24,7 @@ import ctf_os.models as models_module
 import ctf_os.store.files as store_files
 from ctf_os.adapters import get_adapter
 from ctf_os.budget import deadline_epoch
+from ctf_os.benchmark import THIN_SCAFFOLD
 from ctf_os.codex import (
     BatchRunner,
     BuiltCommand,
@@ -98,6 +99,10 @@ from ctf_os.sandbox import (
     SandboxResult,
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.scaffold_binding import (
+    SCAFFOLD_LAUNCH_METADATA_KEY,
+    parse_scaffold_launch_record,
+)
 from ctf_os.store import (
     ArtifactValidationError,
     ChallengeLock,
@@ -731,6 +736,111 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(live.session_context.exists())
         self.assertIn("SESSION.md", live.command[-1])
         self.assertEqual(len(WAVE_ROLES["discovery"]), 3)
+
+    def test_thin_live_hot_path_has_one_model_and_no_roles(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(self.identity, prompt="solve")
+        prepared = engine.prepare_live_session(
+            self.identity,
+            scaffold=THIN_SCAFFOLD,
+        )
+        self.assertEqual(prepared.scaffold, THIN_SCAFFOLD)
+        self.assertIn("features.multi_agent=false", prepared.command)
+        self.assertIn("agents.enabled=false", prepared.command)
+        self.assertIn(
+            "agents.max_concurrent_threads_per_session=1",
+            prepared.command,
+        )
+        self.assertEqual(len(prepared.command_contract_sha256), 64)
+        instructions = (
+            prepared.working_directory / "AGENTS.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("thin one-model baseline", instructions)
+        self.assertNotIn("Maintain three logical worker roles", instructions)
+
+    def test_evaluation_scaffold_launch_is_exact_and_one_shot(self) -> None:
+        image_digest = "sha256:" + hashlib.sha256(b"image").hexdigest()
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                image_digest=image_digest,
+            ),
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        added = engine.add_challenge(self.identity, prompt="solve")
+
+        def digest(value: bytes) -> str:
+            return hashlib.sha256(value).hexdigest()
+
+        def prepare(state: ChallengeState) -> None:
+            state.metadata.update(
+                {
+                    "evaluation_prepared": True,
+                    "evaluation_system": THIN_SCAFFOLD,
+                    "evaluation_benchmark_id": "blind-release",
+                    "evaluation_case_id": "case-one",
+                    "evaluation_session_id": "case-one-thin-1",
+                    "evaluation_manifest_sha256": digest(b"manifest"),
+                    "evaluation_model": config.models.captain,
+                    "evaluation_image_sha256": (
+                        image_digest.removeprefix("sha256:")
+                    ),
+                    "evaluation_tool_manifest_sha256": digest(b"tools"),
+                    "evaluation_model_config_sha256": digest(b"models"),
+                }
+            )
+
+        engine.store.update(
+            self.identity,
+            prepare,
+            expected_revision=added.revision,
+        )
+        contract_sha256 = digest(b"thin-contract")
+        launched = engine.record_evaluation_scaffold_launch(
+            self.identity,
+            arm=THIN_SCAFFOLD,
+            command_contract_sha256=contract_sha256,
+        )
+        binding, _timestamp = parse_scaffold_launch_record(
+            launched.metadata[SCAFFOLD_LAUNCH_METADATA_KEY]
+        )
+        self.assertEqual(binding.arm, THIN_SCAFFOLD)
+        self.assertEqual(binding.command_contract_sha256, contract_sha256)
+        self.assertEqual(
+            binding.configuration_epoch,
+            launched.configuration_epoch,
+        )
+        with self.assertRaisesRegex(EngineError, "already launched"):
+            engine.record_evaluation_scaffold_launch(
+                self.identity,
+                arm=THIN_SCAFFOLD,
+                command_contract_sha256=contract_sha256,
+            )
+
+    def test_prepared_full_arm_rejects_assisted_live_before_setup(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        added = engine.add_challenge(self.identity, prompt="solve")
+
+        def prepare(state: ChallengeState) -> None:
+            state.metadata["evaluation_prepared"] = True
+            state.metadata["evaluation_system"] = "ctf_os"
+
+        engine.store.update(
+            self.identity,
+            prepare,
+            expected_revision=added.revision,
+        )
+        with self.assertRaisesRegex(EngineError, "managed mode"):
+            engine.launch_live(
+                self.identity,
+                runner=lambda *args, **kwargs: None,
+            )
 
     def test_adapter_initial_plan_is_registered_once_and_never_auto_runs(
         self,
