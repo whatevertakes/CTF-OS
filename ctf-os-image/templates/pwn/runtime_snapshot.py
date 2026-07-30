@@ -51,6 +51,7 @@ MAX_PROC_STATUS_BYTES = 64 * 1024
 MAX_TRACED_TASKS = 64
 MAX_JSON_DEPTH = 7
 READ_CHUNK_BYTES = 64 * 1024
+MAX_TARGET_OUTPUT_READS_PER_TICK = 4
 TARGET_TIMEOUT_SECONDS = 5.0
 SCHEMA_VERSION = 1
 CONTRACT_ID = "ctfos.pwn.runtime_snapshot"
@@ -1509,8 +1510,12 @@ def _drain_target_output(
     descriptor: int,
     captured: bytearray,
     truncated: bool,
+    *,
+    deadline: float | None = None,
 ) -> bool:
-    while True:
+    for _attempt in range(MAX_TARGET_OUTPUT_READS_PER_TICK):
+        if deadline is not None and time.monotonic() >= deadline:
+            return truncated
         try:
             chunk = os.read(descriptor, READ_CHUNK_BYTES)
         except BlockingIOError:
@@ -1526,6 +1531,7 @@ def _drain_target_output(
             captured.extend(chunk[:remaining])
         if len(chunk) > remaining:
             truncated = True
+    return truncated
 
 
 def _forward_target_output(
@@ -1651,6 +1657,7 @@ def _execute_target(
                 output_descriptor,
                 captured,
                 output_truncated,
+                deadline=deadline,
             )
             remaining = deadline - time.monotonic()
             if remaining <= 0:

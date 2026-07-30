@@ -49,8 +49,8 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "contract_version": 1,
         "path": "/opt/ctf-templates/pwn/runtime_snapshot.py",
         "sha256": (
-            "e350f9cac577b3201a5f28b04e456200"
-            "c3fc41424616e32cca3dfa2b75f60289"
+            "e9d0927e42258a589d17b02f94071379"
+            "ea015b040051a405cda455ba14879d97"
         ),
     },
     "rev_inventory_v2": {

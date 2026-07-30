@@ -47,7 +47,7 @@
       "attestation_schema_version": 1,
       "contract_id": "ctfos.pwn.runtime_snapshot",
       "contract_version": 1,
-      "sha256": "e350f9cac577b3201a5f28b04e456200c3fc41424616e32cca3dfa2b75f60289"
+      "sha256": "e9d0927e42258a589d17b02f94071379ea015b040051a405cda455ba14879d97"
     },
     {
       "name": "rev_inventory_v2",

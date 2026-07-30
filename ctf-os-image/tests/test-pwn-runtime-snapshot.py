@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -273,6 +274,13 @@ int main(int argc, char **argv) {
             if (written != (ssize_t)sizeof(block)) return 96;
         }
         marked_segv();
+    }
+    if (value == 'Y') {
+        unsigned char block[4096];
+        memset(block, 'I', sizeof(block));
+        for (;;) {
+            write(STDOUT_FILENO, block, sizeof(block));
+        }
     }
     if (value == 'T') {
         for (;;) pause();
@@ -634,6 +642,21 @@ int main(int argc, char **argv) {
                 runtime_snapshot.TARGET_OUTPUT_TRUNCATION_MARKER
             ),
             flooded.stderr[-128:],
+        )
+
+    def test_infinite_target_output_cannot_starve_deadline(self) -> None:
+        started = time.monotonic()
+        flooded = self._invoke(b"Y", timeout_seconds=0.05)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(flooded.returncode, 0, flooded.stderr[-1024:])
+        document = json.loads(flooded.stdout)
+        self.assertEqual(document["status"], "INCONCLUSIVE")
+        self.assertEqual(document["reason_code"], "target_timeout")
+        self.assertLess(elapsed, 2.0)
+        self.assertLessEqual(
+            len(flooded.stderr),
+            runtime_snapshot.MAX_TARGET_OUTPUT_BYTES,
         )
 
     def test_source_payload_mismatch_and_maps_bound_are_errors(
