@@ -47,7 +47,18 @@ def cookie(
 
 
 with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
-    output_root = pathlib.Path(temporary) / "web"
+    private_root = pathlib.Path(temporary) / "private-web"
+    private_timeline_root = pathlib.Path(temporary) / "private-timeline"
+    output_root = pathlib.Path(temporary) / "work" / "web"
+    output_root.parent.mkdir()
+    private_root.mkdir()
+    private_timeline_root.mkdir()
+    attacker_root = private_root / "attacker"
+    user_root = private_root / "user"
+    admin_root = private_root / "admin"
+    attacker_root.mkdir()
+    user_root.mkdir()
+    admin_root.mkdir()
     output_root.mkdir()
     first = [
         cookie("sessionid", "session-secret-a"),
@@ -62,7 +73,10 @@ with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
     normalized_second = session_state.normalize_cookies(second)
 
     with session_state.PersistentWebSession(
-        output_root, "attacker"
+        attacker_root,
+        private_timeline_root,
+        output_root,
+        "attacker",
     ) as attacker:
         assert attacker.load_cookies() == []
         assert attacker.save_cookies(first) == normalized_first
@@ -128,7 +142,7 @@ with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
         } == {("session", "sessionid", "rotated")}
 
     cookie_path = (
-        output_root / "sessions" / "attacker" / "cookies.json"
+        attacker_root / "cookies.json"
     )
     timeline_path = output_root / "timeline.json"
     assert stat.S_IMODE(cookie_path.stat().st_mode) == 0o600
@@ -166,7 +180,12 @@ with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
     ]
 
     # Named identities never inherit each other's cookies.
-    with session_state.PersistentWebSession(output_root, "user") as user:
+    with session_state.PersistentWebSession(
+        user_root,
+        private_timeline_root,
+        output_root,
+        "user",
+    ) as user:
         assert user.load_cookies() == []
         user_cookie = [cookie("sessionid", "different-user-secret")]
         user.save_cookies(user_cookie)
@@ -182,7 +201,12 @@ with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
             artifact="/work/web/response.json",
         )
         assert event_three["ordinal"] == 3
-    with session_state.PersistentWebSession(output_root, "admin") as admin:
+    with session_state.PersistentWebSession(
+        admin_root,
+        private_timeline_root,
+        output_root,
+        "admin",
+    ) as admin:
         assert admin.load_cookies() == []
     combined_timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
     assert [item["session"] for item in combined_timeline["events"]] == [
@@ -198,13 +222,24 @@ with tempfile.TemporaryDirectory(prefix="ctf-web-session-") as temporary:
     cookie_path.symlink_to(outside)
     try:
         with session_state.PersistentWebSession(
-            output_root, "attacker"
+            attacker_root,
+            private_timeline_root,
+            output_root,
+            "attacker",
         ) as attacker:
             attacker.load_cookies()
     except OSError:
         pass
     else:
         raise AssertionError("symlink cookie jar was followed")
+
+    assert not (output_root / "sessions").exists()
+    reflected = session_state.redact_cookie_bytes(
+        b"prefix session-secret-b suffix",
+        normalized_second,
+    )
+    assert b"session-secret-b" not in reflected
+    assert b"*" * len(b"session-secret-b") in reflected
 
 
 # Metadata header redaction is independent from session persistence.

@@ -23,7 +23,10 @@ from session_state import (
     PersistentWebSession,
     SESSION_NAMES,
     WebSessionStateError,
+    engine_private_roots,
     normalize_cookies,
+    redact_cookie_bytes,
+    redact_cookie_text,
     redact_headers,
     sanitize_url,
 )
@@ -195,6 +198,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-screenshot-bytes must be between 1 byte and 128 MiB")
     if args.full_page and not args.screenshot:
         parser.error("--full-page requires --screenshot")
+    if args.session is not None and args.screenshot:
+        parser.error(
+            "--screenshot is unavailable with a persistent session because "
+            "pixels cannot be deterministically checked for cookie disclosure"
+        )
     return args
 
 
@@ -480,7 +488,15 @@ def run_browser(
     try:
         session_name = getattr(args, "session", None)
         if session_name is not None:
-            web_session = PersistentWebSession(OUTPUT_DIR, session_name)
+            private_session_root, private_timeline_root = (
+                engine_private_roots()
+            )
+            web_session = PersistentWebSession(
+                private_session_root,
+                private_timeline_root,
+                OUTPUT_DIR,
+                session_name,
+            )
             web_session.__enter__()
             cookies_before = web_session.load_cookies()
         playwright = sync_playwright().start()
@@ -529,7 +545,13 @@ def run_browser(
         if args.wait_ms:
             page.wait_for_timeout(args.wait_ms)
 
-        rendered = page.content().encode("utf-8", errors="replace")
+        if web_session is not None:
+            cookies_after = normalize_playwright_cookies(context.cookies())
+        rendered = redact_cookie_bytes(
+            page.content().encode("utf-8", errors="replace"),
+            cookies_before,
+            cookies_after,
+        )
         html_truncated = len(rendered) > args.max_html_bytes
         rendered = rendered[: args.max_html_bytes]
         atomic_write(output_descriptor, "browser.html", rendered)
@@ -546,7 +568,6 @@ def run_browser(
             files["screenshot"] = str(OUTPUT_DIR / "browser.png")
 
         if web_session is not None:
-            cookies_after = normalize_playwright_cookies(context.cookies())
             web_session.save_cookies(cookies_after)
             web_session.record_exchange(
                 source="browser",
@@ -602,26 +623,31 @@ def run_browser(
                 **screenshot_metadata,
                 "saved_bytes": len(screenshot),
             }
-        atomic_write(
-            output_descriptor,
-            "browser.json",
+        metadata_payload = redact_cookie_bytes(
             (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode(
                 "utf-8"
             ),
+            cookies_before,
+            cookies_after,
         )
+        atomic_write(output_descriptor, "browser.json", metadata_payload)
         print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "status": metadata["response"]["status"],
-                    "url": metadata["response"]["url"],
-                    "title": metadata["response"]["title"],
-                    "saved_html_bytes": len(rendered),
-                    "html_truncated": html_truncated,
-                    "files": files,
-                },
-                ensure_ascii=False,
-            ),
+            redact_cookie_bytes(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "status": metadata["response"]["status"],
+                        "url": metadata["response"]["url"],
+                        "title": metadata["response"]["title"],
+                        "saved_html_bytes": len(rendered),
+                        "html_truncated": html_truncated,
+                        "files": files,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                cookies_before,
+                cookies_after,
+            ).decode("utf-8"),
             flush=True,
         )
         return 0
@@ -631,7 +657,13 @@ def run_browser(
             {
                 "ok": False,
                 "error": "BrowserDeadlineExceeded",
-                "message": bounded_text(exc),
+                "message": bounded_text(
+                    redact_cookie_text(
+                        exc,
+                        cookies_before,
+                        cookies_after,
+                    )
+                ),
                 "deadline_seconds": args.timeout,
                 "elapsed_seconds": round(time.monotonic() - started, 6),
                 "cleanup_grace_seconds": CLEANUP_GRACE_SECONDS,
@@ -658,7 +690,13 @@ def run_browser(
             {
                 "ok": False,
                 "error": type(exc).__name__,
-                "message": bounded_text(exc),
+                "message": bounded_text(
+                    redact_cookie_text(
+                        exc,
+                        cookies_before,
+                        cookies_after,
+                    )
+                ),
                 "elapsed_seconds": round(time.monotonic() - started, 6),
             },
             control_descriptor,

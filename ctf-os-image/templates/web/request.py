@@ -22,7 +22,10 @@ from session_state import (
     PersistentWebSession,
     SESSION_NAMES,
     WebSessionStateError,
+    engine_private_roots,
     normalize_cookies,
+    redact_cookie_bytes,
+    redact_cookie_text,
     redact_headers,
     sanitize_url,
 )
@@ -265,8 +268,16 @@ def main() -> int:
     try:
         with contextlib.ExitStack() as stack:
             if args.session is not None:
+                private_session_root, private_timeline_root = (
+                    engine_private_roots()
+                )
                 session_state = stack.enter_context(
-                    PersistentWebSession(OUTPUT_DIR, args.session)
+                    PersistentWebSession(
+                        private_session_root,
+                        private_timeline_root,
+                        OUTPUT_DIR,
+                        args.session,
+                    )
                 )
                 cookies_before = session_state.load_cookies()
             session = stack.enter_context(requests.Session())
@@ -363,6 +374,11 @@ def main() -> int:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_alarm_handler)
 
+    raw_body = redact_cookie_bytes(
+        raw_body,
+        cookies_before,
+        cookies_after,
+    )
     encoding = choose_encoding(response, raw_body)
     try:
         decoded = raw_body.decode(encoding, errors="replace")
@@ -382,7 +398,11 @@ def main() -> int:
         "elapsed_seconds": round(time.monotonic() - started, 6),
         "response": {
             "status": response.status_code,
-            "reason": response.reason,
+            "reason": redact_cookie_text(
+                response.reason,
+                cookies_before,
+                cookies_after,
+            ),
             **sanitize_url(response.url),
             "headers": redact_headers(dict(response.headers)),
             "history": [
@@ -410,12 +430,15 @@ def main() -> int:
                 OUTPUT_DIR / "timeline.json"
             ),
         }
-    atomic_write(
-        output_descriptor,
-        "response.json",
-        (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    metadata_payload = redact_cookie_bytes(
+        (json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode(
+            "utf-8"
+        ),
+        cookies_before,
+        cookies_after,
     )
-    print(json.dumps(metadata, ensure_ascii=False))
+    atomic_write(output_descriptor, "response.json", metadata_payload)
+    print(metadata_payload.decode("utf-8").strip())
     return 0
 
 

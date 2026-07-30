@@ -35,6 +35,10 @@ MAX_COOKIE_DOMAIN_BYTES = 1024
 MAX_COOKIE_PATH_BYTES = 2048
 MAX_URL_BYTES = 8192
 MAX_HEADER_COUNT = 200
+PRIVATE_SESSION_ROOT_ENV = "CTF_OS_WEB_PRIVATE_SESSION_ROOT"
+PRIVATE_SESSION_ROOT_PATH = Path("/run/ctfos-web-session")
+PRIVATE_TIMELINE_ROOT_ENV = "CTF_OS_WEB_PRIVATE_TIMELINE_ROOT"
+PRIVATE_TIMELINE_ROOT_PATH = Path("/run/ctfos-web-timeline")
 
 _COOKIE_NAME = re.compile(r"^[^\x00-\x20\x7f()<>@,;:\\\"/\[\]?={}]+$")
 _SECURITY_HEADER_KINDS = {
@@ -50,6 +54,58 @@ _SECURITY_HEADER_KINDS = {
 
 class WebSessionStateError(ValueError):
     """A persisted Web session artifact violates the bounded schema."""
+
+
+def engine_private_roots() -> tuple[Path, Path]:
+    """Return only the fixed engine-injected private mounts.
+
+    A model-controlled environment value must not turn an ordinary ``/work``
+    directory back into a cookie store.
+    """
+
+    configured_session = os.environ.get(PRIVATE_SESSION_ROOT_ENV)
+    configured_timeline = os.environ.get(PRIVATE_TIMELINE_ROOT_ENV)
+    if (
+        configured_session != str(PRIVATE_SESSION_ROOT_PATH)
+        or configured_timeline != str(PRIVATE_TIMELINE_ROOT_PATH)
+    ):
+        raise WebSessionStateError(
+            "persistent Web sessions require the engine private-state boundary"
+        )
+    return PRIVATE_SESSION_ROOT_PATH, PRIVATE_TIMELINE_ROOT_PATH
+
+
+def redact_cookie_bytes(
+    payload: bytes,
+    *cookie_sets: Sequence[Mapping[str, object]],
+) -> bytes:
+    """Remove exact cookie values before bytes enter model-readable ``/work``."""
+
+    secrets_to_remove = {
+        str(cookie.get("value", "")).encode("utf-8")
+        for cookies in cookie_sets
+        for cookie in cookies
+        if str(cookie.get("value", ""))
+    }
+    redacted = payload
+    for secret in sorted(
+        secrets_to_remove,
+        key=lambda value: (-len(value), value),
+    ):
+        # Keep the output byte bound stable even when an adversarial endpoint
+        # reflects one short cookie value thousands of times.
+        redacted = redacted.replace(secret, b"*" * len(secret))
+    return redacted
+
+
+def redact_cookie_text(
+    value: object,
+    *cookie_sets: Sequence[Mapping[str, object]],
+) -> str:
+    return redact_cookie_bytes(
+        str(value).encode("utf-8", errors="replace"),
+        *cookie_sets,
+    ).decode("utf-8", errors="replace")
 
 
 def validate_session_name(value: str) -> str:
@@ -473,19 +529,34 @@ def _read_private_json(
 
 
 class PersistentWebSession:
-    """Serialize one named role's cookie state and redacted event timeline."""
+    """Serialize private cookies and publish only a redacted timeline.
 
-    def __init__(self, output_root: Path, session_name: str) -> None:
-        self.output_root = output_root
+    ``private_session_root`` is an engine-provided, role-only mount that is not
+    part of ``/work``. ``private_timeline_root`` holds only value-free history.
+    ``public_root`` is the ordinary model-readable output directory. Keeping
+    all three roots explicit prevents a caller from accidentally putting raw
+    cookie values beside response artifacts or mounting another role's jar.
+    """
+
+    def __init__(
+        self,
+        private_session_root: Path,
+        private_timeline_root: Path,
+        public_root: Path,
+        session_name: str,
+    ) -> None:
+        self.private_session_root = private_session_root
+        self.private_timeline_root = private_timeline_root
+        self.public_root = public_root
         self.session_name = validate_session_name(session_name)
         self._root_descriptor: int | None = None
-        self._sessions_descriptor: int | None = None
+        self._public_descriptor: int | None = None
         self._session_descriptor: int | None = None
         self._lock_descriptor: int | None = None
 
     @property
     def directory(self) -> Path:
-        return self.output_root / "sessions" / self.session_name
+        return self.private_session_root
 
     @property
     def cookie_path(self) -> Path:
@@ -493,15 +564,28 @@ class PersistentWebSession:
 
     @property
     def timeline_path(self) -> Path:
-        return self.output_root / TIMELINE_FILE
+        return self.public_root / TIMELINE_FILE
 
     def __enter__(self) -> "PersistentWebSession":
-        sessions_path = self.output_root / "sessions"
         try:
-            self._root_descriptor = open_output_dir(self.output_root)
-            self._sessions_descriptor = open_output_dir(sessions_path)
+            resolved_session = self.private_session_root.resolve()
+            resolved_timeline = self.private_timeline_root.resolve()
+            resolved_public = self.public_root.resolve()
+            if (
+                resolved_session == resolved_public
+                or resolved_timeline == resolved_public
+                or resolved_session == resolved_timeline
+            ):
+                raise WebSessionStateError(
+                    "private session, private timeline, and public roots "
+                    "must differ"
+                )
+            self._root_descriptor = open_output_dir(
+                self.private_timeline_root
+            )
+            self._public_descriptor = open_output_dir(self.public_root)
             self._session_descriptor = open_output_dir(
-                sessions_path / self.session_name
+                self.private_session_root
             )
             flags = (
                 os.O_RDWR
@@ -547,12 +631,12 @@ class PersistentWebSession:
         if self._session_descriptor is not None:
             os.close(self._session_descriptor)
             self._session_descriptor = None
-        if self._sessions_descriptor is not None:
-            os.close(self._sessions_descriptor)
-            self._sessions_descriptor = None
         if self._root_descriptor is not None:
             os.close(self._root_descriptor)
             self._root_descriptor = None
+        if self._public_descriptor is not None:
+            os.close(self._public_descriptor)
+            self._public_descriptor = None
 
     def _descriptor(self) -> int:
         if self._session_descriptor is None or self._lock_descriptor is None:
@@ -738,6 +822,13 @@ class PersistentWebSession:
                 TIMELINE_FILE,
                 payload,
             )
+            if self._public_descriptor is None:
+                raise WebSessionStateError("public timeline root is not open")
+            _private_atomic_write(
+                self._public_descriptor,
+                TIMELINE_FILE,
+                payload,
+            )
         finally:
             try:
                 fcntl.flock(timeline_lock, fcntl.LOCK_UN)
@@ -756,8 +847,11 @@ __all__ = [
     "TIMELINE_FILE",
     "WebSessionStateError",
     "cookie_transition",
+    "engine_private_roots",
     "normalize_cookie",
     "normalize_cookies",
+    "redact_cookie_bytes",
+    "redact_cookie_text",
     "redact_headers",
     "sanitize_url",
     "security_header_observations",

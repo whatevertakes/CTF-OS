@@ -71,6 +71,22 @@ from .types import (
     sandbox_result_from_mapping,
     validate_deadline_monotonic_seconds,
 )
+from .web_private import (
+    PRIVATE_WEB_SESSION_CONTAINER_ROOT,
+    PRIVATE_WEB_SESSION_ROOT_ENV,
+    PRIVATE_WEB_TIMELINE_CONTAINER_ROOT,
+    PRIVATE_WEB_TIMELINE_ROOT_ENV,
+    WebPrivateStateError,
+    discard_public_artifacts,
+    prepare_web_session_command,
+    redact_private_timeline,
+    redact_public_artifacts,
+    redact_value,
+    resolve_private_web_mounts,
+    resolve_private_web_root,
+    snapshot_all_cookie_values,
+    snapshot_run_ids,
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 MAX_CONTROL_OUTPUT = 1024 * 1024
@@ -470,6 +486,8 @@ class DockerSandboxBackend:
         *,
         network: str,
         work_dir: Path | None = None,
+        private_web_session_root: Path | None = None,
+        private_web_timeline_root: Path | None = None,
         detach: bool = True,
         name: str | None = None,
         command: Sequence[str] = ("ctf-idle", "--serve"),
@@ -532,6 +550,40 @@ class DockerSandboxBackend:
         )
         if detach:
             argv.append("--detach")
+        if (private_web_session_root is None) != (
+            private_web_timeline_root is None
+        ):
+            raise SandboxError(
+                "private Web session and timeline mounts must be paired"
+            )
+        if (
+            private_web_session_root is not None
+            and private_web_timeline_root is not None
+        ):
+            argv.extend(
+                [
+                    "--env",
+                    (
+                        f"{PRIVATE_WEB_SESSION_ROOT_ENV}="
+                        f"{PRIVATE_WEB_SESSION_CONTAINER_ROOT}"
+                    ),
+                    "--env",
+                    (
+                        f"{PRIVATE_WEB_TIMELINE_ROOT_ENV}="
+                        f"{PRIVATE_WEB_TIMELINE_CONTAINER_ROOT}"
+                    ),
+                    "--mount",
+                    bind_mount_spec(
+                        private_web_session_root,
+                        PRIVATE_WEB_SESSION_CONTAINER_ROOT,
+                    ),
+                    "--mount",
+                    bind_mount_spec(
+                        private_web_timeline_root,
+                        PRIVATE_WEB_TIMELINE_CONTAINER_ROOT,
+                    ),
+                ]
+            )
         if remove:
             argv.append("--rm")
         if actual_limits.read_only_root:
@@ -870,6 +922,8 @@ class DockerSandboxBackend:
         environment: Mapping[str, str],
         timeout: float,
         limits: DockerLimits,
+        private_web_session_root: Path | None = None,
+        private_web_timeline_root: Path | None = None,
     ) -> dict[str, Any]:
         """Run one bounded command with container lifetime as its supervisor."""
 
@@ -886,6 +940,8 @@ class DockerSandboxBackend:
             command=command,
             remove=True,
             limits=limits,
+            private_web_session_root=private_web_session_root,
+            private_web_timeline_root=private_web_timeline_root,
         )
         image_index = len(argv) - len(command) - 1
         environment_args: list[str] = []
@@ -968,6 +1024,58 @@ class DockerSandboxBackend:
                 "leased network resource does not match authorized network mode"
             )
         execution_limits = self._execution_limits(spec.resource_request)
+        try:
+            web_session = prepare_web_session_command(
+                category=self.scope.category,
+                argv=spec.argv,
+                environment=spec.environment,
+            )
+            private_web_root = (
+                resolve_private_web_root(self.scope)
+                if web_session is not None
+                else None
+            )
+            private_web_mounts = (
+                resolve_private_web_mounts(
+                    self.scope,
+                    web_session.session_name,
+                )
+                if web_session is not None
+                else None
+            )
+            private_web_session_root = (
+                private_web_mounts[0]
+                if private_web_mounts is not None
+                else None
+            )
+            private_web_timeline_root = (
+                private_web_mounts[1]
+                if private_web_mounts is not None
+                else None
+            )
+            previous_web_run_ids = (
+                snapshot_run_ids(self.scope.work_dir)
+                if web_session is not None
+                else frozenset()
+            )
+            cookie_values_before = (
+                snapshot_all_cookie_values(private_web_root)
+                if private_web_root is not None
+                else ()
+            )
+            if private_web_timeline_root is not None:
+                redact_private_timeline(
+                    private_web_timeline_root,
+                    cookie_values_before,
+                )
+        except WebPrivateStateError as error:
+            raise SandboxError(str(error)) from error
+        effective_argv = (
+            web_session.argv
+            if web_session is not None
+            else spec.argv
+        )
+        execution_environment = dict(spec.environment)
         with self._work_tree_guard(
             self.scope.work_dir,
             operation="sandbox command",
@@ -990,9 +1098,9 @@ class DockerSandboxBackend:
                 "--stderr-limit-bytes",
                 str(execution_limits.stream_capture_max_bytes),
                 "--",
-                *spec.argv,
+                *effective_argv,
             ]
-            if Path(spec.argv[0]).name in _JOB_CONTROL_COMMANDS:
+            if Path(effective_argv[0]).name in _JOB_CONTROL_COMMANDS:
                 # Existing scoped jobs live in the persistent runtime. Starting new
                 # jobs is disabled, but bounded query/log/cancel remains available.
                 # A status query must not create an idle container after its host
@@ -1029,6 +1137,8 @@ class DockerSandboxBackend:
                         environment=spec.environment,
                         timeout=control_timeout,
                         limits=execution_limits,
+                        private_web_session_root=private_web_session_root,
+                        private_web_timeline_root=private_web_timeline_root,
                     )
             else:
                 # A one-shot container is the foreground process supervisor. Even a
@@ -1043,13 +1153,72 @@ class DockerSandboxBackend:
                     ),
                     operation="sandbox command",
                 )
-                value = self._run_one_shot_json(
-                    network=network,
-                    command=command,
-                    environment=spec.environment,
-                    timeout=control_timeout,
-                    limits=execution_limits,
-                )
+                operation_error: BaseException | None = None
+                try:
+                    value = self._run_one_shot_json(
+                        network=network,
+                        command=command,
+                        environment=execution_environment,
+                        timeout=control_timeout,
+                        limits=execution_limits,
+                        private_web_session_root=private_web_session_root,
+                        private_web_timeline_root=private_web_timeline_root,
+                    )
+                except BaseException as error:
+                    operation_error = error
+                    value = {}
+                if web_session is not None:
+                    try:
+                        assert private_web_session_root is not None
+                        assert private_web_root is not None
+                        cookie_values_after = snapshot_all_cookie_values(
+                            private_web_root
+                        )
+                        cookie_values = tuple(
+                            dict.fromkeys(
+                                (
+                                    *cookie_values_before,
+                                    *cookie_values_after,
+                                )
+                            )
+                        )
+                        assert private_web_timeline_root is not None
+                        redact_private_timeline(
+                            private_web_timeline_root,
+                            cookie_values,
+                        )
+                        redact_public_artifacts(
+                            self.scope.work_dir,
+                            previous_run_ids=previous_web_run_ids,
+                            secrets=cookie_values,
+                        )
+                        value = redact_value(value, cookie_values)
+                    except BaseException as audit_error:
+                        try:
+                            discard_public_artifacts(
+                                self.scope.work_dir,
+                                previous_run_ids=previous_web_run_ids,
+                            )
+                        except BaseException as discard_error:
+                            audit_error.add_note(
+                                "unaudited Web output discard also failed: "
+                                f"{type(discard_error).__name__}: "
+                                f"{discard_error}"
+                            )
+                        if operation_error is not None:
+                            audit_error.add_note(
+                                "Web helper execution also failed: "
+                                f"{type(operation_error).__name__}: "
+                                f"{operation_error}"
+                            )
+                        if isinstance(audit_error, Exception):
+                            raise SandboxError(
+                                "private Web post-run audit failed: "
+                                f"{audit_error}"
+                            ) from audit_error
+                        raise
+                if operation_error is not None:
+                    raise operation_error
             if value.get("kind") != "run_result":
                 raise SandboxError("ctfwrap returned the wrong result kind")
             try:
@@ -1269,6 +1438,19 @@ class DockerSandboxBackend:
         """Run a proof in a new work directory with validated copied inputs."""
 
         ensure_foreground_command(spec.argv)
+        try:
+            web_session = prepare_web_session_command(
+                category=self.scope.category,
+                argv=spec.argv,
+                environment=spec.environment,
+            )
+        except WebPrivateStateError as error:
+            raise SandboxError(str(error)) from error
+        if web_session is not None:
+            raise SandboxError(
+                "persistent Web identities are unavailable in a clean proof "
+                "workspace; use explicit independent proof inputs instead"
+            )
         if input_locators and proof_inputs:
             raise ValueError(
                 "input_locators and proof_inputs cannot be used together"
