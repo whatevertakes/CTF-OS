@@ -52,6 +52,8 @@ from ctf_os.models import (
     ProofRecipe,
     ProofRecipeInput,
     Provenance,
+    PwnDisclosurePhase,
+    PwnRuntimeSnapshotDisclosureEnvelope,
     ReceiptOutcome,
     RevStdinOracleBinding,
     RunReference,
@@ -2030,6 +2032,487 @@ class ModelTests(unittest.TestCase):
                     "terminal status",
                 ):
                     loaded.validate()
+
+
+class PwnDisclosureEnvelopeModelTests(unittest.TestCase):
+    """State-only lifecycle tests over one canonical completed snapshot."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from ctf_os.capabilities import REQUIRED_MANAGED_ATTESTATIONS
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            pwn_runtime_snapshot_child_experiment_id,
+        )
+        from tests import test_pwn_crash_execution as crash_execution
+        from tests.test_pwn_runtime_snapshot_lifecycle import (
+            _SnapshotCoordinator,
+        )
+
+        fixture = crash_execution.PwnCrashExecutionTests(
+            methodName=(
+                "test_confirmed_gate_uses_six_clean_networkless_fixed_calls"
+            )
+        )
+        fixture.setUp()
+        try:
+            coordinator = _SnapshotCoordinator(
+                fixture._confirming_statuses()
+            )
+            engine, parent_id, _artifact_path, payload = (
+                fixture._fixture(coordinator)
+            )
+            fixture._execute(engine, parent_id)
+            child_id = pwn_runtime_snapshot_child_experiment_id(
+                parent_id
+            )
+
+            def capability(digest):
+                return {
+                    "ok": True,
+                    "image_digest": digest,
+                    "available": ["pwn_runtime_snapshot_v1"],
+                    "attestations": {
+                        "pwn_runtime_snapshot_v1": dict(
+                            REQUIRED_MANAGED_ATTESTATIONS[
+                                "pwn_runtime_snapshot_v1"
+                            ]
+                        )
+                    },
+                    "attestation_errors": {},
+                }
+
+            engine._capability_probe = capability
+            completed = engine.execute_registered_experiments(
+                fixture.identity,
+                maximum=1,
+                _session_owned=True,
+                experiment_ids=(child_id,),
+            )
+            cls.legacy_state = copy.deepcopy(completed)
+            cls.parent_id = parent_id
+            cls.child_id = child_id
+            cls.payload = payload
+        finally:
+            fixture.tearDown()
+
+    def _state_inputs(self, state):
+        from ctf_os.engine.pwn_crash import (
+            PwnCrashGateEvaluation,
+            PwnCrashReceiptMetadata,
+            PwnCrashRecipe,
+        )
+        from ctf_os.engine.pwn_disclosure import (
+            build_pwn_disclosure_trusted_receipt_expectation,
+            evaluate_pwn_disclosure,
+        )
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PwnRuntimeSnapshotGateEvaluation,
+            PwnRuntimeSnapshotReceiptMetadata,
+            PwnRuntimeSnapshotRecipe,
+        )
+
+        parent = next(
+            item
+            for item in state.experiments
+            if item.id == self.parent_id
+        )
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        parent_evidence = parent.result["pwn_crash_evidence"]
+        snapshot_evidence = child.result[
+            "pwn_runtime_snapshot_evidence"
+        ]
+        crash_recipe = PwnCrashRecipe.from_dict(
+            parent.extra["pwn_crash_recipe"]
+        )
+        crash_evaluation = PwnCrashGateEvaluation.from_dict(
+            parent_evidence["evaluation"]
+        )
+        snapshot_recipe = PwnRuntimeSnapshotRecipe.from_dict(
+            child.extra["pwn_runtime_snapshot_recipe"]
+        )
+        snapshot_evaluation = (
+            PwnRuntimeSnapshotGateEvaluation.from_dict(
+                snapshot_evidence["evaluation"],
+                recipe=snapshot_recipe,
+            )
+        )
+        receipts = {item.id: item for item in state.receipts}
+        positive_receipts = tuple(
+            PwnCrashReceiptMetadata.from_dict(
+                receipts[attempt["receipt_id"]]
+                .extra["pwn_crash"]["receipt"]
+            )
+            for attempt in parent_evidence["attempts"][:3]
+        )
+        snapshot_receipt = (
+            PwnRuntimeSnapshotReceiptMetadata.from_dict(
+                receipts[snapshot_evidence["receipt_id"]]
+                .extra["pwn_runtime_snapshot"]["receipt"]
+            )
+        )
+        expectation = (
+            build_pwn_disclosure_trusted_receipt_expectation(
+                positive_crash_receipts=positive_receipts,
+                snapshot_receipt=snapshot_receipt,
+            )
+        )
+        result = evaluate_pwn_disclosure(
+            crash_recipe=crash_recipe,
+            crash_evaluation=crash_evaluation,
+            positive_crash_receipts=positive_receipts,
+            snapshot_recipe=snapshot_recipe,
+            snapshot_evaluation=snapshot_evaluation,
+            snapshot_receipt=snapshot_receipt,
+            trusted_receipt_expectation=expectation,
+            payload=self.payload,
+            positive_crash_stderr=(b"", b"", b""),
+            runtime_stderr=b"",
+        )
+        return expectation, result
+
+    def _v2_state(self, phase: PwnDisclosurePhase):
+        from ctf_os.engine.pwn_disclosure import (
+            PWN_DISCLOSURE_SCHEMA_VERSION,
+        )
+
+        state = copy.deepcopy(self.legacy_state)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        expectation, result = self._state_inputs(state)
+        starting_revision = state.revision
+        if phase is PwnDisclosurePhase.AWAITING_EXPECTATION:
+            envelope = PwnRuntimeSnapshotDisclosureEnvelope(
+                schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                phase=phase,
+                expectation_source_state_revision=None,
+                trusted_receipt_expectation=None,
+                trusted_receipt_expectation_sha256=None,
+                evaluation_source_state_revision=None,
+                result=None,
+                result_sha256=None,
+            )
+        elif phase is PwnDisclosurePhase.EXPECTATION_COMMITTED:
+            state.revision += 1
+            envelope = PwnRuntimeSnapshotDisclosureEnvelope(
+                schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                phase=phase,
+                expectation_source_state_revision=starting_revision,
+                trusted_receipt_expectation=expectation,
+                trusted_receipt_expectation_sha256=(
+                    expectation.evidence_sha256
+                ),
+                evaluation_source_state_revision=None,
+                result=None,
+                result_sha256=None,
+            )
+        else:
+            state.revision += 2
+            envelope = PwnRuntimeSnapshotDisclosureEnvelope(
+                schema_version=PWN_DISCLOSURE_SCHEMA_VERSION,
+                phase=phase,
+                expectation_source_state_revision=starting_revision,
+                trusted_receipt_expectation=expectation,
+                trusted_receipt_expectation_sha256=(
+                    expectation.evidence_sha256
+                ),
+                evaluation_source_state_revision=(
+                    starting_revision + 1
+                ),
+                result=result,
+                result_sha256=result.evidence_sha256,
+            )
+        child.extra["managed_contract_version"] = 2
+        child.extra["pwn_disclosure"] = envelope.to_dict()
+        return state
+
+    def test_v2_lifecycle_round_trips_without_new_evidence_authority(
+        self,
+    ) -> None:
+        baseline_counts = tuple(
+            len(getattr(self.legacy_state, field))
+            for field in (
+                "experiments",
+                "runs",
+                "receipts",
+                "artifacts",
+                "facts",
+                "hypotheses",
+            )
+        )
+        for phase in PwnDisclosurePhase:
+            with self.subTest(phase=phase.value):
+                state = self._v2_state(phase)
+                state.validate()
+                restored = type(state).from_dict(state.to_dict())
+                restored.validate()
+                self.assertEqual(restored.to_dict(), state.to_dict())
+                self.assertEqual(
+                    tuple(
+                        len(getattr(state, field))
+                        for field in (
+                            "experiments",
+                            "runs",
+                            "receipts",
+                            "artifacts",
+                            "facts",
+                            "hypotheses",
+                        )
+                    ),
+                    baseline_counts,
+                )
+                if phase is PwnDisclosurePhase.COMPLETE:
+                    child = next(
+                        item
+                        for item in state.experiments
+                        if item.id == self.child_id
+                    )
+                    self.assertTrue(
+                        all(
+                            value is False
+                            for value in child.extra["pwn_disclosure"][
+                                "result"
+                            ]["authorities"].values()
+                        )
+                    )
+
+    def test_phase_hash_and_revision_tamper_fail_closed(self) -> None:
+        state = self._v2_state(PwnDisclosurePhase.COMPLETE)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        child.extra["pwn_disclosure"]["result_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "Pwn disclosure",
+        ):
+            state.validate()
+
+        state = self._v2_state(PwnDisclosurePhase.COMPLETE)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        child.extra["pwn_disclosure"]["result"]["authorities"][
+            "proof_satisfied"
+        ] = True
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "Pwn disclosure",
+        ):
+            state.validate()
+
+        state = self._v2_state(PwnDisclosurePhase.COMPLETE)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        child.extra["pwn_disclosure"][
+            "evaluation_source_state_revision"
+        ] = state.revision
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "Pwn disclosure",
+        ):
+            state.validate()
+
+        state = self._v2_state(
+            PwnDisclosurePhase.EXPECTATION_COMMITTED
+        )
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        child.extra["pwn_disclosure"]["unexpected"] = True
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "schema is not exact",
+        ):
+            state.validate()
+
+        state = self._v2_state(
+            PwnDisclosurePhase.EXPECTATION_COMMITTED
+        )
+        state.revision += 1
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "consecutive canonical state replacements",
+        ):
+            state.validate()
+
+        state = self._v2_state(PwnDisclosurePhase.COMPLETE)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        parsed = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            child.extra["pwn_disclosure"]
+        )
+        durable = PwnRuntimeSnapshotDisclosureEnvelope(
+            schema_version=parsed.schema_version,
+            phase=parsed.phase,
+            expectation_source_state_revision=14,
+            trusted_receipt_expectation=(
+                parsed.trusted_receipt_expectation
+            ),
+            trusted_receipt_expectation_sha256=(
+                parsed.trusted_receipt_expectation_sha256
+            ),
+            evaluation_source_state_revision=15,
+            result=parsed.result,
+            result_sha256=parsed.result_sha256,
+        )
+        durable.validate_state_revision(16)
+        durable.validate_state_revision(17)
+        durable.validate_state_revision(100)
+
+        from ctf_os.engine.pwn_disclosure import (
+            PWN_DISCLOSURE_MAX_CANDIDATES,
+            PwnDisclosureCandidate,
+        )
+
+        oversized = copy.deepcopy(child.extra["pwn_disclosure"])
+        oversized["result"]["candidates"] = [
+            {}
+            for _ in range(PWN_DISCLOSURE_MAX_CANDIDATES + 1)
+        ]
+        oversized["result"]["candidate_count"] = len(
+            oversized["result"]["candidates"]
+        )
+        with mock.patch.object(
+            PwnDisclosureCandidate,
+            "from_dict",
+            side_effect=AssertionError(
+                "oversized candidates were materialized"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ModelValidationError,
+                "Pwn disclosure",
+            ):
+                PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+                    oversized
+                )
+
+    def test_rehashed_foreign_expectation_fails_state_crosslink(self) -> None:
+        from ctf_os.engine.pwn_disclosure import (
+            PwnDisclosureTrustedReceiptExpectation,
+        )
+
+        state = self._v2_state(
+            PwnDisclosurePhase.EXPECTATION_COMMITTED
+        )
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        envelope = child.extra["pwn_disclosure"]
+        foreign = copy.deepcopy(
+            envelope["trusted_receipt_expectation"]
+        )
+        foreign["positive_receipts"][0]["receipt_id"] = (
+            "receipt-foreign"
+        )
+        parsed = PwnDisclosureTrustedReceiptExpectation.from_dict(
+            foreign
+        )
+        envelope["trusted_receipt_expectation"] = parsed.to_dict()
+        envelope["trusted_receipt_expectation_sha256"] = (
+            parsed.evidence_sha256
+        )
+
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "does not match canonical prior state",
+        ):
+            state.validate()
+
+    def test_disclosure_cannot_own_records_or_promote_candidate(
+        self,
+    ) -> None:
+        state = self._v2_state(
+            PwnDisclosurePhase.AWAITING_EXPECTATION
+        )
+        snapshot_run = next(
+            item
+            for item in state.runs
+            if item.role == "pwn_runtime_snapshot"
+        )
+        snapshot_run.extra["pwn_disclosure"] = {}
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "cannot own Run",
+        ):
+            state.validate()
+
+        state = self._v2_state(
+            PwnDisclosurePhase.AWAITING_EXPECTATION
+        )
+        snapshot_run = next(
+            item
+            for item in state.runs
+            if item.role == "pwn_runtime_snapshot"
+        )
+        state.candidates.append(
+            FlagCandidate(
+                id="C-pwn-disclosure",
+                value="CTF{diagnostic_only}",
+                source_run_id=snapshot_run.id,
+            )
+        )
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "cannot promote candidate",
+        ):
+            state.validate()
+
+    def test_legacy_v1_terminal_snapshot_is_not_backfilled(self) -> None:
+        state = copy.deepcopy(self.legacy_state)
+        child = next(
+            item
+            for item in state.experiments
+            if item.id == self.child_id
+        )
+        self.assertEqual(child.extra["managed_contract_version"], 1)
+        self.assertNotIn("pwn_disclosure", child.extra)
+        snapshot_run = next(
+            item
+            for item in state.runs
+            if item.role == "pwn_runtime_snapshot"
+        )
+        state.candidates.append(
+            FlagCandidate(
+                id="C-legacy-snapshot",
+                value="CTF{legacy_snapshot_candidate}",
+                source_run_id=snapshot_run.id,
+            )
+        )
+        state.validate()
+        restored = type(state).from_dict(state.to_dict())
+        restored.validate()
+        restored_child = next(
+            item
+            for item in restored.experiments
+            if item.id == self.child_id
+        )
+        self.assertEqual(
+            restored_child.extra["managed_contract_version"],
+            1,
+        )
+        self.assertNotIn("pwn_disclosure", restored_child.extra)
 
 
 if __name__ == "__main__":

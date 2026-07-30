@@ -174,6 +174,12 @@ class ExperimentStatus(StringEnum):
     COMPLETED = "completed"
 
 
+class PwnDisclosurePhase(StringEnum):
+    AWAITING_EXPECTATION = "awaiting_expectation"
+    EXPECTATION_COMMITTED = "expectation_committed"
+    COMPLETE = "complete"
+
+
 class GoalStatus(StringEnum):
     PENDING = "pending"
     ACTIVE = "active"
@@ -1701,6 +1707,277 @@ class ProofRecipe:
                 else None
             ),
         )
+
+
+_PWN_RUNTIME_SNAPSHOT_DISCLOSURE_ENVELOPE_KEYS = frozenset(
+    {
+        "schema_version",
+        "phase",
+        "expectation_source_state_revision",
+        "trusted_receipt_expectation",
+        "trusted_receipt_expectation_sha256",
+        "evaluation_source_state_revision",
+        "result",
+        "result_sha256",
+    }
+)
+
+
+def _state_only_pwn_disclosure_result(value: object) -> object:
+    """Reconstruct one canonical diagnostic result without reading artifacts.
+
+    This validates the exact persisted contract, including its all-false
+    authorities, but deliberately does not claim that the referenced bytes
+    were reread.  The filesystem-backed validator must later recompute the
+    expected result and compare it byte-for-byte.
+    """
+
+    try:
+        from ctf_os.engine.pwn_disclosure import (
+            PWN_DISCLOSURE_MAX_CANDIDATES,
+            PwnDisclosureCandidate,
+            PwnDisclosureResult,
+            PwnDisclosureResultBinding,
+            PwnDisclosureStatus,
+            _require_current_contract_fingerprint,
+        )
+
+        _require_current_contract_fingerprint()
+        if type(value) is not dict:
+            raise ValueError("result is not an exact object")
+        raw_candidates = value.get("candidates")
+        if (
+            type(raw_candidates) is not list
+            or len(raw_candidates) > PWN_DISCLOSURE_MAX_CANDIDATES
+        ):
+            raise ValueError("result candidates are not an exact array")
+        expected = PwnDisclosureResult(
+            status=PwnDisclosureStatus(value.get("status")),
+            reason_code=value.get("reason_code"),
+            binding=PwnDisclosureResultBinding.from_dict(
+                value.get("binding")
+            ),
+            candidates=tuple(
+                PwnDisclosureCandidate.from_dict(item)
+                for item in raw_candidates
+            ),
+        )
+        return PwnDisclosureResult.from_dict(
+            value,
+            expected_result=expected,
+        )
+    except (ImportError, KeyError, TypeError, ValueError) as error:
+        raise ModelValidationError(
+            "Pwn disclosure result is not an exact canonical diagnostic"
+        ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class PwnRuntimeSnapshotDisclosureEnvelope:
+    """State-only, non-authoritative lifecycle for one disclosure diagnostic."""
+
+    schema_version: int
+    phase: PwnDisclosurePhase
+    expectation_source_state_revision: int | None
+    trusted_receipt_expectation: object | None
+    trusted_receipt_expectation_sha256: str | None
+    evaluation_source_state_revision: int | None
+    result: object | None
+    result_sha256: str | None
+
+    def __post_init__(self) -> None:
+        try:
+            from ctf_os.engine.pwn_disclosure import (
+                PWN_DISCLOSURE_SCHEMA_VERSION,
+                PwnDisclosureResult,
+                PwnDisclosureTrustedReceiptExpectation,
+                _require_current_contract_fingerprint,
+            )
+
+            _require_current_contract_fingerprint()
+        except (ImportError, TypeError, ValueError) as error:
+            raise ModelValidationError(
+                "Pwn disclosure contract dependency is unavailable or drifted"
+            ) from error
+
+        expectation = self.trusted_receipt_expectation
+        result = self.result
+        expectation_revision = self.expectation_source_state_revision
+        evaluation_revision = self.evaluation_source_state_revision
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != PWN_DISCLOSURE_SCHEMA_VERSION
+            or type(self.phase) is not PwnDisclosurePhase
+        ):
+            raise ModelValidationError(
+                "Pwn disclosure envelope identity is not canonical"
+            )
+        for revision in (expectation_revision, evaluation_revision):
+            if revision is not None and (
+                type(revision) is not int or revision < 0
+            ):
+                raise ModelValidationError(
+                    "Pwn disclosure source revision is invalid"
+                )
+
+        if self.phase is PwnDisclosurePhase.AWAITING_EXPECTATION:
+            valid = (
+                expectation_revision is None
+                and expectation is None
+                and self.trusted_receipt_expectation_sha256 is None
+                and evaluation_revision is None
+                and result is None
+                and self.result_sha256 is None
+            )
+        elif self.phase is PwnDisclosurePhase.EXPECTATION_COMMITTED:
+            valid = (
+                expectation_revision is not None
+                and type(expectation)
+                is PwnDisclosureTrustedReceiptExpectation
+                and self.trusted_receipt_expectation_sha256
+                == expectation.evidence_sha256
+                and evaluation_revision is None
+                and result is None
+                and self.result_sha256 is None
+            )
+        else:
+            valid = (
+                expectation_revision is not None
+                and type(expectation)
+                is PwnDisclosureTrustedReceiptExpectation
+                and self.trusted_receipt_expectation_sha256
+                == expectation.evidence_sha256
+                and evaluation_revision is not None
+                and evaluation_revision == expectation_revision + 1
+                and type(result) is PwnDisclosureResult
+                and self.result_sha256 == result.evidence_sha256
+                and (
+                    result.binding.upstream
+                    .trusted_receipt_expectation_sha256
+                    == expectation.evidence_sha256
+                )
+                and result.binding.upstream.positive_receipts
+                == expectation.positive_receipts
+                and result.binding.upstream.runtime_snapshot_receipt
+                == expectation.runtime_snapshot_receipt
+            )
+        if not valid:
+            raise ModelValidationError(
+                "Pwn disclosure envelope phase fields are inconsistent"
+            )
+
+    def validate_state_revision(self, state_revision: int) -> None:
+        if type(state_revision) is not int or state_revision < 0:
+            raise ModelValidationError(
+                "Pwn disclosure state revision is invalid"
+            )
+        if self.phase is PwnDisclosurePhase.AWAITING_EXPECTATION:
+            valid = True
+        elif self.phase is PwnDisclosurePhase.EXPECTATION_COMMITTED:
+            valid = (
+                self.expectation_source_state_revision
+                == state_revision - 1
+            )
+        else:
+            valid = (
+                self.expectation_source_state_revision is not None
+                and self.evaluation_source_state_revision
+                == self.expectation_source_state_revision + 1
+                and state_revision
+                >= self.evaluation_source_state_revision + 1
+            )
+        if not valid:
+            raise ModelValidationError(
+                "Pwn disclosure source revisions must match consecutive "
+                "canonical state replacements"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        expectation = self.trusted_receipt_expectation
+        result = self.result
+        return {
+            "schema_version": self.schema_version,
+            "phase": self.phase.value,
+            "expectation_source_state_revision": (
+                self.expectation_source_state_revision
+            ),
+            "trusted_receipt_expectation": (
+                expectation.to_dict()
+                if expectation is not None
+                else None
+            ),
+            "trusted_receipt_expectation_sha256": (
+                self.trusted_receipt_expectation_sha256
+            ),
+            "evaluation_source_state_revision": (
+                self.evaluation_source_state_revision
+            ),
+            "result": (
+                result.to_dict() if result is not None else None
+            ),
+            "result_sha256": self.result_sha256,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, object],
+    ) -> "PwnRuntimeSnapshotDisclosureEnvelope":
+        if (
+            type(value) is not dict
+            or set(value)
+            != _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_ENVELOPE_KEYS
+        ):
+            raise ModelValidationError(
+                "Pwn disclosure envelope schema is not exact"
+            )
+        try:
+            from ctf_os.engine.pwn_disclosure import (
+                PwnDisclosureTrustedReceiptExpectation,
+            )
+
+            raw_expectation = value["trusted_receipt_expectation"]
+            raw_result = value["result"]
+            envelope = cls(
+                schema_version=value["schema_version"],
+                phase=PwnDisclosurePhase(value["phase"]),
+                expectation_source_state_revision=value[
+                    "expectation_source_state_revision"
+                ],
+                trusted_receipt_expectation=(
+                    PwnDisclosureTrustedReceiptExpectation.from_dict(
+                        raw_expectation
+                    )
+                    if raw_expectation is not None
+                    else None
+                ),
+                trusted_receipt_expectation_sha256=value[
+                    "trusted_receipt_expectation_sha256"
+                ],
+                evaluation_source_state_revision=value[
+                    "evaluation_source_state_revision"
+                ],
+                result=(
+                    _state_only_pwn_disclosure_result(raw_result)
+                    if raw_result is not None
+                    else None
+                ),
+                result_sha256=value["result_sha256"],
+            )
+        except (
+            ImportError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ModelValidationError(
+                "Pwn disclosure envelope is not canonical"
+            ) from error
+        if value != envelope.to_dict():
+            raise ModelValidationError(
+                "Pwn disclosure envelope is not reconstructable"
+            )
+        return envelope
 
 
 @dataclass
@@ -6217,6 +6494,11 @@ _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS = frozenset(
         "pwn_runtime_snapshot_recipe",
     }
 )
+_PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY = "pwn_disclosure"
+_PWN_RUNTIME_SNAPSHOT_V2_EXPERIMENT_EXTRA_KEYS = (
+    _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
+    | {_PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY}
+)
 _PWN_RUNTIME_SNAPSHOT_RECOVERY_EXTRA_KEYS = frozenset(
     {"orphan_recovered_at", "orphan_recovery"}
 )
@@ -6307,6 +6589,7 @@ def _pwn_runtime_snapshot_experiment_marker(
         or experiment.extra.get("engine_executor")
         == _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
         or "pwn_runtime_snapshot_recipe" in experiment.extra
+        or _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in experiment.extra
         or (
             isinstance(result, Mapping)
             and _PWN_RUNTIME_SNAPSHOT_RESULT_KEY in result
@@ -6349,18 +6632,30 @@ def _pwn_runtime_snapshot_recipe_binding(
             f"{label} has missing or unknown engine-owned fields"
         ]
     extra_keys = set(child.extra)
+    managed_contract_version = child.extra.get(
+        "managed_contract_version"
+    )
+    expected_extra_keys = (
+        _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
+        if managed_contract_version == 1
+        else _PWN_RUNTIME_SNAPSHOT_V2_EXPERIMENT_EXTRA_KEYS
+        if managed_contract_version == 2
+        else frozenset()
+    )
     has_recovery = (
         extra_keys
         == (
-            _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
+            expected_extra_keys
             | _PWN_RUNTIME_SNAPSHOT_RECOVERY_EXTRA_KEYS
         )
     )
     if (
         not (
-            extra_keys
-            == _PWN_RUNTIME_SNAPSHOT_EXPERIMENT_EXTRA_KEYS
-            or has_recovery
+            expected_extra_keys
+            and (
+                extra_keys == expected_extra_keys
+                or has_recovery
+            )
         )
         or (
             has_recovery
@@ -6417,7 +6712,7 @@ def _pwn_runtime_snapshot_recipe_binding(
             recipe.parent_experiment_id
         )
         or parent_id != recipe.parent_experiment_id
-        or child.extra.get("managed_contract_version") != 1
+        or managed_contract_version not in {1, 2}
         or child.extra.get("engine_executor")
         != _PWN_RUNTIME_SNAPSHOT_ENGINE_EXECUTOR
         or child.kind is not ExperimentKind.PROBE
@@ -7028,6 +7323,186 @@ def _pwn_runtime_snapshot_terminal_errors(
     return errors, expected_ids
 
 
+def _pwn_runtime_snapshot_disclosure_errors(
+    state: "ChallengeState",
+    child: Experiment,
+    *,
+    parent: Experiment,
+    snapshot_recipe: Any,
+    receipts: Mapping[str, ExecutionReceipt],
+) -> list[str]:
+    """Validate only persisted disclosure structure and canonical crosslinks.
+
+    Artifact bytes are intentionally out of scope here.  A filesystem-backed
+    engine validator must reread those bytes, recompute the exact result, and
+    compare it before completing the lifecycle.
+    """
+
+    label = f"Pwn runtime snapshot experiment {child.id} disclosure"
+    version = child.extra.get("managed_contract_version")
+    if version == 1:
+        return []
+    if version != 2:
+        return [f"{label} has an unsupported managed contract version"]
+    try:
+        envelope = PwnRuntimeSnapshotDisclosureEnvelope.from_dict(
+            child.extra.get(_PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY)
+        )
+        envelope.validate_state_revision(state.revision)
+    except (ModelValidationError, TypeError, ValueError) as error:
+        return [f"{label} envelope is invalid: {error}"]
+
+    if (
+        child.status is not ExperimentStatus.COMPLETED
+        and envelope.phase
+        is not PwnDisclosurePhase.AWAITING_EXPECTATION
+    ):
+        return [
+            f"{label} cannot advance before the runtime snapshot completes"
+        ]
+    if envelope.phase is PwnDisclosurePhase.AWAITING_EXPECTATION:
+        return []
+
+    try:
+        from ctf_os.engine.pwn_crash import (
+            PwnCrashGateEvaluation,
+            PwnCrashReceiptMetadata,
+            PwnCrashRecipe,
+        )
+        from ctf_os.engine.pwn_disclosure import (
+            PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS,
+            PwnDisclosureResult,
+            _result_binding,
+            build_pwn_disclosure_trusted_receipt_expectation,
+        )
+        from ctf_os.engine.pwn_runtime_snapshot import (
+            PwnRuntimeSnapshotGateEvaluation,
+            PwnRuntimeSnapshotReceiptMetadata,
+        )
+
+        raw_parent_recipe = parent.extra.get("pwn_crash_recipe")
+        raw_parent_evidence = (
+            parent.result.get(_PWN_CRASH_RESULT_KEY)
+            if type(parent.result) is dict
+            and set(parent.result) == {_PWN_CRASH_RESULT_KEY}
+            else None
+        )
+        raw_snapshot_evidence = (
+            child.result.get(_PWN_RUNTIME_SNAPSHOT_RESULT_KEY)
+            if type(child.result) is dict
+            and set(child.result)
+            == {_PWN_RUNTIME_SNAPSHOT_RESULT_KEY}
+            else None
+        )
+        if (
+            type(raw_parent_recipe) is not dict
+            or type(raw_parent_evidence) is not dict
+            or type(raw_parent_evidence.get("evaluation")) is not dict
+            or type(raw_parent_evidence.get("attempts")) is not list
+            or type(raw_snapshot_evidence) is not dict
+            or type(raw_snapshot_evidence.get("evaluation")) is not dict
+        ):
+            raise ValueError("upstream evidence is not canonical")
+        parent_recipe = PwnCrashRecipe.from_dict(raw_parent_recipe)
+        parent_evaluation = PwnCrashGateEvaluation.from_dict(
+            raw_parent_evidence["evaluation"]
+        )
+        snapshot_evaluation = (
+            PwnRuntimeSnapshotGateEvaluation.from_dict(
+                raw_snapshot_evidence["evaluation"],
+                recipe=snapshot_recipe,
+            )
+        )
+        attempts = raw_parent_evidence["attempts"]
+        positive_metadata: list[Any] = []
+        for ordinal in range(
+            1,
+            PWN_DISCLOSURE_POSITIVE_CRASH_REPLAYS + 1,
+        ):
+            attempt = attempts[ordinal - 1]
+            if (
+                type(attempt) is not dict
+                or attempt.get("ordinal") != ordinal
+                or type(attempt.get("receipt_id")) is not str
+            ):
+                raise ValueError(
+                    "positive crash receipt order is not canonical"
+                )
+            receipt = receipts.get(attempt["receipt_id"])
+            raw_record = (
+                receipt.extra.get("pwn_crash")
+                if receipt is not None
+                else None
+            )
+            if (
+                type(raw_record) is not dict
+                or type(raw_record.get("receipt")) is not dict
+            ):
+                raise ValueError(
+                    "positive crash receipt metadata is unavailable"
+                )
+            positive_metadata.append(
+                PwnCrashReceiptMetadata.from_dict(
+                    raw_record["receipt"]
+                )
+            )
+        snapshot_receipt = receipts.get(
+            raw_snapshot_evidence.get("receipt_id")
+        )
+        snapshot_record = (
+            snapshot_receipt.extra.get("pwn_runtime_snapshot")
+            if snapshot_receipt is not None
+            else None
+        )
+        if (
+            type(snapshot_record) is not dict
+            or type(snapshot_record.get("receipt")) is not dict
+        ):
+            raise ValueError(
+                "runtime snapshot receipt metadata is unavailable"
+            )
+        snapshot_metadata = PwnRuntimeSnapshotReceiptMetadata.from_dict(
+            snapshot_record["receipt"]
+        )
+        expected_expectation = (
+            build_pwn_disclosure_trusted_receipt_expectation(
+                positive_crash_receipts=tuple(positive_metadata),
+                snapshot_receipt=snapshot_metadata,
+            )
+        )
+        expected_binding = _result_binding(
+            crash_recipe=parent_recipe,
+            crash_evaluation=parent_evaluation,
+            snapshot_recipe=snapshot_recipe,
+            snapshot_evaluation=snapshot_evaluation,
+            trusted_receipt_expectation=expected_expectation,
+        )
+    except (
+        ImportError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return [f"{label} upstream binding is invalid: {error}"]
+
+    if envelope.trusted_receipt_expectation != expected_expectation:
+        return [
+            f"{label} trusted receipt expectation does not match "
+            "canonical prior state"
+        ]
+    if envelope.phase is PwnDisclosurePhase.COMPLETE:
+        result = envelope.result
+        if (
+            type(result) is not PwnDisclosureResult
+            or result.binding != expected_binding
+        ):
+            return [
+                f"{label} result binding does not match canonical prior state"
+            ]
+    return []
+
+
 def _pwn_runtime_snapshot_state_errors(
     state: "ChallengeState",
     *,
@@ -7037,6 +7512,7 @@ def _pwn_runtime_snapshot_state_errors(
     artifacts: Mapping[str, ArtifactReference],
     facts: Mapping[str, Fact],
     hypotheses: Mapping[str, Hypothesis],
+    candidates: Mapping[str, FlagCandidate],
 ) -> list[str]:
     """Validate diagnostic child identity and its isolated lifecycle."""
 
@@ -7064,6 +7540,15 @@ def _pwn_runtime_snapshot_state_errors(
         if recipe is None or parent is None or payload is None:
             continue
         children_by_parent.setdefault(parent.id, []).append(child.id)
+        errors.extend(
+            _pwn_runtime_snapshot_disclosure_errors(
+                state,
+                child,
+                parent=parent,
+                snapshot_recipe=recipe,
+                receipts=receipts,
+            )
+        )
 
         linked_runs = [
             run
@@ -7165,6 +7650,10 @@ def _pwn_runtime_snapshot_state_errors(
             )
 
     for run in state.runs:
+        if _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in run.extra:
+            errors.append(
+                f"Pwn disclosure cannot own Run {run.id}"
+            )
         if (
             _pwn_runtime_snapshot_run_marker(run)
             and run.extra.get("experiment_id") not in children
@@ -7173,6 +7662,10 @@ def _pwn_runtime_snapshot_state_errors(
                 f"Pwn runtime snapshot run {run.id} has no typed child"
             )
     for receipt in state.receipts:
+        if _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in receipt.extra:
+            errors.append(
+                f"Pwn disclosure cannot own receipt {receipt.id}"
+            )
         if (
             "pwn_runtime_snapshot" in receipt.extra
             and receipt.experiment_id not in children
@@ -7190,7 +7683,26 @@ def _pwn_runtime_snapshot_state_errors(
         for artifact in state.artifacts
         if _pwn_runtime_snapshot_artifact_marker(artifact)
     }
+    disclosure_child_ids = {
+        child.id
+        for child in children.values()
+        if child.extra.get("managed_contract_version") == 2
+    }
+    disclosure_snapshot_run_ids = {
+        run.id
+        for run in state.runs
+        if run.extra.get("experiment_id") in disclosure_child_ids
+    }
+    disclosure_snapshot_artifact_ids = {
+        artifact.id
+        for artifact in state.artifacts
+        if artifact.source_run_id in disclosure_snapshot_run_ids
+    }
     for artifact in state.artifacts:
+        if _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in artifact.extra:
+            errors.append(
+                f"Pwn disclosure cannot own artifact {artifact.id}"
+            )
         if (
             _pwn_runtime_snapshot_artifact_marker(artifact)
             and (
@@ -7209,13 +7721,15 @@ def _pwn_runtime_snapshot_state_errors(
             fact.source_run_id in snapshot_run_ids
             or fact.artifact_id in snapshot_artifact_ids
             or "pwn_runtime_snapshot" in fact.extra
+            or _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in fact.extra
         ):
             errors.append(
                 f"Pwn runtime snapshot cannot promote Fact {fact.id}"
             )
     for hypothesis in hypotheses.values():
         if (
-            not set(hypothesis.evidence_run_ids).isdisjoint(
+            _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in hypothesis.extra
+            or not set(hypothesis.evidence_run_ids).isdisjoint(
                 snapshot_run_ids
             )
             or not set(hypothesis.evidence_artifact_ids).isdisjoint(
@@ -7230,6 +7744,42 @@ def _pwn_runtime_snapshot_state_errors(
             errors.append(
                 f"Pwn runtime snapshot cannot promote Hypothesis "
                 f"{hypothesis.id}"
+            )
+    for candidate in candidates.values():
+        if (
+            _PWN_RUNTIME_SNAPSHOT_DISCLOSURE_KEY in candidate.extra
+            or candidate.source_run_id in disclosure_snapshot_run_ids
+            or candidate.artifact_id in disclosure_snapshot_artifact_ids
+            or not set(candidate.proof_run_ids).isdisjoint(
+                disclosure_snapshot_run_ids
+            )
+        ):
+            errors.append(
+                f"Pwn runtime snapshot disclosure cannot promote candidate "
+                f"{candidate.id}"
+            )
+    for experiment in state.experiments:
+        proof_recipe = experiment.proof_recipe
+        if (
+            experiment.kind is ExperimentKind.PROOF
+            and proof_recipe is not None
+            and (
+                proof_recipe.source_experiment_id
+                in disclosure_child_ids
+                or proof_recipe.source_run_id
+                in disclosure_snapshot_run_ids
+                or any(
+                    item.artifact_id
+                    in disclosure_snapshot_artifact_ids
+                    or item.source_run_id
+                    in disclosure_snapshot_run_ids
+                    for item in proof_recipe.inputs
+                )
+            )
+        ):
+            errors.append(
+                f"Pwn runtime snapshot disclosure cannot satisfy proof "
+                f"{experiment.id}"
             )
     return errors
 
@@ -10186,6 +10736,7 @@ class ChallengeState:
                     artifacts=artifacts,
                     facts=facts,
                     hypotheses=hypotheses,
+                    candidates=candidates,
                 )
             )
             errors.extend(
@@ -10274,6 +10825,8 @@ __all__ = [
     "ProofRecipe",
     "ProofRecipeInput",
     "Provenance",
+    "PwnDisclosurePhase",
+    "PwnRuntimeSnapshotDisclosureEnvelope",
     "ReceiptOutcome",
     "RevStdinOracleBinding",
     "RunReference",
