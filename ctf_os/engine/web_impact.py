@@ -1171,13 +1171,18 @@ def evaluate_web_impact(
             failures.append(
                 _failure("source_sink_evidence_invalid", position)
             )
+        # A structurally valid replay remains durable evidence even when its
+        # response fails the impact oracle.  Retaining it prevents callers
+        # from cherry-picking only successful replays while the failure code
+        # continues to make the aggregate verdict fail closed.
+        recordable = len(failures) == before
         if timeline_valid and not _oracle_valid(
             plan,
             raw,
             control=control,
         ):
             failures.append(_failure("impact_oracle_failed", position))
-        if len(failures) == before:
+        if recordable:
             records.append(
                 WebImpactReplayRecord(
                     target_kind=raw.target_kind,

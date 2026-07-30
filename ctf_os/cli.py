@@ -997,6 +997,23 @@ def build_parser() -> argparse.ArgumentParser:
     prove.add_argument("--repetitions", type=int)
     prove.add_argument("proof_command", nargs=argparse.REMAINDER)
 
+    web_prove = commands.add_parser(
+        "web-prove",
+        help=(
+            "운영자 Web impact spec/driver를 사전 발행한 뒤 "
+            "격리된 3회 replay로 실행 검증"
+        ),
+    )
+    _identity_values(web_prove)
+    web_prove.add_argument("--spec", required=True)
+    web_prove.add_argument("--driver", required=True)
+    web_prove.add_argument(
+        "--hypothesis",
+        action="append",
+        default=[],
+    )
+    web_prove.add_argument("--timeout", type=int, default=900)
+
     crypto_prove = commands.add_parser(
         "crypto-prove",
         help=(
@@ -1868,6 +1885,34 @@ def main(
             )
             _print_json(result.to_dict())
             return 0 if result.passed else 1
+
+        if args.command == "web-prove":
+            state, result = engine.prove_web_impact(
+                _identity(args),
+                operator_spec_locator=args.spec,
+                driver_locator=args.driver,
+                hypothesis_ids=tuple(args.hypothesis),
+                timeout_seconds=args.timeout,
+            )
+            semantic_sha256 = (
+                result.semantic_evaluation.sha256
+                if result.semantic_evaluation is not None
+                else None
+            )
+            _print_json(
+                {
+                    "confirmed": result.confirmed,
+                    "execution_plan_sha256": (
+                        result.execution_plan_sha256
+                    ),
+                    "reason_codes": list(result.reason_codes),
+                    "replay_count": len(result.records),
+                    "semantic_evaluation_sha256": semantic_sha256,
+                    "state_revision": state.revision,
+                    "verdict": result.verdict.value,
+                }
+            )
+            return 0 if result.confirmed else 1
 
         if args.command == "crypto-prove":
             state, result = engine.prove_crypto_metamorphic_candidate(

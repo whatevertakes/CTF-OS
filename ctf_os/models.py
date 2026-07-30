@@ -5273,6 +5273,25 @@ def _pwn_crash_experiment_marker(experiment: Experiment) -> bool:
     )
 
 
+def _web_impact_state_marker(value: object) -> bool:
+    """Identify records whose stricter graph is validated after generic rules.
+
+    Keep this local to avoid importing the Web graph module while model types
+    are being defined.  The exact graph validator is invoked at the end of
+    ``ChallengeState.validate`` and rejects forged or orphaned markers.
+    """
+
+    extra = getattr(value, "extra", None)
+    return (
+        type(extra) is dict
+        and (
+            extra.get("engine_executor")
+            == "web_impact_execution_state_v1"
+            or "web_impact_state" in extra
+        )
+    )
+
+
 def _pwn_crash_safe_locator(value: object) -> bool:
     if (
         type(value) is not str
@@ -13037,6 +13056,7 @@ class ChallengeState:
             if (
                 experiment.status in evaluated_statuses
                 and not _pwn_crash_experiment_marker(experiment)
+                and not _web_impact_state_marker(experiment)
             ):
                 result_run_id = (
                     experiment.result.get("run_id")
@@ -13287,6 +13307,7 @@ class ChallengeState:
                     fact.kind is FactKind.OBSERVATION
                     and fact.provenance is Provenance.EXECUTED
                     and not (fact.locator or "").strip()
+                    and not _web_impact_state_marker(fact)
                 ):
                     errors.append(
                         f"executed observation fact {fact.id} requires a locator"
@@ -14036,6 +14057,7 @@ class ChallengeState:
                                     experiment
                                 )
                             )
+                            and not _web_impact_state_marker(experiment)
                         )
                     )
                 ):
@@ -14676,6 +14698,14 @@ class ChallengeState:
                     candidates=candidates,
                 )
             )
+            # Imported lazily because the exact Web graph module constructs
+            # typed state objects from this module.  Persistence must still
+            # reject an orphaned/rebound graph, not merely explicit callers.
+            from ctf_os.engine.web_impact_state import (
+                web_impact_state_graph_errors,
+            )
+
+            errors.extend(web_impact_state_graph_errors(self))
         if errors:
             raise ModelValidationError("; ".join(errors))
 

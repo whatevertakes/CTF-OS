@@ -23818,6 +23818,37 @@ class ChallengeEngine:
                 else:
                     raise cleanup_error
 
+    def prove_web_impact(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        operator_spec_locator: str,
+        driver_locator: str,
+        hypothesis_ids: Sequence[str] = (),
+        timeout_seconds: int = 900,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, Any]:
+        """Run one explicit, pre-issued Web impact replay wave.
+
+        The implementation is imported lazily so the pure Web state contract
+        can construct model objects without creating an engine/model cycle.
+        It grants only an executed fact and a progress marker.
+        """
+
+        from ctf_os.engine.web_impact_hotpath import (
+            prove_web_impact,
+        )
+
+        return prove_web_impact(
+            self,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            driver_locator=driver_locator,
+            hypothesis_ids=tuple(hypothesis_ids),
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
     def prove_crypto_metamorphic_candidate(
         self,
         identity: ChallengeIdentity,

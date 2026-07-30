@@ -11,6 +11,8 @@ import fcntl
 import json
 import os
 import re
+import secrets
+import shutil
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -82,6 +84,7 @@ _MAX_COOKIE_FILE_BYTES = 1024 * 1024
 _MAX_COOKIE_COUNT = 256
 _MAX_SECRET_BYTES = 16 * 1024
 _MAX_REDACTION_FILE_BYTES = 512 * 1024 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WebPrivateStateError(ValueError):
@@ -420,6 +423,220 @@ def resolve_private_web_mounts(
     return _private_owned_directory(session_root), timeline_root
 
 
+def reset_private_web_identity_state(
+    scope: ChallengeScope,
+    identity_epoch_sha256: str,
+) -> Path:
+    """Atomically begin one empty attacker/user/admin identity epoch.
+
+    The caller must hold the challenge session lock.  Existing role jars are
+    renamed out of the mount namespace before fresh directories are created;
+    cleanup only ever targets the exact renamed children below the canonical
+    engine-private Web root.  An interruption can leave a non-mounted
+    ``.stale-*`` directory, but can never make an old jar visible to the next
+    replay.
+    """
+
+    if (
+        type(identity_epoch_sha256) is not str
+        or _SHA256.fullmatch(identity_epoch_sha256) is None
+    ):
+        raise WebPrivateStateError("identity epoch must be one SHA-256 digest")
+    private_root = resolve_private_web_root(scope)
+    lock_path = private_root / ".identity-reset.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise WebPrivateStateError(
+            "private Web identity reset lock is unavailable"
+        ) from error
+    stale_paths: list[Path] = []
+    try:
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.geteuid()
+            or lock_metadata.st_nlink != 1
+            or stat.S_IMODE(lock_metadata.st_mode) & 0o077
+        ):
+            raise WebPrivateStateError(
+                "private Web identity reset lock is unsafe"
+            )
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        nonce = secrets.token_hex(8)
+        for name in ("sessions", "timeline"):
+            path = private_root / name
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                metadata = None
+            except OSError as error:
+                raise WebPrivateStateError(
+                    "private Web identity directory cannot be inspected"
+                ) from error
+            if metadata is not None:
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise WebPrivateStateError(
+                        "private Web identity directory is unsafe"
+                    )
+                stale = (
+                    private_root
+                    / (
+                        f".stale-{identity_epoch_sha256[:16]}-"
+                        f"{name}-{nonce}"
+                    )
+                )
+                try:
+                    os.replace(path, stale)
+                except OSError as error:
+                    raise WebPrivateStateError(
+                        "private Web identity directory cannot be rotated"
+                    ) from error
+                stale_paths.append(stale)
+            try:
+                path.mkdir(mode=0o700)
+                os.chmod(path, 0o700, follow_symlinks=False)
+            except OSError as error:
+                raise WebPrivateStateError(
+                    "fresh private Web identity directory cannot be created"
+                ) from error
+            _private_owned_directory(path)
+
+        epoch_payload = (
+            json.dumps(
+                {
+                    "identity_epoch_sha256": identity_epoch_sha256,
+                    "schema_version": 1,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("ascii")
+        temporary = (
+            private_root
+            / f".identity-epoch-{secrets.token_hex(8)}.tmp"
+        )
+        epoch_path = private_root / ".identity-epoch.json"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.write(descriptor, epoch_payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, epoch_path)
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise WebPrivateStateError(
+                "private Web identity epoch cannot be recorded"
+            ) from error
+
+        for stale in stale_paths:
+            try:
+                metadata = stale.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or stale.parent != private_root
+                    or not stale.name.startswith(".stale-")
+                ):
+                    raise WebPrivateStateError(
+                        "refused unsafe private Web stale-state cleanup"
+                    )
+                shutil.rmtree(stale)
+            except OSError as error:
+                raise WebPrivateStateError(
+                    "private Web stale identity state could not be removed"
+                ) from error
+        return epoch_path
+    finally:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+
+
+def private_web_identity_epoch_sha256(scope: ChallengeScope) -> str:
+    """Read and verify the current value-free identity epoch marker."""
+
+    root = resolve_private_web_root(scope)
+    path = root / ".identity-epoch.json"
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_size > 4096
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise WebPrivateStateError(
+                    "private Web identity epoch marker is unsafe"
+                )
+            payload = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise WebPrivateStateError(
+            "private Web identity epoch marker is unavailable"
+        ) from error
+    try:
+        document = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise WebPrivateStateError(
+            "private Web identity epoch marker is invalid"
+        ) from error
+    if (
+        type(document) is not dict
+        or set(document) != {"identity_epoch_sha256", "schema_version"}
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or type(document["identity_epoch_sha256"]) is not str
+        or _SHA256.fullmatch(document["identity_epoch_sha256"]) is None
+    ):
+        raise WebPrivateStateError(
+            "private Web identity epoch marker is invalid"
+        )
+    canonical = (
+        json.dumps(
+            document,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    if payload != canonical:
+        raise WebPrivateStateError(
+            "private Web identity epoch marker is not canonical"
+        )
+    return document["identity_epoch_sha256"]
+
+
 def snapshot_cookie_values(
     private_session_root: Path,
     session_name: str,
@@ -718,6 +935,8 @@ __all__ = [
     "WebPrivateStateError",
     "WebSessionCommand",
     "prepare_web_session_command",
+    "private_web_identity_epoch_sha256",
+    "reset_private_web_identity_state",
     "discard_public_artifacts",
     "redact_public_artifacts",
     "redact_private_timeline",
