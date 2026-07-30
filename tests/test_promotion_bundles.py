@@ -13,18 +13,38 @@ from pathlib import Path
 
 from ctf_os import cli
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
-from ctf_os.config import default_config_text, set_runtime_image_digest
+from ctf_os.codex import (
+    LIVE_THIN_SCAFFOLD,
+    LiveCommandBuilder,
+    LiveSession,
+    ModelCatalog,
+    ReasoningEffort,
+)
+from ctf_os.config import (
+    default_config_text,
+    load_config,
+    set_runtime_image_digest,
+)
+from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.managed_continuity import (
+    THREAD_CONTINUITY_CONTRACT_VERSION,
+    THREAD_CONTINUITY_RUN_KEY,
+    THREAD_CONTINUITY_SESSION_KEY,
+    build_run_audit,
+    build_session_metadata,
+    source_generation,
+)
 from ctf_os.models import (
     ArtifactReference,
     Budget,
     BudgetMode,
-    CandidateStatus,
-    ChallengeStatus,
-    FlagCandidate,
+    ManagedCycle,
+    RunOrigin,
     RunReference,
     RunStatus,
-    SubmissionReference,
-    SubmissionStatus,
+    SessionMode,
+    SessionStatus,
+    SolveSession,
 )
 from ctf_os.promotion_bundles import (
     PromotionBundleError,
@@ -36,6 +56,12 @@ from ctf_os.promotion_bundles import (
     parse_promotion_manifest,
     prepare_promotion_session,
 )
+from ctf_os.scaffold_binding import (
+    build_scaffold_launch_binding,
+    managed_command_contract_sha256,
+    parse_scaffold_launch_record,
+)
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import StateStore, sha256_file
 from ctf_os.store.atomic import (
     atomic_write_json,
@@ -207,9 +233,10 @@ class PromotionBundleTests(unittest.TestCase):
             ),
             # The generic proof fixture exercises the collector independently
             # from each category's current typed proof contract.  The
-            # canonical evaluator upgrades this legacy record before deriving
-            # metrics, exactly as it does for retained benchmark history.
-            schema_version=1,
+            # scaffold evidence itself is nevertheless canonical schema v2:
+            # arm labels without typed execution bindings must never satisfy
+            # promotion collection.
+            schema_version=STATE_SCHEMA_VERSION,
             exist_ok=False,
         )
         original_created = datetime.fromisoformat(
@@ -237,93 +264,408 @@ class PromotionBundleTests(unittest.TestCase):
             session_id=session_id,
         )
         state = self.store.load(session.identity, recover=False)
+        config = load_config(self.root)
+        if arm == THIN_SCAFFOLD:
+            command_contract_sha256 = LiveCommandBuilder(
+                models=ModelCatalog(
+                    sol=parsed.model_id,
+                    terra=parsed.model_id,
+                    luna=parsed.model_id,
+                )
+            ).command_contract_sha256(
+                LiveSession(
+                    session_key="promotion-thin-fixture",
+                    working_directory=Path("/challenge"),
+                    prompt="frozen thin evaluation",
+                    model_id=parsed.model_id,
+                    reasoning_effort=ReasoningEffort(
+                        config.models.captain_effort
+                    ),
+                    logical_worker_roles=(),
+                    scaffold=LIVE_THIN_SCAFFOLD,
+                ),
+                headless=True,
+            )
+        else:
+            command_contract_sha256 = managed_command_contract_sha256(
+                model_id=parsed.model_id,
+                captain_effort=config.models.captain_effort,
+                worker_effort=config.models.worker_effort,
+                thread_continuity_policy="fresh",
+            )
+        launched = ChallengeEngine(
+            self.root,
+            config=config,
+            store=self.store,
+        ).record_evaluation_scaffold_launch(
+            session.identity,
+            arm=arm,
+            command_contract_sha256=command_contract_sha256,
+        )
+        launch_binding, _launched_at = parse_scaffold_launch_record(
+            launched.metadata["evaluation_scaffold_launch"]
+        )
+        state = launched
         seconds = (
             5
             if arm == CTF_OS_SYSTEM and split == "live"
             else 10
         )
-        candidate_value = "KCTF{bundle_fixture}"
-        artifact: ArtifactReference | None = None
-        if arm == CTF_OS_SYSTEM:
-            relative = (
-                Path("proof") / "C-1" / "eval-1" / "result.json"
-            )
-            proof_path = (
-                self.store.challenge_paths(session.identity).root
-                / relative
-            )
-            proof_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(
-                proof_path,
+        run_id = f"R-{session_id}"
+        run_directory = Path("runs") / run_id
+        run_paths = {
+            "request_path": run_directory / "request.json",
+            "result_path": run_directory / "result.json",
+            "validation_path": run_directory / "validation.json",
+        }
+        challenge_root = self.store.challenge_paths(session.identity).root
+        usage = {
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "output_tokens": 50,
+            "reasoning_output_tokens": 25,
+        }
+        request_path = challenge_root / run_paths["request_path"]
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_document: dict[str, object] = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "base_revision": state.revision,
+        }
+        evidence_artifacts: list[ArtifactReference] = []
+        thin_extra: dict[str, object] = {}
+        if arm == THIN_SCAFFOLD:
+            request_document.update(
                 {
-                    "passed": True,
-                    "candidate": candidate_value,
-                    "policy_mode": "deterministic",
-                    "successful_attempts": 2,
-                    "required_attempts": 2,
-                    "total_attempts": 3,
-                    "source_manifest_sha256": (
-                        session.input_manifest_sha256
+                    "evaluation_scaffold": THIN_SCAFFOLD,
+                    "execution_transport": "headless_jsonl",
+                    "usage_attestation": "codex_jsonl_events",
+                    "command_contract_sha256": (
+                        command_contract_sha256
                     ),
-                    "failures": [
-                        "proof-3: exact candidate was not reproduced"
-                    ],
-                    "run_ids": [
-                        f"{session_id}-proof-1",
-                        f"{session_id}-proof-2",
-                        f"{session_id}-proof-3",
-                    ],
+                }
+            )
+            schema_relative = run_directory / "output-schema.json"
+            jsonl_relative = (
+                run_directory / "raw" / "attempt-1.jsonl"
+            )
+            stderr_relative = (
+                run_directory / "raw" / "attempt-1.stderr"
+            )
+            output_relative = (
+                run_directory / "attempt-1-output.json"
+            )
+            capture_relative = (
+                run_directory / "raw" / "attempt-1-capture.json"
+            )
+            jsonl_text = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "thread.started",
+                            "thread_id": "fixture-thread",
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "usage": usage,
+                        },
+                        sort_keys=True,
+                    ),
+                    "",
+                )
+            )
+            for relative, value in (
+                (schema_relative, {"type": "object"}),
+                (output_relative, {}),
+            ):
+                target = challenge_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(target, value, mode=0o400)
+            jsonl_path = challenge_root / jsonl_relative
+            jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(
+                jsonl_path,
+                jsonl_text,
+                mode=0o400,
+            )
+            stderr_path = challenge_root / stderr_relative
+            atomic_write_text(stderr_path, "", mode=0o400)
+            output_path = challenge_root / output_relative
+            capture_path = challenge_root / capture_relative
+            atomic_write_json(
+                capture_path,
+                {
+                    "schema_version": 1,
+                    "stdout_jsonl": {
+                        "limit_bytes": 1024 * 1024,
+                        "bytes": jsonl_path.stat().st_size,
+                        "stored_bytes": jsonl_path.stat().st_size,
+                        "truncated": False,
+                        "truncation_known": True,
+                        "capture_complete": True,
+                        "oversized_event_lines": 0,
+                    },
+                    "stderr": {
+                        "limit_bytes": 1024 * 1024,
+                        "bytes": 0,
+                        "stored_bytes": 0,
+                        "truncated": False,
+                        "truncation_known": True,
+                        "capture_complete": True,
+                    },
+                    "structured_output": {
+                        "limit_bytes": 1024 * 1024,
+                        "bytes": output_path.stat().st_size,
+                        "oversized": False,
+                    },
+                    "event_accumulator": {
+                        "event_limit": 10_000,
+                        "events_stored": 2,
+                        "events_dropped": 0,
+                        "malformed_line_limit": 1_000,
+                        "malformed_lines_stored": 0,
+                        "malformed_lines_dropped": 0,
+                    },
+                    "flag_scan": {
+                        "candidate_limit": 1_024,
+                        "candidate_chars_limit": 256 * 1_024,
+                        "candidates_stored": 0,
+                        "candidate_chars_stored": 0,
+                        "suppressed_matches": 0,
+                    },
                 },
                 mode=0o400,
             )
-            artifact = ArtifactReference(
-                id="A-proof",
-                path=relative.as_posix(),
-                sha256=sha256_file(proof_path),
-                size=proof_path.stat().st_size,
-                created_at=_later(state.created_at, seconds),
-            )
+            for index, (relative, media_type) in enumerate(
+                (
+                    (schema_relative, "application/schema+json"),
+                    (jsonl_relative, "application/x-ndjson"),
+                    (stderr_relative, "text/plain"),
+                    (output_relative, "application/json"),
+                    (capture_relative, "application/json"),
+                ),
+                start=1,
+            ):
+                target = challenge_root / relative
+                evidence_artifacts.append(
+                    ArtifactReference(
+                        id=f"A-{run_id}-{index}",
+                        path=relative.as_posix(),
+                        sha256=sha256_file(target),
+                        source_run_id=run_id,
+                        media_type=media_type,
+                        size=target.stat().st_size,
+                    )
+                )
+            thread_digest = hashlib.sha256(
+                b"fixture-thread"
+            ).hexdigest()
+            result_document: dict[str, object] = {
+                "schema_version": 1,
+                "base_revision": state.revision,
+                "status": RunStatus.COMPLETED.value,
+                "evaluation_scaffold": THIN_SCAFFOLD,
+                "semantic_output_committed": False,
+                "usage": usage,
+                "usage_event_observed": True,
+                "capture_complete": True,
+                "thread_id_sha256": thread_digest,
+                "evidence": [
+                    {
+                        "artifact_id": artifact.id,
+                        "path": artifact.path,
+                        "sha256": artifact.sha256,
+                        "size_bytes": artifact.size,
+                    }
+                    for artifact in evidence_artifacts
+                ],
+                "automatic_submission": False,
+            }
+            validation_document: dict[str, object] = {
+                "schema_version": 1,
+                "base_revision": state.revision,
+                "ok": True,
+                "errors": [],
+            }
+            thin_extra = {
+                "capture_complete": True,
+                "attempt_count": 1,
+                "produced_thread_id_sha256": thread_digest,
+                "evidence_artifact_ids": [
+                    artifact.id for artifact in evidence_artifacts
+                ],
+            }
+        else:
+            result_document = {
+                "base_revision": state.revision,
+                "status": RunStatus.COMPLETED.value,
+                "provisional_managed_result": True,
+                "attempt_output_path": None,
+                "attempt_count": 1,
+                "artifacts": [],
+                "flag_candidate_count": 0,
+                "failure_kinds": [],
+            }
+            validation_document = {
+                "ok": True,
+                "base_revision": state.revision,
+                "errors": [],
+                "provisional_managed_result": True,
+            }
+        atomic_write_json(
+            request_path,
+            request_document,
+            mode=0o400,
+        )
+        atomic_write_json(
+            challenge_root / run_paths["result_path"],
+            result_document,
+            mode=0o400,
+        )
+        atomic_write_json(
+            challenge_root / run_paths["validation_path"],
+            validation_document,
+            mode=0o400,
+        )
+        run_file_bindings = {
+            "attempt_count": 1,
+            "request_sha256": sha256_file(request_path),
+            "result_sha256": sha256_file(
+                challenge_root / run_paths["result_path"]
+            ),
+            "validation_sha256": sha256_file(
+                challenge_root / run_paths["validation_path"]
+            ),
+        }
 
         def mutate(current) -> None:
             current.budget.spent_seconds = 20
-            current.runs.append(
-                RunReference(
-                    id=f"R-{session_id}",
-                    base_revision=current.revision,
-                    status=RunStatus.COMPLETED,
-                    role="explorer",
-                    model="gpt-5.6-sol",
-                    extra={
-                        "usage": {
-                            "input_tokens": 100,
-                            "cached_input_tokens": 0,
-                            "output_tokens": 50,
-                            "reasoning_output_tokens": 25,
-                        }
+            run_extra: dict[str, object] = {
+                "usage": usage,
+                **run_file_bindings,
+            }
+            run_origin = RunOrigin.MANAGED_MODEL
+            run_session_id = f"managed-{session_id}"
+            cycle_id: str | None = f"cycle-{session_id}"
+            if arm == THIN_SCAFFOLD:
+                run_origin = RunOrigin.ASSISTED_MODEL
+                run_session_id = session_id
+                cycle_id = None
+                run_extra.update(
+                    {
+                        "evaluation_scaffold": THIN_SCAFFOLD,
+                        "execution_transport": "headless_jsonl",
+                        "usage_attestation": "codex_jsonl_events",
+                        "usage_attestation_valid": True,
+                        "semantic_output_committed": False,
+                        "logical_model_count": 1,
+                        "logical_worker_roles": [],
+                        "command_contract_sha256": (
+                            command_contract_sha256
+                        ),
+                        "launch_binding_sha256": (
+                            launch_binding.binding_sha256
+                        ),
+                        **thin_extra,
+                    }
+                )
+            model_run = RunReference(
+                id=run_id,
+                base_revision=current.revision,
+                status=RunStatus.COMPLETED,
+                request_path=run_paths["request_path"].as_posix(),
+                result_path=run_paths["result_path"].as_posix(),
+                validation_path=run_paths[
+                    "validation_path"
+                ].as_posix(),
+                role="captain",
+                model="gpt-5.6-sol",
+                origin=run_origin,
+                session_id=run_session_id,
+                cycle_id=cycle_id,
+                configuration_epoch=current.configuration_epoch,
+                extra=run_extra,
+            )
+            current.runs.append(model_run)
+            current.artifacts.extend(evidence_artifacts)
+            if arm == CTF_OS_SYSTEM:
+                continuity = build_session_metadata(
+                    policy="fresh",
+                    configuration_epoch=current.configuration_epoch,
+                    source_manifest_sha256=session.input_manifest_sha256,
+                    source_generation=source_generation(
+                        session.input_manifest_sha256,
+                        current.metadata.get("source_manifest_history"),
+                    ),
+                    target_id=None,
+                    target_generation=None,
+                    runtime_image_digest=config.runtime.image_digest,
+                    captain_effort=config.models.captain_effort,
+                    worker_effort=config.models.worker_effort,
+                    models={
+                        role: getattr(config.models, role)
+                        for role in (
+                            "captain",
+                            "recon",
+                            "specialist",
+                            "builder",
+                            "falsifier",
+                            "extractor",
+                            "reproducer",
+                            "validator",
+                            "evidence_auditor",
+                        )
                     },
                 )
-            )
-            current.candidates.append(
-                FlagCandidate(
-                    id="C-1",
-                    value=candidate_value,
-                    status=CandidateStatus.ACCEPTED,
+                run_extra["contract_version"] = (
+                    THREAD_CONTINUITY_CONTRACT_VERSION
                 )
-            )
-            current.submissions.append(
-                SubmissionReference(
-                    id="SUB-1",
-                    candidate_id="C-1",
-                    status=SubmissionStatus.ACCEPTED,
-                    submitted_at=_later(current.created_at, seconds),
-                    response="accepted",
-                    proof_passed=arm == CTF_OS_SYSTEM,
-                    format_ok=True,
+                run_extra[THREAD_CONTINUITY_RUN_KEY] = build_run_audit(
+                    session_metadata=continuity,
+                    session_id=run_session_id,
+                    role="captain",
+                    model=parsed.model_id,
+                    decision="fresh",
+                    reason="policy_fresh",
+                    source_run_id=None,
+                    source_thread_id_sha256=None,
+                    stable_lane=False,
+                    lane_identity_sha256=None,
+                    workspace_owner_run_id=None,
                 )
-            )
-            current.status = ChallengeStatus.SOLVED
-            if artifact is not None:
-                current.artifacts.append(artifact)
+                current.sessions.append(
+                    SolveSession(
+                        id=run_session_id,
+                        mode=SessionMode.MANAGED,
+                        status=SessionStatus.COMPLETED,
+                        configuration_epoch=(
+                            current.configuration_epoch
+                        ),
+                        start_revision=current.revision,
+                        end_revision=current.revision,
+                        run_ids=[run_id],
+                        evaluation_policy="observe",
+                        extra={
+                            THREAD_CONTINUITY_SESSION_KEY: continuity,
+                        },
+                    )
+                )
+                current.cycles.append(
+                    ManagedCycle(
+                        id=cycle_id,
+                        session_id=run_session_id,
+                        ordinal=1,
+                        phase="completed",
+                        configuration_epoch=(
+                            current.configuration_epoch
+                        ),
+                        captain_run_id=run_id,
+                        completed_at=_later(current.created_at, seconds),
+                    )
+                )
 
         self.store.update(session.identity, mutate)
         finalize_promotion_session(
@@ -444,6 +786,170 @@ class PromotionBundleTests(unittest.TestCase):
                 self.frozen_path,
                 [bundle],
             )
+
+    def test_validly_rehashed_arm_relabel_is_rejected(self) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[3] == THIN_SCAFFOLD
+        )
+        self._create_state(*record)
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+        config = load_config(self.root)
+
+        def relabel(current) -> None:
+            fake_metadata = dict(current.metadata)
+            fake_metadata["evaluation_system"] = CTF_OS_SYSTEM
+            prior, _timestamp = parse_scaffold_launch_record(
+                current.metadata["evaluation_scaffold_launch"]
+            )
+            current.metadata["evaluation_scaffold_launch"] = (
+                build_scaffold_launch_binding(
+                    metadata=fake_metadata,
+                    configuration_epoch=current.configuration_epoch,
+                    contest_id=session.contest_id,
+                    category=session.category,
+                    challenge_id=session.challenge_id,
+                    arm=CTF_OS_SYSTEM,
+                    model_id=parsed.model_id,
+                    runtime_image_digest=config.runtime.image_digest,
+                    command_contract_sha256=(
+                        prior.command_contract_sha256
+                    ),
+                ).to_record()
+            )
+
+        self.store.update(session.identity, relabel)
+        captured = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=self.root / "relabelled",
+        )
+        self.assertFalse(captured["collection_complete"])
+        self.assertIn(
+            "scaffold_launch_binding_mismatch",
+            captured["collection_blockers"],
+        )
+
+    def test_thin_multiple_model_invocations_are_rejected(self) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[3] == THIN_SCAFFOLD
+        )
+        self._create_state(*record)
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+        state = self.store.load(session.identity, recover=False)
+        launch, _timestamp = parse_scaffold_launch_record(
+            state.metadata["evaluation_scaffold_launch"]
+        )
+        run_id = f"R-extra-{record[0]}"
+        relative_paths = {
+            "request_path": Path("runs") / run_id / "request.json",
+            "result_path": Path("runs") / run_id / "result.json",
+            "validation_path": (
+                Path("runs") / run_id / "validation.json"
+            ),
+        }
+        challenge_root = self.store.challenge_paths(session.identity).root
+        for relative in relative_paths.values():
+            target = challenge_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                target,
+                {"run_id": run_id},
+                mode=0o400,
+            )
+
+        def append_second(current) -> None:
+            current.runs.append(
+                RunReference(
+                    id=run_id,
+                    base_revision=current.revision,
+                    status=RunStatus.COMPLETED,
+                    request_path=relative_paths[
+                        "request_path"
+                    ].as_posix(),
+                    result_path=relative_paths[
+                        "result_path"
+                    ].as_posix(),
+                    validation_path=relative_paths[
+                        "validation_path"
+                    ].as_posix(),
+                    role="captain",
+                    model=parsed.model_id,
+                    origin=RunOrigin.ASSISTED_MODEL,
+                    session_id=record[0],
+                    configuration_epoch=current.configuration_epoch,
+                    created_at=current.created_at,
+                    extra={
+                        "usage": {
+                            "input_tokens": 1,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 1,
+                            "reasoning_output_tokens": 0,
+                        },
+                        "evaluation_scaffold": THIN_SCAFFOLD,
+                        "execution_transport": "headless_jsonl",
+                        "usage_attestation": "codex_jsonl_events",
+                        "usage_attestation_valid": True,
+                        "semantic_output_committed": False,
+                        "logical_model_count": 1,
+                        "logical_worker_roles": [],
+                        "command_contract_sha256": (
+                            launch.command_contract_sha256
+                        ),
+                        "launch_binding_sha256": (
+                            launch.binding_sha256
+                        ),
+                    },
+                )
+            )
+
+        self.store.update(session.identity, append_second)
+        captured = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=self.root / "thin-double-call",
+        )
+        self.assertFalse(captured["collection_complete"])
+        self.assertIn(
+            "thin_model_invocation_count_mismatch",
+            captured["collection_blockers"],
+        )
+
+    def test_full_scaffold_without_managed_cycle_is_rejected(self) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[3] == CTF_OS_SYSTEM
+        )
+        self._create_state(*record)
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+
+        def remove_cycle(current) -> None:
+            current.cycles.clear()
+
+        self.store.update(session.identity, remove_cycle)
+        captured = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=self.root / "full-no-cycle",
+        )
+        self.assertFalse(captured["collection_complete"])
+        self.assertIn(
+            "managed_cycle_missing",
+            captured["collection_blockers"],
+        )
 
     def test_duplicate_bundle_is_rejected_as_duplicate_run_id(self) -> None:
         self._freeze()
@@ -621,7 +1127,7 @@ class PromotionBundleTests(unittest.TestCase):
             )
         )
 
-    def test_complete_real_bundle_comparison_derives_required_metrics(
+    def test_complete_real_bundle_collection_stays_closed_without_proofs(
         self,
     ) -> None:
         self._freeze()
@@ -643,45 +1149,22 @@ class PromotionBundleTests(unittest.TestCase):
             bundles,
         )
 
-        self.assertTrue(result["promotion_eligible"], result["blockers"])
-        self.assertEqual(
-            result["decision"],
-            "eligible_for_manual_promotion",
-        )
+        self.assertFalse(result["promotion_eligible"])
+        self.assertFalse(result["complete_evidence"])
+        self.assertEqual(result["decision"], "do_not_promote")
         self.assertEqual(result["collector"]["blockers"], [])
         self.assertEqual(
             result["collector"]["verified_session_bundles"],
             84,
         )
-        candidate = result["metrics"]["candidate"]
-        self.assertEqual(candidate["overall"]["solve@1"]["rate"], 1.0)
-        self.assertEqual(candidate["overall"]["pass^2/3"]["rate"], 1.0)
-        self.assertEqual(
-            candidate["by_split"]["live"][
-                "median_time_to_first_valid_result"
-            ]["seconds"],
-            5.0,
+        self.assertIsNone(result["metrics"])
+        self.assertIn(
+            "candidate_proof_coverage_incomplete",
+            result["blockers"],
         )
-        self.assertEqual(
-            candidate["live_hidden"][
-                "median_time_to_first_valid_result"
-            ]["seconds"],
-            7.5,
-        )
-        self.assertEqual(
-            candidate["overall"]["proof_pass_rate"]["rate"],
-            1.0,
-        )
-        self.assertEqual(
-            candidate["overall"]["human_interventions"],
-            0,
-        )
-        self.assertEqual(
-            candidate["live_hidden"]["category_floor"]["rate"],
-            1.0,
-        )
-        self.assertTrue(
-            result["comparisons"]["live_hidden_improvement"]
+        self.assertIn(
+            "candidate_reproduction_coverage_incomplete",
+            result["blockers"],
         )
         self.assertFalse(result["automatic_promotion"])
         self.assertFalse(result["automatic_submission"])

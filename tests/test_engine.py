@@ -108,6 +108,7 @@ from ctf_os.store import (
     ChallengeLock,
     RevisionConflict,
     WorkerResultValidationError,
+    sha256_file,
 )
 
 
@@ -986,6 +987,22 @@ class EngineTests(unittest.TestCase):
             run.extra["produced_thread_id_sha256"],
             hashlib.sha256(b"thin-thread-1").hexdigest(),
         )
+        challenge_root = engine.store.challenge_paths(
+            self.identity
+        ).root
+        for pointer_field, digest_field in (
+            ("request_path", "request_sha256"),
+            ("result_path", "result_sha256"),
+            ("validation_path", "validation_sha256"),
+        ):
+            pointer = getattr(run, pointer_field)
+            self.assertIsNotNone(pointer)
+            assert pointer is not None
+            self.assertEqual(
+                run.extra[digest_field],
+                sha256_file(challenge_root / pointer),
+            )
+        self.assertEqual(run.extra["attempt_count"], 1)
         self.assertEqual(state.candidates, [])
         self.assertEqual(state.submissions, [])
         self.assertIn(SCAFFOLD_LAUNCH_METADATA_KEY, state.metadata)

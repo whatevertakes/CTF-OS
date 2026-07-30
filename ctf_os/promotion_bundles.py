@@ -51,15 +51,35 @@ from ctf_os.benchmark import (
     SafetyTotals,
     evaluate_blind_live_promotion,
 )
+from ctf_os.codex import (
+    LIVE_THIN_SCAFFOLD,
+    LiveCommandBuilder,
+    LiveSession,
+    ModelCatalog,
+    ReasoningEffort,
+)
 from ctf_os.evaluation import EvaluationReport, evaluate_workspace
-from ctf_os.config import load_config
+from ctf_os.config import EngineConfig, load_config
+from ctf_os.managed_continuity import (
+    THREAD_CONTINUITY_SESSION_KEY,
+    valid_thread_id,
+)
 from ctf_os.models import (
     ChallengeIdentity,
     ChallengeState,
     ExperimentStatus,
+    RunOrigin,
+    RunReference,
     RunStatus,
+    SessionMode,
     SubmissionStatus,
     utc_now,
+)
+from ctf_os.scaffold_binding import (
+    SCAFFOLD_LAUNCH_METADATA_KEY,
+    ScaffoldBindingError,
+    managed_command_contract_sha256,
+    parse_scaffold_launch_record,
 )
 from ctf_os.store import StateStore
 from ctf_os.store.atomic import (
@@ -1356,6 +1376,676 @@ def _nonnegative_number(value: object) -> float | None:
     return None
 
 
+def _bound_run_file(
+    *,
+    challenge_root: Path,
+    run: RunReference,
+    pointer_field: str,
+    digest_field: str,
+) -> bytes:
+    pointer = getattr(run, pointer_field)
+    expected_digest = run.extra.get(digest_field)
+    if (
+        type(pointer) is not str
+        or type(expected_digest) is not str
+        or _SHA256_RE.fullmatch(expected_digest) is None
+    ):
+        raise PromotionBundleError(
+            f"model run {run.id} lacks an exact {pointer_field} binding"
+        )
+    relative = _validate_relative_path(
+        pointer,
+        f"model run {run.id} {pointer_field}",
+    )
+    path = _assert_no_symlink_components(challenge_root, relative)
+    payload = _read_regular(
+        path,
+        maximum=MAX_CAPTURE_FILE_BYTES,
+        label=f"model run {run.id} {pointer_field}",
+    )
+    if _sha256(payload) != expected_digest:
+        raise PromotionBundleError(
+            f"model run {run.id} {pointer_field} hash mismatch"
+        )
+    return payload
+
+
+def _strict_json_payload(
+    payload: bytes,
+    *,
+    label: str,
+) -> Mapping[str, object]:
+    try:
+        value = strict_json_loads(
+            payload,
+            max_bytes=MAX_CAPTURE_FILE_BYTES,
+        )
+    except (UnicodeError, ValueError) as error:
+        raise PromotionBundleError(
+            f"{label} is not strict JSON"
+        ) from error
+    if type(value) is not dict:
+        raise PromotionBundleError(f"{label} must be an exact object")
+    return value
+
+
+def _usage_record(value: object) -> dict[str, int] | None:
+    if type(value) is not dict or set(value) != {
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    }:
+        return None
+    if any(
+        type(value.get(field)) is not int or value[field] < 0
+        for field in value
+    ):
+        return None
+    return {
+        field: value[field]
+        for field in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    }
+
+
+def _artifact_payload(
+    *,
+    challenge_root: Path,
+    artifact: object,
+) -> bytes:
+    path_value = getattr(artifact, "path", None)
+    digest = getattr(artifact, "sha256", None)
+    size = getattr(artifact, "size", None)
+    artifact_id = getattr(artifact, "id", "<unknown>")
+    if (
+        type(path_value) is not str
+        or type(digest) is not str
+        or _SHA256_RE.fullmatch(digest) is None
+        or type(size) is not int
+        or size < 0
+    ):
+        raise PromotionBundleError(
+            f"thin evidence artifact {artifact_id} is not exactly bound"
+        )
+    relative = _validate_relative_path(
+        path_value,
+        f"thin evidence artifact {artifact_id}",
+    )
+    path = _assert_no_symlink_components(challenge_root, relative)
+    payload = _read_regular(
+        path,
+        maximum=MAX_CAPTURE_FILE_BYTES,
+        label=f"thin evidence artifact {artifact_id}",
+    )
+    if len(payload) != size or _sha256(payload) != digest:
+        raise PromotionBundleError(
+            f"thin evidence artifact {artifact_id} hash mismatch"
+        )
+    return payload
+
+
+def _thin_attestation(
+    *,
+    state: ChallengeState,
+    run: RunReference,
+    challenge_root: Path,
+    command_contract_sha256: str,
+    launch_binding_sha256: str,
+) -> tuple[int, dict[str, int]]:
+    request_payload = _bound_run_file(
+        challenge_root=challenge_root,
+        run=run,
+        pointer_field="request_path",
+        digest_field="request_sha256",
+    )
+    result_payload = _bound_run_file(
+        challenge_root=challenge_root,
+        run=run,
+        pointer_field="result_path",
+        digest_field="result_sha256",
+    )
+    validation_payload = _bound_run_file(
+        challenge_root=challenge_root,
+        run=run,
+        pointer_field="validation_path",
+        digest_field="validation_sha256",
+    )
+    request = _strict_json_payload(
+        request_payload,
+        label=f"thin run {run.id} request",
+    )
+    result = _strict_json_payload(
+        result_payload,
+        label=f"thin run {run.id} result",
+    )
+    validation = _strict_json_payload(
+        validation_payload,
+        label=f"thin run {run.id} validation",
+    )
+    if (
+        request.get("run_id") != run.id
+        or request.get("base_revision") != run.base_revision
+        or request.get("evaluation_scaffold") != THIN_SCAFFOLD
+        or request.get("execution_transport") != "headless_jsonl"
+        or request.get("usage_attestation")
+        != "codex_jsonl_events"
+        or request.get("command_contract_sha256")
+        != command_contract_sha256
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} request contract is invalid"
+        )
+    expected_result_keys = {
+        "schema_version",
+        "base_revision",
+        "status",
+        "evaluation_scaffold",
+        "semantic_output_committed",
+        "usage",
+        "usage_event_observed",
+        "capture_complete",
+        "thread_id_sha256",
+        "evidence",
+        "automatic_submission",
+    }
+    expected_validation_keys = {
+        "schema_version",
+        "base_revision",
+        "ok",
+        "errors",
+    }
+    usage = _usage_record(result.get("usage"))
+    if (
+        set(result) != expected_result_keys
+        or result.get("schema_version") != 1
+        or result.get("base_revision") != run.base_revision
+        or result.get("status") != run.status.value
+        or result.get("evaluation_scaffold") != THIN_SCAFFOLD
+        or result.get("semantic_output_committed") is not False
+        or result.get("usage_event_observed") is not True
+        or result.get("capture_complete") is not True
+        or result.get("automatic_submission") is not False
+        or usage is None
+        or set(validation) != expected_validation_keys
+        or validation.get("schema_version") != 1
+        or validation.get("base_revision") != run.base_revision
+        or validation.get("ok") is not True
+        or validation.get("errors") != []
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} result attestation is invalid"
+        )
+    if (
+        usage != _usage_record(run.extra.get("usage"))
+        or result.get("thread_id_sha256")
+        != run.extra.get("produced_thread_id_sha256")
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} result/state attestation differs"
+        )
+    attempt_count = run.extra.get("attempt_count")
+    evidence_ids = run.extra.get("evidence_artifact_ids")
+    if (
+        type(attempt_count) is not int
+        or attempt_count < 1
+        or type(evidence_ids) is not list
+        or len(evidence_ids) != 1 + (4 * attempt_count)
+        or len(set(evidence_ids)) != len(evidence_ids)
+        or any(type(item) is not str for item in evidence_ids)
+        or run.extra.get("capture_complete") is not True
+        or run.extra.get("launch_binding_sha256")
+        != launch_binding_sha256
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} evidence inventory is invalid"
+        )
+    artifacts = {artifact.id: artifact for artifact in state.artifacts}
+    if any(
+        artifact_id not in artifacts
+        or artifacts[artifact_id].source_run_id != run.id
+        for artifact_id in evidence_ids
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} evidence references are invalid"
+        )
+    run_root = PurePosixPath(run.request_path).parent
+    expected_paths: list[tuple[PurePosixPath, str]] = [
+        (
+            run_root / "output-schema.json",
+            "application/schema+json",
+        )
+    ]
+    for ordinal in range(1, attempt_count + 1):
+        expected_paths.extend(
+            (
+                (
+                    run_root / "raw" / f"attempt-{ordinal}.jsonl",
+                    "application/x-ndjson",
+                ),
+                (
+                    run_root / "raw" / f"attempt-{ordinal}.stderr",
+                    "text/plain",
+                ),
+                (
+                    run_root / f"attempt-{ordinal}-output.json",
+                    "application/json",
+                ),
+                (
+                    run_root
+                    / "raw"
+                    / f"attempt-{ordinal}-capture.json",
+                    "application/json",
+                ),
+            )
+        )
+    ordered_artifacts = [artifacts[item] for item in evidence_ids]
+    if [
+        (PurePosixPath(item.path), item.media_type)
+        for item in ordered_artifacts
+    ] != expected_paths:
+        raise PromotionBundleError(
+            f"thin run {run.id} evidence paths are not exact"
+        )
+    payloads = [
+        _artifact_payload(
+            challenge_root=challenge_root,
+            artifact=artifact,
+        )
+        for artifact in ordered_artifacts
+    ]
+    evidence_rows = [
+        {
+            "artifact_id": artifact.id,
+            "path": artifact.path,
+            "sha256": artifact.sha256,
+            "size_bytes": artifact.size,
+        }
+        for artifact in ordered_artifacts
+    ]
+    if result.get("evidence") != evidence_rows:
+        raise PromotionBundleError(
+            f"thin run {run.id} result evidence inventory differs"
+        )
+
+    accumulated_usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    final_thread_id: str | None = None
+    usage_event_observed = False
+    cumulative_events = 0
+    for index in range(attempt_count):
+        base = 1 + (4 * index)
+        jsonl_payload = payloads[base]
+        stderr_payload = payloads[base + 1]
+        capture = _strict_json_payload(
+            payloads[base + 3],
+            label=f"thin run {run.id} capture {index + 1}",
+        )
+        try:
+            text = jsonl_payload.decode("utf-8", errors="strict")
+        except UnicodeError as error:
+            raise PromotionBundleError(
+                f"thin run {run.id} JSONL is not UTF-8"
+            ) from error
+        attempt_events = 0
+        for raw_line in text.splitlines():
+            if not raw_line:
+                continue
+            try:
+                event = strict_json_loads(
+                    raw_line.encode("utf-8"),
+                    max_bytes=MAX_CAPTURE_FILE_BYTES,
+                )
+            except (UnicodeError, ValueError) as error:
+                raise PromotionBundleError(
+                    f"thin run {run.id} JSONL is malformed"
+                ) from error
+            if type(event) is not dict:
+                raise PromotionBundleError(
+                    f"thin run {run.id} JSONL event is not an object"
+                )
+            attempt_events += 1
+            event_type = event.get("type", event.get("event_type"))
+            if event_type == "thread.started":
+                possible_id = event.get(
+                    "thread_id",
+                    event.get("thread", event.get("id")),
+                )
+                if type(possible_id) is dict:
+                    possible_id = possible_id.get("id")
+                if valid_thread_id(possible_id):
+                    final_thread_id = possible_id
+            event_usage = event.get("usage")
+            if type(event_usage) is dict:
+                for field in accumulated_usage:
+                    token = event_usage.get(field, 0)
+                    if type(token) is int and token >= 0:
+                        accumulated_usage[field] += token
+                if event_type == "turn.completed":
+                    usage_event_observed = True
+        cumulative_events += attempt_events
+        stdout_capture = capture.get("stdout_jsonl")
+        stderr_capture = capture.get("stderr")
+        structured_output = capture.get("structured_output")
+        accumulator = capture.get("event_accumulator")
+        if (
+            capture.get("schema_version") != 1
+            or type(stdout_capture) is not dict
+            or stdout_capture.get("stored_bytes") != len(jsonl_payload)
+            or stdout_capture.get("bytes") != len(jsonl_payload)
+            or stdout_capture.get("truncated") is not False
+            or stdout_capture.get("truncation_known") is not True
+            or stdout_capture.get("capture_complete") is not True
+            or stdout_capture.get("oversized_event_lines") != 0
+            or type(stderr_capture) is not dict
+            or stderr_capture.get("stored_bytes") != len(stderr_payload)
+            or type(stderr_capture.get("bytes")) is not int
+            or stderr_capture["bytes"] < len(stderr_payload)
+            or stderr_capture.get("truncation_known") is not True
+            or stderr_capture.get("truncated")
+            is not (
+                stderr_capture["bytes"] > len(stderr_payload)
+            )
+            or stderr_capture.get("capture_complete") is not True
+            or type(structured_output) is not dict
+            or structured_output.get("bytes") != len(payloads[base + 2])
+            or type(accumulator) is not dict
+            or type(accumulator.get("event_limit")) is not int
+            or accumulator["event_limit"] < 0
+            or accumulator.get("events_stored")
+            != min(cumulative_events, accumulator["event_limit"])
+            or accumulator.get("events_dropped")
+            != max(0, cumulative_events - accumulator["event_limit"])
+            or accumulator.get("malformed_lines_stored") != 0
+            or accumulator.get("malformed_lines_dropped") != 0
+        ):
+            raise PromotionBundleError(
+                f"thin run {run.id} capture metadata is invalid"
+            )
+    thread_digest = (
+        _sha256(final_thread_id.encode("utf-8"))
+        if final_thread_id is not None
+        else None
+    )
+    if (
+        not usage_event_observed
+        or accumulated_usage != usage
+        or usage["input_tokens"] + usage["output_tokens"] <= 0
+        or thread_digest != result.get("thread_id_sha256")
+    ):
+        raise PromotionBundleError(
+            f"thin run {run.id} JSONL usage attestation differs"
+        )
+    return attempt_count, usage
+
+
+def _managed_model_call_count(
+    *,
+    run: RunReference,
+    challenge_root: Path,
+) -> int:
+    _bound_run_file(
+        challenge_root=challenge_root,
+        run=run,
+        pointer_field="request_path",
+        digest_field="request_sha256",
+    )
+    result = _strict_json_payload(
+        _bound_run_file(
+            challenge_root=challenge_root,
+            run=run,
+            pointer_field="result_path",
+            digest_field="result_sha256",
+        ),
+        label=f"managed run {run.id} result",
+    )
+    _strict_json_payload(
+        _bound_run_file(
+            challenge_root=challenge_root,
+            run=run,
+            pointer_field="validation_path",
+            digest_field="validation_sha256",
+        ),
+        label=f"managed run {run.id} validation",
+    )
+    attempt_count = run.extra.get("attempt_count")
+    if (
+        type(attempt_count) is not int
+        or attempt_count < 0
+        or result.get("attempt_count") != attempt_count
+        or result.get("status") != run.status.value
+    ):
+        raise PromotionBundleError(
+            f"managed run {run.id} call count attestation is invalid"
+        )
+    return attempt_count
+
+
+def _scaffold_collection_blockers(
+    *,
+    session: ManifestSession,
+    manifest: ParsedManifest,
+    state: ChallengeState,
+    config: EngineConfig,
+    model_runs: Sequence[RunReference],
+    challenge_root: Path,
+) -> tuple[tuple[str, ...], int]:
+    blockers: list[str] = []
+    model_call_count = 0
+    raw_launch = state.metadata.get(SCAFFOLD_LAUNCH_METADATA_KEY)
+    if raw_launch is None:
+        return ("scaffold_launch_missing",), 0
+    try:
+        binding, _launched_at = parse_scaffold_launch_record(raw_launch)
+    except ScaffoldBindingError:
+        return ("scaffold_launch_invalid",), 0
+    expected_static = {
+        "arm": session.arm,
+        "benchmark_id": manifest.benchmark_id,
+        "case_id": session.case_id,
+        "contest_id": session.contest_id,
+        "category": session.category,
+        "challenge_id": session.challenge_id,
+        "session_id": session.session_id,
+        "manifest_sha256": manifest.manifest_sha256,
+        "source_manifest_sha256": session.input_manifest_sha256,
+        "configuration_epoch": state.configuration_epoch,
+        "model_id": manifest.model_id,
+        "runtime_image_digest": (
+            "sha256:" + manifest.fingerprint.image_sha256
+        ),
+        "tool_manifest_sha256": (
+            manifest.fingerprint.tool_manifest_sha256
+        ),
+        "model_config_sha256": (
+            manifest.fingerprint.model_config_sha256
+        ),
+    }
+    observed_static = {
+        key: getattr(binding, key) for key in expected_static
+    }
+    if observed_static != expected_static:
+        blockers.append("scaffold_launch_binding_mismatch")
+
+    typed_model_runs = list(model_runs)
+    if session.arm == THIN_SCAFFOLD:
+        thin_session = LiveSession(
+            session_key="promotion-thin-contract",
+            working_directory=Path("/challenge"),
+            prompt="frozen thin evaluation",
+            model_id=manifest.model_id,
+            reasoning_effort=ReasoningEffort(
+                config.models.captain_effort
+            ),
+            logical_worker_roles=(),
+            scaffold=LIVE_THIN_SCAFFOLD,
+        )
+        expected_contract = LiveCommandBuilder(
+            models=ModelCatalog(
+                sol=manifest.model_id,
+                terra=manifest.model_id,
+                luna=manifest.model_id,
+            )
+        ).command_contract_sha256(
+            thin_session,
+            headless=True,
+        )
+        if binding.command_contract_sha256 != expected_contract:
+            blockers.append("thin_command_contract_mismatch")
+        if state.sessions or state.cycles or state.waves:
+            blockers.append("thin_contains_managed_orchestration")
+        if len(typed_model_runs) != 1:
+            blockers.append("thin_model_invocation_count_mismatch")
+        for run in typed_model_runs:
+            extra = run.extra
+            if (
+                run.origin is not RunOrigin.ASSISTED_MODEL
+                or run.session_id != session.session_id
+                or run.configuration_epoch != state.configuration_epoch
+                or run.role != "captain"
+                or extra.get("evaluation_scaffold") != THIN_SCAFFOLD
+                or extra.get("execution_transport") != "headless_jsonl"
+                or extra.get("usage_attestation")
+                != "codex_jsonl_events"
+                or extra.get("usage_attestation_valid") is not True
+                or extra.get("semantic_output_committed") is not False
+                or extra.get("logical_model_count") != 1
+                or extra.get("logical_worker_roles") != []
+                or extra.get("command_contract_sha256")
+                != binding.command_contract_sha256
+                or extra.get("launch_binding_sha256")
+                != binding.binding_sha256
+                or run.request_path is None
+                or run.result_path is None
+                or run.validation_path is None
+            ):
+                blockers.append("thin_usage_attestation_invalid")
+                break
+        if len(typed_model_runs) == 1:
+            try:
+                model_call_count, _usage = _thin_attestation(
+                    state=state,
+                    run=typed_model_runs[0],
+                    challenge_root=challenge_root,
+                    command_contract_sha256=(
+                        binding.command_contract_sha256
+                    ),
+                    launch_binding_sha256=binding.binding_sha256,
+                )
+            except PromotionBundleError:
+                blockers.append("thin_evidence_replay_invalid")
+    elif session.arm == CTF_OS_SYSTEM:
+        managed_sessions = [
+            item
+            for item in state.sessions
+            if item.mode is SessionMode.MANAGED
+        ]
+        if len(managed_sessions) != 1 or len(state.sessions) != 1:
+            blockers.append("managed_session_count_mismatch")
+            return tuple(dict.fromkeys(blockers)), 0
+        managed_session = managed_sessions[0]
+        continuity = managed_session.extra.get(
+            THREAD_CONTINUITY_SESSION_KEY
+        )
+        policy = (
+            continuity.get("policy")
+            if isinstance(continuity, Mapping)
+            else None
+        )
+        if type(policy) is not str:
+            blockers.append("managed_continuity_policy_missing")
+        else:
+            expected_models = {
+                role: getattr(config.models, role)
+                for role in _MODEL_ROLE_FIELDS
+            }
+            if (
+                not isinstance(continuity, Mapping)
+                or continuity.get("configuration_epoch")
+                != state.configuration_epoch
+                or continuity.get("runtime_image_digest")
+                != config.runtime.image_digest
+                or continuity.get("captain_effort")
+                != config.models.captain_effort
+                or continuity.get("worker_effort")
+                != config.models.worker_effort
+                or continuity.get("models") != expected_models
+            ):
+                blockers.append(
+                    "managed_continuity_configuration_mismatch"
+                )
+            try:
+                expected_contract = managed_command_contract_sha256(
+                    model_id=manifest.model_id,
+                    captain_effort=config.models.captain_effort,
+                    worker_effort=config.models.worker_effort,
+                    thread_continuity_policy=policy,
+                )
+            except ScaffoldBindingError:
+                blockers.append("managed_command_contract_invalid")
+            else:
+                if binding.command_contract_sha256 != expected_contract:
+                    blockers.append("managed_command_contract_mismatch")
+        managed_cycles = [
+            cycle
+            for cycle in state.cycles
+            if cycle.session_id == managed_session.id
+        ]
+        if (
+            not managed_cycles
+            or len(managed_cycles) != len(state.cycles)
+        ):
+            blockers.append("managed_cycle_missing")
+        managed_cycle_ids = {cycle.id for cycle in managed_cycles}
+        captain_run_ids = {
+            cycle.captain_run_id
+            for cycle in managed_cycles
+            if cycle.captain_run_id is not None
+        }
+        if any(
+            run.origin is not RunOrigin.MANAGED_MODEL
+            or run.session_id != managed_session.id
+            or run.configuration_epoch != state.configuration_epoch
+            or run.id not in managed_session.run_ids
+            or run.cycle_id not in managed_cycle_ids
+            for run in typed_model_runs
+        ):
+            blockers.append("managed_model_run_binding_mismatch")
+        if not any(
+            run.role == "captain"
+            and run.id in captain_run_ids
+            for run in typed_model_runs
+        ):
+            blockers.append("managed_captain_cycle_missing")
+        if any(
+            wave.session_id != managed_session.id
+            or wave.cycle_id not in managed_cycle_ids
+            for wave in state.waves
+        ):
+            blockers.append("managed_wave_binding_mismatch")
+        try:
+            model_call_count = sum(
+                _managed_model_call_count(
+                    run=run,
+                    challenge_root=challenge_root,
+                )
+                for run in typed_model_runs
+            )
+        except PromotionBundleError:
+            blockers.append("managed_model_evidence_replay_invalid")
+    else:
+        blockers.append("unsupported_scaffold_arm")
+    return tuple(dict.fromkeys(blockers)), model_call_count
+
+
 def _derive_attempt(
     *,
     session: ManifestSession,
@@ -1363,6 +2053,8 @@ def _derive_attempt(
     frozen_at: str,
     state: ChallengeState,
     report: EvaluationReport,
+    config: EngineConfig,
+    challenge_root: Path,
 ) -> tuple[PromotionAttempt, SafetyTotals, tuple[str, ...]]:
     blockers: list[str] = []
     if not report.complete or report.evaluated_states != 1:
@@ -1434,6 +2126,17 @@ def _derive_attempt(
         if run.model is not None
         or isinstance(run.extra.get("usage"), Mapping)
     ]
+    scaffold_blockers, model_call_count = (
+        _scaffold_collection_blockers(
+            session=session,
+            manifest=manifest,
+            state=state,
+            config=config,
+            model_runs=model_runs,
+            challenge_root=challenge_root,
+        )
+    )
+    blockers.extend(scaffold_blockers)
     if not model_runs:
         blockers.append("no_model_run_recorded")
     if any(run.model != manifest.model_id for run in model_runs):
@@ -1630,7 +2333,7 @@ def _derive_attempt(
         reproduced=reproduced,
         first_valid_result_seconds=first_seconds,
         solve_wall_seconds_used=wall_used,
-        model_calls_used=len(model_runs),
+        model_calls_used=model_call_count,
         total_tokens_used=total_tokens,
         human_interventions=human_interventions,
     )
@@ -1803,6 +2506,8 @@ def capture_promotion_session(
             frozen_at=frozen_at,
             state=state,
             report=report,
+            config=load_config(workspace),
+            challenge_root=source_root,
         )
         evaluation, evaluation_sha256 = _evaluation_digest(report)
         record: dict[str, object] = {
@@ -2287,6 +2992,10 @@ def _verify_bundle(
         frozen_at=frozen_at,
         state=state,
         report=report,
+        config=load_config(workspace),
+        challenge_root=bundle_root.joinpath(
+            *_challenge_relative_path(session).parts
+        ),
     )
     recorded_attempt = _derived_attempt_from_record(
         record["derived_attempt"]

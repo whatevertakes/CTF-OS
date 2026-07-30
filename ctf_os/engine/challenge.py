@@ -3719,6 +3719,11 @@ class ChallengeEngine:
                 "provisional_managed_result": True,
             },
         )
+        managed_request_sha256 = sha256_file(run_paths.request)
+        managed_result_sha256 = sha256_file(run_paths.result)
+        managed_validation_sha256 = sha256_file(
+            run_paths.validation
+        )
 
         current = self.store.load(identity)
 
@@ -3765,6 +3770,12 @@ class ChallengeEngine:
                     ),
                     "provider_wait_seconds": (
                         result.timing.provider_wait_seconds
+                    ),
+                    "attempt_count": len(result.attempts),
+                    "request_sha256": managed_request_sha256,
+                    "result_sha256": managed_result_sha256,
+                    "validation_sha256": (
+                        managed_validation_sha256
                     ),
                     "usage": {
                         "input_tokens": result.usage.input_tokens,
@@ -6473,6 +6484,9 @@ class ChallengeEngine:
                 ),
             },
         )
+        request_sha256 = sha256_file(run_paths.request)
+        result_sha256 = sha256_file(run_paths.result)
+        validation_sha256 = sha256_file(run_paths.validation)
 
         def apply(state: ChallengeState) -> None:
             if (
@@ -6533,6 +6547,9 @@ class ChallengeEngine:
                         "produced_thread_id_sha256": thread_digest,
                         "capture_complete": capture_complete,
                         "attempt_count": len(result.attempts),
+                        "request_sha256": request_sha256,
+                        "result_sha256": result_sha256,
+                        "validation_sha256": validation_sha256,
                         "evidence_artifact_ids": [
                             artifact.id for artifact in artifacts
                         ],
