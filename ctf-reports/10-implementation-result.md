@@ -2,11 +2,12 @@
 
 > 역사적 본문 상태: 2026-07-28 코드 기준 as-built 정본
 >
-> 현재 delta: 2026-07-31 release candidate. `ad6ae43` 이후 Crypto, Web,
-> Rev, Misc, Pwn dependency/interaction, Forensic provenance와 blind
-> input-immutability가 강화됐다. category별 targeted release validation은 끝났지만
-> 이 변경을 모두 포함한 최종 전체 회귀, clean exact-image matrix와
-> `ctfos doctor`는 대기
+> 현재 delta: 2026-08-01. 현재 릴리스 판정은
+> [RELEASE_STATUS](../RELEASE_STATUS.md)가 정의한 clean-HEAD acceptance
+> receipt 하나로만 한다. receipt가 clean-worktree source suite, 무경고 `ctfos doctor`,
+> exact-image all-category matrix와 종료 시 무변경을 모두 결속하기 전에는
+> `ENGINE_RELEASE_GO`가 아니다. thin 대 CTF-OS blind/live 성능은 별도
+> `NOT_ESTABLISHED`다.
 >
 > 범위: 저장소 루트의 `ctf_os/`, `tests/`, `pyproject.toml`과
 > `ctf-os-image/` 연동 경계
@@ -19,16 +20,43 @@
 
 이 문서의 §1~12는 09의 목표를 2026-07-28 동결 코드가 어디까지
 구현했는지 기록한 역사적 as-built다. 09는 설계 근거와 장기 방향이다.
-충돌 시 현재 코드와 현재 source에서 통과한 회귀, 아래 현재 delta, 12의
-판정 이력, 역사적 본문, 09 순으로 따른다. 기능 이름이나 파일이 존재한다는
+충돌 시 RELEASE_STATUS가 정의한 운영자 선택 exact local unsigned matching
+receipt, 현재 코드와 현재 source에서
+통과한 회귀, 아래 현재 delta, 12의 판정 이력, 역사적 본문, 09 순으로 따른다.
+기능 이름이나 파일이 존재한다는
 이유만으로 end-to-end 완료로 표시하지 않는다.
 
-## 0. 2026-07-31 current-source delta
+## 0. 2026-08-01 current-source delta
+
+현재 구현 사실을 다시 대조한 결과, 과거 한계 목록의 다음 네 항목은 더 이상
+“미구현”이 아니다.
+
+- trusted host background supervisor, durable lease와 `tool start`,
+  `ctfos jobs CONTEST CATEGORY CHALLENGE [--log|--cancel|--recover]`
+- exact host/port allowlist를 집행하는 builtin egress와 token bucket
+- challenge total storage quota와 운영자 명시형 가역 GC/quarantine
+- typed `rev-prove-runtime`의 native, PE, JVM, .NET, WASM, QEMU 및
+  stdin/argv/file 입력
+
+현재 실제 미완성은 typed secret channel, DNS A/AAAA·actual connection IP
+결속과 private/metadata range 차단, ptrace 최소 seccomp·VM급 고위험 격리,
+hermetic rebuild/SBOM/signature/CI, first-class AI/ML 계약, remote portability와
+동일 조건 blind/live 3×3 성능 측정이다. 인증·adversarial DNS·kernel/container
+escape·AI 문제는 기본 공개·비인증 userspace GO 범위에 포함하지 않는다.
+
+운영자는 `ctfos contest-check`와 `ctfos diagnose`로 canonical state를 바꾸지
+않고 대회/문제 상태와 복구 명령을 확인한다. release 판정 자체는
+`scripts/check-release-acceptance.py`의 matching receipt만 권위가 있다.
+
+## 0A. 2026-07-31 historical interim delta
+
+아래 표의 “당시”는 2026-07-31 source만 뜻하며 현재 운영 근거가 아니다.
+그 이후 동작은 §0, RELEASE_STATUS와 README를 따른다.
 
 7월 28일 이후의 핵심 변경은 역할 추가가 아니라 deterministic category
 authority와 실패 인계가 실제 managed 경로에 들어간 것입니다.
 
-| 영역 | 현재 구현 | 제한/미검증 |
+| 영역 | 당시 구현 | 당시 제한/미검증 |
 |---|---|---|
 | 모델·연속성 | 모든 기본 논리 역할은 같은 `gpt-5.6-sol` 계열을 사용한다. CLI managed 기본은 Captain lane만 resume하고 explorer/builder/verifier/proof는 fresh다. provider 한도는 wave 폭을 줄이지 않는다. | Captain continuity의 solve uplift는 미측정이다. programmatic API와 assisted/thin/legacy의 생략 기본은 fresh다. |
 | 상태·되먹임 | hypothesis/experiment/result/falsifier, bounded raw pointer, failure/resume capsule과 다음 Captain 재투입 | capsule과 raw/no-memory의 blind A/B 결과는 아직 없다. |
@@ -57,7 +85,10 @@ flag, solve, remote portability나 autonomous discovery로 승격하지 않습�
 별도 실행 전까지 미측정입니다. CTF 대회 축, ExploitGym exploit 전환 축,
 CyberGym-E2E와 미지 코드베이스 CVE 발견 축도 하나의 점수로 합치지 않습니다.
 
-## 1. 확정된 운영 계약
+## 1. 2026-07-28 역사적 운영 계약
+
+§1~12는 동결 당시 snapshot이며 현재 CLI·기본 모델·operation 수·background·
+egress·quota 동작과 다를 수 있다. 현재 운영에는 사용하지 않는다.
 
 사용자와 확정한 계약은 다음과 같다.
 

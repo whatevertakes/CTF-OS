@@ -6350,6 +6350,7 @@ class ChallengeEngine:
             image_digest=self.config.runtime.image_digest,
             network_policy=policy,
             limits=DockerLimits(
+                ptrace=(state.category.casefold() in {"pwn", "rev", "reversing"}),
                 work_tree_max_bytes=(
                     self.config.runtime.work_tree_max_bytes
                 )

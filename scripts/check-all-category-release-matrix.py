@@ -337,8 +337,10 @@ class _BoundedCapture:
         return value
 
     def metadata(self, locator: str) -> dict[str, object]:
+        payload = self.payload()
         return {
-            "captured_bytes": len(self.payload()),
+            "captured_bytes": len(payload),
+            "captured_sha256": _sha256(payload),
             "locator": locator,
             "sha256": "sha256:" + self.digest.hexdigest(),
             "stream_bytes": self.total_bytes,

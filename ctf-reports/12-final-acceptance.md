@@ -2,11 +2,20 @@
 
 역사적 판정 기준일: 2026-07-28 (Asia/Seoul)
 
-현재 상태 갱신: 2026-07-31 (Asia/Seoul)
+현재 상태 갱신: 2026-08-01 (Asia/Seoul)
 
 > 2026-07-28 동결 상태: **당시 범위 최종 수용**
 >
-> 현재 source 상태: **release candidate — release acceptance 대기**
+> 현재 source 상태: **receipt-driven — matching receipt 없이는 UNVERIFIED**
+>
+> 현재 판정 정본은 [RELEASE_STATUS](../RELEASE_STATUS.md)다. clean `HEAD`와
+> configured exact image 하나에서 clean-worktree source suite, 무경고 `ctfos doctor`,
+> 7-gate/6-category matrix와 postflight stability가 모두 통과한 runner 출력의
+> exact path/hash를 운영자가 현재 HEAD/pin/image/runtime과 대조한 local unsigned
+> receipt의 `ok: true`만 `ENGINE_RELEASE_GO`를 만든다. 과거 PASS는 재사용하지
+> 않는다.
+> 동일 조건 thin 대 CTF-OS blind/live 3×3 cohort가 없으므로
+> `COMPETITION_PERFORMANCE_STATUS`는 별도로 `NOT_ESTABLISHED`다.
 >
 > 아래 2026-07-28 판정은 source freeze
 > `09641f4466b30add7d18d6239a6ff73fb9afa8baccf2fb2d49b2ce5c55a8d96b`
@@ -21,15 +30,32 @@
 > 전체 회귀, clean exact-image all-category matrix와 `ctfos doctor`가 새로
 > 필요하다.
 
-충돌 시 권위 순서는 현재 코드와 통과한 회귀, 이 문서의 요구사항 판정,
+충돌 시 권위 순서는 RELEASE_STATUS가 정의한 운영자 선택 exact local unsigned
+matching receipt, 현재 코드와
+통과한 회귀, 이 문서의 요구사항 판정,
 [10 구현 결과](10-implementation-result.md), [09 역사적 설계](09-implementation-blueprint.md)
 순이다. 운영 명령은 저장소 [README](../README.md)를 따른다.
 
-## 0. 2026-07-31 현재 수용성 delta
+## 0. 2026-08-01 현재 수용성 delta
 
-현재 source에는 2026-07-28 이후 다음 권위 경로가 구현돼 있습니다.
+재감사에서 background supervisor/durable lease, builtin egress/token bucket,
+challenge storage quota와 운영자 GC, native·PE·JVM·.NET·WASM·QEMU를 다루는
+typed Rev runtime은 이미 구현된 것으로 확인됐다. 이를 현재 미완성으로 세지
+않는다. 반대로 typed secret channel, DNS/IP precommit과 private/metadata range
+차단, ptrace 최소 seccomp·별도 VM 격리, hermetic supply chain/SBOM/signature/CI,
+first-class AI/ML, local-to-remote portability와 실제 blind/live 성능은 아직
+수용하지 않는다.
 
-| 영역 | 현재 코드 상태 | 아직 수용하지 않는 주장 |
+`ctfos contest-check`와 `ctfos diagnose`는 state를 고치거나 remote를 찌르지
+않는 운영 snapshot이다. release acceptance, solve 성능, extended-scope 안전을
+한 개의 PASS로 합치지 않는다.
+
+## 0A. 2026-07-31 역사적 interim 수용성 delta
+
+아래에서 “현재”는 2026-07-31 당시 source만 뜻한다. 현재 운영 판정에는 §0과
+RELEASE_STATUS를 사용한다. 당시 source에는 다음 권위 경로가 구현돼 있었다.
+
+| 영역 | 당시 코드 상태 | 당시 수용하지 않는 주장 |
 |---|---|---|
 | Managed 연속성 | CLI managed solve/run/cycle의 생략 기본은 `captain_lane`; 같은 challenge의 Captain만 resume하고 explorer/builder/verifier/proof는 fresh context | retained reasoning이 blind/live solve를 높였다는 주장 |
 | Pwn | D→V crash, runtime snapshot, address-dependency L/N/A, IP-control primitive, one-shot 3+3 exploit-effect와 data-only dynamic interaction 3+3을 engine-owned artifact 및 physical release evidence로 판정 | `1c82147`은 69개 회귀, pinned 16/16·48/48, tamper 3/3, network `none`; `c9eee37`은 23개 회귀와 interaction physical record 6개를 통과했다. 이를 flag/solve/remote portability, autonomous discovery나 solve uplift로 확대하는 주장은 수용하지 않음 |
@@ -195,7 +221,10 @@ size/SHA-256의 재검증으로 변조를 탐지하고 fail-closed한다는 뜻�
 물리적으로 금지한다는 뜻은 아니다. 같은 UID가 mode를 바꿔 bytes를 수정할
 수는 있지만 이후 hash 검증을 통과하지 못한다.
 
-## 4. Sandbox, 자원과 운영 경계
+## 4. 2026-07-28 역사적 Sandbox, 자원과 운영 경계
+
+이 절은 동결 당시 동작이며 현재 background, builtin egress와 quota/GC를
+설명하지 않는다. 현재 동작은 §0, RELEASE_STATUS와 README를 따른다.
 
 - `incoming/`은 read-only `/challenge`, 분석 공간은 writable `/work`로
   mount한다. Challenge binary/parser/browser/remote command는 typed

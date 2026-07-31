@@ -20,26 +20,31 @@ channel이 생기기 전까지 지원 범위가 아닙니다.
 현재 코드가 실제로 구현한 범위와 남은 제한은
 [구현 결과](ctf-reports/10-implementation-result.md), 요구사항별 판정 이력은
 [수용성 기록](ctf-reports/12-final-acceptance.md)에 정리돼 있습니다.
+현재 릴리스 판정의 최상위 정본은 [RELEASE_STATUS](RELEASE_STATUS.md), 대회
+직전 절차는 [contest start runbook](docs/contest-start-runbook.md)입니다.
 명시적으로 고른 NYU CTF Bench 전-category cohort를 실행 없이 준비하는 절차는
 [NYU CTF Bench operator staging](docs/nyu-ctf-bench-stage.md)에 있습니다.
 
 ## 현재 검증 상태
 
-2026-07-28의 source freeze, image digest와 test 수치는 역사적 수용
-기록입니다. 이후 managed hot path와 카테고리 게이트가 크게 바뀌었으므로
-그 동결을 현재 source의 release 승인으로 사용하지 않습니다. `ad6ae43`
-source에서는 exact image
-`sha256:f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338`
-로 7개 gate와 6개 category가 통과한 interim matrix receipt가 있습니다.
-하지만 그 뒤 Crypto physical-run, Web network/log/impact, Rev/Misc/Pwn
-physical provenance, Pwn interaction transport, Forensic 독립 실행기와
-`d2fb1130b147605ca5d829ff7d20946fb2f3e41f`의 blind promotion
-operator-input binding이 모두 강화됐습니다. 해당 promotion focused suite는
-74/74를 110.727초에 통과했지만 실제 blind/live cohort는 아직 실행하지
-않았습니다. 이 변경을 모두 포함한 최종 전체 회귀, clean exact-image
-all-category matrix와 `ctfos doctor`를 새로 통과하기 전까지 현재 source는
-**release candidate**이며, interim receipt를 현재 release 승인으로
-사용하지 않습니다.
+2026-07-28 이후의 source freeze, image digest와 test 수치는 모두 역사적
+구현 증거입니다. 현재 checkout의 `ENGINE_RELEASE_GO`는 tracked 문구나 과거
+PASS가 아니라 `scripts/check-release-acceptance.py`가 clean `HEAD`와 configured
+exact local image에 결속해 출력한 exact path/hash의 local unsigned receipt를
+운영자가 현재 HEAD/pin/image/runtime과 대조하고 `ok: true`를 확인해야 판정합니다.
+receipt는 clean-worktree source suite, 무경고 `ctfos doctor`, all-category
+7-gate/6-category matrix와 종료 시 source/image/pin/runtime 무변경을 한 번에
+검사합니다.
+source suite 명령의 파일명 `check-fresh-clone.sh`은 역사적 이름이며 실제
+acceptance는 별도 clone이 아니라 시작·종료에 clean Git worktree를 검증하고
+동일 interpreter/lock hash를 결속합니다.
+exact 출력 경로/hash를 보존하지 않았거나 현재 HEAD/pin/image/runtime과 다르면
+상태는 `UNVERIFIED`입니다.
+
+이 판정은 deterministic engine release에만 적용됩니다. promotion collector의
+focused 74/74를 포함한 구현 회귀는 실제 blind/live cohort가 아니며, 동일
+모델·effort·image·input·budget의 thin 3회 대 CTF-OS 3회 결과 전까지
+`COMPETITION_PERFORMANCE_STATUS`는 `NOT_ESTABLISHED`입니다.
 
 현재 구현된 결정론적 권위와 범위는 다음과 같습니다.
 
@@ -47,8 +52,8 @@ all-category matrix와 `ctfos doctor`를 새로 통과하기 전까지 현재 so
 |---|---|---|
 | Pwn | ELF 관측, D→V crash, runtime snapshot, address dependency의 L/N/A 판정, IP-control primitive, one-shot 3+3 exploit-effect와 data-only dynamic interaction 3+3 | `1c82147`은 dependency/effect의 physical sidecar·artifact·transport receipt를 다시 읽고 3회 cohort 재사용을 차단했다. 69개 Pwn 회귀, pinned 단일 16/16과 3회 48/48 clean proof, tamper control 3/3, network `none`을 통과했다. `c9eee37` interaction release proof도 23개 회귀와 6개 physical record를 통과했다. 실제 `zone` interaction은 flag, solve, remote portability나 자율 발견 증거는 아니다. |
 | Web | 역할별 session/state, runtime request timeline, differential impact, race 3+3, OOB 3+3 | `dd929f0`은 concurrent target event stream을 strict bounded JSON으로 처리하고, `cf155cc`는 canonical state에서 impact sidecar·artifact·receipt를 다시 읽어 hostile rewrite/deletion을 거부한다. active Docker gate는 생성한 network의 `Internal:true`도 확인한다. 실제 대회 proxy·remote portability는 별도다. |
-| Rev | assembly/dynamic evidence와 원본 바이너리 positive 3 / mutated control 3 | `3726adb`는 failed result/validation sidecar와 artifact deletion을 physical release evidence로 재검증해 거부한다. 범위는 network-none local standalone Linux ELF의 stdin oracle이다. |
-| Crypto | managed Builder의 solver를 operator-preissued hidden variant로 Python/Sage 각각 3+3 검증 | hidden input은 challenge/model workspace 밖 engine-private authority다. `2610c52`부터 persisted physical Run 여섯 개를 재검증하고 `d550df15`는 request/result/validation과 stdout/stderr sidecar provenance까지 결속한다. actual pinned Docker에서 Python/Sage 각각 6/6을 통과하고 hostile sidecar·stdout 교체를 거부했다. 최종 clean matrix receipt는 대기 중이다. |
+| Rev | formal matrix의 legacy accepted-input 3+3; 별도 typed `rev-prove-runtime` 계약 | formal exact-image release gate는 network-none ELF/stdin original-binary 범위다. runtime 선택 경로는 native, PE, JVM, .NET, WASM, QEMU와 stdin/argv/file을 지원하지만 전 runtime의 exact-image end-to-end release 증거는 아직 없다. APK/DEX, Mach-O/iOS, firmware와 network protocol도 범위 밖이다. |
+| Crypto | managed Builder의 solver를 operator-preissued hidden variant로 Python/Sage 각각 3+3 검증 | hidden input은 challenge/model workspace 밖 engine-private authority다. `2610c52`부터 persisted physical Run 여섯 개를 재검증하고 `d550df15`는 request/result/validation과 stdout/stderr sidecar provenance까지 결속한다. actual pinned Docker에서 Python/Sage 각각 6/6을 통과하고 hostile sidecar·stdout 교체를 거부했다. 현재 release 승인은 matching acceptance receipt로만 판정한다. |
 | Forensics | immutable index, pointer/hash 결속, readiness와 cross-tool assertion graph | `7c3d604`는 physical sidecar·artifact를 재검증하고 Python/pread와 Perl/sysread의 서로 다른 executable hash를 요구한다. focused 91개와 pinned Docker 7개가 37.961초에 통과했고 sidecar/artifact 및 duplicate-version 공격을 거부했다. `5e88071`은 이 계약을 matrix schema에도 고정했다. 지원 tool/profile과 evidence coverage 밖의 결론은 승격하지 않는다. |
 | Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay | `c690af0`은 failed physical run과 artifact deletion을 재검증해 거부한다. candidate-only이며 verifier 통과가 자동 제출 권한을 만들지 않는다. |
 
@@ -108,8 +113,9 @@ effort를 사용합니다. provider 한도는 호출을 대기시킬 뿐 역할�
 proof는 같은 exact image ID를 실행합니다. 이미지를 다시 빌드했다면 대회
 시작 전에 `ctfos pin-image`를 다시 실행하십시오.
 
-`doctor`는 Codex, Docker, 이미지, GPU/KVM, CPU/RAM/디스크와 정책을
-읽기 전용으로 보고합니다. 또한 exact local image ID가 현재 tag와 일치하는지,
+`doctor`는 설정이나 canonical state를 수정하지 않고 Codex, Docker, 이미지,
+GPU/KVM, CPU/RAM/디스크와 정책을 보고합니다. 또한 network-none 임시 Docker
+capability probe를 실행해 exact local image ID가 현재 tag와 일치하는지,
 Managed 실행에 필요한 capability와 파일 attestation이 실제 pinned image
 안에 모두 있는지를 network-none/read-only probe로 확인합니다.
 `doctor --calibrate`도 설정을 자동 변경하지 않고 권장값만 출력합니다.
@@ -117,24 +123,30 @@ Managed 실행에 필요한 capability와 파일 attestation이 실제 pinned im
 
 Managed 실행에 쓰는 이미지는 tag가 아니라 exact local image ID로 고정합니다.
 최초 `ctfos init` 뒤의 릴리스 순서는
-`build → exact-ID smoke → pin → doctor → challenge preflight`입니다.
+`clean commit → build → pin → doctor → release acceptance → contest-check →
+challenge preflight`입니다.
 tag를 다시 빌드하는 것만으로 이미 고정된 실행 참조가 바뀌지는 않습니다.
 
 ```sh
 CTFOS_RELEASE_IMAGE_ID="$(
   docker image inspect --format '{{.Id}}' ctf-os:core
 )"
+ctfos pin-image
 uv run python scripts/check-pwn-docker-crash.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 uv run python scripts/check-pwn-docker-snapshot.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 uv run python scripts/check-rev-docker-proof.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
-uv run python scripts/check-all-category-release-matrix.py \
-  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
-ctfos pin-image
 ctfos doctor
+uv run python scripts/check-release-acceptance.py \
+  --image-digest "$CTFOS_RELEASE_IMAGE_ID"
+ctfos contest-check --json
 ```
+
+세 개의 좁은 Docker smoke는 진단용입니다. 정식 acceptance runner가 다시 full
+source suite, doctor와 closed all-category matrix를 실행하고 하나의 receipt로
+묶습니다.
 
 challenge preflight는 전역 초기화 명령이 아닙니다. 아래 절차에서 사람이
 해당 challenge를 등록한 뒤 첫 managed model call 전에 실행합니다.
@@ -1415,11 +1427,13 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   exact output 반복을 증명합니다. 사람이 선택한 proof command의 원인성이나
   의도적으로 hardcode한 flag까지 일반적으로 판별하지는 못하며 이는
   operator trust 경계입니다.
-- Managed Rev executable oracle의 현재 범위는 network-none local standalone
-  Linux ELF와 stdin input 하나입니다. 원격 Rev, argv protocol, 여러 입력
-  파일, non-native target과 이미지에 없는 dynamic library는 지원하지 않고
-  fail-closed합니다. mutation control을 모두 거부하지 않는 의도적으로
-  관대한 parser도 proof를 통과하지 못할 수 있습니다.
+- Legacy Managed Rev accepted-input oracle과 formal matrix는 network-none local
+  ELF/stdin original-binary 범위입니다. 별도 typed `rev-prove-runtime`은 native,
+  PE, JVM, .NET, WASM, QEMU와 stdin/argv/file 다중 입력의 선택·실행 계약을
+  구현했지만 전 runtime exact-image end-to-end release 증거는 아직 없습니다.
+  APK/DEX, Mach-O/iOS, firmware, network protocol과 이미지에 없는 dependency는
+  지원하지 않고 fail-closed합니다. mutation control을 모두 거부하지 않는
+  의도적으로 관대한 parser도 proof를 통과하지 못할 수 있습니다.
 - Local Pwn에는 D→V crash, runtime snapshot, address-dependency L/N/A,
   IP-control primitive, one-shot 3+3 exploit-effect와 data-only dynamic
   interaction 3+3 gate가 있습니다. 실제 `zone`의
@@ -1454,9 +1468,9 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   static source를 schema-v1 operator input으로 결속하고 launch/provider,
   finalize/capture/bundle verification에서 재확인하며 paired arms의 동일성을
   강제합니다. focused 74/74는 통과했지만 실제 blind/live cohort 결과는
-  아닙니다. 현재 source의 최종 전체 회귀, clean Docker matrix와
-  `ctfos doctor`가 끝나기 전에는 이 구현 상태를 release acceptance나 solve
-  성능으로 확대하지 않습니다.
+  아닙니다. 현재 release acceptance는 full source suite, 무경고 doctor,
+  exact-image matrix와 postflight stability를 결속한 matching receipt로만
+  판정하며, 그 결과도 solve 성능으로 확대하지 않습니다.
 - image digest가 설정되지 않아도 실행은 가능하며 `doctor`가 경고합니다.
 - `work_tree_max_bytes`와 문제별 누적 storage quota는 커널 filesystem
   quota가 아닙니다. 한 명령이 실행 중에 상한을 일시 초과할 수 있으며,

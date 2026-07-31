@@ -420,6 +420,55 @@ class StateStore:
         self.last_view_errors: list[str] = []
         self._ensure_private_root()
 
+    @classmethod
+    def open_read_only(
+        cls,
+        workspace_root: Path | str,
+        *,
+        max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+    ) -> StateStore:
+        """Open an existing store without mkdir, chmod, recovery, or writes."""
+
+        if (
+            isinstance(max_artifact_bytes, bool)
+            or not isinstance(max_artifact_bytes, int)
+            or max_artifact_bytes <= 0
+        ):
+            raise ValueError("max_artifact_bytes must be a positive integer")
+        store = cls.__new__(cls)
+        store.workspace_root = Path(workspace_root).resolve()
+        store.root = store.workspace_root / ".ctfos"
+        store.state_root = store.root
+        store.contests_root = store.root / "contests"
+        store.max_artifact_bytes = max_artifact_bytes
+        store.last_view_errors = []
+        store._assert_private_root()
+        return store
+
+    def _assert_private_root(self) -> None:
+        """Validate the existing state root without repairing its metadata."""
+
+        try:
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.root, flags)
+        except OSError as error:
+            raise StateStoreError(
+                f"state root must be an existing private directory: {self.root}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise StateStoreError(
+                    "state root must be owned by the current user with mode 0700"
+                )
+        finally:
+            os.close(descriptor)
+
     def _ensure_private_root(self) -> None:
         """Make all engine state and flag-bearing output non-traversable."""
 

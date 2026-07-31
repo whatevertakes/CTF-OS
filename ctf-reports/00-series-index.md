@@ -33,10 +33,16 @@ AI Agent는 CTF 상위권 경쟁에서 빼기 어려운 도구가 되었습니�
 
 문서와 구현이 어긋날 때의 권위 순서는 다음과 같습니다.
 
-1. 현재 코드와 통과한 회귀 테스트
-2. [12. 최종 수용성 기록](12-final-acceptance.md)의 요구사항별 판정
-3. [10. 구현 결과](10-implementation-result.md)의 as-built 설명
-4. [9. 구현 설계도](09-implementation-blueprint.md)의 역사적 설계 기준선
+1. [RELEASE_STATUS](../RELEASE_STATUS.md)가 정의한 운영자 선택 exact local
+   unsigned receipt와 현재 코드
+2. 현재 source에 결속돼 통과한 회귀 테스트와 release matrix
+3. [12. 최종 수용성 기록](12-final-acceptance.md)의 요구사항별 판정과 상단 current delta
+4. [10. 구현 결과](10-implementation-result.md)의 as-built 설명과 상단 current delta
+5. [9. 구현 설계도](09-implementation-blueprint.md)의 역사적 설계 기준선
+
+10과 12의 과거 본문, 13~21의 실행 수치와 image digest는 날짜가 고정된 역사적
+증거다. 현재 checkout의 GO로 소급하지 않는다. 운영 순서는 저장소
+[contest start runbook](../docs/contest-start-runbook.md)을 따른다.
 
 13은 계약 판정이 아니라 운용 관측이므로 권위 순서에서 10과 12 **아래**입니다.
 다만 13의 가동률 표는 12의 수용 판정에 반례를 제기합니다. 계약이 코드에
@@ -119,7 +125,7 @@ solve uplift는 아직 측정하지 않았습니다.
 
 | 목적 | 읽을 것 |
 | --- | --- |
-| **현재 무엇이 실제로 작동하는지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "구현 상태 요약", [12. 최종 수용성 기록](12-final-acceptance.md), [21. Zone typed interaction 증거](21-zone-solve-capable-exploit-evidence.md), 저장소 [README](../README.md) |
+| **현재 무엇이 실제로 작동하는지 알고 싶다** | [RELEASE_STATUS](../RELEASE_STATUS.md), runner가 출력한 운영자 선택 exact local unsigned receipt, 저장소 [README](../README.md), 그 다음 10/12의 current delta |
 | **다음에 무엇을 코딩할지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "남은 작업 우선순위", [release validation matrix](../docs/release-validation-matrix.md)의 현재 gate 경계, [promotion bundle 운용 계약](../docs/promotion-bundles.md)과 [7. 실험 백로그](07-experiment-backlog.md)의 blind/live 평가 의존 관계 |
 | **왜 그것을 먼저 만드는지 알고 싶다** | [6. 엔진 설계도](06-engine-blueprint.md)의 "레버 우선순위"와 "안티-레버" 두 절. 근거 강도순으로 정렬돼 있습니다 |
 | **실제로 문제가 어떻게 풀리는지 보고 싶다** | [9. 구현 설계도](09-implementation-blueprint.md)의 부록 "실제 운용 시나리오". 카테고리별로 갈리는 지점이 표로 있습니다 |

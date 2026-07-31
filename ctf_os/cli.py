@@ -25,6 +25,10 @@ from ctf_os.config import (
     load_config,
     set_runtime_image_digest,
 )
+from ctf_os.contest_readiness import (
+    challenge_diagnosis,
+    contest_readiness,
+)
 from ctf_os.doctor import collect_diagnostics
 from ctf_os.engine.challenge import (
     ChallengeEngine,
@@ -95,7 +99,7 @@ from ctf_os.storage import (
     storage_inventory,
     storage_plan,
 )
-from ctf_os.store import StateStoreError
+from ctf_os.store import StateStore, StateStoreError
 from ctf_os.store.atomic import atomic_write_text, strict_json_loads
 from ctf_os.terminal import terminal_safe
 
@@ -776,6 +780,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor = commands.add_parser("doctor", help="호스트/도구 환경 진단")
     doctor.add_argument("--calibrate", action="store_true")
+
+    contest_check = commands.add_parser(
+        "contest-check",
+        help=(
+            "canonical state 비변경 대회 준비 상태 "
+            "(local doctor/capability probe 포함)"
+        ),
+    )
+    contest_check.add_argument("contest", nargs="?")
+    contest_check.add_argument("--json", action="store_true")
+
+    diagnose = commands.add_parser(
+        "diagnose",
+        help="문제 하나의 읽기 전용 실패·복구 포인터",
+    )
+    _identity_values(diagnose)
+    diagnose.add_argument("--json", action="store_true")
 
     init_contest = commands.add_parser(
         "init-contest", help="호환 명령: 대회와 문제 폴더 생성"
@@ -1764,6 +1785,60 @@ def _status_once(
             )
 
 
+def _print_operator_report(
+    report: dict[str, object],
+    *,
+    title: str,
+) -> None:
+    """Render the small human view; JSON retains all bounded pointers."""
+
+    print(
+        terminal_safe(
+            f"{title}: " + ("ready" if report.get("ok") else "blocked")
+        )
+    )
+    blockers = report.get("blockers")
+    if not isinstance(blockers, list):
+        readiness = report.get("readiness")
+        blockers = (
+            readiness.get("blockers", [])
+            if isinstance(readiness, dict)
+            else []
+        )
+    for item in blockers:
+        if not isinstance(item, dict):
+            continue
+        print(
+            "- "
+            + terminal_safe(item.get("code", "unknown"))
+            + ": "
+            + terminal_safe(item.get("detail", ""))
+        )
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list):
+        readiness = report.get("readiness")
+        warnings = (
+            readiness.get("warnings", [])
+            if isinstance(readiness, dict)
+            else []
+        )
+    for item in warnings:
+        if not isinstance(item, dict):
+            continue
+        print(
+            "- warning/"
+            + terminal_safe(item.get("code", "unknown"))
+            + ": "
+            + terminal_safe(item.get("detail", ""))
+        )
+    commands = report.get("next_commands", [])
+    if isinstance(commands, list) and commands:
+        print("다음(운영자 승인 후):")
+        for command in commands:
+            if isinstance(command, str):
+                print("- " + terminal_safe(command))
+
+
 def _inspect_value(
     state: Any,
     section: str,
@@ -2015,6 +2090,35 @@ def main(
                     f"{args.migration_command}"
                 )
             _print_json(report)
+            return 0
+
+        if args.command == "contest-check":
+            store = StateStore.open_read_only(
+                workspace,
+                max_artifact_bytes=config.runtime.work_tree_max_bytes,
+            )
+            report = contest_readiness(
+                store,
+                config,
+                collect_diagnostics(config),
+                contest_id=args.contest,
+            )
+            if args.json:
+                _print_json(report)
+            else:
+                _print_operator_report(report, title="contest-check")
+            return 0 if report["ok"] is True else 2
+
+        if args.command == "diagnose":
+            store = StateStore.open_read_only(
+                workspace,
+                max_artifact_bytes=config.runtime.work_tree_max_bytes,
+            )
+            report = challenge_diagnosis(store, _identity(args))
+            if args.json:
+                _print_json(report)
+            else:
+                _print_operator_report(report, title="diagnose")
             return 0
 
         engine = ChallengeEngine(workspace, config=config)

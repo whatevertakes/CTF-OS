@@ -4274,6 +4274,12 @@ class EngineTests(unittest.TestCase):
             client.backend.limits.work_tree_max_bytes,
             config.runtime.work_tree_max_bytes,
         )
+        self.assertTrue(client.backend.limits.ptrace)
+        web = engine.add_challenge(
+            ChallengeIdentity("국내 CTF", "web", "문제 2"),
+            prompt="solve",
+        )
+        self.assertFalse(engine.sandbox(web).backend.limits.ptrace)
 
     def test_live_workspace_is_initialized_before_session_files_are_written(
         self,

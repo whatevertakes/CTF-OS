@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -133,6 +134,115 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(status, 0, errors)
         self.assertIn("28800", output)
+
+    def test_contest_check_and_diagnose_are_snapshot_only_and_commands_parse(
+        self,
+    ) -> None:
+        self.add()
+        paths = StateStore(self.root).challenge_paths(
+            ChallengeIdentity(*self.identity)
+        )
+        before = (
+            paths.state.read_bytes(),
+            paths.previous_state.read_bytes(),
+            paths.events.read_bytes(),
+        )
+        doctor = {
+            "ok": True,
+            "warnings": [],
+            "image": {"pin_status": "matched"},
+            "managed_capabilities": {"status": "ready"},
+        }
+        with (
+            patch("ctf_os.cli.collect_diagnostics", return_value=doctor),
+            patch(
+                "ctf_os.store.files.os.fchmod",
+                side_effect=AssertionError("read-only open repaired permissions"),
+            ),
+            patch(
+                "ctf_os.cli.ChallengeEngine",
+                side_effect=AssertionError("read-only command built engine"),
+            ),
+        ):
+            status, output, errors = self.run_cli(
+                ["contest-check", self.identity[0], "--json"]
+            )
+        self.assertEqual(status, 0, errors)
+        contest_report = json.loads(output)
+        self.assertTrue(contest_report["ok"])
+        self.assertEqual(contest_report["release"]["status"], "not_checked")
+
+        with (
+            patch(
+                "ctf_os.store.files.os.fchmod",
+                side_effect=AssertionError("read-only open repaired permissions"),
+            ),
+            patch(
+                "ctf_os.cli.ChallengeEngine",
+                side_effect=AssertionError("read-only command built engine"),
+            ),
+        ):
+            status, output, errors = self.run_cli(
+                ["diagnose", *self.identity, "--json"]
+            )
+        self.assertEqual(status, 0, errors)
+        diagnosis = json.loads(output)
+        parser = cli.build_parser()
+        for command in diagnosis["next_commands"]:
+            parser.parse_args(shlex.split(command)[1:])
+
+        after = (
+            paths.state.read_bytes(),
+            paths.previous_state.read_bytes(),
+            paths.events.read_bytes(),
+        )
+        self.assertEqual(before, after)
+
+    def test_readiness_suggested_command_shapes_parse(self) -> None:
+        parser = cli.build_parser()
+        commands = (
+            "ctfos preflight 'Demo CTF' web Example",
+            "ctfos inspect 'Demo CTF' web Example summary",
+            "ctfos inspect 'Demo CTF' web Example state",
+            "ctfos inspect 'Demo CTF' web Example experiments",
+            "ctfos inspect 'Demo CTF' web Example runs",
+            "ctfos budget-reset 'Demo CTF' web Example",
+            "ctfos migrate check",
+            "ctfos target list 'Demo CTF' web Example",
+            "ctfos target check 'Demo CTF' web Example T-1",
+            (
+                "ctfos target smoke 'Demo CTF' web Example T-1 "
+                "--mode dns --mode tcp"
+            ),
+            "ctfos jobs 'Demo CTF' web Example --recover",
+        )
+        for command in commands:
+            parser.parse_args(shlex.split(command)[1:])
+
+    def test_contest_check_refuses_doctor_false_without_state_write(self) -> None:
+        self.add()
+        paths = StateStore(self.root).challenge_paths(
+            ChallengeIdentity(*self.identity)
+        )
+        before = paths.state.read_bytes()
+        doctor = {
+            "ok": False,
+            "warnings": ["pinned image is unavailable"],
+            "image": {"pin_status": "missing"},
+            "managed_capabilities": {"status": "blocked"},
+        }
+        with patch("ctf_os.cli.collect_diagnostics", return_value=doctor):
+            status, output, errors = self.run_cli(
+                ["contest-check", self.identity[0], "--json"]
+            )
+        self.assertEqual(status, 2, errors)
+        report = json.loads(output)
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "doctor_not_ready",
+            {item["code"] for item in report["blockers"]},
+        )
+        self.assertEqual(before, paths.state.read_bytes())
 
     def test_safe_contest_and_challenge_flag_formats_are_persisted(self) -> None:
         status, _, errors = self.run_cli(

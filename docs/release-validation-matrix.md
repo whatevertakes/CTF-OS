@@ -24,6 +24,15 @@ exit status, a missing/negative final gate summary, an image-binding mismatch,
 or source/image drift during the run. Model and credential-like environment
 variables are removed from child environments.
 
+Child gates do not carry a second hard-coded release digest. Each child
+validates and binds the exact `sha256:<64hex>` local image ID supplied by the
+parent matrix. The parent is the pin authority: before launching children it
+requires that ID to equal `.ctfos/engine.toml` `runtime.image_digest` and that
+Docker inspection resolve to the same exact ID. After the children finish it
+rechecks the source snapshot, inspected image, and configured pin. A missing or
+mismatched pin is refused before execution; later source, image, or pin drift
+prevents `ok: true`. The report does not claim a separate configured-pin field.
+
 The Pwn dependency child does not trust stage counters or the child process's
 last output line. `1c82147` reloads canonical state, re-reads every bounded
 request/result/validation sidecar, committed artifact, and compact effect
@@ -96,9 +105,10 @@ The remaining category release-proof provenance blockers have been closed:
 - `5e88071` carries the hardened Pwn and Forensic exact schemas into the
   all-category matrix validator.
 
-These child results are completed deterministic evidence, but they are not the
-final release receipt. Release acceptance remains pending one clean
-current-source all-category matrix, the full suite, and `ctfos doctor`.
+These child results are deterministic evidence, but a matrix alone is not the
+final release receipt. `scripts/check-release-acceptance.py` binds the full
+clean-worktree source suite, strict doctor result, this matrix, and pre/post
+source-image-pin-runtime stability into one ignored local unsigned receipt.
 
 After building the release image and committing the exact source under test:
 
@@ -106,6 +116,7 @@ After building the release image and committing the exact source under test:
 CTFOS_RELEASE_IMAGE_ID="$(
   docker image inspect --format '{{.Id}}' ctf-os:core
 )"
+ctfos pin-image
 python scripts/check-all-category-release-matrix.py \
   --image-digest "$CTFOS_RELEASE_IMAGE_ID"
 ```
@@ -150,5 +161,7 @@ evidence rather than current-source release acceptance. The latter commit
 binds schema-v1 prompt/description/category/incoming/static-source operator
 input throughout promotion collection and passed its focused 74/74 tests in
 110.727 seconds; it is implementation evidence, not an executed blind/live
-cohort or measured solve uplift. A new clean-source report pointer and hash,
-full-suite result, and clean `ctfos doctor` result are still required.
+cohort or measured solve uplift. That historical run never becomes current by
+documentation update. Current `ENGINE_RELEASE_GO` is determined only by the
+operator-selected exact local unsigned acceptance receipt described in
+[`RELEASE_STATUS.md`](../RELEASE_STATUS.md).

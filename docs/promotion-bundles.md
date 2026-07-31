@@ -1,5 +1,11 @@
 # Thin baseline / blind-live promotion bundles
 
+> Current authority (2026-08-01): this collector path is implemented and tested,
+> but no genuine blind/live thin-scaffold 3×3 versus CTF-OS 3×3 cohort has been
+> executed. `COMPETITION_PERFORMANCE_STATUS` therefore remains
+> `NOT_ESTABLISHED`. See [RELEASE_STATUS](../RELEASE_STATUS.md); engine release
+> acceptance and solve-performance promotion are separate claims.
+
 The old `ctfos benchmark promotion --evidence FILE` command remains a pure,
 read-only gate for diagnostics. Operator-written outcome fields are not
 engine-derived evidence and must not be used as automatic promotion evidence.
