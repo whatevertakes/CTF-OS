@@ -152,12 +152,15 @@ class CapabilityTests(unittest.TestCase):
         )
         self.assertEqual(report["attestation_errors"], {})
         argv, kwargs = calls[0]
+        self.assertRegex(argv[4], r"^ctfos-capability-[0-9a-f]{24}$")
         self.assertEqual(
             argv,
             [
                 "docker",
                 "run",
                 "--rm",
+                "--name",
+                argv[4],
                 "--network",
                 "none",
                 "--read-only",
@@ -171,6 +174,44 @@ class CapabilityTests(unittest.TestCase):
         )
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["timeout"], 30.0)
+
+    def test_probe_timeout_force_removes_the_exact_named_container(self):
+        probe_calls = []
+        cleanup_calls = []
+
+        def runner(argv, **kwargs):
+            probe_calls.append((argv, kwargs))
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        def cleanup_runner(argv, **kwargs):
+            cleanup_calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with self.assertRaisesRegex(CapabilityError, "timed out"):
+            inspect_pinned_capabilities(
+                DIGEST,
+                runner=runner,
+                cleanup_runner=cleanup_runner,
+                timeout_seconds=0.25,
+            )
+
+        self.assertEqual(len(probe_calls), 1)
+        self.assertEqual(len(cleanup_calls), 1)
+        container_name = probe_calls[0][0][4]
+        self.assertRegex(
+            container_name,
+            r"^ctfos-capability-[0-9a-f]{24}$",
+        )
+        argv, kwargs = cleanup_calls[0]
+        self.assertEqual(
+            argv,
+            ["docker", "rm", "-f", container_name],
+        )
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertFalse(kwargs["check"])
+        self.assertEqual(kwargs["timeout"], 10.0)
 
     def test_probe_timeout_is_positive_finite_and_capped(self):
         calls = []

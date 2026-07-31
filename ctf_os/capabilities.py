@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 import subprocess
 from collections.abc import Callable
 from typing import Any
@@ -294,10 +295,35 @@ def _attestation_error(
     return None
 
 
+def _remove_capability_probe_container(
+    docker: str,
+    container_name: str,
+    *,
+    runner: Runner,
+) -> None:
+    """Best-effort cleanup without replacing the original probe failure."""
+
+    try:
+        runner(
+            [docker, "rm", "-f", container_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10.0,
+        )
+    except Exception:
+        # A daemon failure can make cleanup impossible.  The caller still
+        # receives the original timeout or launch error rather than a cleanup
+        # implementation detail.
+        pass
+
+
 def inspect_pinned_capabilities(
     image_digest: str,
     *,
     runner: Runner = subprocess.run,
+    cleanup_runner: Runner | None = None,
     docker: str = "docker",
     required: frozenset[str] = REQUIRED_MANAGED_CAPABILITIES,
     timeout_seconds: int | float = 30,
@@ -315,10 +341,13 @@ def inspect_pinned_capabilities(
             "image capability timeout must be positive and finite"
         )
     timeout = min(30.0, float(timeout_seconds))
+    container_name = f"ctfos-capability-{secrets.token_hex(12)}"
     command = [
         docker,
         "run",
         "--rm",
+        "--name",
+        container_name,
         "--network",
         "none",
         "--read-only",
@@ -340,8 +369,18 @@ def inspect_pinned_capabilities(
     except FileNotFoundError as error:
         raise CapabilityError("Docker executable is unavailable") from error
     except subprocess.TimeoutExpired as error:
+        _remove_capability_probe_container(
+            docker,
+            container_name,
+            runner=cleanup_runner or runner,
+        )
         raise CapabilityError("image capability probe timed out") from error
     except OSError as error:
+        _remove_capability_probe_container(
+            docker,
+            container_name,
+            runner=cleanup_runner or runner,
+        )
         raise CapabilityError(f"image capability probe failed: {error}") from error
 
     stdout_value = result.stdout or b""
