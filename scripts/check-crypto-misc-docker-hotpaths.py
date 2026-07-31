@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import stat
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,9 @@ from ctf_os.capabilities import inspect_pinned_capabilities
 from ctf_os.codex import Role
 from ctf_os.config import EngineConfig, RuntimeConfig
 from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.engine.crypto_metamorphic import (
+    CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+)
 from ctf_os.engine.managed_oracle_preissue import (
     MANAGED_ORACLE_PREISSUE_PROTOCOL,
     MANAGED_ORACLE_PREISSUE_STATE_KEY,
@@ -33,6 +37,7 @@ from ctf_os.models import (
     FlagCandidate,
     RunStatus,
 )
+from ctf_os.sandbox.files import read_bounded_regular
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
 
@@ -91,6 +96,20 @@ CRYPTO_VARIANT = _rsa_parameter_document(
 
 MISC_CANDIDATE = "KCTF{docker-misc-transform-hotpath}"
 MISC_SOURCE = b"immutable misc docker input\n"
+_CRYPTO_PROOF_RESULT_KEYS = frozenset(
+    {
+        "candidate",
+        "failures",
+        "passed",
+        "policy_mode",
+        "required_attempts",
+        "run_ids",
+        "source_manifest_sha256",
+        "successful_attempts",
+        "total_attempts",
+    }
+)
+_CRYPTO_RUN_DOCUMENT_MAX_BYTES = 1_048_576
 
 
 def _parse_args() -> argparse.Namespace:
@@ -268,6 +287,161 @@ def _execute_managed_builder_action(
     return final, experiment
 
 
+def _read_crypto_run_document(
+    challenge_root: Path,
+    locator: str | None,
+    *,
+    label: str,
+) -> dict[str, object]:
+    if type(locator) is not str or not locator:
+        raise AssertionError(f"Crypto {label} path is absent")
+    try:
+        relative = Path(locator)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("run document path is not canonical")
+        target = challenge_root.joinpath(*relative.parts)
+        metadata = target.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 0
+            or metadata.st_size > _CRYPTO_RUN_DOCUMENT_MAX_BYTES
+        ):
+            raise ValueError("run document is not a bounded regular file")
+        observed = target.read_bytes()
+        if len(observed) != metadata.st_size:
+            raise ValueError("run document changed during inventory")
+        payload = read_bounded_regular(
+            challenge_root,
+            locator,
+            maximum_bytes=_CRYPTO_RUN_DOCUMENT_MAX_BYTES,
+            expected_sha256=hashlib.sha256(observed).hexdigest(),
+            expected_size=len(observed),
+        )
+        value = json.loads(payload)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise AssertionError(
+            f"Crypto {label} is not a bounded canonical JSON document"
+        ) from error
+    if type(value) is not dict:
+        raise AssertionError(f"Crypto {label} is not an object")
+    return value
+
+
+def _validated_crypto_execution(
+    final,
+    candidate,
+    binding: object,
+    *,
+    challenge_root: Path,
+    image_digest: str,
+) -> tuple[list[object], int]:
+    """Cross-check the claimed ProofResult against six physical runs."""
+
+    if type(binding) is not dict:
+        raise AssertionError("Crypto proof binding is absent")
+    proof_result = binding.get("proof_result")
+    run_ids = binding.get("run_ids")
+    if (
+        type(proof_result) is not dict
+        or frozenset(proof_result) != _CRYPTO_PROOF_RESULT_KEYS
+        or type(run_ids) is not list
+        or len(run_ids) != 6
+        or len(set(run_ids)) != 6
+        or any(type(run_id) is not str or not run_id for run_id in run_ids)
+        or list(candidate.proof_run_ids) != run_ids
+        or proof_result.get("run_ids") != run_ids
+        or proof_result.get("passed") is not True
+        or proof_result.get("candidate") != candidate.value
+        or proof_result.get("policy_mode")
+        != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+        or proof_result.get("source_manifest_sha256")
+        != final.metadata.get("source_manifest_sha256")
+        or proof_result.get("successful_attempts") != 6
+        or proof_result.get("required_attempts") != 6
+        or proof_result.get("total_attempts") != 6
+        or proof_result.get("failures") != []
+    ):
+        raise AssertionError(
+            "Crypto ProofResult does not describe six successful attempts"
+        )
+
+    runs_by_id = {
+        item.id: item for item in final.runs if item.id in set(run_ids)
+    }
+    if len(runs_by_id) != 6:
+        raise AssertionError("Crypto physical proof runs are incomplete")
+    runs = [runs_by_id[run_id] for run_id in run_ids]
+    plan_sha256 = binding.get("plan_sha256")
+    for ordinal, run in enumerate(runs, start=1):
+        if (
+            run.status is not RunStatus.COMPLETED
+            or run.role != "crypto_metamorphic_proof"
+            or run.extra.get("crypto_metamorphic_protocol")
+            != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+            or run.extra.get("plan_sha256") != plan_sha256
+            or run.extra.get("attempt_ordinal") != ordinal
+        ):
+            raise AssertionError(
+                f"Crypto physical run {ordinal} is not completed and bound"
+            )
+        request = _read_crypto_run_document(
+            challenge_root,
+            run.request_path,
+            label=f"run {ordinal} request",
+        )
+        result = _read_crypto_run_document(
+            challenge_root,
+            run.result_path,
+            label=f"run {ordinal} result",
+        )
+        validation = _read_crypto_run_document(
+            challenge_root,
+            run.validation_path,
+            label=f"run {ordinal} validation",
+        )
+        attempt = request.get("attempt")
+        observation = result.get("observation")
+        if (
+            request.get("kind") != "crypto_metamorphic_proof"
+            or request.get("candidate_id") != candidate.id
+            or request.get("protocol")
+            != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+            or request.get("plan_sha256") != plan_sha256
+            or request.get("network_target") is not None
+            or request.get("image_reference") != image_digest
+            or request.get("source_manifest_sha256")
+            != final.metadata.get("source_manifest_sha256")
+            or type(attempt) is not dict
+            or attempt.get("ordinal") != ordinal
+            or result.get("status") != "completed"
+            or result.get("exit_code") != 0
+            or result.get("timed_out") is not False
+            or type(observation) is not dict
+            or observation.get("run_id") != run.id
+            or observation.get("ordinal") != ordinal
+            or observation.get("capture_complete") is not True
+            or observation.get("truncation_known") is not True
+            or observation.get("truncated") is not False
+            or observation.get("timed_out") is not False
+            or observation.get("orchestration_status") != "completed"
+            or observation.get("runner_exit_code") != 0
+            or observation.get("ctfwrap_exit_code") != 0
+            or validation.get("ok") is not True
+            or validation.get("protocol")
+            != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+            or validation.get("plan_sha256") != plan_sha256
+            or validation.get("attempt_ordinal") != ordinal
+        ):
+            raise AssertionError(
+                f"Crypto physical run {ordinal} evidence is not successful"
+            )
+    return runs, int(proof_result["successful_attempts"])
+
+
 def _crypto(
     root: Path,
     image_digest: str,
@@ -353,12 +527,15 @@ def _crypto(
         for item in final.candidates
         if item.id == f"C-crypto-docker-{runtime}"
     )
-    runs = [
-        item
-        for item in final.runs
-        if item.id in candidate.proof_run_ids
-    ]
     binding = candidate.extra.get("crypto_metamorphic_proof")
+    challenge_root = engine.store.challenge_paths(identity).root
+    runs, successful_attempts = _validated_crypto_execution(
+        final,
+        candidate,
+        binding,
+        challenge_root=challenge_root,
+        image_digest=image_digest,
+    )
     preissue_state = final.extra[MANAGED_ORACLE_PREISSUE_STATE_KEY][
         preissue["preissue_id"]
     ]
@@ -370,7 +547,6 @@ def _crypto(
         or experiment.result.get("passed") is not True
         or candidate.status is not CandidateStatus.READY_TO_SUBMIT
         or len(runs) != 6
-        or any(item.role != "crypto_metamorphic_proof" for item in runs)
         or preissue_state.get("status") != "consumed"
         or not preissue_state.get("consumed_by_builder_run_id")
         or not preissue_state.get("consumed_by_experiment_id")
@@ -387,7 +563,7 @@ def _crypto(
         "oracle_preissue_status": preissue_state["status"],
         "runtime": runtime,
         "runs": len(runs),
-        "successful_attempts": 6,
+        "successful_attempts": successful_attempts,
         "submissions": len(final.submissions),
     }
 

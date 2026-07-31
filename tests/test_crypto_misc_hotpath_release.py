@@ -5,8 +5,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+
+from ctf_os.models import RunStatus
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -57,6 +61,143 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
         self.assertNotIn("FakeSandbox", source)
         self.assertNotIn("record_manual_submission", source)
         self.assertNotIn("submit_candidate", source)
+
+    def test_crypto_summary_is_derived_from_completed_physical_runs(
+        self,
+    ) -> None:
+        source_manifest = "a" * 64
+        plan_sha256 = "b" * 64
+        image_digest = release.RELEASE_IMAGE_DIGEST
+        run_ids = [f"crypto-run-{ordinal}" for ordinal in range(1, 7)]
+        with tempfile.TemporaryDirectory() as temporary:
+            challenge_root = Path(temporary)
+            runs = []
+            for ordinal, run_id in enumerate(run_ids, start=1):
+                run_root = challenge_root / "runs" / run_id
+                run_root.mkdir(parents=True)
+                documents = {
+                    "request.json": {
+                        "attempt": {"ordinal": ordinal},
+                        "candidate_id": "C-crypto",
+                        "image_reference": image_digest,
+                        "kind": "crypto_metamorphic_proof",
+                        "network_target": None,
+                        "plan_sha256": plan_sha256,
+                        "protocol": (
+                            release.CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                        ),
+                        "source_manifest_sha256": source_manifest,
+                    },
+                    "result.json": {
+                        "exit_code": 0,
+                        "observation": {
+                            "capture_complete": True,
+                            "ctfwrap_exit_code": 0,
+                            "orchestration_status": "completed",
+                            "ordinal": ordinal,
+                            "run_id": run_id,
+                            "runner_exit_code": 0,
+                            "timed_out": False,
+                            "truncated": False,
+                            "truncation_known": True,
+                        },
+                        "status": "completed",
+                        "timed_out": False,
+                    },
+                    "validation.json": {
+                        "attempt_ordinal": ordinal,
+                        "ok": True,
+                        "plan_sha256": plan_sha256,
+                        "protocol": (
+                            release.CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                        ),
+                    },
+                }
+                for name, document in documents.items():
+                    (run_root / name).write_text(
+                        json.dumps(document, sort_keys=True),
+                        encoding="utf-8",
+                    )
+                runs.append(
+                    SimpleNamespace(
+                        id=run_id,
+                        status=RunStatus.COMPLETED,
+                        role="crypto_metamorphic_proof",
+                        request_path=f"runs/{run_id}/request.json",
+                        result_path=f"runs/{run_id}/result.json",
+                        validation_path=f"runs/{run_id}/validation.json",
+                        extra={
+                            "attempt_ordinal": ordinal,
+                            "crypto_metamorphic_protocol": (
+                                release.CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                            ),
+                            "plan_sha256": plan_sha256,
+                        },
+                    )
+                )
+            candidate = SimpleNamespace(
+                id="C-crypto",
+                value="KCTF{candidate}",
+                proof_run_ids=list(run_ids),
+            )
+            proof_result = {
+                "candidate": candidate.value,
+                "failures": [],
+                "passed": True,
+                "policy_mode": (
+                    release.CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+                ),
+                "required_attempts": 6,
+                "run_ids": list(run_ids),
+                "source_manifest_sha256": source_manifest,
+                "successful_attempts": 6,
+                "total_attempts": 6,
+            }
+            binding = {
+                "plan_sha256": plan_sha256,
+                "proof_result": proof_result,
+                "run_ids": list(run_ids),
+            }
+            final = SimpleNamespace(
+                metadata={"source_manifest_sha256": source_manifest},
+                runs=runs,
+            )
+
+            physical, successful = release._validated_crypto_execution(
+                final,
+                candidate,
+                binding,
+                challenge_root=challenge_root,
+                image_digest=image_digest,
+            )
+
+            self.assertEqual(len(physical), 6)
+            self.assertEqual(successful, 6)
+            runs[2].status = RunStatus.FAILED
+            with self.assertRaisesRegex(
+                AssertionError,
+                "physical run 3",
+            ):
+                release._validated_crypto_execution(
+                    final,
+                    candidate,
+                    binding,
+                    challenge_root=challenge_root,
+                    image_digest=image_digest,
+                )
+            runs[2].status = RunStatus.COMPLETED
+            proof_result["successful_attempts"] = 5
+            with self.assertRaisesRegex(
+                AssertionError,
+                "six successful attempts",
+            ):
+                release._validated_crypto_execution(
+                    final,
+                    candidate,
+                    binding,
+                    challenge_root=challenge_root,
+                    image_digest=image_digest,
+                )
 
     @unittest.skipUnless(
         os.environ.get("CTFOS_RUN_CRYPTO_MISC_DOCKER") == "1",
