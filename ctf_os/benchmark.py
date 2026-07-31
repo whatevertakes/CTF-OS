@@ -36,12 +36,29 @@ MIN_HOLDOUT_CASES_PER_CATEGORY = 2
 MIN_HOLDOUT_CASES_PER_SPLIT = 6
 MIN_TTFVR_ABSOLUTE_IMPROVEMENT_SECONDS = 1.0
 MIN_TTFVR_RELATIVE_IMPROVEMENT = 0.05
+MIN_QUALIFIED_ATTEMPTS_PER_SUCCESS_CASE = 2
 THIN_SCAFFOLD = "thin_scaffold"
 CTF_OS_SYSTEM = "ctf_os"
 BLIND_LIVE_PROMOTION_SCHEMA_VERSION = 3
 _MAX_IDENTIFIER_BYTES = 256
 _MAX_PROMOTION_CASES = 4096
 _MAX_COUNTER = (1 << 63) - 1
+_EFFICIENCY_DENOMINATORS = (
+    "per_qualified_case",
+    "per_qualified_attempt",
+)
+_EFFICIENCY_RESOURCES = (
+    "solve_wall_seconds_used",
+    "model_calls_used",
+    "total_tokens_used",
+)
+_PERFORMANCE_NONINFERIORITY_METRICS = (
+    "solve@1",
+    "pass^2/3",
+    "median_time_to_first_valid_result",
+    "first_valid_observed_results",
+    "human_interventions",
+)
 
 
 class BenchmarkError(ValueError):
@@ -1043,6 +1060,18 @@ def _promotion_split_policy_blockers(
         _append_once(blockers, f"prior_exposure:{split.name}")
 
 
+def _is_qualified_solve(attempt: PromotionAttempt) -> bool:
+    """Return whether one accepted solve has both required validations."""
+
+    return (
+        attempt.solved
+        and attempt.proof_evaluated
+        and attempt.proof_passed
+        and attempt.reproduction_evaluated
+        and attempt.reproduced
+    )
+
+
 def _promotion_arm_record_blockers(
     arm: PromotionArm,
     *,
@@ -1076,18 +1105,6 @@ def _promotion_arm_record_blockers(
                 _append_once(blockers, f"{label}_run_id_reused")
                 complete = False
             run_ids.add(attempt.run_id)
-            if label == "candidate" and not attempt.proof_evaluated:
-                _append_once(
-                    blockers,
-                    "candidate_proof_coverage_incomplete",
-                )
-                complete = False
-            if label == "candidate" and not attempt.reproduction_evaluated:
-                _append_once(
-                    blockers,
-                    "candidate_reproduction_coverage_incomplete",
-                )
-                complete = False
             if (
                 (
                     attempt.solved
@@ -1112,24 +1129,32 @@ def _promotion_arm_record_blockers(
                     f"{label}_budget_exceeded:{case_id}:{attempt.attempt}",
                 )
                 complete = False
-            if (
-                label == "candidate"
-                and attempt.solved
-                and (
-                    not attempt.proof_evaluated
-                    or not attempt.proof_passed
-                )
+            if attempt.solved and (
+                not attempt.proof_evaluated
+                or not attempt.proof_passed
             ):
                 _append_once(blockers, f"{label}_unproved_solve")
-            if (
-                label == "candidate"
-                and attempt.solved
-                and (
-                    not attempt.reproduction_evaluated
-                    or not attempt.reproduced
-                )
+            if attempt.solved and (
+                not attempt.reproduction_evaluated
+                or not attempt.reproduced
             ):
                 _append_once(blockers, f"{label}_unreproduced_solve")
+        accepted_attempts = sum(
+            attempt.solved for attempt in attempts.values()
+        )
+        qualified_attempts = sum(
+            _is_qualified_solve(attempt)
+            for attempt in attempts.values()
+        )
+        if (
+            accepted_attempts
+            and qualified_attempts
+            < MIN_QUALIFIED_ATTEMPTS_PER_SUCCESS_CASE
+        ):
+            _append_once(
+                blockers,
+                f"{label}_success_case_not_qualified_2_of_3:{case_id}",
+            )
 
     safety = arm.safety
     if (
@@ -1157,12 +1182,17 @@ def _promotion_summary(
     attempt_one_solved = 0
     two_of_three = 0
     accepted_solve_attempts = 0
+    qualified_solve_attempts = 0
+    qualified_cases = 0
     proof_evaluations = 0
     proof_passes = 0
     reproduction_evaluations = 0
     reproductions = 0
     first_valid_seconds: list[float] = []
     human_interventions = 0
+    total_wall_seconds_used = 0.0
+    total_model_calls_used = 0
+    total_tokens_used = 0
     category_solve_at_one: dict[str, list[bool]] = {}
     category_pass_two_of_three: dict[str, list[bool]] = {}
 
@@ -1171,30 +1201,42 @@ def _promotion_summary(
             attempt.attempt: attempt
             for attempt in results[case.case_id].attempts
         }
-        first_attempt_solved = attempts[1].solved
+        first_attempt_solved = _is_qualified_solve(attempts[1])
         attempt_one_solved += int(first_attempt_solved)
         category_solve_at_one.setdefault(case.category, []).append(
             first_attempt_solved
         )
         solved_for_case = 0
+        qualified_for_case = 0
         for attempt_number in (1, 2, 3):
             attempt = attempts[attempt_number]
             human_interventions += attempt.human_interventions
+            total_wall_seconds_used += float(
+                attempt.solve_wall_seconds_used
+            )
+            total_model_calls_used += attempt.model_calls_used
+            total_tokens_used += attempt.total_tokens_used
             if attempt.proof_evaluated:
                 proof_evaluations += 1
                 proof_passes += int(attempt.proof_passed)
             if attempt.reproduction_evaluated:
                 reproduction_evaluations += 1
                 reproductions += int(attempt.reproduced)
-            if attempt.first_valid_result_seconds is not None:
+            qualified = _is_qualified_solve(attempt)
+            if qualified and attempt.first_valid_result_seconds is not None:
                 first_valid_seconds.append(
                     float(attempt.first_valid_result_seconds)
                 )
-            if not attempt.solved:
-                continue
-            solved_for_case += 1
-            accepted_solve_attempts += 1
+            if qualified:
+                qualified_for_case += 1
+                qualified_solve_attempts += 1
+                solved_for_case += 1
+            accepted_solve_attempts += int(attempt.solved)
         passed_two_of_three = solved_for_case >= 2
+        qualified_cases += int(
+            qualified_for_case
+            >= MIN_QUALIFIED_ATTEMPTS_PER_SUCCESS_CASE
+        )
         two_of_three += int(passed_two_of_three)
         category_pass_two_of_three.setdefault(
             case.category,
@@ -1238,6 +1280,25 @@ def _promotion_summary(
         for category, value in categories.items()
         if value["rate"] == category_floor
     ]
+
+    resource_totals: dict[str, float | int] = {
+        "solve_wall_seconds_used": total_wall_seconds_used,
+        "model_calls_used": total_model_calls_used,
+        "total_tokens_used": total_tokens_used,
+    }
+
+    def per_qualified(
+        denominator: int,
+    ) -> dict[str, float | None]:
+        return {
+            resource: (
+                float(total) / denominator
+                if denominator
+                else None
+            )
+            for resource, total in resource_totals.items()
+        }
+
     return {
         "solve@1": {
             "solved_cases": attempt_one_solved,
@@ -1250,6 +1311,16 @@ def _promotion_summary(
             "rate": two_of_three / case_count,
         },
         "accepted_solve_attempts": accepted_solve_attempts,
+        "qualified_solve_attempts": qualified_solve_attempts,
+        "qualified_solve_efficiency": {
+            "qualified_cases": qualified_cases,
+            "qualified_attempts": qualified_solve_attempts,
+            "resource_totals": resource_totals,
+            "per_qualified_case": per_qualified(qualified_cases),
+            "per_qualified_attempt": per_qualified(
+                qualified_solve_attempts
+            ),
+        },
         "median_time_to_first_valid_result": {
             "seconds": (
                 float(median(first_valid_seconds))
@@ -1312,17 +1383,6 @@ def _time_improved(
     return baseline_seconds - candidate_seconds >= required_improvement
 
 
-def _optional_rate_noninferior(
-    candidate_rate: float | None,
-    baseline_rate: float | None,
-) -> bool:
-    if baseline_rate is None:
-        return True
-    if candidate_rate is None:
-        return False
-    return candidate_rate >= baseline_rate
-
-
 def _summary_noninferiority(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
@@ -1347,18 +1407,18 @@ def _summary_noninferiority(
                 "observed_results"
             ]
         ),
-        "proof_pass_rate": _optional_rate_noninferior(
-            candidate["proof_pass_rate"]["rate"],
-            baseline["proof_pass_rate"]["rate"],
-        ),
-        "reproduction_rate": _optional_rate_noninferior(
-            candidate["reproduction_rate"]["rate"],
-            baseline["reproduction_rate"]["rate"],
-        ),
         "human_interventions": (
             candidate["human_interventions"]
             <= baseline["human_interventions"]
         ),
+    }
+
+
+def _failed_summary_noninferiority() -> dict[str, bool]:
+    """Return a fail-closed result when a required category is absent."""
+
+    return {
+        metric: False for metric in _PERFORMANCE_NONINFERIORITY_METRICS
     }
 
 
@@ -1378,6 +1438,117 @@ def _summary_primary_improvement(
             and candidate["accepted_solve_attempts"] > 0
         )
     )
+
+
+def _qualified_efficiency_comparison(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    baseline_efficiency = baseline["qualified_solve_efficiency"]
+    candidate_efficiency = candidate["qualified_solve_efficiency"]
+    comparisons: dict[str, dict[str, Any]] = {}
+    for denominator in _EFFICIENCY_DENOMINATORS:
+        count_field = (
+            "qualified_cases"
+            if denominator == "per_qualified_case"
+            else "qualified_attempts"
+        )
+        baseline_count = baseline_efficiency[count_field]
+        candidate_count = candidate_efficiency[count_field]
+        resource_improvements = {
+            resource: False for resource in _EFFICIENCY_RESOURCES
+        }
+        outcome_efficiency_improvement = False
+
+        if baseline_count > 0 and candidate_count > 0:
+            mode = "per_qualified_ratio"
+            noninferiority = {
+                resource: (
+                    candidate_efficiency[denominator][resource]
+                    <= baseline_efficiency[denominator][resource]
+                )
+                for resource in _EFFICIENCY_RESOURCES
+            }
+            for resource in _EFFICIENCY_RESOURCES:
+                baseline_value = baseline_efficiency[denominator][resource]
+                candidate_value = candidate_efficiency[denominator][resource]
+                if resource == "solve_wall_seconds_used":
+                    improved = _time_improved(
+                        candidate_value,
+                        baseline_value,
+                    )
+                else:
+                    improved = candidate_value < baseline_value
+                resource_improvements[resource] = improved
+        elif baseline_count == 0 and candidate_count > 0:
+            mode = "baseline_zero_candidate_positive_total_pareto"
+            noninferiority = {
+                resource: (
+                    candidate_efficiency["resource_totals"][resource]
+                    <= baseline_efficiency["resource_totals"][resource]
+                )
+                for resource in _EFFICIENCY_RESOURCES
+            }
+            # Delivering qualified outcomes for no more total resource than
+            # a zero-outcome baseline is itself the efficiency improvement.
+            outcome_efficiency_improvement = all(
+                noninferiority.values()
+            )
+        elif baseline_count == 0 and candidate_count == 0:
+            mode = "both_zero_total_nonincrease"
+            noninferiority = {
+                resource: (
+                    candidate_efficiency["resource_totals"][resource]
+                    <= baseline_efficiency["resource_totals"][resource]
+                )
+                for resource in _EFFICIENCY_RESOURCES
+            }
+        else:
+            mode = "baseline_positive_candidate_zero_regression"
+            noninferiority = {
+                resource: False for resource in _EFFICIENCY_RESOURCES
+            }
+
+        comparisons[denominator] = {
+            "mode": mode,
+            "baseline_denominator": baseline_count,
+            "candidate_denominator": candidate_count,
+            "noninferiority": noninferiority,
+            "resource_improvements": resource_improvements,
+            "outcome_efficiency_improvement": (
+                outcome_efficiency_improvement
+            ),
+        }
+    return comparisons
+
+
+def _record_efficiency_comparison_blockers(
+    *,
+    comparison: dict[str, dict[str, Any]],
+    ratio_blocker_prefix: str,
+    total_blocker_prefix: str,
+    outcome_blocker_prefix: str,
+    blockers: list[str],
+) -> None:
+    for denominator, details in comparison.items():
+        mode = details["mode"]
+        if mode == "baseline_positive_candidate_zero_regression":
+            _append_once(
+                blockers,
+                f"{outcome_blocker_prefix}:{denominator}",
+            )
+            continue
+        resource_checks = details["noninferiority"]
+        for resource, passed in resource_checks.items():
+            if not passed:
+                if mode == "per_qualified_ratio":
+                    prefix = ratio_blocker_prefix
+                else:
+                    prefix = total_blocker_prefix
+                _append_once(
+                    blockers,
+                    f"{prefix}:{denominator}:{resource}",
+                )
 
 
 def evaluate_blind_live_promotion(
@@ -1553,6 +1724,18 @@ def evaluate_blind_live_promotion(
         candidate_public = _promotion_summary(public_cases, candidate_results)
 
         split_noninferiority: dict[str, dict[str, bool]] = {}
+        split_efficiency_noninferiority: dict[
+            str,
+            dict[str, dict[str, bool]],
+        ] = {}
+        split_efficiency_improvements: dict[
+            str,
+            dict[str, dict[str, bool]],
+        ] = {}
+        split_efficiency_comparisons: dict[
+            str,
+            dict[str, dict[str, Any]],
+        ] = {}
         for split in evidence.splits:
             split_checks = _summary_noninferiority(
                 baseline_by_split[split.name],
@@ -1565,10 +1748,48 @@ def evaluate_blind_live_promotion(
                         blockers,
                         f"split_regression:{split.name}:{metric}",
                     )
+            efficiency_comparison = _qualified_efficiency_comparison(
+                baseline_by_split[split.name],
+                candidate_by_split[split.name],
+            )
+            split_efficiency_comparisons[
+                split.name
+            ] = efficiency_comparison
+            efficiency_checks = {
+                denominator: details["noninferiority"]
+                for denominator, details in efficiency_comparison.items()
+            }
+            split_efficiency_noninferiority[
+                split.name
+            ] = efficiency_checks
+            split_efficiency_improvements[
+                split.name
+            ] = {
+                denominator: details["resource_improvements"]
+                for denominator, details in efficiency_comparison.items()
+            }
+            _record_efficiency_comparison_blockers(
+                comparison=efficiency_comparison,
+                ratio_blocker_prefix=(
+                    f"split_efficiency_regression:{split.name}"
+                ),
+                total_blocker_prefix=(
+                    f"split_efficiency_total_regression:{split.name}"
+                ),
+                outcome_blocker_prefix=(
+                    "qualified_efficiency_outcome_regression:"
+                    f"{split.name}"
+                ),
+                blockers=blockers,
+            )
 
         holdout_split_category_noninferiority: dict[
             str,
             dict[str, dict[str, bool]],
+        ] = {}
+        holdout_split_category_efficiency_comparisons: dict[
+            str,
+            dict[str, dict[str, dict[str, Any]] | None],
         ] = {}
         holdout_split_category_floor_noninferiority: dict[str, bool] = {}
         for split in holdout_split_records:
@@ -1588,29 +1809,33 @@ def evaluate_blind_live_promotion(
                 )
 
             category_checks: dict[str, dict[str, bool]] = {}
+            category_efficiency_comparisons: dict[
+                str,
+                dict[str, dict[str, Any]] | None,
+            ] = {}
             for category in sorted(REQUIRED_PROMOTION_CATEGORIES):
-                baseline_category = baseline_split["category_floor"][
-                    "by_category"
-                ].get(category)
-                candidate_category = candidate_split["category_floor"][
-                    "by_category"
-                ].get(category)
-                if baseline_category is None or candidate_category is None:
-                    checks = {
-                        "solve@1": False,
-                        "pass^2/3": False,
-                    }
+                category_cases = tuple(
+                    case
+                    for case in split.cases
+                    if case.category == category
+                )
+                baseline_category_summary: dict[str, Any] | None = None
+                candidate_category_summary: dict[str, Any] | None = None
+                if not category_cases:
+                    checks = _failed_summary_noninferiority()
                 else:
-                    checks = {
-                        "solve@1": (
-                            candidate_category["solve@1"]["rate"]
-                            >= baseline_category["solve@1"]["rate"]
-                        ),
-                        "pass^2/3": (
-                            candidate_category["pass^2/3"]["rate"]
-                            >= baseline_category["pass^2/3"]["rate"]
-                        ),
-                    }
+                    baseline_category_summary = _promotion_summary(
+                        category_cases,
+                        baseline_results,
+                    )
+                    candidate_category_summary = _promotion_summary(
+                        category_cases,
+                        candidate_results,
+                    )
+                    checks = _summary_noninferiority(
+                        baseline_category_summary,
+                        candidate_category_summary,
+                    )
                 category_checks[category] = checks
                 for metric, passed in checks.items():
                     if not passed:
@@ -1619,9 +1844,42 @@ def evaluate_blind_live_promotion(
                             "split_category_regression:"
                             f"{split.name}:{category}:{metric}",
                         )
+                if not category_cases:
+                    category_efficiency_comparisons[category] = None
+                    continue
+                assert baseline_category_summary is not None
+                assert candidate_category_summary is not None
+                category_efficiency_comparison = (
+                    _qualified_efficiency_comparison(
+                        baseline_category_summary,
+                        candidate_category_summary,
+                    )
+                )
+                category_efficiency_comparisons[
+                    category
+                ] = category_efficiency_comparison
+                _record_efficiency_comparison_blockers(
+                    comparison=category_efficiency_comparison,
+                    ratio_blocker_prefix=(
+                        "split_category_efficiency_regression:"
+                        f"{split.name}:{category}"
+                    ),
+                    total_blocker_prefix=(
+                        "split_category_efficiency_total_regression:"
+                        f"{split.name}:{category}"
+                    ),
+                    outcome_blocker_prefix=(
+                        "split_category_efficiency_outcome_regression:"
+                        f"{split.name}:{category}"
+                    ),
+                    blockers=blockers,
+                )
             holdout_split_category_noninferiority[
                 split.name
             ] = category_checks
+            holdout_split_category_efficiency_comparisons[
+                split.name
+            ] = category_efficiency_comparisons
 
         category_floor_noninferior = (
             candidate_holdout["category_floor"]["rate"]
@@ -1634,33 +1892,37 @@ def evaluate_blind_live_promotion(
             str,
             dict[str, bool],
         ] = {}
+        holdout_category_efficiency_comparisons: dict[
+            str,
+            dict[str, dict[str, Any]] | None,
+        ] = {}
         for category in sorted(REQUIRED_PROMOTION_CATEGORIES):
-            baseline_category = baseline_holdout["category_floor"][
-                "by_category"
-            ].get(category)
-            candidate_category = candidate_holdout["category_floor"][
-                "by_category"
-            ].get(category)
-            if baseline_category is None or candidate_category is None:
+            category_cases = tuple(
+                case
+                for case in holdout_cases
+                if case.category == category
+            )
+            baseline_category_summary = None
+            candidate_category_summary = None
+            if not category_cases:
                 # Coverage policy already records a precise missing-category
                 # blocker. Keep the comparison fail-closed as well instead of
                 # allowing malformed benchmark composition to escape as a
                 # KeyError at the CLI boundary.
-                checks = {
-                    "solve@1": False,
-                    "pass^2/3": False,
-                }
+                checks = _failed_summary_noninferiority()
             else:
-                checks = {
-                    "solve@1": (
-                        candidate_category["solve@1"]["rate"]
-                        >= baseline_category["solve@1"]["rate"]
-                    ),
-                    "pass^2/3": (
-                        candidate_category["pass^2/3"]["rate"]
-                        >= baseline_category["pass^2/3"]["rate"]
-                    ),
-                }
+                baseline_category_summary = _promotion_summary(
+                    category_cases,
+                    baseline_results,
+                )
+                candidate_category_summary = _promotion_summary(
+                    category_cases,
+                    candidate_results,
+                )
+                checks = _summary_noninferiority(
+                    baseline_category_summary,
+                    candidate_category_summary,
+                )
             holdout_category_noninferiority[category] = checks
             for metric, passed in checks.items():
                 if not passed:
@@ -1668,8 +1930,37 @@ def evaluate_blind_live_promotion(
                         blockers,
                         f"category_regression:{category}:{metric}",
                     )
+            if not category_cases:
+                holdout_category_efficiency_comparisons[category] = None
+                continue
+            assert baseline_category_summary is not None
+            assert candidate_category_summary is not None
+            category_efficiency_comparison = (
+                _qualified_efficiency_comparison(
+                    baseline_category_summary,
+                    candidate_category_summary,
+                )
+            )
+            holdout_category_efficiency_comparisons[
+                category
+            ] = category_efficiency_comparison
+            _record_efficiency_comparison_blockers(
+                comparison=category_efficiency_comparison,
+                ratio_blocker_prefix=(
+                    f"holdout_category_efficiency_regression:{category}"
+                ),
+                total_blocker_prefix=(
+                    "holdout_category_efficiency_total_regression:"
+                    f"{category}"
+                ),
+                outcome_blocker_prefix=(
+                    "holdout_category_efficiency_outcome_regression:"
+                    f"{category}"
+                ),
+                blockers=blockers,
+            )
 
-        if candidate_holdout["accepted_solve_attempts"] == 0:
+        if candidate_holdout["qualified_solve_attempts"] == 0:
             _append_once(
                 blockers,
                 "candidate_holdout_has_no_accepted_solve",
@@ -1682,7 +1973,7 @@ def evaluate_blind_live_promotion(
             for split in evidence.splits
             if split.name in {DEV, REGRESSION}
         ]
-        holdout_improvement = any(
+        primary_holdout_improvement = any(
             _summary_primary_improvement(
                 baseline_by_split[name],
                 candidate_by_split[name],
@@ -1696,8 +1987,37 @@ def evaluate_blind_live_promotion(
             )
             for name in public_splits
         )
+        live_hidden_efficiency_improvement_signals = [
+            f"{name}:{denominator}:{resource}"
+            for name in promotion_signal_splits
+            for denominator, resource_improvements in (
+                split_efficiency_improvements[name].items()
+            )
+            for resource, improved in resource_improvements.items()
+            if improved
+        ]
+        live_hidden_efficiency_improvement_signals.extend(
+            f"{name}:{denominator}:outcome_pareto_gain"
+            for name in promotion_signal_splits
+            for denominator, details in (
+                split_efficiency_comparisons[name].items()
+            )
+            if details["outcome_efficiency_improvement"]
+        )
+        live_hidden_efficiency_improvement = bool(
+            live_hidden_efficiency_improvement_signals
+        )
+        holdout_improvement = (
+            primary_holdout_improvement
+            or live_hidden_efficiency_improvement
+        )
         if not holdout_improvement:
             _append_once(blockers, "no_live_hidden_improvement")
+        if not live_hidden_efficiency_improvement:
+            _append_once(
+                blockers,
+                "no_live_hidden_efficiency_improvement",
+            )
 
         overall_noninferiority = _summary_noninferiority(
             baseline_all,
@@ -1706,6 +2026,25 @@ def evaluate_blind_live_promotion(
         for metric, passed in overall_noninferiority.items():
             if not passed:
                 _append_once(blockers, f"overall_regression:{metric}")
+        overall_efficiency_comparison = _qualified_efficiency_comparison(
+            baseline_all,
+            candidate_all,
+        )
+        overall_efficiency_noninferiority = {
+            denominator: details["noninferiority"]
+            for denominator, details in (
+                overall_efficiency_comparison.items()
+            )
+        }
+        _record_efficiency_comparison_blockers(
+            comparison=overall_efficiency_comparison,
+            ratio_blocker_prefix="overall_efficiency_regression",
+            total_blocker_prefix="overall_efficiency_total_regression",
+            outcome_blocker_prefix=(
+                "qualified_efficiency_outcome_regression:overall"
+            ),
+            blockers=blockers,
+        )
 
         comparisons = {
             "same_model": baseline.model_id == candidate.model_id,
@@ -1724,6 +2063,21 @@ def evaluate_blind_live_promotion(
             "input_manifests_globally_unique": True,
             "split_noninferiority": split_noninferiority,
             "overall_noninferiority": overall_noninferiority,
+            "split_qualified_efficiency_noninferiority": (
+                split_efficiency_noninferiority
+            ),
+            "overall_qualified_efficiency_noninferiority": (
+                overall_efficiency_noninferiority
+            ),
+            "split_qualified_efficiency_comparisons": (
+                split_efficiency_comparisons
+            ),
+            "overall_qualified_efficiency_comparison": (
+                overall_efficiency_comparison
+            ),
+            "split_qualified_efficiency_improvements": (
+                split_efficiency_improvements
+            ),
             "category_floor_noninferior": category_floor_noninferior,
             "holdout_split_category_floor_noninferiority": (
                 holdout_split_category_floor_noninferiority
@@ -1731,12 +2085,27 @@ def evaluate_blind_live_promotion(
             "holdout_split_category_noninferiority": (
                 holdout_split_category_noninferiority
             ),
+            "holdout_split_category_qualified_efficiency_comparisons": (
+                holdout_split_category_efficiency_comparisons
+            ),
             "holdout_category_noninferiority": (
                 holdout_category_noninferiority
             ),
+            "holdout_category_qualified_efficiency_comparisons": (
+                holdout_category_efficiency_comparisons
+            ),
             "holdout_category_case_counts": holdout_category_counts,
             "public_improvement": public_improvement,
+            "live_hidden_primary_improvement": (
+                primary_holdout_improvement
+            ),
             "live_hidden_improvement": holdout_improvement,
+            "live_hidden_efficiency_improvement": (
+                live_hidden_efficiency_improvement
+            ),
+            "live_hidden_efficiency_improvement_signals": (
+                live_hidden_efficiency_improvement_signals
+            ),
             "promotion_signal_splits": promotion_signal_splits,
         }
         metrics = {
@@ -1776,8 +2145,45 @@ def evaluate_blind_live_promotion(
             "unique_run_ids_per_arm_and_across_arms_required": True,
             "input_manifest_digest_required": True,
             "candidate_proof_and_reproduction_required": True,
+            "minimum_qualified_attempts_per_success_case_per_arm": (
+                MIN_QUALIFIED_ATTEMPTS_PER_SUCCESS_CASE
+            ),
+            "all_arm_successes_require_accepted_proved_reproduced": True,
+            "reported_success_metrics_use_qualified_attempts": True,
+            "failed_attempt_proof_or_reproduction_required": False,
+            "qualified_efficiency_noninferiority_required": True,
+            "qualified_efficiency_resources": list(
+                _EFFICIENCY_RESOURCES
+            ),
+            "qualified_efficiency_denominators": list(
+                _EFFICIENCY_DENOMINATORS
+            ),
+            "holdout_category_qualified_efficiency_nonregression_required": (
+                True
+            ),
+            "holdout_split_category_performance_nonregression_required": True,
+            "holdout_category_performance_nonregression_required": True,
+            "category_performance_noninferiority_metrics": list(
+                _PERFORMANCE_NONINFERIORITY_METRICS
+            ),
+            "holdout_category_qualified_efficiency_improvement_required": (
+                False
+            ),
+            "zero_qualified_efficiency_denominator_allowed": True,
+            "zero_qualified_efficiency_denominator_policy": {
+                "baseline_zero_candidate_positive": (
+                    "all_candidate_resource_totals_must_be_at_or_below_"
+                    "baseline_and_yield_outcome_pareto_gain"
+                ),
+                "both_zero": (
+                    "all_candidate_resource_totals_must_be_at_or_below_"
+                    "baseline_without_an_improvement_signal"
+                ),
+                "baseline_positive_candidate_zero": "regression",
+            },
             "safety_violations_allowed": 0,
             "live_hidden_improvement_required": True,
+            "live_hidden_efficiency_improvement_required": True,
             "candidate_holdout_accepted_solve_required": True,
             "category_floor_regression_allowed": False,
             "required_holdout_categories": sorted(

@@ -36,7 +36,7 @@ def _attempt(
         "reproduction_evaluated": True,
         "reproduced": True,
         "first_valid_result_seconds": seconds,
-        "solve_wall_seconds_used": max(seconds, 20.0),
+        "solve_wall_seconds_used": seconds,
         "model_calls_used": 4,
         "total_tokens_used": 50_000,
         "human_interventions": 0,

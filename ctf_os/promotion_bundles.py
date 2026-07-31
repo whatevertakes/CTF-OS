@@ -27,10 +27,11 @@ import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from ctf_os import evaluation as canonical_evaluation
 from ctf_os.benchmark import (
     BLIND,
     CTF_OS_SYSTEM,
@@ -66,6 +67,7 @@ from ctf_os.managed_continuity import (
     valid_thread_id,
 )
 from ctf_os.models import (
+    BudgetMode,
     ChallengeIdentity,
     ChallengeState,
     ExperimentKind,
@@ -100,7 +102,7 @@ from ctf_os.stages.ingest import IngestError, inventory_challenge
 
 
 PROMOTION_MANIFEST_SCHEMA_VERSION = 2
-PROMOTION_BUNDLE_SCHEMA_VERSION = 2
+PROMOTION_BUNDLE_SCHEMA_VERSION = 3
 PROMOTION_SIGNATURE_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_BUNDLE_INDEX_BYTES = 4 * 1024 * 1024
@@ -200,6 +202,22 @@ class VerifiedBundle:
     safety: SafetyTotals
     complete: bool
     blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateBinding:
+    candidate_id: str
+    value_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateProofEvidence:
+    binding: _CandidateBinding
+    passed: bool
+    successful_attempts: int
+    total_attempts: int
+    completed_at: str
+    run_ids: tuple[str, ...]
 
 
 def _sha256(payload: bytes) -> str:
@@ -310,6 +328,98 @@ def _timestamp_epoch(value: object) -> float | None:
     if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
         return None
     return parsed.timestamp()
+
+
+def _evaluation_utc_now() -> str:
+    """Keep lifecycle endpoints precise enough for exact deadline envelopes."""
+
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _epoch_delta(later_epoch: float, earlier_epoch: float) -> float:
+    """Subtract microsecond timestamps without binary epoch drift."""
+
+    return round(later_epoch - earlier_epoch, 6)
+
+
+def _require_evaluation_clock_binding(
+    state: ChallengeState,
+    *,
+    wall_seconds: int,
+) -> tuple[float, float]:
+    """Return the bound evaluation start/deadline or fail closed."""
+
+    if (
+        state.budget.mode is not BudgetMode.BOUNDED
+        or type(state.budget.allocated_seconds) is not int
+        or state.budget.allocated_seconds != wall_seconds
+    ):
+        raise PromotionBundleError(
+            "promotion evaluation requires the frozen bounded canonical budget"
+        )
+    started_at = state.metadata.get("evaluation_started_at")
+    bound_deadline = state.metadata.get(
+        "evaluation_budget_deadline_utc"
+    )
+    start_epoch = _timestamp_epoch(started_at)
+    deadline_epoch = _timestamp_epoch(bound_deadline)
+    if start_epoch is None:
+        raise PromotionBundleError(
+            "evaluation_started_at must be a valid UTC timestamp"
+        )
+    if deadline_epoch is None:
+        raise PromotionBundleError(
+            "evaluation_budget_deadline_utc must be a valid UTC timestamp"
+        )
+    if state.budget.deadline_utc != bound_deadline:
+        raise PromotionBundleError(
+            "canonical budget deadline differs from the prepared evaluation "
+            "deadline"
+        )
+    if (
+        deadline_epoch <= start_epoch
+        or _epoch_delta(deadline_epoch, start_epoch) > wall_seconds
+    ):
+        raise PromotionBundleError(
+            "prepared evaluation deadline must follow its start within the "
+            "frozen fixed wall budget"
+        )
+    return start_epoch, deadline_epoch
+
+
+def _activity_timestamps(state: ChallengeState) -> tuple[object, ...]:
+    return (
+        *(run.created_at for run in state.runs),
+        *(artifact.created_at for artifact in state.artifacts),
+        *(candidate.created_at for candidate in state.candidates),
+        *(submission.submitted_at for submission in state.submissions),
+    )
+
+
+def _require_activity_window(
+    state: ChallengeState,
+    *,
+    start_epoch: float,
+    finalized_epoch: float,
+) -> None:
+    for timestamp in _activity_timestamps(state):
+        epoch = _timestamp_epoch(timestamp)
+        if epoch is None:
+            raise PromotionBundleError(
+                "promotion activity timestamps must be valid UTC timestamps"
+            )
+        if epoch < start_epoch:
+            raise PromotionBundleError(
+                "promotion activity cannot precede evaluation_started_at"
+            )
+        if epoch > finalized_epoch:
+            raise PromotionBundleError(
+                "promotion activity cannot follow evaluation_finalized_at"
+            )
 
 
 def _parse_budget(value: object) -> FixedBenchmarkBudget:
@@ -1048,6 +1158,7 @@ def _initial_context_sha256(state: ChallengeState) -> str:
         for key, value in state.metadata.items()
         if not key.startswith("evaluation_")
         and key != "human_intervention_count"
+        and key != "budget_reset_at"
     }
     goals = [
         _without_volatile_fields(goal.to_dict(), "created_at")
@@ -1461,6 +1572,13 @@ def prepare_promotion_session(
         raise PromotionBundleError(
             "canonical state does not have the frozen fixed wall budget"
         )
+    if (
+        state.budget.mode is not BudgetMode.BOUNDED
+        or _timestamp_epoch(state.budget.deadline_utc) is None
+    ):
+        raise PromotionBundleError(
+            "canonical state does not have a valid bounded wall deadline"
+        )
     _require_clean_preexecution_context(state)
     knowledge_count, knowledge_sha256 = _knowledge_snapshot(
         store,
@@ -1513,6 +1631,10 @@ def prepare_promotion_session(
         state.metadata.get(key) == expected
         for key, expected in binding.items()
     ):
+        _require_evaluation_clock_binding(
+            state,
+            wall_seconds=manifest.budget.wall_seconds,
+        )
         return {
             "schema_version": PROMOTION_BUNDLE_SCHEMA_VERSION,
             "prepared": True,
@@ -1524,6 +1646,12 @@ def prepare_promotion_session(
             "arm": session.arm,
             "attempt": session.attempt,
             "state_revision": state.revision,
+            "evaluation_started_at": state.metadata[
+                "evaluation_started_at"
+            ],
+            "evaluation_budget_deadline_utc": state.metadata[
+                "evaluation_budget_deadline_utc"
+            ],
             "automatic_challenge_start": False,
         }
     for key, expected in binding.items():
@@ -1534,8 +1662,26 @@ def prepare_promotion_session(
             )
 
     def apply(current: ChallengeState) -> None:
+        started_at = _evaluation_utc_now()
+        start_epoch = _timestamp_epoch(started_at)
+        deadline = current.budget.deadline_utc
+        deadline_epoch = _timestamp_epoch(deadline)
+        if (
+            current.budget.mode is not BudgetMode.BOUNDED
+            or start_epoch is None
+            or deadline_epoch is None
+            or deadline_epoch <= start_epoch
+            or _epoch_delta(deadline_epoch, start_epoch)
+            > manifest.budget.wall_seconds
+        ):
+            raise PromotionBundleError(
+                "canonical budget deadline must follow evaluation preparation "
+                "within the frozen fixed wall budget"
+            )
         for key, expected in binding.items():
             current.metadata[key] = expected
+        current.metadata["evaluation_started_at"] = started_at
+        current.metadata["evaluation_budget_deadline_utc"] = deadline
         current.metadata["human_intervention_count"] = 0
         current.metadata[
             "evaluation_human_interventions_finalized"
@@ -1564,6 +1710,12 @@ def prepare_promotion_session(
         "arm": session.arm,
         "attempt": session.attempt,
         "state_revision": prepared.revision,
+        "evaluation_started_at": prepared.metadata[
+            "evaluation_started_at"
+        ],
+        "evaluation_budget_deadline_utc": prepared.metadata[
+            "evaluation_budget_deadline_utc"
+        ],
         "automatic_challenge_start": False,
     }
 
@@ -1617,6 +1769,10 @@ def finalize_promotion_session(
     )
     require_promotion_knowledge_snapshot(store, state)
     require_promotion_operator_input(workspace, state)
+    start_epoch, deadline_epoch = _require_evaluation_clock_binding(
+        state,
+        wall_seconds=manifest.budget.wall_seconds,
+    )
     if state.metadata.get(
         "evaluation_human_interventions_finalized"
     ) is True or state.metadata.get("evaluation_safety_finalized") is True:
@@ -1637,6 +1793,25 @@ def finalize_promotion_session(
             )
             is str
         ):
+            finalized_epoch = _timestamp_epoch(
+                state.metadata["evaluation_finalized_at"]
+            )
+            if (
+                finalized_epoch is None
+                or finalized_epoch < start_epoch
+                or finalized_epoch > deadline_epoch
+                or _epoch_delta(finalized_epoch, start_epoch)
+                > manifest.budget.wall_seconds
+            ):
+                raise PromotionBundleError(
+                    "existing evaluation finalization is outside the frozen "
+                    "fixed wall window"
+                )
+            _require_activity_window(
+                state,
+                start_epoch=start_epoch,
+                finalized_epoch=finalized_epoch,
+            )
             return {
                 "schema_version": PROMOTION_BUNDLE_SCHEMA_VERSION,
                 "finalized": True,
@@ -1652,6 +1827,30 @@ def finalize_promotion_session(
         )
 
     def apply(current: ChallengeState) -> None:
+        current_start, current_deadline = (
+            _require_evaluation_clock_binding(
+                current,
+                wall_seconds=manifest.budget.wall_seconds,
+            )
+        )
+        finalized_at = _evaluation_utc_now()
+        finalized_epoch = _timestamp_epoch(finalized_at)
+        if (
+            finalized_epoch is None
+            or finalized_epoch < current_start
+            or finalized_epoch > current_deadline
+            or _epoch_delta(finalized_epoch, current_start)
+            > manifest.budget.wall_seconds
+        ):
+            raise PromotionBundleError(
+                "evaluation finalization must remain inside the frozen fixed "
+                "wall window"
+            )
+        _require_activity_window(
+            current,
+            start_epoch=current_start,
+            finalized_epoch=finalized_epoch,
+        )
         current.metadata["human_intervention_count"] = human_count
         current.metadata[
             "evaluation_human_interventions_finalized"
@@ -1660,7 +1859,7 @@ def finalize_promotion_session(
             "evaluation_secret_or_flag_leak_count"
         ] = leak_count
         current.metadata["evaluation_safety_finalized"] = True
-        current.metadata["evaluation_finalized_at"] = utc_now()
+        current.metadata["evaluation_finalized_at"] = finalized_at
 
     finalized = store.update(
         session.identity,
@@ -1825,6 +2024,447 @@ def _nonnegative_number(value: object) -> float | None:
     if type(value) is float:
         return value if math.isfinite(value) and value >= 0 else None
     return None
+
+
+def _candidate_binding(candidate: object) -> _CandidateBinding | None:
+    candidate_id = getattr(candidate, "id", None)
+    value = getattr(candidate, "value", None)
+    if type(candidate_id) is not str or type(value) is not str:
+        return None
+    return _CandidateBinding(
+        candidate_id=candidate_id,
+        value_sha256=_sha256(value.encode("utf-8")),
+    )
+
+
+def _redacted_accepted_submission_snapshot(
+    *,
+    state: ChallengeState,
+    ledger_records: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """Freeze accepted bindings without copying submitted candidate values."""
+
+    snapshot: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in ledger_records:
+        if (
+            record.get("contest_id") != state.contest_id
+            or record.get("category") != state.category
+            or record.get("challenge_id") != state.challenge_id
+            or record.get("status") != SubmissionStatus.ACCEPTED.value
+        ):
+            continue
+        submission_id = _identifier(
+            record.get("id"),
+            "accepted submission id",
+        )
+        if submission_id in seen:
+            raise PromotionBundleError(
+                "accepted submission ledger ids must be unique"
+            )
+        seen.add(submission_id)
+        candidate_id = _identifier(
+            record.get("candidate_id"),
+            "accepted submission candidate_id",
+        )
+        flag = record.get("flag")
+        if type(flag) is not str:
+            raise PromotionBundleError(
+                "accepted submission ledger flag must be a string"
+            )
+        recorded_at = _parse_timestamp(
+            record.get("recorded_at"),
+            "accepted submission recorded_at",
+        )
+        snapshot.append(
+            {
+                "submission_id": submission_id,
+                "candidate_id": candidate_id,
+                "value_sha256": _sha256(flag.encode("utf-8")),
+                "status": SubmissionStatus.ACCEPTED.value,
+                "recorded_at": recorded_at,
+            }
+        )
+    return tuple(
+        sorted(snapshot, key=lambda item: str(item["submission_id"]))
+    )
+
+
+def _parse_accepted_submission_snapshot(
+    value: object,
+) -> tuple[dict[str, object], ...]:
+    raw_records = _strict_list(
+        value,
+        label="accepted submission snapshot",
+        maximum=4096,
+    )
+    parsed: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for value_record in raw_records:
+        record = _strict_mapping(
+            value_record,
+            keys=frozenset(
+                {
+                    "submission_id",
+                    "candidate_id",
+                    "value_sha256",
+                    "status",
+                    "recorded_at",
+                }
+            ),
+            label="accepted submission snapshot record",
+        )
+        submission_id = _identifier(
+            record["submission_id"],
+            "accepted submission snapshot submission_id",
+        )
+        if submission_id in seen:
+            raise PromotionBundleError(
+                "accepted submission snapshot ids must be unique"
+            )
+        seen.add(submission_id)
+        status = record["status"]
+        if status != SubmissionStatus.ACCEPTED.value:
+            raise PromotionBundleError(
+                "accepted submission snapshot status must be accepted"
+            )
+        parsed.append(
+            {
+                "submission_id": submission_id,
+                "candidate_id": _identifier(
+                    record["candidate_id"],
+                    "accepted submission snapshot candidate_id",
+                ),
+                "value_sha256": _sha256_value(
+                    record["value_sha256"],
+                    "accepted submission snapshot value_sha256",
+                ),
+                "status": status,
+                "recorded_at": _parse_timestamp(
+                    record["recorded_at"],
+                    "accepted submission snapshot recorded_at",
+                ),
+            }
+        )
+    ordered = sorted(parsed, key=lambda item: str(item["submission_id"]))
+    if parsed != ordered:
+        raise PromotionBundleError(
+            "accepted submission snapshot must be sorted by submission_id"
+        )
+    return tuple(parsed)
+
+
+def _accepted_submission_bindings(
+    *,
+    state: ChallengeState,
+    ledger_records: Sequence[Mapping[str, object]],
+) -> tuple[
+    frozenset[str],
+    frozenset[_CandidateBinding],
+    bool,
+]:
+    """Bind accepted state records to the frozen redacted submission values."""
+
+    accepted_submissions = tuple(
+        submission
+        for submission in state.submissions
+        if submission.status is SubmissionStatus.ACCEPTED
+    )
+    accepted_ids = frozenset(
+        submission.candidate_id
+        for submission in accepted_submissions
+    )
+    candidate_bindings = {
+        candidate.id: _candidate_binding(candidate)
+        for candidate in state.candidates
+    }
+    ledger_by_id: dict[str, Mapping[str, object]] = {}
+    ledger_accepted_ids: set[str] = set()
+    valid = True
+    for record in ledger_records:
+        record_id = record.get("submission_id")
+        if type(record_id) is not str or not record_id:
+            valid = False
+            continue
+        if record_id in ledger_by_id:
+            valid = False
+            continue
+        ledger_by_id[record_id] = record
+        if record.get("status") == SubmissionStatus.ACCEPTED.value:
+            ledger_accepted_ids.add(record_id)
+
+    bindings: set[_CandidateBinding] = set()
+    state_accepted_record_ids: set[str] = set()
+    for submission in accepted_submissions:
+        state_accepted_record_ids.add(submission.id)
+        record = ledger_by_id.get(submission.id)
+        candidate = candidate_bindings.get(submission.candidate_id)
+        value_sha256 = (
+            record.get("value_sha256") if record is not None else None
+        )
+        if (
+            record is None
+            or candidate is None
+            or record.get("candidate_id") != submission.candidate_id
+            or record.get("status") != SubmissionStatus.ACCEPTED.value
+            or record.get("recorded_at") != submission.submitted_at
+            or type(value_sha256) is not str
+            or _SHA256_RE.fullmatch(value_sha256) is None
+        ):
+            valid = False
+            continue
+        ledger_binding = _CandidateBinding(
+            candidate_id=submission.candidate_id,
+            value_sha256=value_sha256,
+        )
+        if ledger_binding != candidate:
+            valid = False
+            continue
+        bindings.add(ledger_binding)
+
+    if ledger_accepted_ids != state_accepted_record_ids:
+        valid = False
+    if accepted_ids and len(bindings) != len(accepted_ids):
+        valid = False
+    return accepted_ids, frozenset(bindings), valid
+
+
+def _canonical_candidate_proof_evidence(
+    *,
+    state: ChallengeState,
+    challenge_root: Path,
+) -> tuple[tuple[_CandidateProofEvidence, ...], bool]:
+    """Re-read canonical proof evidence while retaining candidate identity.
+
+    The public evaluator intentionally exposes bounded aggregates. Promotion
+    additionally needs the identity that those aggregates omit so an accepted
+    candidate cannot borrow another candidate's proof. Reuse the evaluator's
+    exact semantic parsers here; only candidate IDs and value digests cross
+    this boundary.
+    """
+
+    candidates = {
+        candidate.id: candidate for candidate in state.candidates
+    }
+    record = canonical_evaluation._LoadedState(  # noqa: SLF001
+        state=state,
+        root=challenge_root,
+    )
+    observations: list[_CandidateProofEvidence] = []
+    proof_run_binding_invalid = False
+
+    runs = {run.id: run for run in state.runs}
+
+    def append(
+        observation: object,
+        run_ids: object,
+        *,
+        require_direct_candidate_id: bool = False,
+    ) -> None:
+        nonlocal proof_run_binding_invalid
+        candidate_id = getattr(observation, "candidate_id", None)
+        candidate = candidates.get(candidate_id)
+        binding = _candidate_binding(candidate)
+        passed = getattr(observation, "passed", None)
+        successful_attempts = getattr(
+            observation,
+            "successful_attempts",
+            None,
+        )
+        total_attempts = getattr(
+            observation,
+            "total_attempts",
+            None,
+        )
+        completed_at = getattr(observation, "completed_at", None)
+        if (
+            binding is None
+            or type(passed) is not bool
+            or type(successful_attempts) is not int
+            or successful_attempts < 0
+            or type(total_attempts) is not int
+            or total_attempts < 0
+            or successful_attempts > total_attempts
+            or type(completed_at) is not str
+            or type(run_ids) not in {list, tuple}
+            or len(run_ids) != total_attempts
+            or not all(type(run_id) is str and run_id for run_id in run_ids)
+            or len(set(run_ids)) != len(run_ids)
+        ):
+            return
+        exact_run_ids = tuple(run_ids)
+        completed_epoch = _timestamp_epoch(completed_at)
+        run_epochs = [
+            _timestamp_epoch(runs[run_id].created_at)
+            for run_id in exact_run_ids
+            if run_id in runs
+        ]
+        if (
+            candidate is None
+            or not set(exact_run_ids) <= set(candidate.proof_run_ids)
+            or any(
+                run_id not in runs
+                or runs[run_id].origin is not RunOrigin.PROOF
+                or runs[run_id].status not in _TERMINAL_RUN_STATUSES
+                or (
+                    require_direct_candidate_id
+                    and runs[run_id].extra.get("candidate_id")
+                    != candidate_id
+                )
+                for run_id in exact_run_ids
+            )
+            or completed_epoch is None
+            or len(run_epochs) != len(exact_run_ids)
+            or any(run_epoch is None for run_epoch in run_epochs)
+            or any(
+                float(run_epoch) > completed_epoch
+                for run_epoch in run_epochs
+                if run_epoch is not None
+            )
+        ):
+            proof_run_binding_invalid = True
+            return
+        observations.append(
+            _CandidateProofEvidence(
+                binding=binding,
+                passed=passed,
+                successful_attempts=successful_attempts,
+                total_attempts=total_attempts,
+                completed_at=completed_at,
+                run_ids=exact_run_ids,
+            )
+        )
+
+    for artifact in state.artifacts:
+        candidate_id = canonical_evaluation._proof_path_candidate(  # noqa: SLF001
+            artifact.path
+        )
+        if candidate_id is None or candidate_id not in candidates:
+            continue
+        try:
+            observation = canonical_evaluation._parse_proof_result(  # noqa: SLF001
+                record,
+                artifact.id,
+                candidate_id,
+            )
+            raw = canonical_evaluation._strict_json_bytes(  # noqa: SLF001
+                canonical_evaluation._read_verified_artifact(  # noqa: SLF001
+                    challenge_root,
+                    artifact,
+                    maximum_bytes=(
+                        canonical_evaluation.MAX_PROOF_RESULT_BYTES
+                    ),
+                ),
+                "proof result artifact",
+            )
+        except (canonical_evaluation.EvaluationInputError, OSError):
+            continue
+        if (
+            type(raw) is not dict
+            or raw.get("source_manifest_sha256")
+            != state.metadata.get("source_manifest_sha256")
+        ):
+            continue
+        append(
+            observation,
+            raw.get("run_ids"),
+            require_direct_candidate_id=True,
+        )
+
+    for candidate in state.candidates:
+        if "crypto_metamorphic_proof" not in candidate.extra:
+            continue
+        try:
+            observation = (
+                canonical_evaluation._parse_crypto_metamorphic_result(  # noqa: SLF001
+                    record,
+                    candidate.id,
+                )
+            )
+        except (canonical_evaluation.EvaluationInputError, OSError):
+            continue
+        binding = candidate.extra["crypto_metamorphic_proof"]
+        append(observation, binding["proof_result"]["run_ids"])
+
+    for experiment in state.experiments:
+        result = experiment.result
+        if (
+            type(result) is not dict
+            or "rev_proof_evidence" not in result
+        ):
+            continue
+        try:
+            observation = canonical_evaluation._parse_rev_stdin_result(  # noqa: SLF001
+                record,
+                experiment,
+            )
+        except (canonical_evaluation.EvaluationInputError, OSError):
+            continue
+        append(observation, result["proof_result"]["run_ids"])
+
+    return tuple(observations), proof_run_binding_invalid
+
+
+def _bound_first_valid_result_seconds(
+    *,
+    state: ChallengeState,
+    accepted_bindings: frozenset[_CandidateBinding],
+    evidence: Sequence[_CandidateProofEvidence],
+    start_epoch: float | None,
+    finalized_epoch: float | None,
+) -> float | None:
+    candidate_bindings = {
+        candidate.id: _candidate_binding(candidate)
+        for candidate in state.candidates
+    }
+    if start_epoch is None or finalized_epoch is None:
+        return None
+    accepted_timestamps: dict[_CandidateBinding, list[float]] = {
+        binding: [] for binding in accepted_bindings
+    }
+    proof_timestamps: dict[_CandidateBinding, list[float]] = {
+        binding: [] for binding in accepted_bindings
+    }
+    for submission in state.submissions:
+        if submission.status is not SubmissionStatus.ACCEPTED:
+            continue
+        binding = candidate_bindings.get(submission.candidate_id)
+        if binding not in accepted_bindings:
+            continue
+        timestamp = _timestamp_epoch(submission.submitted_at)
+        if (
+            timestamp is not None
+            and start_epoch < timestamp <= finalized_epoch
+        ):
+            accepted_timestamps[binding].append(timestamp)
+    for observation in evidence:
+        if (
+            observation.binding not in accepted_bindings
+            or not observation.passed
+            or observation.successful_attempts <= 0
+            or observation.total_attempts <= 0
+        ):
+            continue
+        timestamp = _timestamp_epoch(observation.completed_at)
+        if (
+            timestamp is not None
+            and start_epoch < timestamp <= finalized_epoch
+        ):
+            proof_timestamps[observation.binding].append(timestamp)
+    binding_valid_timestamps = [
+        max(
+            min(accepted_timestamps[binding]),
+            min(proof_timestamps[binding]),
+        )
+        for binding in accepted_bindings
+        if (
+            accepted_timestamps[binding]
+            and proof_timestamps[binding]
+        )
+    ]
+    if not binding_valid_timestamps:
+        return None
+    return _epoch_delta(min(binding_valid_timestamps), start_epoch)
 
 
 def _bound_run_file(
@@ -2509,6 +3149,7 @@ def _derive_attempt(
     report: EvaluationReport,
     config: EngineConfig,
     challenge_root: Path,
+    submission_ledger: Sequence[Mapping[str, object]],
 ) -> tuple[PromotionAttempt, SafetyTotals, tuple[str, ...]]:
     blockers: list[str] = []
     if not report.complete or report.evaluated_states != 1:
@@ -2563,36 +3204,74 @@ def _derive_attempt(
         blockers.append("human_interventions_not_finalized")
     if state.metadata.get("evaluation_safety_finalized") is not True:
         blockers.append("safety_counters_not_finalized")
+    start_epoch = _timestamp_epoch(
+        state.metadata.get("evaluation_started_at")
+    )
+    bound_deadline = state.metadata.get(
+        "evaluation_budget_deadline_utc"
+    )
+    deadline_epoch = _timestamp_epoch(bound_deadline)
     finalized_epoch = _timestamp_epoch(
         state.metadata.get("evaluation_finalized_at")
     )
-    activity_timestamps: list[object] = [
-        run.created_at for run in state.runs
-    ]
-    activity_timestamps.extend(
-        artifact.created_at for artifact in state.artifacts
-    )
-    activity_timestamps.extend(
-        candidate.created_at for candidate in state.candidates
-    )
-    activity_timestamps.extend(
-        submission.submitted_at
-        for submission in state.submissions
-        if submission.submitted_at is not None
-    )
+    if start_epoch is None:
+        blockers.append("evaluation_start_timestamp_invalid")
+    if deadline_epoch is None:
+        blockers.append("evaluation_budget_deadline_invalid")
+    if state.budget.deadline_utc != bound_deadline:
+        blockers.append("evaluation_budget_deadline_mismatch")
+    if (
+        start_epoch is not None
+        and deadline_epoch is not None
+        and (
+            deadline_epoch <= start_epoch
+            or _epoch_delta(deadline_epoch, start_epoch)
+            > manifest.budget.wall_seconds
+        )
+    ):
+        blockers.append("evaluation_start_outside_fixed_budget")
+    if finalized_epoch is None:
+        blockers.append("finalization_timestamp_invalid")
+    elif start_epoch is not None and finalized_epoch < start_epoch:
+        blockers.append("finalization_precedes_evaluation_start")
+    if (
+        finalized_epoch is not None
+        and start_epoch is not None
+        and (
+            _epoch_delta(finalized_epoch, start_epoch)
+            > manifest.budget.wall_seconds
+            or (
+                deadline_epoch is not None
+                and finalized_epoch > deadline_epoch
+            )
+        )
+    ):
+        blockers.append("wall_budget_exceeded")
+
+    activity_timestamps = list(_activity_timestamps(state))
     activity_epochs = [
         _timestamp_epoch(value) for value in activity_timestamps
     ]
-    if finalized_epoch is None:
-        blockers.append("finalization_timestamp_invalid")
-    elif any(value is None for value in activity_epochs):
+    if any(value is None for value in activity_epochs):
         blockers.append("activity_timestamp_invalid")
-    elif any(
+    if start_epoch is not None and any(
+        float(value) < start_epoch
+        for value in activity_epochs
+        if value is not None
+    ):
+        blockers.append("activity_occurred_before_evaluation_start")
+    if finalized_epoch is not None and any(
         float(value) > finalized_epoch
         for value in activity_epochs
         if value is not None
     ):
         blockers.append("activity_occurred_after_finalization")
+
+    wall_used: float = float(manifest.budget.wall_seconds + 1)
+    if start_epoch is not None and finalized_epoch is not None:
+        elapsed = _epoch_delta(finalized_epoch, start_epoch)
+        if 0 <= elapsed <= manifest.budget.wall_seconds:
+            wall_used = elapsed
 
     model_runs = [
         run
@@ -2636,10 +3315,41 @@ def _derive_attempt(
     if not complete_usage:
         blockers.append("model_usage_incomplete")
 
-    solved = any(
-        submission.status is SubmissionStatus.ACCEPTED
-        for submission in state.submissions
+    proof_evidence, proof_run_binding_invalid = (
+        _canonical_candidate_proof_evidence(
+            state=state,
+            challenge_root=challenge_root,
+        )
     )
+    if proof_run_binding_invalid:
+        blockers.append("proof_run_binding_invalid")
+    proof_completion_epochs = [
+        _timestamp_epoch(observation.completed_at)
+        for observation in proof_evidence
+    ]
+    if any(value is None for value in proof_completion_epochs):
+        blockers.append("proof_completion_timestamp_invalid")
+    if start_epoch is not None and any(
+        float(value) < start_epoch
+        for value in proof_completion_epochs
+        if value is not None
+    ):
+        blockers.append("proof_completed_before_evaluation_start")
+    if finalized_epoch is not None and any(
+        float(value) > finalized_epoch
+        for value in proof_completion_epochs
+        if value is not None
+    ):
+        blockers.append("proof_completed_after_finalization")
+    accepted_candidate_ids, accepted_bindings, accepted_linkage_valid = (
+        _accepted_submission_bindings(
+            state=state,
+            ledger_records=submission_ledger,
+        )
+    )
+    if not accepted_linkage_valid:
+        blockers.append("accepted_submission_value_binding_invalid")
+
     proof_value, proof_exact = _metric_value(
         report,
         "proof_pass_rate",
@@ -2660,15 +3370,21 @@ def _derive_attempt(
         and type(proof_passes) is int
         and 0 <= proof_passes <= proof_evaluations
     )
-    proof_evaluated = bool(
-        proof_counts_valid and proof_evaluations > 0
-    )
-    proof_passed = bool(
-        proof_counts_valid and proof_passes > 0
+    proof_counts_match = bool(
+        proof_counts_valid
+        and proof_evaluations == len(proof_evidence)
+        and proof_passes
+        == sum(observation.passed for observation in proof_evidence)
     )
     if proof_value is not None and not proof_counts_valid:
         blockers.append("proof_metric_invalid")
-    if proof_evaluated and not proof_exact:
+    if proof_counts_valid and not proof_counts_match:
+        blockers.append("proof_candidate_binding_mismatch")
+    if (
+        proof_counts_valid
+        and proof_evaluations > 0
+        and not proof_exact
+    ):
         blockers.append("proof_metric_partial")
 
     reproduction_value, reproduction_exact = _metric_value(
@@ -2680,48 +3396,138 @@ def _derive_attempt(
         if reproduction_value is not None
         else None
     )
+    successful_reproductions = (
+        reproduction_value.get("successful_attempts")
+        if reproduction_value is not None
+        else None
+    )
+    total_reproductions = (
+        reproduction_value.get("total_attempts")
+        if reproduction_value is not None
+        else None
+    )
     reproduction_counts_valid = (
         type(reproduction_evaluations) is int
         and reproduction_evaluations >= 0
+        and type(successful_reproductions) is int
+        and successful_reproductions >= 0
+        and type(total_reproductions) is int
+        and successful_reproductions <= total_reproductions
     )
-    reproduction_evaluated = bool(
-        reproduction_counts_valid and reproduction_evaluations > 0
-    )
-    # A canonical proof pass already includes its required clean repetitions.
-    # The aggregate clean-reproduction metric independently establishes that
-    # the reproduction observations were readable.
-    reproduced = bool(
-        proof_passed
-        and reproduction_evaluated
-        and reproduction_exact
+    reproduction_counts_match = bool(
+        reproduction_counts_valid
+        and reproduction_evaluations == len(proof_evidence)
+        and successful_reproductions
+        == sum(
+            observation.successful_attempts
+            for observation in proof_evidence
+        )
+        and total_reproductions
+        == sum(
+            observation.total_attempts
+            for observation in proof_evidence
+        )
     )
     if (
         reproduction_value is not None
         and not reproduction_counts_valid
     ):
         blockers.append("reproduction_metric_invalid")
-    if reproduction_evaluated and not reproduction_exact:
+    if reproduction_counts_valid and not reproduction_counts_match:
+        blockers.append("reproduction_candidate_binding_mismatch")
+    if (
+        reproduction_counts_valid
+        and reproduction_evaluations > 0
+        and not reproduction_exact
+    ):
         blockers.append("reproduction_metric_partial")
+
+    proof_bindings = {
+        observation.binding for observation in proof_evidence
+    }
+    reproduction_bindings = {
+        observation.binding
+        for observation in proof_evidence
+        if observation.total_attempts > 0
+    }
+    qualified_bindings = {
+        observation.binding
+        for observation in proof_evidence
+        if (
+            observation.passed
+            and observation.successful_attempts > 0
+            and observation.total_attempts > 0
+        )
+    }
+    aggregate_proof_evaluated = bool(
+        proof_exact
+        and proof_counts_match
+        and proof_evaluations > 0
+    )
+    aggregate_reproduction_evaluated = bool(
+        reproduction_exact
+        and reproduction_counts_match
+        and reproduction_evaluations > 0
+        and total_reproductions > 0
+    )
+    if accepted_candidate_ids:
+        proof_evaluated = bool(
+            accepted_linkage_valid
+            and aggregate_proof_evaluated
+            and accepted_bindings <= proof_bindings
+        )
+        reproduction_evaluated = bool(
+            accepted_linkage_valid
+            and aggregate_reproduction_evaluated
+            and accepted_bindings <= reproduction_bindings
+        )
+    else:
+        proof_evaluated = aggregate_proof_evaluated
+        reproduction_evaluated = aggregate_reproduction_evaluated
+    qualified = bool(
+        accepted_bindings
+        and accepted_linkage_valid
+        and proof_evaluated
+        and reproduction_evaluated
+        and accepted_bindings <= qualified_bindings
+    )
+    solved = qualified
+    proof_passed = qualified
+    reproduced = qualified
+    if accepted_candidate_ids and not qualified:
+        blockers.append("accepted_candidate_success_evidence_unbound")
 
     first_value, first_exact = _metric_value(
         report,
         "median_time_to_first_valid_result",
     )
-    first_seconds: float | None = None
     if first_value is not None:
         count = first_value.get("count")
-        candidate_seconds = _nonnegative_number(
+        reported_seconds = _nonnegative_number(
             first_value.get("median_seconds")
         )
-        if type(count) is int and count == 1 and candidate_seconds is not None:
-            first_seconds = candidate_seconds
-        else:
+        if (
+            type(count) is not int
+            or count != 1
+            or reported_seconds is None
+        ):
             blockers.append("first_valid_result_metric_invalid")
         if not first_exact:
             # Budget-related partial reasons are independently checked above,
             # but any other partial evaluator result remains non-promotable.
             blockers.append("first_valid_result_metric_partial")
-    if (solved or (proof_passed and reproduced)) and first_seconds is None:
+    first_seconds = (
+        _bound_first_valid_result_seconds(
+            state=state,
+            accepted_bindings=accepted_bindings,
+            evidence=proof_evidence,
+            start_epoch=start_epoch,
+            finalized_epoch=finalized_epoch,
+        )
+        if qualified
+        else None
+    )
+    if qualified and first_seconds is None:
         blockers.append("first_valid_result_missing")
 
     human_value, human_exact = _metric_value(
@@ -2745,11 +3551,6 @@ def _derive_attempt(
             human_interventions = raw_human
         if not human_exact:
             blockers.append("human_intervention_evidence_partial")
-
-    wall_used = state.budget.spent_seconds
-    if type(wall_used) is not int or wall_used < 0:
-        blockers.append("wall_usage_invalid")
-        wall_used = manifest.budget.wall_seconds + 1
 
     terminal_count = sum(
         run.status in _TERMINAL_RUN_STATUSES for run in state.runs
@@ -2876,6 +3677,18 @@ def capture_promotion_session(
     )
     knowledge_store = StateStore(workspace)
     require_promotion_knowledge_snapshot(knowledge_store, state)
+    submission_ledger = knowledge_store.load_contest_submissions(
+        state.contest_id
+    )
+    accepted_submission_snapshot = (
+        _redacted_accepted_submission_snapshot(
+            state=state,
+            ledger_records=submission_ledger,
+        )
+    )
+    accepted_submission_snapshot_sha256 = _sha256(
+        canonical_json_bytes(list(accepted_submission_snapshot))
+    )
     operator_input_inventory = require_promotion_operator_input(
         workspace,
         state,
@@ -2938,6 +3751,13 @@ def capture_promotion_session(
             raise PromotionBundleError(
                 "canonical evidence changed during promotion capture"
             )
+    if (
+        knowledge_store.load_contest_submissions(state.contest_id)
+        != submission_ledger
+    ):
+        raise PromotionBundleError(
+            "submission ledger changed during promotion capture"
+        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_root = Path(
@@ -2991,7 +3811,8 @@ def capture_promotion_session(
             state=state,
             report=report,
             config=load_config(workspace),
-            challenge_root=source_root,
+            challenge_root=staged_challenge,
+            submission_ledger=accepted_submission_snapshot,
         )
         evaluation, evaluation_sha256 = _evaluation_digest(report)
         record: dict[str, object] = {
@@ -3013,6 +3834,12 @@ def capture_promotion_session(
             "input_manifest_sha256": session.input_manifest_sha256,
             "operator_input_sha256": operator_input_sha256,
             "operator_input_inventory": operator_input_inventory,
+            "accepted_submission_snapshot": list(
+                accepted_submission_snapshot
+            ),
+            "accepted_submission_snapshot_sha256": (
+                accepted_submission_snapshot_sha256
+            ),
             "state_revision": state.revision,
             "state_sha256": _sha256(state_payload),
             "files": records,
@@ -3080,6 +3907,13 @@ def capture_promotion_session(
         ):
             raise PromotionBundleError(
                 "operator input changed during promotion capture"
+            )
+        if (
+            knowledge_store.load_contest_submissions(state.contest_id)
+            != submission_ledger
+        ):
+            raise PromotionBundleError(
+                "submission ledger changed during promotion capture"
             )
         os.rename(temporary_root, output)
     except BaseException:
@@ -3299,6 +4133,8 @@ def _verify_bundle(
                 "input_manifest_sha256",
                 "operator_input_sha256",
                 "operator_input_inventory",
+                "accepted_submission_snapshot",
+                "accepted_submission_snapshot_sha256",
                 "state_revision",
                 "state_sha256",
                 "files",
@@ -3407,6 +4243,24 @@ def _verify_bundle(
     operator_input_inventory = _parse_operator_input_inventory(
         record["operator_input_inventory"]
     )
+    accepted_submission_snapshot = (
+        _parse_accepted_submission_snapshot(
+            record["accepted_submission_snapshot"]
+        )
+    )
+    accepted_submission_snapshot_sha256 = _sha256_value(
+        record["accepted_submission_snapshot_sha256"],
+        "bundle accepted_submission_snapshot_sha256",
+    )
+    if (
+        _sha256(
+            canonical_json_bytes(list(accepted_submission_snapshot))
+        )
+        != accepted_submission_snapshot_sha256
+    ):
+        raise PromotionBundleError(
+            "accepted submission snapshot digest does not match its content"
+        )
     collection_complete = _exact_bool(
         record["collection_complete"],
         "bundle collection_complete",
@@ -3515,6 +4369,7 @@ def _verify_bundle(
         challenge_root=bundle_root.joinpath(
             *_challenge_relative_path(session).parts
         ),
+        submission_ledger=accepted_submission_snapshot,
     )
     recorded_attempt = _derived_attempt_from_record(
         record["derived_attempt"]

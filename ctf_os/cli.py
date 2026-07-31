@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from ctf_os.benchmark import (
-    BlindLivePromotionEvidence,
     THIN_SCAFFOLD,
+    BlindLivePromotionEvidence,
     evaluate_blind_live_promotion,
 )
 from ctf_os.config import (
@@ -40,6 +40,15 @@ from ctf_os.lifecycle import (
     export_challenge,
     pause_with_handoff,
 )
+from ctf_os.live_broker import (
+    INSPECT_SECTIONS,
+    LIVE_SCOPE_CAPABILITY_ENV,
+    MAX_INSPECT_OFFSET,
+    MAX_INSPECT_PAGE_ITEMS,
+    LiveBrokerClient,
+    LiveBrokerError,
+    inspect_state,
+)
 from ctf_os.managed import (
     ManagedError,
     ManagedOrchestrator,
@@ -51,15 +60,6 @@ from ctf_os.migration import (
     plan_migration,
     rollback_migration,
 )
-from ctf_os.live_broker import (
-    INSPECT_SECTIONS,
-    LIVE_SCOPE_CAPABILITY_ENV,
-    MAX_INSPECT_OFFSET,
-    MAX_INSPECT_PAGE_ITEMS,
-    LiveBrokerClient,
-    LiveBrokerError,
-    inspect_state,
-)
 from ctf_os.models import (
     ChallengeIdentity,
     ChallengeStatus,
@@ -67,26 +67,21 @@ from ctf_os.models import (
     HypothesisStatus,
     Provenance,
 )
+from ctf_os.nyu_stage import stage_nyu_ctf_bench
 from ctf_os.promotion_bundles import (
     capture_promotion_session,
-    execution_fingerprint_report,
     evaluate_promotion_bundles,
+    execution_fingerprint_report,
     finalize_promotion_session,
     freeze_promotion_manifest,
     prepare_promotion_session,
 )
 from ctf_os.sandbox import NetworkTarget, SandboxError
-from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.scaffold_binding import (
     ScaffoldBindingError,
     solve_mode_arm,
 )
-from ctf_os.store import StateStoreError
-from ctf_os.store.atomic import (
-    atomic_write_json,
-    atomic_write_text,
-    strict_json_loads,
-)
+from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.storage import (
     StorageError,
     quarantine_unreachable,
@@ -94,6 +89,8 @@ from ctf_os.storage import (
     storage_inventory,
     storage_plan,
 )
+from ctf_os.store import StateStoreError
+from ctf_os.store.atomic import atomic_write_text, strict_json_loads
 from ctf_os.terminal import terminal_safe
 
 
@@ -998,6 +995,66 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
     )
+    nyu_stage = benchmark_commands.add_parser(
+        "nyu-stage",
+        help=(
+            "operator가 고른 NYU CTF Bench 전-category partial cohort를 "
+            "실행 없이 staging"
+        ),
+    )
+    nyu_stage.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="operator가 pin/checkout한 NYU CTF Bench repository",
+    )
+    nyu_stage.add_argument(
+        "--release-commit",
+        required=True,
+        help="checkout HEAD와 정확히 같아야 하는 full Git object ID",
+    )
+    nyu_stage.add_argument(
+        "--case",
+        dest="cases",
+        action="append",
+        required=True,
+        help=(
+            "test_dataset.json의 canonical case ID; 자동 선택 없이 반복 지정"
+        ),
+    )
+    nyu_stage.add_argument(
+        "--output-manifest",
+        type=Path,
+        required=True,
+        help="새 schema-v2 partial manifest(기존 파일 덮어쓰기 금지)",
+    )
+    nyu_stage.add_argument("--contest", required=True)
+    nyu_stage.add_argument(
+        "--split",
+        choices=("dev", "regression", "blind", "live", "hidden"),
+        required=True,
+    )
+    nyu_stage.add_argument(
+        "--budget-wall-seconds",
+        "--wall-seconds",
+        dest="budget_wall_seconds",
+        type=int,
+        required=True,
+    )
+    nyu_stage.add_argument(
+        "--budget-model-calls",
+        "--model-call-limit",
+        dest="budget_model_calls",
+        type=int,
+        required=True,
+    )
+    nyu_stage.add_argument(
+        "--budget-tokens",
+        "--total-token-limit",
+        dest="budget_tokens",
+        type=int,
+        required=True,
+    )
 
     leases = commands.add_parser("leases", help="도구/model 대기 상태")
     leases.add_argument("--json", action="store_true")
@@ -1638,6 +1695,22 @@ def main(
                         workspace,
                         args.manifest,
                         args.bundle,
+                    )
+                )
+                return 0
+            if args.benchmark_command == "nyu-stage":
+                _print_json(
+                    stage_nyu_ctf_bench(
+                        workspace,
+                        source=args.source,
+                        release_commit=args.release_commit,
+                        case_ids=tuple(args.cases),
+                        output_manifest=args.output_manifest,
+                        contest=args.contest,
+                        split=args.split,
+                        wall_seconds=args.budget_wall_seconds,
+                        model_call_limit=args.budget_model_calls,
+                        total_token_limit=args.budget_tokens,
                     )
                 )
                 return 0

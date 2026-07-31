@@ -126,11 +126,42 @@ ctfos benchmark capture \
 
 Capture copies only bounded state-referenced evidence, records every file
 digest, evaluates the copied canonical state, and authenticates the bundle.
-It emits promotion bundle schema 2 and records the operator-input digest plus
+It emits promotion bundle schema 3 and records the operator-input digest plus
 the bounded incoming inventory. Runtime source, knowledge, and operator input
 are re-attested during finalization, before and after capture, and again when a
 bundle is verified. Activity timestamped after finalization makes the bundle
 incomplete.
+
+Preparation also records `evaluation_started_at` exactly once and binds the
+canonical bounded `deadline_utc` as
+`evaluation_budget_deadline_utc`. Repeating preparation preserves those exact
+values. Finalization must follow preparation and remain inside that fixed wall
+window; run, artifact, candidate, submission, and proof-completion timestamps
+outside the start/finalization interval make collection incomplete.
+
+Promotion wall time is `evaluation_finalized_at - evaluation_started_at`. It
+therefore includes provider/model queue and execution wait, while excluding
+challenge staging time before explicit preparation. `budget.spent_seconds`
+remains operational tool accounting and is not used as the promotion
+performance wall. Time-to-first-valid-result uses the same prepared start, not
+the canonical state's earlier creation time.
+
+Positive `solved`, `proof_passed`, and `reproduced` fields are candidate-scoped,
+not aggregate proof claims. The collector binds every manually accepted
+candidate ID and candidate-value SHA-256 from the durable contest submission
+ledger to a hash-validated passed proof, its terminal `RunOrigin.PROOF` records,
+and its clean reproduction observations. The ledger is checked before and
+after capture. The signed bundle retains a sorted redacted snapshot containing
+only submission ID, candidate ID, value SHA-256, status, and recorded time.
+Verification re-derives candidate bindings from that snapshot rather than the
+later live ledger, so an append after capture cannot change historical replay.
+Raw candidate values are not copied into the bundle report or derived-attempt
+record. All derivation reads the staged, content-addressed capture rather than
+the live challenge directory. A proof artifact also cannot claim completion
+before any proof run it names was created. One accepted candidate cannot borrow
+another candidate's proof, even when the candidate values happen to be equal.
+Missing, partial, reordered, or changed links emit an unbound-evidence blocker
+and leave all success fields false.
 
 ## 4. Compare only after all explicit sessions finish
 
@@ -160,12 +191,31 @@ digest. It derives:
 - proof and clean-reproduction rates
 - human interventions
 - per-category floor
+- wall time, model calls, and total tokens per qualified case and qualified
+  attempt, with a total-resource Pareto rule when either denominator is zero
 - public versus blind/live/hidden performance
+- solve@1, pass^2/3, median time-to-first-valid-result, qualified-result count,
+  and human-intervention non-regression for every held-out split/category and
+  for each category across all held-out splits
+- qualified-resource non-regression for every held-out split/category and for
+  each category across all held-out splits
 - same-model, same-budget, and same-execution-fingerprint comparisons
 
 A missing, duplicate, partial, contaminated, leaked, unsafe, or modified
 bundle closes promotion. The result can only say
 `eligible_for_manual_promotion`; it never changes defaults or submits flags.
+
+Wall time, model calls, and total tokens are price-independent resource
+measures. They do not attest a provider invoice or monetary spend: the current
+bundle schema does not preserve the input/output/cached-token price mix,
+service tier, currency, or billed amount. A policy that requires actual billed
+cost must therefore keep that condition separately unverified.
+
+The current case schema also binds one immutable challenge input and compares
+the `thin_scaffold` and `ctf_os` arms. It does not encode discovery, PoC, and
+patch stages or bind before/after source revisions. These bundles cannot by
+themselves satisfy a CyberGym-style patch-stage improvement claim; that needs
+a later stage/revision schema extension.
 
 The operator-input binding landed in
 `d2fb1130b147605ca5d829ff7d20946fb2f3e41f`. Its focused promotion suite passed

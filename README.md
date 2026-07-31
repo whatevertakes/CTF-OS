@@ -20,6 +20,8 @@ channel이 생기기 전까지 지원 범위가 아닙니다.
 현재 코드가 실제로 구현한 범위와 남은 제한은
 [구현 결과](ctf-reports/10-implementation-result.md), 요구사항별 판정 이력은
 [수용성 기록](ctf-reports/12-final-acceptance.md)에 정리돼 있습니다.
+명시적으로 고른 NYU CTF Bench 전-category cohort를 실행 없이 준비하는 절차는
+[NYU CTF Bench operator staging](docs/nyu-ctf-bench-stage.md)에 있습니다.
 
 ## 현재 검증 상태
 

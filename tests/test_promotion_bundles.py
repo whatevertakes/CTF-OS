@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from ctf_os import cli
+from ctf_os import promotion_bundles as promotion_bundle_module
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.codex import (
     BatchInvocation,
@@ -44,8 +45,11 @@ from ctf_os.models import (
     ArtifactReference,
     Budget,
     BudgetMode,
+    CandidateStatus,
+    ChallengeStatus,
     Fact,
     Falsifier,
+    FlagCandidate,
     Hypothesis,
     ManagedCycle,
     Provenance,
@@ -56,8 +60,11 @@ from ctf_os.models import (
     SessionStatus,
     SolveSession,
     SourceFile,
+    SubmissionReference,
+    SubmissionStatus,
 )
 from ctf_os.promotion_bundles import (
+    PROMOTION_BUNDLE_SCHEMA_VERSION,
     PromotionBundleError,
     capture_promotion_session,
     finalize_promotion_session,
@@ -72,11 +79,15 @@ from ctf_os.scaffold_binding import (
     managed_command_contract_sha256,
     parse_scaffold_launch_record,
 )
-from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.schema import (
+    STATE_SCHEMA_VERSION,
+    SUBMISSION_LEDGER_RECORD_SCHEMA_VERSION,
+)
 from ctf_os.store import StateStore, sha256_file
 from ctf_os.store.atomic import (
     atomic_write_json,
     atomic_write_text,
+    canonical_json_bytes,
 )
 from ctf_os.stages.ingest import inventory_challenge
 
@@ -349,6 +360,11 @@ class PromotionBundleTests(unittest.TestCase):
                 "source_total_bytes": inventory.total_bytes,
             },
             budget=Budget(
+                deadline_utc=(
+                    (datetime.now(timezone.utc) + timedelta(seconds=60))
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                ),
                 allocated_seconds=60,
                 spent_seconds=0,
                 mode=BudgetMode.BOUNDED,
@@ -380,6 +396,7 @@ class PromotionBundleTests(unittest.TestCase):
         attempt: int,
         *,
         prompt: str = "",
+        finalize: bool = True,
     ) -> None:
         parsed = parse_promotion_manifest(self.manifest)
         session, state = self._create_unprepared_state(
@@ -409,11 +426,28 @@ class PromotionBundleTests(unittest.TestCase):
             state.to_dict(),
             mode=0o600,
         )
+        ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        ).reset_budget(session.identity, 60)
         prepare_promotion_session(
             self.root,
             self.frozen_path,
             session_id=session_id,
         )
+
+        # Keep the synthetic evidence clock deterministic while preserving a
+        # distinct pre-prepare staging interval.
+        def bind_fixture_clock(current) -> None:
+            started_at = _later(current.created_at, 1)
+            deadline = _later(started_at, 60)
+            current.metadata["evaluation_started_at"] = started_at
+            current.metadata["evaluation_budget_deadline_utc"] = deadline
+            current.metadata["budget_reset_at"] = started_at
+            current.budget.deadline_utc = deadline
+
+        self.store.update(session.identity, bind_fixture_clock)
         state = self.store.load(session.identity, recover=False)
         config = load_config(self.root)
         if arm == THIN_SCAFFOLD:
@@ -609,6 +643,7 @@ class PromotionBundleTests(unittest.TestCase):
                         source_run_id=run_id,
                         media_type=media_type,
                         size=target.stat().st_size,
+                        created_at=_later(state.created_at, seconds),
                     )
                 )
             thread_digest = hashlib.sha256(
@@ -738,6 +773,7 @@ class PromotionBundleTests(unittest.TestCase):
                 session_id=run_session_id,
                 cycle_id=cycle_id,
                 configuration_epoch=current.configuration_epoch,
+                created_at=_later(current.created_at, seconds),
                 extra=run_extra,
             )
             current.runs.append(model_run)
@@ -819,6 +855,10 @@ class PromotionBundleTests(unittest.TestCase):
                 )
 
         self.store.update(session.identity, mutate)
+        if finalize:
+            self._finalize_session(session_id)
+
+    def _finalize_session(self, session_id: str) -> None:
         finalize_promotion_session(
             self.root,
             self.frozen_path,
@@ -826,6 +866,218 @@ class PromotionBundleTests(unittest.TestCase):
             human_interventions=0,
             secret_or_flag_leaks=0,
         )
+
+    def _add_candidate_proof_evidence(
+        self,
+        session_id: str,
+        *,
+        candidates: dict[str, str],
+        accepted_candidate_ids: tuple[str, ...],
+        proofs: tuple[dict[str, object], ...],
+        submission_after: dict[str, int] | None = None,
+    ) -> None:
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[session_id]
+        state = self.store.load(session.identity, recover=False)
+        challenge_root = self.store.challenge_paths(
+            session.identity
+        ).root
+        proof_artifacts: list[ArtifactReference] = []
+        proof_runs: list[RunReference] = []
+        candidate_proof_run_ids: dict[str, list[str]] = {}
+        for index, proof in enumerate(proofs, start=1):
+            path_candidate_id = str(proof["path_candidate_id"])
+            relative = (
+                Path("proof")
+                / path_candidate_id
+                / f"eval-{index}"
+                / "result.json"
+            )
+            path = challenge_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            run_ids = [
+                f"proof-{session_id}-{index}-{attempt}"
+                for attempt in (1, 2, 3)
+            ]
+            candidate_proof_run_ids.setdefault(
+                path_candidate_id,
+                [],
+            ).extend(run_ids)
+            proof_runs.extend(
+                RunReference(
+                    id=run_id,
+                    base_revision=state.revision,
+                    status=RunStatus.COMPLETED,
+                    role="proof",
+                    origin=RunOrigin.PROOF,
+                    configuration_epoch=state.configuration_epoch,
+                    created_at=_later(state.created_at, 6 + ordinal),
+                    extra={"candidate_id": path_candidate_id},
+                )
+                for ordinal, run_id in enumerate(run_ids, start=1)
+            )
+            payload = {
+                "passed": proof.get("passed", True),
+                "candidate": proof["candidate_value"],
+                "policy_mode": "deterministic",
+                "successful_attempts": proof.get(
+                    "successful_attempts",
+                    2,
+                ),
+                "required_attempts": proof.get(
+                    "required_attempts",
+                    2,
+                ),
+                "total_attempts": proof.get("total_attempts", 3),
+                "source_manifest_sha256": (
+                    state.metadata["source_manifest_sha256"]
+                ),
+                "failures": proof.get(
+                    "failures",
+                    [
+                        "one clean repetition did not reproduce "
+                        "the exact candidate"
+                    ],
+                ),
+                "run_ids": run_ids,
+            }
+            atomic_write_json(path, payload, mode=0o400)
+            proof_artifacts.append(
+                ArtifactReference(
+                    id=f"A-proof-{session_id}-{index}",
+                    path=relative.as_posix(),
+                    sha256=sha256_file(path),
+                    size=path.stat().st_size,
+                    created_at=_later(
+                        state.created_at,
+                        int(proof.get("completed_after", 8 + index)),
+                    ),
+                )
+            )
+
+        accepted_ids = frozenset(accepted_candidate_ids)
+
+        def mutate(current) -> None:
+            current.candidates.extend(
+                FlagCandidate(
+                    id=candidate_id,
+                    value=value,
+                    status=(
+                        CandidateStatus.ACCEPTED
+                        if candidate_id in accepted_ids
+                        else CandidateStatus.OBSERVED_CANDIDATE
+                    ),
+                    created_at=_later(current.created_at, 5),
+                    proof_run_ids=list(
+                        candidate_proof_run_ids.get(candidate_id, ())
+                    ),
+                )
+                for candidate_id, value in candidates.items()
+            )
+            current.runs.extend(proof_runs)
+            current.artifacts.extend(proof_artifacts)
+            current.submissions.extend(
+                SubmissionReference(
+                    id=f"SUB-{session_id}-{index}",
+                    candidate_id=candidate_id,
+                    status=SubmissionStatus.ACCEPTED,
+                    submitted_at=_later(
+                        current.created_at,
+                        (
+                            submission_after.get(
+                                candidate_id,
+                                15 + index,
+                            )
+                            if submission_after is not None
+                            else 15 + index
+                        ),
+                    ),
+                    proof_passed=True,
+                    format_ok=True,
+                )
+                for index, candidate_id in enumerate(
+                    accepted_candidate_ids,
+                    start=1,
+                )
+            )
+            if accepted_candidate_ids:
+                current.status = ChallengeStatus.SOLVED
+
+        updated = self.store.update(session.identity, mutate)
+        ledger_path = self.store.contest_paths(
+            session.contest_id
+        ).submissions
+        existing_ledger = ledger_path.read_text(encoding="utf-8")
+        ledger_records = []
+        for submission in updated.submissions:
+            if (
+                submission.status is not SubmissionStatus.ACCEPTED
+                or submission.candidate_id not in accepted_ids
+            ):
+                continue
+            candidate = next(
+                item
+                for item in updated.candidates
+                if item.id == submission.candidate_id
+            )
+            ledger_records.append(
+                {
+                    "schema_version": (
+                        SUBMISSION_LEDGER_RECORD_SCHEMA_VERSION
+                    ),
+                    "id": submission.id,
+                    "recorded_at": submission.submitted_at,
+                    **session.identity.to_dict(),
+                    "candidate_id": submission.candidate_id,
+                    "flag": candidate.value,
+                    "status": submission.status.value,
+                    "response": submission.response,
+                    "proof_passed": submission.proof_passed,
+                    "format_ok": submission.format_ok,
+                    "points": submission.points,
+                    "state_revision": updated.revision,
+                    "override": None,
+                }
+            )
+        appended = "".join(
+            json.dumps(record, sort_keys=True) + "\n"
+            for record in ledger_records
+        )
+        atomic_write_text(
+            ledger_path,
+            existing_ledger + appended,
+            mode=0o600,
+        )
+
+    def _create_success_fixture(
+        self,
+        record: tuple[str, str, str, str, int],
+        *,
+        candidates: dict[str, str],
+        accepted_candidate_ids: tuple[str, ...],
+        proofs: tuple[dict[str, object], ...],
+        submission_after: dict[str, int] | None = None,
+    ) -> dict[str, object]:
+        self._create_state(*record, finalize=False)
+        self._add_candidate_proof_evidence(
+            record[0],
+            candidates=candidates,
+            accepted_candidate_ids=accepted_candidate_ids,
+            proofs=proofs,
+            submission_after=submission_after,
+        )
+        self._finalize_session(record[0])
+        bundle = self.root / "candidate-binding" / record[0]
+        capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        envelope = json.loads(
+            (bundle / "bundle.json").read_text(encoding="utf-8")
+        )
+        return envelope["record"]
 
     def _freeze(self) -> None:
         freeze_promotion_manifest(
@@ -903,6 +1155,48 @@ class PromotionBundleTests(unittest.TestCase):
             "runtime source inventory",
         ):
             self._create_state(*record)
+
+    def test_prepare_binds_one_idempotent_fixed_evaluation_clock(self) -> None:
+        self._freeze()
+        session_id = self._session_records()[0][0]
+        session, _state = self._create_unprepared_state(session_id)
+
+        first = prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session_id,
+        )
+        second = prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session_id,
+        )
+        prepared = self.store.load(session.identity, recover=False)
+
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(
+            first["evaluation_started_at"],
+            second["evaluation_started_at"],
+        )
+        self.assertEqual(
+            first["evaluation_budget_deadline_utc"],
+            second["evaluation_budget_deadline_utc"],
+        )
+        self.assertEqual(
+            prepared.metadata["evaluation_budget_deadline_utc"],
+            prepared.budget.deadline_utc,
+        )
+        start = datetime.fromisoformat(
+            first["evaluation_started_at"].replace("Z", "+00:00")
+        )
+        deadline = datetime.fromisoformat(
+            first["evaluation_budget_deadline_utc"].replace(
+                "Z", "+00:00"
+            )
+        )
+        self.assertGreater(deadline, start)
+        self.assertLessEqual((deadline - start).total_seconds(), 60)
 
     def test_source_change_after_prepare_blocks_launch(self) -> None:
         self._freeze()
@@ -1596,6 +1890,35 @@ class PromotionBundleTests(unittest.TestCase):
                 [bundle],
             )
 
+    def test_capture_derives_only_from_staged_evidence_bytes(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        source_root = self.store.challenge_paths(
+            parse_promotion_manifest(self.manifest)
+            .sessions[record[0]]
+            .identity
+        ).root
+        with mock.patch(
+            "ctf_os.promotion_bundles._derive_attempt",
+            wraps=promotion_bundle_module._derive_attempt,
+        ) as derive:
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=record[0],
+                output_directory=self.root / "staged-derive",
+            )
+
+        challenge_root = derive.call_args.kwargs["challenge_root"]
+        self.assertNotEqual(challenge_root, source_root)
+        self.assertTrue(
+            any(
+                part.startswith(".ctfos-promotion-")
+                for part in challenge_root.parts
+            )
+        )
+
     def test_validly_rehashed_arm_relabel_is_rejected(self) -> None:
         self._freeze()
         record = next(
@@ -1826,6 +2149,104 @@ class PromotionBundleTests(unittest.TestCase):
             captured["collection_blockers"],
         )
 
+    def test_performance_wall_excludes_staging_and_ignores_spent_seconds(
+        self,
+    ) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+        state = self.store.load(session.identity, recover=False)
+        start = datetime.fromisoformat(
+            state.metadata["evaluation_started_at"].replace("Z", "+00:00")
+        )
+        created = datetime.fromisoformat(
+            state.created_at.replace("Z", "+00:00")
+        )
+        self.assertEqual((start - created).total_seconds(), 1)
+
+        bundle = self.root / "clock-bound-wall"
+        capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        envelope = json.loads(
+            (bundle / "bundle.json").read_text(encoding="utf-8")
+        )
+        wall = envelope["record"]["derived_attempt"][
+            "solve_wall_seconds_used"
+        ]
+        finalized = datetime.fromisoformat(
+            state.metadata["evaluation_finalized_at"].replace(
+                "Z", "+00:00"
+            )
+        )
+        self.assertAlmostEqual(
+            wall,
+            (finalized - start).total_seconds(),
+            places=6,
+        )
+        self.assertNotEqual(wall, state.budget.spent_seconds)
+        self.assertGreaterEqual(wall, 0)
+        self.assertLessEqual(wall, 60)
+
+    def test_collector_rejects_activity_before_bound_start(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        session = parse_promotion_manifest(self.manifest).sessions[record[0]]
+
+        def prestart_activity(current) -> None:
+            current.runs[0].created_at = _later(
+                current.metadata["evaluation_started_at"],
+                -1,
+            )
+
+        self.store.update(session.identity, prestart_activity)
+        captured = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=self.root / "prestart-activity",
+        )
+        self.assertFalse(captured["collection_complete"])
+        self.assertIn(
+            "activity_occurred_before_evaluation_start",
+            captured["collection_blockers"],
+        )
+
+    def test_collector_rejects_finalization_beyond_fixed_wall(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        session = parse_promotion_manifest(self.manifest).sessions[record[0]]
+
+        def overrun(current) -> None:
+            current.metadata["evaluation_finalized_at"] = _later(
+                current.metadata["evaluation_started_at"],
+                61,
+            )
+
+        self.store.update(session.identity, overrun)
+        captured = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=self.root / "wall-overrun",
+        )
+        self.assertFalse(captured["collection_complete"])
+        self.assertIn(
+            "wall_budget_exceeded",
+            captured["collection_blockers"],
+        )
+        self.assertGreater(
+            captured["collection_blockers"].count("wall_budget_exceeded"),
+            0,
+        )
+
     def test_fingerprint_change_after_prepare_blocks_capture(self) -> None:
         self._freeze()
         record = self._session_records()[0]
@@ -1936,7 +2357,701 @@ class PromotionBundleTests(unittest.TestCase):
             )
         )
 
-    def test_complete_real_bundle_collection_stays_closed_without_proofs(
+    def test_bundle_schema_three_rejects_pre_binding_schema_two(
+        self,
+    ) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record)
+        bundle = self.root / "schema-three-bundle"
+        capture = capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        envelope_path = bundle / "bundle.json"
+        envelope = json.loads(
+            envelope_path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(PROMOTION_BUNDLE_SCHEMA_VERSION, 3)
+        self.assertEqual(capture["schema_version"], 3)
+        self.assertEqual(envelope["record"]["schema_version"], 3)
+
+        envelope["record"]["schema_version"] = 2
+        atomic_write_json(envelope_path, envelope, mode=0o400)
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "unsupported promotion bundle schema",
+        ):
+            evaluate_promotion_bundles(
+                self.root,
+                self.frozen_path,
+                [bundle],
+            )
+
+    def test_cross_candidate_proof_cannot_qualify_either_arm(
+        self,
+    ) -> None:
+        self._freeze()
+        records = self._session_records()
+        for arm in (THIN_SCAFFOLD, CTF_OS_SYSTEM):
+            with self.subTest(arm=arm):
+                record = next(
+                    item
+                    for item in records
+                    if item[1] == "dev-pwn"
+                    and item[3] == arm
+                    and item[4] == 1
+                )
+                accepted_value = f"KCTF{{accepted-{arm}}}"
+                # A value match alone is insufficient: the proof must retain
+                # the exact accepted candidate ID as well.
+                proved_value = accepted_value
+                bundle_record = self._create_success_fixture(
+                    record,
+                    candidates={
+                        "C-accepted": accepted_value,
+                        "C-proved": proved_value,
+                    },
+                    accepted_candidate_ids=("C-accepted",),
+                    proofs=(
+                        {
+                            "path_candidate_id": "C-proved",
+                            "candidate_value": proved_value,
+                        },
+                    ),
+                )
+
+                attempt = bundle_record["derived_attempt"]
+                self.assertFalse(bundle_record["collection_complete"])
+                self.assertFalse(attempt["solved"])
+                self.assertFalse(attempt["proof_evaluated"])
+                self.assertFalse(attempt["proof_passed"])
+                self.assertFalse(attempt["reproduction_evaluated"])
+                self.assertFalse(attempt["reproduced"])
+                self.assertIsNone(
+                    attempt["first_valid_result_seconds"]
+                )
+                self.assertIn(
+                    "accepted_candidate_success_evidence_unbound",
+                    bundle_record["collection_blockers"],
+                )
+                serialized = json.dumps(
+                    bundle_record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                self.assertNotIn(accepted_value, serialized)
+                self.assertNotIn(proved_value, serialized)
+
+    def test_accepted_success_without_proof_is_incomplete_and_unqualified(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        candidate_value = "KCTF{accepted-without-proof}"
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={"C-accepted": candidate_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(),
+        )
+
+        attempt = bundle_record["derived_attempt"]
+        self.assertFalse(bundle_record["collection_complete"])
+        self.assertFalse(attempt["solved"])
+        self.assertFalse(attempt["proof_evaluated"])
+        self.assertFalse(attempt["proof_passed"])
+        self.assertFalse(attempt["reproduction_evaluated"])
+        self.assertFalse(attempt["reproduced"])
+        self.assertIsNone(attempt["first_valid_result_seconds"])
+        self.assertIn(
+            "accepted_candidate_success_evidence_unbound",
+            bundle_record["collection_blockers"],
+        )
+        self.assertNotIn(
+            candidate_value,
+            json.dumps(
+                bundle_record,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+
+    def test_multiple_candidate_proofs_bind_success_and_time_exactly(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == THIN_SCAFFOLD
+            and item[4] == 2
+        )
+        accepted_value = "KCTF{accepted-exact}"
+        other_value = "KCTF{other-proof}"
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={
+                "C-accepted": accepted_value,
+                "C-other": other_value,
+            },
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-other",
+                    "candidate_value": other_value,
+                    "completed_after": 10,
+                },
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": accepted_value,
+                    "completed_after": 12,
+                },
+            ),
+        )
+
+        attempt = bundle_record["derived_attempt"]
+        self.assertTrue(bundle_record["collection_complete"])
+        self.assertEqual(bundle_record["collection_blockers"], [])
+        self.assertTrue(attempt["solved"])
+        self.assertTrue(attempt["proof_evaluated"])
+        self.assertTrue(attempt["proof_passed"])
+        self.assertTrue(attempt["reproduction_evaluated"])
+        self.assertTrue(attempt["reproduced"])
+        # The accepted binding is not valid until its later manual outcome.
+        self.assertEqual(attempt["first_valid_result_seconds"], 15.0)
+        aggregate_first = bundle_record["evaluation"]["metrics"][
+            "median_time_to_first_valid_result"
+        ]["value"]["median_seconds"]
+        self.assertEqual(aggregate_first, 10.0)
+        serialized = json.dumps(
+            bundle_record,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(accepted_value, serialized)
+        self.assertNotIn(other_value, serialized)
+
+    def test_bound_first_valid_time_waits_for_proof_after_submission(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 2
+        )
+        candidate_value = "KCTF{submission-before-proof}"
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={"C-accepted": candidate_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": candidate_value,
+                    "completed_after": 18,
+                },
+            ),
+            submission_after={"C-accepted": 7},
+        )
+
+        attempt = bundle_record["derived_attempt"]
+        self.assertTrue(bundle_record["collection_complete"])
+        self.assertTrue(attempt["solved"])
+        self.assertTrue(attempt["proof_passed"])
+        self.assertTrue(attempt["reproduced"])
+        # Manual acceptance alone is not yet a qualified valid result.
+        self.assertEqual(attempt["first_valid_result_seconds"], 17.0)
+        aggregate_first = bundle_record["evaluation"]["metrics"][
+            "median_time_to_first_valid_result"
+        ]["value"]["median_seconds"]
+        self.assertEqual(aggregate_first, 7.0)
+        self.assertNotIn(
+            candidate_value,
+            json.dumps(
+                bundle_record,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+
+    def test_acceptance_ledger_value_cannot_be_rebound_after_submission(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        self._create_state(*record, finalize=False)
+        accepted_value = "KCTF{accepted-ledger-value}"
+        replacement_value = "KCTF{replacement-state-value}"
+        self._add_candidate_proof_evidence(
+            record[0],
+            candidates={"C-accepted": accepted_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(),
+        )
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[record[0]]
+
+        def replace_candidate_value(current) -> None:
+            candidate = next(
+                item
+                for item in current.candidates
+                if item.id == "C-accepted"
+            )
+            candidate.value = replacement_value
+
+        self.store.update(
+            session.identity,
+            replace_candidate_value,
+        )
+        self._add_candidate_proof_evidence(
+            record[0],
+            candidates={},
+            accepted_candidate_ids=(),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": replacement_value,
+                },
+            ),
+        )
+        proof_run_ids = [
+            f"proof-{record[0]}-1-{attempt}"
+            for attempt in (1, 2, 3)
+        ]
+
+        def link_replacement_proof(current) -> None:
+            candidate = next(
+                item
+                for item in current.candidates
+                if item.id == "C-accepted"
+            )
+            candidate.proof_run_ids.extend(proof_run_ids)
+
+        self.store.update(
+            session.identity,
+            link_replacement_proof,
+        )
+        self._finalize_session(record[0])
+        bundle = self.root / "ledger-value-mismatch"
+        capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        envelope = json.loads(
+            (bundle / "bundle.json").read_text(encoding="utf-8")
+        )
+        bundle_record = envelope["record"]
+
+        self.assertFalse(bundle_record["collection_complete"])
+        self.assertFalse(bundle_record["derived_attempt"]["solved"])
+        self.assertIn(
+            "accepted_submission_value_binding_invalid",
+            bundle_record["collection_blockers"],
+        )
+        serialized = json.dumps(bundle_record, sort_keys=True)
+        self.assertNotIn(accepted_value, serialized)
+        self.assertNotIn(replacement_value, serialized)
+
+    def test_proof_artifact_cannot_predate_its_linked_proof_runs(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={"C-accepted": "KCTF{ordered-proof}"},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": "KCTF{ordered-proof}",
+                    "completed_after": 3,
+                },
+            ),
+            submission_after={"C-accepted": 2},
+        )
+
+        self.assertFalse(bundle_record["collection_complete"])
+        self.assertFalse(bundle_record["derived_attempt"]["solved"])
+        self.assertIsNone(
+            bundle_record["derived_attempt"][
+                "first_valid_result_seconds"
+            ]
+        )
+        self.assertIn(
+            "proof_run_binding_invalid",
+            bundle_record["collection_blockers"],
+        )
+
+    def test_submission_ledger_is_rechecked_after_capture_derivation(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        self._create_state(*record, finalize=False)
+        self._add_candidate_proof_evidence(
+            record[0],
+            candidates={"C-accepted": "KCTF{stable-ledger}"},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": "KCTF{stable-ledger}",
+                },
+            ),
+        )
+        self._finalize_session(record[0])
+        parsed = parse_promotion_manifest(self.manifest)
+        ledger = self.store.load_contest_submissions(
+            parsed.sessions[record[0]].contest_id
+        )
+        changed_ledger = [
+            *ledger,
+            {
+                **ledger[0],
+                "id": "SUB-concurrent-change",
+            },
+        ]
+
+        with mock.patch.object(
+            StateStore,
+            "load_contest_submissions",
+            side_effect=(ledger, ledger, changed_ledger),
+        ) as load_ledger:
+            with self.assertRaisesRegex(
+                PromotionBundleError,
+                "submission ledger changed",
+            ):
+                capture_promotion_session(
+                    self.root,
+                    self.frozen_path,
+                    session_id=record[0],
+                    output_directory=self.root / "ledger-race",
+                )
+
+        self.assertEqual(load_ledger.call_count, 3)
+        self.assertFalse((self.root / "ledger-race").exists())
+
+    def test_bundle_replay_uses_redacted_frozen_submission_snapshot(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        candidate_value = "KCTF{frozen-redacted-ledger}"
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={"C-accepted": candidate_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": candidate_value,
+                },
+            ),
+        )
+        bundle = self.root / "candidate-binding" / record[0]
+        serialized = json.dumps(bundle_record, sort_keys=True)
+        self.assertNotIn(candidate_value, serialized)
+        self.assertEqual(
+            bundle_record["accepted_submission_snapshot"][0][
+                "value_sha256"
+            ],
+            hashlib.sha256(candidate_value.encode("utf-8")).hexdigest(),
+        )
+
+        session = parse_promotion_manifest(self.manifest).sessions[record[0]]
+        ledger_path = self.store.contest_paths(
+            session.contest_id
+        ).submissions
+        ledger = self.store.load_contest_submissions(session.contest_id)
+        appended = {
+            **ledger[0],
+            "id": "SUB-post-capture-change",
+            "candidate_id": "C-post-capture-change",
+            "flag": "KCTF{different-later-value}",
+        }
+        atomic_write_text(
+            ledger_path,
+            ledger_path.read_text(encoding="utf-8")
+            + json.dumps(appended, sort_keys=True)
+            + "\n",
+            mode=0o600,
+        )
+
+        # The historical signed bundle remains replayable from its own
+        # redacted snapshot even though the live append-only ledger advanced.
+        result = evaluate_promotion_bundles(
+            self.root,
+            self.frozen_path,
+            [bundle],
+        )
+        self.assertFalse(result["promotion_eligible"])
+
+    def test_redacted_submission_snapshot_tamper_fails_authentication(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 1
+        )
+        candidate_value = "KCTF{signed-redacted-ledger}"
+        self._create_success_fixture(
+            record,
+            candidates={"C-accepted": candidate_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": candidate_value,
+                },
+            ),
+        )
+        bundle = self.root / "candidate-binding" / record[0]
+        envelope_path = bundle / "bundle.json"
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        envelope["record"]["accepted_submission_snapshot"][0][
+            "value_sha256"
+        ] = "0" * 64
+        envelope["record_sha256"] = hashlib.sha256(
+            canonical_json_bytes(envelope["record"])
+        ).hexdigest()
+        os.chmod(envelope_path, 0o600)
+        envelope_path.write_text(
+            json.dumps(envelope, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "authentication failed",
+        ):
+            evaluate_promotion_bundles(
+                self.root,
+                self.frozen_path,
+                [bundle],
+            )
+
+    def test_every_accepted_candidate_requires_its_own_proof(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == CTF_OS_SYSTEM
+            and item[4] == 2
+        )
+        first_value = "KCTF{accepted-one}"
+        second_value = "KCTF{accepted-two}"
+        bundle_record = self._create_success_fixture(
+            record,
+            candidates={
+                "C-one": first_value,
+                "C-two": second_value,
+            },
+            accepted_candidate_ids=("C-one", "C-two"),
+            proofs=(
+                {
+                    "path_candidate_id": "C-two",
+                    "candidate_value": second_value,
+                },
+            ),
+        )
+
+        attempt = bundle_record["derived_attempt"]
+        self.assertFalse(bundle_record["collection_complete"])
+        self.assertFalse(attempt["solved"])
+        self.assertFalse(attempt["proof_evaluated"])
+        self.assertFalse(attempt["proof_passed"])
+        self.assertFalse(attempt["reproduction_evaluated"])
+        self.assertFalse(attempt["reproduced"])
+        self.assertIn(
+            "accepted_candidate_success_evidence_unbound",
+            bundle_record["collection_blockers"],
+        )
+
+    def test_proof_claim_without_candidate_run_link_fails_closed(
+        self,
+    ) -> None:
+        self._freeze()
+        record = next(
+            item
+            for item in self._session_records()
+            if item[1] == "dev-pwn"
+            and item[3] == THIN_SCAFFOLD
+            and item[4] == 1
+        )
+        candidate_value = "KCTF{run-link-required}"
+        self._create_state(*record, finalize=False)
+        self._add_candidate_proof_evidence(
+            record[0],
+            candidates={"C-accepted": candidate_value},
+            accepted_candidate_ids=("C-accepted",),
+            proofs=(
+                {
+                    "path_candidate_id": "C-accepted",
+                    "candidate_value": candidate_value,
+                },
+            ),
+        )
+        session = parse_promotion_manifest(self.manifest).sessions[
+            record[0]
+        ]
+
+        def strip_candidate_run_link(current) -> None:
+            candidate = next(
+                item
+                for item in current.candidates
+                if item.id == "C-accepted"
+            )
+            candidate.proof_run_ids.clear()
+
+        self.store.update(
+            session.identity,
+            strip_candidate_run_link,
+        )
+        self._finalize_session(record[0])
+        bundle = self.root / "missing-run-link"
+        capture_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=record[0],
+            output_directory=bundle,
+        )
+        bundle_record = json.loads(
+            (bundle / "bundle.json").read_text(encoding="utf-8")
+        )["record"]
+
+        attempt = bundle_record["derived_attempt"]
+        self.assertFalse(bundle_record["collection_complete"])
+        self.assertFalse(attempt["solved"])
+        self.assertFalse(attempt["proof_evaluated"])
+        self.assertFalse(attempt["proof_passed"])
+        self.assertFalse(attempt["reproduction_evaluated"])
+        self.assertFalse(attempt["reproduced"])
+        self.assertIn(
+            "proof_candidate_binding_mismatch",
+            bundle_record["collection_blockers"],
+        )
+        self.assertIn(
+            "accepted_candidate_success_evidence_unbound",
+            bundle_record["collection_blockers"],
+        )
+        self.assertNotIn(
+            candidate_value,
+            json.dumps(
+                bundle_record,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+
+    def test_tampered_or_missing_proof_candidate_linkage_fails_closed(
+        self,
+    ) -> None:
+        self._freeze()
+        records = self._session_records()
+        cases = (
+            (
+                "tampered-value",
+                THIN_SCAFFOLD,
+                "C-accepted",
+                "KCTF{tampered-proof-value}",
+            ),
+            (
+                "missing-candidate-id",
+                CTF_OS_SYSTEM,
+                "C-missing",
+                "KCTF{accepted-linkage}",
+            ),
+        )
+        for label, arm, path_candidate_id, proof_value in cases:
+            with self.subTest(label=label):
+                record = next(
+                    item
+                    for item in records
+                    if item[1] == "dev-pwn"
+                    and item[3] == arm
+                    and item[4] == 3
+                )
+                accepted_value = "KCTF{accepted-linkage}"
+                bundle_record = self._create_success_fixture(
+                    record,
+                    candidates={"C-accepted": accepted_value},
+                    accepted_candidate_ids=("C-accepted",),
+                    proofs=(
+                        {
+                            "path_candidate_id": path_candidate_id,
+                            "candidate_value": proof_value,
+                        },
+                    ),
+                )
+
+                attempt = bundle_record["derived_attempt"]
+                self.assertFalse(bundle_record["collection_complete"])
+                self.assertFalse(attempt["solved"])
+                self.assertFalse(attempt["proof_evaluated"])
+                self.assertFalse(attempt["proof_passed"])
+                self.assertFalse(attempt["reproduction_evaluated"])
+                self.assertFalse(attempt["reproduced"])
+                self.assertIn(
+                    "accepted_candidate_success_evidence_unbound",
+                    bundle_record["collection_blockers"],
+                )
+                serialized = json.dumps(
+                    bundle_record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                self.assertNotIn(accepted_value, serialized)
+                self.assertNotIn(proof_value, serialized)
+
+    def test_complete_failed_attempts_need_no_proof_but_stay_closed(
         self,
     ) -> None:
         self._freeze()
@@ -1959,21 +3074,31 @@ class PromotionBundleTests(unittest.TestCase):
         )
 
         self.assertFalse(result["promotion_eligible"])
-        self.assertFalse(result["complete_evidence"])
+        self.assertTrue(result["complete_evidence"])
         self.assertEqual(result["decision"], "do_not_promote")
         self.assertEqual(result["collector"]["blockers"], [])
         self.assertEqual(
             result["collector"]["verified_session_bundles"],
             84,
         )
-        self.assertIsNone(result["metrics"])
-        self.assertIn(
-            "candidate_proof_coverage_incomplete",
-            result["blockers"],
+        self.assertIsNotNone(result["metrics"])
+        candidate = result["metrics"]["candidate"]
+        self.assertEqual(
+            candidate["overall"]["accepted_solve_attempts"],
+            0,
+        )
+        self.assertEqual(
+            candidate["overall"]["qualified_solve_attempts"],
+            0,
         )
         self.assertIn(
-            "candidate_reproduction_coverage_incomplete",
+            "candidate_holdout_has_no_accepted_solve",
             result["blockers"],
+        )
+        self.assertFalse(
+            result["requirements"][
+                "failed_attempt_proof_or_reproduction_required"
+            ]
         )
         self.assertFalse(result["automatic_promotion"])
         self.assertFalse(result["automatic_submission"])

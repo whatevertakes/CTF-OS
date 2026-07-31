@@ -129,7 +129,7 @@ def promotion_result(
             first_valid_result_seconds=(
                 seconds if solved[index - 1] else None
             ),
-            solve_wall_seconds_used=max(seconds, 20.0),
+            solve_wall_seconds_used=seconds,
             model_calls_used=4,
             total_tokens_used=50_000,
             human_interventions=interventions,
@@ -301,6 +301,26 @@ class BlindLivePromotionGateTests(unittest.TestCase):
         )
         self.assertTrue(
             result["comparisons"]["live_hidden_improvement"]
+        )
+        self.assertTrue(
+            result["comparisons"][
+                "live_hidden_efficiency_improvement"
+            ]
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "live_hidden_efficiency_improvement_signals"
+            ],
+            [
+                "live:per_qualified_case:solve_wall_seconds_used",
+                "live:per_qualified_attempt:solve_wall_seconds_used",
+            ],
+        )
+        self.assertEqual(
+            result["metrics"]["candidate"]["by_split"][LIVE][
+                "qualified_solve_efficiency"
+            ]["per_qualified_attempt"]["model_calls_used"],
+            4.0,
         )
 
     def test_split_visibility_and_prior_exposure_fail_closed(self):
@@ -692,7 +712,66 @@ class BlindLivePromotionGateTests(unittest.TestCase):
         self.assertIn("candidate_safety_violation", result["blockers"])
         self.assertFalse(result["promotion_eligible"])
 
-    def test_unvalidated_thin_baseline_is_reported_not_disqualified(self):
+    def test_candidate_success_case_requires_two_qualified_attempts(self):
+        evidence = promotion_evidence()
+        weak_case_id = "blind-pwn"
+        pattern = (True, False, False)
+
+        def replace_case(
+            results: tuple[PromotionCaseResult, ...],
+            *,
+            namespace: str,
+        ) -> tuple[PromotionCaseResult, ...]:
+            return tuple(
+                promotion_result(
+                    result.case_id,
+                    solved=pattern,
+                    proof=pattern,
+                    reproduced=pattern,
+                    run_namespace=namespace,
+                )
+                if result.case_id == weak_case_id
+                else result
+                for result in results
+            )
+
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=replace_case(
+                        evidence.baseline.results,
+                        namespace="baseline",
+                    ),
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=replace_case(
+                        evidence.candidate.results,
+                        namespace="candidate",
+                    ),
+                ),
+            )
+        )
+
+        self.assertFalse(outcome["promotion_eligible"])
+        self.assertIn(
+            "candidate_success_case_not_qualified_2_of_3:blind-pwn",
+            outcome["blockers"],
+        )
+        self.assertIn(
+            "baseline_success_case_not_qualified_2_of_3:blind-pwn",
+            outcome["blockers"],
+        )
+        self.assertEqual(
+            outcome["metrics"]["candidate"]["by_split"][BLIND][
+                "qualified_solve_efficiency"
+            ]["qualified_cases"],
+            5,
+        )
+
+    def test_unqualified_baseline_uses_zero_to_positive_total_policy(self):
         evidence = promotion_evidence()
         baseline_results = tuple(
             promotion_result(
@@ -714,13 +793,43 @@ class BlindLivePromotionGateTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(result["promotion_eligible"])
-        self.assertNotIn("baseline_unproved_solve", result["blockers"])
+        self.assertFalse(result["promotion_eligible"])
+        self.assertIn("baseline_unproved_solve", result["blockers"])
+        self.assertIn(
+            "baseline_success_case_not_qualified_2_of_3:dev-case",
+            result["blockers"],
+        )
+        self.assertFalse(
+            any(
+                blocker.startswith(
+                    "qualified_efficiency_zero_denominator:"
+                )
+                for blocker in result["blockers"]
+            )
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "overall_qualified_efficiency_comparison"
+            ]["per_qualified_case"]["mode"],
+            "baseline_zero_candidate_positive_total_pareto",
+        )
+        self.assertTrue(
+            result["comparisons"][
+                "overall_qualified_efficiency_comparison"
+            ]["per_qualified_attempt"][
+                "outcome_efficiency_improvement"
+            ]
+        )
         self.assertEqual(
             result["metrics"]["baseline"]["overall"][
                 "proof_pass_rate"
             ]["rate"],
             0.0,
+        )
+        self.assertIsNone(
+            result["metrics"]["baseline"]["overall"][
+                "qualified_solve_efficiency"
+            ]["per_qualified_case"]["model_calls_used"]
         )
         self.assertEqual(
             result["metrics"]["baseline"]["overall"][
@@ -728,6 +837,675 @@ class BlindLivePromotionGateTests(unittest.TestCase):
             ]["rate"],
             0.0,
         )
+
+    def test_zero_baseline_positive_candidate_pareto_can_promote(self):
+        evidence = promotion_evidence()
+        baseline_results = tuple(
+            promotion_result(
+                result.case_id,
+                solved=(False, False, False),
+                proof=(False, False, False),
+                reproduced=(False, False, False),
+                run_namespace="baseline",
+            )
+            for result in evidence.baseline.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+            )
+        )
+
+        self.assertTrue(result["promotion_eligible"])
+        live_comparison = result["comparisons"][
+            "split_qualified_efficiency_comparisons"
+        ][LIVE]
+        overall_comparison = result["comparisons"][
+            "overall_qualified_efficiency_comparison"
+        ]
+        for comparison in (live_comparison, overall_comparison):
+            for denominator in (
+                "per_qualified_case",
+                "per_qualified_attempt",
+            ):
+                self.assertEqual(
+                    comparison[denominator]["mode"],
+                    "baseline_zero_candidate_positive_total_pareto",
+                )
+                self.assertTrue(
+                    comparison[denominator][
+                        "outcome_efficiency_improvement"
+                    ]
+                )
+                self.assertTrue(
+                    all(
+                        comparison[denominator][
+                            "noninferiority"
+                        ].values()
+                    )
+                )
+        self.assertIn(
+            "live:per_qualified_case:outcome_pareto_gain",
+            result["comparisons"][
+                "live_hidden_efficiency_improvement_signals"
+            ],
+        )
+
+    def test_split_and_overall_denominator_modes_are_independent(self):
+        evidence = promotion_evidence()
+        baseline_results = tuple(
+            promotion_result(
+                result.case_id,
+                solved=(False, False, False),
+                proof=(False, False, False),
+                reproduced=(False, False, False),
+                run_namespace="baseline",
+            )
+            if result.case_id.startswith("live-")
+            else result
+            for result in evidence.baseline.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+            )
+        )
+
+        self.assertTrue(result["promotion_eligible"])
+        self.assertEqual(
+            result["comparisons"][
+                "split_qualified_efficiency_comparisons"
+            ][LIVE]["per_qualified_case"]["mode"],
+            "baseline_zero_candidate_positive_total_pareto",
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "overall_qualified_efficiency_comparison"
+            ]["per_qualified_case"]["mode"],
+            "per_qualified_ratio",
+        )
+
+    def test_zero_baseline_positive_candidate_requires_total_pareto(self):
+        evidence = promotion_evidence()
+        baseline_results = tuple(
+            promotion_result(
+                result.case_id,
+                solved=(False, False, False),
+                proof=(False, False, False),
+                reproduced=(False, False, False),
+                run_namespace="baseline",
+            )
+            for result in evidence.baseline.results
+        )
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(attempt, model_calls_used=5)
+                    for attempt in result.attempts
+                ),
+            )
+            for result in evidence.candidate.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertFalse(result["promotion_eligible"])
+        self.assertIn(
+            "split_efficiency_total_regression:"
+            "live:per_qualified_case:model_calls_used",
+            result["blockers"],
+        )
+        self.assertIn(
+            "overall_efficiency_total_regression:"
+            "per_qualified_attempt:model_calls_used",
+            result["blockers"],
+        )
+        self.assertIn(
+            "split_category_efficiency_total_regression:"
+            "live:pwn:per_qualified_case:model_calls_used",
+            result["blockers"],
+        )
+        self.assertIn(
+            "holdout_category_efficiency_total_regression:"
+            "pwn:per_qualified_attempt:model_calls_used",
+            result["blockers"],
+        )
+        live_comparison = result["comparisons"][
+            "split_qualified_efficiency_comparisons"
+        ][LIVE]["per_qualified_attempt"]
+        self.assertFalse(
+            live_comparison["outcome_efficiency_improvement"]
+        )
+        self.assertNotIn(
+            "live:per_qualified_attempt:outcome_pareto_gain",
+            result["comparisons"][
+                "live_hidden_efficiency_improvement_signals"
+            ],
+        )
+
+    def test_both_zero_uses_totals_without_improvement_signal(self):
+        evidence = promotion_evidence()
+
+        def zero_results(
+            results: tuple[PromotionCaseResult, ...],
+            *,
+            namespace: str,
+            candidate: bool,
+        ) -> tuple[PromotionCaseResult, ...]:
+            return tuple(
+                promotion_result(
+                    result.case_id,
+                    seconds=(
+                        5.0
+                        if candidate
+                        and result.case_id.startswith("live-")
+                        else 10.0
+                    ),
+                    solved=(False, False, False),
+                    proof=(False, False, False),
+                    reproduced=(False, False, False),
+                    run_namespace=namespace,
+                )
+                for result in results
+            )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=zero_results(
+                        evidence.baseline.results,
+                        namespace="baseline",
+                        candidate=False,
+                    ),
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=zero_results(
+                        evidence.candidate.results,
+                        namespace="candidate",
+                        candidate=True,
+                    ),
+                ),
+            )
+        )
+
+        self.assertFalse(result["promotion_eligible"])
+        for scope_comparison in (
+            result["comparisons"][
+                "split_qualified_efficiency_comparisons"
+            ][LIVE],
+            result["comparisons"][
+                "overall_qualified_efficiency_comparison"
+            ],
+        ):
+            for denominator in (
+                "per_qualified_case",
+                "per_qualified_attempt",
+            ):
+                self.assertEqual(
+                    scope_comparison[denominator]["mode"],
+                    "both_zero_total_nonincrease",
+                )
+                self.assertTrue(
+                    all(
+                        scope_comparison[denominator][
+                            "noninferiority"
+                        ].values()
+                    )
+                )
+                self.assertFalse(
+                    scope_comparison[denominator][
+                        "outcome_efficiency_improvement"
+                    ]
+                )
+        self.assertEqual(
+            result["comparisons"][
+                "live_hidden_efficiency_improvement_signals"
+            ],
+            [],
+        )
+        self.assertIn(
+            "no_live_hidden_efficiency_improvement",
+            result["blockers"],
+        )
+
+    def test_positive_baseline_zero_candidate_is_outcome_regression(self):
+        evidence = promotion_evidence()
+        candidate_results = tuple(
+            promotion_result(
+                result.case_id,
+                solved=(False, False, False),
+                proof=(False, False, False),
+                reproduced=(False, False, False),
+                run_namespace="candidate",
+            )
+            for result in evidence.candidate.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertFalse(result["promotion_eligible"])
+        self.assertIn(
+            "qualified_efficiency_outcome_regression:"
+            "live:per_qualified_case",
+            result["blockers"],
+        )
+        self.assertIn(
+            "qualified_efficiency_outcome_regression:"
+            "overall:per_qualified_attempt",
+            result["blockers"],
+        )
+        self.assertIn(
+            "split_category_efficiency_outcome_regression:"
+            "live:pwn:per_qualified_case",
+            result["blockers"],
+        )
+        self.assertIn(
+            "holdout_category_efficiency_outcome_regression:"
+            "pwn:per_qualified_attempt",
+            result["blockers"],
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "split_qualified_efficiency_comparisons"
+            ][LIVE]["per_qualified_case"]["mode"],
+            "baseline_positive_candidate_zero_regression",
+        )
+
+    def test_actual_resource_regression_blocks_faster_candidate(self):
+        evidence = promotion_evidence()
+
+        for resource, worse_value in (
+            ("model_calls_used", 5),
+            ("total_tokens_used", 60_000),
+        ):
+            with self.subTest(resource=resource):
+                candidate_results = tuple(
+                    replace(
+                        result,
+                        attempts=tuple(
+                            replace(
+                                attempt,
+                                **{resource: worse_value},
+                            )
+                            for attempt in result.attempts
+                        ),
+                    )
+                    if result.case_id.startswith("live-")
+                    else result
+                    for result in evidence.candidate.results
+                )
+
+                outcome = evaluate_blind_live_promotion(
+                    replace(
+                        evidence,
+                        candidate=replace(
+                            evidence.candidate,
+                            results=candidate_results,
+                        ),
+                    )
+                )
+
+                self.assertFalse(outcome["promotion_eligible"])
+                self.assertTrue(
+                    outcome["comparisons"]["live_hidden_improvement"]
+                )
+                self.assertIn(
+                    "split_efficiency_regression:live:"
+                    f"per_qualified_case:{resource}",
+                    outcome["blockers"],
+                )
+                self.assertIn(
+                    "overall_efficiency_regression:"
+                    f"per_qualified_attempt:{resource}",
+                    outcome["blockers"],
+                )
+
+    def test_holdout_category_efficiency_regression_cannot_be_offset(self):
+        evidence = promotion_evidence()
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(
+                        attempt,
+                        solve_wall_seconds_used=11.0,
+                    )
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id == "live-pwn"
+            else result
+            for result in evidence.candidate.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertFalse(result["promotion_eligible"])
+        self.assertTrue(
+            result["comparisons"][
+                "split_qualified_efficiency_noninferiority"
+            ][LIVE]["per_qualified_case"]["solve_wall_seconds_used"]
+        )
+        self.assertTrue(
+            result["comparisons"][
+                "overall_qualified_efficiency_noninferiority"
+            ]["per_qualified_attempt"]["solve_wall_seconds_used"]
+        )
+        self.assertIn(
+            "split_category_efficiency_regression:"
+            "live:pwn:per_qualified_case:solve_wall_seconds_used",
+            result["blockers"],
+        )
+        self.assertIn(
+            "holdout_category_efficiency_regression:"
+            "pwn:per_qualified_attempt:solve_wall_seconds_used",
+            result["blockers"],
+        )
+        split_category = result["comparisons"][
+            "holdout_split_category_qualified_efficiency_comparisons"
+        ][LIVE]["pwn"]["per_qualified_case"]
+        aggregate_category = result["comparisons"][
+            "holdout_category_qualified_efficiency_comparisons"
+        ]["pwn"]["per_qualified_attempt"]
+        self.assertEqual(
+            split_category["mode"],
+            "per_qualified_ratio",
+        )
+        self.assertFalse(
+            split_category["noninferiority"][
+                "solve_wall_seconds_used"
+            ]
+        )
+        self.assertFalse(
+            aggregate_category["noninferiority"][
+                "solve_wall_seconds_used"
+            ]
+        )
+
+    def test_holdout_category_requires_nonregression_not_improvement(self):
+        evidence = promotion_evidence()
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(
+                        attempt,
+                        solve_wall_seconds_used=10.0,
+                    )
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id == "live-pwn"
+            else result
+            for result in evidence.candidate.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertTrue(result["promotion_eligible"])
+        pwn_comparison = result["comparisons"][
+            "holdout_split_category_qualified_efficiency_comparisons"
+        ][LIVE]["pwn"]["per_qualified_attempt"]
+        self.assertTrue(
+            pwn_comparison["noninferiority"][
+                "solve_wall_seconds_used"
+            ]
+        )
+        self.assertFalse(
+            pwn_comparison["resource_improvements"][
+                "solve_wall_seconds_used"
+            ]
+        )
+
+    def test_holdout_category_preserves_zero_denominator_policy(self):
+        evidence = promotion_evidence()
+        baseline_results = tuple(
+            promotion_result(
+                result.case_id,
+                solved=(False, False, False),
+                proof=(False, False, False),
+                reproduced=(False, False, False),
+                run_namespace="baseline",
+            )
+            if result.case_id == "live-pwn"
+            else result
+            for result in evidence.baseline.results
+        )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+            )
+        )
+
+        self.assertTrue(result["promotion_eligible"])
+        pwn_comparison = result["comparisons"][
+            "holdout_split_category_qualified_efficiency_comparisons"
+        ][LIVE]["pwn"]
+        for denominator in (
+            "per_qualified_case",
+            "per_qualified_attempt",
+        ):
+            self.assertEqual(
+                pwn_comparison[denominator]["mode"],
+                "baseline_zero_candidate_positive_total_pareto",
+            )
+            self.assertTrue(
+                pwn_comparison[denominator][
+                    "outcome_efficiency_improvement"
+                ]
+            )
+        self.assertFalse(
+            any(
+                blocker.startswith(
+                    "split_category_efficiency_"
+                )
+                and ":live:pwn:" in blocker
+                for blocker in result["blockers"]
+            )
+        )
+
+    def test_per_attempt_efficiency_cannot_hide_behind_case_efficiency(self):
+        evidence = promotion_evidence()
+
+        def two_qualified_attempts(
+            result: PromotionCaseResult,
+        ) -> PromotionCaseResult:
+            if not result.case_id.startswith("live-"):
+                return result
+            changed = promotion_result(
+                result.case_id,
+                seconds=8.0,
+                solved=(True, True, False),
+                proof=(True, True, True),
+                reproduced=(True, True, True),
+            )
+            attempts = list(changed.attempts)
+            attempts[2] = replace(
+                attempts[2],
+                first_valid_result_seconds=8.0,
+            )
+            return replace(changed, attempts=tuple(attempts))
+
+        candidate_results = tuple(
+            two_qualified_attempts(result)
+            for result in evidence.candidate.results
+        )
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        baseline_efficiency = outcome["metrics"]["baseline"][
+            "by_split"
+        ][LIVE]["qualified_solve_efficiency"]
+        candidate_efficiency = outcome["metrics"]["candidate"][
+            "by_split"
+        ][LIVE]["qualified_solve_efficiency"]
+        self.assertLess(
+            candidate_efficiency["per_qualified_case"][
+                "solve_wall_seconds_used"
+            ],
+            baseline_efficiency["per_qualified_case"][
+                "solve_wall_seconds_used"
+            ],
+        )
+        self.assertGreater(
+            candidate_efficiency["per_qualified_attempt"][
+                "solve_wall_seconds_used"
+            ],
+            baseline_efficiency["per_qualified_attempt"][
+                "solve_wall_seconds_used"
+            ],
+        )
+        self.assertIn(
+            "split_efficiency_regression:live:"
+            "per_qualified_attempt:solve_wall_seconds_used",
+            outcome["blockers"],
+        )
+        self.assertFalse(outcome["promotion_eligible"])
+
+    def test_ttfvr_improvement_without_efficiency_signal_stays_closed(self):
+        evidence = promotion_evidence()
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(attempt, solve_wall_seconds_used=10.0)
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id.startswith("live-")
+            else result
+            for result in evidence.candidate.results
+        )
+
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertTrue(outcome["comparisons"]["live_hidden_improvement"])
+        self.assertFalse(
+            outcome["comparisons"][
+                "live_hidden_efficiency_improvement"
+            ]
+        )
+        self.assertIn(
+            "no_live_hidden_efficiency_improvement",
+            outcome["blockers"],
+        )
+        self.assertFalse(outcome["promotion_eligible"])
+
+    def test_live_cost_efficiency_can_supply_the_improvement_signal(self):
+        evidence = promotion_evidence()
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(
+                        attempt,
+                        first_valid_result_seconds=10.0,
+                        solve_wall_seconds_used=10.0,
+                        model_calls_used=3,
+                    )
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id.startswith("live-")
+            else result
+            for result in evidence.candidate.results
+        )
+
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertFalse(
+            outcome["comparisons"]["live_hidden_primary_improvement"]
+        )
+        self.assertTrue(
+            outcome["comparisons"][
+                "live_hidden_efficiency_improvement"
+            ]
+        )
+        self.assertIn(
+            "live:per_qualified_attempt:model_calls_used",
+            outcome["comparisons"][
+                "live_hidden_efficiency_improvement_signals"
+            ],
+        )
+        self.assertTrue(outcome["promotion_eligible"])
 
     def test_proof_and_reproduction_observations_are_independent(self):
         proof_only = PromotionAttempt(
@@ -769,7 +1547,7 @@ class BlindLivePromotionGateTests(unittest.TestCase):
         reproduction_only.validate()
         proved_and_reproduced.validate()
 
-    def test_candidate_requires_every_attempt_evaluation(self):
+    def test_failed_attempt_does_not_require_proof_evaluation(self):
         evidence = promotion_evidence()
         results = list(evidence.candidate.results)
         first = results[0]
@@ -795,15 +1573,88 @@ class BlindLivePromotionGateTests(unittest.TestCase):
             )
         )
 
-        self.assertFalse(result["promotion_eligible"])
-        self.assertFalse(result["complete_evidence"])
-        self.assertIn(
+        self.assertTrue(result["complete_evidence"])
+        self.assertNotIn(
             "candidate_proof_coverage_incomplete",
             result["blockers"],
         )
-        self.assertIn(
+        self.assertNotIn(
             "candidate_reproduction_coverage_incomplete",
             result["blockers"],
+        )
+        self.assertEqual(
+            result["metrics"]["candidate"]["overall"]["pass^2/3"]["rate"],
+            1.0,
+        )
+
+    def test_two_of_three_failure_coverage_is_symmetric_between_arms(self):
+        evidence = promotion_evidence()
+
+        def two_of_three_results(
+            *,
+            namespace: str,
+            candidate: bool,
+        ) -> tuple[PromotionCaseResult, ...]:
+            return tuple(
+                promotion_result(
+                    case_id,
+                    seconds=(
+                        5.0
+                        if candidate and split_name == LIVE
+                        else 10.0
+                    ),
+                    solved=(True, True, False),
+                    proof_evaluated=(True, True, False),
+                    proof=(True, True, False),
+                    reproduction_evaluated=(True, True, False),
+                    reproduced=(True, True, False),
+                    run_namespace=namespace,
+                )
+                for split_name in (DEV, REGRESSION, BLIND, LIVE)
+                for case_id, _category in PROMOTION_CASES[split_name]
+            )
+
+        result = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=two_of_three_results(
+                        namespace="baseline",
+                        candidate=False,
+                    ),
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=two_of_three_results(
+                        namespace="candidate",
+                        candidate=True,
+                    ),
+                ),
+            )
+        )
+
+        self.assertTrue(result["complete_evidence"])
+        self.assertTrue(result["promotion_eligible"])
+        self.assertEqual(
+            result["metrics"]["baseline"]["overall"]["pass^2/3"]["rate"],
+            1.0,
+        )
+        self.assertEqual(
+            result["metrics"]["candidate"]["overall"]["pass^2/3"]["rate"],
+            1.0,
+        )
+        self.assertFalse(
+            any(
+                "proof_pass_rate" in blocker
+                for blocker in result["blockers"]
+            )
+        )
+        self.assertFalse(
+            any(
+                "reproduction_rate" in blocker
+                for blocker in result["blockers"]
+            )
         )
 
     def test_zero_solve_proof_timing_cannot_promote(self):
@@ -866,6 +1717,20 @@ class BlindLivePromotionGateTests(unittest.TestCase):
         self.assertIn(
             "no_live_hidden_improvement",
             result["blockers"],
+        )
+        self.assertFalse(
+            any(
+                blocker.startswith(
+                    "qualified_efficiency_zero_denominator:"
+                )
+                for blocker in result["blockers"]
+            )
+        )
+        self.assertEqual(
+            result["comparisons"][
+                "overall_qualified_efficiency_comparison"
+            ]["per_qualified_case"]["mode"],
+            "both_zero_total_nonincrease",
         )
         self.assertEqual(
             result["metrics"]["candidate"]["overall"]["solve@1"]["rate"],
@@ -1082,6 +1947,187 @@ class BlindLivePromotionGateTests(unittest.TestCase):
             outcome["blockers"],
         )
         self.assertTrue(outcome["comparisons"]["live_hidden_improvement"])
+
+    def test_category_timing_and_intervention_regressions_cannot_be_offset(
+        self,
+    ):
+        evidence = promotion_evidence()
+
+        baseline_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(
+                        attempt,
+                        first_valid_result_seconds=5.0,
+                        human_interventions=0,
+                    )
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id == "live-pwn"
+            else result
+            for result in evidence.baseline.results
+        )
+        candidate_results = tuple(
+            replace(
+                result,
+                attempts=tuple(
+                    replace(
+                        attempt,
+                        first_valid_result_seconds=6.0,
+                        solve_wall_seconds_used=10.0,
+                    )
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id == "live-pwn"
+            else replace(
+                result,
+                attempts=tuple(
+                    replace(attempt, human_interventions=0)
+                    for attempt in result.attempts
+                ),
+            )
+            if result.case_id.startswith("live-")
+            else result
+            for result in evidence.candidate.results
+        )
+
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertTrue(
+            outcome["comparisons"]["split_noninferiority"][LIVE][
+                "median_time_to_first_valid_result"
+            ]
+        )
+        self.assertTrue(
+            outcome["comparisons"]["split_noninferiority"][LIVE][
+                "human_interventions"
+            ]
+        )
+        for metric in (
+            "median_time_to_first_valid_result",
+            "human_interventions",
+        ):
+            self.assertIn(
+                f"split_category_regression:live:pwn:{metric}",
+                outcome["blockers"],
+            )
+            self.assertIn(
+                f"category_regression:pwn:{metric}",
+                outcome["blockers"],
+            )
+            self.assertFalse(
+                outcome["comparisons"][
+                    "holdout_split_category_noninferiority"
+                ][LIVE]["pwn"][metric]
+            )
+            self.assertFalse(
+                outcome["comparisons"][
+                    "holdout_category_noninferiority"
+                ]["pwn"][metric]
+            )
+        self.assertFalse(outcome["promotion_eligible"])
+
+    def test_category_qualified_result_regression_cannot_be_offset(self):
+        evidence = promotion_evidence()
+
+        def two_qualified(
+            result: PromotionCaseResult,
+            *,
+            namespace: str,
+            seconds: float,
+        ) -> PromotionCaseResult:
+            changed = promotion_result(
+                result.case_id,
+                seconds=seconds,
+                solved=(True, True, False),
+                proof=(True, True, False),
+                reproduced=(True, True, False),
+                run_namespace=namespace,
+            )
+            attempts = list(changed.attempts)
+            attempts[2] = replace(
+                attempts[2],
+                solve_wall_seconds_used=0.0,
+                model_calls_used=0,
+                total_tokens_used=0,
+            )
+            return replace(changed, attempts=tuple(attempts))
+
+        baseline_results = tuple(
+            two_qualified(
+                result,
+                namespace="baseline",
+                seconds=10.0,
+            )
+            if result.case_id == "live-web"
+            else result
+            for result in evidence.baseline.results
+        )
+        candidate_results = tuple(
+            two_qualified(
+                result,
+                namespace="candidate",
+                seconds=5.0,
+            )
+            if result.case_id == "live-pwn"
+            else result
+            for result in evidence.candidate.results
+        )
+
+        outcome = evaluate_blind_live_promotion(
+            replace(
+                evidence,
+                baseline=replace(
+                    evidence.baseline,
+                    results=baseline_results,
+                ),
+                candidate=replace(
+                    evidence.candidate,
+                    results=candidate_results,
+                ),
+            )
+        )
+
+        self.assertTrue(
+            outcome["comparisons"]["split_noninferiority"][LIVE][
+                "first_valid_observed_results"
+            ]
+        )
+        self.assertIn(
+            "split_category_regression:"
+            "live:pwn:first_valid_observed_results",
+            outcome["blockers"],
+        )
+        self.assertIn(
+            "category_regression:pwn:first_valid_observed_results",
+            outcome["blockers"],
+        )
+        self.assertFalse(
+            outcome["comparisons"][
+                "holdout_split_category_noninferiority"
+            ][LIVE]["pwn"]["first_valid_observed_results"]
+        )
+        self.assertFalse(
+            outcome["comparisons"]["holdout_category_noninferiority"][
+                "pwn"
+            ]["first_valid_observed_results"]
+        )
+        self.assertFalse(outcome["promotion_eligible"])
 
     def test_timing_improvement_requires_stricter_effect_floor(self):
         evidence = promotion_evidence()

@@ -2076,6 +2076,7 @@ class ChallengeEngine:
         challenge_flag_format: Mapping[str, Any] | None = None,
         contest_flag_format: Mapping[str, Any] | None = None,
         state_schema_version: int = 1,
+        exist_ok: bool = True,
         _session_owned: bool = False,
     ) -> ChallengeState:
         """Create the human-owned input folder and durable engine state."""
@@ -2102,6 +2103,7 @@ class ChallengeEngine:
                         challenge_flag_format=challenge_flag_format,
                         contest_flag_format=contest_flag_format,
                         state_schema_version=state_schema_version,
+                        exist_ok=exist_ok,
                         _session_owned=True,
                     )
             except LockTimeout as error:
@@ -2184,6 +2186,7 @@ class ChallengeEngine:
             metadata=metadata,
             budget=budget,
             schema_version=state_schema_version,
+            exist_ok=exist_ok,
         )
 
         def update_operator_fields(current: ChallengeState) -> None:
