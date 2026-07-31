@@ -976,34 +976,107 @@ def _validate_forensic_summary(value: dict[str, object]) -> None:
 
 
 def _validate_web_active_summary(value: dict[str, object]) -> None:
-    race = value.get("race")
-    oob = value.get("oob")
-    target_audit = value.get("target_audit")
+    root = _exact_mapping(
+        value,
+        required=frozenset(
+            {
+                "automatic_submission_count",
+                "image_digest",
+                "network",
+                "oob",
+                "protocol",
+                "race",
+                "schema_version",
+                "target_audit",
+            }
+        ),
+        label="web active-probe release summary",
+    )
+    network = _exact_mapping(
+        root["network"],
+        required=frozenset(
+            {
+                "external_internet",
+                "internal",
+                "name",
+            }
+        ),
+        label="web active-probe network summary",
+    )
+    mode_required = frozenset(
+        {
+            "attempt_id",
+            "candidate_count",
+            "evaluation_sha256",
+            "executed_fact_count",
+            "graph_sha256",
+            "mode",
+            "physical_artifact_count",
+            "replay_count",
+            "submission_count",
+        }
+    )
+    race = _exact_mapping(
+        root["race"],
+        required=mode_required,
+        label="web active-probe race summary",
+    )
+    oob = _exact_mapping(
+        root["oob"],
+        required=mode_required,
+        label="web active-probe OOB summary",
+    )
+    target_audit = _exact_mapping(
+        root["target_audit"],
+        required=frozenset(
+            {
+                "control_oob_callbacks",
+                "control_race_requests",
+                "maximum_parallel_race_requests",
+                "vulnerable_oob_callbacks",
+                "vulnerable_race_requests",
+            }
+        ),
+        label="web active-probe target audit",
+    )
     if (
-        value.get("protocol")
+        root["protocol"]
         != "ctfos.web.active_probe.docker_release.v1"
-        or value.get("schema_version") != 1
-        or value.get("external_network") is not False
-        or value.get("automatic_submission_count") != 0
-        or type(race) is not dict
-        or type(oob) is not dict
-        or type(target_audit) is not dict
-        or race.get("mode") != "race"
-        or oob.get("mode") != "oob"
-        or race.get("replay_count") != 6
-        or oob.get("replay_count") != 6
-        or race.get("executed_fact_count") != 1
-        or oob.get("executed_fact_count") != 1
-        or race.get("candidate_count") != 0
-        or oob.get("candidate_count") != 0
-        or race.get("submission_count") != 0
-        or oob.get("submission_count") != 0
-        or race.get("physical_artifact_count") != 29
-        or oob.get("physical_artifact_count") != 26
-        or not _valid_sha256(race.get("evaluation_sha256"))
-        or not _valid_sha256(oob.get("evaluation_sha256"))
-        or not _valid_sha256(race.get("graph_sha256"))
-        or not _valid_sha256(oob.get("graph_sha256"))
+        or root["schema_version"] != 1
+        or root["automatic_submission_count"] != 0
+        or network["external_internet"] is not False
+        or network["internal"] is not True
+        or type(network["name"]) is not str
+        or not network["name"].startswith("ctfos-web-active-")
+        or type(race["attempt_id"]) is not str
+        or re.fullmatch(
+            r"web-active-[0-9a-f]{32}",
+            race["attempt_id"],
+        )
+        is None
+        or type(oob["attempt_id"]) is not str
+        or re.fullmatch(
+            r"web-active-[0-9a-f]{32}",
+            oob["attempt_id"],
+        )
+        is None
+        or race["attempt_id"] == oob["attempt_id"]
+        or race["mode"] != "race"
+        or oob["mode"] != "oob"
+        or race["replay_count"] != 6
+        or oob["replay_count"] != 6
+        or race["executed_fact_count"] != 1
+        or oob["executed_fact_count"] != 1
+        or race["candidate_count"] != 0
+        or oob["candidate_count"] != 0
+        or race["submission_count"] != 0
+        or oob["submission_count"] != 0
+        or race["physical_artifact_count"] != 29
+        or oob["physical_artifact_count"] != 26
+        or not _valid_sha256(race["evaluation_sha256"])
+        or not _valid_sha256(oob["evaluation_sha256"])
+        or not _valid_sha256(race["graph_sha256"])
+        or not _valid_sha256(oob["graph_sha256"])
         or target_audit
         != {
             "control_oob_callbacks": 0,

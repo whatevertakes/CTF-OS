@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -14,6 +16,15 @@ SCRIPT = (
     / "scripts"
     / "check-web-active-probe-docker-hotpath.py"
 )
+SPEC = importlib.util.spec_from_file_location(
+    "ctfos_web_active_probe_docker_hotpath",
+    SCRIPT,
+)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError("could not load Web active-probe Docker hotpath")
+release = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = release
+SPEC.loader.exec_module(release)
 
 
 class WebActiveProbeReleaseTests(unittest.TestCase):
@@ -23,6 +34,7 @@ class WebActiveProbeReleaseTests(unittest.TestCase):
         self.assertIn("engine.validate_web_active_probe(", source)
         self.assertIn('docker_network=network', source)
         self.assertIn('"--internal"', source)
+        self.assertIn('("network", "inspect", network)', source)
         self.assertIn('mode="race"', source)
         self.assertIn('mode="oob"', source)
         self.assertIn("validate_web_active_probe_state_graph(final)", source)
@@ -32,6 +44,45 @@ class WebActiveProbeReleaseTests(unittest.TestCase):
         self.assertNotIn("record_candidate(", source)
         self.assertNotIn("submit_candidate", source)
         self.assertNotIn("select_next_challenge", source)
+
+    def test_network_audit_rejects_non_internal_network(self) -> None:
+        inspected = subprocess.CompletedProcess(
+            args=("docker", "network", "inspect"),
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "Internal": False,
+                        "Name": "ctfos-web-active-test",
+                    }
+                ]
+            ),
+            stderr="",
+        )
+        with mock.patch.object(release, "_docker", return_value=inspected):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "not the requested internal network",
+            ):
+                release._inspect_internal_network(
+                    "ctfos-web-active-test"
+                )
+
+    def test_network_audit_fails_closed_when_inspection_is_refused(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            release,
+            "_docker",
+            side_effect=RuntimeError("docker inspect refused"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "inspect refused",
+            ):
+                release._inspect_internal_network(
+                    "ctfos-web-active-test"
+                )
 
     @unittest.skipUnless(
         os.environ.get("CTFOS_RUN_WEB_ACTIVE_DOCKER") == "1"
@@ -65,7 +116,19 @@ class WebActiveProbeReleaseTests(unittest.TestCase):
             summary["protocol"],
             "ctfos.web.active_probe.docker_release.v1",
         )
-        self.assertFalse(summary["external_network"])
+        self.assertEqual(
+            summary["network"],
+            {
+                "external_internet": False,
+                "internal": True,
+                "name": summary["network"]["name"],
+            },
+        )
+        self.assertTrue(
+            summary["network"]["name"].startswith(
+                "ctfos-web-active-"
+            )
+        )
         self.assertEqual(summary["automatic_submission_count"], 0)
         for mode in ("race", "oob"):
             self.assertEqual(summary[mode]["mode"], mode)

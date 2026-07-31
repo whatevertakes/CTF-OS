@@ -237,6 +237,34 @@ def _docker(
     return result
 
 
+def _inspect_internal_network(network: str) -> dict[str, object]:
+    try:
+        details = json.loads(
+            _docker(("network", "inspect", network), timeout=30).stdout
+        )
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            "release-smoke Docker network inspection was not JSON"
+        ) from error
+    if (
+        type(details) is not list
+        or len(details) != 1
+        or type(details[0]) is not dict
+        or details[0].get("Name") != network
+        or details[0].get("Internal") is not True
+    ):
+        raise AssertionError(
+            "release-smoke Docker network is not the requested "
+            "internal network"
+        )
+    internal = details[0]["Internal"]
+    return {
+        "external_internet": not internal,
+        "internal": internal,
+        "name": network,
+    }
+
+
 def _start_target(
     *,
     image_digest: str,
@@ -689,6 +717,7 @@ def main() -> int:
         )
     )
     try:
+        network_audit = _inspect_internal_network(network)
         with tempfile.TemporaryDirectory(
             prefix="ctfos-web-active-release-"
         ) as temporary:
@@ -736,8 +765,8 @@ def main() -> int:
                 _canonical(
                     {
                         "automatic_submission_count": 0,
-                        "external_network": False,
                         "image_digest": image_digest,
+                        "network": network_audit,
                         "oob": oob,
                         "protocol": (
                             "ctfos.web.active_probe.docker_release.v1"

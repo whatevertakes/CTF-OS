@@ -180,16 +180,22 @@ def _valid_summary(task_id: str) -> dict[str, object]:
         }
         return {
             "automatic_submission_count": 0,
-            "external_network": False,
             "image_digest": IMAGE_DIGEST,
+            "network": {
+                "external_internet": False,
+                "internal": True,
+                "name": "ctfos-web-active-release-test",
+            },
             "oob": {
                 **common,
+                "attempt_id": "web-active-" + "c" * 32,
                 "mode": "oob",
                 "physical_artifact_count": 26,
             },
             "protocol": "ctfos.web.active_probe.docker_release.v1",
             "race": {
                 **common,
+                "attempt_id": "web-active-" + "d" * 32,
                 "mode": "race",
                 "physical_artifact_count": 29,
             },
@@ -434,6 +440,33 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
             "race/OOB oracle",
         ):
             release._validate_child_summary(task, rejected, IMAGE_DIGEST)
+
+    def test_web_active_summary_rejects_extra_root_and_nested_keys(
+        self,
+    ) -> None:
+        for mutate in (
+            lambda value: value.__setitem__("unexpected_root", True),
+            lambda value: value["race"].__setitem__(
+                "unexpected_nested",
+                True,
+            ),
+            lambda value: value["network"].__setitem__(
+                "unexpected_nested",
+                True,
+            ),
+            lambda value: value["target_audit"].__setitem__(
+                "unexpected_nested",
+                True,
+            ),
+        ):
+            with self.subTest(mutate=mutate):
+                summary = _valid_summary("web_active_probe")
+                mutate(summary)
+                with self.assertRaisesRegex(
+                    release.ReleaseMatrixError,
+                    "schema is invalid",
+                ):
+                    release._validate_web_active_summary(summary)
 
     def test_every_category_summary_has_a_field_level_oracle(self) -> None:
         for task in release.RELEASE_TASKS:
