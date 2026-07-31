@@ -21,6 +21,7 @@ from unittest import mock
 
 import ctf_os.engine.challenge as challenge_module
 import ctf_os.models as models_module
+import ctf_os.promotion_bundles as promotion_bundles
 import ctf_os.store.files as store_files
 from ctf_os.adapters import get_adapter
 from ctf_os.budget import deadline_epoch
@@ -601,6 +602,36 @@ class EngineTests(unittest.TestCase):
             sandbox_factory=lambda state, work, policy: FakeSandbox(work),
         )
 
+    def promotion_guard_metadata(
+        self,
+        engine: ChallengeEngine,
+        state: ChallengeState,
+    ) -> dict[str, object]:
+        knowledge_count, knowledge_sha256 = (
+            promotion_bundles._knowledge_snapshot(
+                engine.store,
+                state.identity,
+            )
+        )
+        self.assertEqual(knowledge_count, 0)
+        incoming_inventory = (
+            promotion_bundles._incoming_inventory_summary(
+                self.root,
+                state,
+            )
+        )
+        return {
+            "evaluation_knowledge_document_count": knowledge_count,
+            "evaluation_knowledge_snapshot_sha256": knowledge_sha256,
+            "evaluation_operator_input_schema_version": 1,
+            "evaluation_operator_input_sha256": (
+                promotion_bundles._operator_input_sha256(
+                    state,
+                    incoming_inventory,
+                )
+            ),
+        }
+
     def engine_with_rev_inventory(
         self,
         payload: bytes,
@@ -783,9 +814,12 @@ class EngineTests(unittest.TestCase):
         def digest(value: bytes) -> str:
             return hashlib.sha256(value).hexdigest()
 
+        guard_metadata = self.promotion_guard_metadata(engine, added)
+
         def prepare(state: ChallengeState) -> None:
             state.metadata.update(
                 {
+                    **guard_metadata,
                     "evaluation_prepared": True,
                     "evaluation_system": THIN_SCAFFOLD,
                     "evaluation_benchmark_id": "blind-release",
@@ -878,9 +912,12 @@ class EngineTests(unittest.TestCase):
         def digest(value: bytes) -> str:
             return hashlib.sha256(value).hexdigest()
 
+        guard_metadata = self.promotion_guard_metadata(engine, added)
+
         def prepare(state: ChallengeState) -> None:
             state.metadata.update(
                 {
+                    **guard_metadata,
                     "evaluation_prepared": True,
                     "evaluation_system": THIN_SCAFFOLD,
                     "evaluation_benchmark_id": "blind-release",
@@ -1056,9 +1093,12 @@ class EngineTests(unittest.TestCase):
         def digest(value: bytes) -> str:
             return hashlib.sha256(value).hexdigest()
 
+        guard_metadata = self.promotion_guard_metadata(engine, added)
+
         def prepare(state: ChallengeState) -> None:
             state.metadata.update(
                 {
+                    **guard_metadata,
                     "evaluation_prepared": True,
                     "evaluation_system": THIN_SCAFFOLD,
                     "evaluation_benchmark_id": "blind-release",

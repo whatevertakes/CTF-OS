@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import ctf_os.promotion_bundles as promotion_bundles
 from ctf_os.benchmark import CTF_OS_SYSTEM, THIN_SCAFFOLD
 from ctf_os.budget import deadline_utc_after
 from ctf_os.codex import BatchRunner, FifoModelCallLimiter, Role
@@ -135,6 +136,36 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             state.budget.deadline_utc = None
 
         engine.store.update(self.identity, remove_wall_deadline)
+
+    def promotion_guard_metadata(
+        self,
+        engine: ChallengeEngine,
+    ) -> dict[str, object]:
+        state = engine.store.load(self.identity)
+        knowledge_count, knowledge_sha256 = (
+            promotion_bundles._knowledge_snapshot(
+                engine.store,
+                self.identity,
+            )
+        )
+        self.assertEqual(knowledge_count, 0)
+        incoming_inventory = (
+            promotion_bundles._incoming_inventory_summary(
+                self.root,
+                state,
+            )
+        )
+        return {
+            "evaluation_knowledge_document_count": knowledge_count,
+            "evaluation_knowledge_snapshot_sha256": knowledge_sha256,
+            "evaluation_operator_input_schema_version": 1,
+            "evaluation_operator_input_sha256": (
+                promotion_bundles._operator_input_sha256(
+                    state,
+                    incoming_inventory,
+                )
+            ),
+        }
 
     def test_insufficient_budget_preserves_captain_and_pauses_without_wave(
         self,
@@ -325,12 +356,14 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             image_digest=IMAGE,
         )
         self.add_with_accounting_only_budget(engine, 100)
+        guard_metadata = self.promotion_guard_metadata(engine)
 
         def prepare(state) -> None:
             metadata = prepared_metadata(CTF_OS_SYSTEM)
             metadata["source_manifest_sha256"] = state.metadata[
                 "source_manifest_sha256"
             ]
+            metadata.update(guard_metadata)
             state.metadata.update(metadata)
 
         engine.store.update(self.identity, prepare)
@@ -419,12 +452,14 @@ class ManagedWaveBudgetIntegrationTests(unittest.TestCase):
             image_digest=IMAGE,
         )
         self.add_with_accounting_only_budget(engine, 100)
+        guard_metadata = self.promotion_guard_metadata(engine)
 
         def prepare(state) -> None:
             metadata = prepared_metadata(THIN_SCAFFOLD)
             metadata["source_manifest_sha256"] = state.metadata[
                 "source_manifest_sha256"
             ]
+            metadata.update(guard_metadata)
             state.metadata.update(metadata)
 
         engine.store.update(self.identity, prepare)

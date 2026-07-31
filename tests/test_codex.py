@@ -1304,21 +1304,28 @@ class CommandTests(unittest.TestCase):
                     tool.get("name") or tool.get("type")
                     for tool in additional_tools
                 }
-                self.assertEqual(
+                legacy_surface = {
+                    "exec",
+                    "wait",
+                    "list_mcp_resources",
+                    "list_mcp_resource_templates",
+                    "read_mcp_resource",
+                    "update_plan",
+                    "request_user_input",
+                    "apply_patch",
+                    "view_image",
+                    "collaboration",
+                    "tool_search",
+                }
+                code_mode_surface = {
+                    "exec",
+                    "wait",
+                    "request_user_input",
+                    "collaboration",
+                }
+                self.assertIn(
                     production_names,
-                    {
-                        "exec",
-                        "wait",
-                        "list_mcp_resources",
-                        "list_mcp_resource_templates",
-                        "read_mcp_resource",
-                        "update_plan",
-                        "request_user_input",
-                        "apply_patch",
-                        "view_image",
-                        "collaboration",
-                        "tool_search",
-                    },
+                    (legacy_surface, code_mode_surface),
                 )
                 self.assertTrue(
                     production_names.isdisjoint(
@@ -1332,14 +1339,32 @@ class CommandTests(unittest.TestCase):
                         }
                     )
                 )
-                tool_search = next(
-                    tool
-                    for tool in additional_tools
-                    if tool.get("type") == "tool_search"
-                )
-                tool_search_description = str(tool_search.get("description", ""))
-                self.assertIn("ctfos_live", tool_search_description)
-                self.assertNotIn("codex_apps", tool_search_description)
+                if production_names == legacy_surface:
+                    tool_search = next(
+                        tool
+                        for tool in additional_tools
+                        if tool.get("type") == "tool_search"
+                    )
+                    tool_search_description = str(
+                        tool_search.get("description", "")
+                    )
+                    self.assertIn("ctfos_live", tool_search_description)
+                    self.assertNotIn("codex_apps", tool_search_description)
+                else:
+                    # Codex 0.146 code mode exposes deferred MCP tools only
+                    # through the local exec registry.  Keep this an exact
+                    # four-tool surface and require the documented registry
+                    # boundary rather than accepting an arbitrary subset.
+                    exec_tool = next(
+                        tool
+                        for tool in additional_tools
+                        if tool.get("name") == "exec"
+                    )
+                    exec_description = str(
+                        exec_tool.get("description", "")
+                    )
+                    self.assertIn("ALL_TOOLS", exec_description)
+                    self.assertIn("nested tools", exec_description)
                 self.assertNotIn(b"mcp__codex_apps__", production_bytes)
                 self.assertNotIn(capability.encode("utf-8"), production_bytes)
                 self.assertNotIn(str(mailbox).encode("utf-8"), production_bytes)
