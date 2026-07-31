@@ -31,6 +31,7 @@ from ctf_os.config import (
     set_runtime_image_digest,
 )
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.knowledge import KnowledgeStore
 from ctf_os.managed_continuity import (
     THREAD_CONTINUITY_CONTRACT_VERSION,
     THREAD_CONTINUITY_RUN_KEY,
@@ -43,7 +44,11 @@ from ctf_os.models import (
     ArtifactReference,
     Budget,
     BudgetMode,
+    Fact,
+    Falsifier,
+    Hypothesis,
     ManagedCycle,
+    Provenance,
     RunOrigin,
     RunReference,
     RunStatus,
@@ -274,6 +279,32 @@ class PromotionBundleTests(unittest.TestCase):
             )
         ]
 
+    def _create_unprepared_state(
+        self,
+        session_id: str,
+        *,
+        prompt: str = "",
+    ):
+        parsed = parse_promotion_manifest(self.manifest)
+        session = parsed.sessions[session_id]
+        state = self.store.create_challenge(
+            session.identity,
+            prompt=prompt,
+            metadata={
+                "source_manifest_sha256": (
+                    session.input_manifest_sha256
+                ),
+            },
+            budget=Budget(
+                allocated_seconds=60,
+                spent_seconds=0,
+                mode=BudgetMode.BOUNDED,
+            ),
+            schema_version=STATE_SCHEMA_VERSION,
+            exist_ok=False,
+        )
+        return session, state
+
     def _create_state(
         self,
         session_id: str,
@@ -281,30 +312,18 @@ class PromotionBundleTests(unittest.TestCase):
         split: str,
         arm: str,
         attempt: int,
+        *,
+        prompt: str = "",
     ) -> None:
         parsed = parse_promotion_manifest(self.manifest)
-        session = parsed.sessions[session_id]
-        metadata = {
-            "source_manifest_sha256": (
-                session.input_manifest_sha256
-            ),
-        }
-        state = self.store.create_challenge(
-            session.identity,
-            metadata=metadata,
-            budget=Budget(
-                allocated_seconds=60,
-                spent_seconds=0,
-                mode=BudgetMode.BOUNDED,
-            ),
-            # The generic proof fixture exercises the collector independently
-            # from each category's current typed proof contract.  The
-            # scaffold evidence itself is nevertheless canonical schema v2:
-            # arm labels without typed execution bindings must never satisfy
-            # promotion collection.
-            schema_version=STATE_SCHEMA_VERSION,
-            exist_ok=False,
+        session, state = self._create_unprepared_state(
+            session_id,
+            prompt=prompt,
         )
+        # The generic proof fixture exercises the collector independently
+        # from each category's current typed proof contract.  The scaffold
+        # evidence itself is nevertheless canonical schema v2: arm labels
+        # without typed execution bindings must never satisfy collection.
         original_created = datetime.fromisoformat(
             state.created_at.replace("Z", "+00:00")
         )
@@ -1053,6 +1072,285 @@ class PromotionBundleTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.assertRaises(PromotionBundleError):
                     parse_promotion_manifest(value)
+
+    def test_preloaded_trajectory_and_knowledge_fail_before_prepare(
+        self,
+    ) -> None:
+        self._freeze()
+        records = self._session_records()
+
+        fact_session, _state = self._create_unprepared_state(
+            records[0][0]
+        )
+
+        def inject_fact(current) -> None:
+            current.facts.append(
+                Fact(
+                    id="F-preloaded-answer",
+                    statement="preloaded public writeup answer",
+                    provenance=Provenance.EXTERNAL_DOC,
+                    challenge_id=current.challenge_id,
+                )
+            )
+
+        self.store.update(fact_session.identity, inject_fact)
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "pre-run trajectory state",
+        ):
+            prepare_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=records[0][0],
+            )
+
+        hypothesis_session, _state = self._create_unprepared_state(
+            records[1][0]
+        )
+
+        def inject_hypothesis(current) -> None:
+            current.hypotheses.append(
+                Hypothesis(
+                    id="H-preloaded-answer",
+                    statement="the public writeup already gives the answer",
+                    falsifier=Falsifier(
+                        description="must not enter a blind session"
+                    ),
+                )
+            )
+
+        self.store.update(
+            hypothesis_session.identity,
+            inject_hypothesis,
+        )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "pre-run trajectory state",
+        ):
+            prepare_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=records[1][0],
+            )
+
+        artifact_session, _state = self._create_unprepared_state(
+            records[2][0]
+        )
+        artifact_relative = Path("artifacts") / "preloaded-answer.txt"
+        artifact_path = (
+            self.store.challenge_paths(artifact_session.identity).root
+            / artifact_relative
+        )
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("preloaded answer artifact", encoding="utf-8")
+
+        def inject_artifact(current) -> None:
+            current.artifacts.append(
+                ArtifactReference(
+                    id="A-preloaded-answer",
+                    path=artifact_relative.as_posix(),
+                    sha256=sha256_file(artifact_path),
+                    size=artifact_path.stat().st_size,
+                    media_type="text/plain",
+                )
+            )
+
+        self.store.update(artifact_session.identity, inject_artifact)
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "pre-run trajectory state",
+        ):
+            prepare_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=records[2][0],
+            )
+
+        knowledge_session, _state = self._create_unprepared_state(
+            records[3][0]
+        )
+        writeup = self.root / "public-writeup.txt"
+        writeup.write_text(
+            "flag{must-not-enter-a-promotion-context}",
+            encoding="utf-8",
+        )
+        KnowledgeStore(self.store).add(
+            knowledge_session.identity,
+            writeup,
+            source_url="https://example.invalid/public-writeup",
+        )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "empty challenge knowledge snapshot",
+        ):
+            prepare_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=records[3][0],
+            )
+
+    def test_real_initial_ingest_seeds_remain_preparable(self) -> None:
+        parsed = parse_promotion_manifest(self.manifest)
+        session = next(
+            item
+            for item in parsed.sessions.values()
+            if item.case_id == "blind-pwn"
+            and item.arm == THIN_SCAFFOLD
+            and item.attempt == 1
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        )
+        incoming = engine.challenge_input(session.identity)
+        incoming.mkdir(parents=True, exist_ok=True)
+        (incoming / "challenge.bin").write_bytes(b"initial-ingest-fixture")
+        state = engine.add_challenge(
+            session.identity,
+            prompt="solve the supplied challenge",
+            budget_seconds=60,
+            state_schema_version=STATE_SCHEMA_VERSION,
+        )
+        manifest_sha256 = state.metadata["source_manifest_sha256"]
+        for split in self.manifest["splits"]:
+            for case in split["cases"]:
+                if case["case_id"] == session.case_id:
+                    case["input_manifest_sha256"] = manifest_sha256
+        self.manifest_path.write_text(
+            json.dumps(self.manifest, sort_keys=True),
+            encoding="utf-8",
+        )
+        self._freeze()
+        result = prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session.session_id,
+        )
+        self.assertTrue(result["prepared"])
+        prepared = self.store.load(session.identity, recover=False)
+        self.assertTrue(prepared.goals)
+        self.assertTrue(prepared.experiments)
+        self.assertTrue(
+            all(
+                experiment.extra.get("adapter_seed") is True
+                for experiment in prepared.experiments
+            )
+        )
+
+    def test_knowledge_injected_after_prepare_blocks_provider_and_capture(
+        self,
+    ) -> None:
+        self._freeze()
+        records = self._session_records()
+        session, _state = self._create_unprepared_state(records[0][0])
+        prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=records[0][0],
+        )
+        writeup = self.root / "late-writeup.txt"
+        writeup.write_text("late answer", encoding="utf-8")
+        KnowledgeStore(self.store).add(
+            session.identity,
+            writeup,
+            source_url="https://example.invalid/late-writeup",
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        )
+        with self.assertRaisesRegex(
+            EngineError,
+            "knowledge snapshot",
+        ):
+            engine._require_prepared_execution_fingerprint(
+                self.store.load(session.identity, recover=False)
+            )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "knowledge differs",
+        ):
+            finalize_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=records[0][0],
+                human_interventions=0,
+                secret_or_flag_leaks=0,
+            )
+
+        completed_record = records[1]
+        self._create_state(*completed_record)
+        completed = parse_promotion_manifest(self.manifest).sessions[
+            completed_record[0]
+        ]
+        KnowledgeStore(self.store).add(
+            completed.identity,
+            writeup,
+            source_url="https://example.invalid/late-capture-writeup",
+        )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "knowledge differs",
+        ):
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=completed_record[0],
+                output_directory=self.root / "knowledge-contaminated",
+            )
+
+    def test_paired_sessions_require_identical_initial_context(self) -> None:
+        self._freeze()
+        parsed = parse_promotion_manifest(self.manifest)
+        sessions = sorted(
+            (
+                session
+                for session in parsed.sessions.values()
+                if session.case_id == "blind-pwn"
+            ),
+            key=lambda session: (session.arm, session.attempt),
+        )
+        self.assertEqual(len(sessions), 6)
+        bundles: list[Path] = []
+        for index, session in enumerate(sessions, start=1):
+            record = (
+                session.session_id,
+                session.case_id,
+                session.split,
+                session.arm,
+                session.attempt,
+            )
+            self._create_state(
+                *record,
+                prompt=(
+                    "paired initial context"
+                    if index < 6
+                    else "one-arm preloaded trajectory"
+                ),
+            )
+            bundle = self.root / f"context-mismatch-{index}"
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=session.session_id,
+                output_directory=bundle,
+            )
+            bundles.append(bundle)
+        result = evaluate_promotion_bundles(
+            self.root,
+            self.frozen_path,
+            bundles,
+        )
+        self.assertFalse(result["promotion_eligible"])
+        self.assertIn(
+            "paired_initial_context_mismatch:blind-pwn",
+            result["collector"]["blockers"],
+        )
+        self.assertFalse(
+            result["collector"]["all_paired_initial_contexts_match"]
+        )
 
     def test_cohort_contamination_and_duplicate_run_ids_are_rejected(
         self,

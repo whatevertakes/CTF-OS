@@ -60,6 +60,7 @@ from ctf_os.codex import (
 )
 from ctf_os.evaluation import EvaluationReport, evaluate_workspace
 from ctf_os.config import EngineConfig, load_config
+from ctf_os.knowledge import KnowledgeError, KnowledgeStore
 from ctf_os.managed_continuity import (
     THREAD_CONTINUITY_SESSION_KEY,
     valid_thread_id,
@@ -67,6 +68,7 @@ from ctf_os.managed_continuity import (
 from ctf_os.models import (
     ChallengeIdentity,
     ChallengeState,
+    ExperimentKind,
     ExperimentStatus,
     RunOrigin,
     RunReference,
@@ -124,6 +126,14 @@ _SPLITS = frozenset({DEV, REGRESSION, BLIND, LIVE, HIDDEN})
 _KEY_RELATIVE_PATH = Path("runtime") / "promotion-bundle.key"
 _MANIFEST_DOMAIN = b"ctfos-promotion-manifest-v1\0"
 _BUNDLE_DOMAIN = b"ctfos-promotion-bundle-v1\0"
+_EMPTY_KNOWLEDGE_SNAPSHOT = {
+    "schema_version": 1,
+    "documents": [],
+}
+_EMPTY_KNOWLEDGE_SNAPSHOT_SHA256 = hashlib.sha256(
+    canonical_json_bytes(_EMPTY_KNOWLEDGE_SNAPSHOT)
+).hexdigest()
+_INITIAL_CONTEXT_SCHEMA_VERSION = 1
 _MODEL_ROLE_FIELDS = (
     "captain",
     "recon",
@@ -1010,6 +1020,164 @@ def execution_fingerprint_report(
     }
 
 
+def _without_volatile_fields(
+    value: Mapping[str, object],
+    *fields: str,
+) -> dict[str, object]:
+    excluded = frozenset(fields)
+    return {
+        key: item
+        for key, item in value.items()
+        if key not in excluded
+    }
+
+
+def _initial_context_sha256(state: ChallengeState) -> str:
+    """Hash the operator-visible pre-run context across paired sessions.
+
+    Session identity, timestamps, state revisions, and budget deadlines differ
+    by construction.  Everything that can materially change the initial model
+    context is retained, while those volatile fields are removed.
+    """
+
+    metadata = {
+        key: value
+        for key, value in state.metadata.items()
+        if not key.startswith("evaluation_")
+        and key != "human_intervention_count"
+    }
+    goals = [
+        _without_volatile_fields(goal.to_dict(), "created_at")
+        for goal in state.goals
+    ]
+    experiments = [
+        _without_volatile_fields(
+            experiment.to_dict(v2=state.schema_version >= 2),
+            "created_at",
+        )
+        for experiment in state.experiments
+    ]
+    targets = [
+        _without_volatile_fields(
+            target.to_dict(),
+            "created_at",
+            "last_preflight",
+        )
+        for target in state.targets
+    ]
+    document = {
+        "schema_version": _INITIAL_CONTEXT_SCHEMA_VERSION,
+        "category": state.category,
+        "status": state.status.value,
+        "description": state.description,
+        "prompt": state.prompt,
+        "source_inventory": [
+            source.to_dict() for source in state.source_inventory
+        ],
+        "metadata": metadata,
+        "active_goal_id": state.active_goal_id,
+        "goals": goals,
+        "experiments": experiments,
+        "targets": targets,
+        "primary_target_id": state.primary_target_id,
+        "configuration_epoch": state.configuration_epoch,
+        "budget": {
+            "allocated_seconds": state.budget.allocated_seconds,
+            "model_tier": state.budget.model_tier,
+            "abort_rule": dict(state.budget.abort_rule),
+            "curve_profile": state.budget.curve_profile,
+            "mode": state.budget.mode.value,
+        },
+        "state_extra": dict(state.extra),
+    }
+    return _sha256(canonical_json_bytes(document))
+
+
+def _require_clean_preexecution_context(state: ChallengeState) -> None:
+    """Reject solve-derived state while preserving deterministic ingest seeds."""
+
+    contaminated = [
+        name
+        for name, values in (
+            ("facts", state.facts),
+            ("hypotheses", state.hypotheses),
+            ("progress_markers", state.progress_markers),
+            ("artifacts", state.artifacts),
+            ("checkpoints", state.checkpoints),
+            ("workspace_publishes", state.workspace_publishes),
+        )
+        if values
+    ]
+    if state.closure is not None:
+        contaminated.append("closure")
+    if contaminated:
+        raise PromotionBundleError(
+            "promotion session contains pre-run trajectory state: "
+            + ", ".join(contaminated)
+        )
+    for experiment in state.experiments:
+        if (
+            experiment.status is not ExperimentStatus.REGISTERED
+            or experiment.kind is not ExperimentKind.PROBE
+            or experiment.extra.get("adapter_seed") is not True
+            or experiment.hypothesis_ids
+            or experiment.result is not None
+            or experiment.source_run_id is not None
+            or experiment.artifact_ids
+            or experiment.evidence_fact_ids
+            or experiment.evidence_run_ids
+            or experiment.evidence_receipt_ids
+            or experiment.evaluation_reason is not None
+            or experiment.evaluated_at is not None
+            or experiment.proof_recipe is not None
+        ):
+            raise PromotionBundleError(
+                "promotion session contains a non-ingest pre-run experiment"
+            )
+
+
+def _knowledge_snapshot(
+    store: StateStore,
+    identity: ChallengeIdentity,
+) -> tuple[int, str]:
+    try:
+        records = KnowledgeStore(store).list(identity)
+    except (KnowledgeError, OSError) as error:
+        raise PromotionBundleError(
+            "promotion challenge knowledge could not be verified"
+        ) from error
+    snapshot = {
+        "schema_version": 1,
+        "documents": [record.to_dict() for record in records],
+    }
+    return len(records), _sha256(canonical_json_bytes(snapshot))
+
+
+def require_promotion_knowledge_snapshot(
+    store: StateStore,
+    state: ChallengeState,
+) -> None:
+    """Re-attest the frozen empty knowledge surface at execution boundaries."""
+
+    count, digest = _knowledge_snapshot(store, state.identity)
+    expected_count = state.metadata.get(
+        "evaluation_knowledge_document_count"
+    )
+    expected_digest = state.metadata.get(
+        "evaluation_knowledge_snapshot_sha256"
+    )
+    if (
+        count != 0
+        or digest != _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256
+        or expected_count != 0
+        or expected_digest != _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256
+    ):
+        raise PromotionBundleError(
+            "promotion challenge knowledge differs from the frozen empty "
+            "snapshot"
+        )
+
+
 def _prepared_metadata(
     manifest: ParsedManifest,
     session: ManifestSession,
@@ -1036,6 +1204,10 @@ def _prepared_metadata(
         ),
         "evaluation_engine_source_sha256": (
             manifest.fingerprint.engine_source_sha256
+        ),
+        "evaluation_knowledge_document_count": 0,
+        "evaluation_knowledge_snapshot_sha256": (
+            _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256
         ),
         "evaluation_prepared": True,
     }
@@ -1093,6 +1265,19 @@ def prepare_promotion_session(
         raise PromotionBundleError(
             "canonical state does not have the frozen fixed wall budget"
         )
+    _require_clean_preexecution_context(state)
+    knowledge_count, knowledge_sha256 = _knowledge_snapshot(
+        store,
+        session.identity,
+    )
+    if (
+        knowledge_count != 0
+        or knowledge_sha256 != _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256
+    ):
+        raise PromotionBundleError(
+            "promotion sessions require an empty challenge knowledge snapshot"
+        )
+    initial_context_sha256 = _initial_context_sha256(state)
     executed_experiment = any(
         experiment.status is not ExperimentStatus.REGISTERED
         for experiment in state.experiments
@@ -1115,6 +1300,9 @@ def prepare_promotion_session(
         manifest,
         session,
         frozen_at,
+    )
+    binding["evaluation_initial_context_sha256"] = (
+        initial_context_sha256
     )
     if all(
         state.metadata.get(key) == expected
@@ -1158,6 +1346,7 @@ def prepare_promotion_session(
         apply,
         expected_revision=state.revision,
     )
+    require_promotion_knowledge_snapshot(store, prepared)
     return {
         "schema_version": PROMOTION_BUNDLE_SCHEMA_VERSION,
         "prepared": True,
@@ -1216,6 +1405,11 @@ def finalize_promotion_session(
         raise PromotionBundleError(
             "canonical state is not bound to this frozen session"
         )
+    _sha256_value(
+        state.metadata.get("evaluation_initial_context_sha256"),
+        "evaluation_initial_context_sha256",
+    )
+    require_promotion_knowledge_snapshot(store, state)
     if state.metadata.get(
         "evaluation_human_interventions_finalized"
     ) is True or state.metadata.get("evaluation_safety_finalized") is True:
@@ -2132,6 +2326,14 @@ def _derive_attempt(
         observed = state.metadata.get(key)
         if observed != expected:
             blockers.append(f"state_metadata_mismatch:{key}")
+    initial_context_sha256 = state.metadata.get(
+        "evaluation_initial_context_sha256"
+    )
+    if (
+        type(initial_context_sha256) is not str
+        or _SHA256_RE.fullmatch(initial_context_sha256) is None
+    ):
+        blockers.append("initial_context_binding_invalid")
     if (
         state.metadata.get(
             "evaluation_human_interventions_finalized"
@@ -2452,6 +2654,8 @@ def capture_promotion_session(
         expected=session.identity,
         label="canonical state",
     )
+    knowledge_store = StateStore(workspace)
+    require_promotion_knowledge_snapshot(knowledge_store, state)
     if (
         state.metadata.get("source_manifest_sha256")
         != session.input_manifest_sha256
@@ -2639,6 +2843,7 @@ def capture_promotion_session(
             raise PromotionBundleError(
                 "execution fingerprint changed during promotion capture"
             )
+        require_promotion_knowledge_snapshot(knowledge_store, state)
         os.rename(temporary_root, output)
     except BaseException:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -3135,6 +3340,7 @@ def evaluate_promotion_bundles(
         )
     verified_by_session: dict[str, VerifiedBundle] = {}
     state_hash_sessions: dict[str, str] = {}
+    initial_contexts_by_case: dict[str, set[str]] = {}
     collector_blockers: list[str] = []
     for raw_path in bundle_directories:
         bundle = _verify_bundle(
@@ -3157,6 +3363,21 @@ def evaluate_promotion_bundles(
             )
         else:
             state_hash_sessions[state_sha] = session_id
+        initial_context = bundle.state.metadata.get(
+            "evaluation_initial_context_sha256"
+        )
+        if (
+            type(initial_context) is not str
+            or _SHA256_RE.fullmatch(initial_context) is None
+        ):
+            collector_blockers.append(
+                f"initial_context_binding_invalid:{session_id}"
+            )
+        else:
+            initial_contexts_by_case.setdefault(
+                bundle.session.case_id,
+                set(),
+            ).add(initial_context)
         verified_by_session[session_id] = bundle
         for blocker in bundle.blockers:
             collector_blockers.append(
@@ -3171,6 +3392,16 @@ def evaluate_promotion_bundles(
         collector_blockers.append(
             f"unexpected_session_bundle:{unexpected}"
         )
+    for case_id in sorted(
+        {
+            session.case_id
+            for session in manifest.sessions.values()
+        }
+    ):
+        if len(initial_contexts_by_case.get(case_id, set())) > 1:
+            collector_blockers.append(
+                f"paired_initial_context_mismatch:{case_id}"
+            )
     collector_blockers = list(dict.fromkeys(collector_blockers))
 
     cases = {
@@ -3281,6 +3512,27 @@ def evaluate_promotion_bundles(
             "verified_session_bundles": len(observed_session_ids),
             "all_files_hash_verified": True,
             "all_evaluations_replayed": True,
+            "all_challenge_knowledge_snapshots_empty": (
+                observed_session_ids == expected_session_ids
+                and all(
+                    bundle.state.metadata.get(
+                        "evaluation_knowledge_document_count"
+                    )
+                    == 0
+                    and bundle.state.metadata.get(
+                        "evaluation_knowledge_snapshot_sha256"
+                    )
+                    == _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256
+                    for bundle in verified_by_session.values()
+                )
+            ),
+            "all_paired_initial_contexts_match": (
+                observed_session_ids == expected_session_ids
+                and all(
+                    len(initial_contexts_by_case.get(case_id, set())) == 1
+                    for case_id in cases
+                )
+            ),
             "blockers": collector_blockers,
             "limitations": [
                 (
@@ -3321,4 +3573,5 @@ __all__ = [
     "local_execution_fingerprint",
     "parse_promotion_manifest",
     "prepare_promotion_session",
+    "require_promotion_knowledge_snapshot",
 ]

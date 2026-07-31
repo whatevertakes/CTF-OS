@@ -3595,17 +3595,20 @@ class ChallengeEngine:
         if state.metadata.get("evaluation_prepared") is not True:
             return
         from ctf_os.promotion_bundles import (
+            PromotionBundleError,
             local_execution_fingerprint,
+            require_promotion_knowledge_snapshot,
         )
 
         try:
             fingerprint = local_execution_fingerprint(
                 self.config.workspace_root
             )
-        except ValueError as error:
+            require_promotion_knowledge_snapshot(self.store, state)
+        except (PromotionBundleError, ValueError) as error:
             raise EngineError(
-                "prepared evaluation could not attest the current "
-                "execution fingerprint"
+                "prepared evaluation could not attest the current execution "
+                "fingerprint and knowledge snapshot"
             ) from error
         expected = {
             "tool_manifest_sha256": state.metadata.get(
