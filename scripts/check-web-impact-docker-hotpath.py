@@ -46,8 +46,16 @@ from ctf_os.engine.web_impact_state import (
     validate_web_impact_state_graph,
 )
 from ctf_os.images import validate_image_digest
-from ctf_os.models import ChallengeIdentity, Provenance
+from ctf_os.models import (
+    ChallengeIdentity,
+    Provenance,
+    ReceiptOutcome,
+    RunStatus,
+)
+from ctf_os.sandbox.files import read_bounded_regular
 from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.stages.ingest import inventory_challenge
+from ctf_os.store.atomic import StrictJSONError, strict_json_loads
 
 
 TARGET_PORT = 18080
@@ -66,6 +74,10 @@ ROUTES = (
     ("admin", "browser", "/use/admin"),
     ("attacker", "http", "/extract"),
 )
+TARGET_AUDIT_LOG_MAX_BYTES = 65_536
+TARGET_AUDIT_LOG_MAX_EVENTS = 64
+PHYSICAL_JSON_MAX_BYTES = 256 * 1024
+PHYSICAL_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024
 TARGET_SERVER_SOURCE = r"""
 from __future__ import annotations
 
@@ -314,20 +326,65 @@ def _wait_healthy(name: str) -> None:
     raise RuntimeError(f"target {name} was not healthy: {last_error}")
 
 
-def _target_audit(name: str, mode: str) -> dict[str, object]:
-    lines = _docker(("logs", name), timeout=30).stdout.splitlines()
-    events: list[dict[str, Any]] = []
-    for line in lines:
+def _parse_target_event_stream(
+    payload: str,
+    *,
+    mode: str,
+) -> list[dict[str, object]]:
+    if len(payload.encode("utf-8")) > TARGET_AUDIT_LOG_MAX_BYTES:
+        raise AssertionError(
+            f"{mode} target audit log exceeds its byte limit"
+        )
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_nonfinite(value: str) -> object:
+        raise ValueError(f"non-finite JSON value: {value}")
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_nonfinite,
+    )
+    events: list[dict[str, object]] = []
+    offset = 0
+    while offset < len(payload):
+        while offset < len(payload) and payload[offset].isspace():
+            offset += 1
+        if offset == len(payload):
+            break
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
+            value, end = decoder.raw_decode(payload, offset)
+        except (json.JSONDecodeError, ValueError) as error:
             raise AssertionError(
-                f"{mode} target emitted a non-JSON audit line"
+                f"{mode} target audit log is not an exact JSON object stream"
             ) from error
         if type(value) is not dict:
             raise AssertionError(f"{mode} target audit is not an object")
-        if value.get("path") != "/health":
-            events.append(value)
+        events.append(value)
+        if len(events) > TARGET_AUDIT_LOG_MAX_EVENTS:
+            raise AssertionError(
+                f"{mode} target audit log exceeds its event limit"
+            )
+        offset = end
+    return events
+
+
+def _target_audit(name: str, mode: str) -> dict[str, object]:
+    observed = _parse_target_event_stream(
+        _docker(("logs", name), timeout=30).stdout,
+        mode=mode,
+    )
+    events = [
+        value for value in observed if value.get("path") != "/health"
+    ]
     expected_paths = [route for _role, _channel, route in ROUTES]
     counts = Counter(
         str(event.get("path"))
@@ -376,6 +433,366 @@ def _engine(root: Path, image_digest: str) -> ChallengeEngine:
             ),
         ),
     )
+
+
+def _physical_json(
+    challenge_root: Path,
+    relative: str,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[bytes, dict[str, object]]:
+    path = challenge_root / relative
+    try:
+        if expected_sha256 is None or expected_size is None:
+            metadata = path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > PHYSICAL_JSON_MAX_BYTES
+            ):
+                raise ValueError("not a bounded regular file")
+            initial = path.read_bytes()
+            if expected_sha256 is None:
+                expected_sha256 = _sha256(initial)
+            if expected_size is None:
+                expected_size = len(initial)
+        payload = read_bounded_regular(
+            challenge_root,
+            relative,
+            maximum_bytes=PHYSICAL_JSON_MAX_BYTES,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        )
+        decoded = strict_json_loads(
+            payload,
+            max_bytes=PHYSICAL_JSON_MAX_BYTES,
+            max_depth=32,
+        )
+    except (
+        OSError,
+        StrictJSONError,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise AssertionError(
+            f"Web impact physical JSON revalidation failed: {relative}"
+        ) from error
+    if type(decoded) is not dict:
+        raise AssertionError(
+            f"Web impact physical JSON is not an object: {relative}"
+        )
+    return payload, decoded
+
+
+def _revalidate_physical_web_impact(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    evaluation_sha256: str,
+    expected_replay_count: int,
+) -> tuple[object, dict[str, int]]:
+    """Reload state and verify every committed Web impact byte/sidecar."""
+
+    state = engine.store.load(identity, recover=False)
+    state.validate()
+    validate_web_impact_state_graph(state)
+    attempts = state.extra.get("web_impact_preissues")
+    if type(attempts) is not dict or len(attempts) != 1:
+        raise AssertionError(
+            "Web impact release state must contain one exact attempt"
+        )
+    attempt = next(iter(attempts.values()))
+    if (
+        type(attempt) is not dict
+        or attempt.get("status") != "completed"
+        or type(attempt.get("terminal")) is not dict
+        or attempt["terminal"].get("evaluation_sha256")
+        != evaluation_sha256
+        or attempt.get("runtime_image_digest")
+        != engine.config.runtime.image_digest
+        or inventory_challenge(
+            engine.challenge_input(identity)
+        ).manifest_sha256
+        != attempt.get("source_manifest_sha256")
+    ):
+        raise AssertionError(
+            "Web impact physical environment or terminal binding changed"
+        )
+    replays = attempt.get("replays")
+    requests = attempt.get("canonical_requests")
+    plan = attempt.get("execution_plan")
+    plan_requests = (
+        plan.get("requests") if type(plan) is dict else None
+    )
+    if (
+        type(replays) is not list
+        or type(requests) is not list
+        or type(plan_requests) is not list
+        or type(expected_replay_count) is not int
+        or expected_replay_count < 1
+        or len(replays) != expected_replay_count
+        or len(requests) != expected_replay_count
+        or len(plan_requests) != expected_replay_count
+    ):
+        raise AssertionError(
+            "Web impact physical replay cohort is not exact 3+3"
+        )
+    run_ids = [item.get("run_id") for item in replays]
+    receipt_ids = [item.get("receipt_id") for item in replays]
+    if (
+        any(type(value) is not str for value in run_ids)
+        or len(set(run_ids)) != expected_replay_count
+        or any(type(value) is not str for value in receipt_ids)
+        or len(set(receipt_ids)) != expected_replay_count
+    ):
+        raise AssertionError(
+            "Web impact physical replay identities are reused"
+        )
+    runs = {item.id: item for item in state.runs}
+    receipts = {item.id: item for item in state.receipts}
+    artifacts = {item.id: item for item in state.artifacts}
+    expected_artifact_values: list[str] = []
+    for key in ("operator_spec", "driver"):
+        snapshot = attempt.get(key)
+        if type(snapshot) is not dict:
+            raise AssertionError(
+                f"Web impact {key} snapshot is missing"
+            )
+        expected_artifact_values.append(str(snapshot.get("artifact_id")))
+    snapshots = attempt.get("input_snapshots")
+    if type(snapshots) is not list:
+        raise AssertionError("Web impact input snapshots are missing")
+    expected_artifact_values.extend(
+        str(snapshot.get("artifact_id"))
+        for snapshot in snapshots
+        if type(snapshot) is dict
+    )
+    expected_state_ids = attempt.get("expected_state_ids")
+    if type(expected_state_ids) is not dict:
+        raise AssertionError("Web impact state IDs are missing")
+    for value in expected_state_ids.values():
+        if value in artifacts:
+            expected_artifact_values.append(value)
+    for replay in replays:
+        if type(replay) is not dict:
+            raise AssertionError("Web impact replay binding is invalid")
+        for key in ("request_artifact_ids", "response_artifact_ids"):
+            values = replay.get(key)
+            if type(values) is not list:
+                raise AssertionError(
+                    "Web impact replay artifact IDs are invalid"
+                )
+            expected_artifact_values.extend(str(value) for value in values)
+        expected_artifact_values.append(
+            str(replay.get("trace_artifact_id"))
+        )
+    expected_artifact_ids = set(expected_artifact_values)
+    if any(value not in artifacts for value in expected_artifact_ids):
+        raise AssertionError(
+            "Web impact committed artifact inventory is incomplete"
+        )
+    experiment_id = expected_state_ids.get("experiment_id")
+    marked_artifacts = {
+        item.id
+        for item in state.artifacts
+        if type(item.extra.get("web_impact_state")) is dict
+        and item.extra["web_impact_state"].get("experiment_id")
+        == experiment_id
+    }
+    if not marked_artifacts.issubset(expected_artifact_ids):
+        raise AssertionError(
+            "Web impact state contains an unbound committed artifact"
+        )
+    challenge_root = engine.store.challenge_paths(identity).root
+    for artifact_id in sorted(expected_artifact_ids):
+        artifact = artifacts[artifact_id]
+        if (
+            type(artifact.size) is not int
+            or artifact.size < 0
+            or artifact.size > PHYSICAL_ARTIFACT_MAX_BYTES
+        ):
+            raise AssertionError(
+                "Web impact artifact size is outside release bounds"
+            )
+        try:
+            read_bounded_regular(
+                challenge_root,
+                artifact.path,
+                maximum_bytes=PHYSICAL_ARTIFACT_MAX_BYTES,
+                expected_sha256=artifact.sha256,
+                expected_size=artifact.size,
+            )
+        except (OSError, ValueError) as error:
+            raise AssertionError(
+                "Web impact committed artifact revalidation failed: "
+                f"{artifact.id}"
+            ) from error
+
+    for replay, request_binding, plan_request in zip(
+        replays,
+        requests,
+        plan_requests,
+        strict=True,
+    ):
+        if (
+            type(replay) is not dict
+            or type(request_binding) is not dict
+            or type(plan_request) is not dict
+        ):
+            raise AssertionError(
+                "Web impact replay sidecar binding is invalid"
+            )
+        run_id = replay["run_id"]
+        receipt_id = replay["receipt_id"]
+        run = runs.get(run_id)
+        receipt = receipts.get(receipt_id)
+        run_root = f"runs/{run_id}"
+        if (
+            run is None
+            or receipt is None
+            or run.status is not RunStatus.COMPLETED
+            or receipt.outcome is not ReceiptOutcome.SUCCEEDED
+            or receipt.run_id != run_id
+            or receipt.exit_code != 0
+            or run.request_path != request_binding.get("path")
+            or run.result_path != f"{run_root}/result.json"
+            or run.validation_path != f"{run_root}/validation.json"
+            or run.extra.get("transport_receipt_path")
+            != f"{run_root}/web-impact-receipt.json"
+            or receipt.extra.get("transport_receipt_path")
+            != f"{run_root}/web-impact-receipt.json"
+            or run.extra.get("request_sha256")
+            != plan_request.get("request_sha256")
+        ):
+            raise AssertionError(
+                "Web impact canonical run/receipt binding changed"
+            )
+        _request_payload, request_document = _physical_json(
+            challenge_root,
+            run.request_path,
+            expected_sha256=request_binding.get("sha256"),
+            expected_size=request_binding.get("size_bytes"),
+        )
+        if request_document != request_binding.get("document"):
+            raise AssertionError(
+                "Web impact canonical request document changed"
+            )
+        _receipt_payload, transport_receipt = _physical_json(
+            challenge_root,
+            receipt.extra["transport_receipt_path"],
+            expected_sha256=receipt.extra.get(
+                "transport_receipt_sha256"
+            ),
+        )
+        receipt_transport = transport_receipt.get("transport")
+        if (
+            transport_receipt.get("receipt_id") != receipt_id
+            or transport_receipt.get("run_id") != run_id
+            or transport_receipt.get("request_sha256")
+            != plan_request.get("request_sha256")
+            or transport_receipt.get(
+                "transport_execution_contract_sha256"
+            )
+            != plan_request.get("transport_contract", {}).get(
+                "transport_execution_contract_sha256"
+            )
+            or receipt_transport
+            != {
+                "clean_workspace": True,
+                "exit_code": 0,
+                "fresh_identity_state": True,
+                "network_target_authorized": True,
+                "orchestration_status": "completed",
+                "timed_out": False,
+            }
+        ):
+            raise AssertionError(
+                "Web impact physical transport receipt changed"
+            )
+        _result_payload, result = _physical_json(
+            challenge_root,
+            run.result_path,
+        )
+        expected_capture_ids = [
+            *(
+                artifact_id
+                for pair in zip(
+                    replay["request_artifact_ids"],
+                    replay["response_artifact_ids"],
+                    strict=True,
+                )
+                for artifact_id in pair
+            ),
+            replay["trace_artifact_id"],
+        ]
+        if (
+            set(result)
+            != {
+                "capture_artifact_ids",
+                "category",
+                "challenge_id",
+                "contest_id",
+                "observation_commitment_sha256",
+                "protocol",
+                "receipt_id",
+                "receipt_sha256",
+                "run_id",
+                "schema_version",
+            }
+            or result.get("run_id") != run_id
+            or result.get("protocol") != attempt.get("protocol")
+            or result.get("schema_version") != 1
+            or result.get("contest_id") != identity.contest_id
+            or result.get("category") != identity.category
+            or result.get("challenge_id") != identity.challenge_id
+            or result.get("receipt_id") != receipt_id
+            or result.get("receipt_sha256")
+            != receipt.extra.get("transport_receipt_sha256")
+            or result.get("observation_commitment_sha256")
+            != transport_receipt.get(
+                "observation_commitment_sha256"
+            )
+            or result.get("capture_artifact_ids")
+            != expected_capture_ids
+        ):
+            raise AssertionError(
+                "Web impact physical result sidecar changed"
+            )
+        _validation_payload, validation = _physical_json(
+            challenge_root,
+            run.validation_path,
+        )
+        if (
+            set(validation)
+            != {
+                "ok",
+                "protocol",
+                "request_sha256",
+                "run_id",
+                "transport_execution_contract_sha256",
+                "validated_at",
+            }
+            or validation.get("ok") is not True
+            or validation.get("run_id") != run_id
+            or validation.get("protocol") != attempt.get("protocol")
+            or validation.get("request_sha256")
+            != plan_request.get("request_sha256")
+            or validation.get(
+                "transport_execution_contract_sha256"
+            )
+            != plan_request.get("transport_contract", {}).get(
+                "transport_execution_contract_sha256"
+            )
+        ):
+            raise AssertionError(
+                "Web impact physical validation sidecar changed"
+            )
+    return state, {
+        "physical_artifacts": len(expected_artifact_ids),
+        "physical_run_sidecars": len(replays) * 3,
+        "physical_transport_receipts": len(replays),
+    }
 
 
 def _operator_and_driver(
@@ -557,14 +974,20 @@ def _prove(
         image_digest=image_digest,
     )
 
-    final, evaluation = engine.prove_web_impact(
+    _final, evaluation = engine.prove_web_impact(
         identity,
         operator_spec_locator="web-impact-spec.json",
         driver_locator="web-impact-driver.json",
         timeout_seconds=600,
     )
-    validate_web_impact_state_graph(final)
-    attempts = final.extra.get("web_impact_preissues")
+    canonical, physical = _revalidate_physical_web_impact(
+        engine,
+        identity,
+        evaluation_sha256=evaluation.sha256,
+        expected_replay_count=6,
+    )
+    validate_web_impact_state_graph(canonical)
+    attempts = canonical.extra.get("web_impact_preissues")
     attempt = (
         next(reversed(attempts.values()))
         if type(attempts) is dict and attempts
@@ -593,12 +1016,12 @@ def _prove(
         is not True
         or evaluation_authorities["source_sink_observed"] is not False
         or len(evaluation.records) != 6
-        or final.status is not initial_status
-        or final.candidates
-        or final.submissions
-        or len(final.facts) != 1
-        or final.facts[0].provenance is not Provenance.EXECUTED
-        or len(final.progress_markers) != 1
+        or canonical.status is not initial_status
+        or canonical.candidates
+        or canonical.submissions
+        or len(canonical.facts) != 1
+        or canonical.facts[0].provenance is not Provenance.EXECUTED
+        or len(canonical.progress_markers) != 1
         or type(attempt) is not dict
         or attempt.get("status") != "completed"
         or len(attempt.get("replays", ())) != 6
@@ -608,19 +1031,28 @@ def _prove(
             "ChallengeEngine Web Docker hot path did not confirm exact 3+3"
         )
     return {
-        "automatic_submissions": len(final.submissions),
+        "automatic_submissions": len(canonical.submissions),
         "canonical_requests_preissued": len(
             attempt["canonical_requests"]
         ),
-        "executed_facts": len(final.facts),
+        "executed_facts": len(canonical.facts),
         "network_enforcement": "proxy",
-        "progress_markers": len(final.progress_markers),
+        "physical_artifacts_revalidated": physical[
+            "physical_artifacts"
+        ],
+        "physical_run_sidecars_revalidated": physical[
+            "physical_run_sidecars"
+        ],
+        "physical_transport_receipts_revalidated": physical[
+            "physical_transport_receipts"
+        ],
+        "progress_markers": len(canonical.progress_markers),
         "replays": len(evaluation.records),
         "runtime_request_response_differential_confirmed": (
             evaluation.runtime_request_response_differential_confirmed
         ),
         "source_sink_observed": evaluation.source_sink_observed,
-        "state_revision": final.revision,
+        "state_revision": canonical.revision,
         "verdict": evaluation.verdict.value,
     }
 

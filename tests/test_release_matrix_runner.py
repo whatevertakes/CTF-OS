@@ -149,6 +149,9 @@ def _valid_summary(task_id: str) -> dict[str, object]:
                 "canonical_requests_preissued": 6,
                 "executed_facts": 1,
                 "network_enforcement": "proxy",
+                "physical_artifacts_revalidated": 88,
+                "physical_run_sidecars_revalidated": 18,
+                "physical_transport_receipts_revalidated": 6,
                 "progress_markers": 1,
                 "replays": 6,
                 "runtime_request_response_differential_confirmed": True,
@@ -648,6 +651,9 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
                 "canonical_requests_preissued": 6,
                 "executed_facts": 1,
                 "network_enforcement": "proxy",
+                "physical_artifacts_revalidated": 88,
+                "physical_run_sidecars_revalidated": 18,
+                "physical_transport_receipts_revalidated": 6,
                 "progress_markers": 1,
                 "replays": 6,
                 "runtime_request_response_differential_confirmed": True,
@@ -677,6 +683,18 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
             "differential oracle",
         ):
             release._validate_web_impact_summary(summary)
+
+    def test_web_impact_summary_requires_physical_revalidation(self) -> None:
+        for field, value in (
+            ("physical_artifacts_revalidated", 87),
+            ("physical_run_sidecars_revalidated", 17),
+            ("physical_transport_receipts_revalidated", 5),
+        ):
+            with self.subTest(field=field):
+                summary = _valid_summary("web_state_impact")
+                summary["engine"][field] = value
+                with self.assertRaises(release.ReleaseMatrixError):
+                    release._validate_web_impact_summary(summary)
 
     def test_child_environment_drops_secret_and_model_credentials(self) -> None:
         with mock.patch.dict(

@@ -683,6 +683,9 @@ def _validate_web_impact_summary(value: dict[str, object]) -> None:
                 "canonical_requests_preissued",
                 "executed_facts",
                 "network_enforcement",
+                "physical_artifacts_revalidated",
+                "physical_run_sidecars_revalidated",
+                "physical_transport_receipts_revalidated",
                 "progress_markers",
                 "replays",
                 "runtime_request_response_differential_confirmed",
@@ -727,6 +730,9 @@ def _validate_web_impact_summary(value: dict[str, object]) -> None:
         or engine["canonical_requests_preissued"] != 6
         or engine["executed_facts"] != 1
         or engine["network_enforcement"] != "proxy"
+        or engine["physical_artifacts_revalidated"] != 88
+        or engine["physical_run_sidecars_revalidated"] != 18
+        or engine["physical_transport_receipts_revalidated"] != 6
         or engine["progress_markers"] != 1
         or engine["replays"] != 6
         or engine[
