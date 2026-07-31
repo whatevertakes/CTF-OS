@@ -3598,6 +3598,7 @@ class ChallengeEngine:
             PromotionBundleError,
             local_execution_fingerprint,
             require_promotion_knowledge_snapshot,
+            require_promotion_operator_input,
         )
 
         try:
@@ -3605,10 +3606,14 @@ class ChallengeEngine:
                 self.config.workspace_root
             )
             require_promotion_knowledge_snapshot(self.store, state)
+            require_promotion_operator_input(
+                self.config.workspace_root,
+                state,
+            )
         except (PromotionBundleError, ValueError) as error:
             raise EngineError(
                 "prepared evaluation could not attest the current execution "
-                "fingerprint and knowledge snapshot"
+                "fingerprint, knowledge snapshot, and operator input"
             ) from error
         expected = {
             "tool_manifest_sha256": state.metadata.get(

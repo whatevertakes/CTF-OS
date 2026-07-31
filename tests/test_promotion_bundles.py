@@ -55,6 +55,7 @@ from ctf_os.models import (
     SessionMode,
     SessionStatus,
     SolveSession,
+    SourceFile,
 )
 from ctf_os.promotion_bundles import (
     PromotionBundleError,
@@ -77,9 +78,33 @@ from ctf_os.store.atomic import (
     atomic_write_json,
     atomic_write_text,
 )
+from ctf_os.stages.ingest import inventory_challenge
 
 
 CATEGORIES = ("pwn", "web", "rev", "crypto", "forensics", "misc")
+
+
+def _fixture_input_payload(case_id: str) -> bytes:
+    return f"promotion input for {case_id}\n".encode("utf-8")
+
+
+def _fixture_input_manifest_sha256(case_id: str) -> str:
+    payload = _fixture_input_payload(case_id)
+    records = [
+        {
+            "mode": 0o600,
+            "path": "challenge.bin",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+    ]
+    encoded = json.dumps(
+        records,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _later(timestamp: str, seconds: int) -> str:
@@ -132,9 +157,9 @@ def _manifest(
                 {
                     "case_id": case_id,
                     "category": category,
-                    "input_manifest_sha256": hashlib.sha256(
-                        case_id.encode("ascii")
-                    ).hexdigest(),
+                    "input_manifest_sha256": (
+                        _fixture_input_manifest_sha256(case_id)
+                    ),
                     "sessions": sessions,
                 }
             )
@@ -254,6 +279,21 @@ class PromotionBundleTests(unittest.TestCase):
                 ),
             }
         )
+        parsed = parse_promotion_manifest(self.manifest)
+        for session in parsed.sessions.values():
+            incoming = (
+                self.root
+                / "incoming"
+                / session.contest_id
+                / session.category
+                / session.challenge_id
+            )
+            incoming.mkdir(parents=True, exist_ok=True)
+            challenge = incoming / "challenge.bin"
+            challenge.write_bytes(
+                _fixture_input_payload(session.case_id)
+            )
+            challenge.chmod(0o600)
         self.manifest_path.write_text(
             json.dumps(self.manifest, sort_keys=True),
             encoding="utf-8",
@@ -287,6 +327,18 @@ class PromotionBundleTests(unittest.TestCase):
     ):
         parsed = parse_promotion_manifest(self.manifest)
         session = parsed.sessions[session_id]
+        incoming = (
+            self.root
+            / "incoming"
+            / session.contest_id
+            / session.category
+            / session.challenge_id
+        )
+        inventory = inventory_challenge(incoming)
+        self.assertEqual(
+            inventory.manifest_sha256,
+            session.input_manifest_sha256,
+        )
         state = self.store.create_challenge(
             session.identity,
             prompt=prompt,
@@ -294,6 +346,7 @@ class PromotionBundleTests(unittest.TestCase):
                 "source_manifest_sha256": (
                     session.input_manifest_sha256
                 ),
+                "source_total_bytes": inventory.total_bytes,
             },
             budget=Budget(
                 allocated_seconds=60,
@@ -303,6 +356,19 @@ class PromotionBundleTests(unittest.TestCase):
             schema_version=STATE_SCHEMA_VERSION,
             exist_ok=False,
         )
+
+        def bind_sources(current) -> None:
+            current.source_inventory = [
+                SourceFile(
+                    path=source.path,
+                    sha256=source.sha256,
+                    size=source.size,
+                    kind="file",
+                )
+                for source in inventory.files
+            ]
+
+        state = self.store.update(session.identity, bind_sources)
         return session, state
 
     def _create_state(
@@ -843,20 +909,8 @@ class PromotionBundleTests(unittest.TestCase):
         record = self._session_records()[0]
         parsed = parse_promotion_manifest(self.manifest)
         session = parsed.sessions[record[0]]
-        state = self.store.create_challenge(
-            session.identity,
-            metadata={
-                "source_manifest_sha256": (
-                    session.input_manifest_sha256
-                )
-            },
-            budget=Budget(
-                allocated_seconds=60,
-                spent_seconds=0,
-                mode=BudgetMode.BOUNDED,
-            ),
-            schema_version=STATE_SCHEMA_VERSION,
-            exist_ok=False,
+        _session, state = self._create_unprepared_state(
+            session.session_id
         )
         prepare_promotion_session(
             self.root,
@@ -1301,6 +1355,122 @@ class PromotionBundleTests(unittest.TestCase):
                 output_directory=self.root / "knowledge-contaminated",
             )
 
+    def test_prompt_mutation_after_prepare_blocks_launch_and_finalize(
+        self,
+    ) -> None:
+        self._freeze()
+        session_id = self._session_records()[0][0]
+        session, _state = self._create_unprepared_state(
+            session_id,
+            prompt="clean paired prompt",
+        )
+        prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session_id,
+        )
+
+        def inject_answer(current) -> None:
+            current.prompt = (
+                "flag{one_arm_answer_injected_after_prepare}"
+            )
+
+        self.store.update(session.identity, inject_answer)
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        )
+        with self.assertRaisesRegex(EngineError, "operator input"):
+            engine.record_evaluation_scaffold_launch(
+                session.identity,
+                arm=session.arm,
+                command_contract_sha256="a" * 64,
+            )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "operator input differs",
+        ):
+            finalize_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=session_id,
+                human_interventions=0,
+                secret_or_flag_leaks=0,
+            )
+
+    def test_incoming_mutation_after_prepare_blocks_launch_and_finalize(
+        self,
+    ) -> None:
+        self._freeze()
+        session_id = self._session_records()[0][0]
+        session, _state = self._create_unprepared_state(
+            session_id,
+            prompt="clean paired prompt",
+        )
+        prepare_promotion_session(
+            self.root,
+            self.frozen_path,
+            session_id=session_id,
+        )
+        incoming = (
+            self.root
+            / "incoming"
+            / session.contest_id
+            / session.category
+            / session.challenge_id
+            / "challenge.bin"
+        )
+        incoming.write_bytes(b"flag{one_arm_source_after_prepare}")
+        incoming.chmod(0o600)
+        engine = ChallengeEngine(
+            self.root,
+            config=load_config(self.root),
+            store=self.store,
+        )
+        with self.assertRaisesRegex(EngineError, "operator input"):
+            engine.record_evaluation_scaffold_launch(
+                session.identity,
+                arm=session.arm,
+                command_contract_sha256="a" * 64,
+            )
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "immutable incoming bytes",
+        ):
+            finalize_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=session_id,
+                human_interventions=0,
+                secret_or_flag_leaks=0,
+            )
+
+    def test_prompt_mutation_after_finalize_blocks_capture(self) -> None:
+        self._freeze()
+        record = self._session_records()[0]
+        self._create_state(*record, prompt="clean paired prompt")
+        session = parse_promotion_manifest(self.manifest).sessions[
+            record[0]
+        ]
+
+        def inject_answer(current) -> None:
+            current.description = (
+                "flag{late_description_contamination}"
+            )
+
+        self.store.update(session.identity, inject_answer)
+        with self.assertRaisesRegex(
+            PromotionBundleError,
+            "operator input differs",
+        ):
+            capture_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=record[0],
+                output_directory=self.root / "operator-input-contaminated",
+            )
+
     def test_paired_sessions_require_identical_initial_context(self) -> None:
         self._freeze()
         parsed = parse_promotion_manifest(self.manifest)
@@ -1350,6 +1520,13 @@ class PromotionBundleTests(unittest.TestCase):
         )
         self.assertFalse(
             result["collector"]["all_paired_initial_contexts_match"]
+        )
+        self.assertIn(
+            "paired_operator_input_mismatch:blind-pwn",
+            result["collector"]["blockers"],
+        )
+        self.assertFalse(
+            result["collector"]["all_paired_operator_inputs_match"]
         )
 
     def test_cohort_contamination_and_duplicate_run_ids_are_rejected(

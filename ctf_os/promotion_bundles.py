@@ -96,10 +96,11 @@ from ctf_os.store.atomic import (
     strict_json_loads,
 )
 from ctf_os.store.upgrades import upgrade_state, validate_state_protocol_shape
+from ctf_os.stages.ingest import IngestError, inventory_challenge
 
 
 PROMOTION_MANIFEST_SCHEMA_VERSION = 2
-PROMOTION_BUNDLE_SCHEMA_VERSION = 1
+PROMOTION_BUNDLE_SCHEMA_VERSION = 2
 PROMOTION_SIGNATURE_SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_BUNDLE_INDEX_BYTES = 4 * 1024 * 1024
@@ -134,6 +135,8 @@ _EMPTY_KNOWLEDGE_SNAPSHOT_SHA256 = hashlib.sha256(
     canonical_json_bytes(_EMPTY_KNOWLEDGE_SNAPSHOT)
 ).hexdigest()
 _INITIAL_CONTEXT_SCHEMA_VERSION = 1
+_OPERATOR_INPUT_SCHEMA_VERSION = 1
+_OPERATOR_INPUT_INVENTORY_SCHEMA_VERSION = 1
 _MODEL_ROLE_FIELDS = (
     "captain",
     "recon",
@@ -1093,6 +1096,199 @@ def _initial_context_sha256(state: ChallengeState) -> str:
     return _sha256(canonical_json_bytes(document))
 
 
+def _incoming_challenge_root(
+    workspace: Path,
+    identity: ChallengeIdentity,
+) -> Path:
+    incoming_root = load_config(workspace).incoming_root.resolve(
+        strict=False
+    )
+    candidate = (
+        incoming_root
+        / identity.contest_id
+        / identity.category
+        / identity.challenge_id
+    )
+    try:
+        candidate.resolve(strict=False).relative_to(incoming_root)
+    except ValueError as error:
+        raise PromotionBundleError(
+            "promotion challenge input escapes incoming/"
+        ) from error
+    return candidate
+
+
+def _state_source_records(
+    state: ChallengeState,
+) -> list[dict[str, object]]:
+    return [source.to_dict() for source in state.source_inventory]
+
+
+def _incoming_inventory_summary(
+    workspace: Path,
+    state: ChallengeState,
+) -> dict[str, object]:
+    try:
+        inventory = inventory_challenge(
+            _incoming_challenge_root(workspace, state.identity)
+        )
+    except (IngestError, OSError, ValueError) as error:
+        raise PromotionBundleError(
+            "promotion immutable incoming input could not be inventoried"
+        ) from error
+    files = [
+        {
+            "path": source.path,
+            "sha256": source.sha256,
+            "size": source.size,
+        }
+        for source in inventory.files
+    ]
+    state_files = [
+        {
+            "path": source.path,
+            "sha256": source.sha256,
+            "size": source.size,
+        }
+        for source in state.source_inventory
+    ]
+    if state_files != files:
+        raise PromotionBundleError(
+            "canonical source inventory differs from immutable incoming bytes"
+        )
+    if (
+        state.metadata.get("source_manifest_sha256")
+        != inventory.manifest_sha256
+        or state.metadata.get("source_total_bytes")
+        != inventory.total_bytes
+    ):
+        raise PromotionBundleError(
+            "canonical source metadata differs from immutable incoming bytes"
+        )
+    return {
+        "schema_version": _OPERATOR_INPUT_INVENTORY_SCHEMA_VERSION,
+        "manifest_sha256": inventory.manifest_sha256,
+        "files_sha256": _sha256(canonical_json_bytes(files)),
+        "file_count": len(files),
+        "total_bytes": inventory.total_bytes,
+    }
+
+
+def _operator_input_document(
+    state: ChallengeState,
+    incoming: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": _OPERATOR_INPUT_SCHEMA_VERSION,
+        "category": state.category,
+        "description": state.description,
+        "prompt": state.prompt,
+        "incoming_inventory": dict(incoming),
+        "static_source": {
+            "source_manifest_sha256": state.metadata.get(
+                "source_manifest_sha256"
+            ),
+            "source_total_bytes": state.metadata.get(
+                "source_total_bytes"
+            ),
+            "source_inventory": _state_source_records(state),
+        },
+    }
+
+
+def _parse_operator_input_inventory(
+    value: object,
+) -> dict[str, object]:
+    raw = _strict_mapping(
+        value,
+        keys=frozenset(
+            {
+                "schema_version",
+                "manifest_sha256",
+                "files_sha256",
+                "file_count",
+                "total_bytes",
+            }
+        ),
+        label="operator input inventory",
+    )
+    if (
+        type(raw["schema_version"]) is not int
+        or raw["schema_version"]
+        != _OPERATOR_INPUT_INVENTORY_SCHEMA_VERSION
+    ):
+        raise PromotionBundleError(
+            "operator input inventory has an invalid schema"
+        )
+    result = {
+        "schema_version": raw["schema_version"],
+        "manifest_sha256": _sha256_value(
+            raw["manifest_sha256"],
+            "operator input manifest_sha256",
+        ),
+        "files_sha256": _sha256_value(
+            raw["files_sha256"],
+            "operator input files_sha256",
+        ),
+        "file_count": _count(
+            raw["file_count"],
+            "operator input file_count",
+        ),
+        "total_bytes": _count(
+            raw["total_bytes"],
+            "operator input total_bytes",
+        ),
+    }
+    return result
+
+
+def _operator_input_sha256(
+    state: ChallengeState,
+    incoming: Mapping[str, object],
+) -> str:
+    return _sha256(
+        canonical_json_bytes(_operator_input_document(state, incoming))
+    )
+
+
+def require_promotion_operator_input(
+    workspace_root: Path | str,
+    state: ChallengeState,
+    *,
+    captured_inventory: object | None = None,
+) -> dict[str, object]:
+    """Re-attest immutable operator input without hashing solve trajectory."""
+
+    expected_schema = state.metadata.get(
+        "evaluation_operator_input_schema_version"
+    )
+    expected_sha256 = state.metadata.get(
+        "evaluation_operator_input_sha256"
+    )
+    if (
+        expected_schema != _OPERATOR_INPUT_SCHEMA_VERSION
+        or type(expected_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+    ):
+        raise PromotionBundleError(
+            "promotion operator input commitment is missing or invalid"
+        )
+    incoming = (
+        _incoming_inventory_summary(
+            Path(workspace_root).resolve(),
+            state,
+        )
+        if captured_inventory is None
+        else _parse_operator_input_inventory(captured_inventory)
+    )
+    observed = _operator_input_sha256(state, incoming)
+    if not hmac.compare_digest(observed, expected_sha256):
+        raise PromotionBundleError(
+            "promotion operator input differs from the prepared commitment"
+        )
+    return incoming
+
+
 def _require_clean_preexecution_context(state: ChallengeState) -> None:
     """Reject solve-derived state while preserving deterministic ingest seeds."""
 
@@ -1277,6 +1473,11 @@ def prepare_promotion_session(
         raise PromotionBundleError(
             "promotion sessions require an empty challenge knowledge snapshot"
         )
+    incoming_inventory = _incoming_inventory_summary(workspace, state)
+    operator_input_sha256 = _operator_input_sha256(
+        state,
+        incoming_inventory,
+    )
     initial_context_sha256 = _initial_context_sha256(state)
     executed_experiment = any(
         experiment.status is not ExperimentStatus.REGISTERED
@@ -1304,6 +1505,10 @@ def prepare_promotion_session(
     binding["evaluation_initial_context_sha256"] = (
         initial_context_sha256
     )
+    binding["evaluation_operator_input_schema_version"] = (
+        _OPERATOR_INPUT_SCHEMA_VERSION
+    )
+    binding["evaluation_operator_input_sha256"] = operator_input_sha256
     if all(
         state.metadata.get(key) == expected
         for key, expected in binding.items()
@@ -1347,6 +1552,7 @@ def prepare_promotion_session(
         expected_revision=state.revision,
     )
     require_promotion_knowledge_snapshot(store, prepared)
+    require_promotion_operator_input(workspace, prepared)
     return {
         "schema_version": PROMOTION_BUNDLE_SCHEMA_VERSION,
         "prepared": True,
@@ -1410,6 +1616,7 @@ def finalize_promotion_session(
         "evaluation_initial_context_sha256",
     )
     require_promotion_knowledge_snapshot(store, state)
+    require_promotion_operator_input(workspace, state)
     if state.metadata.get(
         "evaluation_human_interventions_finalized"
     ) is True or state.metadata.get("evaluation_safety_finalized") is True:
@@ -1460,6 +1667,7 @@ def finalize_promotion_session(
         apply,
         expected_revision=state.revision,
     )
+    require_promotion_operator_input(workspace, finalized)
     return {
         "schema_version": PROMOTION_BUNDLE_SCHEMA_VERSION,
         "finalized": True,
@@ -2334,6 +2542,18 @@ def _derive_attempt(
         or _SHA256_RE.fullmatch(initial_context_sha256) is None
     ):
         blockers.append("initial_context_binding_invalid")
+    operator_input_sha256 = state.metadata.get(
+        "evaluation_operator_input_sha256"
+    )
+    if (
+        state.metadata.get(
+            "evaluation_operator_input_schema_version"
+        )
+        != _OPERATOR_INPUT_SCHEMA_VERSION
+        or type(operator_input_sha256) is not str
+        or _SHA256_RE.fullmatch(operator_input_sha256) is None
+    ):
+        blockers.append("operator_input_binding_invalid")
     if (
         state.metadata.get(
             "evaluation_human_interventions_finalized"
@@ -2656,6 +2876,14 @@ def capture_promotion_session(
     )
     knowledge_store = StateStore(workspace)
     require_promotion_knowledge_snapshot(knowledge_store, state)
+    operator_input_inventory = require_promotion_operator_input(
+        workspace,
+        state,
+    )
+    operator_input_sha256 = _sha256_value(
+        state.metadata.get("evaluation_operator_input_sha256"),
+        "evaluation_operator_input_sha256",
+    )
     if (
         state.metadata.get("source_manifest_sha256")
         != session.input_manifest_sha256
@@ -2783,6 +3011,8 @@ def capture_promotion_session(
                 "challenge_id": session.challenge_id,
             },
             "input_manifest_sha256": session.input_manifest_sha256,
+            "operator_input_sha256": operator_input_sha256,
+            "operator_input_inventory": operator_input_inventory,
             "state_revision": state.revision,
             "state_sha256": _sha256(state_payload),
             "files": records,
@@ -2844,6 +3074,13 @@ def capture_promotion_session(
                 "execution fingerprint changed during promotion capture"
             )
         require_promotion_knowledge_snapshot(knowledge_store, state)
+        if (
+            require_promotion_operator_input(workspace, state)
+            != operator_input_inventory
+        ):
+            raise PromotionBundleError(
+                "operator input changed during promotion capture"
+            )
         os.rename(temporary_root, output)
     except BaseException:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -3060,6 +3297,8 @@ def _verify_bundle(
                 "attempt",
                 "identity",
                 "input_manifest_sha256",
+                "operator_input_sha256",
+                "operator_input_inventory",
                 "state_revision",
                 "state_sha256",
                 "files",
@@ -3161,6 +3400,13 @@ def _verify_bundle(
         record["evaluation_sha256"],
         "bundle evaluation_sha256",
     )
+    operator_input_sha256 = _sha256_value(
+        record["operator_input_sha256"],
+        "bundle operator_input_sha256",
+    )
+    operator_input_inventory = _parse_operator_input_inventory(
+        record["operator_input_inventory"]
+    )
     collection_complete = _exact_bool(
         record["collection_complete"],
         "bundle collection_complete",
@@ -3233,6 +3479,18 @@ def _verify_bundle(
         raise PromotionBundleError(
             "bundled state revision does not match the record"
         )
+    if (
+        state.metadata.get("evaluation_operator_input_sha256")
+        != operator_input_sha256
+    ):
+        raise PromotionBundleError(
+            "bundled operator input digest does not match canonical state"
+        )
+    require_promotion_operator_input(
+        workspace,
+        state,
+        captured_inventory=operator_input_inventory,
+    )
     report = evaluate_workspace(
         bundle_root,
         contest_id=session.contest_id,
@@ -3341,6 +3599,7 @@ def evaluate_promotion_bundles(
     verified_by_session: dict[str, VerifiedBundle] = {}
     state_hash_sessions: dict[str, str] = {}
     initial_contexts_by_case: dict[str, set[str]] = {}
+    operator_inputs_by_case: dict[str, set[str]] = {}
     collector_blockers: list[str] = []
     for raw_path in bundle_directories:
         bundle = _verify_bundle(
@@ -3378,6 +3637,11 @@ def evaluate_promotion_bundles(
                 bundle.session.case_id,
                 set(),
             ).add(initial_context)
+        operator_input = bundle.record["operator_input_sha256"]
+        operator_inputs_by_case.setdefault(
+            bundle.session.case_id,
+            set(),
+        ).add(str(operator_input))
         verified_by_session[session_id] = bundle
         for blocker in bundle.blockers:
             collector_blockers.append(
@@ -3401,6 +3665,10 @@ def evaluate_promotion_bundles(
         if len(initial_contexts_by_case.get(case_id, set())) > 1:
             collector_blockers.append(
                 f"paired_initial_context_mismatch:{case_id}"
+            )
+        if len(operator_inputs_by_case.get(case_id, set())) > 1:
+            collector_blockers.append(
+                f"paired_operator_input_mismatch:{case_id}"
             )
     collector_blockers = list(dict.fromkeys(collector_blockers))
 
@@ -3533,6 +3801,13 @@ def evaluate_promotion_bundles(
                     for case_id in cases
                 )
             ),
+            "all_paired_operator_inputs_match": (
+                observed_session_ids == expected_session_ids
+                and all(
+                    len(operator_inputs_by_case.get(case_id, set())) == 1
+                    for case_id in cases
+                )
+            ),
             "blockers": collector_blockers,
             "limitations": [
                 (
@@ -3574,4 +3849,5 @@ __all__ = [
     "parse_promotion_manifest",
     "prepare_promotion_session",
     "require_promotion_knowledge_snapshot",
+    "require_promotion_operator_input",
 ]
