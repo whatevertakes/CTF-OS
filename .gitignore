@@ -4,6 +4,9 @@
 .ctfos/
 incoming/
 
+# Local audit/design working note; not part of the release source tree.
+docs/category-solve-design.md
+
 .venv/
 __pycache__/
 *.py[cod]
