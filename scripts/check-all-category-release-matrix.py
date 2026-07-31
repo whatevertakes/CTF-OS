@@ -496,6 +496,7 @@ def _validate_pwn_interaction_summary(value: dict[str, object]) -> None:
                 "network_none",
                 "one_shot",
                 "physical_identities",
+                "physical_records",
                 "proof_outputs_per_run",
                 "unique_clean_prefix_count",
                 "unique_proof_identity_count",
@@ -537,6 +538,7 @@ def _validate_pwn_interaction_summary(value: dict[str, object]) -> None:
         label="pwn interaction failure control",
     )
     physical_identities = transport["physical_identities"]
+    physical_records = transport["physical_records"]
     physical_tuples: list[tuple[str, str, str]] = []
     clean_prefixes: list[str] = []
     canonical_scope = transport["canonical_scope_fingerprint"]
@@ -575,6 +577,87 @@ def _validate_pwn_interaction_summary(value: dict[str, object]) -> None:
                 (str(scope), sandbox_run_id, clean_prefix)
             )
             clean_prefixes.append(clean_prefix)
+    reconstructed_tuples: list[tuple[str, str, str]] = []
+    reconstructed_run_ids: list[str] = []
+    reconstructed_clean = 0
+    reconstructed_network_none = 0
+    reconstructed_one_shot = 0
+    reconstructed_output_counts: set[int] = set()
+    if type(physical_records) is list:
+        for ordinal, item in enumerate(physical_records, start=1):
+            record = _exact_mapping(
+                item,
+                required=frozenset(
+                    {
+                        "artifact_count",
+                        "artifact_manifest_sha256",
+                        "clean_prefix",
+                        "clean_workspace",
+                        "network",
+                        "one_shot",
+                        "proof_output_count",
+                        "request_sha256",
+                        "result_sha256",
+                        "run_id",
+                        "sandbox_method",
+                        "sandbox_run_id",
+                        "scope_fingerprint",
+                        "validation_sha256",
+                    }
+                ),
+                label=(
+                    "pwn interaction physical record "
+                    f"{ordinal}"
+                ),
+            )
+            if (
+                record["artifact_count"] != 6
+                or not _valid_sha256(
+                    record["artifact_manifest_sha256"]
+                )
+                or type(record["clean_prefix"]) is not str
+                or re.fullmatch(
+                    r"clean-[0-9a-f]{12}",
+                    record["clean_prefix"],
+                )
+                is None
+                or record["clean_workspace"] is not True
+                or record["network"] != "none"
+                or record["one_shot"] is not True
+                or record["proof_output_count"] != 4
+                or not _valid_sha256(record["request_sha256"])
+                or not _valid_sha256(record["result_sha256"])
+                or type(record["run_id"]) is not str
+                or not record["run_id"]
+                or record["sandbox_method"] != "run_clean_proof"
+                or type(record["sandbox_run_id"]) is not str
+                or not record["sandbox_run_id"]
+                or record["scope_fingerprint"] != canonical_scope
+                or not _valid_sha256(record["validation_sha256"])
+            ):
+                raise ReleaseMatrixError(
+                    "pwn interaction physical record is invalid"
+                )
+            reconstructed_tuples.append(
+                (
+                    str(record["scope_fingerprint"]),
+                    str(record["sandbox_run_id"]),
+                    str(record["clean_prefix"]),
+                )
+            )
+            reconstructed_run_ids.append(str(record["run_id"]))
+            reconstructed_clean += int(
+                record["clean_workspace"] is True
+            )
+            reconstructed_network_none += int(
+                record["network"] == "none"
+            )
+            reconstructed_one_shot += int(
+                record["one_shot"] is True
+            )
+            reconstructed_output_counts.add(
+                int(record["proof_output_count"])
+            )
     parent_authority = parent["authority"]
     parent_pointer_valid = (
         type(parent["experiment_id"]) is str
@@ -629,14 +712,25 @@ def _validate_pwn_interaction_summary(value: dict[str, object]) -> None:
         or evaluation["matched_terminal"] is not True
         or not _valid_sha256(canonical_scope)
         or transport["fresh_clean_workspaces"] != 6
+        or transport["fresh_clean_workspaces"]
+        != reconstructed_clean
         or len(physical_tuples) != 6
         or len(set(physical_tuples)) != 6
+        or len(reconstructed_tuples) != 6
+        or len(set(reconstructed_tuples)) != 6
+        or set(reconstructed_tuples) != set(physical_tuples)
+        or len(set(reconstructed_run_ids)) != 6
         or len(set(clean_prefixes)) != 6
         or transport["unique_clean_prefix_count"] != 6
         or transport["unique_proof_identity_count"] != 6
         or transport["network_none"] != 6
+        or transport["network_none"] != reconstructed_network_none
         or transport["one_shot"] != 6
+        or transport["one_shot"] != reconstructed_one_shot
         or transport["proof_outputs_per_run"] != 4
+        or reconstructed_output_counts != {4}
+        or transport["proof_outputs_per_run"]
+        != next(iter(reconstructed_output_counts), None)
         or authority["executed_fact_added"] != 1
         or authority["progress_added"] != 1
         or authority["candidates_added"] != 0

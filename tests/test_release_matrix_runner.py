@@ -124,6 +124,25 @@ def _valid_summary(task_id: str) -> dict[str, object]:
                     }
                     for ordinal in range(1, 7)
                 ],
+                "physical_records": [
+                    {
+                        "artifact_count": 6,
+                        "artifact_manifest_sha256": SHA256,
+                        "clean_prefix": f"clean-{ordinal:012x}",
+                        "clean_workspace": True,
+                        "network": "none",
+                        "one_shot": True,
+                        "proof_output_count": 4,
+                        "request_sha256": SHA256,
+                        "result_sha256": SHA256,
+                        "run_id": f"engine-run-{ordinal}",
+                        "sandbox_method": "run_clean_proof",
+                        "sandbox_run_id": "producer-run",
+                        "scope_fingerprint": SHA256,
+                        "validation_sha256": SHA256,
+                    }
+                    for ordinal in range(1, 7)
+                ],
                 "proof_outputs_per_run": 4,
                 "unique_clean_prefix_count": 6,
                 "unique_proof_identity_count": 6,
@@ -593,6 +612,12 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
             ),
             lambda value: value["transport"]["physical_identities"][5].update(
                 {"scope_fingerprint": "c" * 64}
+            ),
+            lambda value: value["transport"]["physical_records"][0].update(
+                {"network": "bridge"}
+            ),
+            lambda value: value["transport"]["physical_records"][0].update(
+                {"proof_output_count": 3}
             ),
             lambda value: value["authority"].__setitem__(
                 "candidates_added",

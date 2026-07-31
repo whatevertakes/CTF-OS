@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import unittest
 from pathlib import Path
 
@@ -24,9 +25,25 @@ from ctf_os.engine.pwn_runtime_snapshot import (
 from ctf_os.models import ExperimentStatus, RunStatus
 from ctf_os.sandbox import ArtifactRef, SandboxResult
 from ctf_os.store import StateStore
+from ctf_os.store.atomic import atomic_write_json, read_json
 from tests import test_pwn_crash_execution as crash_execution
 from tests import test_pwn_interaction_evaluation as evaluation_fixture
 from tests import test_pwn_ip_control_lifecycle as ip_lifecycle
+
+
+_RELEASE_SCRIPT = (
+    Path(__file__).resolve().parent.parent
+    / "scripts"
+    / "check-pwn-interaction-hotpath-docker.py"
+)
+_RELEASE_SPEC = importlib.util.spec_from_file_location(
+    "ctfos_pwn_interaction_hotpath_release",
+    _RELEASE_SCRIPT,
+)
+if _RELEASE_SPEC is None or _RELEASE_SPEC.loader is None:
+    raise RuntimeError("could not load Pwn interaction release proof")
+interaction_release = importlib.util.module_from_spec(_RELEASE_SPEC)
+_RELEASE_SPEC.loader.exec_module(interaction_release)
 
 
 class _InteractionSandbox:
@@ -467,6 +484,39 @@ class PwnInteractionHotPathTests(unittest.TestCase):
                 persisted,
             )
         final.validate()
+        physical = interaction_release._interaction_physical_summary(
+            final,
+            engine.store,
+            fixture.identity,
+            attempt,
+        )
+        self.assertEqual(physical["fresh_clean_workspaces"], 6)
+        self.assertEqual(physical["network_none"], 6)
+        self.assertEqual(physical["one_shot"], 6)
+        self.assertEqual(physical["proof_outputs_per_run"], 4)
+        self.assertEqual(len(physical["physical_records"]), 6)
+
+        hostile_run = engine.store.run_paths(
+            fixture.identity,
+            child.evidence_run_ids[0],
+        )
+        hostile_validation = read_json(hostile_run.validation)
+        hostile_validation["transport"]["network"] = "bridge"
+        atomic_write_json(
+            hostile_run.validation,
+            hostile_validation,
+            mode=0o400,
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "physical sidecars disagree",
+        ):
+            interaction_release._interaction_physical_summary(
+                final,
+                engine.store,
+                fixture.identity,
+                attempt,
+            )
 
     def test_partial_failure_terminalizes_full_matrix_without_authority(self):
         fixture, engine, coordinator, parent_id = self._fixture()
