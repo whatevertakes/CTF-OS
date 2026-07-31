@@ -56,10 +56,11 @@ The manifest has these top-level fields:
 }
 ```
 
-Every case inside a split declares one input manifest digest and exactly six
-globally unique sessions: attempts 1, 2, and 3 for `thin_scaffold`, and attempts
-1, 2, and 3 for `ctf_os`. Each session binds an exact contest/category/challenge
-identity. One identity cannot be reused in another arm, case, or repeat.
+Every case inside a split declares the exact fresh `incoming/` source-manifest
+digest and exactly six globally unique sessions: attempts 1, 2, and 3 for
+`thin_scaffold`, and attempts 1, 2, and 3 for `ctf_os`. Each session binds an
+exact contest/category/challenge identity. One identity cannot be reused in
+another arm, case, or repeat.
 
 Required exposure policy:
 
@@ -92,10 +93,15 @@ ctfos benchmark prepare \
 
 Preparation fails if the challenge-source digest, fixed budget,
 model/tool/image/engine-source fingerprint, or challenge identity differs, or
-if execution activity already exists. It only writes evaluation binding
-metadata through the state store. The engine re-attests this fingerprint when
-it records the scaffold launch and again after provider capacity is acquired,
-immediately before every model invocation.
+if execution activity already exists. It also creates a schema-v1 operator
+input commitment over category, description, prompt, the fresh `incoming/`
+manifest/files/count/bytes, and the canonical static source inventory. It only
+writes evaluation binding metadata through the state store. The engine
+re-attests the execution fingerprint, empty knowledge snapshot, and operator
+input before and after recording the scaffold launch, and again after provider
+capacity is acquired immediately before every model invocation. Prompt,
+description, category, incoming bytes, or source inventory changes therefore
+fail closed instead of silently changing one arm.
 
 The operator then runs that one session normally. After all activity and manual
 outcomes are recorded, finalize the counters that cannot be inferred from an
@@ -120,8 +126,11 @@ ctfos benchmark capture \
 
 Capture copies only bounded state-referenced evidence, records every file
 digest, evaluates the copied canonical state, and authenticates the bundle.
-It re-attests runtime source before and after capture. Activity timestamped
-after finalization makes the bundle incomplete.
+It emits promotion bundle schema 2 and records the operator-input digest plus
+the bounded incoming inventory. Runtime source, knowledge, and operator input
+are re-attested during finalization, before and after capture, and again when a
+bundle is verified. Activity timestamped after finalization makes the bundle
+incomplete.
 
 ## 4. Compare only after all explicit sessions finish
 
@@ -141,7 +150,9 @@ ctfos benchmark compare \
 The complete real manifest will have more bundles. Comparison re-authenticates
 the manifest and each bundle, checks the exact file inventory and hashes,
 re-attests runtime source before and after verification, re-runs canonical
-evaluation, rejects reused session IDs/state, and derives:
+evaluation, rejects reused session IDs/state, and requires the paired
+`thin_scaffold`/`ctf_os` sessions for each case to share one operator-input
+digest. It derives:
 
 - solve@1
 - pass^2/3
@@ -155,6 +166,13 @@ evaluation, rejects reused session IDs/state, and derives:
 A missing, duplicate, partial, contaminated, leaked, unsafe, or modified
 bundle closes promotion. The result can only say
 `eligible_for_manual_promotion`; it never changes defaults or submits flags.
+
+The operator-input binding landed in
+`d2fb1130b147605ca5d829ff7d20946fb2f3e41f`. Its focused promotion suite passed
+74/74 tests in 110.727 seconds. This is implementation evidence, not a completed
+blind/live cohort or a solve-performance result. It also does not replace the
+pending current-source full suite, clean all-category matrix, or `ctfos doctor`
+release checks.
 
 ## Trust boundary
 

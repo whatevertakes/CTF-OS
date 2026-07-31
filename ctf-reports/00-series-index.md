@@ -69,9 +69,25 @@ continuation / per-role continuation의 X-26 A/B로 바꾼 기록입니다.
 
 21은 그 뒤 같은 사람이 선택한 `zone` 한 문제에서 실제 off-by-one heap
 primitive, 동적 stack/libc disclosure, staged pivot과 `system()` 효과를
-3 attack/3 control로 재현한 기록입니다. 로컬 flag source와 active target이
-없어 solve로 승격하지 않았고, 동적 interaction을 image-owned typed oracle로
-옮겨야 하는 남은 제품 경계를 함께 고정합니다.
+3 attack/3 control로 재현한 기록입니다. 이후 `6d27bef`/`ad6ae43`에서
+동적 interaction을 image-owned typed oracle로 옮기고 실제 `zone` evaluation
+SHA-256 `d622818d48afaec9b07f209d81f15a36794709ded83bde13935d8953bd3d2d5e`
+로 다시 통과한 후속 증거도 포함합니다. 로컬 flag source와 active target이
+없고 recipe/parent를 운영자가 제공했으므로 solve, remote portability나
+autonomous discovery로 승격하지 않습니다.
+
+그 뒤 category release provenance의 알려진 반례도 닫혔습니다.
+Pwn dependency/effect `1c82147`은 69개 회귀와 pinned 16/16·48/48,
+tamper control 3/3, network `none`을 통과했고, interaction `c9eee37`은
+23개 회귀와 physical record 6개를 통과했습니다. Web `dd929f0`/`cf155cc`,
+Rev `3726adb`, Crypto `d550df1`, Misc `c690af0`, Forensic
+`7c3d604`/`5e88071`도 각각 physical evidence와 hostile control을
+fail-closed합니다. Forensic은 서로 다른 Python/Perl executable hash를
+결속하고 focused 91개와 pinned Docker 7개를 37.961초에 통과했습니다.
+이들은 구현·category child evidence이며, 현재 source의 최종 clean
+all-category matrix, full suite와 `ctfos doctor`를 대신하지 않습니다.
+`d2fb113` promotion collector도 focused 74/74만 통과했으며 실제 blind/live
+solve uplift는 아직 측정하지 않았습니다.
 
 설계 근거끼리 **6과 9가 어긋나면 9**를 따릅니다. 6은 왜 그렇게
 설계했는지, 9는 무엇을 만들려고 했는지, 10은 실제로 무엇이 만들어졌는지,
@@ -91,7 +107,7 @@ primitive, 동적 stack/libc disclosure, staged pivot과 `system()` 효과를
 - [18. Zone one-cycle live diagnostic](18-zone-one-cycle-live-diagnostic.md) — 개선된 all-Sol 엔진으로 `zone` 한 cycle을 재실행해 stale adapter seed와 managed shell/argv 의미 불일치가 target 관측을 막는 실제 병목임을 고정합니다 (관측일 2026-07-30)
 - [19. Zone shell-contract live regression](19-zone-shell-contract-live-regression.md) — stale action retirement와 managed shell contract가 실제 bounded output을 만든 회귀, sandbox-local artifact locator 충돌의 false stall, semantic evaluation 전 결과를 solve로 세지 않는 경계를 기록합니다 (관측일 2026-07-30)
 - [20. OpenAI 2026 agent harness 운용 delta](20-openai-agent-harness-2026-delta.md) — external oracle, bounded append-only context, retained reasoning과 compaction의 최신 공식 근거를 현재 Batch runner에 대입하고 X-26 role-continuity A/B로 제한합니다 (검토일 2026-07-31)
-- [21. Zone solve-capable exploit 실행 증거](21-zone-solve-capable-exploit-evidence.md) — 실제 원본 `zone`에서 동적 stack/libc disclosure와 staged `system()` chain을 3/3 attack 대 3/3 control로 재현하고, flag 부재와 아직 남은 typed interaction-oracle 경계를 기록합니다 (관측일 2026-07-30)
+- [21. Zone solve-capable exploit 실행 증거](21-zone-solve-capable-exploit-evidence.md) — 실제 원본 `zone`에서 동적 stack/libc disclosure와 staged `system()` chain을 operator 3+3과 후속 image-owned typed interaction 3+3으로 재현하고, exact evaluation pointer와 flag/solve/remote 비승격 경계를 기록합니다 (관측일 2026-07-30~31)
 
 부록: [이전 보고서에서 수정한 것](99-corrections.md) — 이전 라운드의 정정 내역
 
@@ -103,8 +119,8 @@ primitive, 동적 stack/libc disclosure, staged pivot과 `system()` 효과를
 
 | 목적 | 읽을 것 |
 | --- | --- |
-| **현재 무엇이 실제로 작동하는지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "구현 상태 요약", [12. 최종 수용성 기록](12-final-acceptance.md), [17. Pwn runtime readiness](17-pwn-runtime-readiness-and-address-advisory.md), 저장소 [README](../README.md) |
-| **다음에 무엇을 코딩할지 알고 싶다** | [17. Pwn runtime readiness](17-pwn-runtime-readiness-and-address-advisory.md)의 마지막 절, [16. Pwn crash 실행 게이트](16-pwn-crash-gate-and-failure-replay.md)의 "다음 구현 우선순위", [10. 구현 결과](10-implementation-result.md)의 "남은 작업 우선순위"와 [9. 구현 설계도](09-implementation-blueprint.md)의 "구현 단계" |
+| **현재 무엇이 실제로 작동하는지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "구현 상태 요약", [12. 최종 수용성 기록](12-final-acceptance.md), [21. Zone typed interaction 증거](21-zone-solve-capable-exploit-evidence.md), 저장소 [README](../README.md) |
+| **다음에 무엇을 코딩할지 알고 싶다** | [10. 구현 결과](10-implementation-result.md)의 "남은 작업 우선순위", [release validation matrix](../docs/release-validation-matrix.md)의 현재 gate 경계, [promotion bundle 운용 계약](../docs/promotion-bundles.md)과 [7. 실험 백로그](07-experiment-backlog.md)의 blind/live 평가 의존 관계 |
 | **왜 그것을 먼저 만드는지 알고 싶다** | [6. 엔진 설계도](06-engine-blueprint.md)의 "레버 우선순위"와 "안티-레버" 두 절. 근거 강도순으로 정렬돼 있습니다 |
 | **실제로 문제가 어떻게 풀리는지 보고 싶다** | [9. 구현 설계도](09-implementation-blueprint.md)의 부록 "실제 운용 시나리오". 카테고리별로 갈리는 지점이 표로 있습니다 |
 | **특정 카테고리를 개선하려 한다** | 해당 편의 "엔진 설계 요구사항" 절. 요구사항 ID와 CTF-OS 현황이 표로 정리돼 있습니다 |

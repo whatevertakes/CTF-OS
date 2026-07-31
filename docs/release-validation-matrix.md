@@ -9,9 +9,10 @@ The runner executes this closed source-controlled gate inventory:
 
 | Gate | Category coverage | Network contract |
 | --- | --- | --- |
-| Pwn dependency/effect | Pwn D→V→L/N/A→P→E | `none` |
+| Pwn dependency/effect | Pwn D→V→L/N/A→P→one-shot E | `none` |
+| Pwn interaction effect | typed RIP-control or canonical executed parent → bounded data-only interaction recipe → attack 3 + matched control 3 | `none` |
 | Web state/impact | Web role-separated state and differential impact | ephemeral Docker `--internal` targets |
-| Web active probe | Web race 3+3 and OOB 3+3 | ephemeral Docker `--internal` targets |
+| Web active probe | Web race 3+3 and OOB 3+3; inspected network and exact target-event audit | ephemeral Docker `--internal` targets |
 | Rev accepted input | Rev original-binary positive 3 / negative 3 | `none` |
 | Crypto + Misc | managed Builder → operator-preissued hidden Crypto 3+3; managed Misc transform + negative control + 3 replays | `none` |
 | Forensic assertion | Forensic indexed, pointer-bound, cross-tool assertion | `none` |
@@ -23,15 +24,81 @@ exit status, a missing/negative final gate summary, an image-binding mismatch,
 or source/image drift during the run. Model and credential-like environment
 variables are removed from child environments.
 
+The Pwn dependency child does not trust stage counters or the child process's
+last output line. `1c82147` reloads canonical state, re-reads every bounded
+request/result/validation sidecar, committed artifact, and compact effect
+transport receipt, and requires exact stage cohorts for six crash, one runtime
+snapshot, three IP-control, and six effect executions. Its parent parser uses a
+bounded full-stream strict JSON schema and requires three repetitions to have
+disjoint run, effect-child, physical-manifest, and sentinel evidence. The
+focused Pwn suite passed 69 tests; the pinned image passed one 16/16 proof and
+the three-way 48/48 proof with all three tamper controls rejected, network
+`none`, and zero candidates/submissions.
+
+The Pwn interaction child accepts no shell program as its interaction
+authority. It binds an existing typed RIP-control or canonical executed parent
+to a canonical `pwn_local_bounded_interaction_v1` recipe, exact source and
+image, an engine preissue, and the attested image producer. Three attacks and
+three matched producer-owned controls run in distinct clean network-none
+workspaces. The child summary is accepted only when the host evaluator
+reconstructs all transcript and derivation-DAG bindings, observes the effect in
+all attacks, rejects it in all controls, and confirms that no candidate,
+submission, or challenge-status authority was created.
+`c9eee37` derives every transport counter from the six physical records instead
+of literals. Its focused suite passed 23 tests and the release proof reported
+exactly six physical records.
+
+The Web active child inspects the exact Docker network after creation and
+requires a matching name with `Internal:true`; printing a literal isolation
+claim is not sufficient. Its target log parser consumes a bounded stream of
+complete JSON objects, including valid objects written adjacently by concurrent
+target threads. Malformed or trailing bytes, non-object JSON, duplicate keys,
+non-finite values, and stream/event bound violations fail closed. The release
+summary itself is an exact no-extra schema at the root, network, race, OOB, and
+target-audit levels. Network inspection was added in `e201e6a`; concurrent log
+stream parsing was fixed in `dd929f0`. `cf155cc` additionally reloads canonical
+impact state and re-reads the physical request/result/validation sidecars,
+artifacts, and receipts, so hostile sidecar rewrites and artifact deletion fail
+closed.
+
 The Crypto/Misc child is also an authority-bound release gate. The operator
 preissues variant parameters/expected output or the verifier from host files
 outside the challenge tree before the Builder run exists. The managed Builder
 publishes only the solver/original parameters or transform DAG/tool plus the
 opaque preissue ID. The child summary is rejected unless
 `oracle_authority=managed_oracle_preissue_v1`, that preissue was consumed
-exactly once, Crypto completed all six clean runs, and Misc completed exactly
-one transform, one rejecting negative control, and three verifier replays
-while remaining candidate-only. Neither path authorizes a submission.
+exactly once, and Crypto's declared result is reconstructed from six persisted
+physical Run records and their request/result/validation documents. The Python
+and Sage paths each require all six clean runs. Misc must complete exactly one
+transform, one rejecting negative control, and three verifier replays while
+remaining candidate-only. Neither path authorizes a submission. Physical-run
+reconstruction was added in `2610c52`.
+`d550df15b13b47304872300989e6beeb94c93701` additionally binds every
+request/result/validation and stdout/stderr sidecar to the corresponding
+physical Run. Its actual pinned-Docker gate completed in 42.122 seconds with
+Python 6/6 and Sage 6/6 physical successes, while hostile sidecar and stdout
+replacement controls were rejected. This direct child gate still does not
+replace the pending final clean-source matrix.
+
+The remaining category release-proof provenance blockers have been closed:
+
+- `3726adb` makes Rev re-read the six terminal sidecars and committed artifacts;
+  failed-sidecar rewrites and artifact deletion no longer preserve a pass.
+- `c690af0` derives Misc success from physical runs and artifacts; the five
+  failed-run and 22-deleted-artifact controls fail closed.
+- `7c3d604` makes Forensic re-read physical sidecars/artifacts and requires two
+  genuinely distinct implementations: Python `/usr/bin/python3` with SHA-256
+  `1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118`
+  and Perl `/usr/bin/perl` with SHA-256
+  `56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa`.
+  Its focused 91 tests and seven pinned-Docker tests passed in 37.961 seconds;
+  sidecar/artifact mutation and duplicate-version controls were rejected.
+- `5e88071` carries the hardened Pwn and Forensic exact schemas into the
+  all-category matrix validator.
+
+These child results are completed deterministic evidence, but they are not the
+final release receipt. Release acceptance remains pending one clean
+current-source all-category matrix, the full suite, and `ctfos doctor`.
 
 After building the release image and committing the exact source under test:
 
@@ -70,3 +137,18 @@ image. It does **not** prove solve@1, hidden/live solve performance, frontier
 model quality, remote portability, or a human-submitted flag. Those remain
 separate thin/full and blind/live evaluations; a green local matrix must not
 be presented as a competition solve.
+
+An interim run at source `ad6ae43` passed all seven gates and all six
+categories against image
+`sha256:f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338`.
+Its local report is `.ctfos/release-matrix/run-ddz31_yt/report.json`, SHA-256
+`ef8e1a8c2c36c689a45d10304e4bd8fe1da629f02e3f766aac03e46f10899570`.
+That receipt predates `d550df1`, `dd929f0`, `cf155cc`, `3726adb`, `c690af0`,
+`1c82147`, `c9eee37`, `7c3d604`, `5e88071`, and
+`d2fb1130b147605ca5d829ff7d20946fb2f3e41f`, so it is historical interim
+evidence rather than current-source release acceptance. The latter commit
+binds schema-v1 prompt/description/category/incoming/static-source operator
+input throughout promotion collection and passed its focused 74/74 tests in
+110.727 seconds; it is implementation evidence, not an executed blind/live
+cohort or measured solve uplift. A new clean-source report pointer and hash,
+full-suite result, and clean `ctfos doctor` result are still required.

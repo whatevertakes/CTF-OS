@@ -6,15 +6,19 @@
 
 > 2026-07-28 동결 상태: **당시 범위 최종 수용**
 >
-> 현재 source 상태: **release acceptance 대기**
+> 현재 source 상태: **release candidate — release acceptance 대기**
 >
 > 아래 2026-07-28 판정은 source freeze
 > `09641f4466b30add7d18d6239a6ff73fb9afa8baccf2fb2d49b2ce5c55a8d96b`
 > 의 코드, Python 3.13 회귀, 정적·image gate, 독립 감사와 Claude CLI
 > read-only 검토를 직접 대조한 **역사적 요구사항 판정**이다. 이후
 > managed/category hot path가 변경됐으므로 그 hash, test 수와 image
-> receipt를 현재 source의 승인으로 재사용하지 않는다. 현재 승격에는
-> 현재 source의 전체 회귀와 exact-image all-category matrix가 새로
+> receipt를 현재 source의 승인으로 재사용하지 않는다. `ad6ae43` source의
+> interim 7-gate/6-category matrix도 이후 Crypto, Web, Rev, Misc, Pwn
+> dependency/interaction, Forensic provenance와
+> `d2fb1130b147605ca5d829ff7d20946fb2f3e41f`의 blind promotion
+> operator-input binding보다 이전이다. 현재 승격에는 이 변경을 모두 포함한
+> 전체 회귀, clean exact-image all-category matrix와 `ctfos doctor`가 새로
 > 필요하다.
 
 충돌 시 권위 순서는 현재 코드와 통과한 회귀, 이 문서의 요구사항 판정,
@@ -28,28 +32,89 @@
 | 영역 | 현재 코드 상태 | 아직 수용하지 않는 주장 |
 |---|---|---|
 | Managed 연속성 | CLI managed solve/run/cycle의 생략 기본은 `captain_lane`; 같은 challenge의 Captain만 resume하고 explorer/builder/verifier/proof는 fresh context | retained reasoning이 blind/live solve를 높였다는 주장 |
-| Pwn | D→V crash, runtime snapshot, address-dependency L/N/A, IP-control primitive와 one-shot 3+3 exploit-effect를 engine-owned artifact로 판정 | 실행 중 pointer capture/derive/staged send가 필요한 exploit을 typed interaction gate가 검증했다는 주장 |
-| Web | 역할별 session/state, runtime timeline, differential impact, race/OOB의 실행 oracle | 실제 대회 proxy, remote portability와 source-only 추론을 impact로 인정하는 것 |
-| Rev | 원본 바이너리 positive 3회와 mutated negative 3회 | 원격/argv/multi-file/non-native 범위 |
-| Crypto | managed Builder보다 앞서 operator가 challenge 밖에서 hidden variant를 preissue하고 engine-private authority를 one-shot 소비하는 3+3 oracle | 현재 source와 image에 결속된 최종 Docker release receipt 및 hidden/live solve 성능 |
-| Forensics | immutable index, file/offset/frame 계열 pointer, readiness와 cross-tool assertion graph | coverage가 낮거나 pointer가 없는 사건 서술 |
-| Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay; candidate-only | verifier 통과를 제출/solve 권한으로 취급하는 것과 현재 Docker release receipt |
+| Pwn | D→V crash, runtime snapshot, address-dependency L/N/A, IP-control primitive, one-shot 3+3 exploit-effect와 data-only dynamic interaction 3+3을 engine-owned artifact 및 physical release evidence로 판정 | `1c82147`은 69개 회귀, pinned 16/16·48/48, tamper 3/3, network `none`; `c9eee37`은 23개 회귀와 interaction physical record 6개를 통과했다. 이를 flag/solve/remote portability, autonomous discovery나 solve uplift로 확대하는 주장은 수용하지 않음 |
+| Web | 역할별 session/state, runtime timeline, differential impact, race/OOB 실행 oracle, matching Docker network `Internal:true`, strict event stream과 physical impact evidence | `dd929f0`/`cf155cc`는 concurrent log 및 sidecar/artifact/receipt hostile controls를 닫았다. 실제 대회 proxy, remote portability와 source-only 추론을 impact로 인정하는 것은 수용하지 않음 |
+| Rev | 원본 바이너리 positive 3회와 mutated negative 3회, physical sidecar/artifact release evidence | `3726adb`가 failed-sidecar rewrite와 artifact deletion을 거부한다. 원격/argv/multi-file/non-native 범위는 미수용 |
+| Crypto | managed Builder보다 앞서 operator가 challenge 밖에서 hidden variant를 preissue하고 engine-private authority를 one-shot 소비하며 persisted physical Run 6개의 request/result/validation과 stdout/stderr provenance에서 Python/Sage 3+3 성공을 재구성 | direct pinned-Docker gate는 통과했지만 현재 전체 source/image에 결속된 최종 clean matrix 및 hidden/live solve 성능은 미검증 |
+| Forensics | immutable index, file/offset/frame 계열 pointer, readiness와 Python/pread·Perl/sysread 독립 executable 기반 cross-tool assertion graph | `7c3d604`/`5e88071`은 focused 91개와 pinned Docker 7개를 37.961초에 통과하고 sidecar/artifact 및 duplicate-version 공격을 거부했다. coverage가 낮거나 pointer가 없는 사건 서술은 미수용 |
+| Misc | modality intake, hash-bound transform DAG, negative control과 3회 replay; candidate-only physical oracle | `c690af0`이 failed physical run/artifact deletion을 거부한다. verifier 통과를 제출/solve 권한으로 취급하는 것은 미수용 |
 
 실제 `zone` 한 문제에서는 bounded operator harness가 매 process의 stack/libc
 주소를 다시 구해 exploit effect를 attack 3/3, matched control 0/3으로
-재현했습니다. 그러나 local flag source와 active remote target이 없었고,
-현재 one-shot typed effect producer가 그 interaction을 표현하지 못합니다.
-따라서 genuine flag, solve, remote portability 또는 typed interaction
-P/E 승격이 아닙니다. 정본 포인터는
+재현했습니다. 이후 이 실행을 parent evidence로 보존하고 54-step data-only
+recipe를 image-owned producer와 engine-preissued 3+3 validator에
+연결했습니다. 후속 evaluation SHA-256
+`d622818d48afaec9b07f209d81f15a36794709ded83bde13935d8953bd3d2d5e`
+도 attack 3회 effect와 matched control 3회 non-effect를 확인했으므로 typed
+interaction exploit-effect evidence로 승격됐습니다. 그러나 local flag
+source와 active remote target이 없고 recipe/parent를 운영자가 제공했으므로
+genuine flag, solve, remote portability 또는 autonomous discovery는
+아닙니다. 정본 포인터는
 [21-zone-solve-capable-exploit-evidence.md](21-zone-solve-capable-exploit-evidence.md)에
 있습니다.
 
-이 delta는 코드 구현 기록이지 현재 release 승인서가 아닙니다. 전체 suite와
-현재 exact-image matrix가 끝나기 전에는 아래 역사적 PASS를 현재 source에
-적용하지 않습니다. 그 뒤에도 동일 모델·도구 thin baseline 대비 3회 중
+Blind promotion collector는
+`d2fb1130b147605ca5d829ff7d20946fb2f3e41f`에서 schema-v1
+prompt/description/category/fresh-incoming/static-source operator input을
+prepare 시 결속하고 launch/provider/finalize/capture/bundle verification
+경계에서 재확인합니다. 같은 case의 thin/full arms가 다른 operator input을
+쓰면 승격을 닫습니다. focused suite 74/74가 110.727초에 통과했지만 실제
+blind/live cohort를 실행했다는 뜻은 아닙니다.
+
+이 delta는 코드 구현 기록이지 현재 release 승인서가 아닙니다. `d550df1`,
+`cf155cc`, `3726adb`, `c690af0`, `1c82147`, `c9eee37`, `7c3d604`,
+`5e88071`과
+`d2fb1130b147605ca5d829ff7d20946fb2f3e41f`를 포함한 전체 suite, 현재
+clean exact-image matrix와 `ctfos doctor`가 끝나기 전에는 아래 역사적
+PASS나 interim matrix를 현재 source에 적용하지 않습니다. 그 뒤에도 동일
+모델·도구 thin baseline 대비 3회 중
 2회 재현, blind/live solve@1, 카테고리 floor는 별도 측정 대상입니다.
 ExploitGym/CyberGym-E2E와 미지 코드베이스 CVE 발견 능력도 CTF 점수와
 합치지 않습니다.
+
+현재 수용성 판단에 참고하되 최종 승인으로 사용하지 않는 중간 evidence는
+다음과 같습니다.
+
+- `ad6ae43` source의 exact-image matrix:
+  `.ctfos/release-matrix/run-ddz31_yt/report.json`, SHA-256
+  `ef8e1a8c2c36c689a45d10304e4bd8fe1da629f02e3f766aac03e46f10899570`,
+  7개 gate/6개 category 통과
+- Pwn interaction implementation/release integration:
+  `6d27bef85e8e8c6d0d1387fcf5955327dbeae25e`,
+  `ad6ae439a07a9e30d70be7f2f61f9ee42f47cace`, `c9eee37`; focused
+  23개, physical record 6개
+- Pwn dependency/effect physical release validation:
+  `1c82147`; focused Pwn 69개, pinned 단일 16/16과 3회 48/48 clean
+  proof, tamper control 3/3, network `none`, candidate/submission 0
+- Web network, concurrent log와 impact provenance:
+  `e201e6ad7957bbf87e2a6d10760d9b0dbeb73b88`,
+  `dd929f0`, `cf155cc`; concurrent stream 및 hostile
+  sidecar/artifact/receipt control 거부. `dd929f0`의 actual pinned-image
+  child summary SHA-256
+  `f73f5f3e7502d4cc1ab782b9da7ff911363272da8806d5bdb2b1dc625b874ec1`
+- Rev/Misc physical provenance:
+  `3726adb`, `c690af0`; failed sidecar/run과 artifact deletion controls 거부
+- Crypto physical-run/provenance reconstruction:
+  `2610c52`, `d550df15b13b47304872300989e6beeb94c93701`; actual pinned
+  Docker 42.122초, Python/Sage 각각 physical 6/6, hostile sidecar·stdout
+  replacement 거부
+- Forensic physical corroboration과 matrix schema:
+  `7c3d604`, `5e88071`; Python `/usr/bin/python3`
+  `1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118`,
+  Perl `/usr/bin/perl`
+  `56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa`,
+  focused 91개와 pinned Docker 7개/37.961초, sidecar/artifact 및
+  duplicate-version controls 거부
+- Blind promotion operator-input binding:
+  `d2fb1130b147605ca5d829ff7d20946fb2f3e41f`; schema-v1
+  prompt/description/category/fresh incoming/static source,
+  launch/provider/finalize/capture/bundle re-attestation, paired-arm equality,
+  bundle schema 2, focused 74/74 in 110.727초
+
+첫 matrix는 뒤의 category hardening보다 이전이고 개별 child smoke는 전체
+matrix를 대신하지 않으므로, 최종 clean-source report pointer/hash, full
+suite와 clean `ctfos doctor` 결과가 발행될 때까지 현재 release acceptance는
+대기 상태입니다. 실제 blind/live solve uplift도 여전히 미측정입니다.
 
 ## 1. 확정 계약 수용표 — 2026-07-28 역사적 동결
 
