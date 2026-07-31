@@ -20,6 +20,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from ctf_os.contracts.interaction_data_common import (
+    canonical_ascii_json_bytes,
+    translate_common_error,
+)
+
 
 PWN_INTERACTION_V1_SCHEMA_VERSION = 1
 PWN_INTERACTION_V1_CONTRACT_ID = "ctfos.pwn.interaction_recipe"
@@ -100,23 +105,13 @@ class PwnInteractionRecipe:
 def pwn_interaction_v1_canonical_json_bytes(value: object) -> bytes:
     """Return the sole accepted JSON representation."""
 
-    try:
-        encoded = (
-            json.dumps(
-                value,
-                allow_nan=False,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode("ascii")
-    except (TypeError, ValueError, UnicodeEncodeError) as error:
-        raise PwnInteractionRecipeError(
+    return translate_common_error(
+        lambda: canonical_ascii_json_bytes(value),
+        lambda _error: PwnInteractionRecipeError(
             "invalid_json_value",
             "recipe contains a value outside canonical ASCII JSON",
-        ) from error
-    return encoded
+        ),
+    )
 
 
 def _reject_duplicate_keys(
