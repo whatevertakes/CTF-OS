@@ -386,9 +386,18 @@ def _validate_pwn_summary(value: dict[str, object]) -> None:
         label="pwn release summary",
     )
     graph_ids = root["graph_ids"]
+    counters = (
+        root["candidate_count"],
+        root["submission_count"],
+        root["repetitions"],
+        root["no_leak_required_chains"],
+        root["real_clean_proofs"],
+        root["tamper_controls_rejected"],
+    )
     if (
         root["ok"] is not True
         or root["network"] != "none"
+        or any(type(item) is not int for item in counters)
         or root["candidate_count"] != 0
         or root["submission_count"] != 0
         or root["repetitions"] != 3
@@ -1000,13 +1009,21 @@ def _validate_forensic_summary(value: dict[str, object]) -> None:
                 "sandbox",
                 "state_status",
                 "submissions",
+                "tool_executables",
             }
         ),
         label="forensic release summary",
     )
     control = _exact_mapping(
         root["control"],
-        required=frozenset({"algorithms", "confirmed", "reason_codes"}),
+        required=frozenset(
+            {
+                "algorithms",
+                "confirmed",
+                "reason_codes",
+                "tool_version_sha256s",
+            }
+        ),
         label="forensic control summary",
     )
     plans = _exact_mapping(
@@ -1030,6 +1047,33 @@ def _validate_forensic_summary(value: dict[str, object]) -> None:
         label="forensic evidence pointer",
         allow_extra=True,
     )
+    tool_executables = _exact_mapping(
+        root["tool_executables"],
+        required=frozenset(
+            {"family-perl-sysread", "family-python-pread"}
+        ),
+        label="forensic tool executables",
+    )
+    perl_executable = _exact_mapping(
+        tool_executables["family-perl-sysread"],
+        required=frozenset({"path", "sha256"}),
+        label="forensic Perl executable",
+    )
+    python_executable = _exact_mapping(
+        tool_executables["family-python-pread"],
+        required=frozenset({"path", "sha256"}),
+        label="forensic Python executable",
+    )
+    if (
+        not _valid_sha256(perl_executable["sha256"])
+        or not _valid_sha256(python_executable["sha256"])
+    ):
+        raise ReleaseMatrixError(
+            "forensic tool executable hashes were invalid"
+        )
+    expected_versions = sorted(
+        (perl_executable["sha256"], python_executable["sha256"])
+    )
     confirmed = root["confirmed"]
     confirmations_valid = (
         type(confirmed) is list
@@ -1038,8 +1082,18 @@ def _validate_forensic_summary(value: dict[str, object]) -> None:
         == [1, 2, 3]
         and all(
             type(item) is dict
-            and item.get("algorithms") == ["descriptor", "mmap"]
+            and set(item)
+            == {
+                "algorithms",
+                "evaluation_sha256",
+                "ordinal",
+                "record_count",
+                "tool_version_sha256s",
+            }
+            and item.get("algorithms")
+            == ["descriptor", "perl-sysread"]
             and item.get("record_count") == 2
+            and item.get("tool_version_sha256s") == expected_versions
             and _valid_sha256(item.get("evaluation_sha256"))
             for item in confirmed
         )
@@ -1055,10 +1109,18 @@ def _validate_forensic_summary(value: dict[str, object]) -> None:
         or root["network"] != "none"
         or root["sandbox"] != "production_real_docker"
         or root["cleanup"] != "verified"
-        or control["algorithms"] != ["descriptor", "mmap"]
+        or control["algorithms"] != ["descriptor", "perl-sysread"]
         or control["confirmed"] is not False
+        or control["tool_version_sha256s"] != expected_versions
         or type(control["reason_codes"]) is not list
         or not control["reason_codes"]
+        or perl_executable["path"] != "/usr/bin/perl"
+        or perl_executable["sha256"]
+        != "56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa"
+        or python_executable["path"] != "/usr/bin/python3"
+        or python_executable["sha256"]
+        != "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
+        or perl_executable["sha256"] == python_executable["sha256"]
         or not any(
             "observation_request_binding_mismatch" in item
             for item in control["reason_codes"]

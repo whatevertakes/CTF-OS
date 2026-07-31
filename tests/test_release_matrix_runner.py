@@ -285,19 +285,31 @@ def _valid_summary(task_id: str) -> dict[str, object]:
             "cleanup": "verified",
             "confirmed": [
                 {
-                    "algorithms": ["descriptor", "mmap"],
+                    "algorithms": ["descriptor", "perl-sysread"],
                     "evaluation_sha256": SHA256,
                     "ordinal": ordinal,
                     "record_count": 2,
+                    "tool_version_sha256s": sorted(
+                        (
+                            "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118",
+                            "56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa",
+                        )
+                    ),
                 }
                 for ordinal in range(1, 4)
             ],
             "control": {
-                "algorithms": ["descriptor", "mmap"],
+                "algorithms": ["descriptor", "perl-sysread"],
                 "confirmed": False,
                 "reason_codes": [
                     "observation_request_binding_mismatch:control"
                 ],
+                "tool_version_sha256s": sorted(
+                    (
+                        "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118",
+                        "56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa",
+                    )
+                ),
             },
             "image_digest": IMAGE_DIGEST,
             "index_execution_sha256": SHA256,
@@ -320,6 +332,22 @@ def _valid_summary(task_id: str) -> dict[str, object]:
             "sandbox": "production_real_docker",
             "state_status": "TRIAGING",
             "submissions": 0,
+            "tool_executables": {
+                "family-perl-sysread": {
+                    "path": "/usr/bin/perl",
+                    "sha256": (
+                        "56e5ea41974eb1eff0f7ea64677578b193"
+                        "8053d29818c2810bcb21e2ca68cafa"
+                    ),
+                },
+                "family-python-pread": {
+                    "path": "/usr/bin/python3",
+                    "sha256": (
+                        "1643dacd9feaedc58f3cc581e4d22577d"
+                        "fe25c09b10282936186ccf0f2e61118"
+                    ),
+                },
+            },
         }
     raise AssertionError(f"no valid fixture for {task_id}")
 
@@ -578,6 +606,75 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
                         capture,
                         IMAGE_DIGEST,
                     )
+
+    def test_pwn_summary_rejects_bool_or_float_counters(self) -> None:
+        task = next(
+            item
+            for item in release.RELEASE_TASKS
+            if item.id == "pwn_dependency_effect"
+        )
+        for field, invalid in (
+            ("candidate_count", False),
+            ("submission_count", 0.0),
+            ("repetitions", 3.0),
+            ("no_leak_required_chains", 3.0),
+            ("real_clean_proofs", 48.0),
+            ("tamper_controls_rejected", True),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                summary = _valid_summary(task.id)
+                summary[field] = invalid
+                capture = release._BoundedCapture(limit_bytes=32_768)
+                capture.consume(
+                    io.BytesIO(
+                        json.dumps(summary, sort_keys=True).encode("ascii")
+                        + b"\n"
+                    )
+                )
+                with self.assertRaises(release.ReleaseMatrixError):
+                    release._validate_child_summary(
+                        task,
+                        capture,
+                        IMAGE_DIGEST,
+                    )
+
+    def test_forensic_rejects_duplicate_tool_executable_version(
+        self,
+    ) -> None:
+        task = next(
+            item
+            for item in release.RELEASE_TASKS
+            if item.id == "forensic_assertion_graph"
+        )
+        summary = _valid_summary(task.id)
+        duplicate = summary["tool_executables"][
+            "family-python-pread"
+        ]["sha256"]
+        summary["tool_executables"]["family-perl-sysread"][
+            "sha256"
+        ] = duplicate
+        summary["control"]["tool_version_sha256s"] = [
+            duplicate,
+            duplicate,
+        ]
+        for item in summary["confirmed"]:
+            item["tool_version_sha256s"] = [
+                duplicate,
+                duplicate,
+            ]
+        capture = release._BoundedCapture(limit_bytes=32_768)
+        capture.consume(
+            io.BytesIO(
+                json.dumps(summary, sort_keys=True).encode("ascii")
+                + b"\n"
+            )
+        )
+        with self.assertRaises(release.ReleaseMatrixError):
+            release._validate_child_summary(
+                task,
+                capture,
+                IMAGE_DIGEST,
+            )
 
     def test_pwn_interaction_summary_is_exact_and_requires_physical_controls(
         self,
