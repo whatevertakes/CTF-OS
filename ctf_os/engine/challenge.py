@@ -11364,6 +11364,7 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_diagnostic_flag,
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
             (
@@ -14524,6 +14525,7 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_diagnostic_flag,
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
             (
@@ -15695,6 +15697,7 @@ class ChallengeEngine:
         snapshot_flag_detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_snapshot_flag,
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         try:
             (
@@ -16458,6 +16461,7 @@ class ChallengeEngine:
         pwn_flag_detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_pwn_flag,
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         source_staging = None
         input_staging = None
@@ -17774,6 +17778,7 @@ class ChallengeEngine:
         detector = FlagDetector(
             flag_policy.patterns,
             callback=receive_tool_flag,
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
         for experiment in pending:
             latest_before_start = self.store.load(identity)
@@ -27954,6 +27959,9 @@ class ChallengeEngine:
                 proof_detector = FlagDetector(
                     proof_flag_policy.patterns,
                     callback=receive_proof_flag,
+                    suppress_generic_code_noise=(
+                        proof_flag_policy.source == "runtime"
+                    ),
                 )
                 proof_interruption: BaseException | None = None
                 try:

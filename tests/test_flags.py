@@ -87,6 +87,77 @@ class FlagDetectorTests(unittest.TestCase):
         self.assertEqual(len(detector.seen), 2)
         self.assertEqual(detector.suppressed_matches, 2)
 
+    def test_generic_code_noise_filter_suppresses_field_false_positives(
+        self,
+    ) -> None:
+        candidates: list[DetectedFlag] = []
+        detector = FlagDetector(
+            (r"\b[A-Za-z0-9_]{2,32}\{[^{}\r\n]{1,512}\}",),
+            callback=candidates.append,
+            suppress_generic_code_noise=True,
+        )
+
+        found = detector.feed(
+            "body{color:#222;font:normal 13px arial;"
+            "margin:0} return{file:!1,glob:!1,sortOrder:!1} "
+            "u003d{docid} DH{%s} DH{real_candidate}",
+            source="browser:stdout",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in found],
+            ["DH{real_candidate}"],
+        )
+        self.assertEqual(
+            [candidate.value for candidate in candidates],
+            ["DH{real_candidate}"],
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 4)
+
+    def test_generic_code_noise_filter_uses_markup_and_source_context(
+        self,
+    ) -> None:
+        candidates: list[DetectedFlag] = []
+        detector = FlagDetector(
+            (r"\b[A-Za-z0-9_]{2,32}\{[^{}\r\n]{1,512}\}",),
+            callback=candidates.append,
+            suppress_generic_code_noise=True,
+        )
+
+        detector.feed(
+            "<script>config{alpha:1,beta:2}</script> "
+            "TEAM{alpha:1,beta:2}",
+            source="response.html",
+        )
+        detector.feed(
+            "theme{foreground:#fff;background:#000}",
+            source="/challenge/site.css",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in candidates],
+            ["TEAM{alpha:1,beta:2}"],
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 2)
+
+    def test_generic_code_noise_filter_is_opt_in_for_exact_formats(self) -> None:
+        candidates: list[DetectedFlag] = []
+        detector = FlagDetector(
+            (r"TEAM\{[^{}\r\n]+\}",),
+            callback=candidates.append,
+        )
+
+        detector.feed(
+            "<script>TEAM{alpha:1,beta:2}</script>",
+            source="response.html",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in candidates],
+            ["TEAM{alpha:1,beta:2}"],
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 0)
+
     def test_invalid_candidate_does_not_consume_seen_or_quota(self) -> None:
         candidates: list[DetectedFlag] = []
         detector = FlagDetector(

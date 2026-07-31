@@ -1499,15 +1499,17 @@ def prove_pwn_interaction(
             raise EngineError(
                 "Pwn interaction resource lease unavailable"
             )
+        flag_policy = resolve_flag_format(
+            preissued_state,
+            engine.config.runtime.flag_patterns,
+        )
         detector = FlagDetector(
-            resolve_flag_format(
-                preissued_state,
-                engine.config.runtime.flag_patterns,
-            ).patterns,
+            flag_policy.patterns,
             callback=lambda detected: engine._on_tool_flag(
                 identity,
                 detected,
             ),
+            suppress_generic_code_noise=flag_policy.source == "runtime",
         )
 
         evidences: list[PwnInteractionReplayEvidence] = []

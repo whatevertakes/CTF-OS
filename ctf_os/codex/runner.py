@@ -2112,11 +2112,13 @@ class BatchRunner:
                 self.flag_patterns,
                 candidate_limit=self.flag_candidate_limit,
                 candidate_chars_limit=self.flag_candidate_chars_limit,
+                suppress_generic_code_noise=True,
             )
         else:
             detector = FlagDetector(
                 candidate_limit=self.flag_candidate_limit,
                 candidate_chars_limit=self.flag_candidate_chars_limit,
+                suppress_generic_code_noise=True,
             )
         accumulator = EventAccumulator(
             detector=detector,
