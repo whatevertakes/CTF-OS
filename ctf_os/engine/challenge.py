@@ -256,7 +256,11 @@ from ctf_os.engine.pwn_disclosure import (
     evaluate_pwn_disclosure,
 )
 from ctf_os.engine.pwn_ip_control import (
+    PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION,
+    PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS,
+    PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION,
     PWN_IP_CONTROL_REPLAY_COUNT,
+    PWN_IP_CONTROL_TIMEOUT_SECONDS,
     PWN_IP_CONTROL_WIDTH_BYTES,
     PwnIpControlPlan,
     PwnIpControlPlanError,
@@ -1581,7 +1585,6 @@ _PWN_IP_CONTROL_ENGINE_COMMAND = "ctfos-engine:pwn-ip-control-v1"
 _PWN_IP_CONTROL_ENGINE_EXECUTOR = "pwn_ip_control_v1"
 _PWN_IP_CONTROL_RESULT_KEY = "pwn_ip_control_evidence"
 _PWN_IP_CONTROL_PROTOCOL = "pwn_ip_control_metamorphic_replay_v1"
-_PWN_IP_CONTROL_TIMEOUT_SECONDS = 30
 _PWN_IP_CONTROL_EXPECTED_OBSERVATION = (
     "three clean replays move the full x86_64 RIP to three engine-derived "
     "unmapped addresses"
@@ -14690,10 +14693,22 @@ class ChallengeEngine:
     ) -> _PwnIpControlCanonicalInputs:
         """Reconstruct a registered primitive probe from canonical state."""
 
+        managed_contract_version = child.extra.get(
+            "managed_contract_version"
+        )
+        expected_timeout_seconds = (
+            PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS
+            if managed_contract_version
+            == PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION
+            else PWN_IP_CONTROL_TIMEOUT_SECONDS
+            if managed_contract_version
+            == PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION
+            else None
+        )
         if (
             str(get_adapter(state.category).name) != "pwn"
             or child.command != _PWN_IP_CONTROL_ENGINE_COMMAND
-            or child.extra.get("managed_contract_version") != 1
+            or expected_timeout_seconds is None
             or child.extra.get("engine_executor")
             != _PWN_IP_CONTROL_ENGINE_EXECUTOR
             or type(child.extra.get("baseline_experiment_id")) is not str
@@ -14723,7 +14738,7 @@ class ChallengeEngine:
         if (
             child.id != pwn_ip_control_child_experiment_id(baseline.id)
             or raw_plan != plan.to_dict()
-            or child.timeout_seconds != _PWN_IP_CONTROL_TIMEOUT_SECONDS
+            or child.timeout_seconds != expected_timeout_seconds
             or child.resource_class != "light"
             or child.kind is not ExperimentKind.PROBE
         ):
@@ -14878,13 +14893,15 @@ class ChallengeEngine:
             expected_observation=_PWN_IP_CONTROL_EXPECTED_OBSERVATION,
             keep_if=_PWN_IP_CONTROL_KEEP_CONDITION,
             drop_if=_PWN_IP_CONTROL_DROP_CONDITION,
-            timeout_seconds=_PWN_IP_CONTROL_TIMEOUT_SECONDS,
+            timeout_seconds=PWN_IP_CONTROL_TIMEOUT_SECONDS,
             resource_class="light",
             kind=ExperimentKind.PROBE,
             status=ExperimentStatus.REGISTERED,
             artifact_ids=[item.id for item in variant_artifacts],
             extra={
-                "managed_contract_version": 1,
+                "managed_contract_version": (
+                    PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION
+                ),
                 "engine_executor": _PWN_IP_CONTROL_ENGINE_EXECUTOR,
                 "baseline_experiment_id": baseline.id,
                 "pwn_ip_control_plan": plan.to_dict(),
@@ -15189,6 +15206,14 @@ class ChallengeEngine:
                 challenge_dir_override=challenge_root,
                 network_policy_override=NetworkPolicy.deny_all(),
             )
+            capability_report = (
+                self._inspect_pwn_runtime_snapshot_capability(
+                    inputs.disclosure.snapshot_recipe.image_digest,
+                    deadline_monotonic_seconds=(
+                        gate_deadline_monotonic
+                    ),
+                )
+            )
 
             for ordinal, (variant, proof_input) in enumerate(
                 zip(
@@ -15209,11 +15234,12 @@ class ChallengeEngine:
                     variant,
                     run_id=run_id,
                 )
-                capability = self._probe_pwn_runtime_snapshot_capability(
-                    recipe,
-                    deadline_monotonic_seconds=(
-                        gate_deadline_monotonic
-                    ),
+                capability = (
+                    normalize_pwn_runtime_snapshot_capability_attestation(
+                        dict(capability_report),
+                        image_digest=recipe.image_digest,
+                        recipe_sha256=recipe.recipe_sha256,
+                    )
                 )
                 capability_path = (
                     plan_root
@@ -16162,6 +16188,24 @@ class ChallengeEngine:
     ) -> PwnRuntimeSnapshotCapabilityAttestation:
         """Attest the exact pinned diagnostic producer."""
 
+        report = self._inspect_pwn_runtime_snapshot_capability(
+            recipe.image_digest,
+            deadline_monotonic_seconds=deadline_monotonic_seconds,
+        )
+        return normalize_pwn_runtime_snapshot_capability_attestation(
+            report,
+            image_digest=recipe.image_digest,
+            recipe_sha256=recipe.recipe_sha256,
+        )
+
+    def _inspect_pwn_runtime_snapshot_capability(
+        self,
+        image_digest: str,
+        *,
+        deadline_monotonic_seconds: float,
+    ) -> dict[str, object]:
+        """Inspect one exact image for recipe-bound snapshot attestations."""
+
         self._require_before_hard_deadline(
             deadline_monotonic_seconds,
             "Pwn runtime snapshot capability probe",
@@ -16174,24 +16218,21 @@ class ChallengeEngine:
             )
         report = (
             self._capability_probe(
-                recipe.image_digest,
+                image_digest,
                 timeout_seconds=min(30.0, remaining),
             )
             if self._capability_probe_accepts_timeout
-            else self._capability_probe(recipe.image_digest)
-        )
-        attestation = (
-            normalize_pwn_runtime_snapshot_capability_attestation(
-                dict(report),
-                image_digest=recipe.image_digest,
-                recipe_sha256=recipe.recipe_sha256,
-            )
+            else self._capability_probe(image_digest)
         )
         self._require_before_hard_deadline(
             deadline_monotonic_seconds,
             "Pwn runtime snapshot capability probe",
         )
-        return attestation
+        if type(report) is not dict:
+            raise EngineError(
+                "Pwn runtime snapshot capability report is invalid"
+            )
+        return dict(report)
 
     def _execute_pwn_runtime_snapshot(
         self,

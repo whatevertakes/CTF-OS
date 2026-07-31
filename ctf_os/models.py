@@ -8469,7 +8469,11 @@ def _pwn_ip_control_state_errors(
         raw_plan = child.extra.get("pwn_ip_control_plan")
         try:
             from ctf_os.engine.pwn_ip_control import (
+                PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION,
+                PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS,
+                PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION,
                 PWN_IP_CONTROL_REPLAY_COUNT,
+                PWN_IP_CONTROL_TIMEOUT_SECONDS,
                 PwnIpControlResult,
                 PwnIpControlStatus,
                 pwn_ip_control_child_experiment_id,
@@ -8498,6 +8502,19 @@ def _pwn_ip_control_state_errors(
             errors.append(f"{label} plan is invalid: {error}")
             continue
 
+        managed_contract_version = child.extra.get(
+            "managed_contract_version"
+        )
+        expected_timeout_seconds = (
+            PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS
+            if managed_contract_version
+            == PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION
+            else PWN_IP_CONTROL_TIMEOUT_SECONDS
+            if managed_contract_version
+            == PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION
+            else None
+        )
+
         baseline_id = child.extra.get("baseline_experiment_id")
         baseline = (
             experiments.get(baseline_id)
@@ -8508,7 +8525,7 @@ def _pwn_ip_control_state_errors(
             type(child.extra) is not dict
             or set(child.extra)
             != _PWN_IP_CONTROL_EXPERIMENT_EXTRA_KEYS
-            or child.extra.get("managed_contract_version") != 1
+            or expected_timeout_seconds is None
             or child.extra.get("engine_executor")
             != _PWN_IP_CONTROL_ENGINE_EXECUTOR
             or state.category.strip().casefold() != "pwn"
@@ -8526,7 +8543,7 @@ def _pwn_ip_control_state_errors(
             != _PWN_IP_CONTROL_EXPECTED_OBSERVATION
             or child.keep_if != _PWN_IP_CONTROL_KEEP_CONDITION
             or child.drop_if != _PWN_IP_CONTROL_DROP_CONDITION
-            or child.timeout_seconds != 30
+            or child.timeout_seconds != expected_timeout_seconds
             or child.resource_class != "light"
             or child.source_run_id is not None
             or child.proof_recipe is not None

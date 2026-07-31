@@ -61,6 +61,7 @@ from ctf_os.store.atomic import (
     canonical_json_bytes,
     strict_json_loads,
 )
+from ctf_os.terminal import terminal_safe
 from tests import test_pwn_crash_execution as crash_execution
 from tests import test_pwn_ip_control_lifecycle as ip_lifecycle
 
@@ -252,6 +253,20 @@ def _recipe(effect_address: int) -> bytes:
     return recipe.canonical_bytes
 
 
+def _parent_failure_detail(experiment) -> str:
+    status = getattr(experiment.status, "value", experiment.status)
+    raw_error = (
+        experiment.result.get("error")
+        if type(experiment.result) is dict
+        else None
+    )
+    error = raw_error if type(raw_error) is str else "missing error detail"
+    return (
+        f"status={terminal_safe(status)[:64]} "
+        f"error={terminal_safe(error)[:512]}"
+    )
+
+
 def _typed_parent(state, parent_id: str) -> None:
     experiment = next(
         item for item in state.experiments if item.id == parent_id
@@ -260,7 +275,10 @@ def _typed_parent(state, parent_id: str) -> None:
         experiment.status is not ExperimentStatus.COMPLETED
         or type(experiment.result) is not dict
     ):
-        raise AssertionError("typed IP-control parent did not complete")
+        raise AssertionError(
+            "typed IP-control parent did not complete: "
+            f"{_parent_failure_detail(experiment)}"
+        )
     result = PwnIpControlResult.from_dict(
         experiment.result["pwn_ip_control_evidence"]["result"]
     )

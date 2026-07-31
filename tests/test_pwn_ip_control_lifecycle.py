@@ -10,7 +10,11 @@ from ctf_os.contracts.pwn_runtime_snapshot_v1 import (
     build_pwn_runtime_snapshot_v1_result,
 )
 from ctf_os.engine.pwn_ip_control import (
+    PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION,
+    PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS,
+    PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION,
     PWN_IP_CONTROL_REPLAY_COUNT,
+    PWN_IP_CONTROL_TIMEOUT_SECONDS,
     PWN_IP_CONTROL_WIDTH_BYTES,
     PwnIpControlResult,
     PwnIpControlStatus,
@@ -249,6 +253,13 @@ class PwnIpControlLifecycleTests(unittest.TestCase):
             _session_owned=True,
             experiment_ids=(snapshot_id,),
         )
+        capability_calls: list[str] = []
+
+        def capability(digest: str):
+            capability_calls.append(digest)
+            return self._snapshot_capability(digest)
+
+        engine._capability_probe = capability
         before = {
             "status": snapshot_state.status,
             "candidates": len(snapshot_state.candidates),
@@ -272,6 +283,14 @@ class PwnIpControlLifecycleTests(unittest.TestCase):
         envelope = child.result["pwn_ip_control_evidence"]
         result = PwnIpControlResult.from_dict(envelope["result"])
         self.assertIs(child.status, ExperimentStatus.COMPLETED)
+        self.assertEqual(
+            child.extra["managed_contract_version"],
+            PWN_IP_CONTROL_MANAGED_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            child.timeout_seconds,
+            PWN_IP_CONTROL_TIMEOUT_SECONDS,
+        )
         self.assertIs(result.status, PwnIpControlStatus.PROVEN)
         self.assertTrue(result.instruction_pointer_control_proven)
         self.assertFalse(result.to_dict()["authorities"]["exploit_proven"])
@@ -290,6 +309,30 @@ class PwnIpControlLifecycleTests(unittest.TestCase):
             PWN_IP_CONTROL_REPLAY_COUNT,
         )
         self.assertEqual(len(child.artifact_ids), 13)
+        self.assertEqual(len(capability_calls), 1)
+        capability_artifacts = [
+            item
+            for item in completed.artifacts
+            if item.extra.get("kind")
+            == "pwn_ip_control_capability_attestation"
+        ]
+        self.assertEqual(
+            len(capability_artifacts),
+            PWN_IP_CONTROL_REPLAY_COUNT,
+        )
+        self.assertEqual(
+            len({item.sha256 for item in capability_artifacts}),
+            PWN_IP_CONTROL_REPLAY_COUNT,
+        )
+        self.assertEqual(
+            len(
+                {
+                    item.extra["transport_recipe_sha256"]
+                    for item in capability_artifacts
+                }
+            ),
+            PWN_IP_CONTROL_REPLAY_COUNT,
+        )
         self.assertEqual(coordinator.snapshot_calls, 4)
         self.assertEqual(coordinator.generic_calls, 0)
         self.assertEqual(coordinator.snapshot_payloads[0], payload)
@@ -337,6 +380,76 @@ class PwnIpControlLifecycleTests(unittest.TestCase):
             self.assertIsNone(spec.network_target)
             self.assertEqual(spec.resource_request.network, 0)
             self.assertEqual(policy.authorize(None), "none")
+        replay_deadlines = {
+            spec.deadline_monotonic_seconds
+            for spec in coordinator.specs[-PWN_IP_CONTROL_REPLAY_COUNT:]
+        }
+        self.assertNotIn(None, replay_deadlines)
+        self.assertEqual(len(replay_deadlines), 1)
+
+    def test_legacy_v1_child_remains_readable_and_executable(self) -> None:
+        fixture, _coordinator, engine, parent_id, _payload = self._fixture()
+        fixture._execute(engine, parent_id)
+        snapshot_id = pwn_runtime_snapshot_child_experiment_id(parent_id)
+        engine._capability_probe = self._snapshot_capability
+        engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(snapshot_id,),
+        )
+        disclosed = engine._advance_pwn_runtime_snapshot_disclosures(
+            fixture.identity
+        )
+        engine._register_pwn_ip_control_child_if_applicable(
+            fixture.identity,
+            disclosed,
+        )
+        child_id = pwn_ip_control_child_experiment_id(snapshot_id)
+
+        def restore_legacy_identity(state) -> None:
+            child = next(
+                item for item in state.experiments if item.id == child_id
+            )
+            child.extra["managed_contract_version"] = (
+                PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION
+            )
+            child.timeout_seconds = PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS
+
+        engine.store.update(fixture.identity, restore_legacy_identity)
+        loaded = engine.store.load(fixture.identity)
+        legacy = next(
+            item for item in loaded.experiments if item.id == child_id
+        )
+        self.assertIs(legacy.status, ExperimentStatus.REGISTERED)
+        self.assertEqual(
+            legacy.extra["managed_contract_version"],
+            PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            legacy.timeout_seconds,
+            PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS,
+        )
+
+        completed = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(child_id,),
+        )
+        terminal = next(
+            item for item in completed.experiments if item.id == child_id
+        )
+        self.assertIs(terminal.status, ExperimentStatus.COMPLETED)
+        self.assertEqual(
+            terminal.extra["managed_contract_version"],
+            PWN_IP_CONTROL_LEGACY_MANAGED_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            terminal.timeout_seconds,
+            PWN_IP_CONTROL_LEGACY_TIMEOUT_SECONDS,
+        )
+        completed.validate()
 
     def test_running_child_recovery_fails_closed_without_evidence(
         self,
@@ -453,6 +566,97 @@ class PwnIpControlLifecycleTests(unittest.TestCase):
         self.assertEqual(len(completed.facts), before_facts)
         self.assertEqual(len(completed.progress_markers), before_progress)
         self.assertEqual(completed.status, before_status)
+
+    def test_capability_mismatch_fails_once_before_any_replay(self) -> None:
+        fixture, coordinator, engine, parent_id, _payload = self._fixture()
+        fixture._execute(engine, parent_id)
+        snapshot_id = pwn_runtime_snapshot_child_experiment_id(parent_id)
+        engine._capability_probe = self._snapshot_capability
+        baseline = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(snapshot_id,),
+        )
+        before = (
+            len(baseline.facts),
+            len(baseline.progress_markers),
+            coordinator.snapshot_calls,
+        )
+        capability_calls: list[str] = []
+
+        def mismatched(digest: str):
+            capability_calls.append(digest)
+            report = self._snapshot_capability(digest)
+            report["image_digest"] = "sha256:" + ("0" * 64)
+            return report
+
+        engine._capability_probe = mismatched
+        child_id = pwn_ip_control_child_experiment_id(snapshot_id)
+        failed = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(child_id,),
+        )
+        child = next(
+            item for item in failed.experiments if item.id == child_id
+        )
+        self.assertIs(child.status, ExperimentStatus.FAILED)
+        self.assertIn("invalid_capability_report", child.result["error"])
+        self.assertEqual(len(capability_calls), 1)
+        self.assertEqual(coordinator.snapshot_calls, before[2])
+        self.assertEqual(len(failed.facts), before[0])
+        self.assertEqual(len(failed.progress_markers), before[1])
+        self.assertEqual(child.evidence_fact_ids, [])
+        self.assertEqual(child.evidence_run_ids, [])
+        self.assertEqual(child.evidence_receipt_ids, [])
+
+    def test_deadline_failure_preserves_cause_without_authority(self) -> None:
+        fixture, coordinator, engine, parent_id, _payload = self._fixture()
+        fixture._execute(engine, parent_id)
+        snapshot_id = pwn_runtime_snapshot_child_experiment_id(parent_id)
+        engine._capability_probe = self._snapshot_capability
+        baseline = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(snapshot_id,),
+        )
+        before = (
+            len(baseline.facts),
+            len(baseline.progress_markers),
+            coordinator.snapshot_calls,
+        )
+        original_deadline_gate = engine._require_before_hard_deadline
+
+        def expire_before_replay(deadline: float, operation: str) -> None:
+            if operation == "Pwn IP-control replay 1":
+                raise RuntimeError("sentinel aggregate deadline exhausted")
+            original_deadline_gate(deadline, operation)
+
+        engine._require_before_hard_deadline = expire_before_replay
+        child_id = pwn_ip_control_child_experiment_id(snapshot_id)
+        failed = engine.execute_registered_experiments(
+            fixture.identity,
+            maximum=1,
+            _session_owned=True,
+            experiment_ids=(child_id,),
+        )
+        child = next(
+            item for item in failed.experiments if item.id == child_id
+        )
+        self.assertIs(child.status, ExperimentStatus.FAILED)
+        self.assertIn(
+            "sentinel aggregate deadline exhausted",
+            child.result["error"],
+        )
+        self.assertEqual(coordinator.snapshot_calls, before[2])
+        self.assertEqual(len(failed.facts), before[0])
+        self.assertEqual(len(failed.progress_markers), before[1])
+        self.assertEqual(child.evidence_fact_ids, [])
+        self.assertEqual(child.evidence_run_ids, [])
+        self.assertEqual(child.evidence_receipt_ids, [])
 
 
 if __name__ == "__main__":

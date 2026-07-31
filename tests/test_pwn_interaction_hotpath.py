@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from ctf_os import cli
@@ -334,6 +335,21 @@ class _Coordinator:
 
 
 class PwnInteractionHotPathTests(unittest.TestCase):
+    def test_failed_ip_parent_reason_is_bounded_and_terminal_safe(self):
+        parent = SimpleNamespace(
+            id="E-ip-control",
+            status=ExperimentStatus.FAILED,
+            result={"error": "sentinel\n" + ("x" * 2_000)},
+        )
+        state = SimpleNamespace(experiments=[parent])
+        with self.assertRaises(AssertionError) as raised:
+            interaction_release._typed_parent(state, parent.id)
+        message = str(raised.exception)
+        self.assertIn("status=failed", message)
+        self.assertIn(r"error=sentinel\x0a", message)
+        self.assertNotIn("\n", message)
+        self.assertLess(len(message), 700)
+
     def _fixture(self):
         lifecycle = ip_lifecycle.PwnIpControlLifecycleTests(
             methodName=(
