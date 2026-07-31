@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Release proof for the public Forensic assertion hot path in real Docker.
 
-The proof builds the production evidence index, probes two distinct file-range
-implementations in the digest-pinned image, and executes three independently
+The proof builds the production evidence index, probes Python/pread and
+Perl/sysread implementations in the digest-pinned image, and executes three
+independently
 issued confirmed assertion waves plus one deliberately nonmatching control.
 Every evidence-producing command uses the production challenge sandbox with
 network disabled.  Raw selected bytes remain in private artifacts only.
@@ -15,14 +16,16 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -66,7 +69,11 @@ from ctf_os.sandbox.files import (
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store import MAX_CANONICAL_STATE_BYTES
-from ctf_os.store.atomic import atomic_write_bytes
+from ctf_os.store.atomic import (
+    atomic_write_bytes,
+    canonical_json_bytes,
+    strict_json_loads,
+)
 
 
 FIXTURE_SOURCE = (
@@ -76,16 +83,30 @@ FIXTURE_SOURCE = (
     / "fixtures"
     / "forensic_assertion_tool.py"
 )
+PERL_FIXTURE_SOURCE = (
+    REPOSITORY
+    / "ctf-os-image"
+    / "tests"
+    / "fixtures"
+    / "forensic_assertion_perl_tool.pl"
+)
 RELEASE_IMAGE_DIGEST = (
     "sha256:"
     "f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338"
 )
 FIXTURE_DESTINATION = "forensic_assertion_tool.py"
+PERL_FIXTURE_DESTINATION = "forensic_assertion_perl_tool.pl"
 TOOL_PROTOCOL = "ctfos.release.forensic.assertion.tool.v1"
 POSITIVE_REPETITIONS = 3
 EVIDENCE_PREFIX = b"release-forensic-prefix|"
 EVIDENCE_SUFFIX = b"|release-forensic-suffix"
 READINESS_MAX_BYTES = 64 * 1024
+PYTHON_EXECUTABLE_SHA256 = (
+    "1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118"
+)
+PERL_EXECUTABLE_SHA256 = (
+    "56e5ea41974eb1eff0f7ea64677578b1938053d29818c2810bcb21e2ca68cafa"
+)
 
 
 def _load_fixture() -> ModuleType:
@@ -239,6 +260,9 @@ def _copy_challenge_inputs(
     fixture_destination = incoming / FIXTURE_DESTINATION
     shutil.copyfile(FIXTURE_SOURCE, fixture_destination)
     fixture_destination.chmod(0o500)
+    perl_destination = incoming / PERL_FIXTURE_DESTINATION
+    shutil.copyfile(PERL_FIXTURE_SOURCE, perl_destination)
+    perl_destination.chmod(0o400)
 
 
 def _execute_index(
@@ -329,11 +353,18 @@ def _tool_version(
     algorithm: str,
     corrupt_binding: bool,
 ) -> str:
-    return fixture.tool_version_sha256(
-        FIXTURE_SOURCE.read_bytes(),
-        algorithm=algorithm,
-        corrupt_binding=corrupt_binding,
-    )
+    if algorithm == "descriptor":
+        observed = fixture.tool_version_sha256(
+            FIXTURE_SOURCE.read_bytes(),
+            algorithm=algorithm,
+            corrupt_binding=corrupt_binding,
+        )
+        if observed != PYTHON_EXECUTABLE_SHA256:
+            raise AssertionError("host Python executable hash is unexpected")
+        return PYTHON_EXECUTABLE_SHA256
+    if algorithm == "perl-sysread":
+        return PERL_EXECUTABLE_SHA256
+    raise AssertionError("unknown Forensic release implementation")
 
 
 def _command_template(
@@ -343,16 +374,28 @@ def _command_template(
     tool_version: str,
     corrupt_binding: bool,
 ) -> tuple[str, ...]:
-    values = [
-        "/usr/bin/python3",
-        f"/challenge/{FIXTURE_DESTINATION}",
-        "--algorithm",
-        algorithm,
-        "--expected-image-digest",
-        image_digest,
-        "--expected-tool-version",
-        tool_version,
-    ]
+    if algorithm == "descriptor":
+        values = [
+            "/usr/bin/python3",
+            f"/challenge/{FIXTURE_DESTINATION}",
+            "--algorithm",
+            algorithm,
+        ]
+    elif algorithm == "perl-sysread":
+        values = [
+            "/usr/bin/perl",
+            f"/challenge/{PERL_FIXTURE_DESTINATION}",
+        ]
+    else:
+        raise AssertionError("unknown Forensic release implementation")
+    values.extend(
+        (
+            "--expected-image-digest",
+            image_digest,
+            "--expected-tool-version",
+            tool_version,
+        )
+    )
     if corrupt_binding:
         values.append("--corrupt-binding")
     values.extend(
@@ -403,20 +446,17 @@ def _probe_tool(
     ):
         raise AssertionError("readiness sandbox was not pinned deny-all")
     client.initialize_workspace()
-    argv = [
-        "/usr/bin/python3",
-        f"/challenge/{FIXTURE_DESTINATION}",
-        "--algorithm",
-        algorithm,
-        "--expected-image-digest",
-        image_digest,
-        "--expected-tool-version",
-        tool_version,
-        "--probe",
-        "readiness.json",
-    ]
+    argv = list(
+        _command_template(
+            algorithm=algorithm,
+            image_digest=image_digest,
+            tool_version=tool_version,
+            corrupt_binding=False,
+        )[:-6]
+    )
     if corrupt_binding:
         argv.append("--corrupt-binding")
+    argv.extend(("--probe", "readiness.json"))
     result = client.run(
         CommandSpec(
             argv=tuple(argv),
@@ -459,6 +499,16 @@ def _probe_tool(
         probe = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AssertionError("readiness probe did not emit JSON") from error
+    expected_fixture = (
+        FIXTURE_SOURCE
+        if algorithm == "descriptor"
+        else PERL_FIXTURE_SOURCE
+    )
+    expected_executable = (
+        "/usr/bin/python3"
+        if algorithm == "descriptor"
+        else "/usr/bin/perl"
+    )
     if (
         payload != _canonical(probe)
         or probe.get("protocol") != TOOL_PROTOCOL
@@ -466,9 +516,11 @@ def _probe_tool(
         or probe.get("binding_mode")
         != ("pointer_mismatch" if corrupt_binding else "exact")
         or probe.get("fixture_sha256")
-        != _sha256(FIXTURE_SOURCE.read_bytes())
+        != _sha256(expected_fixture.read_bytes())
         or probe.get("image_digest") != image_digest
         or probe.get("network") != "none"
+        or probe.get("producer_executable") != expected_executable
+        or probe.get("producer_executable_sha256") != tool_version
         or probe.get("tool_version_sha256") != tool_version
     ):
         raise AssertionError("readiness probe binding was invalid")
@@ -599,6 +651,305 @@ def _write_operator_spec(
     destination.chmod(0o400)
 
 
+def _reload_verified_state(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    committed_revision: int,
+):
+    state = engine.store.load(identity, recover=False)
+    state.validate()
+    validate_forensic_assertion_state_graph(state)
+    verified = engine.store.verify_artifacts(identity)
+    if (
+        state.revision != committed_revision
+        or set(verified) != {item.id for item in state.artifacts}
+    ):
+        raise AssertionError(
+            "Forensic StateStore reload or artifact validation failed"
+        )
+    return state
+
+
+def _physical_assertion_execution(
+    engine: ChallengeEngine,
+    state,
+    evaluation,
+) -> tuple[int, tuple[str, ...]]:
+    """Reconstruct one proof wave from physical state and sidecar bytes."""
+
+    attempts = state.extra.get("forensic_assertion_preissues")
+    matches = [
+        item
+        for item in attempts.values()
+        if (
+            type(item) is dict
+            and type(item.get("terminal")) is dict
+            and item["terminal"].get("evaluation_sha256")
+            == evaluation.sha256
+        )
+    ] if type(attempts) is dict else []
+    if len(matches) != 1:
+        raise AssertionError("Forensic terminal attempt is not unique")
+    attempt = matches[0]
+    execution_plan = attempt.get("execution_plan")
+    request_states = attempt.get("requests")
+    plan_requests = (
+        execution_plan.get("requests")
+        if type(execution_plan) is dict
+        else None
+    )
+    if (
+        type(plan_requests) is not list
+        or type(request_states) is not list
+        or len(plan_requests) != len(request_states)
+        or not plan_requests
+        or attempt.get("status") != "completed"
+    ):
+        raise AssertionError("Forensic physical request wave is incomplete")
+    root = engine.store.challenge_paths(state.identity).root
+    artifacts = {item.id: item for item in state.artifacts}
+    runs = {item.id: item for item in state.runs}
+    if len(artifacts) != len(state.artifacts) or len(runs) != len(state.runs):
+        raise AssertionError("Forensic physical state identities are reused")
+    records = {item.request_id: item for item in evaluation.records}
+    if (
+        len(records) != len(evaluation.records)
+        or any(
+            request_id
+            not in {
+                item.get("request_id")
+                for item in plan_requests
+                if type(item) is dict
+            }
+            for request_id in records
+        )
+        or (evaluation.confirmed and len(records) != len(plan_requests))
+    ):
+        raise AssertionError("Forensic evaluation record set is incomplete")
+    physical_versions: set[str] = set()
+    for ordinal, (planned, request_state) in enumerate(
+        zip(
+            plan_requests,
+            request_states,
+            strict=True,
+        ),
+        start=1,
+    ):
+        record = (
+            records.get(planned.get("request_id"))
+            if type(planned) is dict
+            else None
+        )
+        request_id = (
+            planned.get("request_id")
+            if type(planned) is dict
+            else None
+        )
+        run_id = planned.get("run_id") if type(planned) is dict else None
+        request_path = (
+            planned.get("request_path")
+            if type(planned) is dict
+            else None
+        )
+        request_sha256 = (
+            planned.get("request_sha256")
+            if type(planned) is dict
+            else None
+        )
+        if (
+            type(planned) is not dict
+            or type(request_state) is not dict
+            or request_state.get("status") != "captured"
+            or request_state.get("run_id") != run_id
+            or request_state.get("request", {}).get("request_id")
+            != request_id
+            or request_state.get("request", {}).get("sha256")
+            != request_sha256
+            or (
+                record is not None
+                and (
+                    record.run_id != run_id
+                    or record.request_path != request_path
+                    or record.request_sha256 != request_sha256
+                )
+            )
+        ):
+            raise AssertionError(
+                f"Forensic physical request {ordinal} is not bound"
+            )
+        request_document = dict(planned)
+        request_document.pop("request_sha256")
+        request_payload = _read_unreferenced(
+            root,
+            request_path,
+            maximum_bytes=256 * 1024,
+        )
+        if request_payload != _canonical(request_document):
+            raise AssertionError(
+                f"Forensic physical request {ordinal} changed"
+            )
+        request_artifact = artifacts.get(request_id)
+        if (
+            request_artifact is None
+            or request_artifact.path != request_path
+            or request_artifact.sha256 != request_sha256
+            or request_artifact.size != len(request_payload)
+        ):
+            raise AssertionError(
+                f"Forensic physical request {ordinal} artifact changed"
+            )
+        capture = request_state.get("capture")
+        if type(capture) is not dict:
+            raise AssertionError(
+                f"Forensic physical capture {ordinal} is absent"
+            )
+        expected_result = {
+            "artifact": capture.get("artifact"),
+            "observation": capture.get("observation"),
+            "protocol": (
+                assertion_hotpath.FORENSIC_ASSERTION_HOTPATH_PROTOCOL
+            ),
+            "request_id": request_id,
+            "run_id": run_id,
+            "sandbox": capture.get("sandbox"),
+        }
+        result_path = (
+            f"runs/{run_id}/forensic-assertion/result.json"
+        )
+        validation_path = (
+            f"runs/{run_id}/forensic-assertion/validation.json"
+        )
+        result_payload = _read_unreferenced(
+            root,
+            result_path,
+            maximum_bytes=64 * 1024,
+        )
+        validation_payload = _read_unreferenced(
+            root,
+            validation_path,
+            maximum_bytes=64 * 1024,
+        )
+        try:
+            result = strict_json_loads(result_payload)
+            validation = strict_json_loads(validation_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise AssertionError(
+                f"Forensic physical sidecar {ordinal} is not JSON"
+            ) from error
+        expected_validation = {
+            "network": "none",
+            "ok": True,
+            "protocol": (
+                assertion_hotpath.FORENSIC_ASSERTION_HOTPATH_PROTOCOL
+            ),
+            "request_sha256": request_sha256,
+            "workspace": "fresh",
+        }
+        run = runs.get(run_id)
+        if (
+            result != expected_result
+            or result_payload != canonical_json_bytes(result)
+            or type(result.get("sandbox")) is not dict
+            or set(result["sandbox"])
+            != {"duration_ms", "exit_code", "status", "timed_out"}
+            or type(result["sandbox"].get("duration_ms")) is not int
+            or result["sandbox"].get("duration_ms", -1) < 0
+            or result["sandbox"].get("exit_code") != 0
+            or result["sandbox"].get("status") != "completed"
+            or result["sandbox"].get("timed_out") is not False
+            or validation != expected_validation
+            or validation_payload != canonical_json_bytes(validation)
+            or (
+                record is not None
+                and (
+                    run is None
+                    or run.status.value != "completed"
+                    or run.result_path != result_path
+                    or run.validation_path != validation_path
+                )
+            )
+            or (record is None and run is not None)
+        ):
+            raise AssertionError(
+                f"Forensic physical sidecar {ordinal} is not successful"
+            )
+        captures = (
+            (
+                planned["observation"]["observation_id"],
+                capture["observation"]["path"],
+                capture["observation"]["sha256"],
+                capture["observation"]["size_bytes"],
+                1024 * 1024,
+            ),
+            (
+                planned["artifact"]["artifact_id"],
+                capture["artifact"]["path"],
+                capture["artifact"]["sha256"],
+                capture["artifact"]["size_bytes"],
+                16 * 1024 * 1024,
+            ),
+        )
+        for artifact_id, path, sha256, size_bytes, maximum in captures:
+            try:
+                read_bounded_regular(
+                    root,
+                    path,
+                    maximum_bytes=maximum,
+                    expected_sha256=sha256,
+                    expected_size=size_bytes,
+                )
+            except (OSError, ValueError) as error:
+                raise AssertionError(
+                    f"Forensic physical capture {ordinal} changed"
+                ) from error
+            artifact = artifacts.get(artifact_id)
+            if record is not None and (
+                artifact is None
+                or artifact.path != path
+                or artifact.sha256 != sha256
+                or artifact.size != size_bytes
+                or artifact.source_run_id != run_id
+            ):
+                raise AssertionError(
+                    f"Forensic physical capture {ordinal} is not state-bound"
+                )
+            if record is None and artifact is not None:
+                raise AssertionError(
+                    f"Forensic rejected capture {ordinal} gained authority"
+                )
+        physical_versions.add(planned["tool"]["tool_version_sha256"])
+
+    expected_ids = attempt.get("expected_state_ids")
+    evaluation_artifact = (
+        artifacts.get(expected_ids.get("evaluation_artifact_id"))
+        if type(expected_ids) is dict
+        else None
+    )
+    if (
+        evaluation_artifact is None
+        or evaluation_artifact.sha256 != evaluation.sha256
+        or evaluation_artifact.size != len(evaluation.canonical_bytes)
+        or read_bounded_regular(
+            root,
+            evaluation_artifact.path,
+            maximum_bytes=8 * 1024 * 1024,
+            expected_sha256=evaluation_artifact.sha256,
+            expected_size=evaluation_artifact.size,
+        )
+        != evaluation.canonical_bytes
+    ):
+        raise AssertionError("Forensic physical evaluation changed")
+    if evaluation.confirmed and physical_versions != {
+        PYTHON_EXECUTABLE_SHA256,
+        PERL_EXECUTABLE_SHA256,
+    }:
+        raise AssertionError(
+            "Forensic confirmation lacks two executable versions"
+        )
+    return len(plan_requests), tuple(sorted(physical_versions))
+
+
 def _artifact_documents(
     engine: ChallengeEngine,
     state,
@@ -610,6 +961,15 @@ def _artifact_documents(
     root = engine.store.challenge_paths(state.identity).root
     documents: list[dict[str, object]] = []
     families: set[str] = set()
+    semantic = evaluation.semantic_evaluation
+    versions = (
+        {
+            record.tool_version_sha256
+            for record in semantic.corroboration_records
+        }
+        if semantic is not None
+        else set()
+    )
     for record in evaluation.records:
         if (
             record.pointer_sha256 != expected_pointer_sha256
@@ -652,8 +1012,10 @@ def _artifact_documents(
     if (
         len(documents) != 2
         or len(families) != 2
+        or versions
+        != {PYTHON_EXECUTABLE_SHA256, PERL_EXECUTABLE_SHA256}
         or {item["algorithm"] for item in documents}
-        != {"descriptor", "mmap"}
+        != {"descriptor", "perl-sysread"}
     ):
         raise AssertionError("two independent tool families did not execute")
     return documents
@@ -669,17 +1031,88 @@ def _read_unreferenced(
     *,
     maximum_bytes: int,
 ) -> bytes:
-    candidate = root / locator
-    payload = candidate.read_bytes()
-    if len(payload) > maximum_bytes:
-        raise AssertionError("unreferenced release artifact exceeded bound")
-    return read_bounded_regular(
-        root,
-        locator,
-        maximum_bytes=maximum_bytes,
-        expected_sha256=_sha256(payload),
-        expected_size=len(payload),
-    )
+    if type(maximum_bytes) is not int or maximum_bytes <= 0:
+        raise AssertionError("unreferenced release bound is invalid")
+    if type(locator) is not str:
+        raise AssertionError("unreferenced release locator is invalid")
+    relative = PurePosixPath(locator)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise AssertionError("unreferenced release locator is unsafe")
+
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directories: list[int] = []
+    source: int | None = None
+    try:
+        directories.append(os.open(root, directory_flags))
+        for component in relative.parts[:-1]:
+            directories.append(
+                os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=directories[-1],
+                )
+            )
+        source = os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=directories[-1],
+        )
+        before = os.fstat(source)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > maximum_bytes
+        ):
+            raise AssertionError(
+                "unreferenced release artifact exceeded its bound"
+            )
+        payload = bytearray()
+        while True:
+            block = os.read(
+                source,
+                min(64 * 1024, maximum_bytes - len(payload) + 1),
+            )
+            if not block:
+                break
+            payload.extend(block)
+            if len(payload) > maximum_bytes:
+                raise AssertionError(
+                    "unreferenced release artifact exceeded its bound"
+                )
+        after = os.fstat(source)
+        if (
+            len(payload) != before.st_size
+            or any(
+                getattr(before, field) != getattr(after, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+            )
+        ):
+            raise AssertionError(
+                "unreferenced release artifact changed while reading"
+            )
+        return bytes(payload)
+    except OSError as error:
+        raise AssertionError(
+            "unreferenced release artifact could not be read safely"
+        ) from error
+    finally:
+        if source is not None:
+            os.close(source)
+        for descriptor in reversed(directories):
+            os.close(descriptor)
 
 
 def _require_raw_absent(
@@ -736,7 +1169,7 @@ def _run_release(
             engine,
             state,
             tool_id="release-descriptor-positive",
-            family="family-descriptor",
+            family="family-python-pread",
             algorithm="descriptor",
             corrupt_binding=False,
             artifact_id="READY-release-descriptor-positive",
@@ -744,11 +1177,11 @@ def _run_release(
         _probe_tool(
             engine,
             state,
-            tool_id="release-mmap-positive",
-            family="family-mmap",
-            algorithm="mmap",
+            tool_id="release-perl-positive",
+            family="family-perl-sysread",
+            algorithm="perl-sysread",
             corrupt_binding=False,
-            artifact_id="READY-release-mmap-positive",
+            artifact_id="READY-release-perl-positive",
         ),
     )
     control = (
@@ -756,7 +1189,7 @@ def _run_release(
             engine,
             state,
             tool_id="release-descriptor-control",
-            family="family-descriptor",
+            family="family-python-pread",
             algorithm="descriptor",
             corrupt_binding=False,
             artifact_id="READY-release-descriptor-control",
@@ -764,11 +1197,11 @@ def _run_release(
         _probe_tool(
             engine,
             state,
-            tool_id="release-mmap-control",
-            family="family-mmap",
-            algorithm="mmap",
+            tool_id="release-perl-control",
+            family="family-perl-sysread",
+            algorithm="perl-sysread",
             corrupt_binding=True,
-            artifact_id="READY-release-mmap-control",
+            artifact_id="READY-release-perl-control",
         ),
     )
     state = _install_readiness(
@@ -817,10 +1250,23 @@ def _run_release(
     )
     confirmed: list[dict[str, object]] = []
     for ordinal in range(1, POSITIVE_REPETITIONS + 1):
-        state, evaluation = engine.prove_forensic_assertion(
+        committed, evaluation = engine.prove_forensic_assertion(
             identity,
             operator_spec_locator="forensic-positive.json",
             timeout_seconds=180,
+        )
+        state = _reload_verified_state(
+            engine,
+            identity,
+            committed_revision=committed.revision,
+        )
+        (
+            physical_record_count,
+            physical_tool_versions,
+        ) = _physical_assertion_execution(
+            engine,
+            state,
+            evaluation,
         )
         if (
             not evaluation.confirmed
@@ -854,8 +1300,6 @@ def _run_release(
             or state.status is not baseline_status
         ):
             raise AssertionError("confirmed reduction widened authority")
-        state.validate()
-        validate_forensic_assertion_state_graph(state)
         _require_raw_absent(engine, state, secret)
         confirmed.append(
             {
@@ -864,16 +1308,30 @@ def _run_release(
                 ),
                 "evaluation_sha256": evaluation.sha256,
                 "ordinal": ordinal,
-                "record_count": len(evaluation.records),
+                "record_count": physical_record_count,
+                "tool_version_sha256s": list(physical_tool_versions),
             }
         )
 
     before_control_facts = len(state.facts)
     before_control_progress = len(state.progress_markers)
-    state, rejected = engine.prove_forensic_assertion(
+    committed, rejected = engine.prove_forensic_assertion(
         identity,
         operator_spec_locator="forensic-control.json",
         timeout_seconds=180,
+    )
+    state = _reload_verified_state(
+        engine,
+        identity,
+        committed_revision=committed.revision,
+    )
+    (
+        control_record_count,
+        control_tool_versions,
+    ) = _physical_assertion_execution(
+        engine,
+        state,
+        rejected,
     )
     if (
         rejected.confirmed
@@ -885,6 +1343,7 @@ def _run_release(
         or len(state.candidates) != baseline_candidates
         or len(state.submissions) != baseline_submissions
         or state.status is not baseline_status
+        or control_record_count != 2
     ):
         raise AssertionError("nonmatching control did not fail closed")
     attempts = state.extra.get("forensic_assertion_preissues")
@@ -923,10 +1382,8 @@ def _run_release(
         if bytes.fromhex(document["range_hex"]) != secret:
             raise AssertionError("control tool did not read the exact range")
         control_algorithms.add(document["algorithm"])
-    if control_algorithms != {"descriptor", "mmap"}:
+    if control_algorithms != {"descriptor", "perl-sysread"}:
         raise AssertionError("control did not run both tool families")
-    state.validate()
-    validate_forensic_assertion_state_graph(state)
     _require_raw_absent(engine, state, secret)
 
     assertion_facts = [
@@ -953,6 +1410,7 @@ def _run_release(
             "algorithms": sorted(control_algorithms),
             "confirmed": rejected.confirmed,
             "reason_codes": list(rejected.reason_codes),
+            "tool_version_sha256s": list(control_tool_versions),
         },
         "index_execution_sha256": index_execution.sha256,
         "network": "none",
@@ -967,6 +1425,16 @@ def _run_release(
         "readiness_probes": len(positive) + len(control),
         "state_status": state.status.value,
         "submissions": len(state.submissions),
+        "tool_executables": {
+            "family-perl-sysread": {
+                "path": "/usr/bin/perl",
+                "sha256": PERL_EXECUTABLE_SHA256,
+            },
+            "family-python-pread": {
+                "path": "/usr/bin/python3",
+                "sha256": PYTHON_EXECUTABLE_SHA256,
+            },
+        },
     }
 
 

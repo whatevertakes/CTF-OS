@@ -1056,8 +1056,19 @@ def _corroboration_bindings(
     observed: dict[str, set[str]] = {
         pointer.pointer_id: set() for pointer in plan.pointers
     }
+    observed_versions: dict[str, set[str]] = {
+        pointer.pointer_id: set() for pointer in plan.pointers
+    }
     for record in evaluation.records:
         observed[record.pointer_id].add(record.independence_family)
+        request = next(
+            item
+            for item in execution_plan.requests
+            if item.request_id == record.request_id
+        )
+        observed_versions[record.pointer_id].add(
+            request.tool_version_sha256
+        )
     result: list[dict[str, object]] = []
     for pointer in plan.pointers:
         available = sorted(
@@ -1067,12 +1078,15 @@ def _corroboration_bindings(
                 if pointer.kind in tool.supported_pointer_kinds
             }
         )
-        required = 2 if len(available) >= 2 else 1
+        required = 2
         observed_families = sorted(observed[pointer.pointer_id])
         result.append(
             {
                 "available_families": available,
-                "covered": len(observed_families) >= required,
+                "covered": (
+                    len(observed_families) >= required
+                    and len(observed_versions[pointer.pointer_id]) >= 2
+                ),
                 "observed_families": observed_families,
                 "pointer_id": pointer.pointer_id,
                 "pointer_kind": pointer.kind,
@@ -2886,6 +2900,10 @@ def _validate_binding_document(
         entry["pointer"]["pointer_id"]: set()
         for entry in plan["pointers"]
     }
+    record_versions: dict[str, set[str]] = {
+        entry["pointer"]["pointer_id"]: set()
+        for entry in plan["pointers"]
+    }
     total_capture_bytes = 0
     for position, (raw_record, request) in enumerate(
         zip(records_raw, preissued, strict=False),
@@ -3003,6 +3021,9 @@ def _validate_binding_document(
         record_families[execution_record["pointer_id"]].add(
             execution_record["independence_family"]
         )
+        record_versions[execution_record["pointer_id"]].add(
+            pre_tool["tool_version_sha256"]
+        )
         total_capture_bytes += (
             observation["size_bytes"] + output["size_bytes"]
         )
@@ -3037,12 +3058,15 @@ def _validate_binding_document(
                 if pointer["kind"] in tool["supported_pointer_kinds"]
             }
         )
-        required = 2 if len(available) >= 2 else 1
+        required = 2
         observed = sorted(record_families[pointer["pointer_id"]])
         expected_corroboration.append(
             {
                 "available_families": available,
-                "covered": len(observed) >= required,
+                "covered": (
+                    len(observed) >= required
+                    and len(record_versions[pointer["pointer_id"]]) >= 2
+                ),
                 "observed_families": observed,
                 "pointer_id": pointer["pointer_id"],
                 "pointer_kind": pointer["kind"],

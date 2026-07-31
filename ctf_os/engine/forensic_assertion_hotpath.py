@@ -1254,12 +1254,30 @@ def execute_forensic_assertion_hotpath(
 
     issue_count = 0
     for pointer in specification.plan.pointers:
-        families = {
-            item.independence_family
-            for item in readiness
-            if pointer.kind in item.supported_pointer_kinds
-        }
-        issue_count += min(2, len(families))
+        eligible = sorted(
+            (
+                item
+                for item in readiness
+                if pointer.kind in item.supported_pointer_kinds
+            ),
+            key=lambda item: (
+                item.independence_family,
+                item.tool_id,
+            ),
+        )
+        distinct_pair_available = any(
+            first.independence_family != second.independence_family
+            and first.tool_version_sha256 != second.tool_version_sha256
+            for first_index, first in enumerate(eligible)
+            for second in eligible[first_index + 1 :]
+        )
+        issue_count += (
+            2
+            if distinct_pair_available
+            else 1
+            if eligible
+            else 0
+        )
     issues = tuple(
         ForensicObservationIssue(
             request_id=_new_id("FREQ"),

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Real-Docker fixture for two independent file-range observations.
+"""Real-Docker Python fixture for exact file-range observations.
 
 The ``descriptor`` implementation hashes through a no-follow file descriptor
 and reads the selected range with ``pread``.  The ``mmap`` implementation
-independently resolves the source, hashes an immutable mapping, and slices the
-same range.  Both emit a raw-bearing private artifact and a canonical,
-value-free observation document bound to the engine-issued request.
+resolves the source, hashes an immutable mapping, and slices the same range.
+These are two modes of one Python producer, so both deliberately report the
+same executable-version identity.  Cross-tool corroboration is supplied by a
+separate Perl producer.  Both modes emit a raw-bearing private artifact and a
+canonical, value-free observation document bound to the engine-issued request.
 """
 
 from __future__ import annotations
@@ -56,14 +58,13 @@ def tool_version_sha256(
 ) -> str:
     if algorithm not in ALGORITHMS or type(corrupt_binding) is not bool:
         raise FixtureError("tool_version_input_invalid")
-    return sha256(
-        b"ctfos.release.forensic.assertion.tool-version.v1\0"
-        + source
-        + b"\0"
-        + algorithm.encode("ascii")
-        + b"\0"
-        + (b"pointer-mismatch" if corrupt_binding else b"exact")
-    )
+    if type(source) is not bytes or not source:
+        raise FixtureError("tool_version_input_invalid")
+    # The semantic mode and negative-control flag are request contracts, not
+    # independent implementations.  Version identity is the actual pinned
+    # image executable, so two labels around this file cannot masquerade as
+    # cross-tool corroboration.
+    return sha256(Path("/usr/bin/python3").read_bytes())
 
 
 def _safe_relative(value: object) -> str:
@@ -291,6 +292,8 @@ def _probe(arguments: argparse.Namespace) -> None:
         "fixture_sha256": sha256(source),
         "image_digest": arguments.expected_image_digest,
         "network": "none",
+        "producer_executable": "/usr/bin/python3",
+        "producer_executable_sha256": observed_version,
         "protocol": PROTOCOL,
         "schema_version": SCHEMA_VERSION,
         "supported_pointer_kinds": ["file_range"],

@@ -694,6 +694,29 @@ class ForensicAssertionGraphEvaluation:
                 )
             ):
                 return False
+            for pointer_id in covered_ids:
+                corroborations = [
+                    record
+                    for record in self.corroboration_records
+                    if record.pointer_id == pointer_id
+                ]
+                if (
+                    len(
+                        {
+                            record.independence_family
+                            for record in corroborations
+                        }
+                    )
+                    < 2
+                    or len(
+                        {
+                            record.tool_version_sha256
+                            for record in corroborations
+                        }
+                    )
+                    < 2
+                ):
+                    return False
             if assertion.state is ForensicAssertionState.CONFIRMED:
                 confirmed.append(coverage)
         return bool(confirmed) and all(
@@ -1552,6 +1575,7 @@ def evaluate_forensic_assertion_graph(
     used_observation_ids: set[str] = set()
     used_pointer_tool_pairs: set[tuple[str, str]] = set()
     used_pointer_families: set[tuple[str, str]] = set()
+    used_pointer_versions: set[tuple[str, str]] = set()
     used_run_ids: set[str] = set()
     used_receipt_ids: set[str] = set()
     used_receipt_hashes: set[str] = set()
@@ -1612,6 +1636,16 @@ def evaluate_forensic_assertion_graph(
                 )
             else:
                 used_pointer_families.add(family_pair)
+            version_pair = (
+                raw.pointer_id,
+                tool.tool_version_sha256,
+            )
+            if version_pair in used_pointer_versions:
+                failures.append(
+                    _failure("pointer_tool_version_reused", position)
+                )
+            else:
+                used_pointer_versions.add(version_pair)
         for value, used, code in (
             (raw.run_id, used_run_ids, "run_id_invalid_or_reused"),
             (
@@ -1717,34 +1751,27 @@ def evaluate_forensic_assertion_graph(
                     observation_artifact=raw.observation_artifact,
                 )
             )
-    families_available: dict[str, set[str]] = {
-        kind: {
-            tool.independence_family
-            for tool in plan.tools
-            if kind in tool.supported_pointer_kinds
-        }
-        for kind in FORENSIC_POINTER_KINDS
-    }
     families_observed: dict[str, set[str]] = {
+        pointer.pointer_id: set() for pointer in plan.pointers
+    }
+    versions_observed: dict[str, set[str]] = {
         pointer.pointer_id: set() for pointer in plan.pointers
     }
     for record in records:
         families_observed[record.pointer_id].add(
             record.independence_family
         )
+        versions_observed[record.pointer_id].add(
+            record.tool_version_sha256
+        )
     coverage_records: list[ForensicAssertionCoverageRecord] = []
     for assertion in plan.assertions:
         covered: list[str] = []
         insufficient: list[str] = []
         for pointer_id in assertion.evidence_pointer_ids:
-            pointer = pointer_by_id[pointer_id]
-            available_count = len(
-                families_available[_pointer_kind(pointer)]
-            )
-            required = 2 if available_count >= 2 else 1
             if (
-                available_count > 0
-                and len(families_observed[pointer_id]) >= required
+                len(families_observed[pointer_id]) >= 2
+                and len(versions_observed[pointer_id]) >= 2
             ):
                 covered.append(pointer_id)
             else:

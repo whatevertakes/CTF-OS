@@ -918,6 +918,57 @@ class ForensicAssertionExecutionTests(unittest.TestCase):
             )
         )
 
+    def test_planner_skips_family_with_duplicate_tool_version(self) -> None:
+        readiness = (
+            self.readiness[0],
+            replace(
+                self.readiness[1],
+                tool_version_sha256=(
+                    self.readiness[0].tool_version_sha256
+                ),
+            ),
+            self.readiness[2],
+        )
+        graph_plan = build_forensic_assertion_graph_plan(
+            index_execution=self.index_execution,
+            expected_sources=self.sources,
+            tools=tuple(item.tool_binding for item in readiness),
+            pointers=self.pointers,
+            assertions=self.assertions,
+        )
+        document = {
+            **self.operator_document,
+            "index_root": graph_plan.inventory_root.to_dict(),
+            "readiness_registry_sha256": (
+                forensic_tool_readiness_registry_sha256(readiness)
+            ),
+            "source_catalog_sha256": graph_plan.source_catalog_sha256,
+            "tools": [item.to_dict() for item in readiness],
+        }
+        specification = self._parse(
+            _canonical(document),
+            readiness=readiness,
+        )
+        plan = plan_forensic_assertion_execution(
+            specification,
+            self.issues,
+        )
+        selected = {
+            (
+                request.independence_family,
+                request.tool_version_sha256,
+            )
+            for request in plan.requests
+        }
+        self.assertEqual(
+            {family for family, _version in selected},
+            {"family-alpha", "family-gamma"},
+        )
+        self.assertEqual(
+            len({version for _family, version in selected}),
+            2,
+        )
+
     def test_observation_document_round_trip_is_strict_and_value_free(
         self,
     ) -> None:

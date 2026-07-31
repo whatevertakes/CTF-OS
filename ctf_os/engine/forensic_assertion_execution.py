@@ -1072,26 +1072,46 @@ class ForensicAssertionExecutionPlan:
 def _required_pointer_tool_pairs(
     specification: ForensicAssertionExecutionSpecification,
 ) -> tuple[tuple[ForensicEvidencePointer, ForensicToolReadiness], ...]:
-    """Choose one tool from the first two available independent families."""
+    """Choose up to two tools with distinct families and version hashes."""
 
     result: list[
         tuple[ForensicEvidencePointer, ForensicToolReadiness]
     ] = []
     for pointer in specification.plan.pointers:
-        by_family: dict[str, list[ForensicToolReadiness]] = {}
-        for readiness in specification.readiness:
-            if pointer.kind in readiness.supported_pointer_kinds:
-                by_family.setdefault(
-                    readiness.independence_family,
-                    [],
-                ).append(readiness)
-        selected_families = sorted(by_family)[:2]
-        for family in selected_families:
-            selected = min(
-                by_family[family],
-                key=lambda item: item.tool_id,
-            )
-            result.append((pointer, selected))
+        eligible = sorted(
+            (
+                readiness
+                for readiness in specification.readiness
+                if pointer.kind in readiness.supported_pointer_kinds
+            ),
+            key=lambda item: (
+                item.independence_family,
+                item.tool_id,
+            ),
+        )
+        selected: tuple[
+            ForensicToolReadiness,
+            ForensicToolReadiness,
+        ] | None = None
+        for first_index, first in enumerate(eligible):
+            for second in eligible[first_index + 1 :]:
+                if (
+                    second.independence_family
+                    != first.independence_family
+                    and second.tool_version_sha256
+                    != first.tool_version_sha256
+                ):
+                    selected = (first, second)
+                    break
+            if selected is not None:
+                break
+        if selected is not None:
+            result.extend((pointer, item) for item in selected)
+        elif eligible:
+            # Keep one bounded observation as lower-grade evidence.  The
+            # semantic evaluator will refuse CONFIRMED authority without a
+            # second physically distinct implementation.
+            result.append((pointer, eligible[0]))
     return tuple(result)
 
 

@@ -449,17 +449,42 @@ class ForensicAssertionGraphTests(unittest.TestCase):
             0,
         )
 
-    def test_single_family_fallback_only_when_registry_has_one(self) -> None:
+    def test_single_family_is_retained_but_never_confirms(self) -> None:
         plan = self._plan(tools=(self.tools[0],))
         evaluation = evaluate_forensic_assertion_graph(
             plan,
             self._observations(plan),
         )
 
-        self.assertTrue(evaluation.passed)
+        self.assertFalse(evaluation.passed)
         self.assertEqual(
             evaluation.coverage_records[0].coverage_ppm,
-            1_000_000,
+            0,
+        )
+        self.assertEqual(
+            len(evaluation.corroboration_records),
+            len(plan.pointers),
+        )
+
+    def test_distinct_families_cannot_share_one_tool_version(self) -> None:
+        duplicate_version = replace(
+            self.tools[1],
+            tool_version_sha256=self.tools[0].tool_version_sha256,
+        )
+        plan = self._plan(
+            tools=(self.tools[0], duplicate_version)
+        )
+        evaluation = evaluate_forensic_assertion_graph(
+            plan,
+            self._observations(plan),
+        )
+
+        self.assertFalse(evaluation.passed)
+        self.assertTrue(
+            any(
+                "pointer_tool_version_reused" in item
+                for item in evaluation.failure_codes
+            )
         )
 
     def test_same_family_is_not_independent_corroboration(self) -> None:
