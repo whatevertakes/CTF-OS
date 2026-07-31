@@ -90,6 +90,8 @@ MAX_RECEIPT_STREAM_EVIDENCE_TOTAL_BYTES = (
 )
 MAX_RECEIPT_SAMPLE_BYTES = 1024
 MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
+MAX_RECEIPT_STRUCTURE_JSON_BYTES = 1536
+MAX_RECEIPT_STRUCTURE_ITEMS = 16
 MAX_PROOF_RECIPE_INPUTS = 256
 MAX_PROOF_ATTEMPTS = 11
 MAX_PROOF_POLICY_STRING_BYTES = 256
@@ -2837,12 +2839,16 @@ def _receipt_stream_evidence_errors(
             continue
         if len(encoded_stream) > MAX_RECEIPT_STREAM_EVIDENCE_BYTES:
             errors.append(f"{label} exceeds its size bound")
-        if set(evidence) != allowed_record_keys:
+        schema_version = evidence.get("schema_version")
+        expected_record_keys = set(allowed_record_keys)
+        if schema_version == 2:
+            expected_record_keys.add("structured_summary")
+        if set(evidence) != expected_record_keys:
             errors.append(f"{label} has an invalid nested schema")
 
         if (
-            isinstance(evidence.get("schema_version"), bool)
-            or evidence.get("schema_version") != 1
+            isinstance(schema_version, bool)
+            or schema_version not in {1, 2}
         ):
             errors.append(f"{label} has an invalid schema_version")
         if evidence.get("stream") != stream:
@@ -3077,6 +3083,266 @@ def _receipt_stream_evidence_errors(
         )
         if evidence.get("binary_sample_omitted") is not binary_present:
             errors.append(f"{label} binary omission marker is inconsistent")
+
+        if schema_version == 2:
+            structured = evidence.get("structured_summary")
+            structured_label = f"{label} structured_summary"
+            if not isinstance(structured, dict):
+                errors.append(f"{structured_label} must be an object")
+                continue
+            try:
+                encoded_structured = json.dumps(
+                    structured,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    allow_nan=False,
+                ).encode("ascii")
+            except (TypeError, ValueError, UnicodeError):
+                errors.append(
+                    f"{structured_label} is not canonical JSON"
+                )
+                continue
+            if (
+                len(encoded_structured)
+                > MAX_RECEIPT_STRUCTURE_JSON_BYTES
+            ):
+                errors.append(
+                    f"{structured_label} exceeds its size bound"
+                )
+
+            common_structure_keys = {
+                "version",
+                "kind",
+                "scope",
+                "bytes_analyzed",
+                "details_omitted",
+            }
+            kind = structured.get("kind")
+            scope = structured.get("scope")
+            details_omitted = structured.get("details_omitted")
+            if (
+                isinstance(structured.get("version"), bool)
+                or structured.get("version") != 1
+            ):
+                errors.append(
+                    f"{structured_label} has an invalid version"
+                )
+            if kind not in {
+                "binary",
+                "delimited_text",
+                "html",
+                "json",
+                "text",
+            }:
+                errors.append(f"{structured_label} has an invalid kind")
+            expected_scope = {
+                "complete_stream": "complete_stream",
+                "retained_prefix_only": "retained_prefix",
+            }.get(coverage, "stored_snapshot")
+            if scope != expected_scope:
+                errors.append(
+                    f"{structured_label} has an invalid scope"
+                )
+            if (
+                not valid_nonnegative_integer(
+                    structured.get("bytes_analyzed")
+                )
+                or structured.get("bytes_analyzed") != stored_bytes
+            ):
+                errors.append(
+                    f"{structured_label} has an invalid byte count"
+                )
+            if not isinstance(details_omitted, bool):
+                errors.append(
+                    f"{structured_label} details_omitted must be boolean"
+                )
+
+            def valid_structure_text(value: object) -> bool:
+                if not isinstance(value, str):
+                    return False
+                return (
+                    len(
+                        json.dumps(
+                            value,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                    <= 96
+                )
+
+            if details_omitted is True:
+                if set(structured) != common_structure_keys:
+                    errors.append(
+                        f"{structured_label} omitted details are not minimal"
+                    )
+                continue
+
+            json_types = {
+                "array",
+                "boolean",
+                "null",
+                "number",
+                "object",
+                "string",
+                "unknown",
+            }
+            expected_structure_keys = set(common_structure_keys)
+            if kind == "json":
+                top_level = structured.get("top_level")
+                expected_structure_keys.add("top_level")
+                if top_level not in json_types:
+                    errors.append(
+                        f"{structured_label} has an invalid JSON top level"
+                    )
+                if top_level == "object":
+                    expected_structure_keys.update(
+                        {"key_count", "key_types", "keys_omitted"}
+                    )
+                    key_count = structured.get("key_count")
+                    keys_omitted = structured.get("keys_omitted")
+                    key_types = structured.get("key_types")
+                    if (
+                        not valid_nonnegative_integer(key_count)
+                        or not valid_nonnegative_integer(keys_omitted)
+                        or not isinstance(key_types, dict)
+                        or len(key_types) > MAX_RECEIPT_STRUCTURE_ITEMS
+                    ):
+                        errors.append(
+                            f"{structured_label} has invalid JSON keys"
+                        )
+                    else:
+                        if key_count != len(key_types) + keys_omitted:
+                            errors.append(
+                                f"{structured_label} JSON key counts differ"
+                            )
+                        if any(
+                            not valid_structure_text(key)
+                            or value not in json_types
+                            for key, value in key_types.items()
+                        ):
+                            errors.append(
+                                f"{structured_label} has invalid key types"
+                            )
+                elif top_level == "array":
+                    expected_structure_keys.update(
+                        {"item_count", "item_types"}
+                    )
+                    item_types = structured.get("item_types")
+                    if (
+                        not valid_nonnegative_integer(
+                            structured.get("item_count")
+                        )
+                        or not isinstance(item_types, list)
+                        or len(item_types) > len(json_types)
+                        or item_types != sorted(set(item_types))
+                        or any(
+                            value not in json_types
+                            for value in item_types
+                        )
+                    ):
+                        errors.append(
+                            f"{structured_label} has invalid array shape"
+                        )
+            elif kind == "html":
+                expected_structure_keys.update(
+                    {
+                        "http_status",
+                        "tag_counts",
+                        "tags_omitted",
+                        "title",
+                    }
+                )
+                for name in ("http_status", "title"):
+                    value = structured.get(name)
+                    if value is not None and not valid_structure_text(value):
+                        errors.append(
+                            f"{structured_label} has invalid {name}"
+                        )
+                tag_counts = structured.get("tag_counts")
+                if (
+                    not isinstance(tag_counts, dict)
+                    or len(tag_counts) > MAX_RECEIPT_STRUCTURE_ITEMS
+                    or any(
+                        not isinstance(tag, str)
+                        or re.fullmatch(r"[a-z0-9:_-]{1,64}", tag)
+                        is None
+                        or not valid_nonnegative_integer(count)
+                        for tag, count in tag_counts.items()
+                    )
+                    or not valid_nonnegative_integer(
+                        structured.get("tags_omitted")
+                    )
+                ):
+                    errors.append(
+                        f"{structured_label} has invalid HTML tags"
+                    )
+            elif kind == "delimited_text":
+                expected_structure_keys.update(
+                    {
+                        "columns",
+                        "columns_omitted",
+                        "delimiter",
+                        "row_count",
+                        "row_count_exact",
+                    }
+                )
+                columns = structured.get("columns")
+                if (
+                    structured.get("delimiter") not in {"comma", "tab"}
+                    or not isinstance(columns, list)
+                    or len(columns) > MAX_RECEIPT_STRUCTURE_ITEMS
+                    or any(
+                        not valid_structure_text(column)
+                        for column in columns
+                    )
+                    or not valid_nonnegative_integer(
+                        structured.get("columns_omitted")
+                    )
+                    or not valid_nonnegative_integer(
+                        structured.get("row_count")
+                    )
+                    or not isinstance(
+                        structured.get("row_count_exact"), bool
+                    )
+                ):
+                    errors.append(
+                        f"{structured_label} has invalid delimited shape"
+                    )
+            elif kind == "text":
+                expected_structure_keys.update(
+                    {
+                        "line_count",
+                        "line_count_exact",
+                        "nonempty_line_count",
+                    }
+                )
+                line_count = structured.get("line_count")
+                nonempty_line_count = structured.get(
+                    "nonempty_line_count"
+                )
+                if (
+                    not valid_nonnegative_integer(line_count)
+                    or not valid_nonnegative_integer(nonempty_line_count)
+                    or (
+                        valid_nonnegative_integer(line_count)
+                        and valid_nonnegative_integer(
+                            nonempty_line_count
+                        )
+                        and nonempty_line_count > line_count
+                    )
+                    or not isinstance(
+                        structured.get("line_count_exact"), bool
+                    )
+                ):
+                    errors.append(
+                        f"{structured_label} has invalid text shape"
+                    )
+            if set(structured) != expected_structure_keys:
+                errors.append(
+                    f"{structured_label} has an invalid schema"
+                )
     return errors
 
 

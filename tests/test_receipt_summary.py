@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from ctf_os.engine.receipt_summary import (
+    MAX_RECEIPT_STRUCTURE_JSON_BYTES,
     MAX_RECEIPT_STREAM_EVIDENCE_BYTES,
     ReceiptSummaryError,
     build_receipt_preview,
@@ -355,6 +356,118 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertNotIn("text", head)
         self.assertTrue(evidence["binary_sample_omitted"])
         self.assertNotIn("private-binary", json.dumps(evidence))
+        self.assertEqual(
+            evidence["structured_summary"],
+            {
+                "version": 1,
+                "kind": "binary",
+                "scope": "stored_snapshot",
+                "bytes_analyzed": len(payload),
+                "details_omitted": False,
+            },
+        )
+
+    def test_json_structure_reports_shape_without_values(self) -> None:
+        payload = json.dumps(
+            {
+                "api_key": "must-not-appear-in-structure",
+                "rows": [{"id": 1}, {"id": 2}],
+                "success": True,
+            },
+            separators=(",", ":"),
+        ).encode()
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+            ),
+            sample_bytes=16,
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(evidence["schema_version"], 2)
+        self.assertEqual(structure["kind"], "json")
+        self.assertEqual(structure["scope"], "complete_stream")
+        self.assertEqual(structure["top_level"], "object")
+        self.assertEqual(
+            structure["key_types"],
+            {
+                "api_key": "string",
+                "rows": "array",
+                "success": "boolean",
+            },
+        )
+        self.assertNotIn(
+            "must-not-appear-in-structure",
+            json.dumps(structure, sort_keys=True),
+        )
+
+    def test_http_html_structure_reports_status_title_and_tags(self) -> None:
+        payload = (
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+            b"<!doctype html><html><head><title>"
+            b"Authorization: Bearer must-not-leak"
+            b"</title></head><body><a>x</a><a>y</a></body></html>"
+        )
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+            ),
+            sample_bytes=16,
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["kind"], "html")
+        self.assertEqual(structure["http_status"], "HTTP/1.1 404 Not Found")
+        self.assertEqual(structure["title"], "Authorization: [REDACTED]")
+        self.assertEqual(structure["tag_counts"]["a"], 2)
+        self.assertNotIn("must-not-leak", json.dumps(structure))
+
+    def test_tsv_structure_reports_columns_and_exact_row_count(self) -> None:
+        payload = b"name\tstatus\tbytes\nalpha\tok\t12\nbeta\tfail\t99\n"
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["kind"], "delimited_text")
+        self.assertEqual(structure["delimiter"], "tab")
+        self.assertEqual(
+            structure["columns"],
+            ["name", "status", "bytes"],
+        )
+        self.assertEqual(structure["row_count"], 2)
+        self.assertTrue(structure["row_count_exact"])
+        self.assertLessEqual(
+            len(
+                json.dumps(
+                    structure,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ),
+            MAX_RECEIPT_STRUCTURE_JSON_BYTES,
+        )
 
     def test_truncated_capture_is_explicitly_a_retained_prefix(self) -> None:
         payload = b"x" * 100

@@ -9,11 +9,15 @@ be a size-limited prefix.
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import os
 import re
 import stat
+from collections import Counter
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Literal, Mapping
 
@@ -33,6 +37,9 @@ MAX_RECEIPT_EXCERPT_JSON_CHARS = 512
 MAX_RECEIPT_STREAM_EVIDENCE_BYTES = 4096
 MAX_RECEIPT_PREVIEW_CHARS = 160
 MAX_RECEIPT_ARTIFACT_ID_CHARS = 256
+MAX_RECEIPT_STRUCTURE_JSON_BYTES = 1536
+MAX_RECEIPT_STRUCTURE_ITEMS = 16
+MAX_RECEIPT_DELIMITED_ROWS = 100_000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CREDENTIAL_ASSIGNMENT = re.compile(
@@ -112,7 +119,7 @@ def _read_verified_samples(
     expected_sha256: str,
     sample_bytes: int,
     maximum_snapshot_bytes: int,
-) -> tuple[int, bytes, bytes, bool, bool]:
+) -> tuple[int, bytes, bytes, bool, bool, bytes]:
     if (
         isinstance(sample_bytes, bool)
         or not isinstance(sample_bytes, int)
@@ -214,6 +221,7 @@ def _read_verified_samples(
             tail,
             head_requires_omission,
             tail_requires_omission,
+            bytes(snapshot_payload),
         )
     finally:
         os.close(descriptor)
@@ -333,6 +341,310 @@ def _redact_credentials(value: str) -> tuple[str, int]:
     result = _CREDENTIAL_QUERY.sub(replace_one, result)
     result = _URL_USERINFO.sub(replace_one, result)
     return result, redactions
+
+
+def _structured_text(value: object) -> str:
+    redacted, _redactions = _redact_credentials(str(value))
+    safe = terminal_safe(redacted, multiline=False)
+    bounded, _truncated = _bounded_json_text(safe, 96)
+    return bounded
+
+
+def _json_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+class _BoundedHTMLSummaryParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: Counter[str] = Counter()
+        self._in_title = False
+        self._title_parts: list[str] = []
+        self._title_chars = 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del attrs
+        normalized = tag.casefold()
+        if normalized in self.tags or len(self.tags) < 256:
+            self.tags[normalized] += 1
+        if normalized == "title":
+            self._in_title = True
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_title or self._title_chars >= 512:
+            return
+        retained = data[: 512 - self._title_chars]
+        self._title_parts.append(retained)
+        self._title_chars += len(retained)
+
+    @property
+    def title(self) -> str | None:
+        value = " ".join("".join(self._title_parts).split())
+        return _structured_text(value) if value else None
+
+
+def _base_structured_summary(
+    *,
+    kind: str,
+    scope: str,
+    bytes_analyzed: int,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "kind": kind,
+        "scope": scope,
+        "bytes_analyzed": bytes_analyzed,
+        "details_omitted": False,
+    }
+
+
+def _bounded_structured_summary(
+    summary: dict[str, object],
+) -> dict[str, object]:
+    encoded = json.dumps(
+        summary,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("ascii")
+    if len(encoded) <= MAX_RECEIPT_STRUCTURE_JSON_BYTES:
+        return summary
+    return {
+        "version": 1,
+        "kind": summary["kind"],
+        "scope": summary["scope"],
+        "bytes_analyzed": summary["bytes_analyzed"],
+        "details_omitted": True,
+    }
+
+
+def _structured_json_summary(
+    parsed: object,
+    *,
+    scope: str,
+    bytes_analyzed: int,
+) -> dict[str, object]:
+    summary = _base_structured_summary(
+        kind="json",
+        scope=scope,
+        bytes_analyzed=bytes_analyzed,
+    )
+    summary["top_level"] = _json_type(parsed)
+    if isinstance(parsed, dict):
+        keys = sorted(parsed)
+        retained = keys[:MAX_RECEIPT_STRUCTURE_ITEMS]
+        summary["key_count"] = len(keys)
+        summary["key_types"] = {
+            _structured_text(key): _json_type(parsed[key])
+            for key in retained
+        }
+        summary["keys_omitted"] = len(keys) - len(retained)
+    elif isinstance(parsed, list):
+        summary["item_count"] = len(parsed)
+        summary["item_types"] = sorted(
+            {_json_type(item) for item in parsed}
+        )
+    return _bounded_structured_summary(summary)
+
+
+def _structured_html_summary(
+    text: str,
+    *,
+    scope: str,
+    bytes_analyzed: int,
+    http_status: str | None,
+) -> dict[str, object]:
+    parser = _BoundedHTMLSummaryParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except (AssertionError, ValueError):
+        # HTMLParser is intentionally best effort over hostile, malformed
+        # challenge output. The raw immutable pointer remains authoritative.
+        pass
+    retained_tags = sorted(
+        parser.tags.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:MAX_RECEIPT_STRUCTURE_ITEMS]
+    summary = _base_structured_summary(
+        kind="html",
+        scope=scope,
+        bytes_analyzed=bytes_analyzed,
+    )
+    summary.update(
+        {
+            "http_status": (
+                _structured_text(http_status)
+                if http_status is not None
+                else None
+            ),
+            "title": parser.title,
+            "tag_counts": dict(retained_tags),
+            "tags_omitted": max(0, len(parser.tags) - len(retained_tags)),
+        }
+    )
+    return _bounded_structured_summary(summary)
+
+
+def _structured_delimited_summary(
+    text: str,
+    *,
+    delimiter: str,
+    scope: str,
+    bytes_analyzed: int,
+) -> dict[str, object] | None:
+    try:
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        header = next(reader)
+        if len(header) < 2:
+            return None
+        row_count = 0
+        consistent_rows = 0
+        for row in reader:
+            if not row or (len(row) == 1 and not row[0]):
+                continue
+            row_count += 1
+            if len(row) == len(header):
+                consistent_rows += 1
+            if row_count >= MAX_RECEIPT_DELIMITED_ROWS:
+                break
+    except (csv.Error, StopIteration):
+        return None
+    if row_count < 1 or consistent_rows * 4 < row_count * 3:
+        return None
+    retained = header[:MAX_RECEIPT_STRUCTURE_ITEMS]
+    summary = _base_structured_summary(
+        kind="delimited_text",
+        scope=scope,
+        bytes_analyzed=bytes_analyzed,
+    )
+    summary.update(
+        {
+            "delimiter": "tab" if delimiter == "\t" else "comma",
+            "columns": [_structured_text(value) for value in retained],
+            "columns_omitted": len(header) - len(retained),
+            "row_count": row_count,
+            "row_count_exact": (
+                row_count < MAX_RECEIPT_DELIMITED_ROWS
+                and scope == "complete_stream"
+            ),
+        }
+    )
+    return _bounded_structured_summary(summary)
+
+
+def _structured_content_summary(
+    payload: bytes,
+    *,
+    coverage: str,
+) -> dict[str, object]:
+    scope = {
+        "complete_stream": "complete_stream",
+        "retained_prefix_only": "retained_prefix",
+    }.get(coverage, "stored_snapshot")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return _base_structured_summary(
+            kind="binary",
+            scope=scope,
+            bytes_analyzed=len(payload),
+        )
+
+    stripped = text.strip()
+    if coverage == "complete_stream" and stripped:
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            pass
+        else:
+            return _structured_json_summary(
+                parsed,
+                scope=scope,
+                bytes_analyzed=len(payload),
+            )
+
+    http_status: str | None = None
+    html_text = text
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    if re.fullmatch(r"HTTP/\d(?:\.\d)?[ \t]+\d{3}(?:[ \t]+.*)?", first_line):
+        http_status = first_line
+        partition = (
+            text.partition("\r\n\r\n")
+            if "\r\n\r\n" in text
+            else text.partition("\n\n")
+        )
+        if partition[1]:
+            html_text = partition[2]
+    if re.search(
+        r"(?is)<!doctype[ \t]+html\b|"
+        r"<(?:html|head|body|title|table|script|style)\b",
+        html_text,
+    ):
+        return _structured_html_summary(
+            html_text,
+            scope=scope,
+            bytes_analyzed=len(payload),
+            http_status=http_status,
+        )
+
+    for delimiter in ("\t", ","):
+        if delimiter not in text:
+            continue
+        summary = _structured_delimited_summary(
+            text,
+            delimiter=delimiter,
+            scope=scope,
+            bytes_analyzed=len(payload),
+        )
+        if summary is not None:
+            return summary
+
+    line_count = text.count("\n") + bool(text and not text.endswith("\n"))
+    nonempty_line_count = sum(
+        1 for line in text.splitlines() if line.strip()
+    )
+    summary = _base_structured_summary(
+        kind="text",
+        scope=scope,
+        bytes_analyzed=len(payload),
+    )
+    summary.update(
+        {
+            "line_count": line_count,
+            "line_count_exact": scope == "complete_stream",
+            "nonempty_line_count": nonempty_line_count,
+        }
+    )
+    return _bounded_structured_summary(summary)
 
 
 def _text_sample(value: bytes) -> tuple[str | None, int]:
@@ -514,6 +826,7 @@ def summarize_stream_snapshot(
         tail_payload,
         head_requires_omission,
         tail_requires_omission,
+        snapshot_payload,
     ) = _read_verified_samples(
         snapshot_path,
         expected_sha256=normalized_sha256,
@@ -543,8 +856,12 @@ def summarize_stream_snapshot(
         stream,
         stored_bytes=stored_bytes,
     )
+    structured_summary = _structured_content_summary(
+        snapshot_payload,
+        coverage=str(metadata["coverage"]),
+    )
     evidence: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "stream": stream,
         "artifact_id": normalized_artifact_id,
         "path": normalized_artifact_path,
@@ -559,6 +876,7 @@ def summarize_stream_snapshot(
         ),
         "redaction_count": head_redactions + tail_redactions,
         "binary_sample_omitted": head_binary or tail_binary,
+        "structured_summary": structured_summary,
     }
     encoded = json.dumps(
         evidence,
@@ -635,6 +953,7 @@ def build_receipt_preview(
 __all__ = [
     "MAX_RECEIPT_PREVIEW_CHARS",
     "MAX_RECEIPT_SAMPLE_BYTES",
+    "MAX_RECEIPT_STRUCTURE_JSON_BYTES",
     "MAX_RECEIPT_STREAM_EVIDENCE_BYTES",
     "RECEIPT_SAMPLE_BYTES",
     "ReceiptSummaryError",

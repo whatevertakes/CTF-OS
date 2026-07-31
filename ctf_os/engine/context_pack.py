@@ -116,6 +116,9 @@ def _compact_receipt_streams(receipt: Any) -> dict[str, object]:
             "coverage": evidence.get("coverage"),
             "head": _compact_receipt_sample(evidence.get("head")),
         }
+        structured_summary = evidence.get("structured_summary")
+        if isinstance(structured_summary, dict):
+            compact_stream["structured_summary"] = structured_summary
         tail = _compact_receipt_sample(evidence.get("tail"))
         if tail is not None:
             compact_stream["tail"] = tail

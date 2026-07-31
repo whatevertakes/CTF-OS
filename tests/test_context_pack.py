@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 from ctf_os.adapters import get_adapter
 from ctf_os.engine import failure_capsule as failure_capsule_module
-from ctf_os.engine.context_pack import build_context_pack
+from ctf_os.engine.context_pack import (
+    _compact_receipt_streams,
+    build_context_pack,
+)
 from ctf_os.engine.failure_capsule import build_failure_capsule
 from ctf_os.engine.resume_capsule import (
     MAX_RESUME_CAPSULE_BYTES,
@@ -111,6 +114,49 @@ class ContextPackTests(unittest.TestCase):
         self.assertNotIn(private_id, pack.text)
         self.assertNotIn(private_path, pack.text)
         self.assertIn('"id":"A-1"', pack.text)
+
+    def test_receipt_context_keeps_bounded_structured_summary(self) -> None:
+        structure = {
+            "version": 1,
+            "kind": "json",
+            "scope": "complete_stream",
+            "bytes_analyzed": 27,
+            "details_omitted": False,
+            "top_level": "object",
+            "key_count": 1,
+            "key_types": {"rows": "array"},
+            "keys_omitted": 0,
+        }
+        receipt = SimpleNamespace(
+            extra={
+                "stream_evidence": {
+                    "stdout": {
+                        "artifact_id": "A-stdout",
+                        "path": "artifacts/snapshots/A-stdout.log",
+                        "sha256": "a" * 64,
+                        "stored_bytes": 27,
+                        "drained_bytes": 27,
+                        "coverage": "complete_stream",
+                        "structured_summary": structure,
+                        "head": {
+                            "byte_start": 0,
+                            "byte_end": 8,
+                            "encoding": "utf-8",
+                            "text": '{"rows":',
+                            "text_truncated": False,
+                        },
+                        "tail": None,
+                    }
+                }
+            }
+        )
+
+        compact = _compact_receipt_streams(receipt)
+
+        self.assertEqual(
+            compact["stdout"]["structured_summary"],
+            structure,
+        )
 
     def pwn_crash_state(
         self,
