@@ -19,6 +19,7 @@ MAX_BYTES = 256 * 1024
 MAX_ATTESTED_FILE_BYTES = 4 * 1024 * 1024
 MAX_ASSET_FILES = 16
 MAX_ASSET_MINIMUM_BYTES = 1024**4
+COMMAND_TIMEOUT_SECONDS = 16
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAGIC_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,64}$")
 _PYSAT_SOLVERS = frozenset({"cadical300", "kissat404"})
@@ -139,7 +140,7 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
                 stderr=subprocess.DEVNULL,
                 env=_probe_environment(),
                 check=False,
-                timeout=10,
+                timeout=COMMAND_TIMEOUT_SECONDS,
             )
         except (OSError, subprocess.TimeoutExpired):
             return {"name": name, "available": False}
@@ -160,7 +161,7 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
             stderr=subprocess.DEVNULL,
             env=_probe_environment(),
             check=False,
-            timeout=10,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"name": name, "available": False}

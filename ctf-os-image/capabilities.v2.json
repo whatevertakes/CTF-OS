@@ -154,113 +154,86 @@
     {
       "name": "forensic_volatility3",
       "kind": "command",
-      "command": "/usr/local/bin/vol",
-      "arguments": ["--help"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["volatility3"]
     },
     {
       "name": "forensic_volatility_symbols",
-      "kind": "regular_file_set",
-      "files": [
-        {
-          "path": "/opt/volatility3/symbols/windows.zip",
-          "minimum_bytes": 1000000,
-          "magic_hex": "504b0304"
-        },
-        {
-          "path": "/opt/volatility3/symbols/linux.zip",
-          "minimum_bytes": 1000000,
-          "magic_hex": "504b0304"
-        },
-        {
-          "path": "/opt/volatility3/symbols/mac.zip",
-          "minimum_bytes": 1000000,
-          "magic_hex": "504b0304"
-        }
-      ]
+      "kind": "command",
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["volatility-symbols"]
     },
     {
       "name": "forensic_sleuthkit",
       "kind": "command",
-      "command": "/usr/bin/fls",
-      "arguments": ["-V"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["sleuthkit"]
     },
     {
       "name": "forensic_ewf",
       "kind": "command",
-      "command": "/usr/bin/ewfinfo",
-      "arguments": ["-V"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["ewf"]
     },
     {
       "name": "forensic_tshark",
       "kind": "command",
-      "command": "/usr/bin/tshark",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["tshark"]
     },
     {
       "name": "forensic_zeek",
       "kind": "command",
-      "command": "/opt/zeek/bin/zeek",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["zeek"]
     },
     {
       "name": "forensic_tesseract",
       "kind": "command",
-      "command": "/usr/bin/tesseract",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["tesseract"]
     },
     {
       "name": "forensic_ocr_korean",
-      "kind": "regular_file_set",
-      "files": [
-        {
-          "path": "/usr/share/tesseract-ocr/5/tessdata/eng.traineddata",
-          "minimum_bytes": 1000
-        },
-        {
-          "path": "/usr/share/tesseract-ocr/5/tessdata/kor.traineddata",
-          "minimum_bytes": 1000
-        },
-        {
-          "path": "/usr/share/tesseract-ocr/5/tessdata/kor_vert.traineddata",
-          "minimum_bytes": 1000
-        }
-      ]
+      "kind": "command",
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["tesseract-korean"]
     },
     {
       "name": "forensic_hwp",
       "kind": "command",
-      "command": "/usr/local/bin/hwp5txt",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["hwp"]
     },
     {
       "name": "misc_stegseek",
       "kind": "command",
-      "command": "/usr/local/bin/stegseek",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["stegseek"]
     },
     {
       "name": "misc_zsteg",
       "kind": "command",
-      "command": "/usr/local/bin/zsteg",
-      "arguments": ["--help"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["zsteg"]
     },
     {
       "name": "misc_ffmpeg",
       "kind": "command",
-      "command": "/usr/bin/ffmpeg",
-      "arguments": ["-version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["ffmpeg"]
     },
     {
       "name": "misc_sox",
       "kind": "command",
-      "command": "/usr/bin/sox",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["sox"]
     },
     {
       "name": "misc_zbar",
       "kind": "command",
-      "command": "/usr/bin/zbarimg",
-      "arguments": ["--version"]
+      "command": "/usr/local/bin/ctf-capability-smoke",
+      "arguments": ["zbar"]
     }
   ]
 }

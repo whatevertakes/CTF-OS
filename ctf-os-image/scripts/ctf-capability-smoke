@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""Bounded, offline functional probes for managed category capabilities."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import lzma
+import math
+import os
+import random
+import resource
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import wave
+import zipfile
+from pathlib import Path
+from typing import Callable
+
+
+COMMAND_TIMEOUT_SECONDS = 4
+MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_SYMBOL_MEMBER_BYTES = 2 * 1024 * 1024
+MAX_SYMBOL_JSON_BYTES = 16 * 1024 * 1024
+HWP_FIXTURE = Path("/opt/ctf-capability-fixtures/charshape.hwp")
+HWP_FIXTURE_SHA256 = (
+    "8eb333ab110db6f91d7e426d507d41ca09cacd4d40d945188b5ec40663d7576b"
+)
+VOLATILITY_SYMBOLS = {
+    "windows.zip": (
+        "231d69735b9a5482b16bdbf1ec356e0a95574c44079e68dfb02ebddb34d55f3e",
+        839_727_133,
+        3019,
+        3014,
+    ),
+    "linux.zip": (
+        "58bb7da2ed1e491ce922d04a59881d201e233b5605c9fd5a7f0c08ee528253c6",
+        2_980_184,
+        5,
+        4,
+    ),
+    "mac.zip": (
+        "fd12c8338724b175b0c5765af3313328b700ad53de4a00b4aa50e9a8bcef9129",
+        84_808_562,
+        129,
+        129,
+    ),
+}
+TESSERACT_MODELS = {
+    "eng": (
+        "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+        4_113_088,
+    ),
+    "kor": (
+        "6b85e11d9bbf07863b97b3523b1b112844c43e713df8b66418a081fd1060b3b2",
+        1_677_415,
+    ),
+    "kor_vert": (
+        "c28f19dee36927baba5215fb793a3c00fff3ef2cfbcaa100122401d8f4374869",
+        1_113_715,
+    ),
+}
+
+
+class SmokeError(RuntimeError):
+    """A functional capability probe failed."""
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SmokeError(message)
+
+
+def _command_environment(root: Path) -> dict[str, str]:
+    return {
+        "HOME": str(root),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": (
+            "/opt/venvs/main/bin:/opt/zeek/bin:/usr/local/sbin:"
+            "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TERM": "dumb",
+        "XDG_CACHE_HOME": str(root / "cache"),
+    }
+
+
+def _limit_child_files() -> None:
+    resource.setrlimit(
+        resource.RLIMIT_FSIZE,
+        (MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_OUTPUT_BYTES),
+    )
+
+
+def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait()
+
+
+def _run(
+    root: Path,
+    argv: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    cwd: Path | None = None,
+    expected: frozenset[int] = frozenset({0}),
+) -> bytes:
+    _require(bool(argv) and Path(argv[0]).is_file(), "probe executable missing")
+    identity = os.urandom(8).hex()
+    stdout_path = root / f"command-{identity}.stdout"
+    stderr_path = root / f"command-{identity}.stderr"
+    with (
+        stdout_path.open("w+b") as stdout,
+        stderr_path.open("w+b") as stderr,
+    ):
+        process = subprocess.Popen(
+            argv,
+            cwd=str(cwd or root),
+            env=_command_environment(root),
+            stdin=(
+                subprocess.PIPE
+                if input_bytes is not None
+                else subprocess.DEVNULL
+            ),
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+            preexec_fn=_limit_child_files,
+        )
+        previous_handlers: dict[int, signal.Handlers] = {}
+
+        def terminate_from_parent(
+            signum: int,
+            _frame: object,
+        ) -> None:
+            _kill_and_reap(process)
+            raise SystemExit(128 + signum)
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(
+                signum,
+                terminate_from_parent,
+            )
+        try:
+            process.communicate(
+                input=input_bytes,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            _kill_and_reap(process)
+            raise SmokeError("functional probe timed out") from error
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+        stdout.flush()
+        stderr.flush()
+        stdout_size = os.fstat(stdout.fileno()).st_size
+        stderr_size = os.fstat(stderr.fileno()).st_size
+        _require(
+            stdout_size <= MAX_COMMAND_OUTPUT_BYTES
+            and stderr_size <= MAX_COMMAND_OUTPUT_BYTES,
+            "probe output was unbounded",
+        )
+        stdout.seek(0)
+        captured = stdout.read()
+    if process.returncode not in expected:
+        raise SmokeError(
+            f"{Path(argv[0]).name} exited {process.returncode}"
+        )
+    return captured
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _probe_volatility3(root: Path) -> None:
+    source = (
+        "from volatility3.framework import contexts\n"
+        "from volatility3.plugins import frameworkinfo\n"
+        "context=contexts.Context()\n"
+        "plugin=frameworkinfo.FrameworkInfo("
+        "context,'plugins.FrameworkInfo',lambda _:None)\n"
+        "grid=plugin.run()\n"
+        "rows=[]\n"
+        "grid.populate(lambda node,values:rows.append((node,values)))\n"
+        "assert len(rows)>=20\n"
+    )
+    _run(root, ["/opt/venvs/vol3/bin/python", "-c", source])
+
+
+def _bounded_lzma_json(value: bytes) -> object:
+    with lzma.LZMAFile(io.BytesIO(value), "rb") as source:
+        decoded = source.read(MAX_SYMBOL_JSON_BYTES + 1)
+        _require(
+            len(decoded) <= MAX_SYMBOL_JSON_BYTES,
+            "symbol JSON exceeds probe bound",
+        )
+        _require(source.read(1) == b"", "symbol JSON was truncated")
+    return json.loads(decoded.decode("utf-8"))
+
+
+def _probe_volatility_symbols(_root: Path) -> None:
+    symbol_root = Path("/opt/volatility3/symbols")
+    expected_attestation = "".join(
+        f"{values[0]}  {filename}\n"
+        for filename, values in VOLATILITY_SYMBOLS.items()
+    ).encode("ascii")
+    attestation = symbol_root / "SHA256SUMS"
+    _require(attestation.is_file(), "symbol build attestation is missing")
+    _require(
+        attestation.stat().st_size == len(expected_attestation),
+        "symbol build attestation size mismatch",
+    )
+    _require(
+        attestation.read_bytes() == expected_attestation,
+        "symbol build attestation mismatch",
+    )
+    for filename, (
+        _expected_sha256,
+        expected_size,
+        expected_entries,
+        expected_members,
+    ) in (
+        VOLATILITY_SYMBOLS.items()
+    ):
+        archive = symbol_root / filename
+        _require(archive.is_file(), f"{filename} is missing")
+        _require(
+            archive.stat().st_size == expected_size,
+            f"{filename} size mismatch",
+        )
+        with zipfile.ZipFile(archive, "r") as bundle:
+            entries = bundle.infolist()
+            _require(
+                len(entries) == expected_entries,
+                f"{filename} central directory mismatch",
+            )
+            members = [
+                member
+                for member in entries
+                if not member.is_dir()
+                and member.filename.endswith(".json.xz")
+                and 0 < member.file_size <= MAX_SYMBOL_MEMBER_BYTES
+            ]
+            _require(
+                len(members) == expected_members,
+                f"{filename} symbol index is incomplete",
+            )
+            selected = min(members, key=lambda item: item.file_size)
+            with bundle.open(selected, "r") as source:
+                encoded = source.read(MAX_SYMBOL_MEMBER_BYTES + 1)
+            _require(
+                len(encoded) == selected.file_size,
+                f"{filename} representative symbol is truncated",
+            )
+            decoded = _bounded_lzma_json(encoded)
+            _require(
+                isinstance(decoded, dict) and bool(decoded),
+                f"{filename} representative symbol is invalid",
+            )
+
+
+def _probe_sleuthkit(root: Path) -> None:
+    image = root / "sleuthkit.ext2"
+    with image.open("wb") as output:
+        output.truncate(2 * 1024 * 1024)
+    _run(
+        root,
+        ["/usr/sbin/mke2fs", "-q", "-t", "ext2", "-F", str(image)],
+    )
+    listing = _run(root, ["/usr/bin/fls", "-f", "ext2", str(image)])
+    _require(b"lost+found" in listing, "SleuthKit did not parse ext2")
+
+
+def _probe_ewf(root: Path) -> None:
+    raw = (b"CTFOS-EWF-SMOKE\x00" * 2048)[:32768]
+    target = root / "ewf-smoke"
+    _run(
+        root,
+        [
+            "/usr/bin/ewfacquirestream",
+            "-q",
+            "-B",
+            str(len(raw)),
+            "-P",
+            "512",
+            "-t",
+            str(target),
+        ],
+        input_bytes=raw,
+    )
+    evidence = root / "ewf-smoke.E01"
+    _require(evidence.is_file(), "E01 acquisition did not publish evidence")
+    info = _run(root, ["/usr/bin/ewfinfo", str(evidence)])
+    _require(
+        b"32768 bytes" in info or b"32 KiB" in info,
+        "ewfinfo did not parse the acquired media size",
+    )
+    verified = _run(root, ["/usr/bin/ewfverify", "-q", str(evidence)])
+    _require(b"SUCCESS" in verified, "ewfverify did not verify the E01")
+
+
+def _dns_pcap_bytes() -> bytes:
+    query = (
+        b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        b"\x05ctfos\x05local\x00\x00\x01\x00\x01"
+    )
+    udp_length = 8 + len(query)
+    ipv4_length = 20 + udp_length
+    ethernet = bytes.fromhex(
+        "00112233445566778899aabb0800"
+    )
+    ipv4 = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        ipv4_length,
+        1,
+        0,
+        64,
+        17,
+        0,
+        bytes((192, 0, 2, 1)),
+        bytes((198, 51, 100, 2)),
+    )
+    udp = struct.pack("!HHHH", 53000, 53, udp_length, 0)
+    packet = ethernet + ipv4 + udp + query
+    global_header = struct.pack(
+        "<IHHIIII",
+        0xA1B2C3D4,
+        2,
+        4,
+        0,
+        0,
+        65535,
+        1,
+    )
+    packet_header = struct.pack("<IIII", 1, 0, len(packet), len(packet))
+    return global_header + packet_header + packet
+
+
+def _write_dns_pcap(root: Path) -> Path:
+    path = root / "dns.pcap"
+    path.write_bytes(_dns_pcap_bytes())
+    return path
+
+
+def _probe_tshark(root: Path) -> None:
+    capture = _write_dns_pcap(root)
+    output = _run(
+        root,
+        [
+            "/usr/bin/tshark",
+            "-n",
+            "-r",
+            str(capture),
+            "-Y",
+            "dns",
+            "-T",
+            "fields",
+            "-e",
+            "dns.qry.name",
+        ],
+    )
+    _require(
+        output.strip() == b"ctfos.local",
+        "tshark did not decode the DNS query",
+    )
+
+
+def _probe_zeek(root: Path) -> None:
+    capture = _write_dns_pcap(root)
+    _run(
+        root,
+        [
+            "/opt/zeek/bin/zeek",
+            "-C",
+            "-r",
+            str(capture),
+            "LogAscii::use_json=T",
+        ],
+        cwd=root,
+    )
+    dns_log = root / "dns.log"
+    _require(dns_log.is_file(), "Zeek did not publish dns.log")
+    records = [
+        json.loads(line)
+        for line in dns_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    _require(
+        any(record.get("query") == "ctfos.local" for record in records),
+        "Zeek did not decode the DNS query",
+    )
+
+
+def _render_text(
+    path: Path,
+    *,
+    font_path: str,
+    text: str,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("L", (900, 220), 255)
+    drawing = ImageDraw.Draw(image)
+    font = ImageFont.truetype(font_path, 88)
+    drawing.text((30, 45), text, font=font, fill=0)
+    image.save(path)
+
+
+def _normalized_ocr(output: bytes) -> str:
+    return "".join(
+        output.decode("utf-8", errors="strict").split()
+    ).casefold()
+
+
+def _verify_tesseract_models(names: tuple[str, ...]) -> None:
+    model_root = Path("/usr/share/tesseract-ocr/5/tessdata")
+    for name in names:
+        expected_sha256, expected_size = TESSERACT_MODELS[name]
+        model = model_root / f"{name}.traineddata"
+        _require(model.is_file(), f"Tesseract {name} model is missing")
+        _require(
+            model.stat().st_size == expected_size
+            and _sha256_file(model) == expected_sha256,
+            f"Tesseract {name} model mismatch",
+        )
+
+
+def _probe_tesseract(root: Path) -> None:
+    _verify_tesseract_models(("eng",))
+    image = root / "english.png"
+    _render_text(
+        image,
+        font_path="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        text="CTFOS OCR 31415",
+    )
+    output = _run(
+        root,
+        [
+            "/usr/bin/tesseract",
+            str(image),
+            "stdout",
+            "--psm",
+            "7",
+            "-l",
+            "eng",
+        ],
+    )
+    _require(
+        "ctfosocr31415" in _normalized_ocr(output),
+        "Tesseract English OCR mismatch",
+    )
+
+
+def _probe_tesseract_korean(root: Path) -> None:
+    _verify_tesseract_models(("kor", "kor_vert"))
+    image = root / "korean.png"
+    _render_text(
+        image,
+        font_path="/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        text="한글 31415",
+    )
+    output = _run(
+        root,
+        [
+            "/usr/bin/tesseract",
+            str(image),
+            "stdout",
+            "--psm",
+            "7",
+            "-l",
+            "kor",
+        ],
+    )
+    normalized = _normalized_ocr(output)
+    _require(
+        "한글" in normalized and "31415" in normalized,
+        "Tesseract Korean OCR mismatch",
+    )
+    vertical_output = _run(
+        root,
+        [
+            "/usr/bin/tesseract",
+            str(image),
+            "stdout",
+            "--psm",
+            "7",
+            "-l",
+            "kor_vert",
+        ],
+    )
+    _require(
+        bool(_normalized_ocr(vertical_output)),
+        "Tesseract Korean vertical model did not load",
+    )
+
+
+def _probe_hwp(root: Path) -> None:
+    _require(HWP_FIXTURE.is_file(), "HWP fixture is missing")
+    _require(
+        _sha256_file(HWP_FIXTURE) == HWP_FIXTURE_SHA256,
+        "HWP fixture digest mismatch",
+    )
+    output = _run(
+        root,
+        ["/usr/local/bin/hwp5txt", str(HWP_FIXTURE)],
+    )
+    text = output.decode("utf-8", errors="strict")
+    _require(
+        "기울임" in text and "글자크기" in text,
+        "hwp5txt did not parse the pinned HWP5 fixture",
+    )
+
+
+def _probe_stegseek(root: Path) -> None:
+    from PIL import Image
+
+    generator = random.Random(0x435446)
+    pixels = bytes(
+        generator.getrandbits(8) for _ in range(256 * 256 * 3)
+    )
+    cover = root / "cover.jpg"
+    Image.frombytes("RGB", (256, 256), pixels).save(
+        cover,
+        quality=95,
+    )
+    secret = root / "secret.txt"
+    secret.write_bytes(b"ctfos-stegseek-smoke")
+    stego = root / "stego.jpg"
+    _run(
+        root,
+        [
+            "/usr/local/bin/stegseek",
+            "--embed",
+            "-cf",
+            str(cover),
+            "-ef",
+            str(secret),
+            "-sf",
+            str(stego),
+            "-p",
+            "ctfos-smoke",
+            "-f",
+        ],
+    )
+    words = root / "words.txt"
+    words.write_bytes(b"wrong\nctfos-smoke\n")
+    recovered = root / "recovered.txt"
+    _run(
+        root,
+        [
+            "/usr/local/bin/stegseek",
+            str(stego),
+            str(words),
+            str(recovered),
+            "-f",
+            "-q",
+        ],
+    )
+    _require(
+        recovered.read_bytes() == secret.read_bytes(),
+        "StegSeek recovered the wrong payload",
+    )
+
+
+def _probe_zsteg(root: Path) -> None:
+    from PIL import Image
+
+    payload = b"ctfos-zsteg-smoke\n"
+    bits = [
+        (value >> shift) & 1
+        for value in payload
+        for shift in range(7, -1, -1)
+    ]
+    pixels = [(20, 40, 60)] * (64 * 64)
+    encoded = [
+        ((red & 0xFE) | bits[index], green, blue)
+        if index < len(bits)
+        else (red, green, blue)
+        for index, (red, green, blue) in enumerate(pixels)
+    ]
+    image = Image.new("RGB", (64, 64))
+    image.putdata(encoded)
+    path = root / "zsteg.png"
+    image.save(path)
+    output = _run(
+        root,
+        [
+            "/usr/local/bin/zsteg",
+            "-E",
+            "b1,r,lsb,xy",
+            str(path),
+        ],
+    )
+    _require(
+        output.startswith(payload),
+        "zsteg did not extract the LSB payload",
+    )
+
+
+def _write_audio(path: Path) -> None:
+    sample_rate = 8000
+    samples = [
+        int(12000 * math.sin(2 * math.pi * 440 * index / sample_rate))
+        for index in range(800)
+    ]
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(
+            b"".join(struct.pack("<h", sample) for sample in samples)
+        )
+
+
+def _probe_ffmpeg(root: Path) -> None:
+    source = root / "source.wav"
+    _write_audio(source)
+    output = root / "ffmpeg.raw"
+    _run(
+        root,
+        [
+            "/usr/bin/ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(source),
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            str(output),
+        ],
+    )
+    _require(output.stat().st_size == 1600, "ffmpeg PCM conversion mismatch")
+
+
+def _probe_sox(root: Path) -> None:
+    source = root / "source.wav"
+    _write_audio(source)
+    output = root / "sox.wav"
+    _run(
+        root,
+        [
+            "/usr/bin/sox",
+            str(source),
+            str(output),
+            "gain",
+            "-3",
+        ],
+    )
+    with wave.open(str(source), "rb") as original:
+        _require(original.getnchannels() == 1, "SoX source channel mismatch")
+        _require(original.getsampwidth() == 2, "SoX source width mismatch")
+        source_frames = original.readframes(original.getnframes())
+    with wave.open(str(output), "rb") as result:
+        _require(result.getframerate() == 8000, "SoX sample rate mismatch")
+        _require(result.getnframes() == 800, "SoX frame count mismatch")
+        _require(result.getnchannels() == 1, "SoX channel mismatch")
+        _require(result.getsampwidth() == 2, "SoX sample width mismatch")
+        output_frames = result.readframes(800)
+    _require(output_frames != source_frames, "SoX gain was not applied")
+    source_samples = struct.unpack("<800h", source_frames)
+    output_samples = struct.unpack("<800h", output_frames)
+    source_rms = math.sqrt(
+        sum(sample * sample for sample in source_samples)
+        / len(source_samples)
+    )
+    output_rms = math.sqrt(
+        sum(sample * sample for sample in output_samples)
+        / len(output_samples)
+    )
+    gain_ratio = output_rms / source_rms
+    _require(
+        0.69 <= gain_ratio <= 0.725,
+        "SoX -3 dB RMS gain mismatch",
+    )
+
+
+def _probe_zbar(root: Path) -> None:
+    image = root / "qr.png"
+    _run(
+        root,
+        [
+            "/usr/bin/qrencode",
+            "-o",
+            str(image),
+            "ctfos-zbar-smoke",
+        ],
+    )
+    output = _run(
+        root,
+        [
+            "/usr/bin/zbarimg",
+            "--quiet",
+            "--raw",
+            str(image),
+        ],
+    )
+    _require(
+        output.strip() == b"ctfos-zbar-smoke",
+        "zbar did not decode the QR payload",
+    )
+
+
+PROBES: dict[str, Callable[[Path], None]] = {
+    "volatility3": _probe_volatility3,
+    "volatility-symbols": _probe_volatility_symbols,
+    "sleuthkit": _probe_sleuthkit,
+    "ewf": _probe_ewf,
+    "tshark": _probe_tshark,
+    "zeek": _probe_zeek,
+    "tesseract": _probe_tesseract,
+    "tesseract-korean": _probe_tesseract_korean,
+    "hwp": _probe_hwp,
+    "stegseek": _probe_stegseek,
+    "zsteg": _probe_zsteg,
+    "ffmpeg": _probe_ffmpeg,
+    "sox": _probe_sox,
+    "zbar": _probe_zbar,
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctf-capability-smoke")
+    parser.add_argument("probe", choices=sorted(PROBES))
+    arguments = parser.parse_args()
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f"ctfos-cap-{arguments.probe}-"
+        ) as temporary:
+            PROBES[arguments.probe](Path(temporary))
+    except (
+        SmokeError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        lzma.LZMAError,
+        zipfile.BadZipFile,
+    ) as error:
+        print(f"{arguments.probe}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

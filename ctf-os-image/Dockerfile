@@ -136,24 +136,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /assets
 
 # ── 워드리스트 (SecLists 부분 체크아웃 + rockyou) ─────────────────────────
-RUN git clone --depth=1 --filter=blob:none --sparse \
-      https://github.com/danielmiessler/SecLists /assets/wordlists/SecLists \
- && cd /assets/wordlists/SecLists \
- && git sparse-checkout set \
+ARG SECLISTS_REF=aeb36e9df937d1b77042e5667780e8156cd419f7
+RUN git init /assets/wordlists/SecLists \
+ && git -C /assets/wordlists/SecLists remote add origin \
+      https://github.com/danielmiessler/SecLists \
+ && git -C /assets/wordlists/SecLists sparse-checkout init --cone \
+ && git -C /assets/wordlists/SecLists sparse-checkout set \
       Discovery/Web-Content \
       Passwords/Common-Credentials \
       Passwords/Leaked-Databases \
       Fuzzing/special-chars \
       Usernames \
- && ROCKYOU_ARCHIVE="$(find Passwords/Leaked-Databases -type f \
-      -name 'rockyou*.tar.gz' -print -quit)" \
- && test -n "${ROCKYOU_ARCHIVE}" \
- && tar -xzf "${ROCKYOU_ARCHIVE}" -C /assets/wordlists \
+ && git -C /assets/wordlists/SecLists fetch --depth=1 origin \
+      "${SECLISTS_REF}" \
+ && git -C /assets/wordlists/SecLists checkout --detach FETCH_HEAD \
+ && test -f \
+      /assets/wordlists/SecLists/Passwords/Leaked-Databases/rockyou.txt.tar.gz \
+ && tar -xzf \
+      /assets/wordlists/SecLists/Passwords/Leaked-Databases/rockyou.txt.tar.gz \
+      -C /assets/wordlists \
  && rm -rf /assets/wordlists/SecLists/.git
 
 # ── libc-database ────────────────────────────────────────────────────────
 #   ./get 은 여러 카테고리를 받는다. 전체 출력은 파일에 보관하고 크기만 출력한다.
-RUN git clone --depth=1 https://github.com/niklasb/libc-database /assets/libc-database \
+ARG LIBC_DATABASE_REF=291b0ebf126de9961cd2f8dd1cea2654c57a594a
+RUN git init /assets/libc-database \
+ && git -C /assets/libc-database remote add origin \
+      https://github.com/niklasb/libc-database \
+ && git -C /assets/libc-database fetch --depth=1 origin \
+      "${LIBC_DATABASE_REF}" \
+ && git -C /assets/libc-database checkout --detach FETCH_HEAD \
  && cd /assets/libc-database \
  && if ! ./get ubuntu debian > /tmp/libc-database-get.log 2>&1; then \
       tail -n 100 /tmp/libc-database-get.log; exit 1; \
@@ -165,17 +177,28 @@ RUN git clone --depth=1 https://github.com/niklasb/libc-database /assets/libc-da
 # ── Volatility 심볼 ──────────────────────────────────────────────────────
 # windows.zip은 약 800 MiB라 일시적인 CDN reset이 발생할 수 있다. 실패한
 # 레이어에서도 부분 파일을 BuildKit cache에 남기고 다음 시도에서 Range 재개한다.
-RUN --mount=type=cache,id=ctf-volatility-symbols,target=/var/cache/ctf-volatility \
+ARG VOLATILITY_WINDOWS_SYMBOLS_SHA256=231d69735b9a5482b16bdbf1ec356e0a95574c44079e68dfb02ebddb34d55f3e
+ARG VOLATILITY_LINUX_SYMBOLS_SHA256=58bb7da2ed1e491ce922d04a59881d201e233b5605c9fd5a7f0c08ee528253c6
+ARG VOLATILITY_MAC_SYMBOLS_SHA256=fd12c8338724b175b0c5765af3313328b700ad53de4a00b4aa50e9a8bcef9129
+RUN --mount=type=cache,id=ctf-volatility-symbols,target=/var/cache/ctf-volatility,sharing=locked \
     set -eu; \
     mkdir -p /assets/volatility3/symbols; \
     for s in windows linux mac; do \
       archive="/var/cache/ctf-volatility/${s}.zip"; \
       partial="${archive}.part"; \
-      if ! unzip -tq "${archive}" >/dev/null 2>&1; then \
+      case "${s}" in \
+        windows) expected="${VOLATILITY_WINDOWS_SYMBOLS_SHA256}" ;; \
+        linux) expected="${VOLATILITY_LINUX_SYMBOLS_SHA256}" ;; \
+        mac) expected="${VOLATILITY_MAC_SYMBOLS_SHA256}" ;; \
+      esac; \
+      if ! unzip -tq "${archive}" >/dev/null 2>&1 \
+          || ! echo "${expected}  ${archive}" | sha256sum -c - >/dev/null 2>&1; then \
         rm -f -- "${archive}"; \
-        if unzip -tq "${partial}" >/dev/null 2>&1; then \
+        if unzip -tq "${partial}" >/dev/null 2>&1 \
+            && echo "${expected}  ${partial}" | sha256sum -c - >/dev/null 2>&1; then \
           mv -f -- "${partial}" "${archive}"; \
         else \
+          rm -f -- "${partial}"; \
           attempt=0; \
           while [ "${attempt}" -lt 10 ]; do \
             attempt=$((attempt + 1)); \
@@ -184,7 +207,8 @@ RUN --mount=type=cache,id=ctf-volatility-symbols,target=/var/cache/ctf-volatilit
                 --retry 5 --retry-all-errors --retry-delay 3 \
                 -C - -o "${partial}" \
                 "https://downloads.volatilityfoundation.org/volatility3/symbols/${s}.zip"; then \
-              if unzip -tq "${partial}" >/dev/null 2>&1; then \
+              if unzip -tq "${partial}" >/dev/null 2>&1 \
+                  && echo "${expected}  ${partial}" | sha256sum -c - >/dev/null 2>&1; then \
                 mv -f -- "${partial}" "${archive}"; \
                 break; \
               fi; \
@@ -195,8 +219,24 @@ RUN --mount=type=cache,id=ctf-volatility-symbols,target=/var/cache/ctf-volatilit
         fi; \
       fi; \
       unzip -tq "${archive}" >/dev/null; \
+      echo "${expected}  ${archive}" | sha256sum -c -; \
       install -m 0644 "${archive}" "/assets/volatility3/symbols/${s}.zip"; \
-    done
+    done; \
+    printf '%s  %s\n' \
+      "${VOLATILITY_WINDOWS_SYMBOLS_SHA256}" windows.zip \
+      "${VOLATILITY_LINUX_SYMBOLS_SHA256}" linux.zip \
+      "${VOLATILITY_MAC_SYMBOLS_SHA256}" mac.zip \
+      > /assets/volatility3/symbols/SHA256SUMS
+
+# pyhwp의 실제 HWP5 parser smoke에 사용하는 upstream 고정 fixture.
+ARG PYHWP_FIXTURE_REF=83239f0d3bdf438b2c9f7dcff455a6e841154a39
+ARG PYHWP_FIXTURE_SHA256=8eb333ab110db6f91d7e426d507d41ca09cacd4d40d945188b5ec40663d7576b
+RUN mkdir -p /assets/ctf-capability-fixtures \
+ && curl -fsSL --retry 5 --retry-all-errors \
+      -o /assets/ctf-capability-fixtures/charshape.hwp \
+      "https://raw.githubusercontent.com/mete0r/pyhwp/${PYHWP_FIXTURE_REF}/tests/hwp5_tests/fixtures/charshape.hwp" \
+ && echo "${PYHWP_FIXTURE_SHA256}  /assets/ctf-capability-fixtures/charshape.hwp" \
+      | sha256sum -c -
 
 # ── nuclei 템플릿 (커밋 고정) ────────────────────────────────────────────
 ARG NUCLEI_TEMPLATES_REF=4ccef9ea7c907d917b1608d60d73b12823bdfdf5
@@ -236,7 +276,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libc6-dev-arm64-cross libc6-dev-armhf-cross \
  && rm -rf /var/lib/apt/lists/*
 
-RUN gem install --no-document one_gadget seccomp-tools zsteg
+RUN gem install --no-document one_gadget --version 1.10.0 \
+ && gem install --no-document seccomp-tools --version 1.6.2 \
+ && gem install --no-document zsteg --version 0.2.14
 
 # pwndbg
 ARG PWNDBG_VER=2026.02.18
@@ -275,12 +317,17 @@ RUN curl -fsSL -o /usr/local/bin/pwninit \
  && chmod +x /usr/local/bin/pwninit
 
 # 커널 pwn
+ARG VMLINUX_TO_ELF_REF=19683fb95b29cd31362d49e6f48ab8368f96cbdf
+ARG EXTRACT_VMLINUX_REF=8ba098e6b6ff0db8edf28528d1552be261af30d4
+ARG EXTRACT_VMLINUX_SHA256=aacb6bb09af227a6cf508f5283458f001722a39abd9c4cfb026bc97c31624910
 RUN uv venv /opt/venvs/kernel \
  && VIRTUAL_ENV=/opt/venvs/kernel uv pip install \
-      "git+https://github.com/marin-m/vmlinux-to-elf" \
+      "git+https://github.com/marin-m/vmlinux-to-elf@${VMLINUX_TO_ELF_REF}" \
  && ln -sf /opt/venvs/kernel/bin/vmlinux-to-elf /usr/local/bin/vmlinux-to-elf \
  && curl -fsSL -o /usr/local/bin/extract-vmlinux \
-      "https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-vmlinux" \
+      "https://raw.githubusercontent.com/torvalds/linux/${EXTRACT_VMLINUX_REF}/scripts/extract-vmlinux" \
+ && echo "${EXTRACT_VMLINUX_SHA256}  /usr/local/bin/extract-vmlinux" \
+      | sha256sum -c - \
  && chmod +x /usr/local/bin/extract-vmlinux
 
 # angr / ROP 도구 (격리)
@@ -369,7 +416,11 @@ ENV PATH="/root/.dotnet/tools:${PATH}"
 RUN VIRTUAL_ENV=/opt/venvs/main uv pip install dnfile pefile
 
 # Python 바이트코드
-RUN git clone --depth=1 https://github.com/zrax/pycdc /tmp/pycdc \
+ARG PYCDC_REF=b4289760970dbc399684f1e155ec6d1ea1cc787e
+RUN git init /tmp/pycdc \
+ && git -C /tmp/pycdc remote add origin https://github.com/zrax/pycdc \
+ && git -C /tmp/pycdc fetch --depth=1 origin "${PYCDC_REF}" \
+ && git -C /tmp/pycdc checkout --detach FETCH_HEAD \
  && cmake -S /tmp/pycdc -B /tmp/pycdc/build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build /tmp/pycdc/build -j"$(nproc)" \
  && install -m755 /tmp/pycdc/build/pycdc /tmp/pycdc/build/pycdas /usr/local/bin/ \
@@ -377,9 +428,13 @@ RUN git clone --depth=1 https://github.com/zrax/pycdc /tmp/pycdc \
 RUN uv venv /opt/venvs/pydec \
  && VIRTUAL_ENV=/opt/venvs/pydec uv pip install uncompyle6 xdis \
  && ln -sf /opt/venvs/pydec/bin/uncompyle6 /usr/local/bin/uncompyle6 \
- && ln -sf /opt/venvs/pydec/bin/pydisasm /usr/local/bin/pydisasm \
- && curl -fsSL -o /usr/local/bin/pyinstxtractor.py \
-      "https://raw.githubusercontent.com/extremecoders-re/pyinstxtractor/master/pyinstxtractor.py"
+ && ln -sf /opt/venvs/pydec/bin/pydisasm /usr/local/bin/pydisasm
+ARG PYINSTXTRACTOR_REF=815d31cf26bc71e62f851b2e549452e7b7c9dd98
+ARG PYINSTXTRACTOR_SHA256=94e0b6c9d5151bbeefc7e7452e96e24b396c2dbfcb0348e5f12c4c0865fefe58
+RUN curl -fsSL -o /usr/local/bin/pyinstxtractor.py \
+      "https://raw.githubusercontent.com/extremecoders-re/pyinstxtractor/${PYINSTXTRACTOR_REF}/pyinstxtractor.py" \
+ && echo "${PYINSTXTRACTOR_SHA256}  /usr/local/bin/pyinstxtractor.py" \
+      | sha256sum -c -
 
 # Go / Rust 심볼
 ARG GORESYM_VER=3.4
@@ -459,14 +514,25 @@ RUN git init /tmp/flatter \
  && flatter -h >/dev/null
 
 # RsaCtfTool (격리 — 의존성 핀이 넓다)
-RUN git clone --depth=1 https://github.com/RsaCtfTool/RsaCtfTool /opt/ctf-tools/RsaCtfTool \
+ARG RSACTFTOOL_REF=7c98848f1945de3e67a420871e8672f5ad9aa5d5
+RUN git init /opt/ctf-tools/RsaCtfTool \
+ && git -C /opt/ctf-tools/RsaCtfTool remote add origin \
+      https://github.com/RsaCtfTool/RsaCtfTool \
+ && git -C /opt/ctf-tools/RsaCtfTool fetch --depth=1 origin \
+      "${RSACTFTOOL_REF}" \
+ && git -C /opt/ctf-tools/RsaCtfTool checkout --detach FETCH_HEAD \
  && uv venv /opt/venvs/rsactftool \
  && VIRTUAL_ENV=/opt/venvs/rsactftool uv pip install /opt/ctf-tools/RsaCtfTool \
  && printf '#!/bin/sh\nexec /opt/venvs/rsactftool/bin/python /opt/ctf-tools/RsaCtfTool/RsaCtfTool.py "$@"\n' \
       > /usr/local/bin/RsaCtfTool && chmod +x /usr/local/bin/RsaCtfTool
 
 # CADO-NFS
-RUN git clone --depth=1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git /opt/cado-nfs \
+ARG CADO_NFS_REF=d67f463a8e5d2f4ab79cd114441b2cf982dc0da7
+RUN git init /opt/cado-nfs \
+ && git -C /opt/cado-nfs remote add origin \
+      https://gitlab.inria.fr/cado-nfs/cado-nfs.git \
+ && git -C /opt/cado-nfs fetch --depth=1 origin "${CADO_NFS_REF}" \
+ && git -C /opt/cado-nfs checkout --detach FETCH_HEAD \
  && cd /opt/cado-nfs && make -j"$(nproc)"
 
 # ★ CADO-NFS 는 빌드 디렉터리를 호스트명으로 찾는다.
@@ -482,7 +548,11 @@ exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
  && chmod +x /usr/local/bin/cado-nfs
 
 # John the Ripper jumbo (소스)
-RUN git clone --depth=1 https://github.com/openwall/john /opt/john \
+ARG JOHN_REF=94caf43756b1f13c7e3829ff848df344ea755cac
+RUN git init /opt/john \
+ && git -C /opt/john remote add origin https://github.com/openwall/john \
+ && git -C /opt/john fetch --depth=1 origin "${JOHN_REF}" \
+ && git -C /opt/john checkout --detach FETCH_HEAD \
  && cd /opt/john/src && ./configure && make -sj"$(nproc)"
 RUN printf '#!/bin/sh\nexec /opt/john/run/john "$@"\n' > /usr/local/bin/john \
  && chmod +x /usr/local/bin/john \
@@ -542,6 +612,8 @@ RUN printf '%s\n' \
 # ─────────────────────────────────────────────────────────────────────────
 # FORENSIC
 # ─────────────────────────────────────────────────────────────────────────
+ARG TESSERACT_VER=5.3.4-1build5
+ARG TESSERACT_LANG_VER=1:4.1.0-2
 RUN apt-get update && apt-get install -y --no-install-recommends \
       sleuthkit testdisk foremost scalpel \
       tshark tcpdump ngrep \
@@ -550,7 +622,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libregf-utils libevtx-utils qemu-utils squashfs-tools \
       poppler-utils qpdf \
       ssdeep clamav clamav-freshclam \
-      tesseract-ocr tesseract-ocr-eng tesseract-ocr-kor tesseract-ocr-kor-vert \
+      "tesseract-ocr=${TESSERACT_VER}" \
+      "tesseract-ocr-eng=${TESSERACT_LANG_VER}" \
+      "tesseract-ocr-kor=${TESSERACT_LANG_VER}" \
+      "tesseract-ocr-kor-vert=${TESSERACT_LANG_VER}" \
       fonts-nanum fonts-nanum-coding \
       libreoffice-writer libreoffice-calc libreoffice-impress \
       flex libabsl-dev libre2-dev libxml2-utils libewf-dev ewf-tools \
@@ -573,22 +648,43 @@ RUN git clone --depth=1 --branch "v${BULK_EXTRACTOR_VER}" \
 RUN sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true \
  && freshclam
 
-# Zeek
-RUN echo 'deb https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /' \
-      > /etc/apt/sources.list.d/zeek.list \
- && curl -fsSL "https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/Release.key" \
-      | gpg --dearmor -o /etc/apt/trusted.gpg.d/zeek.gpg \
- && apt-get update && apt-get install -y --no-install-recommends zeek \
- && rm -rf /var/lib/apt/lists/*
+# Zeek. OBS only retains the newest package, so use the retained official
+# release tarball and verify its bytes instead of pinning an evictable apt
+# version.
+ARG ZEEK_VER=8.2.1
+ARG ZEEK_SHA256=a8067c75cc89bef4b58019230434a90073671a7cabfcf7ac616ac872a40a2edd
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bison cppzmq-dev libfl-dev libmaxminddb-dev libzmq3-dev swig \
+      python3-git python3-semantic-version python3-websockets \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL --retry 5 --retry-all-errors \
+      -o /tmp/zeek.tar.gz \
+      "https://download.zeek.org/zeek-${ZEEK_VER}.tar.gz" \
+ && echo "${ZEEK_SHA256}  /tmp/zeek.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/zeek.tar.gz -C /tmp \
+ && cd "/tmp/zeek-${ZEEK_VER}" \
+ && ./configure --prefix=/opt/zeek --build-type=Release \
+ && make -j"$(nproc)" \
+ && make install \
+ && /opt/zeek/bin/zeek --version > /tmp/zeek.version 2>&1 \
+ && grep -F "zeek version ${ZEEK_VER}" /tmp/zeek.version \
+ && rm /tmp/zeek.version \
+ && rm -rf /tmp/zeek.tar.gz "/tmp/zeek-${ZEEK_VER}"
 ENV PATH="/opt/zeek/bin:${PATH}"
 
 # Volatility 3 (격리)
+ARG VOLATILITY3_VER=2.28.0
 RUN uv venv /opt/venvs/vol3 \
- && VIRTUAL_ENV=/opt/venvs/vol3 uv pip install volatility3 \
+ && VIRTUAL_ENV=/opt/venvs/vol3 uv pip install \
+      "volatility3==${VOLATILITY3_VER}" \
  && ln -sf /opt/venvs/vol3/bin/vol /usr/local/bin/vol
-ARG DWARF2JSON_VER=latest
+ARG DWARF2JSON_VER=0.9.0
+ARG DWARF2JSON_SHA256=e2e75ba5bc9c22bc38a48edffbb050456d089d54998d54f46cb580223d9fbc6b
 RUN curl -fsSL -o /usr/local/bin/dwarf2json \
-      "https://github.com/volatilityfoundation/dwarf2json/releases/download/v0.9.0/dwarf2json-linux-amd64" \
+      "https://github.com/volatilityfoundation/dwarf2json/releases/download/v${DWARF2JSON_VER}/dwarf2json-linux-amd64" \
+ && echo "${DWARF2JSON_SHA256}  /usr/local/bin/dwarf2json" \
+      | sha256sum -c - \
  && chmod +x /usr/local/bin/dwarf2json
 
 # 문서 분석
@@ -599,11 +695,14 @@ RUN uv venv /opt/venvs/docs \
  && chmod +x /usr/local/bin/pdfid
 
 # ★ 한글 문서
+ARG PYHWP_VER=0.1b15
 RUN uv venv /opt/venvs/hwp \
- && VIRTUAL_ENV=/opt/venvs/hwp uv pip install pyhwp olefile chardet six \
+ && VIRTUAL_ENV=/opt/venvs/hwp uv pip install \
+      "pyhwp==${PYHWP_VER}" "olefile==0.47" "chardet==7.4.3" "six==1.17.0" \
  && for b in hwp5txt hwp5proc hwp5odt; do \
       ln -sf "/opt/venvs/hwp/bin/$b" "/usr/local/bin/$b" 2>/dev/null || true; done \
- && /opt/venvs/hwp/bin/hwp5txt --version
+ && /opt/venvs/hwp/bin/hwp5txt --version \
+      | grep -F "hwp5txt ${PYHWP_VER}"
 
 # ─────────────────────────────────────────────────────────────────────────
 # WEB
@@ -637,7 +736,13 @@ RUN printf '#!/bin/sh\nexec /usr/local/bin/nuclei -duc -t "$NUCLEI_TEMPLATES_DIR
 RUN uv venv /opt/venvs/mitm \
  && VIRTUAL_ENV=/opt/venvs/mitm uv pip install mitmproxy \
  && for b in mitmproxy mitmdump mitmweb; do ln -sf "/opt/venvs/mitm/bin/$b" "/usr/local/bin/$b"; done
-RUN git clone --depth=1 https://github.com/ticarpi/jwt_tool /opt/ctf-tools/jwt_tool \
+ARG JWT_TOOL_REF=3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b
+RUN git init /opt/ctf-tools/jwt_tool \
+ && git -C /opt/ctf-tools/jwt_tool remote add origin \
+      https://github.com/ticarpi/jwt_tool \
+ && git -C /opt/ctf-tools/jwt_tool fetch --depth=1 origin \
+      "${JWT_TOOL_REF}" \
+ && git -C /opt/ctf-tools/jwt_tool checkout --detach FETCH_HEAD \
  && uv venv /opt/venvs/jwt \
  && VIRTUAL_ENV=/opt/venvs/jwt uv pip install termcolor cprint pycryptodomex requests \
  && printf '#!/bin/sh\nexec /opt/venvs/jwt/bin/python /opt/ctf-tools/jwt_tool/jwt_tool.py "$@"\n' \
@@ -672,12 +777,18 @@ RUN uv venv /opt/venvs/pw \
 
 # 역직렬화 가젯 체인
 ARG YSOSERIAL_VER=0.0.6
+ARG PHPGGC_REF=f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c
 RUN mkdir -p /opt/ctf-tools/gadgets && cd /opt/ctf-tools/gadgets \
  && curl -fsSL -o ysoserial.jar \
       "https://github.com/frohoff/ysoserial/releases/download/v${YSOSERIAL_VER}/ysoserial-all.jar" \
  && printf '#!/bin/sh\nexec java -jar /opt/ctf-tools/gadgets/ysoserial.jar "$@"\n' > /usr/local/bin/ysoserial \
  && chmod +x /usr/local/bin/ysoserial \
- && git clone --depth=1 https://github.com/ambionics/phpggc /opt/ctf-tools/gadgets/phpggc \
+ && git init /opt/ctf-tools/gadgets/phpggc \
+ && git -C /opt/ctf-tools/gadgets/phpggc remote add origin \
+      https://github.com/ambionics/phpggc \
+ && git -C /opt/ctf-tools/gadgets/phpggc fetch --depth=1 origin \
+      "${PHPGGC_REF}" \
+ && git -C /opt/ctf-tools/gadgets/phpggc checkout --detach FETCH_HEAD \
  && ln -sf /opt/ctf-tools/gadgets/phpggc/phpggc /usr/local/bin/phpggc
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -700,9 +811,15 @@ RUN curl -fsSL -o /tmp/bkcrack.tar.gz \
  && rm /tmp/bkcrack.tar.gz \
  && bkcrack --version | grep -F "${BKCRACK_VER}"
 
-RUN git clone --depth=1 https://github.com/RickdeJager/stegseek /tmp/stegseek \
+ARG STEGSEEK_REF=0e10a674b326298c5d51af8f2f7219ccac45e123
+RUN git init /tmp/stegseek \
+ && git -C /tmp/stegseek remote add origin \
+      https://github.com/RickdeJager/stegseek \
+ && git -C /tmp/stegseek fetch --depth=1 origin "${STEGSEEK_REF}" \
+ && git -C /tmp/stegseek checkout --detach FETCH_HEAD \
  && cmake -S /tmp/stegseek -B /tmp/stegseek/build -DCMAKE_BUILD_TYPE=Release \
  && cmake --build /tmp/stegseek/build --target install -j"$(nproc)" \
+ && stegseek --version 2>&1 | grep -F 'StegSeek 0.6' \
  && rm -rf /tmp/stegseek
 
 # 자동 시도 도구 — ★ 출력이 많다. ctfwrap 을 반드시 경유시킬 것.
@@ -868,6 +985,7 @@ COPY --from=assets /assets/wordlists        /opt/wordlists
 COPY --from=assets /assets/libc-database    /opt/ctf-tools/libc-database
 COPY --from=assets /assets/volatility3      /opt/volatility3
 COPY --from=assets /assets/nuclei-templates /opt/nuclei-templates
+COPY --from=assets /assets/ctf-capability-fixtures /opt/ctf-capability-fixtures
 
 RUN printf '%s\n' \
       '#!/bin/sh' \

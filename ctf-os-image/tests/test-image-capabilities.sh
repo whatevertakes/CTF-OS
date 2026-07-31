@@ -127,18 +127,41 @@ tesseract --list-langs >"${test_root}/tesseract-langs.txt"
 grep -Fx 'kor' "${test_root}/tesseract-langs.txt" >/dev/null
 grep -Fx 'kor_vert' "${test_root}/tesseract-langs.txt" >/dev/null
 hwp5txt --version | grep -F 'hwp5txt ' >/dev/null
-stegseek --version | grep -F 'StegSeek ' >/dev/null
+stegseek --version 2>&1 | grep -F 'StegSeek ' >/dev/null
 zsteg --help | grep -F 'Usage: zsteg ' >/dev/null
 ffmpeg -version | grep -F 'ffmpeg version ' >/dev/null
 sox --version | grep -F 'SoX v' >/dev/null
 zbarimg --version | grep -E '^[0-9]+[.]' >/dev/null
 vol --help | grep -F 'usage: vol ' >/dev/null
 
-for symbol_archive in windows linux mac; do
-    archive="/opt/volatility3/symbols/${symbol_archive}.zip"
-    [[ -s "${archive}" ]]
-    [[ "$(od -An -tx1 -N4 "${archive}" | tr -d ' \n')" == "504b0304" ]]
+functional_probes=(
+    volatility3 volatility-symbols sleuthkit ewf tshark zeek
+    tesseract tesseract-korean hwp
+    stegseek zsteg ffmpeg sox zbar
+)
+for probe in "${functional_probes[@]}"; do
+    timeout --signal=TERM --kill-after=2s 20s \
+        ctf-capability-smoke "${probe}"
 done
+
+[[ "$(sha256sum /opt/ctf-capability-fixtures/charshape.hwp \
+    | cut -d' ' -f1)" == \
+    "8eb333ab110db6f91d7e426d507d41ca09cacd4d40d945188b5ec40663d7576b" ]]
+/opt/venvs/vol3/bin/python - <<'PY'
+import importlib.metadata
+
+assert importlib.metadata.version("volatility3") == "2.28.0"
+PY
+/opt/venvs/hwp/bin/python - <<'PY'
+import importlib.metadata
+
+assert importlib.metadata.version("pyhwp") == "0.1b15"
+assert importlib.metadata.version("olefile") == "0.47"
+assert importlib.metadata.version("chardet") == "7.4.3"
+assert importlib.metadata.version("six") == "1.17.0"
+PY
+gem list --local --exact zsteg --version 0.2.14 \
+    | grep -Fx 'zsteg (0.2.14)' >/dev/null
 
 [[ "$(readlink -f /usr/local/lib/ctf-cuda/libnvrtc.so)" == \
     */site-packages/nvidia/cu13/lib/libnvrtc.so.13 ]]

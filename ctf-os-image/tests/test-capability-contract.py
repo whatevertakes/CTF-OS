@@ -6,10 +6,15 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import pathlib
 import re
 import runpy
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -32,6 +37,9 @@ managed_manifest = json.loads(
 )
 managed_probe_source = (
     REPO_ROOT / "scripts" / "ctf-capabilities"
+).read_text(encoding="utf-8")
+functional_probe_source = (
+    REPO_ROOT / "scripts" / "ctf-capability-smoke"
 ).read_text(encoding="utf-8")
 sqlite_wrapper_source = (
     REPO_ROOT / "scripts" / "ctf-sqlite-readonly"
@@ -143,6 +151,10 @@ assert (
     in dockerfile
 )
 ast.parse(managed_probe_source, filename="scripts/ctf-capabilities")
+ast.parse(
+    functional_probe_source,
+    filename="scripts/ctf-capability-smoke",
+)
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2
 assert len(managed_manifest["capabilities"]) == 34
@@ -201,6 +213,32 @@ managed_attestations = {
         "forensic_evidence_index_v1",
     }
 }
+functional_capabilities = {
+    "forensic_volatility3": "volatility3",
+    "forensic_volatility_symbols": "volatility-symbols",
+    "forensic_sleuthkit": "sleuthkit",
+    "forensic_ewf": "ewf",
+    "forensic_tshark": "tshark",
+    "forensic_zeek": "zeek",
+    "forensic_tesseract": "tesseract",
+    "forensic_ocr_korean": "tesseract-korean",
+    "forensic_hwp": "hwp",
+    "misc_stegseek": "stegseek",
+    "misc_zsteg": "zsteg",
+    "misc_ffmpeg": "ffmpeg",
+    "misc_sox": "sox",
+    "misc_zbar": "zbar",
+}
+managed_by_name = {
+    item["name"]: item for item in managed_manifest["capabilities"]
+}
+for capability, probe in functional_capabilities.items():
+    assert managed_by_name[capability] == {
+        "name": capability,
+        "kind": "command",
+        "command": "/usr/local/bin/ctf-capability-smoke",
+        "arguments": [probe],
+    }
 expected_managed_attestations = {
     "pwn_crash_v1": {
         "path": "/opt/ctf-templates/pwn/crash_oracle.py",
@@ -317,6 +355,83 @@ assert 'or .name == "rev_runtime_exec_v1"' in dockerfile
 assert 'or .name == "data_transcript_v1"' in dockerfile
 assert 'or .name == "forensic_evidence_index_v1"' in dockerfile
 assert "--network" not in managed_probe_source
+assert "subprocess.DEVNULL" in functional_probe_source
+assert "start_new_session=True" in functional_probe_source
+assert "resource.RLIMIT_FSIZE" in functional_probe_source
+assert "COMMAND_TIMEOUT_SECONDS = 4" in functional_probe_source
+assert "shell=True" not in functional_probe_source
+assert "VOLATILITY3_VER=2.28.0" in dockerfile
+assert "PYHWP_VER=0.1b15" in dockerfile
+assert "ZEEK_VER=8.2.1" in dockerfile
+assert (
+    "ZEEK_SHA256=a8067c75cc89bef4b58019230434a90073671a7cabfcf7ac616ac872a40a2edd"
+    in dockerfile
+)
+assert "https://download.zeek.org/zeek-${ZEEK_VER}.tar.gz" in dockerfile
+assert "security:/zeek" not in dockerfile
+assert "TESSERACT_VER=5.3.4-1build5" in dockerfile
+assert "TESSERACT_LANG_VER=1:4.1.0-2" in dockerfile
+assert "sharing=locked" in dockerfile
+assert (
+    "STEGSEEK_REF=0e10a674b326298c5d51af8f2f7219ccac45e123"
+    in dockerfile
+)
+assert "stegseek --version 2>&1 | grep -F 'StegSeek 0.6'" in dockerfile
+assert "zsteg --version 0.2.14" in dockerfile
+assert (
+    "PYHWP_FIXTURE_REF=83239f0d3bdf438b2c9f7dcff455a6e841154a39"
+    in dockerfile
+)
+assert (
+    "8eb333ab110db6f91d7e426d507d41ca09cacd4d40d945188b5ec40663d7576b"
+    in dockerfile
+)
+for digest in (
+    "231d69735b9a5482b16bdbf1ec356e0a95574c44079e68dfb02ebddb34d55f3e",
+    "58bb7da2ed1e491ce922d04a59881d201e233b5605c9fd5a7f0c08ee528253c6",
+    "fd12c8338724b175b0c5765af3313328b700ad53de4a00b4aa50e9a8bcef9129",
+):
+    assert digest in dockerfile
+    assert digest in functional_probe_source
+assert "SHA256SUMS" in dockerfile
+assert "SHA256SUMS" in functional_probe_source
+assert "_sha256_file(archive)" not in functional_probe_source
+for size in ("839_727_133", "2_980_184", "84_808_562"):
+    assert size in functional_probe_source
+for digest in (
+    "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+    "6b85e11d9bbf07863b97b3523b1b112844c43e713df8b66418a081fd1060b3b2",
+    "c28f19dee36927baba5215fb793a3c00fff3ef2cfbcaa100122401d8f4374869",
+):
+    assert digest in functional_probe_source
+assert "output_frames != source_frames" in functional_probe_source
+assert "0.69 <= gain_ratio <= 0.725" in functional_probe_source
+for pin in (
+    "SECLISTS_REF=aeb36e9df937d1b77042e5667780e8156cd419f7",
+    "LIBC_DATABASE_REF=291b0ebf126de9961cd2f8dd1cea2654c57a594a",
+    "VMLINUX_TO_ELF_REF=19683fb95b29cd31362d49e6f48ab8368f96cbdf",
+    "EXTRACT_VMLINUX_REF=8ba098e6b6ff0db8edf28528d1552be261af30d4",
+    "PYCDC_REF=b4289760970dbc399684f1e155ec6d1ea1cc787e",
+    "PYINSTXTRACTOR_REF=815d31cf26bc71e62f851b2e549452e7b7c9dd98",
+    "RSACTFTOOL_REF=7c98848f1945de3e67a420871e8672f5ad9aa5d5",
+    "CADO_NFS_REF=d67f463a8e5d2f4ab79cd114441b2cf982dc0da7",
+    "JOHN_REF=94caf43756b1f13c7e3829ff848df344ea755cac",
+    "JWT_TOOL_REF=3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b",
+    "PHPGGC_REF=f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c",
+    "DWARF2JSON_VER=0.9.0",
+    "DWARF2JSON_SHA256=e2e75ba5bc9c22bc38a48edffbb050456d089d54998d54f46cb580223d9fbc6b",
+):
+    assert pin in dockerfile
+assert "/torvalds/linux/master/" not in dockerfile
+assert "DWARF2JSON_VER=latest" not in dockerfile
+assert (
+    dockerfile.count(
+        'echo "${expected}  ${partial}" | sha256sum -c -'
+    )
+    == 2
+)
+assert 'rm -f -- "${archive}"' in dockerfile
+assert dockerfile.count('rm -f -- "${partial}"') >= 2
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source
 
@@ -351,5 +466,98 @@ with tempfile.TemporaryDirectory() as temporary:
         },
     )
     assert observation == {"name": "fixture_assets", "available": False}
+
+functional_namespace = runpy.run_path(
+    str(REPO_ROOT / "scripts" / "ctf-capability-smoke"),
+    run_name="ctf_capability_smoke_under_test",
+)
+probe_sox = functional_namespace["_probe_sox"]
+smoke_error = functional_namespace["SmokeError"]
+original_run = probe_sox.__globals__["_run"]
+for mutation, expected_error in (
+    ("copy", "gain was not applied"),
+    ("near-copy", "RMS gain mismatch"),
+):
+    def fake_sox(_root, argv, **_kwargs):
+        source = pathlib.Path(argv[1]).read_bytes()
+        if mutation == "near-copy":
+            changed = bytearray(source)
+            changed[-1] ^= 1
+            source = bytes(changed)
+        pathlib.Path(argv[2]).write_bytes(source)
+        return b""
+
+    probe_sox.__globals__["_run"] = fake_sox
+    with tempfile.TemporaryDirectory() as temporary:
+        try:
+            probe_sox(pathlib.Path(temporary))
+        except smoke_error as error:
+            assert expected_error in str(error)
+        else:
+            raise AssertionError(f"SoX {mutation} passthrough was accepted")
+probe_sox.__globals__["_run"] = original_run
+
+with tempfile.TemporaryDirectory() as temporary:
+    temporary_root = pathlib.Path(temporary)
+    child_pid_path = temporary_root / "child.pid"
+    hanging_child = temporary_root / "hanging-child"
+    hanging_child.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$$" > "$1"\n'
+        "exec /bin/sleep 30\n",
+        encoding="utf-8",
+    )
+    hanging_child.chmod(0o755)
+    parent_source = (
+        "import runpy,sys\n"
+        "from pathlib import Path\n"
+        "namespace=runpy.run_path(sys.argv[1],run_name='signal_test')\n"
+        "namespace['_run']("
+        "Path(sys.argv[2]),[sys.argv[3],sys.argv[4]])\n"
+    )
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            parent_source,
+            str(REPO_ROOT / "scripts" / "ctf-capability-smoke"),
+            str(temporary_root),
+            str(hanging_child),
+            str(child_pid_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if child_pid_path.is_file():
+                child_pid = int(
+                    child_pid_path.read_text(encoding="ascii").strip()
+                )
+                break
+            if parent.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert child_pid is not None, parent.communicate(timeout=1)
+        os.kill(parent.pid, signal.SIGTERM)
+        assert parent.wait(timeout=3) == 128 + signal.SIGTERM
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("external SIGTERM leaked the probe child")
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 print("capability contract: ok")

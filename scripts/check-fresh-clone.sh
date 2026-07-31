@@ -44,6 +44,7 @@ required=(
   ctf-os-image/Dockerfile
   ctf-os-image/SOURCE.json
   ctf-os-image/capabilities.v2.json
+  ctf-os-image/scripts/ctf-capability-smoke
   ctf-os-image/scripts/ctf-capabilities
   ctf-os-image/scripts/ctf-sqlite-readonly
   ctf-os-image/scripts/entrypoint.sh

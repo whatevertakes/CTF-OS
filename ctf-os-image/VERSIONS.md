@@ -41,7 +41,7 @@ GoReSym 3.4는 기존의 버전 포함 tarball 대신 `GoReSym-linux.zip`을 배
 | Rust 툴체인 | [rustup](https://rustup.rs/) `stable`, `minimal` 프로필로 실제 설치 시 `rustc 1.97.1`, `cargo 1.97.1`. 이 cargo로 `rustfilt`와 `ciphey 0.12.0` 컴파일·설치 성공 | apt cargo 폴백 제거, `/root/.cargo/bin`을 `PATH`에 추가, cargo 오류를 숨기거나 건너뛰지 않음 |
 | 압축 해제 실행 권한 | GoReSym과 nuclei의 ZIP 내부 파일은 실행 비트 보존을 전제로 할 수 없음 | 두 바이너리에 명시적으로 `chmod +x` |
 | `/work` 볼륨 | Dockerfile의 `VOLUME`은 런처의 명시적 bind mount와 이미지 레이어 검증을 방해할 수 있음 | `VOLUME ["/work"]` 제거 |
-| Zeek OBS Noble 저장소 | [`xUbuntu_24.04/`](https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/), [`Release`](https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/Release), [`Release.key`](https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/Release.key) 모두 HTTP 200 | 저장소를 HTTPS로 바꾸고 키 URL을 동일한 정규 경로로 통일 |
+| Zeek 배포 경계 | OBS Noble 저장소는 같은 line의 최신 package만 유지해 exact apt version이 후속 release 때 사라짐 | 장기 보존되는 official `zeek-8.2.1.tar.gz`를 SHA-256 검증 후 source build |
 | Ares 설치법 | [bee-san/Ares](https://github.com/bee-san/Ares)의 배포 패키지와 바이너리 이름은 둘 다 `ciphey`. crates.io의 최신 공개 버전은 `0.12.0`이고 README 설치법은 `cargo install ciphey`. 이 버전은 `--version` CLI 옵션은 제공하지 않음 | `cargo install --locked --version 0.12.0 --root /usr/local ciphey`. 실행 명령은 `ciphey` |
 | ILSpyCmd 런타임 | 최신 10.1.1.8388 NuGet 패키지는 `tools/net10.0`만 포함해 .NET 8 SDK에서 설치 불가. 9.1.0.7988은 `tools/net8.0`을 포함하며 설치 및 `--version` 실행 성공 | `ILSPYCMD_VER=9.1.0.7988`로 고정하고 빌드 중 실제 버전 검사 |
 | flatter | upstream 설치 문서의 필수 패키지에 `libopenblas-dev`가 있으며, 기존 실패는 CMake의 `Could NOT find BLAS` | `libopenblas-dev` 추가, 검증한 커밋 `d2b8026f29b4a69e987b15d4b240f8a5053275d3` 고정, `flatter -h` 검사 |
@@ -55,6 +55,29 @@ GoReSym 3.4는 기존의 버전 포함 tarball 대신 `GoReSym-linux.zip`을 배
 | 오프라인 자산 실패 처리 | rockyou 아카이브 부재와 Volatility 심볼 다운로드 실패가 기존에는 성공으로 처리될 수 있었음 | 필수 아카이브 존재를 검사하고 세 플랫폼 심볼 중 하나라도 실패하면 빌드 실패 |
 | rockyou 변형 | SecLists에는 `rockyou-withcount.txt.tar.gz`와 일반 `rockyou.txt.tar.gz`가 함께 있어 첫 glob 결과가 풀이 도구가 기대하는 형식과 다를 수 있음 | 일반 `rockyou.txt`를 명시적으로 추출하고 count 포함 변형은 제거 |
 | Volatility 심볼 전송 | 839,727,133-byte Windows ZIP 전송이 중간 reset으로 끊기는 것을 실제 재현 | BuildKit cache에 부분 파일을 보존하고 Range 재개, 저속 연결 중단, 재시도, 세 ZIP의 `unzip -t` 검증을 모두 강제 |
+
+## Git/source 입력 고정
+
+release rebuild가 upstream HEAD 이동에 따라 달라지지 않도록 기존 live
+clone/raw URL을 다음 commit으로 고정했다.
+
+| source | commit |
+|---|---|
+| SecLists | `aeb36e9df937d1b77042e5667780e8156cd419f7` |
+| libc-database | `291b0ebf126de9961cd2f8dd1cea2654c57a594a` |
+| vmlinux-to-elf | `19683fb95b29cd31362d49e6f48ab8368f96cbdf` |
+| Linux `extract-vmlinux` | `8ba098e6b6ff0db8edf28528d1552be261af30d4`, file SHA-256 `aacb6bb09af227a6cf508f5283458f001722a39abd9c4cfb026bc97c31624910` |
+| pycdc | `b4289760970dbc399684f1e155ec6d1ea1cc787e` |
+| pyinstxtractor | `815d31cf26bc71e62f851b2e549452e7b7c9dd98`, file SHA-256 `94e0b6c9d5151bbeefc7e7452e96e24b396c2dbfcb0348e5f12c4c0865fefe58` |
+| RsaCtfTool | `7c98848f1945de3e67a420871e8672f5ad9aa5d5` |
+| CADO-NFS | `d67f463a8e5d2f4ab79cd114441b2cf982dc0da7` |
+| John jumbo | `94caf43756b1f13c7e3829ff848df344ea755cac` |
+| jwt_tool | `3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b` |
+| PHPGGC | `f8aebde3a1abb88b02042fd12a71b4c61d6cfe2c` |
+
+`dwarf2json`은 dead `latest` ARG를 제거하고 official v0.9.0 amd64 asset을
+SHA-256 `e2e75ba5bc9c22bc38a48edffbb050456d089d54998d54f46cb580223d9fbc6b`
+로 검증한다.
 
 ## 기능 공백 보강 검증
 
@@ -88,6 +111,63 @@ PySAT의 두 backend는 import 성공만으로 준비 완료로 보지 않고 ca
 probe마다 작은 SAT/UNSAT 쌍을 실제로 푼다. CryptoMiniSat도 `--version` 대신
 고정 DIMACS를 stdin으로 풀어 `s SATISFIABLE`과 표준 SAT 종료 코드 10을 함께
 검사한다.
+
+## Forensic/Misc 기능 preflight와 공급원 고정
+
+2026-07-31에 기존 `--version`/파일 선두 magic 검사를 실제 parser 작업으로
+교체했다. 모든 probe는 네트워크 없이, operator stdin을 비활성화하고, 자식별
+4초 제한과 stdout/stderr 스트림별 8 MiB 제한으로 실행된다. EWF probe만
+operator 입력이 아닌 코드에 고정된 32 KiB 검증 바이트를 파이프로 전달한다.
+probe parent가 외부 SIGTERM/SIGINT를 받으면 detached child process group을
+SIGKILL하고 `wait()`한 뒤 종료한다. managed command 상한은 EWF의 세 단계
+내부 상한보다 큰 16초, image integration wrapper는 20초+2초 kill-after다.
+
+| capability | 기능 smoke |
+|---|---|
+| Volatility 3 | `frameworkinfo.FrameworkInfo` plugin을 실제 구성·실행해 render grid를 생성 |
+| Volatility symbols | build에서 Windows/Linux/macOS ZIP 전체 SHA-256·ZIP CRC를 확인하고 attestation 생성. runtime은 attestation, exact size/central-directory 수를 확인한 뒤 각 archive의 대표 `.json.xz`를 해제·JSON 파싱 |
+| SleuthKit/E01 | 즉석 ext2를 `fls`로 파싱하고, 32 KiB raw를 E01로 획득한 뒤 `ewfinfo`/`ewfverify` 수행 |
+| tshark/Zeek | 고정 DNS PCAP을 각각 해석해 `ctfos.local` query 확인 |
+| OCR | pinned `eng`/`kor`/`kor_vert` traineddata digest를 확인하고 실제 영문 및 Nanum 한글 이미지를 생성해 `eng`/`kor` OCR 결과 확인 |
+| HWP | pyhwp upstream의 고정 `charshape.hwp`를 `hwp5txt`로 파싱하고 예상 한글 내용 확인 |
+| steg/audio | StegSeek embed→wordlist crack, zsteg LSB extraction, ffmpeg PCM 변환, SoX -3 dB RMS gain 비율 검증, QR→zbar decode |
+
+재빌드 변동을 막기 위해 다음 값을 실제 설치 이미지, PyPI JSON, GitHub API와
+upstream 파일로 확인해 고정했다.
+
+- `volatility3==2.28.0`, `pyhwp==0.1b15`, `olefile==0.47`,
+  `chardet==7.4.3`, `six==1.17.0`
+- Zeek official source `8.2.1`, SHA-256
+  `a8067c75cc89bef4b58019230434a90073671a7cabfcf7ac616ac872a40a2edd`
+- StegSeek v0.6 commit
+  `0e10a674b326298c5d51af8f2f7219ccac45e123`
+- zsteg `0.2.14`와 tag commit
+  `b75b578ea13ed207561a46b8620b843c0a894422`
+- pyhwp fixture commit
+  `83239f0d3bdf438b2c9f7dcff455a6e841154a39`, SHA-256
+  `8eb333ab110db6f91d7e426d507d41ca09cacd4d40d945188b5ec40663d7576b`
+- Volatility symbol SHA-256:
+  Windows `231d69735b9a5482b16bdbf1ec356e0a95574c44079e68dfb02ebddb34d55f3e`,
+  Linux `58bb7da2ed1e491ce922d04a59881d201e233b5605c9fd5a7f0c08ee528253c6`,
+  macOS `fd12c8338724b175b0c5765af3313328b700ad53de4a00b4aa50e9a8bcef9129`
+- Ubuntu Noble Tesseract `5.3.4-1build5`, language packages
+  `1:4.1.0-2`; traineddata SHA-256:
+  `eng` `7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2`,
+  `kor` `6b85e11d9bbf07863b97b3523b1b112844c43e713df8b66418a081fd1060b3b2`,
+  `kor_vert`
+  `c28f19dee36927baba5215fb793a3c00fff3ef2cfbcaa100122401d8f4374869`
+
+이는 위 항목의 top-level 재현성을 높이는 고정이며 전체 apt/Python/Ruby
+전이 의존성까지 byte-for-byte 결정적이라는 주장은 아니다. 실제 대회
+release 경계는 최종 로컬 image ID를 다시 고정하고 exact-ID smoke와 doctor를
+통과시키는 절차다.
+
+Volatility runtime probe는 저자원 환경에서 매번 약 884 MiB를 다시 해시하지
+않는다. 전체 archive SHA-256과 `unzip -t`는 build에서 강제하고, runtime은
+그 결과로 생성된 exact `SHA256SUMS`, archive 크기/central directory와 대표
+symbol parser 작업을 검사한다. 이 검사는 임의의 mutable archive를 신뢰하는
+계약이 아니라 위 release 절차의 content-addressed exact image ID 무결성을
+전제로 한다.
 
 ## PyTorch CUDA 채널
 
