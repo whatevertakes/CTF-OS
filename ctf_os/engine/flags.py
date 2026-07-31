@@ -20,6 +20,7 @@ from ctf_os.candidates import (
     FlagNotificationError,
     candidate_value_is_valid,
     flag_notification_error,
+    looks_like_generic_code_noise,
 )
 from ctf_os.terminal import terminal_safe
 
@@ -38,67 +39,6 @@ _PROOF_LIVE_ATTEMPT_DIRECTORY = re.compile(
     r"clean-[0-9a-f]{12}-[A-Za-z0-9_]{1,64}"
 )
 _PROOF_FINAL_ATTEMPT_DIRECTORY = re.compile(r"clean-[0-9a-f]{12}")
-_BRACE_CANDIDATE = re.compile(
-    r"(?P<prefix>[A-Za-z_$][A-Za-z0-9_$.-]{0,63})"
-    r"\{(?P<inner>[^{}\r\n]{1,512})\}"
-)
-_CODE_SOURCE = re.compile(
-    r"(?i)(?:^|[/\\:])[^/\\:\s?#]+\."
-    r"(?:css|js|mjs|cjs|map)(?:$|[\s?#:])"
-)
-_PRINTF_PLACEHOLDER = re.compile(
-    r"%(?:[-+#0 ']*\d*(?:\.\d+)?(?:hh|h|ll|l|j|z|t|L)?"
-    r"[diuoxXfFeEgGaAcspn%])"
-)
-_JS_OBJECT_MEMBER = re.compile(
-    r"(?:^|,)\s*[A-Za-z_$][A-Za-z0-9_$]*\s*:"
-)
-_CSS_DECLARATION = re.compile(
-    r"(?:^|;)\s*[-A-Za-z][A-Za-z0-9-]*\s*:"
-)
-_HTML_STYLE_PREFIXES = frozenset(
-    {
-        "a",
-        "body",
-        "button",
-        "div",
-        "form",
-        "html",
-        "img",
-        "input",
-        "label",
-        "li",
-        "main",
-        "nav",
-        "p",
-        "pre",
-        "section",
-        "select",
-        "span",
-        "style",
-        "table",
-        "td",
-        "textarea",
-        "th",
-        "tr",
-        "ul",
-    }
-)
-_JS_BLOCK_PREFIXES = frozenset(
-    {
-        "catch",
-        "class",
-        "else",
-        "finally",
-        "for",
-        "function",
-        "if",
-        "return",
-        "switch",
-        "try",
-        "while",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,78 +46,6 @@ class DetectedFlag:
     value: str
     source: str
     observed_at: str
-
-
-def _inside_markup_code(text: str, position: int) -> bool:
-    """Return whether ``position`` is inside a visible script/style block.
-
-    This is deliberately a bounded lexical check rather than an HTML parser.
-    Challenge output is untrusted and may be malformed.  False negatives only
-    retain a noisy candidate; false positives are avoided by requiring an open
-    tag after the most recent matching close tag.
-    """
-
-    prefix = text[:position].casefold()
-    for tag in ("script", "style"):
-        opened = prefix.rfind(f"<{tag}")
-        closed = prefix.rfind(f"</{tag}")
-        if opened > closed:
-            terminator = prefix.find(">", opened)
-            if terminator != -1 and terminator < position:
-                return True
-    return False
-
-
-def _looks_like_generic_code_noise(
-    value: str,
-    *,
-    source: str,
-    context: str,
-    position: int,
-) -> bool:
-    """Recognize high-confidence CSS/JS/placeholder false positives.
-
-    The caller enables this only for the generic runtime fallback.  Exact
-    challenge and contest formats never pass through this filter.
-    """
-
-    parsed = _BRACE_CANDIDATE.fullmatch(value)
-    if parsed is None:
-        return False
-    prefix = parsed.group("prefix")
-    inner = parsed.group("inner")
-    folded_prefix = prefix.casefold()
-
-    # Common minified-source artifacts seen in field records.
-    if re.fullmatch(r"u[0-9a-fA-F]{4,8}", prefix):
-        return True
-    if _PRINTF_PLACEHOLDER.fullmatch(inner.strip()) is not None:
-        return True
-
-    code_source = _CODE_SOURCE.search(source) is not None
-    markup_code = _inside_markup_code(context, position)
-    css_declarations = len(_CSS_DECLARATION.findall(inner))
-    js_members = len(_JS_OBJECT_MEMBER.findall(inner))
-
-    if (
-        css_declarations >= 2
-        and (
-            code_source
-            or markup_code
-            or folded_prefix in _HTML_STYLE_PREFIXES
-        )
-    ):
-        return True
-    if (
-        js_members >= 2
-        and (
-            code_source
-            or markup_code
-            or folded_prefix in _JS_BLOCK_PREFIXES
-        )
-    ):
-        return True
-    return False
 
 
 def _safe_terminal_text(value: str) -> str:
@@ -296,7 +164,7 @@ class FlagDetector:
                 for match in pattern.finditer(combined):
                     if (
                         self._suppress_generic_code_noise
-                        and _looks_like_generic_code_noise(
+                        and looks_like_generic_code_noise(
                             match.group(0),
                             source=source,
                             context=combined,

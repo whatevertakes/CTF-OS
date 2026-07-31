@@ -1569,6 +1569,35 @@ class EventTests(unittest.TestCase):
         )
         self.assertEqual(accumulator.detector.suppressed_matches, 0)
 
+    def test_event_flag_scanner_suppresses_generic_code_noise_only_in_text(
+        self,
+    ) -> None:
+        detector = EventFlagDetector(
+            suppress_generic_code_noise=True,
+        )
+
+        scanned = detector.scan(
+            "body{color:#222;margin:0} "
+            "return{file:!1,glob:!1,sortOrder:!1} "
+            "DH{%s} DH{real_candidate}",
+            "item.completed",
+        )
+        explicit = detector.report_candidate(
+            "body{color:#222;margin:0}",
+            "turn.completed",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in scanned],
+            ["DH{real_candidate}"],
+        )
+        self.assertIsNotNone(explicit)
+        self.assertEqual(
+            explicit.value,
+            "body{color:#222;margin:0}",
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 3)
+
     def test_flag_callback_failure_releases_failed_and_unattempted_values(
         self,
     ) -> None:

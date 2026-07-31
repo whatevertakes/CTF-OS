@@ -11,6 +11,7 @@ from ctf_os.candidates import (
     FlagNotificationError,
     candidate_value_is_valid,
     flag_notification_error,
+    looks_like_generic_code_noise,
 )
 
 DEFAULT_FLAG_PATTERNS = (
@@ -78,6 +79,7 @@ class FlagDetector:
         *,
         candidate_limit: int = DEFAULT_FLAG_CANDIDATE_LIMIT,
         candidate_chars_limit: int = DEFAULT_FLAG_CANDIDATE_CHARS_LIMIT,
+        suppress_generic_code_noise: bool = False,
     ) -> None:
         compiled = tuple(re.compile(pattern) for pattern in patterns)
         if not compiled:
@@ -90,8 +92,10 @@ class FlagDetector:
         self._seen: set[str] = set()
         self._candidate_limit = candidate_limit
         self._candidate_chars_limit = candidate_chars_limit
+        self._suppress_generic_code_noise = suppress_generic_code_noise
         self.accepted_chars = 0
         self.suppressed_matches = 0
+        self.code_noise_suppressed_matches = 0
 
     def _accept(
         self,
@@ -119,6 +123,18 @@ class FlagDetector:
         for text in _string_values(value):
             for pattern in self._patterns:
                 for match in pattern.finditer(text):
+                    if (
+                        self._suppress_generic_code_noise
+                        and looks_like_generic_code_noise(
+                            match.group(0),
+                            source=source,
+                            context=text,
+                            position=match.start(),
+                        )
+                    ):
+                        self.suppressed_matches += 1
+                        self.code_noise_suppressed_matches += 1
+                        continue
                     candidate = self._accept(
                         match.group(0),
                         event_type,
