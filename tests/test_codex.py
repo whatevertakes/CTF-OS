@@ -1599,6 +1599,32 @@ class EventTests(unittest.TestCase):
         )
         self.assertEqual(detector.code_noise_suppressed_matches, 3)
 
+    def test_event_code_noise_does_not_hide_later_real_candidate(self) -> None:
+        detector = EventFlagDetector(
+            candidate_limit=1,
+            suppress_generic_code_noise=True,
+        )
+
+        scanned = detector.scan(
+            ".disabled{color:#ccc} "
+            "return{file:!1} "
+            "function{return result=1} "
+            "KCTF{color:red;margin:0}",
+            "item.completed",
+            "/challenge/assets/site.css",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in scanned],
+            ["KCTF{color:red;margin:0}"],
+        )
+        self.assertEqual(
+            detector.accepted_chars,
+            len("KCTF{color:red;margin:0}"),
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 3)
+        self.assertEqual(detector.suppressed_matches, 3)
+
     def test_flag_callback_failure_releases_failed_and_unattempted_values(
         self,
     ) -> None:

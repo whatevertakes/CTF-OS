@@ -13,17 +13,39 @@ _BRACE_CANDIDATE = re.compile(
 )
 _CODE_SOURCE = re.compile(
     r"(?i)(?:^|[/\\:])[^/\\:\s?#]+\."
-    r"(?:css|js|mjs|cjs|map)(?:$|[\s?#:])"
+    r"(?P<extension>css|js|mjs|cjs|map)(?:$|[\s?#:])"
 )
 _PRINTF_PLACEHOLDER = re.compile(
     r"%(?:[-+#0 ']*\d*(?:\.\d+)?(?:hh|h|ll|l|j|z|t|L)?"
     r"[diuoxXfFeEgGaAcspn%])"
 )
 _JS_OBJECT_MEMBER = re.compile(
-    r"(?:^|,)\s*[A-Za-z_$][A-Za-z0-9_$]*\s*:"
+    r"""(?:^|,)\s*(?:
+        [A-Za-z_$][A-Za-z0-9_$]*
+        |[0-9]+
+        |"[^"\\\r\n]*(?:\\.[^"\\\r\n]*)*"
+        |'[^'\\\r\n]*(?:\\.[^'\\\r\n]*)*'
+    )\s*:""",
+    re.VERBOSE,
+)
+_JS_SHORTHAND_MEMBERS = re.compile(
+    r"\s*[A-Za-z_$][A-Za-z0-9_$]*"
+    r"(?:\s*,\s*[A-Za-z_$][A-Za-z0-9_$]*)+\s*"
+)
+_JS_STATEMENT_SIGNAL = re.compile(
+    r"""(?:^|;)\s*(?:
+        (?:const|let|var)\s+[A-Za-z_$]
+        |(?:return|throw|break|continue)\b
+        |[A-Za-z_$][A-Za-z0-9_$.\[\]]*\s*
+          (?:=>|={1,3}|[+\-*/%&|^]=|\+\+|--)
+    )""",
+    re.VERBOSE,
 )
 _CSS_DECLARATION = re.compile(
-    r"(?:^|;)\s*[-A-Za-z][A-Za-z0-9-]*\s*:"
+    r"\s*(?:--)?[-A-Za-z_][A-Za-z0-9_-]*\s*:\s*\S(?:[^;]*)\s*"
+)
+_STRONG_FLAG_PREFIX_SHAPE = re.compile(
+    r"(?:[A-Z][A-Z0-9_]{1,31}|[A-Za-z0-9_]*(?i:ctf|flag)[A-Za-z0-9_]*)"
 )
 _HTML_STYLE_PREFIXES = frozenset(
     {
@@ -68,6 +90,22 @@ _JS_BLOCK_PREFIXES = frozenset(
         "while",
     }
 )
+_CSS_PSEUDO_PREFIXES = frozenset(
+    {
+        "active",
+        "after",
+        "before",
+        "checked",
+        "disabled",
+        "enabled",
+        "focus",
+        "hover",
+        "link",
+        "root",
+        "target",
+        "visited",
+    }
+)
 
 
 class FlagNotificationError(RuntimeError):
@@ -99,18 +137,82 @@ def candidate_value_is_valid(value: object) -> bool:
     )
 
 
-def _inside_markup_code(text: str, position: int) -> bool:
-    """Return whether ``position`` is inside a visible script/style block."""
+def _markup_code_kind(text: str, position: int) -> str | None:
+    """Return the nearest open ``script``/``style`` element, if visible."""
 
     prefix = text[:position].casefold()
+    nearest: tuple[int, str] | None = None
     for tag in ("script", "style"):
         opened = prefix.rfind(f"<{tag}")
         closed = prefix.rfind(f"</{tag}")
         if opened > closed:
-            terminator = prefix.find(">", opened)
-            if terminator != -1 and terminator < position:
-                return True
-    return False
+            boundary = opened + len(tag) + 1
+            if (
+                boundary < len(prefix)
+                and prefix[boundary] not in " \t\r\n/>"
+            ):
+                continue
+            terminator = prefix.find(">", boundary)
+            if (
+                terminator != -1
+                and (nearest is None or opened > nearest[0])
+            ):
+                nearest = (opened, tag)
+    return nearest[1] if nearest is not None else None
+
+
+def _code_source_kind(source: str) -> str | None:
+    match = _CODE_SOURCE.search(source)
+    if match is None:
+        return None
+    extension = match.group("extension").casefold()
+    if extension == "css":
+        return "style"
+    if extension == "map":
+        return "map"
+    return "script"
+
+
+def _css_declaration_count(inner: str) -> int:
+    """Count a complete, flat CSS declaration list or return zero."""
+
+    parts = inner.split(";")
+    if parts and not parts[-1].strip():
+        parts.pop()
+    if not parts or any(
+        _CSS_DECLARATION.fullmatch(part) is None for part in parts
+    ):
+        return 0
+    return len(parts)
+
+
+def _has_css_selector_signal(context: str, position: int) -> bool:
+    """Recognize the selector punctuation omitted by the generic match."""
+
+    return position > 0 and context[position - 1] in ".#"
+
+
+def _has_strong_flag_prefix_shape(prefix: str) -> bool:
+    """Protect arbitrary acronym/CTF-shaped prefixes without an allowlist."""
+
+    return _STRONG_FLAG_PREFIX_SHAPE.fullmatch(prefix) is not None
+
+
+def _is_complete_quoted_literal(
+    value: str,
+    *,
+    context: str,
+    position: int,
+) -> bool:
+    """Return whether the exact match is visibly enclosed by one quote pair."""
+
+    end = position + len(value)
+    return (
+        position > 0
+        and end < len(context)
+        and context[position - 1] in "\"'`"
+        and context[end] == context[position - 1]
+    )
 
 
 def looks_like_generic_code_noise(
@@ -139,27 +241,46 @@ def looks_like_generic_code_noise(
     if _PRINTF_PLACEHOLDER.fullmatch(inner.strip()) is not None:
         return True
 
-    code_source = _CODE_SOURCE.search(source) is not None
-    markup_code = _inside_markup_code(context, position)
-    css_declarations = len(_CSS_DECLARATION.findall(inner))
+    # A strong but non-enumerated flag prefix is better evidence than
+    # surrounding code. Unicode-escape and printf artifacts were already
+    # rejected above; arbitrary acronym prefixes remain visible.
+    if _has_strong_flag_prefix_shape(prefix) or _is_complete_quoted_literal(
+        value,
+        context=context,
+        position=position,
+    ):
+        return False
+
+    source_kind = _code_source_kind(source)
+    markup_kind = _markup_code_kind(context, position)
+    css_declarations = _css_declaration_count(inner)
     js_members = len(_JS_OBJECT_MEMBER.findall(inner))
 
     if (
-        css_declarations >= 2
+        css_declarations >= 1
         and (
-            code_source
-            or markup_code
+            source_kind in {"style", "map"}
+            or markup_kind == "style"
+            or _has_css_selector_signal(context, position)
             or folded_prefix in _HTML_STYLE_PREFIXES
+            or folded_prefix in _CSS_PSEUDO_PREFIXES
         )
     ):
         return True
     if (
-        js_members >= 2
+        folded_prefix in _JS_BLOCK_PREFIXES
         and (
-            code_source
-            or markup_code
-            or folded_prefix in _JS_BLOCK_PREFIXES
+            js_members >= 1
+            or _JS_SHORTHAND_MEMBERS.fullmatch(inner) is not None
+            or _JS_STATEMENT_SIGNAL.search(inner) is not None
         )
+    ):
+        return True
+    if (
+        source_kind in {"script", "map"} or markup_kind == "script"
+    ) and (
+        js_members >= 2
+        or _JS_SHORTHAND_MEMBERS.fullmatch(inner) is not None
     ):
         return True
     return False

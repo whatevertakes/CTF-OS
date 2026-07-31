@@ -99,7 +99,8 @@ class FlagDetectorTests(unittest.TestCase):
 
         found = detector.feed(
             "body{color:#222;font:normal 13px arial;"
-            "margin:0} return{file:!1,glob:!1,sortOrder:!1} "
+            "margin:0} .disabled{color:#ccc} "
+            "return{file:!1,glob:!1,sortOrder:!1} "
             "u003d{docid} DH{%s} DH{real_candidate}",
             source="browser:stdout",
         )
@@ -112,7 +113,86 @@ class FlagDetectorTests(unittest.TestCase):
             [candidate.value for candidate in candidates],
             ["DH{real_candidate}"],
         )
+        self.assertEqual(detector.code_noise_suppressed_matches, 5)
+
+    def test_generic_code_noise_does_not_spend_candidate_quota(self) -> None:
+        candidates: list[DetectedFlag] = []
+        detector = FlagDetector(
+            (r"\b[A-Za-z0-9_]{2,32}\{[^{}\r\n]{1,512}\}",),
+            callback=candidates.append,
+            candidate_limit=1,
+            suppress_generic_code_noise=True,
+        )
+
+        detector.feed(
+            ".disabled{color:#ccc} "
+            "return{file:!1} "
+            "function{return result=1} "
+            "return{file,glob}",
+            source="browser:stdout",
+        )
+        found = detector.feed(
+            "KCTF{color:red;margin:0}",
+            source="/challenge/assets/site.css",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in found],
+            ["KCTF{color:red;margin:0}"],
+        )
+        self.assertEqual(candidates, list(found))
+        self.assertEqual(
+            detector.seen,
+            frozenset({"KCTF{color:red;margin:0}"}),
+        )
         self.assertEqual(detector.code_noise_suppressed_matches, 4)
+        self.assertEqual(detector.suppressed_matches, 4)
+
+    def test_generic_code_noise_keeps_ambiguous_and_flag_shaped_values(
+        self,
+    ) -> None:
+        candidates: list[DetectedFlag] = []
+        detector = FlagDetector(
+            (r"\b[A-Za-z0-9_]{2,32}\{[^{}\r\n]{1,512}\}",),
+            callback=candidates.append,
+            suppress_generic_code_noise=True,
+        )
+
+        detector.feed(
+            "<scripture>config{alpha:1,beta:2}</scripture> "
+            "<script>TEAM{alpha:1,beta:2}</script> "
+            "return{not_code} acsc{real_candidate} "
+            "flag:acsc{color:red}",
+            source="response.html",
+        )
+        detector.feed(
+            "<script>NYU{alpha:1,beta:2} "
+            "ACSC{file:!1,glob:!1} "
+            "QZX2026{first:1,second:2} "
+            "'zer0pts{alpha:1,beta:2}'</script>",
+            source="response.html",
+        )
+        detector.feed(
+            "LINECTF{color:red;margin:0}",
+            source="/challenge/assets/site.css",
+        )
+
+        self.assertEqual(
+            [candidate.value for candidate in candidates],
+            [
+                "config{alpha:1,beta:2}",
+                "TEAM{alpha:1,beta:2}",
+                "return{not_code}",
+                "acsc{real_candidate}",
+                "acsc{color:red}",
+                "NYU{alpha:1,beta:2}",
+                "ACSC{file:!1,glob:!1}",
+                "QZX2026{first:1,second:2}",
+                "zer0pts{alpha:1,beta:2}",
+                "LINECTF{color:red;margin:0}",
+            ],
+        )
+        self.assertEqual(detector.code_noise_suppressed_matches, 0)
 
     def test_generic_code_noise_filter_uses_markup_and_source_context(
         self,
