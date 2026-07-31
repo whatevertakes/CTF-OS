@@ -39,7 +39,7 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
         self.assertEqual(
             release.RELEASE_IMAGE_DIGEST,
             "sha256:"
-            "f39d2216ddaa93fae3134014b25be0609096bacd8648b1621121787db6196338",
+            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
         )
         self.assertIn(
             "engine.preissue_managed_crypto_oracle(",
