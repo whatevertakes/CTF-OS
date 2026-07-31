@@ -915,23 +915,38 @@ class RemoteCommandStartLimiterTests(unittest.TestCase):
         )
         limiter.wait_for_start("example.test")
         cancelled = threading.Event()
+        waiter_errors: list[BaseException] = []
 
         def occupy_queue() -> None:
-            with self.assertRaises(RemoteCommandStartCancelled):
+            try:
                 limiter.wait_for_start(
                     "example.test",
-                    timeout=2,
+                    timeout=10,
                     cancel_event=cancelled,
                 )
+            except BaseException as error:
+                waiter_errors.append(error)
 
         waiter = threading.Thread(target=occupy_queue)
         waiter.start()
         self._wait_for_waiters(limiter, "example.test", 1)
-        with self.assertRaises(RemoteLimiterQueueFull):
-            limiter.wait_for_start("example.test", timeout=0)
-        cancelled.set()
-        waiter.join(timeout=2)
+        try:
+            # A zero timeout intentionally performs only one nonblocking lock
+            # attempt, so it may report StartTimeout while the existing
+            # waiter briefly owns the state lock.  Give this capacity probe a
+            # bounded lock-acquisition window so it deterministically reaches
+            # the already-full FIFO instead of testing lock scheduling.
+            with self.assertRaises(RemoteLimiterQueueFull):
+                limiter.wait_for_start("example.test", timeout=2)
+        finally:
+            cancelled.set()
+            waiter.join(timeout=3)
         self.assertFalse(waiter.is_alive())
+        self.assertEqual(len(waiter_errors), 1)
+        self.assertIsInstance(
+            waiter_errors[0],
+            RemoteCommandStartCancelled,
+        )
         self.assertEqual(limiter.snapshot("example.test").waiting, 0)
 
         oversized = limiter.state_path("oversized.example")
