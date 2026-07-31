@@ -15606,6 +15606,26 @@ class ChallengeState:
             )
 
             errors.extend(rev_acceptance_state_graph_errors(self))
+
+            # Hash-bound PE/JVM/.NET/WASM/native/QEMU accepted-input evidence
+            # owns one aggregate plus six single-receipt clean-proof records.
+            # Import lazily because the executor consumes these model types;
+            # every persistence validation still reconstructs the exact
+            # candidate-free graph and rejects copied or rebound markers.
+            from ctf_os.engine.rev_runtime_proof import (
+                rev_runtime_proof_state_errors,
+            )
+
+            errors.extend(rev_runtime_proof_state_errors(self))
+
+            # A consumed transcript preissue and its bounded recovery
+            # reservation are one authority graph. Persistence rejects
+            # consumed-only state and orphan CREATED replay runs.
+            from ctf_os.engine.data_transcript_state import (
+                data_transcript_state_errors,
+            )
+
+            errors.extend(data_transcript_state_errors(self))
         if errors:
             raise ModelValidationError("; ".join(errors))
 

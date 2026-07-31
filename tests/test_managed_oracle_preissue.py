@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import stat
 import tempfile
 import threading
 import unittest
@@ -16,14 +17,24 @@ from unittest import mock
 from ctf_os import cli
 from ctf_os.adapters import get_adapter
 from ctf_os.codex import Role
+from ctf_os.contracts.data_transcript_v1 import (
+    DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT,
+    data_transcript_v1_reset_commitment_sha256,
+)
 from ctf_os.engine.challenge import ChallengeEngine, EngineError
 from ctf_os.engine.context_pack import build_context_pack
+from ctf_os.engine.data_transcript_hotpath import (
+    DATA_TRANSCRIPT_HOTPATH_PROTOCOL,
+    DATA_TRANSCRIPT_STATE_KEY,
+)
 from ctf_os.engine.managed_oracle_preissue import (
     MANAGED_ORACLE_PREISSUE_CRYPTO,
+    MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
     MANAGED_ORACLE_PREISSUE_STATE_KEY,
 )
 from ctf_os.live_broker import inspect_state
 from ctf_os.models import (
+    ArtifactReference,
     CandidateStatus,
     Experiment,
     ExperimentKind,
@@ -55,6 +66,19 @@ class ManagedOraclePreissueTests(unittest.TestCase):
     ) -> tuple[str, str]:
         builder_run_id = "R-managed-preissue-builder"
         experiment_id = "E-managed-preissue-gate"
+        if base_revision is None:
+            # Model the real managed lifecycle: an issued preissue is
+            # durably visible before the Builder takes its base snapshot.
+            engine.store.update(
+                identity,
+                lambda state: state.extra.update(
+                    {
+                        "managed_preissue_builder_barrier_revision": (
+                            state.revision + 1
+                        )
+                    }
+                ),
+            )
 
         def seed(state):
             state.runs.append(
@@ -238,6 +262,137 @@ class ManagedOraclePreissueTests(unittest.TestCase):
         finally:
             case.tearDown()
 
+    def test_transcript_preissue_seals_peer_and_hides_private_inputs(
+        self,
+    ) -> None:
+        case = crypto_support.CryptoEngineProofTests(
+            "test_six_clean_bound_runs_are_required_before_promotion"
+        )
+        case.setUp()
+        try:
+            engine, _sandbox = case._engine()
+            marker = b"operator-transcript-secret-6f3c"
+            with tempfile.TemporaryDirectory() as operator_temp:
+                root = Path(operator_temp)
+                peer = root / "peer.py"
+                peer.write_bytes(
+                    b"#!/usr/bin/python3\n# " + marker + b"\n"
+                )
+                peer.chmod(0o700)
+                peer_data = root / "peer-data.bin"
+                peer_data.write_bytes(b"")
+                peer_sha256 = hashlib.sha256(
+                    peer.read_bytes()
+                ).hexdigest()
+                peer_data_sha256 = hashlib.sha256(b"").hexdigest()
+                host_paths = (str(peer), str(peer_data))
+
+                state, record = (
+                    engine.preissue_managed_crypto_transcript(
+                        case.identity,
+                        peer_path=peer,
+                        peer_data_path=peer_data,
+                    )
+                )
+
+            self.assertEqual(
+                record["kind"],
+                MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
+            )
+            expected_reset = (
+                data_transcript_v1_reset_commitment_sha256(
+                    category="crypto",
+                    peer_sha256=peer_sha256,
+                    peer_size_bytes=len(
+                        b"#!/usr/bin/python3\n# " + marker + b"\n"
+                    ),
+                    peer_data_sha256=peer_data_sha256,
+                    peer_data_size_bytes=0,
+                )
+            )
+            self.assertEqual(
+                record["reset_commitment_sha256"],
+                expected_reset,
+            )
+            public_json = json.dumps(record, sort_keys=True)
+            for forbidden in (
+                *host_paths,
+                peer_sha256,
+                peer_data_sha256,
+                marker.decode("ascii"),
+            ):
+                self.assertNotIn(forbidden, public_json)
+
+            inputs = [
+                item
+                for item in state.artifacts
+                if item.extra.get("preissue_id")
+                == record["preissue_id"]
+                and item.extra.get("kind")
+                == "managed_oracle_preissue_input"
+            ]
+            self.assertEqual(
+                {
+                    item.extra.get("purpose")
+                    for item in inputs
+                },
+                {"transcript_peer", "transcript_peer_data"},
+            )
+            paths = engine.store.challenge_paths(case.identity)
+            by_purpose = {
+                str(item.extra["purpose"]): item for item in inputs
+            }
+            self.assertEqual(
+                stat.S_IMODE(
+                    (
+                        paths.root
+                        / by_purpose["transcript_peer"].path
+                    ).stat().st_mode
+                ),
+                0o500,
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    (
+                        paths.root
+                        / by_purpose["transcript_peer_data"].path
+                    ).stat().st_mode
+                ),
+                0o400,
+            )
+            self.assertEqual(
+                by_purpose["transcript_peer_data"].size,
+                0,
+            )
+            self.assertTrue(
+                all(
+                    item.extra.get("context_visibility")
+                    == "engine_private"
+                    for item in inputs
+                )
+            )
+            context = build_context_pack(
+                state,
+                get_adapter(state.category),
+                state_path=paths.state,
+                role=Role.BUILDER.value,
+            ).text
+            broker = json.dumps(
+                inspect_state(state, "state"),
+                sort_keys=True,
+            )
+            for forbidden in (
+                *host_paths,
+                peer_sha256,
+                peer_data_sha256,
+                marker.decode("ascii"),
+            ):
+                self.assertNotIn(forbidden, context)
+                self.assertNotIn(forbidden, broker)
+            state.validate()
+        finally:
+            case.tearDown()
+
     def test_managed_raw_crypto_oracle_locator_is_rejected(self) -> None:
         case = crypto_support.CryptoEngineProofTests(
             "test_six_clean_bound_runs_are_required_before_promotion"
@@ -406,42 +561,238 @@ class ManagedOraclePreissueTests(unittest.TestCase):
         finally:
             case.tearDown()
 
-    def test_oracle_issued_after_builder_revision_is_rejected(self) -> None:
+    def test_session_boundary_recovers_crash_left_transcript_reservation(
+        self,
+    ) -> None:
         case = crypto_support.CryptoEngineProofTests(
             "test_six_clean_bound_runs_are_required_before_promotion"
         )
         case.setUp()
         try:
-            engine, sandbox = case._engine()
-            _state, record = self._preissue_crypto(engine, case.identity)
-            builder_run_id, experiment_id = self._seed_running_builder(
-                engine,
-                case.identity,
-                base_revision=int(record["issue_revision"]) - 1,
-            )
-            with self.assertRaisesRegex(
-                EngineError,
-                "not issued before",
-            ):
-                engine.prove_crypto_metamorphic_candidate(
-                    case.identity,
-                    "C-crypto-candidate",
-                    solver_locator="solver.py",
-                    original_parameters_locator="original.json",
-                    oracle_preissue_id=str(record["preissue_id"]),
-                    _session_owned=True,
-                    _managed_builder_run_id=builder_run_id,
-                    _managed_experiment_id=experiment_id,
+            engine, _sandbox = case._engine()
+            with tempfile.TemporaryDirectory() as operator_temp:
+                operator_root = Path(operator_temp)
+                peer = operator_root / "peer"
+                peer.write_bytes(b"#!/bin/sh\nexit 0\n")
+                peer.chmod(0o500)
+                peer_data = operator_root / "peer-data.bin"
+                peer_data.write_bytes(b"recovery-seed")
+                _state, record = (
+                    engine.preissue_managed_crypto_transcript(
+                        case.identity,
+                        peer_path=peer,
+                        peer_data_path=peer_data,
+                    )
                 )
-            self.assertEqual(sandbox.proof_calls, [])
+
+            engine.store.update(
+                case.identity,
+                lambda state: state.extra.update(
+                    {"transcript_recovery_test_epoch": 1}
+                ),
+            )
+            builder_run_id, experiment_id = (
+                self._seed_running_builder(
+                    engine,
+                    case.identity,
+                )
+            )
+            recipe_payload = b'{"data_only":"pinned"}\n'
+            recipe_sha256 = hashlib.sha256(
+                recipe_payload
+            ).hexdigest()
+            recipe_id = "A-transcript-recovery-recipe"
+            recipe_relative = (
+                f"artifacts/snapshots/{recipe_id}.json"
+            )
+            recipe_path = (
+                engine.store.challenge_paths(case.identity).root
+                / recipe_relative
+            )
+            recipe_path.parent.mkdir(parents=True, exist_ok=True)
+            recipe_path.write_bytes(recipe_payload)
+            recipe_path.chmod(0o400)
+
+            def add_recipe(state):
+                state.artifacts.append(
+                    ArtifactReference(
+                        id=recipe_id,
+                        path=recipe_relative,
+                        sha256=recipe_sha256,
+                        source_run_id=builder_run_id,
+                        size=len(recipe_payload),
+                        extra={
+                            "reported_locator": (
+                                "transcript/recipe.json"
+                            )
+                        },
+                    )
+                )
+
+            engine.store.update(case.identity, add_recipe)
+            phases = (
+                ("positive", 1),
+                ("positive", 2),
+                ("positive", 3),
+                ("control", 1),
+                ("control", 2),
+                ("control", 3),
+            )
+            attempt_id = "data-transcript-process-death"
+            reservation = {
+                "attempt_id": attempt_id,
+                "automatic_submission_authorized": False,
+                "candidate_authorized": False,
+                "configuration_epoch": engine.store.load(
+                    case.identity
+                ).configuration_epoch,
+                "contract_fingerprint": (
+                    DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT
+                ),
+                "image_digest": engine.config.runtime.image_digest,
+                "managed_builder_run_id": builder_run_id,
+                "managed_experiment_id": experiment_id,
+                "oracle_preissue_id": record["preissue_id"],
+                "oracle_preissue_sha256": record[
+                    "oracle_seal_sha256"
+                ],
+                "protocol": DATA_TRANSCRIPT_HOTPATH_PROTOCOL,
+                "recipe_artifact_id": recipe_id,
+                "recipe_sha256": recipe_sha256,
+                "recipe_size_bytes": len(recipe_payload),
+                "reset_commitment_sha256": record[
+                    "reset_commitment_sha256"
+                ],
+                "replays": [
+                    {
+                        "artifact_ids": [
+                            f"A-process-death-{position}-{index}"
+                            for index in range(6)
+                        ],
+                        "ordinal": ordinal,
+                        "phase": phase,
+                        "run_id": (
+                            f"data-transcript-process-death-{position}"
+                        ),
+                        "sidecar_artifact_ids": {
+                            "request": (
+                                f"A-process-death-request-{position}"
+                            ),
+                            "result": (
+                                f"A-process-death-result-{position}"
+                            ),
+                            "validation": (
+                                f"A-process-death-validation-{position}"
+                            ),
+                        },
+                    }
+                    for position, (phase, ordinal) in enumerate(
+                        phases,
+                        start=1,
+                    )
+                ],
+                "schema_version": 1,
+                "source_manifest_sha256": engine.store.load(
+                    case.identity
+                ).metadata["source_manifest_sha256"],
+                "status": "reserved",
+                "terminal": False,
+            }
+            engine._consume_managed_oracle_preissue(
+                case.identity,
+                preissue_id=str(record["preissue_id"]),
+                expected_kind=(
+                    MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT
+                ),
+                builder_run_id=builder_run_id,
+                experiment_id=experiment_id,
+                transcript_attempt_id=attempt_id,
+                transcript_reservation=reservation,
+            )
+            orphan_run_id = reservation["replays"][0]["run_id"]
+            orphan_paths = engine.store.create_run(
+                case.identity,
+                run_id=orphan_run_id,
+                request={"kind": "crash_left_transcript"},
+                base_revision=engine.store.load(
+                    case.identity
+                ).revision,
+            )
+            self.assertTrue(orphan_paths.root.is_dir())
+
+            recovered = engine._recover_session_boundary(case.identity)
+            recovered.validate()
+            self.assertFalse(orphan_paths.root.exists())
+            journal = recovered.extra[DATA_TRANSCRIPT_STATE_KEY][
+                attempt_id
+            ]
+            self.assertEqual(journal["status"], "failed")
+            self.assertTrue(journal["terminal"])
+            experiment = next(
+                item
+                for item in recovered.experiments
+                if item.id == experiment_id
+            )
+            self.assertIs(
+                experiment.status,
+                ExperimentStatus.FAILED,
+            )
             self.assertEqual(
-                engine.store.load(case.identity).extra[
+                recovered.extra[
                     MANAGED_ORACLE_PREISSUE_STATE_KEY
                 ][record["preissue_id"]]["status"],
-                "unused",
+                "consumed",
             )
         finally:
             case.tearDown()
+
+    def test_oracle_not_strictly_before_builder_is_rejected(self) -> None:
+        for revision_delta in (0, -1):
+            with self.subTest(revision_delta=revision_delta):
+                case = crypto_support.CryptoEngineProofTests(
+                    "test_six_clean_bound_runs_are_required_before_promotion"
+                )
+                case.setUp()
+                try:
+                    engine, sandbox = case._engine()
+                    _state, record = self._preissue_crypto(
+                        engine, case.identity
+                    )
+                    builder_run_id, experiment_id = (
+                        self._seed_running_builder(
+                            engine,
+                            case.identity,
+                            base_revision=(
+                                int(record["issue_revision"])
+                                + revision_delta
+                            ),
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        EngineError,
+                        "not issued before",
+                    ):
+                        engine.prove_crypto_metamorphic_candidate(
+                            case.identity,
+                            "C-crypto-candidate",
+                            solver_locator="solver.py",
+                            original_parameters_locator="original.json",
+                            oracle_preissue_id=str(
+                                record["preissue_id"]
+                            ),
+                            _session_owned=True,
+                            _managed_builder_run_id=builder_run_id,
+                            _managed_experiment_id=experiment_id,
+                        )
+                    self.assertEqual(sandbox.proof_calls, [])
+                    self.assertEqual(
+                        engine.store.load(case.identity).extra[
+                            MANAGED_ORACLE_PREISSUE_STATE_KEY
+                        ][record["preissue_id"]]["status"],
+                        "unused",
+                    )
+                finally:
+                    case.tearDown()
 
     def test_current_pin_drift_rejects_before_crypto_proof_call(self) -> None:
         for drift in ("image", "configuration_epoch", "source_manifest"):
@@ -964,6 +1315,71 @@ class ManagedOraclePreissueTests(unittest.TestCase):
         self.assertNotIn("variant_parameters", output)
         self.assertNotIn("variant_expected_output", output)
         self.assertNotIn("path", json.dumps(output))
+
+    def test_transcript_preissue_cli_routes_only_public_record(self) -> None:
+        root = Path(self.temporary.name)
+        identity = crypto_support.ChallengeIdentity(
+            "CLI CTF",
+            "crypto",
+            "transcript",
+        )
+        record = {
+            "schema_version": 1,
+            "protocol": "managed_oracle_preissue_v1",
+            "preissue_id": "oracle-transcript-cli",
+            "kind": "crypto_transcript",
+            "status": "unused",
+            "issuer": "operator",
+            "issued_at": "2026-07-31T00:00:00Z",
+            "issue_revision": 4,
+            "configuration_epoch": 1,
+            "source_manifest_sha256": "a" * 64,
+            "image_digest": "sha256:" + "b" * 64,
+            "oracle_seal_sha256": "c" * 64,
+            "reset_commitment_sha256": "d" * 64,
+            "consumed_at": None,
+            "consumed_by_builder_run_id": None,
+            "consumed_by_experiment_id": None,
+        }
+        state = mock.Mock(revision=4)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        arguments = [
+            "managed-oracle-preissue-crypto-transcript",
+            identity.contest_id,
+            identity.category,
+            identity.challenge_id,
+            "--peer",
+            "operator/peer.py",
+            "--peer-data",
+            "operator/seed.bin",
+        ]
+        with (
+            mock.patch.object(
+                ChallengeEngine,
+                "preissue_managed_crypto_transcript",
+                return_value=(state, record),
+            ) as preissue,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = cli.main(arguments, root=root)
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        preissue.assert_called_once_with(
+            identity,
+            peer_path="operator/peer.py",
+            peer_data_path="operator/seed.bin",
+        )
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(
+            output["preissue_id"],
+            "oracle-transcript-cli",
+        )
+        self.assertEqual(output["state_revision"], 4)
+        self.assertNotIn("operator/peer.py", json.dumps(output))
+        self.assertNotIn("operator/seed.bin", json.dumps(output))
+        self.assertNotIn("inputs", output)
 
 
 if __name__ == "__main__":

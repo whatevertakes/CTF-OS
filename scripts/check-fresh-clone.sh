@@ -49,9 +49,11 @@ required=(
   ctf-os-image/scripts/entrypoint.sh
   ctf-os-image/scripts/gen-manifest.sh
   ctf-os-image/templates/README.md
+  ctf-os-image/templates/common/data_transcript.py
   ctf-os-image/templates/pwn/crash_oracle.py
   ctf-os-image/templates/pwn/runtime_snapshot.py
   ctf-os-image/templates/rev/inventory_v2.py
+  ctf-os-image/templates/rev/runtime_exec.py
   ctf-os-image/templates/rev/safe_output.py
   ctf-os-image/templates/rev/stdin_exec.py
   ctf-os-image/tests/fixtures/pwn-crash-oracle.c
@@ -61,6 +63,7 @@ required=(
   ctf-os-image/tests/test-pwn-crash-oracle.py
   ctf-os-image/tests/test-pwn-runtime-snapshot.py
   ctf-os-image/tests/test-rev-inventory.py
+  ctf-os-image/tests/test-rev-runtime-exec.py
   ctf-os-image/tests/test-rev-stdin-exec.py
   scripts/check-pwn-docker-crash.py
   scripts/check-pwn-docker-snapshot.py
@@ -94,6 +97,7 @@ fi
 "${python_bin}" ctf-os-image/tests/test-pwn-crash-oracle.py
 "${python_bin}" ctf-os-image/tests/test-pwn-runtime-snapshot.py
 "${python_bin}" ctf-os-image/tests/test-rev-inventory.py
+"${python_bin}" ctf-os-image/tests/test-rev-runtime-exec.py
 "${python_bin}" ctf-os-image/tests/test-rev-stdin-exec.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-crash.py
 "${python_bin}" -m py_compile scripts/check-pwn-docker-snapshot.py

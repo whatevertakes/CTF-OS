@@ -962,7 +962,7 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
       | jq -e '.found == true and .tool.available == true' >/dev/null \
  && /usr/local/bin/ctf-capabilities --json \
       | jq -e '.schema_version == 2 \
-          and (.capabilities | length == 32) \
+          and (.capabilities | length == 34) \
           and all(.capabilities[]; .available == true) \
           and ([.capabilities[] \
               | select(.name == "pwn_crash_v1" \
@@ -972,8 +972,10 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
                   or .name == "rev_inventory_v2" \
                   or .name == "rev_safe_output" \
                   or .name == "rev_stdin_exec" \
+                  or .name == "rev_runtime_exec_v1" \
+                  or .name == "data_transcript_v1" \
                   or .name == "forensic_evidence_index_v1") \
-              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1, 1])' >/dev/null \
+              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1, 1, 1, 1])' >/dev/null \
  && rm -f /tools/failed.txt
 
 # 실행 환경

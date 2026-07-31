@@ -41,7 +41,7 @@ def capability_payload(
 
 class CapabilityTests(unittest.TestCase):
     def test_host_attestations_match_vendored_v2_manifest(self):
-        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 32)
+        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 34)
         manifest = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -228,12 +228,14 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "data_transcript_v1",
                 "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
+                "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
             ],
@@ -389,6 +391,20 @@ class CapabilityTests(unittest.TestCase):
             if item["name"] == "pwn_interaction_v1"
         )
         interaction["attestation"]["sha256"] = "e" * 64
+        rev_runtime = next(
+            item
+            for item in records
+            if item["name"] == "rev_runtime_exec_v1"
+        )
+        rev_runtime["attestation"]["sha256"] = "c" * 64
+        data_transcript = next(
+            item
+            for item in records
+            if item["name"] == "data_transcript_v1"
+        )
+        data_transcript["attestation"]["contract_id"] = (
+            "ctfos.data_transcript.stale"
+        )
         forensic_index = next(
             item
             for item in records
@@ -410,12 +426,14 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "data_transcript_v1",
                 "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
+                "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
             ],
@@ -423,12 +441,14 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             set(report["attestation_errors"]),
             {
+                "data_transcript_v1",
                 "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",
                 "pwn_runtime_snapshot_v1",
                 "rev_inventory_v2",
+                "rev_runtime_exec_v1",
                 "rev_safe_output",
                 "rev_stdin_exec",
             },

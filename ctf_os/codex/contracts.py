@@ -179,6 +179,7 @@ MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND = "prove_web_active_probe"
 MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND = "prove_crypto_metamorphic"
 MANAGED_FORENSIC_ASSERTION_ACTION_KIND = "prove_forensic_assertion"
 MANAGED_MISC_TRANSFORM_ACTION_KIND = "evaluate_misc_transform"
+MANAGED_DATA_TRANSCRIPT_ACTION_KIND = "prove_data_transcript"
 MANAGED_TYPED_GATE_ACTION_KINDS = (
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND,
     MANAGED_PWN_INTERACTION_ACTION_KIND,
@@ -188,6 +189,7 @@ MANAGED_TYPED_GATE_ACTION_KINDS = (
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
     MANAGED_MISC_TRANSFORM_ACTION_KIND,
+    MANAGED_DATA_TRANSCRIPT_ACTION_KIND,
 )
 PROOF_INPUT_PURPOSE_VALUES = (
     "reproducer",
@@ -669,6 +671,26 @@ def role_output_schema(
                             "oracle_preissue_id": (
                                 managed_reference_schema
                             ),
+                        },
+                    }
+                )
+                continue
+            if action_kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+                action_variants.append(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "kind",
+                            "oracle_preissue_id",
+                            "recipe_artifact_path",
+                        ],
+                        "properties": {
+                            "kind": {"enum": [action_kind]},
+                            "oracle_preissue_id": (
+                                managed_reference_schema
+                            ),
+                            "recipe_artifact_path": managed_path_schema,
                         },
                     }
                 )
@@ -1644,6 +1666,11 @@ def validate_role_output(
                         "spec_artifact_path",
                         "oracle_preissue_id",
                     },
+                    MANAGED_DATA_TRANSCRIPT_ACTION_KIND: {
+                        "kind",
+                        "oracle_preissue_id",
+                        "recipe_artifact_path",
+                    },
                 }[kind]
                 _exact_keys(item, typed_keys, path, errors)
                 if contract_version != 2 or role is not Role.BUILDER:
@@ -1651,7 +1678,11 @@ def validate_role_output(
                         f"{path}.kind: {kind} is restricted to the v2 builder"
                     )
                 if (
-                    kind != MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND
+                    kind
+                    not in {
+                        MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
+                        MANAGED_DATA_TRANSCRIPT_ACTION_KIND,
+                    }
                     and not isinstance(item.get("description"), str)
                 ):
                     errors.append(f"{path}.description: expected string")

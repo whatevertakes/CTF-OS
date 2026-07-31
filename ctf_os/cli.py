@@ -31,6 +31,10 @@ from ctf_os.engine.challenge import (
     EngineError,
     SessionAlreadyRunning,
 )
+from ctf_os.engine.rev_runtime_proof import (
+    RevRuntimeProofError,
+    prove_rev_runtime_accepted_input,
+)
 from ctf_os.evaluation import EvaluationError, evaluate_workspace
 from ctf_os.images import image_status_is_usable, inspect_local_image
 from ctf_os.knowledge import KnowledgeError, KnowledgeStore
@@ -84,6 +88,8 @@ from ctf_os.scaffold_binding import (
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.storage import (
     StorageError,
+    prepare_quarantine_purge,
+    purge_quarantine,
     quarantine_unreachable,
     restore_quarantine,
     storage_inventory,
@@ -101,6 +107,20 @@ class CLIError(RuntimeError):
 
 
 MAX_PROMOTION_EVIDENCE_BYTES = 16 * 1024 * 1024
+
+
+def _rev_runtime_timeout_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Rev runtime timeout must be an integer"
+        ) from error
+    if not 1 <= parsed <= 3600:
+        raise argparse.ArgumentTypeError(
+            "Rev runtime timeout must be between 1 and 3600 seconds"
+        )
+    return parsed
 
 
 def _read_bounded_regular_bytes(
@@ -159,6 +179,47 @@ def _read_bounded_regular_bytes(
         raise CLIError(f"{label} 파일을 안전하게 읽을 수 없습니다.") from error
     finally:
         os.close(descriptor)
+
+
+def _read_rev_runtime_expected_oracle(path: Path) -> dict[str, object]:
+    """Read one canonical hash/size-only oracle without exposing its path."""
+
+    from ctf_os.engine.rev_acceptance import (
+        REV_ACCEPTANCE_MAX_SPEC_BYTES,
+        RevAcceptanceContractError,
+        canonical_json_bytes,
+        validate_rev_acceptance_expected_oracle,
+    )
+    from ctf_os.store.atomic import StrictJSONError
+
+    payload = _read_bounded_regular_bytes(
+        path,
+        maximum=REV_ACCEPTANCE_MAX_SPEC_BYTES,
+        label="Rev runtime hash-only oracle",
+    )
+    try:
+        value = strict_json_loads(
+            payload,
+            max_bytes=REV_ACCEPTANCE_MAX_SPEC_BYTES,
+        )
+        normalized = validate_rev_acceptance_expected_oracle(value)
+        if payload != canonical_json_bytes(normalized):
+            raise CLIError(
+                "Rev runtime hash-only oracle JSON은 canonical 형식이어야 "
+                "합니다."
+            )
+    except CLIError:
+        raise
+    except (
+        RevAcceptanceContractError,
+        StrictJSONError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise CLIError(
+            "Rev runtime hash-only oracle JSON이 유효하지 않습니다."
+        ) from error
+    return normalized
 
 
 def _inspect_offset_argument(value: str) -> int:
@@ -1274,6 +1335,40 @@ def build_parser() -> argparse.ArgumentParser:
     rev_accept.add_argument("--spec", required=True)
     rev_accept.add_argument("--timeout", type=int, default=300)
 
+    rev_runtime = commands.add_parser(
+        "rev-prove-runtime",
+        help=(
+            "canonical runtime spec과 hash-only oracle를 결속해 "
+            "PE/JVM/.NET/WASM/native/QEMU accepted input을 "
+            "3회 + 고정 변형 3회로 검증"
+        ),
+    )
+    _identity_values(rev_runtime)
+    rev_runtime.add_argument(
+        "--runtime-spec",
+        required=True,
+        help="challenge workspace 안의 canonical runtime spec locator",
+    )
+    rev_runtime.add_argument(
+        "--accepted-input-file",
+        type=Path,
+        required=True,
+        help=(
+            "CTF-OS workspace 전체 밖의 operator-private regular file"
+        ),
+    )
+    rev_runtime.add_argument(
+        "--oracle",
+        type=Path,
+        required=True,
+        help="canonical hash/size-only expected oracle JSON file",
+    )
+    rev_runtime.add_argument(
+        "--timeout",
+        type=_rev_runtime_timeout_argument,
+        default=300,
+    )
+
     crypto_preissue = commands.add_parser(
         "managed-oracle-preissue-crypto",
         aliases=["oracle-preissue-crypto"],
@@ -1302,6 +1397,30 @@ def build_parser() -> argparse.ArgumentParser:
     misc_preissue.add_argument("--verifier", required=True)
     misc_preissue.add_argument("--verifier-id", required=True)
     misc_preissue.add_argument("--oracle-id", required=True)
+
+    crypto_transcript_preissue = commands.add_parser(
+        "managed-oracle-preissue-crypto-transcript",
+        aliases=["oracle-preissue-crypto-transcript"],
+        help=(
+            "managed Builder 시작 전에 Crypto interactive peer와 초기 "
+            "data를 engine-private one-shot transcript oracle로 봉인"
+        ),
+    )
+    _identity_values(crypto_transcript_preissue)
+    crypto_transcript_preissue.add_argument("--peer", required=True)
+    crypto_transcript_preissue.add_argument("--peer-data", required=True)
+
+    misc_transcript_preissue = commands.add_parser(
+        "managed-oracle-preissue-misc-transcript",
+        aliases=["oracle-preissue-misc-transcript"],
+        help=(
+            "managed Builder 시작 전에 Misc interactive peer와 초기 "
+            "data를 engine-private one-shot transcript oracle로 봉인"
+        ),
+    )
+    _identity_values(misc_transcript_preissue)
+    misc_transcript_preissue.add_argument("--peer", required=True)
+    misc_transcript_preissue.add_argument("--peer-data", required=True)
 
     crypto_prove = commands.add_parser(
         "crypto-prove",
@@ -1367,11 +1486,31 @@ def build_parser() -> argparse.ArgumentParser:
     storage_commands = storage.add_subparsers(
         dest="storage_command", required=True
     )
-    for storage_name in ("inventory", "plan", "gc", "restore"):
+    for storage_name in (
+        "inventory",
+        "plan",
+        "gc",
+        "restore",
+        "purge-prepare",
+        "purge",
+    ):
         storage_parser = storage_commands.add_parser(storage_name)
         _identity_values(storage_parser)
-        if storage_name == "restore":
+        if storage_name in {"restore", "purge-prepare", "purge"}:
             storage_parser.add_argument("quarantine_id")
+        if storage_name == "purge":
+            storage_parser.add_argument("--manifest-sha256", required=True)
+            storage_parser.add_argument(
+                "--confirm",
+                required=True,
+                help="purge-prepare가 출력한 confirmation을 정확히 다시 입력",
+            )
+
+    gc = commands.add_parser(
+        "gc",
+        help="도달 불가능 artifact를 가역 quarantine으로만 이동",
+    )
+    _identity_values(gc)
 
     jobs = commands.add_parser("jobs", help="문제 container job 상태 조회")
     _identity_values(jobs)
@@ -2467,6 +2606,41 @@ def main(
             )
             return 0 if result["passed"] else 1
 
+        if args.command == "rev-prove-runtime":
+            expected_oracle = _read_rev_runtime_expected_oracle(
+                args.oracle
+            )
+            state, result = prove_rev_runtime_accepted_input(
+                engine,
+                _identity(args),
+                runtime_spec_locator=args.runtime_spec,
+                accepted_input_path=args.accepted_input_file,
+                expected_oracle=expected_oracle,
+                timeout_seconds=args.timeout,
+            )
+            _print_json(
+                {
+                    "authorities": result["authorities"],
+                    "evaluation_sha256": hashlib.sha256(
+                        (
+                            json.dumps(
+                                result,
+                                allow_nan=False,
+                                ensure_ascii=True,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        ).encode("ascii")
+                    ).hexdigest(),
+                    "passed": result["passed"],
+                    "reason_codes": result["reason_codes"],
+                    "run_count": result["record_count"],
+                    "state_revision": state.revision,
+                }
+            )
+            return 0 if result["passed"] else 1
+
         if args.command == "crypto-prove":
             state, result = engine.prove_crypto_metamorphic_candidate(
                 _identity(args),
@@ -2512,6 +2686,40 @@ def main(
                 verifier_path=args.verifier,
                 verifier_id=args.verifier_id,
                 oracle_id=args.oracle_id,
+            )
+            _print_json(
+                {
+                    **dict(record),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0
+
+        if args.command in {
+            "managed-oracle-preissue-crypto-transcript",
+            "oracle-preissue-crypto-transcript",
+        }:
+            state, record = engine.preissue_managed_crypto_transcript(
+                _identity(args),
+                peer_path=args.peer,
+                peer_data_path=args.peer_data,
+            )
+            _print_json(
+                {
+                    **dict(record),
+                    "state_revision": state.revision,
+                }
+            )
+            return 0
+
+        if args.command in {
+            "managed-oracle-preissue-misc-transcript",
+            "oracle-preissue-misc-transcript",
+        }:
+            state, record = engine.preissue_managed_misc_transcript(
+                _identity(args),
+                peer_path=args.peer,
+                peer_data_path=args.peer_data,
             )
             _print_json(
                 {
@@ -2579,24 +2787,63 @@ def main(
             _print_json(state.closure.to_dict())
             return 0
 
-        if args.command == "storage":
+        if args.command in {"storage", "gc"}:
             identity = _identity(args)
-            if args.storage_command == "inventory":
-                report = storage_inventory(engine.store, identity)
-            elif args.storage_command == "plan":
-                report = storage_plan(engine.store, identity)
-            elif args.storage_command == "gc":
-                report = quarantine_unreachable(engine.store, identity)
-            elif args.storage_command == "restore":
+            storage_command = (
+                "gc" if args.command == "gc" else args.storage_command
+            )
+            if storage_command == "inventory":
+                report = storage_inventory(
+                    engine.store,
+                    identity,
+                    quota_bytes=(
+                        config.runtime.challenge_storage_quota_bytes
+                    ),
+                    max_entries=config.runtime.storage_scan_max_entries,
+                    max_scan_bytes=config.runtime.storage_scan_max_bytes,
+                )
+            elif storage_command == "plan":
+                report = storage_plan(
+                    engine.store,
+                    identity,
+                    quota_bytes=(
+                        config.runtime.challenge_storage_quota_bytes
+                    ),
+                    max_entries=config.runtime.storage_scan_max_entries,
+                    max_scan_bytes=config.runtime.storage_scan_max_bytes,
+                )
+            elif storage_command == "gc":
+                report = quarantine_unreachable(
+                    engine.store,
+                    identity,
+                    max_entries=config.runtime.storage_scan_max_entries,
+                    max_scan_bytes=config.runtime.storage_scan_max_bytes,
+                )
+            elif storage_command == "restore":
                 report = restore_quarantine(
                     engine.store,
                     identity,
                     args.quarantine_id,
                 )
+            elif storage_command == "purge-prepare":
+                report = prepare_quarantine_purge(
+                    engine.store,
+                    identity,
+                    args.quarantine_id,
+                    max_verify_bytes=config.runtime.storage_scan_max_bytes,
+                )
+            elif storage_command == "purge":
+                report = purge_quarantine(
+                    engine.store,
+                    identity,
+                    args.quarantine_id,
+                    manifest_sha256=args.manifest_sha256,
+                    confirmation=args.confirm,
+                )
             else:
                 raise AssertionError(
                     f"처리되지 않은 storage 명령: "
-                    f"{args.storage_command}"
+                    f"{storage_command}"
                 )
             _print_json(report)
             return 0
@@ -2850,6 +3097,12 @@ def main(
     except ManagedError as error:
         print(f"오류: {terminal_safe(error)}", file=sys.stderr)
         return 1
+    except RevRuntimeProofError:
+        print(
+            "오류: Rev runtime proof를 안전하게 완료하지 못했습니다.",
+            file=sys.stderr,
+        )
+        return 2
     except (
         CLIError,
         ConfigError,

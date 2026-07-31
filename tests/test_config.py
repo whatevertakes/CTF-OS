@@ -58,6 +58,15 @@ class ConfigTests(unittest.TestCase):
             config.runtime.work_tree_max_bytes,
             16 * 1024 * 1024 * 1024,
         )
+        self.assertEqual(
+            config.runtime.challenge_storage_quota_bytes,
+            64 * 1024 * 1024 * 1024,
+        )
+        self.assertEqual(config.runtime.storage_scan_max_entries, 100_000)
+        self.assertEqual(
+            config.runtime.storage_scan_max_bytes,
+            256 * 1024 * 1024 * 1024,
+        )
         self.assertEqual(config.runtime.managed_wave_queue_reserve_s, 90.0)
         self.assertEqual(
             config.runtime.managed_wave_role_call_reserve_s,
@@ -80,6 +89,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("not an HTTP request limiter", text)
         self.assertIn("command_timeout_s = 900\n", text)
         self.assertNotIn("command_timeout_s = 900.0", text)
+        self.assertIn(
+            "challenge_storage_quota_bytes = 68719476736",
+            text,
+        )
+        self.assertIn("storage_scan_max_entries = 100000", text)
+        self.assertIn(
+            "storage_scan_max_bytes = 274877906944",
+            text,
+        )
         self.assertIn("managed_wave_queue_reserve_s = 90.0", text)
         self.assertIn(
             "Provider concurrency changes",
@@ -214,6 +232,35 @@ class ConfigTests(unittest.TestCase):
                     "work_tree_max_bytes",
                 ):
                     load_config(self.root)
+
+    def test_runtime_storage_bounds_are_configurable_positive_integers(
+        self,
+    ) -> None:
+        self.write_config(
+            "[runtime]\n"
+            "challenge_storage_quota_bytes = 67108864\n"
+            "storage_scan_max_entries = 1234\n"
+            "storage_scan_max_bytes = 134217728\n"
+        )
+        runtime = load_config(self.root).runtime
+        self.assertEqual(runtime.challenge_storage_quota_bytes, 67_108_864)
+        self.assertEqual(runtime.storage_scan_max_entries, 1_234)
+        self.assertEqual(runtime.storage_scan_max_bytes, 134_217_728)
+
+        config_path = self.root / ".ctfos" / "engine.toml"
+        for name in (
+            "challenge_storage_quota_bytes",
+            "storage_scan_max_entries",
+            "storage_scan_max_bytes",
+        ):
+            for value in ("0", "-1", "true", "1.5", '"1"'):
+                with self.subTest(name=name, value=value):
+                    config_path.write_text(
+                        f"[runtime]\n{name} = {value}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ConfigError, name):
+                        load_config(self.root)
 
     def test_model_efforts_accept_only_codex_supported_values(self) -> None:
         self.write_config(

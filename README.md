@@ -930,6 +930,36 @@ summary tail로 따로 유지합니다. `stream-capture.json`, `result.json`과
 기본값은 16 GiB입니다. 이는 커널 project quota가 아니므로 한 명령이 실행
 중에 잠깐 상한을 넘는 write까지 즉시 막지는 않습니다.
 
+문제별 누적 `.ctfos` 저장소는 별도의 bounded inventory로 계측합니다.
+`runtime.challenge_storage_quota_bytes` 기본값은 64 GiB이며 문제 범위의
+`runs/`, `artifacts/`(가역 quarantine 포함), `proof/`, `runtime/`,
+`context/`, `knowledge/`, `exports/`를 모두 포함합니다. 이 중
+`runtime/`, `context/`, `knowledge/`, `exports/`는 연속성·정본·운영자
+산출물을 보존하는 root이므로 항상 reachable/canonical이며 GC와 영구
+purge의 대상이 아닙니다. 문제 root의 `state.json`, `state.prev.json`,
+`events.jsonl` 같은 control file과 contest 공용 `submissions.jsonl`은 이
+quota에 포함되지 않습니다. scan은 기본 100,000 entry와 256 GiB
+관찰량에서 중단하며, symlink·special file·hardlink 또는 scan 한계 때문에
+exact total을 증명할 수 없으면 quota 판정을 fail-closed합니다.
+
+```sh
+ctfos storage inventory 'Demo CTF' rev 'VM'
+ctfos storage plan 'Demo CTF' rev 'VM'
+
+# 도달 불가능 파일을 삭제하지 않고 문제 범위 quarantine으로 이동
+ctfos gc 'Demo CTF' rev 'VM'
+ctfos storage restore 'Demo CTF' rev 'VM' QUARANTINE_ID
+
+# 영구 삭제는 별도의 준비 결과를 exact하게 재확인해야 함
+ctfos storage purge-prepare 'Demo CTF' rev 'VM' QUARANTINE_ID
+ctfos storage purge 'Demo CTF' rev 'VM' QUARANTINE_ID \
+  --manifest-sha256 MANIFEST_SHA256 --confirm 'EXACT_CONFIRMATION'
+```
+
+`ctfos gc`는 항상 가역 이동만 수행합니다. 영구 purge는 준비 manifest의
+identity, 파일 집합, digest와 confirmation을 다시 검증하며, 중단된 이동,
+복구 및 purge tombstone은 재실행 시 동일 문제 범위 안에서 조정됩니다.
+
 도구 실행, flag callback, artifact scan 또는 결과 commit이 실패하면 해당
 실험은 canonical state에서 `FAILED`와 failed run으로 종결됩니다. 진단용
 `result.json`을 쓰는 과정 자체가 실패해도 실험을 `RUNNING`으로 남기지
@@ -1345,11 +1375,14 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   `ctfos doctor`가 끝나기 전에는 이 구현 상태를 release acceptance나 solve
   성능으로 확대하지 않습니다.
 - image digest가 설정되지 않아도 실행은 가능하며 `doctor`가 경고합니다.
-- `work_tree_max_bytes`와 canonical artifact 합계 cap은 문제 디렉터리 전체의
-  disk quota가 아닙니다. 누적 `runs/` raw, contest
-  `submissions.jsonl`과 전체 challenge tree에는 별도 총량 quota나
-  retention/GC가 없습니다. Work-tree entry 수는 `scandir` 전체를
-  materialize하기 전에 전역 상한+1에서 즉시 중단합니다.
+- `work_tree_max_bytes`와 문제별 누적 storage quota는 커널 filesystem
+  quota가 아닙니다. 한 명령이 실행 중에 상한을 일시 초과할 수 있으며,
+  문제 root control file과 contest 공용 `submissions.jsonl`은 문제별
+  quota에 포함되지 않습니다. 보존 root인 `runtime/`, `context/`,
+  `knowledge/`, `exports/`의 byte는 quota에는 포함하지만 GC/purge에는
+  포함하지 않습니다. Work-tree와 누적 storage scan은 entry/byte 한계에서
+  즉시 중단하고 불완전한 계측을 통과로 해석하지 않습니다. GC는 자동
+  retention이 아니라 운영자가 문제별로 명시하는 가역 quarantine입니다.
 - 자동 제출은 없습니다.
 
 이 제한을 포함한 요구사항 판정 이력은

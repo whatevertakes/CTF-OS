@@ -113,6 +113,24 @@
       "sha256": "036edb158461aa32c6688a7f33f3d523f593202409b62377288c8c8e54b45610"
     },
     {
+      "name": "rev_runtime_exec_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/rev/runtime_exec.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.rev.runtime_exec",
+      "contract_version": 1,
+      "sha256": "9b2544102e8fa2ec7930b09f3d8b650041bdf782eff6b5bab0454895194d0d79"
+    },
+    {
+      "name": "data_transcript_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/common/data_transcript.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.data_transcript.producer",
+      "contract_version": 1,
+      "sha256": "a0e5402456ba09f08429b01632990047366ca2680be5be52c0f308ef73e74788"
+    },
+    {
       "name": "forensic_evidence_index_v1",
       "kind": "file_sha256",
       "path": "/opt/ctf-templates/forensic/evidence_index.py",

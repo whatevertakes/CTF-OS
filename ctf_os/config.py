@@ -77,6 +77,9 @@ class RuntimeConfig:
     )
     flag_scan_max_bytes: int = 16 * 1024 * 1024
     work_tree_max_bytes: int = 16 * 1024 * 1024 * 1024
+    challenge_storage_quota_bytes: int = 64 * 1024 * 1024 * 1024
+    storage_scan_max_entries: int = 100_000
+    storage_scan_max_bytes: int = 256 * 1024 * 1024 * 1024
     command_timeout_s: int = 900
     wave_deadline_s: float = 1800.0
     managed_wave_queue_reserve_s: float = 90.0
@@ -223,7 +226,13 @@ def _validate(config: EngineConfig) -> EngineConfig:
             raise ConfigError(
                 f"[runtime] flag_patterns[{index}] is invalid: {error}"
             ) from error
-    for name in ("flag_scan_max_bytes", "work_tree_max_bytes"):
+    for name in (
+        "flag_scan_max_bytes",
+        "work_tree_max_bytes",
+        "challenge_storage_quota_bytes",
+        "storage_scan_max_entries",
+        "storage_scan_max_bytes",
+    ):
         value = getattr(runtime, name)
         if (
             isinstance(value, bool)
@@ -380,6 +389,13 @@ flag_scan_max_bytes = 16777216
 # Descriptor-anchored checks account /work before and after each command.
 # This is not a live filesystem quota; a command can transiently exceed it.
 work_tree_max_bytes = 17179869184
+# Cumulative logical bytes below runs/, artifacts/ (including quarantine/),
+# proof/, runtime/, context/, knowledge/, and exports/. Preserved roots count
+# toward admission but never enter GC/purge. Incomplete bounded scans fail
+# closed unless an active supervised writer has a conservative byte reserve.
+challenge_storage_quota_bytes = 68719476736
+storage_scan_max_entries = 100000
+storage_scan_max_bytes = 274877906944
 command_timeout_s = 900
 wave_deadline_s = 1800.0
 # Before a Captain may reserve a fixed three-role wave, the engine conservatively

@@ -29,7 +29,7 @@ jq -e '
 ctf-capabilities --json >"${test_root}/managed-capabilities.json"
 jq -e '
     .schema_version == 2
-    and (.capabilities | length == 32)
+    and (.capabilities | length == 34)
     and all(.capabilities[]; .available == true)
     and all(
         .capabilities[]
@@ -42,6 +42,8 @@ jq -e '
             .name == "rev_inventory_v2"
             or .name == "rev_safe_output"
             or .name == "rev_stdin_exec"
+            or .name == "rev_runtime_exec_v1"
+            or .name == "data_transcript_v1"
             or .name == "forensic_evidence_index_v1"
         );
         .attestation.schema_version == 1
@@ -51,6 +53,7 @@ jq -e '
             .attestation.path
             | startswith("/opt/ctf-templates/pwn/")
               or startswith("/opt/ctf-templates/rev/")
+              or startswith("/opt/ctf-templates/common/")
               or startswith("/opt/ctf-templates/forensic/")
         )
         and (.attestation.sha256 | test("^[0-9a-f]{64}$"))

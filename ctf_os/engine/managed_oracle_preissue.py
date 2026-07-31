@@ -17,10 +17,19 @@ MANAGED_ORACLE_PREISSUE_MAX_HISTORY = 64
 MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES = 64 * 1024
 MANAGED_ORACLE_PREISSUE_CRYPTO = "crypto"
 MANAGED_ORACLE_PREISSUE_MISC = "misc"
+MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT = "crypto_transcript"
+MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT = "misc_transcript"
+MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS = frozenset(
+    {
+        MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
+        MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT,
+    }
+)
 MANAGED_ORACLE_PREISSUE_KINDS = frozenset(
     {
         MANAGED_ORACLE_PREISSUE_CRYPTO,
         MANAGED_ORACLE_PREISSUE_MISC,
+        *MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS,
     }
 )
 
@@ -45,6 +54,9 @@ _PUBLIC_KEYS = frozenset(
         "consumed_by_builder_run_id",
         "consumed_by_experiment_id",
     }
+)
+_PUBLIC_TRANSCRIPT_KEYS = frozenset(
+    {*_PUBLIC_KEYS, "reset_commitment_sha256"}
 )
 _MANIFEST_KEYS = frozenset(
     {
@@ -219,25 +231,42 @@ def parse_manifest(value: object) -> ManagedOraclePreissueManifest:
     metadata = value.get("metadata")
     if not isinstance(metadata, Mapping):
         raise ManagedOraclePreissueError("managed oracle metadata is invalid")
-    expected_metadata = (
-        frozenset({"mutation_id"})
-        if kind == MANAGED_ORACLE_PREISSUE_CRYPTO
-        else frozenset({"oracle_id", "verifier_id"})
-    )
+    if kind == MANAGED_ORACLE_PREISSUE_CRYPTO:
+        expected_metadata = frozenset({"mutation_id"})
+    elif kind == MANAGED_ORACLE_PREISSUE_MISC:
+        expected_metadata = frozenset({"oracle_id", "verifier_id"})
+    else:
+        expected_metadata = frozenset({"reset_commitment_sha256"})
     if frozenset(metadata) != expected_metadata:
         raise ManagedOraclePreissueError(
             "managed oracle metadata has unknown or missing fields"
         )
-    normalized_metadata = {
-        key: _safe_id(metadata.get(key), f"managed oracle {key}")
-        for key in sorted(expected_metadata)
-    }
-    raw_inputs = value.get("inputs")
-    expected_purposes = (
-        ("variant_parameters", "variant_expected_output")
-        if kind == MANAGED_ORACLE_PREISSUE_CRYPTO
-        else ("verifier_tool",)
+    normalized_metadata = (
+        {
+            "reset_commitment_sha256": _sha256(
+                metadata.get("reset_commitment_sha256"),
+                "managed oracle reset commitment",
+            )
+        }
+        if kind in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS
+        else {
+            key: _safe_id(metadata.get(key), f"managed oracle {key}")
+            for key in sorted(expected_metadata)
+        }
     )
+    raw_inputs = value.get("inputs")
+    if kind == MANAGED_ORACLE_PREISSUE_CRYPTO:
+        expected_purposes = (
+            "variant_parameters",
+            "variant_expected_output",
+        )
+    elif kind == MANAGED_ORACLE_PREISSUE_MISC:
+        expected_purposes = ("verifier_tool",)
+    else:
+        expected_purposes = (
+            "transcript_peer",
+            "transcript_peer_data",
+        )
     if type(raw_inputs) is not list or len(raw_inputs) != len(expected_purposes):
         raise ManagedOraclePreissueError("managed oracle input count is invalid")
     inputs: list[ManagedOraclePreissueInput] = []
@@ -294,7 +323,7 @@ def parse_manifest(value: object) -> ManagedOraclePreissueManifest:
 
 
 def public_record(manifest: ManagedOraclePreissueManifest) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "schema_version": MANAGED_ORACLE_PREISSUE_SCHEMA_VERSION,
         "protocol": MANAGED_ORACLE_PREISSUE_PROTOCOL,
         "preissue_id": manifest.preissue_id,
@@ -311,10 +340,25 @@ def public_record(manifest: ManagedOraclePreissueManifest) -> dict[str, object]:
         "consumed_by_builder_run_id": None,
         "consumed_by_experiment_id": None,
     }
+    if manifest.kind in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS:
+        record["reset_commitment_sha256"] = manifest.metadata[
+            "reset_commitment_sha256"
+        ]
+    return record
 
 
 def validate_public_record(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or frozenset(value) != _PUBLIC_KEYS:
+    if not isinstance(value, Mapping):
+        raise ManagedOraclePreissueError(
+            "managed oracle public record has unknown or missing fields"
+        )
+    expected_keys = (
+        _PUBLIC_TRANSCRIPT_KEYS
+        if value.get("kind")
+        in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS
+        else _PUBLIC_KEYS
+    )
+    if frozenset(value) != expected_keys:
         raise ManagedOraclePreissueError(
             "managed oracle public record has unknown or missing fields"
         )
@@ -356,6 +400,11 @@ def validate_public_record(value: object) -> dict[str, object]:
         raise ManagedOraclePreissueError(
             "managed oracle public pins are invalid"
         )
+    if value.get("kind") in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS:
+        _sha256(
+            value.get("reset_commitment_sha256"),
+            "managed oracle public reset commitment",
+        )
     consumed_fields = (
         value.get("consumed_at"),
         value.get("consumed_by_builder_run_id"),
@@ -383,13 +432,16 @@ def validate_public_record(value: object) -> dict[str, object]:
 
 __all__ = [
     "MANAGED_ORACLE_PREISSUE_CRYPTO",
+    "MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT",
     "MANAGED_ORACLE_PREISSUE_KINDS",
     "MANAGED_ORACLE_PREISSUE_MAX_HISTORY",
     "MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES",
     "MANAGED_ORACLE_PREISSUE_MISC",
+    "MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT",
     "MANAGED_ORACLE_PREISSUE_PROTOCOL",
     "MANAGED_ORACLE_PREISSUE_SCHEMA_VERSION",
     "MANAGED_ORACLE_PREISSUE_STATE_KEY",
+    "MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS",
     "ManagedOraclePreissueError",
     "ManagedOraclePreissueInput",
     "ManagedOraclePreissueManifest",

@@ -145,7 +145,7 @@ assert (
 ast.parse(managed_probe_source, filename="scripts/ctf-capabilities")
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2
-assert len(managed_manifest["capabilities"]) == 32
+assert len(managed_manifest["capabilities"]) == 34
 assert {
     item["name"] for item in managed_manifest["capabilities"]
 } == {
@@ -164,6 +164,8 @@ assert {
     "rev_inventory_v2",
     "rev_safe_output",
     "rev_stdin_exec",
+    "rev_runtime_exec_v1",
+    "data_transcript_v1",
     "forensic_evidence_index_v1",
     "forensic_assertion_python3",
     "forensic_assertion_perl",
@@ -194,6 +196,8 @@ managed_attestations = {
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
+        "rev_runtime_exec_v1",
+        "data_transcript_v1",
         "forensic_evidence_index_v1",
     }
 }
@@ -240,6 +244,20 @@ expected_managed_attestations = {
         "path": "/opt/ctf-templates/rev/safe_output.py",
         "source": REPO_ROOT / "templates" / "rev" / "safe_output.py",
         "contract_id": "ctfos.rev.safe_output",
+        "contract_version": 1,
+    },
+    "rev_runtime_exec_v1": {
+        "path": "/opt/ctf-templates/rev/runtime_exec.py",
+        "source": REPO_ROOT / "templates" / "rev" / "runtime_exec.py",
+        "contract_id": "ctfos.rev.runtime_exec",
+        "contract_version": 1,
+    },
+    "data_transcript_v1": {
+        "path": "/opt/ctf-templates/common/data_transcript.py",
+        "source": (
+            REPO_ROOT / "templates" / "common" / "data_transcript.py"
+        ),
+        "contract_id": "ctfos.data_transcript.producer",
         "contract_version": 1,
     },
     "forensic_evidence_index_v1": {
@@ -291,10 +309,12 @@ with tempfile.TemporaryDirectory() as temporary:
         != changed_record["sha256"]
     )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
-assert "(.capabilities | length == 32)" in dockerfile
+assert "(.capabilities | length == 34)" in dockerfile
 assert 'or .name == "pwn_runtime_snapshot_v1"' in dockerfile
 assert 'or .name == "pwn_exploit_effect_v1"' in dockerfile
 assert 'or .name == "pwn_interaction_v1"' in dockerfile
+assert 'or .name == "rev_runtime_exec_v1"' in dockerfile
+assert 'or .name == "data_transcript_v1"' in dockerfile
 assert 'or .name == "forensic_evidence_index_v1"' in dockerfile
 assert "--network" not in managed_probe_source
 assert "mode=ro&immutable=1" in sqlite_wrapper_source

@@ -43,6 +43,7 @@ CATEGORY_MANAGED_CAPABILITIES: dict[str, frozenset[str]] = {
             "rev_inventory_v2",
             "rev_safe_output",
             "rev_stdin_exec",
+            "rev_runtime_exec_v1",
         }
     ),
     "crypto": frozenset(
@@ -52,6 +53,7 @@ CATEGORY_MANAGED_CAPABILITIES: dict[str, frozenset[str]] = {
             "pysat_cadical300",
             "pysat_kissat404",
             "cryptominisat5",
+            "data_transcript_v1",
         }
     ),
     "forensic": frozenset(
@@ -79,6 +81,7 @@ CATEGORY_MANAGED_CAPABILITIES: dict[str, frozenset[str]] = {
             "misc_ffmpeg",
             "misc_sox",
             "misc_zbar",
+            "data_transcript_v1",
         }
     ),
 }
@@ -171,6 +174,26 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
         "sha256": (
             "036edb158461aa32c6688a7f33f3d523"
             "f593202409b62377288c8c8e54b45610"
+        ),
+    },
+    "rev_runtime_exec_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.rev.runtime_exec",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/rev/runtime_exec.py",
+        "sha256": (
+            "9b2544102e8fa2ec7930b09f3d8b6500"
+            "41bdf782eff6b5bab0454895194d0d79"
+        ),
+    },
+    "data_transcript_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.data_transcript.producer",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/common/data_transcript.py",
+        "sha256": (
+            "a0e5402456ba09f08429b016329900473"
+            "66ca2680be5be52c0f308ef73e74788"
         ),
     },
     "forensic_evidence_index_v1": {

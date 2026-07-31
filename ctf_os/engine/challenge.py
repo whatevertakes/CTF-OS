@@ -135,6 +135,15 @@ from ctf_os.engine.crypto_metamorphic import (
     build_crypto_metamorphic_plan,
     evaluate_crypto_metamorphic_proof,
 )
+from ctf_os.engine.data_transcript import (
+    DATA_TRANSCRIPT_MAX_HISTORY,
+    DATA_TRANSCRIPT_STATE_KEY,
+)
+from ctf_os.contracts.data_transcript_v1 import (
+    DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT,
+    DATA_TRANSCRIPT_V1_MAX_DOCUMENT_BYTES,
+    data_transcript_v1_reset_commitment_sha256,
+)
 from ctf_os.engine.flags import (
     FLAG_PATTERNS_ENV,
     DetectedFlag,
@@ -166,11 +175,14 @@ from ctf_os.engine.misc_execution import (
 )
 from ctf_os.engine.managed_oracle_preissue import (
     MANAGED_ORACLE_PREISSUE_CRYPTO,
+    MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
     MANAGED_ORACLE_PREISSUE_MAX_HISTORY,
     MANAGED_ORACLE_PREISSUE_MAX_MANIFEST_BYTES,
     MANAGED_ORACLE_PREISSUE_MISC,
+    MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT,
     MANAGED_ORACLE_PREISSUE_PROTOCOL,
     MANAGED_ORACLE_PREISSUE_STATE_KEY,
+    MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS,
     ManagedOraclePreissueError,
     ManagedOraclePreissueInput,
     ManagedOraclePreissueManifest,
@@ -22026,6 +22038,46 @@ class ChallengeEngine:
             },
         )
 
+    def preissue_managed_crypto_transcript(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        peer_path: str | Path,
+        peer_data_path: str | Path,
+    ) -> tuple[ChallengeState, Mapping[str, object]]:
+        """Seal a local Crypto transcript peer before a Builder runs."""
+
+        return self._preissue_managed_oracle(
+            identity,
+            kind=MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
+            input_paths=(peer_path, peer_data_path),
+            input_purposes=(
+                "transcript_peer",
+                "transcript_peer_data",
+            ),
+            metadata={},
+        )
+
+    def preissue_managed_misc_transcript(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        peer_path: str | Path,
+        peer_data_path: str | Path,
+    ) -> tuple[ChallengeState, Mapping[str, object]]:
+        """Seal a local Misc transcript peer before a Builder runs."""
+
+        return self._preissue_managed_oracle(
+            identity,
+            kind=MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT,
+            input_paths=(peer_path, peer_data_path),
+            input_purposes=(
+                "transcript_peer",
+                "transcript_peer_data",
+            ),
+            metadata={},
+        )
+
     def _preissue_managed_oracle(
         self,
         identity: ChallengeIdentity,
@@ -22063,7 +22115,11 @@ class ChallengeEngine:
             state = self.refresh_ingest(identity)
             expected_category = (
                 "crypto"
-                if kind == MANAGED_ORACLE_PREISSUE_CRYPTO
+                if kind
+                in {
+                    MANAGED_ORACLE_PREISSUE_CRYPTO,
+                    MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
+                }
                 else "misc"
             )
             if get_adapter(state.category).name != expected_category:
@@ -22148,6 +22204,10 @@ class ChallengeEngine:
                 if (
                     not stat.S_ISREG(source_lstat.st_mode)
                     or resolved_source.is_relative_to(canonical_root)
+                    or (
+                        purpose == "transcript_peer"
+                        and source_lstat.st_mode & 0o111 == 0
+                    )
                 ):
                     raise EngineError(
                         "managed oracle source must be an operator-only "
@@ -22162,14 +22222,21 @@ class ChallengeEngine:
                             DEFAULT_SNAPSHOT_MAX_BYTES,
                             self.store.max_artifact_bytes,
                         ),
-                        mode=0o400,
+                        mode=(
+                            0o500
+                            if purpose == "transcript_peer"
+                            else 0o400
+                        ),
                     )
                 except (OSError, SafeFileError, ValueError) as error:
                     raise EngineError(
                         "managed oracle operator source could not be "
                         "snapshotted"
                     ) from error
-                if snapshot.size_bytes < 1:
+                if (
+                    snapshot.size_bytes < 1
+                    and purpose != "transcript_peer_data"
+                ):
                     raise EngineError(
                         "managed oracle inputs must be non-empty"
                     )
@@ -22195,6 +22262,33 @@ class ChallengeEngine:
                         size_bytes=int(artifact.size or 0),
                     )
                 )
+            resolved_metadata = dict(metadata)
+            if kind in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS:
+                if (
+                    len(inputs) != 2
+                    or inputs[0].purpose != "transcript_peer"
+                    or inputs[1].purpose != "transcript_peer_data"
+                ):
+                    raise EngineError(
+                        "managed transcript oracle inputs are incomplete"
+                    )
+                transcript_category = (
+                    "crypto"
+                    if kind
+                    == MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT
+                    else "misc"
+                )
+                resolved_metadata = {
+                    "reset_commitment_sha256": (
+                        data_transcript_v1_reset_commitment_sha256(
+                            category=transcript_category,
+                            peer_sha256=inputs[0].sha256,
+                            peer_size_bytes=inputs[0].size_bytes,
+                            peer_data_sha256=inputs[1].sha256,
+                            peer_data_size_bytes=inputs[1].size_bytes,
+                        )
+                    )
+                }
             try:
                 manifest = build_managed_oracle_preissue_manifest(
                     preissue_id=preissue_id,
@@ -22205,7 +22299,7 @@ class ChallengeEngine:
                     source_manifest_sha256=source_manifest,
                     image_digest=image_digest,
                     seal_nonce=hashlib.sha256(os.urandom(32)).hexdigest(),
-                    metadata=metadata,
+                    metadata=resolved_metadata,
                     inputs=inputs,
                 )
             except ManagedOraclePreissueError as error:
@@ -22325,10 +22419,223 @@ class ChallengeEngine:
         expected_kind: str,
         builder_run_id: str,
         experiment_id: str,
+        transcript_attempt_id: str | None = None,
+        transcript_reservation: Mapping[str, object] | None = None,
     ) -> _ManagedOraclePreissueResolution:
         """Atomically consume and return one still-hidden canonical bundle."""
 
         state = self.store.load(identity)
+        reservation_enabled = (
+            transcript_attempt_id is not None
+            or transcript_reservation is not None
+        )
+        if reservation_enabled:
+            reservation_keys = {
+                "attempt_id",
+                "automatic_submission_authorized",
+                "candidate_authorized",
+                "configuration_epoch",
+                "contract_fingerprint",
+                "image_digest",
+                "managed_builder_run_id",
+                "managed_experiment_id",
+                "oracle_preissue_id",
+                "oracle_preissue_sha256",
+                "protocol",
+                "recipe_artifact_id",
+                "recipe_sha256",
+                "recipe_size_bytes",
+                "reset_commitment_sha256",
+                "replays",
+                "schema_version",
+                "source_manifest_sha256",
+                "status",
+                "terminal",
+            }
+            reservation_replays = (
+                transcript_reservation.get("replays")
+                if type(transcript_reservation) is dict
+                else None
+            )
+            expected_replays = (
+                ("positive", 1),
+                ("positive", 2),
+                ("positive", 3),
+                ("control", 1),
+                ("control", 2),
+                ("control", 3),
+            )
+            replay_shape_valid = (
+                type(reservation_replays) is list
+                and len(reservation_replays) == 6
+                and all(
+                    type(item) is dict
+                    and set(item)
+                    == {
+                        "artifact_ids",
+                        "ordinal",
+                        "phase",
+                        "run_id",
+                        "sidecar_artifact_ids",
+                    }
+                    and (item.get("phase"), item.get("ordinal"))
+                    == expected
+                    and type(item.get("run_id")) is str
+                    and bool(item["run_id"])
+                    and type(item.get("artifact_ids")) is list
+                    and len(item["artifact_ids"]) == 6
+                    and all(
+                        type(artifact_id) is str and bool(artifact_id)
+                        for artifact_id in item["artifact_ids"]
+                    )
+                    and type(item.get("sidecar_artifact_ids"))
+                    is dict
+                    and set(item["sidecar_artifact_ids"])
+                    == {"request", "result", "validation"}
+                    and all(
+                        type(artifact_id) is str and bool(artifact_id)
+                        for artifact_id in item[
+                            "sidecar_artifact_ids"
+                        ].values()
+                    )
+                    for item, expected in zip(
+                        reservation_replays,
+                        expected_replays,
+                        strict=True,
+                    )
+                )
+                and len(
+                    {
+                        item["run_id"]
+                        for item in reservation_replays
+                    }
+                )
+                == 6
+                and len(
+                    {
+                        artifact_id
+                        for item in reservation_replays
+                        for artifact_id in item["artifact_ids"]
+                    }
+                )
+                == 36
+                and len(
+                    {
+                        artifact_id
+                        for item in reservation_replays
+                        for artifact_id in item[
+                            "sidecar_artifact_ids"
+                        ].values()
+                    }
+                )
+                == 18
+                and not {
+                    artifact_id
+                    for item in reservation_replays
+                    for artifact_id in item["artifact_ids"]
+                }.intersection(
+                    {
+                        artifact_id
+                        for item in reservation_replays
+                        for artifact_id in item[
+                            "sidecar_artifact_ids"
+                        ].values()
+                    }
+                )
+            )
+            if (
+                expected_kind
+                not in MANAGED_ORACLE_PREISSUE_TRANSCRIPT_KINDS
+                or type(transcript_attempt_id) is not str
+                or not transcript_attempt_id
+                or type(transcript_reservation) is not dict
+                or set(transcript_reservation) != reservation_keys
+                or transcript_reservation.get("attempt_id")
+                != transcript_attempt_id
+                or transcript_reservation.get("oracle_preissue_id")
+                != preissue_id
+                or transcript_reservation.get(
+                    "managed_builder_run_id"
+                )
+                != builder_run_id
+                or transcript_reservation.get(
+                    "managed_experiment_id"
+                )
+                != experiment_id
+                or transcript_reservation.get("status") != "reserved"
+                or transcript_reservation.get("terminal") is not False
+                or transcript_reservation.get("schema_version") != 1
+                or transcript_reservation.get("protocol")
+                != "ctfos.data_transcript.hotpath.v1"
+                or transcript_reservation.get(
+                    "contract_fingerprint"
+                )
+                != DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT
+                or transcript_reservation.get("configuration_epoch")
+                != state.configuration_epoch
+                or transcript_reservation.get("image_digest")
+                != self.config.runtime.image_digest
+                or transcript_reservation.get(
+                    "source_manifest_sha256"
+                )
+                != state.metadata.get("source_manifest_sha256")
+                or type(
+                    transcript_reservation.get("recipe_artifact_id")
+                )
+                is not str
+                or not transcript_reservation["recipe_artifact_id"]
+                or type(transcript_reservation.get("recipe_sha256"))
+                is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    transcript_reservation["recipe_sha256"],
+                )
+                is None
+                or type(
+                    transcript_reservation.get("recipe_size_bytes")
+                )
+                is not int
+                or not 1
+                <= transcript_reservation["recipe_size_bytes"]
+                <= DATA_TRANSCRIPT_V1_MAX_DOCUMENT_BYTES
+                or type(
+                    transcript_reservation.get(
+                        "reset_commitment_sha256"
+                    )
+                )
+                is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    transcript_reservation[
+                        "reset_commitment_sha256"
+                    ],
+                )
+                is None
+                or not replay_shape_valid
+                or transcript_reservation.get(
+                    "candidate_authorized"
+                )
+                is not False
+                or transcript_reservation.get(
+                    "automatic_submission_authorized"
+                )
+                is not False
+            ):
+                raise EngineError(
+                    "managed transcript reservation is invalid"
+                )
+            transcript_history = state.extra.get(
+                DATA_TRANSCRIPT_STATE_KEY, {}
+            )
+            if (
+                type(transcript_history) is not dict
+                or len(transcript_history)
+                >= DATA_TRANSCRIPT_MAX_HISTORY
+                or transcript_attempt_id in transcript_history
+            ):
+                raise EngineError(
+                    "managed transcript history is invalid or full"
+                )
         history = state.extra.get(MANAGED_ORACLE_PREISSUE_STATE_KEY)
         if type(history) is not dict:
             raise EngineError("managed oracle preissue is unavailable")
@@ -22361,15 +22668,45 @@ class ChallengeEngine:
             (item for item in state.experiments if item.id == experiment_id),
             None,
         )
+        reservation_recipe_matches = (
+            [
+                item
+                for item in state.artifacts
+                if item.id
+                == transcript_reservation.get("recipe_artifact_id")
+                and item.source_run_id == builder_run_id
+                and item.sha256
+                == transcript_reservation.get("recipe_sha256")
+                and item.size
+                == transcript_reservation.get("recipe_size_bytes")
+            ]
+            if reservation_enabled
+            and type(transcript_reservation) is dict
+            else []
+        )
         if (
             builder_run is None
             or builder_run.role != Role.BUILDER.value
             or builder_run.origin is not RunOrigin.MANAGED_MODEL
             or builder_run.status is not RunStatus.COMPLETED
-            or builder_run.base_revision < int(record["issue_revision"])
+            or builder_run.base_revision <= int(record["issue_revision"])
             or experiment is None
             or experiment.source_run_id != builder_run_id
             or experiment.status is not ExperimentStatus.RUNNING
+            or (
+                reservation_enabled
+                and (
+                    len(reservation_recipe_matches) != 1
+                    or transcript_reservation.get(
+                        "oracle_preissue_sha256"
+                    )
+                    != record["oracle_seal_sha256"]
+                    or transcript_reservation.get(
+                        "reset_commitment_sha256"
+                    )
+                    != record.get("reset_commitment_sha256")
+                )
+            )
         ):
             raise EngineError(
                 "managed oracle was not issued before its Builder subject"
@@ -22457,6 +22794,8 @@ class ChallengeEngine:
                 "oracle/variant-expected-output-source.bin"
             ),
             "verifier_tool": "oracle/verifier.py",
+            "transcript_peer": "oracle/peer",
+            "transcript_peer_data": "oracle/peer-data.bin",
         }
         bound_artifacts: list[ArtifactReference] = []
         for expected_input in manifest.inputs:
@@ -22527,6 +22866,9 @@ class ChallengeEngine:
             current_history = current.extra.get(
                 MANAGED_ORACLE_PREISSUE_STATE_KEY
             )
+            current_transcript_history = current.extra.get(
+                DATA_TRANSCRIPT_STATE_KEY, {}
+            )
             current_builder = next(
                 (
                     item
@@ -22543,6 +22885,26 @@ class ChallengeEngine:
                 ),
                 None,
             )
+            current_reservation_recipe_matches = (
+                [
+                    item
+                    for item in current.artifacts
+                    if item.id
+                    == transcript_reservation.get(
+                        "recipe_artifact_id"
+                    )
+                    and item.source_run_id == builder_run_id
+                    and item.sha256
+                    == transcript_reservation.get("recipe_sha256")
+                    and item.size
+                    == transcript_reservation.get(
+                        "recipe_size_bytes"
+                    )
+                ]
+                if reservation_enabled
+                and type(transcript_reservation) is dict
+                else []
+            )
             if (
                 type(current_history) is not dict
                 or current_history.get(preissue_id) != raw_record
@@ -22553,6 +22915,22 @@ class ChallengeEngine:
                 or current_experiment is None
                 or current_experiment.status is not ExperimentStatus.RUNNING
                 or current_experiment.source_run_id != builder_run_id
+                or (
+                    reservation_enabled
+                    and (
+                        type(current_transcript_history) is not dict
+                        or len(current_transcript_history)
+                        >= DATA_TRANSCRIPT_MAX_HISTORY
+                        or transcript_attempt_id
+                        in current_transcript_history
+                        or len(
+                            current_reservation_recipe_matches
+                        )
+                        != 1
+                        or current_reservation_recipe_matches[0]
+                        != reservation_recipe_matches[0]
+                    )
+                )
             ):
                 raise EngineError(
                     "managed oracle binding changed before consume"
@@ -22572,6 +22950,16 @@ class ChallengeEngine:
             current.extra[
                 MANAGED_ORACLE_PREISSUE_STATE_KEY
             ] = next_history
+            if reservation_enabled:
+                next_transcript_history = copy.deepcopy(
+                    current_transcript_history
+                )
+                next_transcript_history[str(transcript_attempt_id)] = (
+                    copy.deepcopy(dict(transcript_reservation or {}))
+                )
+                current.extra[
+                    DATA_TRANSCRIPT_STATE_KEY
+                ] = next_transcript_history
 
         try:
             self.store.update(
@@ -26902,6 +27290,64 @@ class ChallengeEngine:
             _session_owned=_session_owned,
         )
 
+    def prove_rev_runtime_accepted_input(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        runtime_spec_locator: str,
+        accepted_input_path: Path,
+        expected_oracle: Mapping[str, object],
+        timeout_seconds: int = 300,
+        _session_owned: bool = False,
+    ) -> tuple[ChallengeState, dict[str, object]]:
+        """Run the hash-bound multi-runtime Rev accepted-input 3+3 oracle."""
+
+        from ctf_os.engine.rev_runtime_proof import (
+            prove_rev_runtime_accepted_input,
+        )
+
+        return prove_rev_runtime_accepted_input(
+            self,
+            identity,
+            runtime_spec_locator=runtime_spec_locator,
+            accepted_input_path=accepted_input_path,
+            expected_oracle=expected_oracle,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+        )
+
+    def prove_data_transcript(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        recipe_locator: str,
+        recipe_artifact_id: str,
+        recipe_sha256: str,
+        recipe_size_bytes: int,
+        oracle_preissue_id: str,
+        _session_owned: bool = False,
+        _managed_builder_run_id: str | None = None,
+        _managed_experiment_id: str | None = None,
+    ) -> tuple[ChallengeState, Any]:
+        """Run one managed Crypto/Misc data-transcript 3+3 matrix."""
+
+        from ctf_os.engine.data_transcript_hotpath import (
+            prove_data_transcript,
+        )
+
+        return prove_data_transcript(
+            self,
+            identity,
+            recipe_locator=recipe_locator,
+            recipe_artifact_id=recipe_artifact_id,
+            recipe_sha256=recipe_sha256,
+            recipe_size_bytes=recipe_size_bytes,
+            oracle_preissue_id=oracle_preissue_id,
+            _session_owned=_session_owned,
+            _managed_builder_run_id=_managed_builder_run_id,
+            _managed_experiment_id=_managed_experiment_id,
+        )
+
     def prove_crypto_metamorphic_candidate(
         self,
         identity: ChallengeIdentity,
@@ -29631,6 +30077,11 @@ class ChallengeEngine:
     ) -> ChallengeState:
         """Recover crash-left notifications and orphaned tool experiments."""
 
+        from ctf_os.engine.data_transcript_hotpath import (
+            recover_data_transcript_attempts,
+        )
+
+        recover_data_transcript_attempts(self, identity)
         initial = self.store.load(identity, recover=False)
         if str(get_adapter(initial.category).name) == "pwn":
             self._advance_pwn_runtime_snapshot_disclosures(identity)

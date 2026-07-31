@@ -34,6 +34,7 @@ from ctf_os.store.atomic import (
 DEFAULT_CHALLENGE_STORAGE_QUOTA_BYTES = 64 * 1024 * 1024 * 1024
 DEFAULT_STORAGE_SCAN_MAX_BYTES = 256 * 1024 * 1024 * 1024
 DEFAULT_STORAGE_SCAN_MAX_ENTRIES = 100_000
+DEFAULT_STORAGE_TRANSIENT_SCAN_RETRIES = 2
 MAX_QUARANTINE_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_PURGE_STATE_BYTES = 32 * 1024 * 1024
 MAX_STORAGE_ISSUES = 64
@@ -41,6 +42,25 @@ MAX_STORAGE_ISSUES = 64
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _QUARANTINE_ID = re.compile(r"^Q-[0-9a-f]{32}$")
 _ALLOWED_STORAGE_ROOTS = frozenset({"artifacts", "proof", "runs"})
+_PRESERVED_STORAGE_ROOTS = frozenset(
+    {"context", "exports", "knowledge", "runtime"}
+)
+_ACCOUNTED_STORAGE_ROOTS = (
+    "runs",
+    "artifacts",
+    "proof",
+    "runtime",
+    "context",
+    "knowledge",
+    "exports",
+)
+_TRANSIENT_SCAN_ISSUE_CODES = frozenset(
+    {
+        "directory_changed_during_scan",
+        "entry_changed_during_scan",
+        "file_changed_during_scan",
+    }
+)
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | os.O_CLOEXEC
@@ -70,6 +90,12 @@ class _PurgeAttestationError(StorageError):
 def _positive_integer(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _nonnegative_integer(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
     return value
 
 
@@ -386,6 +412,13 @@ def _storage_class(
     reachable: set[str],
     reachable_prefixes: tuple[str, ...],
 ) -> tuple[str, str, bool]:
+    root = relative.split("/", 1)[0]
+    # These roots contain engine-owned continuity, staging, snapshot, context,
+    # and export payloads.  They count toward the challenge quota, but are
+    # deliberately preserved: the GC path allowlist remains limited to
+    # runs/artifacts/proof and can never move or purge one of these files.
+    if root in _PRESERVED_STORAGE_ROOTS:
+        return root, "canonical", True
     is_reachable = relative in reachable or relative.startswith(
         reachable_prefixes
     )
@@ -395,7 +428,6 @@ def _storage_class(
             "canonical" if is_reachable else "quarantine",
             is_reachable,
         )
-    root = relative.split("/", 1)[0]
     return (
         root,
         "canonical" if is_reachable else "noncanonical",
@@ -457,7 +489,7 @@ def _scan_storage(
     scanned_bytes = 0
     halted = False
 
-    for root_name in ("runs", "artifacts", "proof"):
+    for root_name in _ACCOUNTED_STORAGE_ROOTS:
         if halted:
             break
         root_path = paths.root / root_name
@@ -881,14 +913,23 @@ def _inventory_from_state(
     else:
         quota_status = "indeterminate"
     roots: dict[str, dict[str, int]] = {}
-    for scope in ("runs", "artifacts", "proof", "quarantine"):
+    for scope in (
+        "runs",
+        "artifacts",
+        "proof",
+        "quarantine",
+        "runtime",
+        "context",
+        "knowledge",
+        "exports",
+    ):
         scoped = [item for item in files if item["scope"] == scope]
         roots[scope] = {
             "files": len(scoped),
             "bytes": sum(item["bytes"] for item in scoped),
         }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "identity": identity.key,
         "state_revision": state.revision,
         "scan_complete": scan["scan_complete"],
@@ -949,19 +990,79 @@ def enforce_storage_quota(
     quota_bytes: int = DEFAULT_CHALLENGE_STORAGE_QUOTA_BYTES,
     max_entries: int = DEFAULT_STORAGE_SCAN_MAX_ENTRIES,
     max_scan_bytes: int = DEFAULT_STORAGE_SCAN_MAX_BYTES,
+    additional_bytes: int = 0,
+    transient_scan_retries: int = DEFAULT_STORAGE_TRANSIENT_SCAN_RETRIES,
 ) -> dict[str, Any]:
-    report = storage_inventory(
-        store,
-        identity,
-        quota_bytes=quota_bytes,
-        max_entries=max_entries,
-        max_scan_bytes=max_scan_bytes,
+    """Fail closed unless the current and projected totals fit the quota.
+
+    This is an admission check, not a filesystem reservation.  A writer must
+    already own the challenge session lock and retain it through its write and
+    canonical state commit.  Calling this while holding the exclusive state
+    lock would violate the session -> shared-state lock order.
+    """
+
+    quota_bytes = _positive_integer(quota_bytes, "quota_bytes")
+    max_entries = _positive_integer(max_entries, "max_entries")
+    max_scan_bytes = _positive_integer(max_scan_bytes, "max_scan_bytes")
+    additional_bytes = _nonnegative_integer(
+        additional_bytes,
+        "additional_bytes",
     )
+    transient_scan_retries = _nonnegative_integer(
+        transient_scan_retries,
+        "transient_scan_retries",
+    )
+    if transient_scan_retries > DEFAULT_STORAGE_TRANSIENT_SCAN_RETRIES:
+        raise ValueError(
+            "transient_scan_retries exceeds the bounded retry limit"
+        )
+
+    report: dict[str, Any] | None = None
+    retries_used = 0
+    for attempt in range(transient_scan_retries + 1):
+        report = storage_inventory(
+            store,
+            identity,
+            quota_bytes=quota_bytes,
+            max_entries=max_entries,
+            max_scan_bytes=max_scan_bytes,
+        )
+        status = report["quota"]["status"]
+        issues = report["scan"]["issues"]
+        retryable = (
+            status == "indeterminate"
+            and bool(issues)
+            and all(
+                isinstance(issue, dict)
+                and issue.get("code") in _TRANSIENT_SCAN_ISSUE_CODES
+                for issue in issues
+            )
+        )
+        if not retryable or attempt == transient_scan_retries:
+            retries_used = attempt
+            break
+    if report is None:  # pragma: no cover - loop always runs once.
+        raise AssertionError("storage quota inventory did not run")
+
     status = report["quota"]["status"]
+    observed_bytes = report["total_bytes"]
+    projected_bytes = observed_bytes + additional_bytes
+    report["quota"].update(
+        {
+            "additional_bytes": additional_bytes,
+            "projected_bytes": projected_bytes,
+            "transient_scan_retries_used": retries_used,
+        }
+    )
     if status == "exceeded":
         raise StorageQuotaError(
             f"challenge storage quota exceeded: "
-            f"{report['total_bytes']} > {quota_bytes} bytes"
+            f"{observed_bytes} > {quota_bytes} bytes"
+        )
+    if projected_bytes > quota_bytes:
+        raise StorageQuotaError(
+            "challenge storage quota would be exceeded by the requested "
+            f"write: {projected_bytes} > {quota_bytes} bytes"
         )
     if status != "within":
         raise StorageQuotaError(
@@ -2137,6 +2238,7 @@ __all__ = [
     "DEFAULT_CHALLENGE_STORAGE_QUOTA_BYTES",
     "DEFAULT_STORAGE_SCAN_MAX_BYTES",
     "DEFAULT_STORAGE_SCAN_MAX_ENTRIES",
+    "DEFAULT_STORAGE_TRANSIENT_SCAN_RETRIES",
     "StorageError",
     "StorageQuotaError",
     "enforce_storage_quota",

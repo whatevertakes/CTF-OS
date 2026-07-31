@@ -244,6 +244,171 @@ int main(int argc, char **argv) {
                 self.assertNotIn("LD_PRELOAD", environment)
                 self.assertEqual(environment["HOME"], "/nonexistent")
 
+    def test_java_jar_manifest_and_explicit_main_classpaths_are_exact(
+        self,
+    ) -> None:
+        source = _binding("app/oracle.jar", b"PK\x03\x04jar")
+        dependency = _binding("lib/helper.jar", b"PK\x03\x04dependency")
+        manifest_spec = build_rev_runtime_v1_spec(
+            format="java-jar",
+            runtime="java",
+            source=source,
+            dependencies=(dependency,),
+            argv=("--mode", "proof"),
+            working_directory="app",
+        )
+        explicit_spec = build_rev_runtime_v1_spec(
+            format="java-jar",
+            runtime="java",
+            source=source,
+            dependencies=(dependency,),
+            argv=("--mode", "proof"),
+            working_directory="app",
+            main_class="ctf.Main",
+        )
+
+        manifest_command, _, _ = runtime_exec._runtime_invocation(
+            runtime_exec._parse_spec(manifest_spec.canonical_bytes)
+        )
+        explicit_command, _, _ = runtime_exec._runtime_invocation(
+            runtime_exec._parse_spec(explicit_spec.canonical_bytes)
+        )
+
+        self.assertEqual(
+            manifest_command,
+            (
+                "/usr/bin/java",
+                "-jar",
+                "/challenge/app/oracle.jar",
+                "--mode",
+                "proof",
+            ),
+        )
+        self.assertEqual(
+            explicit_command,
+            (
+                "/usr/bin/java",
+                "-cp",
+                (
+                    "/challenge/app/oracle.jar:"
+                    "/challenge/app:"
+                    "/challenge/lib/helper.jar"
+                ),
+                "ctf.Main",
+                "--mode",
+                "proof",
+            ),
+        )
+
+    @unittest.skipUnless(
+        shutil.which("javac")
+        and shutil.which("jar")
+        and Path("/usr/bin/java").is_file(),
+        "JDK tools are unavailable",
+    )
+    def test_java_jar_manifest_and_explicit_main_positive_control(
+        self,
+    ) -> None:
+        source_root = self.root / "java-source" / "ctf"
+        source_root.mkdir(parents=True)
+        source_file = source_root / "Main.java"
+        source_file.write_text(
+            """
+package ctf;
+import java.nio.charset.StandardCharsets;
+public final class Main {
+    public static void main(String[] args) throws Exception {
+        byte[] input = System.in.readAllBytes();
+        boolean accepted = args.length == 2
+            && args[0].equals("--mode")
+            && args[1].equals("proof")
+            && new String(input, StandardCharsets.UTF_8).equals("secret\\n");
+        System.out.print(accepted ? "accepted\\n" : "rejected\\n");
+        if (!accepted) {
+            System.exit(7);
+        }
+    }
+}
+""".lstrip(),
+            encoding="utf-8",
+        )
+        classes = self.root / "java-classes"
+        classes.mkdir()
+        compiled = subprocess.run(
+            (
+                shutil.which("javac") or "javac",
+                "-d",
+                str(classes),
+                str(source_file),
+            ),
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+
+        for name, explicit_main in (
+            ("manifest", False),
+            ("explicit", True),
+        ):
+            with self.subTest(mode=name):
+                jar_path = self.challenge / f"{name}.jar"
+                command = [
+                    shutil.which("jar") or "jar",
+                    "--create",
+                    "--file",
+                    str(jar_path),
+                ]
+                if not explicit_main:
+                    command.extend(("--main-class", "ctf.Main"))
+                command.extend(("-C", str(classes), "."))
+                archived = subprocess.run(
+                    command,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(archived.returncode, 0, archived.stderr)
+                payload = jar_path.read_bytes()
+                spec = build_rev_runtime_v1_spec(
+                    format="java-jar",
+                    runtime="java",
+                    source=_binding(jar_path.name, payload),
+                    argv=("--mode", "proof"),
+                    main_class=("ctf.Main" if explicit_main else None),
+                )
+                parsed = runtime_exec._parse_spec(spec.canonical_bytes)
+                invocation, _, environment = (
+                    runtime_exec._runtime_invocation(parsed)
+                )
+                translated = tuple(
+                    value.replace(
+                        "/challenge",
+                        str(self.challenge),
+                    )
+                    for value in invocation
+                )
+                environment["TMPDIR"] = str(self.work)
+
+                positive = subprocess.run(
+                    translated,
+                    input=b"secret\n",
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+                self.assertEqual(positive.returncode, 0, positive.stderr)
+                self.assertEqual(positive.stdout, b"accepted\n")
+
+                control = subprocess.run(
+                    translated,
+                    input=b"secreu\n",
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                )
+                self.assertEqual(control.returncode, 7, control.stderr)
+                self.assertEqual(control.stdout, b"rejected\n")
+                jar_path.unlink()
+
     def test_dex_and_apk_are_rejected_before_spawn(self) -> None:
         for binary_format, payload in (
             ("dex", b"dex\n035\x00" + b"\x00" * 64),

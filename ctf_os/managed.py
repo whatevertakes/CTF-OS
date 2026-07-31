@@ -32,6 +32,7 @@ from ctf_os.capabilities import (
 from ctf_os.codex import Role
 from ctf_os.codex.contracts import (
     MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
+    MANAGED_DATA_TRANSCRIPT_ACTION_KIND,
     MANAGED_FORENSIC_ASSERTION_ACTION_KIND,
     MANAGED_MISC_TRANSFORM_ACTION_KIND,
     MANAGED_PWN_CRASH_ACTION_KIND,
@@ -41,6 +42,12 @@ from ctf_os.codex.contracts import (
     MANAGED_TYPED_GATE_ACTION_KINDS,
     MANAGED_WEB_ACTIVE_PROBE_ACTION_KIND,
     MANAGED_WEB_IMPACT_ACTION_KIND,
+)
+from ctf_os.contracts.data_transcript_v1 import (
+    DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT,
+    DATA_TRANSCRIPT_V1_MAX_DOCUMENT_BYTES,
+    DataTranscriptContractError,
+    parse_data_transcript_v1_recipe,
 )
 from ctf_os.contracts.managed_rejection_v1 import (
     MANAGED_REJECTION_V1_MAX_ATTEMPT,
@@ -76,7 +83,9 @@ from ctf_os.engine.failure_capsule import (
 )
 from ctf_os.engine.managed_oracle_preissue import (
     MANAGED_ORACLE_PREISSUE_CRYPTO,
+    MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT,
     MANAGED_ORACLE_PREISSUE_MISC,
+    MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT,
     MANAGED_ORACLE_PREISSUE_STATE_KEY,
     ManagedOraclePreissueError,
     validate_public_record as validate_managed_oracle_preissue_public_record,
@@ -226,6 +235,9 @@ _MANAGED_TYPED_GATE_PATH_FIELDS = {
     MANAGED_MISC_TRANSFORM_ACTION_KIND: (
         "spec_artifact_path",
     ),
+    MANAGED_DATA_TRANSCRIPT_ACTION_KIND: (
+        "recipe_artifact_path",
+    ),
 }
 _MANAGED_TYPED_GATE_KEYS = {
     MANAGED_PWN_EXPLOIT_EFFECT_ACTION_KIND: frozenset(
@@ -304,6 +316,13 @@ _MANAGED_TYPED_GATE_KEYS = {
             "candidate_id",
             "spec_artifact_path",
             "oracle_preissue_id",
+        }
+    ),
+    MANAGED_DATA_TRANSCRIPT_ACTION_KIND: frozenset(
+        {
+            "kind",
+            "oracle_preissue_id",
+            "recipe_artifact_path",
         }
     ),
 }
@@ -523,6 +542,15 @@ def _safe_managed_artifact_locator(value: object) -> str | None:
     return value
 
 
+def _managed_typed_gate_category_matches(
+    kind: str,
+    adapter_name: str,
+) -> bool:
+    if kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+        return adapter_name in {"crypto", "misc"}
+    return _MANAGED_TYPED_GATE_CATEGORIES.get(kind) == adapter_name
+
+
 def _managed_typed_gate_action_shape_error(
     action: object,
 ) -> str | None:
@@ -536,7 +564,11 @@ def _managed_typed_gate_action_shape_error(
         or kind not in MANAGED_TYPED_GATE_ACTION_KINDS
         or set(action) != _MANAGED_TYPED_GATE_KEYS[kind]
         or (
-            kind != MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND
+            kind
+            not in {
+                MANAGED_REV_ACCEPTED_INPUT_ACTION_KIND,
+                MANAGED_DATA_TRANSCRIPT_ACTION_KIND,
+            }
             and type(action.get("description")) is not str
         )
     ):
@@ -2266,6 +2298,104 @@ class ManagedOrchestrator:
             None,
         )
 
+    def _bind_managed_data_transcript_recipe(
+        self,
+        identity: ChallengeIdentity,
+        state: ChallengeState,
+        artifact_bindings: Mapping[str, object],
+        *,
+        oracle_preissue_id: object,
+    ) -> tuple[dict[str, object] | None, str | None]:
+        """Bind a closed transcript recipe to one unused private preissue."""
+
+        if set(artifact_bindings) != {"recipe_artifact_path"}:
+            return None, "typed_gate_artifact_unbound"
+        binding = artifact_bindings.get("recipe_artifact_path")
+        if type(binding) is not dict:
+            return None, "typed_gate_artifact_unbound"
+        locator = _safe_managed_artifact_locator(binding.get("locator"))
+        digest = binding.get("sha256")
+        size = binding.get("size_bytes")
+        if (
+            locator is None
+            or type(digest) is not str
+            or type(size) is not int
+            or not 1 <= size <= DATA_TRANSCRIPT_V1_MAX_DOCUMENT_BYTES
+            or type(oracle_preissue_id) is not str
+        ):
+            return None, "typed_gate_recipe_invalid"
+        workspace = (
+            self.engine.store.challenge_paths(identity).artifacts
+            / "workspace"
+        )
+        try:
+            payload = read_bounded_regular(
+                workspace,
+                locator,
+                maximum_bytes=DATA_TRANSCRIPT_V1_MAX_DOCUMENT_BYTES,
+                expected_sha256=digest,
+                expected_size=size,
+            )
+            recipe = parse_data_transcript_v1_recipe(payload)
+            history = state.extra.get(MANAGED_ORACLE_PREISSUE_STATE_KEY)
+            raw_preissue = (
+                history.get(oracle_preissue_id)
+                if type(history) is dict
+                else None
+            )
+            preissue = validate_managed_oracle_preissue_public_record(
+                raw_preissue
+            )
+        except (
+            OSError,
+            SafeFileError,
+            DataTranscriptContractError,
+            ManagedOraclePreissueError,
+        ):
+            return None, "typed_gate_recipe_invalid"
+        category = get_adapter(state.category).name
+        expected_kind = (
+            MANAGED_ORACLE_PREISSUE_CRYPTO_TRANSCRIPT
+            if category == "crypto"
+            else MANAGED_ORACLE_PREISSUE_MISC_TRANSCRIPT
+            if category == "misc"
+            else None
+        )
+        if (
+            expected_kind is None
+            or recipe.canonical_bytes != payload
+            or recipe.sha256 != digest
+            or recipe.category != category
+            or recipe.preissue_id != oracle_preissue_id
+            or preissue.get("preissue_id") != oracle_preissue_id
+            or preissue.get("kind") != expected_kind
+            or preissue.get("status") != "unused"
+            or preissue.get("issuer") != "operator"
+            or preissue.get("configuration_epoch")
+            != state.configuration_epoch
+            or preissue.get("source_manifest_sha256")
+            != state.metadata.get("source_manifest_sha256")
+            or preissue.get("image_digest")
+            != self.engine.config.runtime.image_digest
+            or preissue.get("reset_commitment_sha256")
+            != recipe.reset_commitment_sha256
+        ):
+            return None, "typed_gate_oracle_preissue_invalid"
+        return (
+            {
+                "oracle_preissue_id": oracle_preissue_id,
+                "recipe_contract_fingerprint": (
+                    DATA_TRANSCRIPT_V1_CONTRACT_FINGERPRINT
+                ),
+                "recipe_sha256": recipe.sha256,
+                "recipe_size_bytes": len(recipe.canonical_bytes),
+                "reset_commitment_sha256": (
+                    recipe.reset_commitment_sha256
+                ),
+            },
+            None,
+        )
+
     def _execute_typed_gate_experiment(
         self,
         identity: ChallengeIdentity,
@@ -2422,6 +2552,28 @@ class ManagedOrchestrator:
             ):
                 raise ManagedError(
                     "managed Pwn interaction recipe changed"
+                )
+        elif kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+            transcript_reference, transcript_error = (
+                self._bind_managed_data_transcript_recipe(
+                    identity,
+                    current,
+                    bindings,
+                    oracle_preissue_id=request.get(
+                        "oracle_preissue_id"
+                    ),
+                )
+            )
+            if (
+                transcript_error is not None
+                or transcript_reference is None
+                or any(
+                    request.get(field) != value
+                    for field, value in transcript_reference.items()
+                )
+            ):
+                raise ManagedError(
+                    "managed data transcript recipe changed"
                 )
 
         def mark_running(state: ChallengeState) -> None:
@@ -2605,6 +2757,32 @@ class ManagedOrchestrator:
                 passed = bool(evaluation.passed)
                 reason_codes = tuple(evaluation.failure_codes)
                 evaluation_sha256 = str(evaluation.sha256)
+            elif kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+                recipe_binding = bindings["recipe_artifact_path"]
+                _state, evaluation = self.engine.prove_data_transcript(
+                    identity,
+                    recipe_locator=locators[
+                        "recipe_artifact_path"
+                    ],
+                    recipe_artifact_id=str(
+                        recipe_binding["artifact_id"]
+                    ),
+                    recipe_sha256=str(recipe_binding["sha256"]),
+                    recipe_size_bytes=int(
+                        recipe_binding["size_bytes"]
+                    ),
+                    oracle_preissue_id=str(
+                        request["oracle_preissue_id"]
+                    ),
+                    _session_owned=True,
+                    _managed_builder_run_id=source_run.id,
+                    _managed_experiment_id=experiment_id,
+                )
+                passed = bool(evaluation.passed)
+                reason_codes = (str(evaluation.reason_code),)
+                evaluation_sha256 = hashlib.sha256(
+                    evaluation.canonical_bytes()
+                ).hexdigest()
             else:  # pragma: no cover - guarded by the exact kind check.
                 raise ManagedError("unsupported managed typed gate")
         except Exception as error:
@@ -2630,6 +2808,125 @@ class ManagedOrchestrator:
             for item in terminal.runs
             if item.id not in prior_run_ids
         )
+
+        if kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+            target = next(
+                (
+                    item
+                    for item in terminal.experiments
+                    if item.id == experiment_id
+                ),
+                None,
+            )
+            result = target.result if target is not None else None
+            result_artifact_ids = (
+                result.get("evidence_artifact_ids")
+                if type(result) is dict
+                else None
+            )
+            result_run_ids = (
+                result.get("evidence_run_ids")
+                if type(result) is dict
+                else None
+            )
+            if (
+                target is not None
+                and target.status
+                in {
+                    ExperimentStatus.COMPLETED,
+                    ExperimentStatus.FAILED,
+                }
+                and type(result) is dict
+                and set(result)
+                == {
+                    "action_kind",
+                    "authority",
+                    "evaluation_sha256",
+                    "evidence_artifact_ids",
+                    "evidence_run_ids",
+                    "execution_error_type",
+                    "passed",
+                    "reason_codes",
+                    "schema_version",
+                }
+            ):
+                artifact_ids = {item.id for item in terminal.artifacts}
+                run_ids = {item.id for item in terminal.runs}
+                terminal_passed = result.get("passed")
+                reason_values = result.get("reason_codes")
+                terminal_status_exact = (
+                    terminal_passed is True
+                    and target.status is ExperimentStatus.COMPLETED
+                ) or (
+                    terminal_passed is False
+                    and target.status is ExperimentStatus.FAILED
+                )
+                if (
+                    result["schema_version"] == 1
+                    and result["action_kind"] == kind
+                    and result["authority"]
+                    == "engine_deterministic_gate"
+                    and terminal_status_exact
+                    and type(reason_values) is list
+                    and bool(reason_values)
+                    and all(
+                        type(item) is str
+                        and bool(item)
+                        and len(item) <= 160
+                        for item in reason_values
+                    )
+                    and (
+                        (
+                            terminal_passed is True
+                            and type(
+                                result["evaluation_sha256"]
+                            )
+                            is str
+                            and len(result["evaluation_sha256"]) == 64
+                            and result["execution_error_type"] is None
+                        )
+                        or (
+                            terminal_passed is False
+                            and result["evaluation_sha256"] is None
+                            and type(
+                                result["execution_error_type"]
+                            )
+                            is str
+                            and bool(result["execution_error_type"])
+                        )
+                    )
+                    and type(result_artifact_ids) is list
+                    and len(result_artifact_ids)
+                    == len(set(result_artifact_ids))
+                    and all(
+                        type(item) is str and item in artifact_ids
+                        for item in result_artifact_ids
+                    )
+                    and set(result_artifact_ids).issubset(
+                        target.artifact_ids
+                    )
+                    and result_artifact_ids
+                    == list(evidence_artifact_ids)
+                    and type(result_run_ids) is list
+                    and len(result_run_ids)
+                    == len(set(result_run_ids))
+                    and all(
+                        type(item) is str and item in run_ids
+                        for item in result_run_ids
+                    )
+                    and result_run_ids == list(evidence_run_ids)
+                ):
+                    return terminal
+                raise ManagedError(
+                    "managed data transcript terminal result is invalid"
+                )
+            if (
+                target is not None
+                and target.status is not ExperimentStatus.RUNNING
+            ):
+                raise ManagedError(
+                    "managed data transcript changed during execution"
+                )
 
         def mark_terminal(state: ChallengeState) -> None:
             target = next(
@@ -2778,8 +3075,10 @@ class ManagedOrchestrator:
                     and kind in MANAGED_TYPED_GATE_ACTION_KINDS
                     and _managed_typed_gate_action_shape_error(action)
                     is None
-                    and _MANAGED_TYPED_GATE_CATEGORIES.get(str(kind))
-                    == adapter_name
+                    and _managed_typed_gate_category_matches(
+                        str(kind),
+                        adapter_name,
+                    )
                     and wave.kind is WaveKind.ATTACK
                 ):
                     relative_paths = tuple(
@@ -3324,10 +3623,11 @@ class ManagedOrchestrator:
             if not isinstance(kind, str):
                 reject(run, index, "typed_gate_action_invalid")
                 return
-            expected_category = _MANAGED_TYPED_GATE_CATEGORIES.get(kind)
             if (
-                expected_category is None
-                or get_adapter(state.category).name != expected_category
+                not _managed_typed_gate_category_matches(
+                    kind,
+                    get_adapter(state.category).name,
+                )
             ):
                 reject(run, index, "typed_gate_wrong_category")
                 return
@@ -3562,6 +3862,49 @@ class ManagedOrchestrator:
                         timeout,
                     ),
                 }
+            elif kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+                transcript_reference, transcript_error = (
+                    self._bind_managed_data_transcript_recipe(
+                        identity,
+                        state,
+                        artifact_bindings,
+                        oracle_preissue_id=action.get(
+                            "oracle_preissue_id"
+                        ),
+                    )
+                )
+                oracle_preissue_id = action.get("oracle_preissue_id")
+                history = state.extra.get(
+                    MANAGED_ORACLE_PREISSUE_STATE_KEY
+                )
+                raw_preissue = (
+                    history.get(oracle_preissue_id)
+                    if type(history) is dict
+                    and type(oracle_preissue_id) is str
+                    else None
+                )
+                try:
+                    preissue = (
+                        validate_managed_oracle_preissue_public_record(
+                            raw_preissue
+                        )
+                    )
+                except ManagedOraclePreissueError:
+                    preissue = {}
+                if (
+                    transcript_error is not None
+                    or transcript_reference is None
+                    or run.base_revision
+                    <= int(preissue.get("issue_revision", 0))
+                ):
+                    reject(
+                        run,
+                        index,
+                        transcript_error
+                        or "typed_gate_oracle_preissue_invalid",
+                    )
+                    return
+                reference = transcript_reference
             elif kind in {
                 MANAGED_CRYPTO_METAMORPHIC_ACTION_KIND,
                 MANAGED_MISC_TRANSFORM_ACTION_KIND,
@@ -3617,7 +3960,7 @@ class ManagedOrchestrator:
                     or preissue.get("image_digest")
                     != self.engine.config.runtime.image_digest
                     or run.base_revision
-                    < int(preissue.get("issue_revision", 0))
+                    <= int(preissue.get("issue_revision", 0))
                 ):
                     reject(run, index, "typed_gate_oracle_preissue_invalid")
                     return
@@ -3660,6 +4003,25 @@ class ManagedOrchestrator:
                 str(binding["artifact_id"])
                 for binding in artifact_bindings.values()
             ]
+            if kind == MANAGED_DATA_TRANSCRIPT_ACTION_KIND:
+                private_recipe_ids = set(artifact_ids)
+                private_recipes = [
+                    artifact
+                    for artifact in state.artifacts
+                    if artifact.id in private_recipe_ids
+                ]
+                if (
+                    len(private_recipes) != 1
+                    or private_recipes[0].source_run_id
+                    != invocation.run_id
+                ):
+                    raise ManagedError(
+                        "managed data transcript recipe lost its "
+                        "private artifact binding"
+                    )
+                private_recipes[0].extra[
+                    "context_visibility"
+                ] = "engine_private"
             command = f"{_MANAGED_TYPED_GATE_ENGINE_COMMAND}:{kind}"
             if existing is not None:
                 if (

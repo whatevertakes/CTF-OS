@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import tempfile
 import unittest
@@ -168,6 +169,207 @@ class StorageTests(unittest.TestCase):
                 for item in detached["files"]
             )
         )
+
+    def test_preserved_roots_count_toward_quota_but_never_enter_gc(
+        self,
+    ) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        baseline = storage_inventory(self.store, self.identity)
+        preserved = {
+            "runtime/managed-thread-lanes/lane/work/payload.bin": b"lane",
+            "context/history/cycle.md": b"context",
+            "knowledge/operator-note.bin": b"knowledge",
+            "exports/report.bin": b"export",
+        }
+        preserved_paths = {
+            relative: self.orphan(relative, payload)
+            for relative, payload in preserved.items()
+        }
+        collectable = self.orphan(
+            "artifacts/orphan/collectable.bin",
+            b"collectable",
+        )
+
+        report = storage_inventory(self.store, self.identity)
+        indexed = {item["path"]: item for item in report["files"]}
+        expected_preserved_bytes = sum(
+            len(payload) for payload in preserved.values()
+        )
+        expected_delta = expected_preserved_bytes + len(b"collectable")
+        for relative in preserved:
+            self.assertEqual(indexed[relative]["storage_class"], "canonical")
+            self.assertTrue(indexed[relative]["reachable"])
+            self.assertEqual(
+                indexed[relative]["scope"],
+                relative.split("/", 1)[0],
+            )
+        self.assertEqual(
+            report["total_bytes"] - baseline["total_bytes"],
+            expected_delta,
+        )
+        self.assertEqual(
+            report["totals"]["canonical_bytes"]
+            - baseline["totals"]["canonical_bytes"],
+            expected_preserved_bytes,
+        )
+        self.assertEqual(
+            sum(report["totals"].values()),
+            report["total_bytes"],
+        )
+        for scope in ("runtime", "context", "knowledge", "exports"):
+            self.assertEqual(
+                report["roots"][scope]["bytes"]
+                - baseline["roots"][scope]["bytes"],
+                sum(
+                    len(payload)
+                    for relative, payload in preserved.items()
+                    if relative.startswith(scope + "/")
+                ),
+            )
+
+        candidates = {
+            item["path"]
+            for item in storage_plan(
+                self.store,
+                self.identity,
+            )["candidates"]
+        }
+        self.assertEqual(
+            candidates.intersection(preserved),
+            set(),
+        )
+        self.assertIn(
+            collectable.relative_to(paths.root).as_posix(),
+            candidates,
+        )
+
+        manifest = quarantine_unreachable(self.store, self.identity)
+        moved = {item["path"] for item in manifest["files"]}
+        self.assertIn(
+            collectable.relative_to(paths.root).as_posix(),
+            moved,
+        )
+        self.assertEqual(moved.intersection(preserved), set())
+        self.assertFalse(collectable.exists())
+        self.assertTrue(
+            all(path.is_file() for path in preserved_paths.values())
+        )
+
+    def test_preserved_root_special_file_makes_quota_indeterminate(
+        self,
+    ) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        fifo = paths.runtime / "unexpected.pipe"
+        os.mkfifo(fifo)
+
+        report = storage_inventory(
+            self.store,
+            self.identity,
+            quota_bytes=1024,
+        )
+
+        self.assertFalse(report["scan_complete"])
+        self.assertEqual(report["quota"]["status"], "indeterminate")
+        self.assertIn(
+            "special_file_forbidden",
+            {item["code"] for item in report["scan"]["issues"]},
+        )
+        with self.assertRaisesRegex(StorageQuotaError, "cannot be proven"):
+            enforce_storage_quota(
+                self.store,
+                self.identity,
+                quota_bytes=1024,
+            )
+        with self.assertRaisesRegex(StorageError, "incomplete"):
+            quarantine_unreachable(self.store, self.identity)
+
+    def test_quota_admission_checks_projected_known_write_bytes(self) -> None:
+        self.orphan("artifacts/existing.bin", b"12345678")
+        observed = storage_inventory(
+            self.store,
+            self.identity,
+        )["total_bytes"]
+
+        admitted = enforce_storage_quota(
+            self.store,
+            self.identity,
+            quota_bytes=observed + 4,
+            additional_bytes=4,
+        )
+        self.assertEqual(
+            admitted["quota"]["projected_bytes"],
+            observed + 4,
+        )
+        self.assertEqual(admitted["quota"]["additional_bytes"], 4)
+
+        with self.assertRaisesRegex(
+            StorageQuotaError,
+            "requested write",
+        ):
+            enforce_storage_quota(
+                self.store,
+                self.identity,
+                quota_bytes=observed + 4,
+                additional_bytes=5,
+            )
+        for invalid in (-1, True, 1.5):
+            with (
+                self.subTest(additional_bytes=invalid),
+                self.assertRaises(ValueError),
+            ):
+                enforce_storage_quota(
+                    self.store,
+                    self.identity,
+                    additional_bytes=invalid,
+                )
+
+    def test_quota_admission_retries_only_transient_scan_changes(
+        self,
+    ) -> None:
+        exact = storage_inventory(self.store, self.identity)
+        transient = copy.deepcopy(exact)
+        transient["scan_complete"] = False
+        transient["quota"]["status"] = "indeterminate"
+        transient["quota"]["exact"] = False
+        transient["scan"]["issues"] = [
+            {
+                "code": "directory_changed_during_scan",
+                "path": "runtime/live-mailboxes",
+            }
+        ]
+        with mock.patch(
+            "ctf_os.storage.storage_inventory",
+            side_effect=(transient, exact),
+        ) as inventory:
+            admitted = enforce_storage_quota(
+                self.store,
+                self.identity,
+            )
+        self.assertEqual(inventory.call_count, 2)
+        self.assertEqual(
+            admitted["quota"]["transient_scan_retries_used"],
+            1,
+        )
+
+        unsafe = copy.deepcopy(transient)
+        unsafe["scan"]["issues"] = [
+            {
+                "code": "special_file_forbidden",
+                "path": "runtime/unexpected.pipe",
+            }
+        ]
+        with (
+            mock.patch(
+                "ctf_os.storage.storage_inventory",
+                return_value=unsafe,
+            ) as inventory,
+            self.assertRaisesRegex(StorageQuotaError, "cannot be proven"),
+        ):
+            enforce_storage_quota(
+                self.store,
+                self.identity,
+            )
+        self.assertEqual(inventory.call_count, 1)
 
     def test_inventory_bounds_are_fail_closed(self) -> None:
         self.orphan("artifacts/a.bin", b"A" * 8)

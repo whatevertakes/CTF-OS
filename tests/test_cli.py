@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -7,10 +8,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ctf_os import cli
 from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.engine.rev_runtime_proof import RevRuntimeProofError
 from ctf_os.live_broker import MAX_INSPECT_PAGE_ITEMS
 from ctf_os.models import ChallengeIdentity, GoalStatus, HypothesisStatus
 from ctf_os.sandbox.daemon import CapabilityAuthority
@@ -19,13 +21,66 @@ from ctf_os.store import ChallengeLock, StateStore
 IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
+def _rev_runtime_oracle() -> dict[str, object]:
+    empty = hashlib.sha256(b"").hexdigest()
+
+    def expectation(
+        exit_code: int,
+        stdout_sha256: str,
+    ) -> dict[str, object]:
+        return {
+            "exit_code": exit_code,
+            "stderr_sha256": empty,
+            "stderr_size_bytes": 0,
+            "stdout_sha256": stdout_sha256,
+            "stdout_size_bytes": 8,
+        }
+
+    return {
+        "accepted": expectation(0, "1" * 64),
+        "controls": [
+            {
+                "expectation": expectation(7, digest * 64),
+                "mutation_id": mutation_id,
+            }
+            for mutation_id, digest in (
+                ("xor-first-01", "2"),
+                ("xor-last-80", "3"),
+                ("truncate-last", "4"),
+            )
+        ],
+    }
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
 class CLITests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
+        self.operator_directory = tempfile.TemporaryDirectory(
+            prefix="ctfos-cli-operator-private-"
+        )
         self.root = Path(self.temporary_directory.name)
+        self.operator_input = (
+            Path(self.operator_directory.name) / "accepted-input.bin"
+        )
+        self.operator_input.write_bytes(b"operator-private-input")
+        self.operator_input.chmod(0o600)
         self.identity = ("국내 CTF", "rev", "문제 1")
 
     def tearDown(self) -> None:
+        self.operator_directory.cleanup()
         self.temporary_directory.cleanup()
 
     def run_cli(self, arguments: list[str]) -> tuple[int, str, str]:
@@ -45,6 +100,17 @@ class CLITests(unittest.TestCase):
             ]
         )
         self.assertEqual(status, 0, errors)
+
+    def write_storage_config(self) -> None:
+        directory = self.root / ".ctfos"
+        directory.mkdir(exist_ok=True)
+        (directory / "engine.toml").write_text(
+            "[runtime]\n"
+            "challenge_storage_quota_bytes = 111\n"
+            "storage_scan_max_entries = 222\n"
+            "storage_scan_max_bytes = 333\n",
+            encoding="utf-8",
+        )
 
     def test_human_folder_prompt_status_and_budget_workflow(self) -> None:
         self.add()
@@ -138,6 +204,198 @@ class CLITests(unittest.TestCase):
 
     def test_no_contest_wide_automatic_challenge_runner_is_exposed(self) -> None:
         self.assertNotIn("run-contest", cli.build_parser().format_help())
+
+    def test_rev_runtime_proof_forwards_only_data_and_prints_summary(
+        self,
+    ) -> None:
+        oracle = _rev_runtime_oracle()
+        oracle_path = self.root / "operator-oracle.json"
+        oracle_path.write_bytes(_canonical_json_bytes(oracle))
+        authorities = {
+            "automatic_submission_authorized": False,
+            "candidate_authorized": False,
+            "challenge_status_transition_authorized": False,
+            "flag_proven": False,
+        }
+        result = {
+            "authorities": authorities,
+            "passed": True,
+            "reason_codes": [],
+            "record_count": 6,
+        }
+        state = Mock(revision=41)
+        with (
+            patch(
+                "ctf_os.cli.prove_rev_runtime_accepted_input",
+                return_value=(state, result),
+            ) as prove,
+            patch.object(
+                ChallengeEngine,
+                "record_candidate",
+            ) as candidate,
+            patch.object(
+                ChallengeEngine,
+                "record_manual_submission",
+            ) as submission,
+        ):
+            status, output, errors = self.run_cli(
+                [
+                    "rev-prove-runtime",
+                    *self.identity,
+                    "--runtime-spec",
+                    "private/runtime.json",
+                    "--accepted-input-file",
+                    str(self.operator_input),
+                    "--oracle",
+                    str(oracle_path),
+                    "--timeout",
+                    "77",
+                ]
+            )
+        self.assertEqual(status, 0, errors)
+        prove.assert_called_once_with(
+            unittest.mock.ANY,
+            ChallengeIdentity(*self.identity),
+            runtime_spec_locator="private/runtime.json",
+            accepted_input_path=self.operator_input,
+            expected_oracle=oracle,
+            timeout_seconds=77,
+        )
+        candidate.assert_not_called()
+        submission.assert_not_called()
+        summary = json.loads(output)
+        self.assertEqual(
+            set(summary),
+            {
+                "authorities",
+                "evaluation_sha256",
+                "passed",
+                "reason_codes",
+                "run_count",
+                "state_revision",
+            },
+        )
+        self.assertEqual(summary["authorities"], authorities)
+        self.assertTrue(summary["passed"])
+        self.assertEqual(summary["run_count"], 6)
+        self.assertEqual(summary["state_revision"], 41)
+        self.assertNotIn("private/runtime.json", output)
+        self.assertNotIn(str(self.operator_input), output)
+        self.assertNotIn(str(oracle_path), output)
+
+    def test_rev_runtime_proof_parser_rejects_unbounded_timeout(self) -> None:
+        parser = cli.build_parser()
+        for value in ("0", "-1", "3601", "1.5"):
+            with (
+                self.subTest(timeout=value),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                parser.parse_args(
+                    [
+                        "rev-prove-runtime",
+                        *self.identity,
+                        "--runtime-spec",
+                        "runtime.json",
+                        "--accepted-input-file",
+                        str(self.operator_input),
+                        "--oracle",
+                        "oracle.json",
+                        "--timeout",
+                        value,
+                    ]
+                )
+
+    def test_rev_runtime_proof_rejects_raw_oracle_before_engine(
+        self,
+    ) -> None:
+        secret = "OPEN-SECRET-MUST-NOT-LOG"
+        oracle_path = self.root / "invalid-oracle.json"
+        oracle_path.write_text(
+            json.dumps(
+                {
+                    **_rev_runtime_oracle(),
+                    "accepted_input": secret,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch(
+            "ctf_os.cli.prove_rev_runtime_accepted_input",
+        ) as prove:
+            status, output, errors = self.run_cli(
+                [
+                    "rev-prove-runtime",
+                    *self.identity,
+                    "--runtime-spec",
+                    "runtime.json",
+                    "--accepted-input-file",
+                    str(self.operator_input),
+                    "--oracle",
+                    str(oracle_path),
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn(secret, errors)
+        prove.assert_not_called()
+
+    def test_rev_runtime_duplicate_oracle_key_is_sanitized(self) -> None:
+        secret = "EXPECTED_ORACLE_SECRET_7fbc"
+        oracle_path = self.root / "duplicate-oracle.json"
+        oracle_path.write_text(
+            '{"' + secret + '":1,"' + secret + '":2}\n',
+            encoding="utf-8",
+        )
+        with patch(
+            "ctf_os.cli.prove_rev_runtime_accepted_input",
+        ) as prove:
+            status, output, errors = self.run_cli(
+                [
+                    "rev-prove-runtime",
+                    *self.identity,
+                    "--runtime-spec",
+                    "runtime.json",
+                    "--accepted-input-file",
+                    str(self.operator_input),
+                    "--oracle",
+                    str(oracle_path),
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn(secret, errors)
+        self.assertIn("유효하지 않습니다", errors)
+        prove.assert_not_called()
+
+    def test_rev_runtime_engine_error_is_generic_and_sanitized(self) -> None:
+        oracle = _rev_runtime_oracle()
+        oracle_path = self.root / "operator-oracle.json"
+        oracle_path.write_bytes(_canonical_json_bytes(oracle))
+        secret = "PRIVATE_RUNTIME_ERROR_SECRET"
+        with patch(
+            "ctf_os.cli.prove_rev_runtime_accepted_input",
+            side_effect=RevRuntimeProofError(secret),
+        ):
+            status, output, errors = self.run_cli(
+                [
+                    "rev-prove-runtime",
+                    *self.identity,
+                    "--runtime-spec",
+                    "runtime.json",
+                    "--accepted-input-file",
+                    str(self.operator_input),
+                    "--oracle",
+                    str(oracle_path),
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertEqual(output, "")
+        self.assertNotIn(secret, errors)
+        self.assertEqual(
+            errors,
+            "오류: Rev runtime proof를 안전하게 완료하지 못했습니다.\n",
+        )
 
     def test_status_rejects_non_finite_watch_intervals(self) -> None:
         for value in ("nan", "inf", "-inf"):
@@ -516,6 +774,150 @@ class CLITests(unittest.TestCase):
         status, _, errors = self.run_cli(["pin-image"])
         self.assertNotEqual(status, 0)
         self.assertIn("ctfos init", errors)
+
+    def test_storage_inventory_and_plan_use_runtime_bounds(self) -> None:
+        self.write_storage_config()
+        self.add()
+        identity = ChallengeIdentity(*self.identity)
+
+        with patch(
+            "ctf_os.cli.storage_inventory",
+            return_value={"kind": "inventory"},
+        ) as inventory:
+            status, output, errors = self.run_cli(
+                ["storage", "inventory", *self.identity]
+            )
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output), {"kind": "inventory"})
+        self.assertEqual(inventory.call_args.args[1], identity)
+        self.assertEqual(
+            inventory.call_args.kwargs,
+            {
+                "quota_bytes": 111,
+                "max_entries": 222,
+                "max_scan_bytes": 333,
+            },
+        )
+
+        with patch(
+            "ctf_os.cli.storage_plan",
+            return_value={"kind": "plan"},
+        ) as plan:
+            status, output, errors = self.run_cli(
+                ["storage", "plan", *self.identity]
+            )
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output), {"kind": "plan"})
+        self.assertEqual(plan.call_args.args[1], identity)
+        self.assertEqual(
+            plan.call_args.kwargs,
+            {
+                "quota_bytes": 111,
+                "max_entries": 222,
+                "max_scan_bytes": 333,
+            },
+        )
+
+    def test_top_level_gc_is_the_same_quarantine_only_operation(self) -> None:
+        self.write_storage_config()
+        self.add()
+        report = {
+            "quarantine_id": "Q-" + "1" * 32,
+            "permanent_delete_enabled": False,
+        }
+        with (
+            patch(
+                "ctf_os.cli.quarantine_unreachable",
+                return_value=report,
+            ) as quarantine,
+            patch("ctf_os.cli.purge_quarantine") as purge,
+        ):
+            top_status, top_output, top_errors = self.run_cli(
+                ["gc", *self.identity]
+            )
+            nested_status, nested_output, nested_errors = self.run_cli(
+                ["storage", "gc", *self.identity]
+            )
+
+        self.assertEqual(top_status, 0, top_errors)
+        self.assertEqual(nested_status, 0, nested_errors)
+        self.assertEqual(json.loads(top_output), json.loads(nested_output))
+        self.assertEqual(quarantine.call_count, 2)
+        for call in quarantine.call_args_list:
+            self.assertEqual(
+                call.kwargs,
+                {"max_entries": 222, "max_scan_bytes": 333},
+            )
+        purge.assert_not_called()
+
+    def test_storage_purge_requires_and_forwards_exact_confirmation(
+        self,
+    ) -> None:
+        self.write_storage_config()
+        self.add()
+        quarantine_id = "Q-" + "2" * 32
+        manifest_sha256 = "a" * 64
+        confirmation = (
+            f"PURGE {self.identity[1]}/{self.identity[2]} "
+            f"{quarantine_id} {manifest_sha256}"
+        )
+
+        with patch(
+            "ctf_os.cli.prepare_quarantine_purge",
+            return_value={"confirmation": confirmation},
+        ) as prepare:
+            status, output, errors = self.run_cli(
+                [
+                    "storage",
+                    "purge-prepare",
+                    *self.identity,
+                    quarantine_id,
+                ]
+            )
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output)["confirmation"], confirmation)
+        self.assertEqual(
+            prepare.call_args.kwargs,
+            {"max_verify_bytes": 333},
+        )
+
+        with patch(
+            "ctf_os.cli.purge_quarantine",
+            return_value={"status": "purged"},
+        ) as purge:
+            status, output, errors = self.run_cli(
+                [
+                    "storage",
+                    "purge",
+                    *self.identity,
+                    quarantine_id,
+                    "--manifest-sha256",
+                    manifest_sha256,
+                    "--confirm",
+                    confirmation,
+                ]
+            )
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output), {"status": "purged"})
+        self.assertEqual(
+            purge.call_args.kwargs,
+            {
+                "manifest_sha256": manifest_sha256,
+                "confirmation": confirmation,
+            },
+        )
+
+        with self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(
+                [
+                    "storage",
+                    "purge",
+                    *self.identity,
+                    quarantine_id,
+                    "--manifest-sha256",
+                    manifest_sha256,
+                ]
+            )
 
     def test_tool_rejects_background_start_before_sandbox(self) -> None:
         self.add()

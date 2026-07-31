@@ -778,6 +778,11 @@ def _runtime_invocation(
             )
         else:
             classpath = [
+                *(
+                    [public_source]
+                    if spec["format"] == "java-jar"
+                    else []
+                ),
                 (
                     "/challenge"
                     if options["working_directory"] == "."
