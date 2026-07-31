@@ -117,7 +117,16 @@ def load_json(path):
     except (OSError, UnicodeError, ValueError):
         return {}
 
-def tail(path):
+capture = load_json(job_dir / "stream-capture.json")
+capture_streams = (
+    capture.get("streams")
+    if capture.get("schema_version") == 1
+    else None
+)
+if not isinstance(capture_streams, dict):
+    capture_streams = {}
+
+def tail(name, path):
     try:
         before = path.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -148,12 +157,53 @@ def tail(path):
                 os.close(descriptor)
         except OSError as exc:
             raise SystemExit(f"ctf-log: cannot safely read log {path}: {exc}") from exc
-    return {
+    details = {
         "path": str(path),
         "bytes": size,
+        "stored_bytes": size,
         "tail": data.decode("utf-8", errors="replace"),
         "tail_truncated": size > len(data),
+        "raw_truncated": False,
+        "capture_complete": False,
+        "tail_scope": "stream",
     }
+
+    captured = capture_streams.get(name)
+    if isinstance(captured, dict):
+        try:
+            captured_bytes = captured["bytes"]
+            stored_bytes = captured["stored_bytes"]
+            limit_bytes = captured["limit_bytes"]
+            truncated = captured["truncated"]
+            complete = captured["complete"]
+            if (
+                type(captured_bytes) is not int
+                or type(stored_bytes) is not int
+                or type(limit_bytes) is not int
+                or type(truncated) is not bool
+                or type(complete) is not bool
+                or captured_bytes < 0
+                or stored_bytes < 0
+                or limit_bytes < 0
+                or stored_bytes != size
+                or stored_bytes > captured_bytes
+                or stored_bytes > limit_bytes
+                or truncated != (captured_bytes > stored_bytes)
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise SystemExit("ctf-log: stream capture metadata is invalid")
+        details.update(
+            {
+                "bytes": captured_bytes,
+                "stored_bytes": stored_bytes,
+                "tail_truncated": captured_bytes > len(data),
+                "raw_truncated": truncated,
+                "capture_complete": complete,
+                "tail_scope": "stored_prefix" if truncated else "stream",
+            }
+        )
+    return details
 
 def terminal_safe(value):
     output = []
@@ -167,9 +217,9 @@ def terminal_safe(value):
 status = load_json(job_dir / "status.json")
 streams = {}
 if requested_stream in {"stdout", "both"}:
-    streams["stdout"] = tail(job_dir / "stdout.log")
+    streams["stdout"] = tail("stdout", job_dir / "stdout.log")
 if requested_stream in {"stderr", "both"}:
-    streams["stderr"] = tail(job_dir / "stderr.log")
+    streams["stderr"] = tail("stderr", job_dir / "stderr.log")
 
 payload = {
     "schema_version": 1,
@@ -183,7 +233,10 @@ if json_mode == "1":
 else:
     print(f"{job_id}: {payload['status']}")
     for name, details in streams.items():
-        marker = " [tail; truncated]" if details["tail_truncated"] else ""
+        if details["raw_truncated"]:
+            marker = " [stored prefix; output limit exceeded]"
+        else:
+            marker = " [tail; truncated]" if details["tail_truncated"] else ""
         print(f"--- {name}{marker}: {details['path']} ({details['bytes']} bytes) ---")
         value = terminal_safe(details["tail"])
         if value:

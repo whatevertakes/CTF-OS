@@ -251,6 +251,7 @@ for directory in directories:
             "name": meta.get("name"),
             "status": state,
             "exit_code": status.get("exit_code"),
+            "reason_code": status.get("reason_code"),
             "runner_pid": status.get("runner_pid"),
             "created_at": meta.get("created_at"),
             "started_at": status.get("started_at"),

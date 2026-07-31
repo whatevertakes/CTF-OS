@@ -5,14 +5,17 @@ usage() {
     cat <<'EOF'
 Usage: ctf-bg [OPTIONS] -- COMMAND [ARG...]
 
-Start a detached, stdin-free job. Complete stdout, stderr, metadata, and status
-are stored under /work/.ctf/jobs/JOB_ID.
+Start a detached, stdin-free job. Bounded stdout/stderr prefixes, metadata, and
+status are stored under /work/.ctf/jobs/JOB_ID.
 
 Options:
-  --json             Emit one schema_version=1 JSON launch result
-  --timeout SECONDS  Stop the job after SECONDS (default: 3600; 0 disables)
-  --name NAME        Attach a short display name to the job
-  -h, --help         Show this help
+  --json                       Emit one schema_version=1 JSON launch result
+  --timeout SECONDS            Stop the job after SECONDS (default: 3600;
+                               0 disables)
+  --name NAME                  Attach a short display name to the job
+  --stdout-limit-bytes BYTES   Stored stdout prefix cap (default: 16777216)
+  --stderr-limit-bytes BYTES   Stored stderr prefix cap (default: 16777216)
+  -h, --help                   Show this help
 EOF
 }
 
@@ -34,9 +37,10 @@ write_status() {
     local cancelled="${10}"
     local command_pid="${11}"
     local command_pid_start_ticks="${12}"
+    local reason_code="${13:-}"
     python3 - "$path" "$job_id" "$status" "$runner_pid" "$pid_start_ticks" \
         "$started_at" "$finished_at" "$exit_code" "$timed_out" "$cancelled" \
-        "$command_pid" "$command_pid_start_ticks" <<'PY'
+        "$command_pid" "$command_pid_start_ticks" "$reason_code" <<'PY'
 import json
 import os
 import sys
@@ -54,6 +58,7 @@ import sys
     cancelled,
     command_pid,
     command_pid_start_ticks,
+    reason_code,
 ) = sys.argv[1:]
 payload = {
     "schema_version": 1,
@@ -73,6 +78,7 @@ payload = {
     "command_pid_start_ticks": (
         int(command_pid_start_ticks) if command_pid_start_ticks else None
     ),
+    "reason_code": reason_code or None,
 }
 tmp = f"{path}.tmp.{os.getpid()}"
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -160,11 +166,13 @@ state_root="${CTF_STATE_ROOT:-/work/.ctf}"
 jobs_root="${state_root%/}/jobs"
 
 if [[ "${1:-}" == "__ctf_internal_run_v1" ]]; then
-    (($# >= 5)) || exit 125
+    (($# >= 7)) || exit 125
     job_dir="$2"
     job_id="$3"
     timeout_seconds="$4"
-    shift 4
+    stdout_limit_bytes="$5"
+    stderr_limit_bytes="$6"
+    shift 6
     [[ "${1:-}" == "--" ]] || exit 125
     shift
     (($# > 0)) || exit 125
@@ -172,6 +180,14 @@ if [[ "${1:-}" == "__ctf_internal_run_v1" ]]; then
     [[ "$job_dir" == "$jobs_root/$job_id" ]] || exit 125
     [[ -d "$job_dir" && ! -L "$job_dir" ]] || exit 125
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || exit 125
+    [[ "$stdout_limit_bytes" =~ ^[0-9]+$ ]] || exit 125
+    [[ "$stderr_limit_bytes" =~ ^[0-9]+$ ]] || exit 125
+    (( ${#timeout_seconds} <= 6 )) || exit 125
+    ((10#$timeout_seconds <= 604800)) || exit 125
+    (( ${#stdout_limit_bytes} <= 10 )) || exit 125
+    (( ${#stderr_limit_bytes} <= 10 )) || exit 125
+    ((10#$stdout_limit_bytes <= 1073741824)) || exit 125
+    ((10#$stderr_limit_bytes <= 1073741824)) || exit 125
 
     command_args=("$@")
     runner_pid="$$"
@@ -188,7 +204,9 @@ PY
     status_path="$job_dir/status.json"
     stdout_path="$job_dir/stdout.log"
     stderr_path="$job_dir/stderr.log"
+    capture_path="$job_dir/stream-capture.json"
     exit_marker="$job_dir/.command-exit"
+    output_limit_marker="$job_dir/output-limit.requested"
     timeout_marker="$job_dir/timeout.requested"
     identity_path="$job_dir/.command-identity"
     release_path="$job_dir/.command-release"
@@ -221,24 +239,233 @@ temporary = path.with_name(f"{path.name}.tmp.{pid}")
 temporary.write_text(value, encoding="utf-8")
 os.replace(temporary, path)
 '
+    stream_drainer="$(cat <<'PY'
+import json
+import os
+import pathlib
+import selectors
+import stat
+import subprocess
+import sys
+import time
+
+(
+    stdout_path,
+    stderr_path,
+    capture_path,
+    output_limit_marker,
+    stdout_limit,
+    stderr_limit,
+    *command,
+) = sys.argv[1:]
+
+limits = {
+    "stdout": int(stdout_limit),
+    "stderr": int(stderr_limit),
+}
+streams = {}
+overflow = False
+
+
+def open_log(name, path):
+    flags = os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        os.close(descriptor)
+        raise OSError(f"{name} log is not a single regular file")
+    streams[name] = {
+        "descriptor": descriptor,
+        "bytes": 0,
+        "stored_bytes": 0,
+        "complete": False,
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+    }
+
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+
+
+def atomic_text(path, value):
+    destination = pathlib.Path(path)
+    temporary = destination.with_name(
+        f"{destination.name}.tmp.{os.getpid()}"
+    )
+    with open(temporary, "x", encoding="ascii") as handle:
+        handle.write(value)
+    os.replace(temporary, destination)
+
+
+def write_capture():
+    payload = {
+        "schema_version": 1,
+        "reason_code": "output_limit_exceeded" if overflow else None,
+        "streams": {},
+    }
+    for name, value in streams.items():
+        payload["streams"][name] = {
+            "bytes": value["bytes"],
+            "stored_bytes": value["stored_bytes"],
+            "limit_bytes": limits[name],
+            "truncated": value["bytes"] > value["stored_bytes"],
+            "complete": value["complete"],
+            "device": value["device"],
+            "inode": value["inode"],
+        }
+    destination = pathlib.Path(capture_path)
+    temporary = destination.with_name(
+        f"{destination.name}.tmp.{os.getpid()}"
+    )
+    with open(temporary, "x", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, destination)
+
+
+def mark_overflow():
+    global overflow
+    if overflow:
+        return
+    overflow = True
+    atomic_text(output_limit_marker, "output_limit_exceeded\n")
+    write_capture()
+
+
+def consume(name, data):
+    value = streams[name]
+    value["bytes"] += len(data)
+    remaining = limits[name] - value["stored_bytes"]
+    if remaining > 0:
+        stored = data[:remaining]
+        write_all(value["descriptor"], stored)
+        value["stored_bytes"] += len(stored)
+    if value["bytes"] > value["stored_bytes"]:
+        mark_overflow()
+
+
+for stream_name, stream_path in (
+    ("stdout", stdout_path),
+    ("stderr", stderr_path),
+):
+    open_log(stream_name, stream_path)
+
+try:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+    )
+except OSError as exc:
+    diagnostic = f"ctf-bg: command launch failed: {exc}\n".encode()
+    remaining = limits["stderr"] - streams["stderr"]["stored_bytes"]
+    stored = diagnostic[:max(0, remaining)]
+    if stored:
+        write_all(streams["stderr"]["descriptor"], stored)
+        streams["stderr"]["stored_bytes"] += len(stored)
+    streams["stderr"]["bytes"] += len(diagnostic)
+    for value in streams.values():
+        value["complete"] = True
+    write_capture()
+    for value in streams.values():
+        os.close(value["descriptor"])
+    raise SystemExit(127)
+
+selector = selectors.DefaultSelector()
+assert process.stdout is not None and process.stderr is not None
+for name, pipe in (("stdout", process.stdout), ("stderr", process.stderr)):
+    os.set_blocking(pipe.fileno(), False)
+    selector.register(pipe, selectors.EVENT_READ, name)
+
+exit_drain_deadline = None
+overflow_deadline = None
+overflow_killed = False
+while selector.get_map():
+    ready = selector.select(0.05)
+    for key, _ in ready:
+        try:
+            data = os.read(key.fileobj.fileno(), 64 * 1024)
+        except BlockingIOError:
+            continue
+        if data:
+            consume(key.data, data)
+        else:
+            streams[key.data]["complete"] = True
+            selector.unregister(key.fileobj)
+            key.fileobj.close()
+
+    now = time.monotonic()
+    returncode = process.poll()
+    if overflow and overflow_deadline is None:
+        if returncode is None:
+            process.terminate()
+        overflow_deadline = now + 0.25
+    elif (
+        overflow_deadline is not None
+        and not overflow_killed
+        and returncode is None
+        and now >= overflow_deadline
+    ):
+        process.kill()
+        overflow_killed = True
+
+    returncode = process.poll()
+    if returncode is not None:
+        if exit_drain_deadline is None:
+            exit_drain_deadline = now + 0.2
+        elif now >= exit_drain_deadline:
+            for key in list(selector.get_map().values()):
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+            break
+
+returncode = process.wait()
+write_capture()
+for value in streams.values():
+    os.close(value["descriptor"])
+if overflow:
+    raise SystemExit(125)
+if returncode < 0:
+    returncode = 128 + (-returncode)
+raise SystemExit(returncode)
+PY
+)"
     setsid bash -c '
         identity_path=$1
         release_path=$2
         marker=$3
         identity_writer=$4
-        shift 4
+        stream_drainer=$5
+        stdout_path=$6
+        stderr_path=$7
+        capture_path=$8
+        output_limit_marker=$9
+        stdout_limit=${10}
+        stderr_limit=${11}
+        shift 11
         python3 -c "$identity_writer" "$identity_path" "$$"
         while [[ ! -e "$release_path" ]]; do
             sleep 0.01
         done
         set +e
-        "$@"
+        python3 -c "$stream_drainer" "$stdout_path" "$stderr_path" \
+            "$capture_path" "$output_limit_marker" "$stdout_limit" \
+            "$stderr_limit" "$@"
         rc=$?
         printf "%s\n" "$rc" > "$marker"
         exit "$rc"
     ' ctf-bg-runner "$identity_path" "$release_path" "$exit_marker" \
-        "$identity_writer" "${command_args[@]}" \
-        </dev/null >"$stdout_path" 2>"$stderr_path" &
+        "$identity_writer" "$stream_drainer" "$stdout_path" "$stderr_path" \
+        "$capture_path" "$output_limit_marker" "$stdout_limit_bytes" \
+        "$stderr_limit_bytes" "${command_args[@]}" \
+        </dev/null >/dev/null 2>/dev/null &
     command_pid=$!
 
     command_pid_start_ticks=""
@@ -429,11 +656,16 @@ PY
     final_status="failed"
     was_timed_out=0
     was_cancelled=0
+    reason_code=""
 
     if [[ -f "$job_dir/cancel.requested" ]]; then
         final_status="cancelled"
         exit_code=130
         was_cancelled=1
+    elif [[ -f "$output_limit_marker" ]]; then
+        final_status="failed"
+        exit_code=125
+        reason_code="output_limit_exceeded"
     elif [[ -f "$exit_marker" ]]; then
         IFS= read -r recorded_exit < "$exit_marker" || recorded_exit="$wrapper_rc"
         if [[ "$recorded_exit" =~ ^[0-9]+$ ]] && ((recorded_exit <= 255)); then
@@ -447,16 +679,19 @@ PY
         exit_code=124
         was_timed_out=1
     fi
-    rm -f -- "$exit_marker" "$timeout_marker" "$identity_path" "$release_path"
+    rm -f -- "$exit_marker" "$timeout_marker" "$identity_path" "$release_path" \
+        "$output_limit_marker"
     write_status "$status_path" "$job_id" "$final_status" "$runner_pid" \
         "$pid_start_ticks" "$started_at" "$finished_at" "$exit_code" \
         "$was_timed_out" "$was_cancelled" "$command_pid" \
-        "$command_pid_start_ticks"
+        "$command_pid_start_ticks" "$reason_code"
     exit 0
 fi
 
 json_mode=0
 timeout_seconds="${CTF_BG_TIMEOUT:-3600}"
+stdout_limit_bytes="${CTF_BG_STDOUT_LIMIT_BYTES:-16777216}"
+stderr_limit_bytes="${CTF_BG_STDERR_LIMIT_BYTES:-16777216}"
 job_name=""
 
 if (($# == 0)); then
@@ -480,6 +715,16 @@ while (($# > 0)); do
             job_name="$2"
             shift 2
             ;;
+        --stdout-limit-bytes)
+            (($# >= 2)) || die '--stdout-limit-bytes requires a value'
+            stdout_limit_bytes="$2"
+            shift 2
+            ;;
+        --stderr-limit-bytes)
+            (($# >= 2)) || die '--stderr-limit-bytes requires a value'
+            stderr_limit_bytes="$2"
+            shift 2
+            ;;
         --)
             shift
             break
@@ -500,6 +745,17 @@ done
 (($# > 0)) || die 'COMMAND is required'
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die '--timeout must be a non-negative integer'
 ((timeout_seconds <= 604800)) || die '--timeout must not exceed 604800 seconds'
+for stream_limit_name in stdout_limit_bytes stderr_limit_bytes; do
+    stream_limit="${!stream_limit_name}"
+    [[ "$stream_limit" =~ ^[0-9]+$ ]] ||
+        die "--${stream_limit_name//_/-} must be a non-negative integer"
+    (( ${#stream_limit} <= 10 )) ||
+        die "--${stream_limit_name//_/-} must not exceed 1073741824 bytes"
+    stream_limit="$((10#$stream_limit))"
+    ((stream_limit <= 1073741824)) ||
+        die "--${stream_limit_name//_/-} must not exceed 1073741824 bytes"
+    printf -v "$stream_limit_name" '%s' "$stream_limit"
+done
 command_args=("$@")
 if [[ -z "$job_name" ]]; then
     job_name="${command_args[0]##*/}"
@@ -606,6 +862,7 @@ stdout_path="$job_dir/stdout.log"
 stderr_path="$job_dir/stderr.log"
 meta_path="$job_dir/meta.json"
 status_path="$job_dir/status.json"
+capture_path="$job_dir/stream-capture.json"
 runner_log="$job_dir/runner.log"
 : > "$stdout_path"
 : > "$stderr_path"
@@ -613,7 +870,8 @@ runner_log="$job_dir/runner.log"
 working_directory="$(pwd -P)"
 
 python3 - "$meta_path" "$job_id" "$job_name" "$working_directory" \
-    "$timeout_seconds" "$stdout_path" "$stderr_path" "${command_args[@]}" <<'PY'
+    "$timeout_seconds" "$stdout_path" "$stderr_path" "$capture_path" \
+    "$stdout_limit_bytes" "$stderr_limit_bytes" "${command_args[@]}" <<'PY'
 import datetime
 import json
 import os
@@ -627,6 +885,9 @@ import sys
     timeout_seconds,
     stdout_path,
     stderr_path,
+    capture_path,
+    stdout_limit_bytes,
+    stderr_limit_bytes,
     *command,
 ) = sys.argv[1:]
 payload = {
@@ -640,6 +901,9 @@ payload = {
     "timeout_seconds": int(timeout_seconds),
     "stdout_path": stdout_path,
     "stderr_path": stderr_path,
+    "stream_capture_path": capture_path,
+    "stdout_limit_bytes": int(stdout_limit_bytes),
+    "stderr_limit_bytes": int(stderr_limit_bytes),
 }
 tmp = f"{path}.tmp.{os.getpid()}"
 with open(tmp, "w", encoding="utf-8") as handle:
@@ -651,7 +915,8 @@ PY
 write_status "$status_path" "$job_id" "starting" "" "" "" "" "" "0" "0" "" ""
 self_path="$(readlink -f -- "$0")"
 setsid bash "$self_path" __ctf_internal_run_v1 "$job_dir" "$job_id" \
-    "$timeout_seconds" -- "${command_args[@]}" \
+    "$timeout_seconds" "$stdout_limit_bytes" "$stderr_limit_bytes" -- \
+    "${command_args[@]}" \
     </dev/null >/dev/null 2>>"$runner_log" &
 launcher_pid=$!
 
@@ -723,6 +988,8 @@ payload = {
     "timeout_seconds": meta["timeout_seconds"],
     "stdout_path": meta["stdout_path"],
     "stderr_path": meta["stderr_path"],
+    "stdout_limit_bytes": meta["stdout_limit_bytes"],
+    "stderr_limit_bytes": meta["stderr_limit_bytes"],
     "status_path": status_path,
 }
 if json_mode == "1":
