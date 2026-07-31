@@ -28,6 +28,36 @@ SPEC.loader.exec_module(release)
 
 
 class WebActiveProbeReleaseTests(unittest.TestCase):
+    @staticmethod
+    def _target_log(mode: str) -> str:
+        race = [
+            {
+                "active_at_entry": 2 if ordinal == 1 else 1,
+                "kind": "race",
+                "max_active": 2,
+                "mode": mode,
+                "status": (
+                    200
+                    if mode == "vulnerable" and ordinal % 2
+                    else 409
+                ),
+            }
+            for ordinal in range(1, 7)
+        ]
+        oob = [
+            {
+                "called_back": mode == "vulnerable",
+                "kind": "oob",
+                "mode": mode,
+                "status": 202 if mode == "vulnerable" else 403,
+            }
+            for _ordinal in range(1, 4)
+        ]
+        return "".join(
+            json.dumps(item, separators=(",", ":"), sort_keys=True)
+            for item in (*race, *oob)
+        )
+
     def test_release_smoke_is_public_internal_and_not_faked(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("engine.prove_web_active_probe(", source)
@@ -83,6 +113,70 @@ class WebActiveProbeReleaseTests(unittest.TestCase):
                 release._inspect_internal_network(
                     "ctfos-web-active-test"
                 )
+
+    def test_target_audit_accepts_adjacent_complete_json_objects(
+        self,
+    ) -> None:
+        logs = {
+            "vulnerable-target": self._target_log("vulnerable"),
+            "control-target": self._target_log("control"),
+        }
+
+        def docker(
+            argv: tuple[str, ...],
+            *,
+            timeout: int,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[0], "logs")
+            self.assertEqual(timeout, 30)
+            return subprocess.CompletedProcess(
+                args=("docker", *argv),
+                returncode=0,
+                stdout=logs[argv[1]],
+                stderr="",
+            )
+
+        with mock.patch.object(release, "_docker", side_effect=docker):
+            self.assertEqual(
+                release._audit_targets(
+                    "vulnerable-target",
+                    "control-target",
+                ),
+                {
+                    "control_oob_callbacks": 0,
+                    "control_race_requests": 6,
+                    "maximum_parallel_race_requests": 2,
+                    "vulnerable_oob_callbacks": 3,
+                    "vulnerable_race_requests": 6,
+                },
+            )
+
+    def test_target_event_stream_rejects_hostile_extra_data(
+        self,
+    ) -> None:
+        valid = json.dumps(
+            {
+                "kind": "race",
+                "max_active": 2,
+                "status": 200,
+            },
+            separators=(",", ":"),
+        )
+        for suffix in (
+            "trailing-garbage",
+            "[]",
+            '{"kind":"race","kind":"oob"}',
+            '{"kind":NaN}',
+        ):
+            with self.subTest(suffix=suffix):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "target audit log",
+                ):
+                    release._parse_target_event_stream(
+                        valid + suffix,
+                        container_name="hostile-target",
+                    )
 
     @unittest.skipUnless(
         os.environ.get("CTFOS_RUN_WEB_ACTIVE_DOCKER") == "1"

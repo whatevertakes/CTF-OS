@@ -53,6 +53,8 @@ OOB_CALLBACK = b"oob-callback-b7318e"
 OOB_VULNERABLE_TRIGGER = b"oob-trigger-vulnerable-9d7c12"
 OOB_CONTROL_TRIGGER = b"oob-trigger-control-3f8a45"
 CALLBACK_PLACEHOLDER = b"{{CTF_OOB_URL}}"
+TARGET_AUDIT_LOG_MAX_BYTES = 65_536
+TARGET_AUDIT_LOG_MAX_EVENTS = 64
 
 TARGET_SERVER_SOURCE = r"""
 from __future__ import annotations
@@ -602,12 +604,10 @@ def _audit_targets(
         ("vulnerable", vulnerable_name),
         ("control", control_name),
     ):
-        events = []
-        for line in _docker(("logs", name), timeout=30).stdout.splitlines():
-            value = json.loads(line)
-            if type(value) is dict:
-                events.append(value)
-        values[mode] = events
+        values[mode] = _parse_target_event_stream(
+            _docker(("logs", name), timeout=30).stdout,
+            container_name=name,
+        )
     vulnerable = values["vulnerable"]
     control = values["control"]
     race_vulnerable = [
@@ -655,6 +655,62 @@ def _audit_targets(
         "vulnerable_oob_callbacks": len(oob_vulnerable),
         "vulnerable_race_requests": len(race_vulnerable),
     }
+
+
+def _parse_target_event_stream(
+    payload: str,
+    *,
+    container_name: str,
+) -> list[dict[str, object]]:
+    if len(payload.encode("utf-8")) > TARGET_AUDIT_LOG_MAX_BYTES:
+        raise AssertionError(
+            f"target audit log for {container_name} exceeds its byte limit"
+        )
+
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_nonfinite(value: str) -> object:
+        raise ValueError(f"non-finite JSON value: {value}")
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_nonfinite,
+    )
+    events: list[dict[str, object]] = []
+    offset = 0
+    while offset < len(payload):
+        while offset < len(payload) and payload[offset].isspace():
+            offset += 1
+        if offset == len(payload):
+            break
+        try:
+            value, end = decoder.raw_decode(payload, offset)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise AssertionError(
+                f"target audit log for {container_name} is not an exact "
+                "JSON object stream"
+            ) from error
+        if type(value) is not dict:
+            raise AssertionError(
+                f"target audit log for {container_name} contains a "
+                "non-object JSON value"
+            )
+        events.append(value)
+        if len(events) > TARGET_AUDIT_LOG_MAX_EVENTS:
+            raise AssertionError(
+                f"target audit log for {container_name} exceeds its "
+                "event limit"
+            )
+        offset = end
+    return events
 
 
 def _cleanup(containers: tuple[str, ...], network: str) -> None:
