@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from ctf_os.models import ChallengeIdentity
+from ctf_os.models import ChallengeIdentity, ChallengeState
 from ctf_os.store import (
     ChallengeLock,
     LockTimeout,
@@ -22,10 +22,8 @@ class StorageError(RuntimeError):
 
 
 def _reachable_paths(
-    store: StateStore,
-    identity: ChallengeIdentity,
+    state: ChallengeState,
 ) -> tuple[set[str], tuple[str, ...]]:
-    state = store.load(identity)
     reachable = {
         item.path for item in state.artifacts if item.path
     }
@@ -64,9 +62,13 @@ def storage_inventory(
     identity: ChallengeIdentity,
 ) -> dict[str, Any]:
     paths = store.challenge_paths(identity)
-    reachable, run_prefixes = _reachable_paths(store, identity)
+    # One atomic state image defines both reachability and the reported
+    # revision. Loading twice can combine paths from revision N with the
+    # revision number from N+1 while a normal state writer commits.
+    state = store.load(identity)
+    reachable, run_prefixes = _reachable_paths(state)
     files: list[dict[str, Any]] = []
-    scan_roots = (paths.artifacts, paths.runs)
+    scan_roots = (paths.artifacts, paths.runs, paths.proof)
     for scan_root in scan_roots:
         if not scan_root.is_dir():
             continue
@@ -88,7 +90,7 @@ def storage_inventory(
             )
     return {
         "identity": identity.key,
-        "state_revision": store.load(identity).revision,
+        "state_revision": state.revision,
         "files": files,
         "total_bytes": sum(item["bytes"] for item in files),
         "unreachable_bytes": sum(
