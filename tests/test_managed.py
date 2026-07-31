@@ -4180,6 +4180,120 @@ class ManagedV2Tests(unittest.TestCase):
         ):
             tampered_truncation.validate()
 
+    def test_managed_storage_admission_covers_failure_request_snapshot(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        orchestrator = ManagedOrchestrator(
+            engine,
+            capability_probe=self.capability,
+        )
+        _state, session_id = orchestrator._reserve_session(
+            self.identity,
+            "S-failure-request-admission",
+        )
+        state = engine.synchronize_managed_adapter_seed_plan(
+            self.identity,
+            session_id,
+        )
+        selected = tuple(
+            item.id
+            for item in state.experiments
+            if (
+                item.extra.get("adapter_seed") is True
+                and item.status is ExperimentStatus.REGISTERED
+            )
+        )
+        self.assertEqual(len(selected), 3)
+
+        admitted: list[int] = []
+
+        def capture_admission(_identity, *, requested_bytes=None):
+            self.assertIsNotNone(requested_bytes)
+            admitted.append(requested_bytes)
+            return {}
+
+        with mock.patch.object(
+            engine,
+            "_enforce_storage_admission",
+            side_effect=capture_admission,
+        ):
+            reservation = engine._admit_managed_tool_action_batch_storage(
+                self.identity,
+                experiment_ids=selected,
+            )
+        try:
+            per_stream_limit = min(
+                challenge_module.DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+                engine.config.runtime.work_tree_max_bytes // 4,
+            )
+            expected_without_failure_snapshots = len(selected) * (
+                engine.config.runtime.work_tree_max_bytes
+                + 2 * per_stream_limit
+                + 6 * challenge_module.MAX_RUN_DOCUMENT_BYTES
+            )
+            current = engine.store.load(self.identity, recover=False)
+            registered = {item.id: item for item in current.experiments}
+            for experiment_id in selected:
+                experiment = registered[experiment_id]
+                if (
+                    experiment.extra.get("adapter_seed") is True
+                    and experiment.extra.get("adapter_name") == "reversing"
+                ):
+                    expected_without_failure_snapshots += (
+                        challenge_module.REV_INVENTORY_V2_MAX_SOURCE_BYTES
+                    )
+                if engine._is_forensic_index_experiment(current, experiment):
+                    expected_without_failure_snapshots += (
+                        challenge_module.FORENSIC_INDEX_MAX_BYTES
+                    )
+            self.assertEqual(admitted, [reservation.requested_bytes])
+            self.assertEqual(
+                reservation.requested_bytes
+                - expected_without_failure_snapshots,
+                len(selected)
+                * challenge_module._FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES,
+            )
+        finally:
+            engine._release_managed_tool_action_batch_storage(reservation)
+
+        run_id = "R-failure-request-admission"
+        experiment_id = selected[0]
+        base_revision = engine.store.load(self.identity).revision
+        engine.store.create_run(
+            self.identity,
+            run_id=run_id,
+            request={
+                "kind": "tool",
+                "experiment_id": experiment_id,
+            },
+            base_revision=base_revision,
+        )
+        copy_arguments: list[dict[str, object]] = []
+        original_copy = challenge_module.copy_bounded_regular
+
+        def capture_copy(*args, **kwargs):
+            copy_arguments.append(dict(kwargs))
+            return original_copy(*args, **kwargs)
+
+        with mock.patch.object(
+            challenge_module,
+            "copy_bounded_regular",
+            side_effect=capture_copy,
+        ):
+            request = engine._failure_tool_request(
+                self.identity,
+                experiment_id,
+                run_id,
+                storage_pre_admitted=True,
+            )
+        self.assertIsNotNone(request)
+        self.assertEqual(len(copy_arguments), 1)
+        self.assertEqual(
+            copy_arguments[0]["maximum_bytes"],
+            challenge_module._FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES,
+        )
+        self.assertIsNone(copy_arguments[0]["source_size_admission"])
+
     def test_attack_route_with_insufficient_frontier_creates_repair_checkpoint(
         self,
     ):

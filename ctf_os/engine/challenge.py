@@ -1540,6 +1540,7 @@ _REV_STDIN_PRE_REPLACE_SAFETY_SECONDS = 0.05
 _ANALYSIS_RESULT_JSON_MAX_BYTES = MAX_RUN_DOCUMENT_BYTES
 _ANALYSIS_CANONICAL_SIDECAR_MAX_BYTES = 3 * MAX_RUN_DOCUMENT_BYTES
 _ANALYSIS_PRIVATE_CONTROL_MAX_BYTES = 4 * MAX_RUN_DOCUMENT_BYTES
+_FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES = 1024 * 1024
 _ANALYSIS_MAX_INPUTS = 256
 _ANALYSIS_MAX_INPUT_LOCATOR_BYTES = 4096
 _ANALYSIS_MAX_INPUT_LOCATORS_TOTAL_BYTES = 1024 * 1024
@@ -23356,6 +23357,9 @@ class ChallengeEngine:
             work_tree_limit
             + 2 * per_stream_limit
             + 6 * MAX_RUN_DOCUMENT_BYTES
+            # Failure terminalization may briefly copy the durable request
+            # into quota-accounted runtime storage while sibling lanes run.
+            + _FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES
         )
         current = self.store.load(identity, recover=False)
         identity_key = identity.key
@@ -33548,7 +33552,7 @@ class ChallengeEngine:
                     paths.root,
                     request_relative,
                     Path(temporary) / "request.json",
-                    maximum_bytes=1024 * 1024,
+                    maximum_bytes=_FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES,
                     source_size_admission=(
                         None
                         if storage_pre_admitted
@@ -33558,7 +33562,7 @@ class ChallengeEngine:
                 )
                 request = strict_json_loads(
                     snapshot.path.read_bytes(),
-                    max_bytes=1024 * 1024,
+                    max_bytes=_FAILURE_TOOL_REQUEST_SNAPSHOT_MAX_BYTES,
                 )
         except (
             OSError,
