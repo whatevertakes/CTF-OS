@@ -337,6 +337,7 @@ class PromotionBundleTests(unittest.TestCase):
         prompt: str = "",
     ):
         parsed = parse_promotion_manifest(self.manifest)
+        wall_seconds = parsed.budget.wall_seconds
         session = parsed.sessions[session_id]
         incoming = (
             self.root
@@ -361,11 +362,14 @@ class PromotionBundleTests(unittest.TestCase):
             },
             budget=Budget(
                 deadline_utc=(
-                    (datetime.now(timezone.utc) + timedelta(seconds=60))
+                    (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=wall_seconds)
+                    )
                     .isoformat(timespec="seconds")
                     .replace("+00:00", "Z")
                 ),
-                allocated_seconds=60,
+                allocated_seconds=wall_seconds,
                 spent_seconds=0,
                 mode=BudgetMode.BOUNDED,
             ),
@@ -426,22 +430,43 @@ class PromotionBundleTests(unittest.TestCase):
             state.to_dict(),
             mode=0o600,
         )
-        ChallengeEngine(
+        reset_state = ChallengeEngine(
             self.root,
             config=load_config(self.root),
             store=self.store,
-        ).reset_budget(session.identity, 60)
-        prepare_promotion_session(
-            self.root,
-            self.frozen_path,
-            session_id=session_id,
+        ).reset_budget(
+            session.identity,
+            parsed.budget.wall_seconds,
         )
+        reset_deadline = datetime.fromisoformat(
+            reset_state.budget.deadline_utc.replace("Z", "+00:00")
+        )
+        fixture_prepare_at = (
+            reset_deadline
+            - timedelta(seconds=parsed.budget.wall_seconds)
+            + timedelta(microseconds=1)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        # This helper synthesizes 84 complete session bundles in one test.
+        # Bind preparation just inside the canonical reset envelope so
+        # filesystem load cannot consume the synthetic fixed wall budget.
+        with mock.patch(
+            "ctf_os.promotion_bundles._evaluation_utc_now",
+            return_value=fixture_prepare_at,
+        ):
+            prepare_promotion_session(
+                self.root,
+                self.frozen_path,
+                session_id=session_id,
+            )
 
         # Keep the synthetic evidence clock deterministic while preserving a
         # distinct pre-prepare staging interval.
         def bind_fixture_clock(current) -> None:
             started_at = _later(current.created_at, 1)
-            deadline = _later(started_at, 60)
+            deadline = _later(
+                started_at,
+                parsed.budget.wall_seconds,
+            )
             current.metadata["evaluation_started_at"] = started_at
             current.metadata["evaluation_budget_deadline_utc"] = deadline
             current.metadata["budget_reset_at"] = started_at

@@ -1013,7 +1013,8 @@ class InteractiveProcessTests(unittest.TestCase):
                 "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
                 "time.sleep(30)']);"
                 "pathlib.Path(sys.argv[1]).write_text("
-                "f'{os.getpid()} {child.pid}')"
+                "f'{os.getpid()} {child.pid}');"
+                "os._exit(0)"
             )
             leader_pid: int | None = None
             descendant_pid: int | None = None

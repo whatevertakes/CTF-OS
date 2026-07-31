@@ -56,6 +56,7 @@ class ScaffoldBindingTests(unittest.TestCase):
                 "prove_crypto_metamorphic",
                 "prove_forensic_assertion",
                 "evaluate_misc_transform",
+                "prove_data_transcript",
             ),
         )
         self.assertEqual(
