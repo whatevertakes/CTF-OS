@@ -22,6 +22,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from ctf_os.credential_safety import validate_metadata_credentials
 from ctf_os.container_tools import (
     CLIError as ContainerCapabilityError,
 )
@@ -43,6 +44,7 @@ from ctf_os.images import (
     validate_image_name,
 )
 
+from .egress import RestrictedEgressBoundary
 from .files import (
     DEFAULT_STREAM_CAPTURE_MAX_BYTES,
     DEFAULT_WORK_TREE_MAX_BYTES,
@@ -54,8 +56,14 @@ from .files import (
     measure_work_tree,
     normalize_locator,
 )
-from .egress import RestrictedEgressBoundary
+from .output_redaction import (
+    OutputCredentialError,
+    audit_run_output_credentials,
+    payload_contains_protected_credentials,
+)
 from .types import (
+    AnalysisLeaseRef,
+    AnalysisRuntimeCleanupPending,
     BackgroundJobUnsupported,
     ChallengeScope,
     CommandSpec,
@@ -95,7 +103,31 @@ from .web_private import (
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 MAX_CONTROL_OUTPUT = 1024 * 1024
 MAX_PROOF_INPUTS = 256
+MAX_ANALYSIS_INPUTS = 256
+MAX_ANALYSIS_OWNER_BYTES = 16 * 1024
 _JOB_CONTROL_COMMANDS = frozenset({"ctf-jobs", "ctf-log", "ctf-kill"})
+_BOOT_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_ANALYSIS_OWNER_KEYS = frozenset(
+    {
+        "schema_version",
+        "analysis_id",
+        "scope_fingerprint",
+        "owner_pid",
+        "owner_start_ticks",
+        "owner_boot_id",
+        "root_device",
+        "root_inode",
+        "work_device",
+        "work_inode",
+        "base_revision",
+        "work_tree_limit_bytes",
+        "storage_reservation_bytes",
+        "created_at",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +169,14 @@ class DockerLimits:
             DEFAULT_STREAM_CAPTURE_MAX_BYTES,
             self.work_tree_max_bytes // 4,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalysisWorkBinding:
+    path: Path
+    lease_identity: tuple[int, int]
+    work_identity: tuple[int, int]
+    work_tree_limit_bytes: int
 
 
 class _WorkTreeGuard:
@@ -286,6 +326,7 @@ class DockerSandboxBackend:
         self,
         scope: ChallengeScope,
         *,
+        analysis_root: Path | None = None,
         image: str = "ctf-os:core",
         image_digest: str | None = None,
         network_policy: NetworkPolicy | None = None,
@@ -296,6 +337,52 @@ class DockerSandboxBackend:
         kvm_detector: Callable[[], bool] | None = None,
     ) -> None:
         self.scope = scope
+        self.analysis_root: Path | None = None
+        self._analysis_root_identity: tuple[int, int] | None = None
+        if analysis_root is not None:
+            configured_root = Path(analysis_root).expanduser()
+            try:
+                terminal = configured_root.stat(follow_symlinks=False)
+                resolved_root = configured_root.resolve(strict=True)
+                descriptor = os.open(
+                    resolved_root,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except OSError as error:
+                raise ScopeError(
+                    "analysis root must be a pre-created private directory"
+                ) from error
+            try:
+                opened = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (
+                not stat.S_ISDIR(terminal.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (terminal.st_dev, terminal.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or opened.st_uid != os.geteuid()
+                or stat.S_IMODE(opened.st_mode) & 0o077
+            ):
+                raise ScopeError(
+                    "analysis root must be private, owned, and non-symlink"
+                )
+            if (
+                resolved_root == scope.challenge_dir
+                or resolved_root in scope.challenge_dir.parents
+                or scope.challenge_dir in resolved_root.parents
+                or resolved_root == scope.work_dir
+                or resolved_root in scope.work_dir.parents
+                or scope.work_dir in resolved_root.parents
+            ):
+                raise ScopeError(
+                    "analysis root must not overlap challenge or canonical work"
+                )
+            self.analysis_root = resolved_root
+            self._analysis_root_identity = (opened.st_dev, opened.st_ino)
         self.image = validate_image_name(image)
         self.image_digest = (
             validate_image_digest(image_digest)
@@ -476,6 +563,57 @@ class DockerSandboxBackend:
 
         return _WorkTreeGuard(self, work_dir, operation)
 
+    @staticmethod
+    def _audit_run_credentials(
+        work_dir: Path,
+        value: Mapping[str, Any],
+    ) -> None:
+        """Reject one result after scrubbing protected values from run files."""
+
+        try:
+            control_payload = json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        except (TypeError, ValueError) as error:
+            raise SandboxError(
+                "sandbox output credential audit could not serialize the "
+                "control result"
+            ) from error
+        control_contaminated = payload_contains_protected_credentials(
+            control_payload
+        )
+        try:
+            audit = audit_run_output_credentials(
+                work_dir,
+                str(value.get("run_id", "")),
+            )
+        except OutputCredentialError as error:
+            raise SandboxError(
+                f"sandbox output credential audit failed: {error}"
+            ) from error
+        if control_contaminated or audit.contaminated:
+            raise SandboxError(
+                "sandbox output contained a protected credential; "
+                "bounded run artifacts were redacted and the result was "
+                "rejected"
+            )
+
+    @staticmethod
+    def _reject_job_log_credentials(*payloads: bytes) -> None:
+        """Keep protected host/provider values out of job-log responses."""
+
+        if any(
+            payload_contains_protected_credentials(payload)
+            for payload in payloads
+        ):
+            raise SandboxError(
+                "sandbox job log contained a protected credential; "
+                "log response was rejected"
+            )
+
     def _runtime_id(self, network: str) -> str:
         return network
 
@@ -514,6 +652,276 @@ class DockerSandboxBackend:
 
         runtime_digest = hashlib.sha256(runtime_id.encode("utf-8")).hexdigest()[:10]
         return f"ctfos-{self.scope.fingerprint[:16]}-{runtime_digest}"
+
+    def _analysis_container_names(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> tuple[str, str]:
+        self._check_analysis_ref(lease)
+        suffix = lease.analysis_id.removeprefix("analysis-")[:20]
+        prefix = f"ctfos-analysis-{self.scope.fingerprint[:12]}-{suffix}"
+        return f"{prefix}-init", f"{prefix}-run"
+
+    def isolated_analysis_runtime_id(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> str:
+        """Return the deterministic command-container identity for a lease."""
+
+        _init_name, run_name = self._analysis_container_names(lease)
+        return run_name
+
+    def _check_analysis_ref(self, lease: AnalysisLeaseRef) -> None:
+        if type(lease) is not AnalysisLeaseRef:
+            raise TypeError("lease must be an AnalysisLeaseRef")
+        if lease.scope_fingerprint != self.scope.fingerprint:
+            raise ScopeError("analysis lease belongs to another challenge")
+
+    def _analysis_work_binding(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> _AnalysisWorkBinding:
+        """Resolve one lease only below the constructor-bound host root."""
+
+        self._check_analysis_ref(lease)
+        analysis_root = self.analysis_root
+        expected_root = self._analysis_root_identity
+        if analysis_root is None or expected_root is None:
+            raise ScopeError(
+                "isolated analysis requires a configured trusted analysis root"
+            )
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        root_descriptor: int | None = None
+        lease_descriptor: int | None = None
+        work_descriptor: int | None = None
+        try:
+            root_descriptor = os.open(analysis_root, directory_flags)
+            root_metadata = os.fstat(root_descriptor)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != expected_root
+                or root_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(root_metadata.st_mode) & 0o077
+            ):
+                raise ScopeError("trusted analysis root identity changed")
+            lease_metadata = os.stat(
+                lease.analysis_id,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            lease_descriptor = os.open(
+                lease.analysis_id,
+                directory_flags,
+                dir_fd=root_descriptor,
+            )
+            opened_lease = os.fstat(lease_descriptor)
+            if (
+                not stat.S_ISDIR(lease_metadata.st_mode)
+                or (lease_metadata.st_dev, lease_metadata.st_ino)
+                != (opened_lease.st_dev, opened_lease.st_ino)
+                or opened_lease.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_lease.st_mode) & 0o077
+            ):
+                raise ScopeError("analysis lease directory is unsafe")
+            owner_metadata = os.stat(
+                "owner.json",
+                dir_fd=lease_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(owner_metadata.st_mode)
+                or owner_metadata.st_nlink != 1
+                or owner_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(owner_metadata.st_mode) != 0o400
+            ):
+                raise ScopeError("analysis owner receipt is unsafe")
+            lease_path = analysis_root / lease.analysis_id
+            owner_descriptor: int | None = None
+            try:
+                owner_descriptor = os.open(
+                    "owner.json",
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_NONBLOCK
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=lease_descriptor,
+                )
+                opened_owner = os.fstat(owner_descriptor)
+                owner_signature = (
+                    owner_metadata.st_dev,
+                    owner_metadata.st_ino,
+                    owner_metadata.st_mode,
+                    owner_metadata.st_nlink,
+                    owner_metadata.st_size,
+                    owner_metadata.st_mtime_ns,
+                    owner_metadata.st_ctime_ns,
+                )
+                if owner_signature != (
+                    opened_owner.st_dev,
+                    opened_owner.st_ino,
+                    opened_owner.st_mode,
+                    opened_owner.st_nlink,
+                    opened_owner.st_size,
+                    opened_owner.st_mtime_ns,
+                    opened_owner.st_ctime_ns,
+                ) or opened_owner.st_size > MAX_ANALYSIS_OWNER_BYTES:
+                    raise ScopeError("analysis owner receipt changed while opening")
+                chunks = bytearray()
+                while len(chunks) <= MAX_ANALYSIS_OWNER_BYTES:
+                    block = os.read(
+                        owner_descriptor,
+                        min(
+                            65536,
+                            MAX_ANALYSIS_OWNER_BYTES + 1 - len(chunks),
+                        ),
+                    )
+                    if not block:
+                        break
+                    chunks.extend(block)
+                final_owner = os.fstat(owner_descriptor)
+                final_path_owner = os.stat(
+                    "owner.json",
+                    dir_fd=lease_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    len(chunks) > MAX_ANALYSIS_OWNER_BYTES
+                    or owner_signature
+                    != (
+                        final_owner.st_dev,
+                        final_owner.st_ino,
+                        final_owner.st_mode,
+                        final_owner.st_nlink,
+                        final_owner.st_size,
+                        final_owner.st_mtime_ns,
+                        final_owner.st_ctime_ns,
+                    )
+                    or owner_signature
+                    != (
+                        final_path_owner.st_dev,
+                        final_path_owner.st_ino,
+                        final_path_owner.st_mode,
+                        final_path_owner.st_nlink,
+                        final_path_owner.st_size,
+                        final_path_owner.st_mtime_ns,
+                        final_path_owner.st_ctime_ns,
+                    )
+                ):
+                    raise ScopeError("analysis owner receipt changed while reading")
+                owner_payload = bytes(chunks)
+                owner = json.loads(owner_payload.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ScopeError(
+                    "analysis owner receipt cannot be trusted"
+                ) from error
+            finally:
+                if owner_descriptor is not None:
+                    os.close(owner_descriptor)
+            if type(owner) is not dict or set(owner) != _ANALYSIS_OWNER_KEYS:
+                raise ScopeError("analysis owner receipt has an invalid schema")
+            if (
+                owner.get("schema_version") != 1
+                or owner.get("analysis_id") != lease.analysis_id
+                or owner.get("scope_fingerprint") != lease.scope_fingerprint
+                or type(owner.get("owner_pid")) is not int
+                or owner["owner_pid"] <= 1
+                or type(owner.get("owner_start_ticks")) is not int
+                or owner["owner_start_ticks"] <= 0
+                or type(owner.get("owner_boot_id")) is not str
+                or _BOOT_ID.fullmatch(owner["owner_boot_id"]) is None
+                or type(owner.get("root_device")) is not int
+                or type(owner.get("root_inode")) is not int
+                or owner["root_device"] < 0
+                or owner["root_inode"] <= 0
+                or type(owner.get("base_revision")) is not int
+                or owner["base_revision"] < 0
+                or type(owner.get("work_tree_limit_bytes")) is not int
+                or owner["work_tree_limit_bytes"] <= 0
+                or type(owner.get("storage_reservation_bytes")) is not int
+                or owner["storage_reservation_bytes"]
+                < owner["work_tree_limit_bytes"]
+                or type(owner.get("created_at")) is not str
+                or not owner["created_at"]
+                or len(owner["created_at"]) > 128
+                or (
+                    owner.get("root_device"),
+                    owner.get("root_inode"),
+                )
+                != (opened_lease.st_dev, opened_lease.st_ino)
+            ):
+                raise ScopeError("analysis owner receipt binding changed")
+            work_metadata = os.stat(
+                "work",
+                dir_fd=lease_descriptor,
+                follow_symlinks=False,
+            )
+            work_descriptor = os.open(
+                "work",
+                directory_flags,
+                dir_fd=lease_descriptor,
+            )
+            opened_work = os.fstat(work_descriptor)
+            if (
+                not stat.S_ISDIR(work_metadata.st_mode)
+                or (work_metadata.st_dev, work_metadata.st_ino)
+                != (opened_work.st_dev, opened_work.st_ino)
+                or opened_work.st_dev != opened_lease.st_dev
+                or type(owner.get("work_device")) is not int
+                or type(owner.get("work_inode")) is not int
+                or owner["work_device"] < 0
+                or owner["work_inode"] <= 0
+                or (
+                    owner.get("work_device"),
+                    owner.get("work_inode"),
+                )
+                != (opened_work.st_dev, opened_work.st_ino)
+                or opened_work.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_work.st_mode) & 0o077
+            ):
+                raise ScopeError("analysis work directory is unsafe")
+            return _AnalysisWorkBinding(
+                path=lease_path / "work",
+                lease_identity=(opened_lease.st_dev, opened_lease.st_ino),
+                work_identity=(opened_work.st_dev, opened_work.st_ino),
+                work_tree_limit_bytes=owner["work_tree_limit_bytes"],
+            )
+        except FileNotFoundError as error:
+            raise ScopeError("analysis lease workspace is unavailable") from error
+        except OSError as error:
+            raise ScopeError("analysis lease workspace is unsafe") from error
+        finally:
+            for descriptor in (
+                work_descriptor,
+                lease_descriptor,
+                root_descriptor,
+            ):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+    def _revalidate_analysis_work(
+        self,
+        lease: AnalysisLeaseRef,
+        expected: _AnalysisWorkBinding,
+    ) -> _AnalysisWorkBinding:
+        observed = self._analysis_work_binding(lease)
+        if (
+            observed.path != expected.path
+            or observed.lease_identity != expected.lease_identity
+            or observed.work_identity != expected.work_identity
+            or observed.work_tree_limit_bytes
+            != expected.work_tree_limit_bytes
+        ):
+            raise ScopeError("analysis lease workspace identity changed")
+        return observed
 
     def build_container_argv(
         self,
@@ -848,6 +1256,173 @@ class DockerSandboxBackend:
         ):
             raise SandboxError("Docker inspect returned an unexpected result")
         return values[0]
+
+    def _analysis_container_present(self, name: str) -> bool:
+        """Prove exact-name presence/absence through a successful list call."""
+
+        if not re.fullmatch(
+            r"ctfos-analysis-[0-9a-f]{12}-[0-9a-f]{20}-(?:init|run)",
+            name,
+        ):
+            raise AnalysisRuntimeCleanupPending(
+                "refused an invalid isolated-analysis container identity"
+            )
+        result = self._capture(
+            [
+                self.docker,
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"name=^/{name}$",
+            ],
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise AnalysisRuntimeCleanupPending(
+                "could not prove isolated-analysis container absence: "
+                + self._bounded(result.stderr or result.stdout or "", 4096).strip()
+            )
+        identifiers = [
+            line.strip() for line in (result.stdout or "").splitlines()
+            if line.strip()
+        ]
+        if len(identifiers) > 1 or any(
+            re.fullmatch(r"[0-9a-f]{12,64}", identifier) is None
+            for identifier in identifiers
+        ):
+            raise AnalysisRuntimeCleanupPending(
+                "Docker returned an ambiguous isolated-analysis identity"
+            )
+        return bool(identifiers)
+
+    def _verify_analysis_container(
+        self,
+        details: Mapping[str, Any],
+        *,
+        lease: AnalysisLeaseRef,
+        binding: _AnalysisWorkBinding,
+        phase: str,
+    ) -> None:
+        labels = details.get("Config", {}).get("Labels", {})
+        if (
+            not isinstance(labels, dict)
+            or labels.get("ctfos.managed") != "true"
+            or labels.get("ctfos.scope") != self.scope.fingerprint
+            or labels.get("ctfos.challenge") != self.scope.qualified_id
+            or labels.get("ctfos.analysis") != lease.analysis_id
+            or labels.get("ctfos.analysis_phase") != phase
+            or labels.get("ctfos.image") != self.image
+            or labels.get("ctfos.image_digest", "")
+            != (self.image_digest or "")
+            or details.get("Config", {}).get("Image")
+            != self.image_reference
+            or (
+                self.image_digest is not None
+                and details.get("Image") != self.image_digest
+            )
+        ):
+            raise AnalysisRuntimeCleanupPending(
+                "isolated-analysis container labels do not match its lease"
+            )
+        mounts = details.get("Mounts")
+        if not isinstance(mounts, list):
+            raise AnalysisRuntimeCleanupPending(
+                "isolated-analysis container mounts are unavailable"
+            )
+        challenge_match = False
+        work_match = False
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                raise AnalysisRuntimeCleanupPending(
+                    "isolated-analysis container has an invalid mount"
+                )
+            mount_type = mount.get("Type")
+            destination = mount.get("Destination")
+            if mount_type == "tmpfs":
+                if destination not in {"/tmp", "/run"}:
+                    raise AnalysisRuntimeCleanupPending(
+                        "isolated-analysis container has an unexpected tmpfs"
+                    )
+                continue
+            if mount_type != "bind":
+                raise AnalysisRuntimeCleanupPending(
+                    "isolated-analysis container has an unexpected mount type"
+                )
+            source = str(mount.get("Source", ""))
+            rw = mount.get("RW")
+            if destination == "/challenge":
+                try:
+                    source_path = Path(source).resolve(strict=True)
+                except OSError as error:
+                    raise AnalysisRuntimeCleanupPending(
+                        "isolated-analysis challenge mount cannot be verified"
+                    ) from error
+                challenge_match = (
+                    source_path == self.scope.challenge_dir and rw is False
+                )
+            elif destination == "/work":
+                try:
+                    source_path = Path(source).resolve(strict=True)
+                except OSError as error:
+                    raise AnalysisRuntimeCleanupPending(
+                        "isolated-analysis work mount cannot be verified"
+                    ) from error
+                work_match = source_path == binding.path and rw is True
+            else:
+                raise AnalysisRuntimeCleanupPending(
+                    "isolated-analysis container has an unexpected bind mount"
+                )
+            try:
+                source_path = Path(source).resolve(strict=True)
+            except OSError:
+                source_path = None
+            if source_path == self.scope.work_dir:
+                raise AnalysisRuntimeCleanupPending(
+                    "isolated-analysis container mounted canonical work"
+                )
+        if not challenge_match or not work_match:
+            raise AnalysisRuntimeCleanupPending(
+                "isolated-analysis container mount scope does not match"
+            )
+
+    def cleanup_isolated_analysis(self, lease: AnalysisLeaseRef) -> None:
+        """Remove and prove absence of the two exact lease containers."""
+
+        binding = self._analysis_work_binding(lease)
+        init_name, run_name = self._analysis_container_names(lease)
+        for name, phase in ((init_name, "init"), (run_name, "run")):
+            if not self._analysis_container_present(name):
+                continue
+            details = self._inspect(name)
+            if details is None:
+                raise AnalysisRuntimeCleanupPending(
+                    "present isolated-analysis container could not be inspected"
+                )
+            self._verify_analysis_container(
+                details,
+                lease=lease,
+                binding=binding,
+                phase=phase,
+            )
+            result = self._capture(
+                [self.docker, "container", "rm", "--force", name],
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise AnalysisRuntimeCleanupPending(
+                    "exact isolated-analysis container removal failed: "
+                    + self._bounded(
+                        result.stderr or result.stdout or "",
+                        4096,
+                    ).strip()
+                )
+            if self._analysis_container_present(name):
+                raise AnalysisRuntimeCleanupPending(
+                    "isolated-analysis container remains after exact removal"
+                )
+        self._revalidate_analysis_work(lease, binding)
 
     def _verify_container(self, details: Mapping[str, Any], network: str) -> bool:
         labels = details.get("Config", {}).get("Labels", {})
@@ -1269,6 +1844,7 @@ class DockerSandboxBackend:
                     raise operation_error
             if value.get("kind") != "run_result":
                 raise SandboxError("ctfwrap returned the wrong result kind")
+            self._audit_run_credentials(self.scope.work_dir, value)
             try:
                 sandbox_result = sandbox_result_from_mapping(value)
             except (KeyError, TypeError, ValueError) as error:
@@ -1278,6 +1854,300 @@ class DockerSandboxBackend:
             operation="sandbox result promotion",
         )
         return sandbox_result
+
+    def run_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+        spec: CommandSpec,
+        *,
+        input_locators: Sequence[str] = (),
+    ) -> SandboxResult:
+        """Run once in a manager-owned scratch using declared copied inputs.
+
+        The canonical work tree is never mounted.  Only normalized regular
+        files named by ``input_locators`` are copied through the stable bounded
+        copy primitive after the image initializes a fresh challenge tree.
+        """
+
+        binding = self._analysis_work_binding(lease)
+        if self.limits.work_tree_max_bytes > binding.work_tree_limit_bytes:
+            raise ScopeError(
+                "sandbox work-tree bound exceeds the analysis reservation"
+            )
+        if (
+            isinstance(input_locators, (str, bytes, bytearray))
+            or not isinstance(input_locators, Sequence)
+            or len(input_locators) > MAX_ANALYSIS_INPUTS
+        ):
+            raise ValueError(
+                "isolated analysis inputs must be at most 256 strings"
+            )
+        input_values = tuple(input_locators)
+        if any(type(locator) is not str for locator in input_values):
+            raise ValueError(
+                "isolated analysis inputs must be at most 256 strings"
+            )
+        try:
+            normalized_inputs = tuple(
+                normalize_locator(locator) for locator in input_values
+            )
+        except SafeFileError as error:
+            raise ScopeError("isolated analysis input locator is invalid") from error
+        if len(set(normalized_inputs)) != len(normalized_inputs):
+            raise ValueError("isolated analysis input locators must be unique")
+
+        deadline_monotonic = self._anchor_hard_deadline(
+            spec.deadline_monotonic_seconds
+        )
+        ensure_foreground_command(spec.argv)
+        if Path(spec.argv[0]).name in _JOB_CONTROL_COMMANDS:
+            raise BackgroundJobUnsupported(
+                "persistent background job control is unavailable in "
+                "isolated analysis"
+            )
+        try:
+            web_session = prepare_web_session_command(
+                category=self.scope.category,
+                argv=spec.argv,
+                environment=spec.environment,
+            )
+        except WebPrivateStateError as error:
+            raise SandboxError(str(error)) from error
+        if web_session is not None:
+            raise SandboxError(
+                "persistent Web identities are unavailable in isolated analysis"
+            )
+        network, boundary_environment = self._authorized_runtime(spec)
+        if bool(spec.resource_request.network) != (network != "none"):
+            raise SandboxError(
+                "leased network resource does not match authorized network mode"
+            )
+        execution_limits = self._execution_limits(spec.resource_request)
+        init_name, run_name = self._analysis_container_names(lease)
+
+        # A stale runtime from a killed prior owner must be reconciled before
+        # any new bytes are written into its still-reserved scratch.
+        self.cleanup_isolated_analysis(lease)
+        primary_error: BaseException | None = None
+        try:
+            self._revalidate_analysis_work(lease, binding)
+            try:
+                existing = os.listdir(binding.path)
+            except OSError as error:
+                raise ScopeError(
+                    "analysis work directory cannot be enumerated"
+                ) from error
+            if existing:
+                raise ScopeError(
+                    "isolated analysis requires an empty admitted work directory"
+                )
+            self.check_work_tree(
+                binding.path,
+                phase="before isolated analysis initialization",
+            )
+            init_argv = self.build_container_argv(
+                network="none",
+                work_dir=binding.path,
+                detach=False,
+                name=init_name,
+                command=("true",),
+                remove=True,
+                limits=execution_limits,
+                labels={
+                    "ctfos.analysis": lease.analysis_id,
+                    "ctfos.analysis_phase": "init",
+                },
+            )
+            initialized = self._capture(
+                init_argv,
+                timeout=self._clamp_hard_deadline_timeout(
+                    deadline_monotonic,
+                    120,
+                    operation="isolated analysis initialization container",
+                ),
+            )
+            self._remaining_hard_deadline(
+                deadline_monotonic,
+                operation="isolated analysis initialization completion",
+            )
+            if initialized.returncode != 0:
+                raise SandboxError(
+                    "could not initialize isolated analysis workspace: "
+                    + self._bounded(initialized.stderr, 4096).strip()
+                )
+            # Prove the initialization runtime gone before host-side copies.
+            self.cleanup_isolated_analysis(lease)
+            usage = self.check_work_tree(
+                binding.path,
+                phase="after isolated analysis initialization",
+            )
+            admitted_bytes = usage.accounted_bytes
+
+            for locator in normalized_inputs:
+                self._remaining_hard_deadline(
+                    deadline_monotonic,
+                    operation="isolated analysis input preparation",
+                )
+                parts = locator.split("/")
+                try:
+                    destination_parent = ensure_relative_directory(
+                        binding.path,
+                        "/".join(parts[:-1]),
+                    )
+                except SafeFileError as error:
+                    raise ScopeError(
+                        "isolated analysis input destination is unsafe: "
+                        f"{locator}"
+                    ) from error
+                destination = destination_parent / parts[-1]
+                if destination.exists() or destination.is_symlink():
+                    raise ScopeError(
+                        "isolated analysis input would overwrite a challenge "
+                        f"file: {locator}"
+                    )
+
+                def admit_source(size: int) -> None:
+                    nonlocal admitted_bytes
+                    if admitted_bytes + size > self.limits.work_tree_max_bytes:
+                        raise SafeFileError(
+                            "declared analysis inputs exceed the work-tree bound"
+                        )
+                    admitted_bytes += size
+
+                try:
+                    copy_bounded_regular(
+                        self.scope.work_dir,
+                        locator,
+                        destination,
+                        maximum_bytes=self.limits.work_tree_max_bytes,
+                        source_size_admission=admit_source,
+                        require_single_link=True,
+                        mode=0o500,
+                    )
+                except SafeFileError as error:
+                    raise ScopeError(
+                        "isolated analysis input could not be copied safely: "
+                        f"{locator}"
+                    ) from error
+
+            self.check_work_tree(
+                binding.path,
+                phase="after isolated analysis input preparation",
+            )
+            self._revalidate_analysis_work(lease, binding)
+            command_timeout = self._effective_command_timeout(
+                spec,
+                deadline_monotonic,
+                operation="isolated analysis command",
+            )
+            command = (
+                "ctfwrap",
+                "--json",
+                "--timeout",
+                str(command_timeout),
+                "--summary-bytes",
+                str(spec.summary_bytes),
+                "--stdout-limit-bytes",
+                str(execution_limits.stream_capture_max_bytes),
+                "--stderr-limit-bytes",
+                str(execution_limits.stream_capture_max_bytes),
+                "--",
+                *spec.argv,
+            )
+            argv = self.build_container_argv(
+                network=network,
+                work_dir=binding.path,
+                detach=False,
+                name=run_name,
+                command=command,
+                remove=True,
+                limits=execution_limits,
+                labels={
+                    "ctfos.analysis": lease.analysis_id,
+                    "ctfos.analysis_phase": "run",
+                },
+            )
+            image_index = argv.index(self.image_reference)
+            environment = dict(spec.environment)
+            environment.update(boundary_environment)
+            environment_args: list[str] = []
+            for name, value in sorted(environment.items()):
+                environment_args.extend(["--env", f"{name}={value}"])
+            argv[image_index:image_index] = environment_args
+            result = self._capture(
+                argv,
+                timeout=self._clamp_hard_deadline_timeout(
+                    deadline_monotonic,
+                    (
+                        command_timeout + 15
+                        if command_timeout
+                        else 604800 + 15
+                    ),
+                    operation="isolated analysis command",
+                ),
+            )
+            self._remaining_hard_deadline(
+                deadline_monotonic,
+                operation="isolated analysis command completion",
+            )
+            value = self._parse_json(result)
+            if value.get("kind") != "run_result":
+                raise SandboxError(
+                    "isolated analysis returned the wrong result kind"
+                )
+            self._audit_run_credentials(binding.path, value)
+            self.check_work_tree(
+                binding.path,
+                phase="after isolated analysis command",
+            )
+            self._revalidate_analysis_work(lease, binding)
+            run_id = value.get("run_id")
+            if type(run_id) is not str or re.fullmatch(
+                r"run-[0-9]{8,}", run_id
+            ) is None:
+                raise SandboxError("isolated analysis returned an invalid run id")
+            result_root = f"/work/.ctf/runs/{run_id}"
+            try:
+                return sandbox_result_from_mapping(
+                    value,
+                    stdout_path=f"{result_root}/stdout.log",
+                    stderr_path=f"{result_root}/stderr.log",
+                    bound_timeout_seconds=command_timeout,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise SandboxError(
+                    "isolated analysis returned an invalid result"
+                ) from error
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                self.cleanup_isolated_analysis(lease)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                if not isinstance(primary_error, Exception):
+                    primary_error.add_note(
+                        "isolated analysis runtime cleanup is pending: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                elif not isinstance(cleanup_error, Exception):
+                    cleanup_error.add_note(
+                        "isolated analysis operation also failed: "
+                        f"{type(primary_error).__name__}: {primary_error}"
+                    )
+                    raise cleanup_error
+                else:
+                    pending = AnalysisRuntimeCleanupPending(
+                        "isolated analysis failed and its runtime absence "
+                        "could not be proven"
+                    )
+                    pending.add_note(
+                        "isolated analysis runtime cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    raise pending from primary_error
 
     def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef:
         del spec, name
@@ -1341,6 +2211,8 @@ class DockerSandboxBackend:
             raise ValueError(
                 "background job name must be a bounded printable string"
             )
+        if name is not None:
+            validate_metadata_credentials(name)
         ensure_foreground_command(spec.argv)
         deadline_monotonic = self._anchor_hard_deadline(
             spec.deadline_monotonic_seconds
@@ -1418,6 +2290,10 @@ class DockerSandboxBackend:
                 "--json",
                 "--timeout",
                 str(timeout_seconds),
+                "--stdout-limit-bytes",
+                str(execution_limits.stream_capture_max_bytes),
+                "--stderr-limit-bytes",
+                str(execution_limits.stream_capture_max_bytes),
             ]
             if name is not None:
                 command.extend(["--name", name])
@@ -1607,6 +2483,11 @@ class DockerSandboxBackend:
                 finished_at=(
                     str(value["finished_at"])
                     if value.get("finished_at") is not None
+                    else None
+                ),
+                reason_code=(
+                    str(value["reason_code"])
+                    if value.get("reason_code") is not None
                     else None
                 ),
             )
@@ -1827,6 +2708,11 @@ class DockerSandboxBackend:
                     if job.get("finished_at") is not None
                     else None
                 ),
+                reason_code=(
+                    str(job["reason_code"])
+                    if job.get("reason_code") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise SandboxError("ctf-jobs returned an invalid status") from error
@@ -1842,6 +2728,9 @@ class DockerSandboxBackend:
             self._validate_supervised_ref(ref)
             stdout_locator = f".ctf/jobs/{ref.job_id}/stdout.log"
             stderr_locator = f".ctf/jobs/{ref.job_id}/stderr.log"
+            capture_locator = (
+                f".ctf/jobs/{ref.job_id}/stream-capture.json"
+            )
             stdout_payload = self._read_scoped_job_file(
                 stdout_locator,
                 maximum_bytes=self.limits.work_tree_max_bytes,
@@ -1852,16 +2741,86 @@ class DockerSandboxBackend:
                 maximum_bytes=self.limits.work_tree_max_bytes,
                 tail_bytes=tail_bytes,
             )
+            self._reject_job_log_credentials(
+                stdout_payload,
+                stderr_payload,
+            )
             stdout_size = self._scoped_job_file_size(stdout_locator)
             stderr_size = self._scoped_job_file_size(stderr_locator)
+            stream_totals = {
+                "stdout": stdout_size,
+                "stderr": stderr_size,
+            }
+            capture_path = self.scope.work_dir / capture_locator
+            try:
+                capture_path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                capture_payload = self._read_scoped_job_file(
+                    capture_locator,
+                    maximum_bytes=1024 * 1024,
+                )
+                try:
+                    capture = json.loads(capture_payload.decode("utf-8"))
+                    streams = capture["streams"]
+                    if (
+                        not isinstance(capture, dict)
+                        or capture.get("schema_version") != 1
+                        or not isinstance(streams, dict)
+                    ):
+                        raise ValueError
+                    for stream_name, stored_size in (
+                        ("stdout", stdout_size),
+                        ("stderr", stderr_size),
+                    ):
+                        stream = streams[stream_name]
+                        if not isinstance(stream, dict):
+                            raise ValueError
+                        total = stream["bytes"]
+                        stored = stream["stored_bytes"]
+                        limit = stream["limit_bytes"]
+                        truncated = stream["truncated"]
+                        complete = stream["complete"]
+                        if (
+                            type(total) is not int
+                            or type(stored) is not int
+                            or type(limit) is not int
+                            or type(truncated) is not bool
+                            or type(complete) is not bool
+                            or total < 0
+                            or stored < 0
+                            or stored != stored_size
+                            or stored > total
+                            or stored > limit
+                            or limit
+                            != self.limits.stream_capture_max_bytes
+                            or truncated != (total > stored)
+                        ):
+                            raise ValueError
+                        stream_totals[stream_name] = total
+                except (
+                    KeyError,
+                    TypeError,
+                    UnicodeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise SandboxError(
+                        "sandbox job stream capture metadata is invalid"
+                    ) from error
             return JobLog(
                 ref=ref,
                 stdout=stdout_payload.decode("utf-8", errors="replace"),
                 stderr=stderr_payload.decode("utf-8", errors="replace"),
-                stdout_bytes=stdout_size,
-                stderr_bytes=stderr_size,
-                stdout_truncated=stdout_size > len(stdout_payload),
-                stderr_truncated=stderr_size > len(stderr_payload),
+                stdout_bytes=stream_totals["stdout"],
+                stderr_bytes=stream_totals["stderr"],
+                stdout_truncated=(
+                    stream_totals["stdout"] > len(stdout_payload)
+                ),
+                stderr_truncated=(
+                    stream_totals["stderr"] > len(stderr_payload)
+                ),
             )
         container = self._container_for_ref(ref)
         value = self._exec_json(
@@ -1883,10 +2842,16 @@ class DockerSandboxBackend:
         stdout = streams.get("stdout", {})
         stderr = streams.get("stderr", {})
         try:
+            stdout_tail = str(stdout.get("tail", ""))
+            stderr_tail = str(stderr.get("tail", ""))
+            self._reject_job_log_credentials(
+                stdout_tail.encode("utf-8", errors="replace"),
+                stderr_tail.encode("utf-8", errors="replace"),
+            )
             return JobLog(
                 ref=ref,
-                stdout=str(stdout.get("tail", "")),
-                stderr=str(stderr.get("tail", "")),
+                stdout=stdout_tail,
+                stderr=stderr_tail,
                 stdout_bytes=int(stdout.get("bytes", 0)),
                 stderr_bytes=int(stderr.get("bytes", 0)),
                 stdout_truncated=bool(stdout.get("tail_truncated", False)),
@@ -2357,6 +3322,7 @@ class DockerSandboxBackend:
                     raise SandboxError(
                         "clean proof returned the wrong result kind"
                     )
+                self._audit_run_credentials(proof_work, value)
             try:
                 run_id = str(value["run_id"])
                 if not re.fullmatch(r"run-[0-9]{8,}", run_id):

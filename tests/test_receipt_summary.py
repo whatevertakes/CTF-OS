@@ -6,6 +6,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ctf_os.engine.receipt_summary import (
     MAX_RECEIPT_STRUCTURE_JSON_BYTES,
@@ -40,6 +41,7 @@ class ReceiptSummaryTests(unittest.TestCase):
         stdout_truncation_known: bool = False,
         stdout_capture_complete: bool = False,
         stdout_summary: str = "",
+        stdout_limit_bytes: int = 4096,
     ) -> SandboxResult:
         return SandboxResult(
             run_id="run-1",
@@ -55,7 +57,7 @@ class ReceiptSummaryTests(unittest.TestCase):
             stderr_path="/work/raw/stderr.log",
             stdout_stored_bytes=stdout_stored_bytes,
             stderr_stored_bytes=0,
-            stdout_limit_bytes=4096,
+            stdout_limit_bytes=stdout_limit_bytes,
             stderr_limit_bytes=4096,
             stdout_truncated=stdout_truncated,
             stderr_truncated=False,
@@ -155,6 +157,84 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertNotIn(secret, preview)
         self.assertLessEqual(len(preview), 160)
         self.assertEqual(evidence["redaction_count"], 1)
+
+    def test_json_prefixed_environment_and_known_tokens_are_redacted(
+        self,
+    ) -> None:
+        environment_secret = "engine-environment-secret-value"
+        values = (
+            "quoted-json-secret",
+            environment_secret,
+            "ctfd-token-secret",
+            "sk-proj-ABCDEFGHIJKLMNOPQRSTUV",
+        )
+        payload = (
+            b'{"api_key":"quoted-json-secret","status":"ok"}\n'
+            + f"OPENAI_API_KEY={environment_secret}\n".encode()
+            + b"CTFD_TOKEN=ctfd-token-secret\n"
+            + b"token sk-proj-ABCDEFGHIJKLMNOPQRSTUV\n"
+        )
+        path = self.snapshot(payload)
+        result = self.result(
+            stdout_bytes=len(payload),
+            stdout_stored_bytes=len(payload),
+            stdout_truncated=False,
+            stdout_truncation_known=True,
+            stdout_capture_complete=True,
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {"CTFOS_ENGINE_TEST_TOKEN": environment_secret},
+        ):
+            evidence = self.summarize(path, result, sample_bytes=1024)
+            preview = build_receipt_preview(
+                exit_code=0,
+                stdout_bytes=len(payload),
+                stderr_bytes=0,
+                stdout_evidence=evidence,
+            )
+
+        serialized = json.dumps(evidence, sort_keys=True)
+        for secret in values:
+            self.assertNotIn(secret, serialized)
+            self.assertNotIn(secret, preview)
+        self.assertIn("[REDACTED]", serialized)
+        self.assertGreaterEqual(evidence["redaction_count"], len(values))
+        self.assertEqual(
+            evidence["sha256"],
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+    def test_environment_secret_crossing_sample_boundary_is_omitted(
+        self,
+    ) -> None:
+        secret = "environment-secret-crossing-the-tail-boundary"
+        payload = b"safe\n" + b"x" * 40 + secret.encode() + b"\n"
+        sample_bytes = 24
+        tail_start = len(payload) - sample_bytes
+        secret_start = payload.index(secret.encode())
+        self.assertLess(secret_start, tail_start)
+        self.assertLess(tail_start, secret_start + len(secret))
+        path = self.snapshot(payload)
+
+        with mock.patch.dict(
+            "os.environ",
+            {"CTFOS_ENGINE_TEST_TOKEN": secret},
+        ):
+            evidence = self.summarize(
+                path,
+                self.result(stdout_bytes=len(payload)),
+                sample_bytes=sample_bytes,
+            )
+
+        tail = evidence["tail"]
+        self.assertEqual(tail["encoding"], "binary-omitted")
+        self.assertNotIn("text", tail)
+        self.assertNotIn(
+            payload[tail_start:].decode(),
+            json.dumps(evidence, sort_keys=True),
+        )
 
     def test_tail_omits_authorization_value_split_across_boundary(
         self,
@@ -385,6 +465,7 @@ class ReceiptSummaryTests(unittest.TestCase):
                 stdout_truncated=False,
                 stdout_truncation_known=True,
                 stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
             ),
             sample_bytes=16,
         )
@@ -405,6 +486,93 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertNotIn(
             "must-not-appear-in-structure",
             json.dumps(structure, sort_keys=True),
+        )
+
+    def test_long_json_reports_shape_and_pointer_without_middle_values(
+        self,
+    ) -> None:
+        opaque_marker = "middle-only-opaque-challenge-payload"
+        payload = json.dumps(
+            {
+                "records": [{"id": 1}, {"id": 2}],
+                "opaque": (
+                    ("x" * 128_000)
+                    + opaque_marker
+                    + ("y" * 128_000)
+                ),
+                "status": "complete",
+            },
+            separators=(",", ":"),
+        ).encode()
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+                stdout_limit_bytes=len(payload),
+            ),
+            sample_bytes=64,
+        )
+
+        structure = evidence["structured_summary"]
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertEqual(structure["kind"], "json")
+        self.assertEqual(structure["bytes_analyzed"], len(payload))
+        self.assertEqual(
+            structure["key_types"],
+            {
+                "opaque": "string",
+                "records": "array",
+                "status": "string",
+            },
+        )
+        self.assertNotIn(opaque_marker, serialized)
+        self.assertEqual(path.read_bytes(), payload)
+        self.assertEqual(evidence["path"], "artifacts/snapshots/A-run-stdout.log")
+        self.assertEqual(
+            evidence["sha256"],
+            hashlib.sha256(payload).hexdigest(),
+        )
+        self.assertLessEqual(
+            len(serialized.encode("utf-8")),
+            MAX_RECEIPT_STREAM_EVIDENCE_BYTES,
+        )
+
+    def test_redacted_json_key_collisions_remain_self_consistent(
+        self,
+    ) -> None:
+        shared_prefix = "A" * 120
+        payload = json.dumps(
+            {
+                shared_prefix + "-first": 1,
+                shared_prefix + "-second": "two",
+            },
+            separators=(",", ":"),
+        ).encode()
+        path = self.snapshot(payload)
+        evidence = self.summarize(
+            path,
+            self.result(
+                stdout_bytes=len(payload),
+                stdout_stored_bytes=len(payload),
+                stdout_truncated=False,
+                stdout_truncation_known=True,
+                stdout_capture_complete=True,
+            ),
+        )
+
+        structure = evidence["structured_summary"]
+        self.assertEqual(structure["kind"], "json")
+        self.assertEqual(structure["key_count"], 2)
+        self.assertEqual(len(structure["key_types"]), 1)
+        self.assertEqual(structure["keys_omitted"], 1)
+        self.assertEqual(
+            structure["key_count"],
+            len(structure["key_types"]) + structure["keys_omitted"],
         )
 
     def test_http_html_structure_reports_status_title_and_tags(self) -> None:
@@ -487,6 +655,13 @@ class ReceiptSummaryTests(unittest.TestCase):
         self.assertTrue(evidence["truncated"])
         self.assertEqual(evidence["drained_bytes"], 200)
         self.assertEqual(evidence["stored_bytes"], 100)
+        self.assertEqual(
+            evidence["structured_summary"]["scope"],
+            "retained_prefix",
+        )
+        self.assertFalse(
+            evidence["structured_summary"]["line_count_exact"],
+        )
 
     def test_legacy_result_never_claims_complete_capture(self) -> None:
         payload = b"legacy output\n"

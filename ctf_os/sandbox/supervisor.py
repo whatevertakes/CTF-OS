@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ctf_os.credential_safety import validate_metadata_credentials
 from ctf_os.director.leases import LeaseBroker
 from ctf_os.director.resources import ResourceVector
 from ctf_os.store.atomic import (
@@ -42,6 +43,8 @@ from .docker import DockerLimits, DockerSandboxBackend
 from .files import ensure_private_directory
 from .types import (
     JOB_SUPERVISOR_ID,
+    BackgroundLaunchState,
+    BackgroundLaunchStatus,
     ChallengeScope,
     CommandSpec,
     JobLog,
@@ -56,6 +59,7 @@ from .types import (
 
 _RECEIPT_NAME = "receipt.json"
 _REQUEST_NAME = "request.json"
+_CANCEL_NAME = "cancel.json"
 _MAX_CONTROL_DOCUMENT_BYTES = 256 * 1024
 _TERMINAL_STATES = frozenset(
     {
@@ -66,6 +70,16 @@ _TERMINAL_STATES = frozenset(
         JobState.LOST,
     }
 )
+_RELEASED_RECEIPT_STATES = frozenset(
+    {
+        "terminal",
+        "failed",
+        "launch_failed",
+        "cancelled",
+        "recovered",
+    }
+)
+_WORK_TREE_QUOTA_REASON = "work_tree_quota_exceeded"
 
 
 class _SupervisorStop(BaseException):
@@ -105,6 +119,7 @@ def _status_dict(status: JobStatus) -> dict[str, object]:
         "cancelled": status.cancelled,
         "started_at": status.started_at,
         "finished_at": status.finished_at,
+        "reason_code": status.reason_code,
     }
 
 
@@ -128,6 +143,101 @@ def _ref_from_value(value: object) -> JobRef:
         runtime_id=value.get("runtime_id", "none"),  # type: ignore[arg-type]
         supervisor_id=value.get("supervisor_id"),  # type: ignore[arg-type]
     )
+
+
+def _status_from_value(ref: JobRef, value: object) -> JobStatus:
+    if not isinstance(value, Mapping):
+        raise SandboxError("background receipt has no exact job status")
+    try:
+        exit_code = value.get("exit_code")
+        timed_out = value.get("timed_out", False)
+        cancelled = value.get("cancelled", False)
+        started_at = value.get("started_at")
+        finished_at = value.get("finished_at")
+        reason_code = value.get("reason_code")
+        if (
+            (exit_code is not None and type(exit_code) is not int)
+            or type(timed_out) is not bool
+            or type(cancelled) is not bool
+            or (started_at is not None and type(started_at) is not str)
+            or (finished_at is not None and type(finished_at) is not str)
+            or (reason_code is not None and type(reason_code) is not str)
+        ):
+            raise ValueError("invalid background status fields")
+        return JobStatus(
+            ref=ref,
+            status=JobState(value.get("status")),
+            exit_code=exit_code,
+            timed_out=timed_out,
+            cancelled=cancelled,
+            started_at=started_at,
+            finished_at=finished_at,
+            reason_code=reason_code,
+        )
+    except (TypeError, ValueError) as error:
+        raise SandboxError("background receipt job status is invalid") from error
+
+
+def _work_tree_failed_status(
+    ref: JobRef,
+    prior: JobStatus | None,
+) -> JobStatus:
+    """Project a bounded public failure without exposing command output."""
+
+    return JobStatus(
+        ref,
+        JobState.FAILED,
+        exit_code=prior.exit_code if prior is not None else None,
+        timed_out=prior.timed_out if prior is not None else False,
+        cancelled=prior.cancelled if prior is not None else False,
+        started_at=prior.started_at if prior is not None else None,
+        finished_at=prior.finished_at if prior is not None else None,
+        reason_code=_WORK_TREE_QUOTA_REASON,
+    )
+
+
+def _released_receipt_status(
+    receipt: Mapping[str, object],
+    ref: JobRef,
+) -> JobStatus | None:
+    """Return a trusted monitor's terminal status without re-querying Docker."""
+
+    if receipt.get("state") not in _RELEASED_RECEIPT_STATES:
+        return None
+    value = receipt.get("job_status")
+    if value is None:
+        return None
+    status = _status_from_value(ref, value)
+    if status.status not in _TERMINAL_STATES:
+        raise SandboxError(
+            "released background receipt has a non-terminal job status"
+        )
+    return status
+
+
+def _launch_cancel_requested(
+    job_root: Path,
+    supervisor_id: str,
+) -> bool:
+    path = job_root / _CANCEL_NAME
+    if not path.exists():
+        return False
+    value = _read_private_json(path)
+    if (
+        set(value)
+        != {
+            "schema_version",
+            "supervisor_id",
+            "requested_at",
+            "reason",
+        }
+        or value.get("schema_version") != 1
+        or value.get("supervisor_id") != supervisor_id
+        or value.get("reason") != "orphaned_prelaunch_recovery"
+        or type(value.get("requested_at")) is not str
+    ):
+        raise ScopeError("background launch cancellation binding changed")
+    return True
 
 
 def _command_dict(spec: CommandSpec) -> dict[str, object]:
@@ -443,6 +553,7 @@ class BackgroundJobSupervisor:
         *,
         name: str | None = None,
         owner: str | None = None,
+        supervisor_id: str | None = None,
     ) -> JobRef:
         """Return only after the worker publishes a lease-bound launch receipt."""
 
@@ -459,6 +570,8 @@ class BackgroundJobSupervisor:
             raise ValueError(
                 "background job name must be a bounded printable string"
             )
+        if name is not None:
+            validate_metadata_credentials(name)
         owner_value = owner or (
             f"{backend.scope.qualified_id}:background"
         )
@@ -468,7 +581,13 @@ class BackgroundJobSupervisor:
             or any(ord(character) < 0x20 for character in owner_value)
         ):
             raise ValueError("background lease owner is invalid")
-        supervisor_id = f"bg-{secrets.token_hex(16)}"
+        if supervisor_id is None:
+            supervisor_id = f"bg-{secrets.token_hex(16)}"
+        elif (
+            type(supervisor_id) is not str
+            or not JOB_SUPERVISOR_ID.fullmatch(supervisor_id)
+        ):
+            raise ValueError("invalid background supervisor identity")
         # The persisted owner is an exact recovery binding, not merely a
         # human-readable challenge label.  This closes the crash window after
         # durable acquire but before the worker can publish its lease id.
@@ -543,8 +662,18 @@ class BackgroundJobSupervisor:
                             raise SandboxError(
                                 "background launch receipt PID changed"
                             )
+                        if ref.supervisor_id != supervisor_id:
+                            raise SandboxError(
+                                "background launch returned another "
+                                "supervisor identity"
+                            )
                         return ref
-                    if state in {"failed", "launch_failed", "cancelled"}:
+                    if state in {
+                        "failed",
+                        "launch_failed",
+                        "cancelled",
+                        "recovered",
+                    }:
                         raise SandboxError(
                             str(
                                 receipt.get(
@@ -690,6 +819,16 @@ class BackgroundJobSupervisor:
                     "unbound background runtime cleanup failed: "
                     f"{cleanup_error}"
                 )
+            work_tree_breach = False
+            try:
+                backend.check_work_tree(
+                    phase="background orphan recovery",
+                )
+            except SandboxError:
+                # The exact runtime is already absent, so releasing its host
+                # resource lease is safe.  Preserve a bounded trusted failure
+                # instead of misreporting the oversized tree as recovered.
+                work_tree_breach = True
             matching_leases = tuple(
                 record
                 for record in self.lease_broker.status().leases
@@ -709,12 +848,27 @@ class BackgroundJobSupervisor:
                 directory / _RECEIPT_NAME,
                 {
                     **receipt,
-                    "state": "recovered",
+                    "state": (
+                        "failed" if work_tree_breach else "recovered"
+                    ),
                     "recovered_at": _utc_now(),
                     "recovery_action": (
-                        "unbound_runtime_removed_and_lease_reclaimed"
+                        "unbound_runtime_removed_with_quota_failure"
+                        if work_tree_breach
+                        else "unbound_runtime_removed_and_lease_reclaimed"
                     ),
                     "lease_owner": owner,
+                    **(
+                        {
+                            "error": (
+                                "background work-tree quota check failed "
+                                "during orphan recovery"
+                            ),
+                            "reason_code": _WORK_TREE_QUOTA_REASON,
+                        }
+                        if work_tree_breach
+                        else {}
+                    ),
                     **(
                         {"lease_id": matching_leases[0].lease_id}
                         if matching_leases
@@ -726,6 +880,13 @@ class BackgroundJobSupervisor:
         statuses: list[JobStatus] = []
         for current_ref in refs:
             receipt = self._require_exact_receipt(backend, current_ref)
+            released_status = _released_receipt_status(
+                receipt,
+                current_ref,
+            )
+            if released_status is not None:
+                statuses.append(released_status)
+                continue
             worker_alive = _pid_matches(
                 receipt.get("supervisor_pid"),
                 receipt.get("supervisor_start_ticks"),
@@ -756,6 +917,14 @@ class BackgroundJobSupervisor:
                     "orphaned background runtime cleanup failed: "
                     f"{cleanup_error}"
                 )
+            work_tree_breach = False
+            try:
+                backend.check_work_tree(
+                    phase="background orphan recovery",
+                )
+            except SandboxError:
+                work_tree_breach = True
+                status = _work_tree_failed_status(current_ref, status)
             lease_id = receipt.get("lease_id")
             if isinstance(lease_id, str):
                 request = _read_private_json(
@@ -782,16 +951,31 @@ class BackgroundJobSupervisor:
                 )
             recovered = {
                 **receipt,
-                "state": "recovered",
+                "state": (
+                    "failed" if work_tree_breach else "recovered"
+                ),
                 "recovered_at": _utc_now(),
                 "recovery_action": (
-                    "orphaned_command_cancelled"
+                    "runtime_removed_with_quota_failure"
+                    if work_tree_breach
+                    else "orphaned_command_cancelled"
                     if status.status is JobState.CANCELLED
                     else "terminal_runtime_removed"
                     if status.status in _TERMINAL_STATES
                     else "orphaned_runtime_lost"
                 ),
                 "job_status": _status_dict(status),
+                **(
+                    {
+                        "error": (
+                            "background work-tree quota check failed "
+                            "during orphan recovery"
+                        ),
+                        "reason_code": _WORK_TREE_QUOTA_REASON,
+                    }
+                    if work_tree_breach
+                    else {}
+                ),
             }
             atomic_write_json(
                 self._job_root(
@@ -807,12 +991,291 @@ class BackgroundJobSupervisor:
         self.lease_broker.status()
         return tuple(statuses)
 
+    def recover_launch(
+        self,
+        backend: DockerSandboxBackend,
+        supervisor_id: str,
+    ) -> BackgroundLaunchStatus:
+        """Reconcile one preallocated launch without guessing its identity."""
+
+        if (
+            type(supervisor_id) is not str
+            or not JOB_SUPERVISOR_ID.fullmatch(supervisor_id)
+        ):
+            raise ValueError("invalid background supervisor identity")
+        job_root = self._job_root(
+            backend.scope.fingerprint,
+            supervisor_id,
+        )
+        try:
+            root_stat = job_root.lstat()
+        except FileNotFoundError:
+            cleanup_error = backend._remove_supervised_runtime(
+                supervisor_id,
+                runtime_id=None,
+                missing_ok=True,
+            )
+            if cleanup_error is not None:
+                raise SandboxError(
+                    "absent background runtime could not be attested: "
+                    f"{cleanup_error}"
+                )
+            expected_owner = (
+                f"{(backend.scope.qualified_id + ':background')[:220]}:"
+                f"{supervisor_id}"
+            )
+            matching_leases = tuple(
+                record
+                for record in self.lease_broker.status().leases
+                if record.durable and record.owner == expected_owner
+            )
+            if len(matching_leases) > 1:
+                raise SandboxError(
+                    "absent background durable lease is ambiguous"
+                )
+            for record in matching_leases:
+                self.lease_broker.release_orphaned_durable(
+                    record.lease_id,
+                    owner=expected_owner,
+                    missing_ok=True,
+                )
+            return BackgroundLaunchStatus(
+                supervisor_id,
+                BackgroundLaunchState.ABSENT,
+            )
+        except OSError as error:
+            raise SandboxError(
+                "background launch directory could not be inspected"
+            ) from error
+        if not stat.S_ISDIR(root_stat.st_mode) or job_root.is_symlink():
+            raise ScopeError("background launch directory binding changed")
+
+        request_path = job_root / _REQUEST_NAME
+        receipt_path = job_root / _RECEIPT_NAME
+        request: dict[str, object] | None = None
+        if request_path.exists():
+            request = _read_private_json(request_path)
+            backend_value = request.get("backend")
+            scope_value = (
+                backend_value.get("scope")
+                if isinstance(backend_value, Mapping)
+                else None
+            )
+            if (
+                request.get("schema_version") != 1
+                or request.get("supervisor_id") != supervisor_id
+                or not isinstance(scope_value, Mapping)
+                or scope_value.get("fingerprint")
+                != backend.scope.fingerprint
+            ):
+                raise ScopeError(
+                    "background launch request binding changed"
+                )
+
+        # A caller can die after the immutable request is published but before
+        # Popen returns.  Publish a cancellation tombstone before attesting
+        # absence.  A concurrently booting trusted worker writes its receipt
+        # first and checks this tombstone before it can acquire a lease.
+        if not receipt_path.exists():
+            atomic_write_json(
+                job_root / _CANCEL_NAME,
+                {
+                    "schema_version": 1,
+                    "supervisor_id": supervisor_id,
+                    "requested_at": _utc_now(),
+                    "reason": "orphaned_prelaunch_recovery",
+                },
+                mode=0o400,
+            )
+            if not receipt_path.exists():
+                cleanup_error = backend._remove_supervised_runtime(
+                    supervisor_id,
+                    runtime_id=None,
+                    missing_ok=True,
+                )
+                if cleanup_error is not None:
+                    raise SandboxError(
+                        "prelaunch background runtime absence could not be "
+                        f"attested: {cleanup_error}"
+                    )
+                matching_leases = ()
+                owner: str | None = None
+                if request is not None:
+                    lease_value = request.get("lease")
+                    owner_value = (
+                        lease_value.get("owner")
+                        if isinstance(lease_value, Mapping)
+                        else None
+                    )
+                    if not isinstance(owner_value, str):
+                        raise SandboxError(
+                            "prelaunch durable lease owner is unavailable"
+                        )
+                    owner = owner_value
+                    matching_leases = tuple(
+                        record
+                        for record in self.lease_broker.status().leases
+                        if record.durable and record.owner == owner
+                    )
+                    if len(matching_leases) > 1:
+                        raise SandboxError(
+                            "prelaunch durable lease recovery is ambiguous"
+                        )
+                    for record in matching_leases:
+                        self.lease_broker.release_orphaned_durable(
+                            record.lease_id,
+                            owner=owner,
+                            missing_ok=True,
+                        )
+                recovered: dict[str, object] = {
+                    "schema_version": 1,
+                    "supervisor_id": supervisor_id,
+                    "state": "recovered",
+                    "recovered_at": _utc_now(),
+                    "recovery_action": (
+                        "prelaunch_cancelled_before_receipt"
+                    ),
+                }
+                if request is not None:
+                    recovered["request_sha256"] = hashlib.sha256(
+                        canonical_json_bytes(request)
+                    ).hexdigest()
+                if owner is not None:
+                    recovered["lease_owner"] = owner
+                if matching_leases:
+                    recovered["lease_id"] = matching_leases[0].lease_id
+                atomic_write_json(receipt_path, recovered)
+
+        receipt = _read_private_json(receipt_path)
+        if (
+            receipt.get("schema_version") != 1
+            or receipt.get("supervisor_id") != supervisor_id
+        ):
+            raise ScopeError("background launch receipt identity changed")
+        state = receipt.get("state")
+        allowed_states = {
+            "starting",
+            "leased",
+            "running",
+            "cleanup_pending",
+            "terminal",
+            "failed",
+            "launch_failed",
+            "cancelled",
+            "recovered",
+        }
+        if state not in allowed_states:
+            raise SandboxError("background launch receipt state is invalid")
+        if request is None and state != "recovered":
+            raise ScopeError(
+                "background launch receipt has no immutable request"
+            )
+        if request is not None:
+            expected_request_sha256 = receipt.get("request_sha256")
+            if (
+                state != "launch_failed"
+                and expected_request_sha256
+                != hashlib.sha256(
+                    canonical_json_bytes(request)
+                ).hexdigest()
+            ):
+                raise ScopeError(
+                    "background launch request digest changed"
+                )
+
+        ref = (
+            _ref_from_value(receipt["ref"])
+            if receipt.get("ref") is not None
+            else None
+        )
+        if ref is not None:
+            self._require_exact_receipt(
+                backend,
+                ref,
+                receipt=receipt,
+            )
+
+        worker_alive = _pid_matches(
+            receipt.get("supervisor_pid"),
+            receipt.get("supervisor_start_ticks"),
+        )
+        if state not in _RELEASED_RECEIPT_STATES and not worker_alive:
+            if ref is None:
+                self.recover(backend)
+            else:
+                self.recover(backend, ref)
+            receipt = _read_private_json(receipt_path)
+            if (
+                receipt.get("schema_version") != 1
+                or receipt.get("supervisor_id") != supervisor_id
+            ):
+                raise ScopeError(
+                    "background launch receipt identity changed"
+                )
+            state = receipt.get("state")
+            if state not in allowed_states:
+                raise SandboxError(
+                    "background launch receipt state is invalid"
+                )
+            ref = (
+                _ref_from_value(receipt["ref"])
+                if receipt.get("ref") is not None
+                else None
+            )
+            if ref is not None:
+                self._require_exact_receipt(
+                    backend,
+                    ref,
+                    receipt=receipt,
+                )
+
+        recorded_status = None
+        if ref is not None and receipt.get("job_status") is not None:
+            recorded_status = _status_from_value(
+                ref,
+                receipt["job_status"],
+            )
+        if state in _RELEASED_RECEIPT_STATES:
+            return BackgroundLaunchStatus(
+                supervisor_id,
+                BackgroundLaunchState.RELEASED,
+                ref=ref,
+                job_status=recorded_status,
+            )
+        if state == "running" and ref is not None:
+            try:
+                live_status = backend.job_status(ref)
+            except SandboxError:
+                live_status = JobStatus(ref, JobState.LOST)
+            if live_status.status in {
+                JobState.STARTING,
+                JobState.RUNNING,
+            }:
+                return BackgroundLaunchStatus(
+                    supervisor_id,
+                    BackgroundLaunchState.ACTIVE,
+                    ref=ref,
+                    job_status=live_status,
+                )
+            # The trusted monitor still owns cleanup and its durable lease.
+            # A terminal observation or LOST is not a quiescence attestation.
+            recorded_status = live_status
+        return BackgroundLaunchStatus(
+            supervisor_id,
+            BackgroundLaunchState.PENDING,
+            ref=ref,
+            job_status=recorded_status,
+        )
+
     def status(
         self,
         backend: DockerSandboxBackend,
         ref: JobRef,
     ) -> JobStatus:
-        self._require_exact_receipt(backend, ref)
+        receipt = self._require_exact_receipt(backend, ref)
+        released_status = _released_receipt_status(receipt, ref)
+        if released_status is not None:
+            return released_status
         try:
             return backend.job_status(ref)
         except SandboxError:
@@ -878,6 +1341,13 @@ class BackgroundJobSupervisor:
                 current_ref,
                 receipt=receipt,
             )
+            released_status = _released_receipt_status(
+                receipt,
+                current_ref,
+            )
+            if released_status is not None:
+                statuses.append(released_status)
+                continue
             try:
                 statuses.append(backend.job_status(current_ref))
             except SandboxError:
@@ -897,6 +1367,7 @@ def _worker_receipt(
     lease_owner: str | None = None,
     status: JobStatus | None = None,
     error: str | None = None,
+    reason_code: str | None = None,
 ) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_version": 1,
@@ -917,6 +1388,8 @@ def _worker_receipt(
         value["job_status"] = _status_dict(status)
     if error is not None:
         value["error"] = error[:4096]
+    if reason_code is not None:
+        value["reason_code"] = reason_code
     return value
 
 
@@ -998,6 +1471,8 @@ def _worker(job_root: Path) -> int:
     lease = None
     ref: JobRef | None = None
     status: JobStatus | None = None
+    work_tree_breach = False
+    work_tree_checked = False
 
     def publish_cleanup_pending(detail: str) -> None:
         try:
@@ -1079,7 +1554,51 @@ def _worker(job_root: Path) -> int:
                     pass
                 delay = min(delay * 2, 5.0)
 
+    def check_quiesced_work_tree() -> SandboxError | None:
+        """Measure exactly once after the supervised runtime is absent."""
+
+        nonlocal status, work_tree_breach, work_tree_checked
+        if work_tree_checked:
+            return None
+        try:
+            backend.check_work_tree(
+                phase="background job terminal",
+            )
+            work_tree_checked = True
+            return None
+        except SandboxError:
+            work_tree_checked = True
+            work_tree_breach = True
+            if ref is not None:
+                status = _work_tree_failed_status(ref, status)
+            return SandboxError(
+                "background work-tree quota check failed after exact "
+                "runtime removal"
+            )
+
+    def wait_for_quiesced_work_tree() -> SandboxError | None:
+        """Do not release capacity until one complete postcheck is observed."""
+
+        delay = 0.05
+        while not work_tree_checked:
+            try:
+                return check_quiesced_work_tree()
+            except BaseException as check_error:
+                publish_cleanup_pending(
+                    "background work-tree postcheck interrupted; retrying "
+                    "before lease release: "
+                    f"{type(check_error).__name__}"
+                )
+                try:
+                    time.sleep(delay)
+                except BaseException:
+                    pass
+                delay = min(delay * 2, 5.0)
+        return None
+
     try:
+        if _launch_cancel_requested(job_root, supervisor_id):
+            raise _SupervisorStop()
         effective_wait = float(wait_timeout)
         if spec.deadline_monotonic_seconds is not None:
             effective_wait = min(
@@ -1114,6 +1633,8 @@ def _worker(job_root: Path) -> int:
                 lease_owner=owner,
             ),
         )
+        if _launch_cancel_requested(job_root, supervisor_id):
+            raise _SupervisorStop()
         ref = backend._start_supervised_job(
             spec,
             supervisor_id=supervisor_id,
@@ -1139,6 +1660,9 @@ def _worker(job_root: Path) -> int:
                 break
             time.sleep(0.25)
         wait_for_exact_runtime_removal()
+        quota_error = wait_for_quiesced_work_tree()
+        if quota_error is not None:
+            raise quota_error
         wait_for_lease_release()
         atomic_write_json(
             receipt_path,
@@ -1156,7 +1680,7 @@ def _worker(job_root: Path) -> int:
         )
         return 0
     except BaseException as error:
-        if ref is not None:
+        if ref is not None and not work_tree_breach:
             try:
                 current = backend.job_status(ref)
                 if current.status not in _TERMINAL_STATES:
@@ -1169,19 +1693,69 @@ def _worker(job_root: Path) -> int:
                     "removal will enforce containment: "
                     f"{type(cancellation_error).__name__}"
                 )
-        if lease is not None and not lease.released:
+        if ref is not None or (
+            lease is not None and not lease.released
+        ):
             # This also covers launch failures after Docker create but before
             # a JobRef receipt: runtime_id=None derives and verifies the exact
             # network identity from trusted labels.
             wait_for_exact_runtime_removal()
+        quota_error = wait_for_quiesced_work_tree()
+        if quota_error is not None:
+            error = quota_error
+        if lease is not None and not lease.released:
             wait_for_lease_release()
+        if ref is not None:
+            prior = status
+            status = JobStatus(
+                ref,
+                (
+                    JobState.FAILED
+                    if work_tree_breach
+                    else JobState.CANCELLED
+                    if isinstance(error, _SupervisorStop)
+                    else JobState.FAILED
+                ),
+                exit_code=(
+                    prior.exit_code if prior is not None else None
+                ),
+                timed_out=(
+                    prior.timed_out if prior is not None else False
+                ),
+                cancelled=(
+                    prior.cancelled
+                    if work_tree_breach and prior is not None
+                    else True
+                    if isinstance(error, _SupervisorStop)
+                    else prior.cancelled
+                    if prior is not None
+                    else False
+                ),
+                started_at=(
+                    prior.started_at if prior is not None else None
+                ),
+                finished_at=(
+                    prior.finished_at if prior is not None else None
+                ),
+                reason_code=(
+                    _WORK_TREE_QUOTA_REASON
+                    if work_tree_breach
+                    else prior.reason_code
+                    if prior is not None
+                    else None
+                ),
+            )
         state = (
-            "cancelled"
+            "failed"
+            if work_tree_breach
+            else "cancelled"
             if isinstance(error, _SupervisorStop)
             else "failed"
         )
         message = (
-            "trusted background supervisor was stopped"
+            "background work-tree quota check failed after exact runtime removal"
+            if work_tree_breach
+            else "trusted background supervisor was stopped"
             if isinstance(error, _SupervisorStop)
             else (
                 "trusted background supervisor failed: "
@@ -1201,6 +1775,11 @@ def _worker(job_root: Path) -> int:
                 lease_owner=owner,
                 status=status,
                 error=message,
+                reason_code=(
+                    _WORK_TREE_QUOTA_REASON
+                    if work_tree_breach
+                    else None
+                ),
             ),
         )
         return 130 if isinstance(error, _SupervisorStop) else 1

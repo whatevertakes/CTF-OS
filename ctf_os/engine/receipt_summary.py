@@ -21,6 +21,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Literal, Mapping
 
+from ctf_os.credential_safety import (
+    CREDENTIAL_KEY_PATTERN,
+    KNOWN_PROVIDER_CREDENTIAL,
+    host_credential_values,
+)
 from ctf_os.sandbox.files import (
     DEFAULT_STREAM_CAPTURE_MAX_BYTES,
     SafeFileError,
@@ -42,15 +47,17 @@ MAX_RECEIPT_STRUCTURE_ITEMS = 16
 MAX_RECEIPT_DELIMITED_ROWS = 100_000
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CREDENTIAL_KEY = CREDENTIAL_KEY_PATTERN
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?im)"
-    r"(\b(?:"
-    r"authorization|proxy-authorization|cookie|set-cookie|"
-    r"password|passwd|secret|client_secret|api[_-]?key|"
-    r"access[_-]?token|refresh[_-]?token|auth[_-]?token|"
-    r"session(?:[_-]?(?:id|key|token|cookie|secret))?"
-    r")\b[ \t]*[:=][ \t]*)"
+    rf"((?<![A-Za-z0-9_])[\"']?{_CREDENTIAL_KEY}"
+    r"[\"']?[ \t]*[:=][ \t]*)"
     r"([^\r\n]*)"
+)
+_COMMAND_CREDENTIAL = re.compile(
+    r"(?i)"
+    rf"(\B--{_CREDENTIAL_KEY}[ \t]+)"
+    r"([^\s]+)"
 )
 _BEARER = re.compile(
     r"(?i)(\bbearer[ \t]+)[A-Za-z0-9._~+/=-]{4,}"
@@ -77,18 +84,34 @@ _PRIVATE_KEY = re.compile(
     r".*?"
     r"(?:-----END[ \t]+[A-Z0-9 ]*PRIVATE KEY-----|$)"
 )
+_KNOWN_CREDENTIAL_TOKEN = KNOWN_PROVIDER_CREDENTIAL
 _SENSITIVE_CONTEXT_PATTERNS = (
     _CREDENTIAL_ASSIGNMENT,
+    _COMMAND_CREDENTIAL,
     _BEARER,
     _JWT,
     _CREDENTIAL_QUERY,
     _URL_USERINFO,
     _PRIVATE_KEY,
+    _KNOWN_CREDENTIAL_TOKEN,
 )
 
 
 class ReceiptSummaryError(ValueError):
     """An immutable stream artifact cannot support a trustworthy summary."""
+
+
+def _environment_secret_values() -> tuple[str, ...]:
+    """Return host credential values that must never enter model context.
+
+    Sandbox commands do not receive the host environment, but this additional
+    boundary also protects operator-supplied output and test doubles from
+    echoing a credential already present in the engine process.  Short values
+    are excluded because they create broad, low-signal replacements such as
+    redacting every occurrence of ``true``.
+    """
+
+    return host_credential_values()
 
 
 def _validate_artifact_identity(
@@ -285,6 +308,26 @@ def _sensitive_context_omissions(
                 tail_omitted = True
             if head_omitted and tail_omitted:
                 return True, True
+    for secret in _environment_secret_values():
+        start = 0
+        while True:
+            secret_start = complete_text.find(secret, start)
+            if secret_start < 0:
+                break
+            secret_end = secret_start + len(secret)
+            if (
+                head_character_end is not None
+                and secret_start < head_character_end < secret_end
+            ):
+                head_omitted = True
+            if (
+                tail_character_start is not None
+                and secret_start < tail_character_start < secret_end
+            ):
+                tail_omitted = True
+            if head_omitted and tail_omitted:
+                return True, True
+            start = secret_start + 1
     return head_omitted, tail_omitted
 
 
@@ -334,12 +377,25 @@ def _redact_credentials(value: str) -> tuple[str, int]:
         redactions += 1
         return "[REDACTED_PRIVATE_KEY]"
 
-    result = _PRIVATE_KEY.sub(replace_private_key, value)
+    def replace_known_token(_match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return "[REDACTED_TOKEN]"
+
+    result = value
+    for secret in _environment_secret_values():
+        occurrences = result.count(secret)
+        if occurrences:
+            result = result.replace(secret, "[REDACTED_ENV]")
+            redactions += occurrences
+    result = _PRIVATE_KEY.sub(replace_private_key, result)
     result = _CREDENTIAL_ASSIGNMENT.sub(replace_assignment, result)
+    result = _COMMAND_CREDENTIAL.sub(replace_assignment, result)
     result = _BEARER.sub(replace_one, result)
     result = _JWT.sub(replace_jwt, result)
     result = _CREDENTIAL_QUERY.sub(replace_one, result)
     result = _URL_USERINFO.sub(replace_one, result)
+    result = _KNOWN_CREDENTIAL_TOKEN.sub(replace_known_token, result)
     return result, redactions
 
 
@@ -460,13 +516,17 @@ def _structured_json_summary(
     summary["top_level"] = _json_type(parsed)
     if isinstance(parsed, dict):
         keys = sorted(parsed)
-        retained = keys[:MAX_RECEIPT_STRUCTURE_ITEMS]
+        retained_types: dict[str, str] = {}
+        for key in keys:
+            projected = _structured_text(key)
+            if projected in retained_types:
+                continue
+            retained_types[projected] = _json_type(parsed[key])
+            if len(retained_types) >= MAX_RECEIPT_STRUCTURE_ITEMS:
+                break
         summary["key_count"] = len(keys)
-        summary["key_types"] = {
-            _structured_text(key): _json_type(parsed[key])
-            for key in retained
-        }
-        summary["keys_omitted"] = len(keys) - len(retained)
+        summary["key_types"] = retained_types
+        summary["keys_omitted"] = len(keys) - len(retained_types)
     elif isinstance(parsed, list):
         summary["item_count"] = len(parsed)
         summary["item_types"] = sorted(

@@ -28,6 +28,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ctf_os.adapters import get_adapter
+from ctf_os.analysis_leases import (
+    AnalysisLease,
+    AnalysisLeaseBusy,
+    AnalysisLeaseError,
+    AnalysisLeaseManager,
+)
 from ctf_os.budget import (
     BudgetExhausted,
     deadline_epoch,
@@ -40,6 +46,7 @@ from ctf_os.candidates import (
 )
 from ctf_os.capabilities import inspect_pinned_capabilities
 from ctf_os.codex import (
+    ROLE_SPECS,
     BatchCommandBuilder,
     BatchInvocation,
     BatchResult,
@@ -47,6 +54,8 @@ from ctf_os.codex import (
     BatchWave,
     BatchWaveRunner,
     BuiltCommand,
+    ContractValidation,
+    ExecutionFailure,
     FileFifoModelCallLimiter,
     LIVE_FULL_SCAFFOLD,
     LIVE_THIN_SCAFFOLD,
@@ -58,6 +67,10 @@ from ctf_os.codex import (
 )
 from ctf_os.codex.limiter import ModelCallLimitCancelled
 from ctf_os.config import EngineConfig, load_config
+from ctf_os.credential_safety import (
+    model_process_environment,
+    validate_metadata_credentials,
+)
 from ctf_os.contracts.managed_rejection_v1 import (
     MANAGED_REJECTION_V1_MAX_ATTEMPT,
     build_managed_rejection_v1,
@@ -115,7 +128,10 @@ from ctf_os.director.resources import (
     ResourceVector,
     tool_profile,
 )
-from ctf_os.engine.context_archive import archive_context_pack
+from ctf_os.engine.context_archive import (
+    MAX_ARCHIVED_CONTEXT_BYTES,
+    archive_context_pack,
+)
 from ctf_os.engine.context_pack import build_context_pack
 from ctf_os.managed_continuity import (
     THREAD_CONTINUITY_CONTRACT_VERSION,
@@ -388,6 +404,8 @@ from ctf_os.remote_limiter import (
     RemoteLimiterStateError,
 )
 from ctf_os.sandbox import (
+    BackgroundLaunchState,
+    BackgroundLaunchStatus,
     BackgroundJobSupervisor,
     BackgroundJobUnsupported,
     ChallengeSandboxClient,
@@ -396,6 +414,7 @@ from ctf_os.sandbox import (
     DockerLimits,
     JobLog,
     JobRef,
+    JobState,
     JobStatus,
     LocalChallengeSandboxClient,
     NetworkPolicy,
@@ -405,6 +424,7 @@ from ctf_os.sandbox import (
     SandboxResult,
     ensure_foreground_command,
 )
+from ctf_os.sandbox.client import result_from_dict
 from ctf_os.sandbox.files import (
     DEFAULT_SNAPSHOT_MAX_BYTES,
     DEFAULT_STREAM_CAPTURE_MAX_BYTES,
@@ -413,20 +433,29 @@ from ctf_os.sandbox.files import (
     copy_bounded_regular,
     ensure_private_directory,
     ensure_relative_directory,
+    measure_work_tree,
     normalize_locator,
     read_bounded_regular,
+    read_bounded_regular_unbound,
     read_regular_prefix,
 )
 from ctf_os.stages.ingest import inventory_challenge
+from ctf_os.storage import (
+    StorageQuotaError,
+    enforce_storage_quota,
+    storage_inventory,
+)
 from ctf_os.store import (
     ArtifactValidationError,
     ChallengeLock,
     LockTimeout,
+    MAX_RUN_DOCUMENT_BYTES,
     RevisionConflict,
     RunPaths,
     StateStore,
     WorkerResultValidationError,
     sha256_file,
+    validate_artifact,
 )
 from ctf_os.store.atomic import (
     StrictJSONError,
@@ -1292,11 +1321,17 @@ def _durable_unlink_beneath(
         current = os.open(root, directory_flags)
         descriptors.append(current)
         for component in relative.parts[:-1]:
-            current = os.open(
-                component,
-                directory_flags,
-                dir_fd=current,
-            )
+            try:
+                current = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=current,
+                )
+            except FileNotFoundError:
+                # A missing ancestor proves the exact leaf is absent. This is
+                # a successful idempotent cleanup, not loss of cleanup
+                # authority.
+                return
             descriptors.append(current)
         try:
             os.unlink(relative.parts[-1], dir_fd=current)
@@ -1489,6 +1524,13 @@ _REV_STDIN_RUNNER_INPUT_SUFFIX = (
     "/work/oracle/accepted-input.bin",
 )
 _REV_STDIN_PRE_REPLACE_SAFETY_SECONDS = 0.05
+_ANALYSIS_RESULT_JSON_MAX_BYTES = MAX_RUN_DOCUMENT_BYTES
+_ANALYSIS_CANONICAL_SIDECAR_MAX_BYTES = 3 * MAX_RUN_DOCUMENT_BYTES
+_ANALYSIS_PRIVATE_CONTROL_MAX_BYTES = 4 * MAX_RUN_DOCUMENT_BYTES
+_ANALYSIS_MAX_INPUTS = 256
+_ANALYSIS_MAX_INPUT_LOCATOR_BYTES = 4096
+_ANALYSIS_MAX_INPUT_LOCATORS_TOTAL_BYTES = 1024 * 1024
+_ANALYSIS_CLOCK_WINDOW_SKEW_SECONDS = 5.0
 _REV_STDIN_SEMANTIC_FAILURE_CODES = frozenset(
     {
         "negative_flag_candidate_observed",
@@ -3471,6 +3513,7 @@ class ChallengeEngine:
         modes: Sequence[str],
         path: str = "/",
         timeout_seconds: int = 10,
+        _session_owned: bool = False,
     ) -> ChallengeState:
         """Run explicit remote preflight through the built-in boundary.
 
@@ -3508,6 +3551,28 @@ class ChallengeEngine:
             raise EngineError(
                 "network smoke WebSocket path must be a bounded absolute path"
             )
+        if not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                with ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ) as session_lock:
+                    session_lock.acquire()
+                    self._recover_session_boundary(identity)
+                    return self.smoke_network_target(
+                        identity,
+                        target_id,
+                        modes=normalized_modes,
+                        path=path,
+                        timeout_seconds=timeout_seconds,
+                        _session_owned=True,
+                    )
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+        self._enforce_storage_admission(identity)
         state = self.store.load(identity)
         target = next(
             (item for item in state.targets if item.id == target_id),
@@ -4591,33 +4656,22 @@ class ChallengeEngine:
         ):
             return False
         paths = self.store.challenge_paths(state.identity)
-        paths.runtime.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=".ctfos-proof-scan-",
-            dir=paths.runtime,
-        ) as temporary:
-            copied = copy_bounded_regular(
+        try:
+            payload = read_bounded_regular(
                 paths.root,
                 artifact.path,
-                Path(temporary) / "artifact.bin",
                 maximum_bytes=min(
                     DEFAULT_SNAPSHOT_MAX_BYTES,
                     self.store.max_artifact_bytes,
                 ),
                 expected_sha256=artifact.sha256,
                 expected_size=artifact.size,
-                mode=0o400,
             )
-            overlap = b""
-            with copied.path.open("rb") as handle:
-                while True:
-                    chunk = handle.read(64 * 1024)
-                    if not chunk:
-                        return needle in overlap
-                    window = overlap + chunk
-                    if needle in window:
-                        return True
-                    overlap = window[-max(0, len(needle) - 1) :]
+        except (OSError, SafeFileError, ValueError) as error:
+            raise EngineError(
+                "canonical artifact could not be read exactly"
+            ) from error
+        return needle in payload
 
     @staticmethod
     def _managed_proof_replay_source(
@@ -4716,6 +4770,8 @@ class ChallengeEngine:
         self,
         state: ChallengeState,
         recipe: ProofRecipe,
+        *,
+        allow_source_snapshot_create: bool = True,
     ) -> tuple[FlagCandidate, Experiment, RunReference]:
         """Fail closed if any engine-owned proof binding became stale."""
 
@@ -4746,7 +4802,12 @@ class ChallengeEngine:
             )
         if is_rev_stdin:
             binding, _inventory_experiment, _challenge_root = (
-                self._resolve_rev_stdin_inventory_binding(state)
+                self._resolve_rev_stdin_inventory_binding(
+                    state,
+                    allow_source_snapshot_create=(
+                        allow_source_snapshot_create
+                    ),
+                )
             )
             if (
                 recipe.oracle_binding is None
@@ -4968,24 +5029,19 @@ class ChallengeEngine:
                 "managed proof source run request path is not canonical"
             )
         challenge_paths = self.store.challenge_paths(state.identity)
-        challenge_paths.runtime.mkdir(parents=True, exist_ok=True)
         try:
-            with tempfile.TemporaryDirectory(
-                prefix=".ctfos-proof-request-",
-                dir=challenge_paths.runtime,
-            ) as temporary:
-                snapshot = copy_bounded_regular(
-                    challenge_paths.root,
-                    expected_relative,
-                    Path(temporary) / "request.json",
-                    maximum_bytes=1024 * 1024,
-                    mode=0o400,
-                )
-                request = strict_json_loads(
-                    snapshot.path.read_bytes(),
-                    max_bytes=1024 * 1024,
-                )
-                request_sha256 = snapshot.sha256
+            request_payload = read_bounded_regular_unbound(
+                challenge_paths.root,
+                expected_relative,
+                maximum_bytes=1024 * 1024,
+            )
+            request = strict_json_loads(
+                request_payload,
+                max_bytes=1024 * 1024,
+            )
+            request_sha256 = hashlib.sha256(
+                request_payload
+            ).hexdigest()
         except (
             OSError,
             SafeFileError,
@@ -5166,6 +5222,8 @@ class ChallengeEngine:
         self,
         state: ChallengeState,
         experiment: Experiment,
+        *,
+        allow_create: bool = True,
     ) -> tuple[Path, ImmutableFile] | None:
         """Install and verify the exact bytes mounted for one Rev seed."""
 
@@ -5259,6 +5317,11 @@ class ChallengeEngine:
                             "Rev adapter source snapshot failed verification"
                         ) from verification_error
                 else:
+                    if not allow_create:
+                        raise EngineError(
+                            "Rev adapter source snapshot must be prepared "
+                            "before the state writer lock"
+                        )
                     try:
                         with tempfile.TemporaryDirectory(
                             prefix=f".{snapshot_id}.staging-",
@@ -5285,6 +5348,11 @@ class ChallengeEngine:
                                 maximum_bytes=maximum_bytes,
                                 expected_sha256=expected_sha256,
                                 expected_size=expected_size,
+                                source_size_admission=(
+                                    self._storage_source_size_admission(
+                                        state.identity
+                                    )
+                                ),
                                 mode=_REV_SOURCE_SNAPSHOT_FILE_MODE,
                             )
                             current = staging_destination.parent
@@ -5377,6 +5445,7 @@ class ChallengeEngine:
         allowed_run_origins: frozenset[RunOrigin] = frozenset(
             {RunOrigin.MANAGED_TOOL}
         ),
+        allow_source_snapshot_create: bool = True,
     ) -> tuple[RevStdinOracleBinding, Experiment, Path]:
         """Resolve the one current CONFIRMED v2 inventory proof anchor."""
 
@@ -5544,6 +5613,7 @@ class ChallengeEngine:
         prepared = self._prepare_rev_adapter_source_snapshot(
             state,
             experiment,
+            allow_create=allow_source_snapshot_create,
         )
         if prepared is None:
             raise EngineError(
@@ -5579,7 +5649,10 @@ class ChallengeEngine:
         )
         self._remaining_budget_seconds(state)
         binding, inventory_experiment, challenge_root = (
-            self._resolve_rev_stdin_inventory_binding(state)
+            self._resolve_rev_stdin_inventory_binding(
+                state,
+                allow_source_snapshot_create=False,
+            )
         )
         if (
             recipe.oracle_binding is None
@@ -5625,24 +5698,16 @@ class ChallengeEngine:
             )
         if accepted_artifact is not None:
             paths = self.store.challenge_paths(state.identity)
-            paths.runtime.mkdir(parents=True, exist_ok=True)
             try:
-                with tempfile.TemporaryDirectory(
-                    prefix=".ctfos-rev-proof-input-guard-",
-                    dir=paths.runtime,
-                ) as temporary:
-                    guarded_input = copy_bounded_regular(
-                        paths.root,
-                        accepted_artifact.path,
-                        Path(temporary) / "accepted-input.bin",
-                        maximum_bytes=(
-                            REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
-                        ),
-                        expected_sha256=accepted_artifact.sha256,
-                        expected_size=accepted_artifact.size,
-                        mode=0o400,
-                    )
-                    guarded_input.path.read_bytes()
+                read_bounded_regular(
+                    paths.root,
+                    accepted_artifact.path,
+                    maximum_bytes=(
+                        REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                    ),
+                    expected_sha256=accepted_artifact.sha256,
+                    expected_size=accepted_artifact.size,
+                )
             except (OSError, SafeFileError, ValueError) as error:
                 raise EngineError(
                     "Rev proof accepted input changed before commit"
@@ -5925,19 +5990,14 @@ class ChallengeEngine:
         try:
             if request_relative is None:
                 raise SafeFileError("request path is outside challenge state")
-            with tempfile.TemporaryDirectory(
-                prefix=".ctfos-rev-oracle-request-",
-                dir=challenge_paths.runtime,
-            ) as temporary:
-                request_snapshot = copy_bounded_regular(
-                    challenge_paths.root,
-                    request_relative,
-                    Path(temporary) / "request.json",
-                    maximum_bytes=_REV_INVENTORY_REQUEST_MAX_BYTES,
-                    mode=0o400,
-                )
-                request_payload = request_snapshot.path.read_bytes()
-            request_sha256 = request_snapshot.sha256
+            request_payload = read_bounded_regular_unbound(
+                challenge_paths.root,
+                request_relative,
+                maximum_bytes=_REV_INVENTORY_REQUEST_MAX_BYTES,
+            )
+            request_sha256 = hashlib.sha256(
+                request_payload
+            ).hexdigest()
         except (OSError, SafeFileError, ValueError):
             return outcome.rejected("request_snapshot_unavailable")
         execution_binding = copy.deepcopy(outcome.execution_binding)
@@ -6200,27 +6260,15 @@ class ChallengeEngine:
             )
 
         try:
-            with tempfile.TemporaryDirectory(
-                prefix=".ctfos-rev-oracle-stdout-",
-                dir=challenge_paths.runtime,
-            ) as temporary:
-                stdout_snapshot = copy_bounded_regular(
-                    challenge_paths.root,
-                    stdout_artifact.path,
-                    Path(temporary) / "stdout.bin",
-                    maximum_bytes=DEFAULT_STREAM_CAPTURE_MAX_BYTES,
-                    expected_sha256=stdout_artifact.sha256,
-                    expected_size=artifact_size,
-                    mode=0o400,
-                )
-                payload = stdout_snapshot.path.read_bytes()
+            payload = read_bounded_regular(
+                challenge_paths.root,
+                stdout_artifact.path,
+                maximum_bytes=DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+                expected_sha256=stdout_artifact.sha256,
+                expected_size=artifact_size,
+            )
         except (OSError, SafeFileError, ValueError):
             return outcome.rejected("stdout_snapshot_unavailable")
-        if (
-            stdout_snapshot.sha256 != stdout_artifact.sha256
-            or stdout_snapshot.size_bytes != artifact_size
-        ):
-            return outcome.rejected("stdout_snapshot_identity_mismatch")
 
         oracle_result = evaluate_rev_inventory_v2(
             payload,
@@ -6275,6 +6323,7 @@ class ChallengeEngine:
         workspace_override: Path | None = None,
         challenge_dir_override: Path | None = None,
         network_policy_override: NetworkPolicy | None = None,
+        analysis_root: Path | None = None,
     ) -> ChallengeSandboxClient:
         workspace = workspace_override or self._workspace(state)
         policy = network_policy_override or self._network_policy(state)
@@ -6293,6 +6342,7 @@ class ChallengeEngine:
         )
         return LocalChallengeSandboxClient(
             scope,
+            analysis_root=analysis_root,
             image=self.config.runtime.image,
             image_digest=self.config.runtime.image_digest,
             network_policy=policy,
@@ -6466,6 +6516,7 @@ class ChallengeEngine:
         broker_directory: Path | None = None,
         scaffold: str = LIVE_FULL_SCAFFOLD,
         headless: bool = False,
+        _session_owned: bool = False,
     ) -> PreparedLiveSession:
         if scaffold not in {
             LIVE_FULL_SCAFFOLD,
@@ -6480,6 +6531,28 @@ class ChallengeEngine:
             raise EngineError(
                 "headless thin evaluation cannot resume a model thread"
             )
+        if not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                with ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ) as session_lock:
+                    session_lock.acquire()
+                    self._recover_session_boundary(identity)
+                    return self.prepare_live_session(
+                        identity,
+                        resume_thread_id=resume_thread_id,
+                        broker_directory=broker_directory,
+                        scaffold=scaffold,
+                        headless=headless,
+                        _session_owned=True,
+                    )
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+        self._enforce_storage_admission(identity)
         self._require_model_work_allowed(self.store.load(identity))
         state = self.refresh_ingest(identity)
         self._require_model_work_allowed(state)
@@ -6570,7 +6643,7 @@ class ChallengeEngine:
                 else self.live_builder.start(session)
             )
         environment = {
-            **os.environ,
+            **model_process_environment(),
             "CTFOS_WORKSPACE_ROOT": str(self.config.workspace_root),
             "CTFOS_CONTEST": identity.contest_id,
             "CTFOS_CATEGORY": identity.category,
@@ -6822,12 +6895,23 @@ class ChallengeEngine:
             else None
         )
         attestation_ok = bool(
-            result.attempts
+            result.completed
+            and result.validation.valid
+            and result.attempts
             and capture_complete
             and usage_event_observed
             and token_total > 0
             and thread_digest is not None
         )
+        validation_errors = list(result.validation.errors[:32])
+        if len(result.validation.errors) > 32:
+            validation_errors.append(
+                "$: additional validation errors were omitted"
+            )
+        if not attestation_ok and not validation_errors:
+            validation_errors.append(
+                "thin model usage/capture attestation incomplete"
+            )
         status = self._batch_result_run_status(result)
         if status is RunStatus.COMPLETED and not attestation_ok:
             status = RunStatus.INVALID
@@ -6871,13 +6955,7 @@ class ChallengeEngine:
                 "schema_version": 1,
                 "base_revision": current.revision,
                 "ok": attestation_ok,
-                "errors": (
-                    []
-                    if attestation_ok
-                    else [
-                        "thin model usage/capture attestation incomplete"
-                    ]
-                ),
+                "errors": validation_errors,
             },
         )
         request_sha256 = sha256_file(run_paths.request)
@@ -6999,6 +7077,10 @@ class ChallengeEngine:
             deadline_monotonic_seconds,
             deadline_epoch_seconds,
         ) = self._budget_deadline_pair(state, 8 * 60 * 60)
+        self._enforce_storage_admission(
+            identity,
+            requested_bytes=self._model_run_storage_reservation_bytes(),
+        )
         invocation = self._make_invocation(
             state,
             Role.CAPTAIN,
@@ -7085,6 +7167,12 @@ class ChallengeEngine:
             ),
             command_builder=adapter,
         )
+        result = self._batch_result_after_workspace_postcondition(
+            identity,
+            result,
+            force=True,
+            include_challenge_quota=True,
+        )
         committed = self._commit_thin_evaluation_result(
             identity,
             result,
@@ -7142,7 +7230,11 @@ class ChallengeEngine:
                 f"a live session already owns {identity.key}"
             ) from error
         owner_path = paths.runtime / "delegation-owner.json"
+        prepared_for_postcondition: PreparedLiveSession | None = None
+        live_storage_postcondition_done = False
         try:
+            self._recover_session_boundary(identity)
+            self._enforce_storage_admission(identity)
             initial_state = self.store.load(identity)
             self._require_model_work_allowed(initial_state)
             evaluation_headless = False
@@ -7179,7 +7271,6 @@ class ChallengeEngine:
                     _session_start_mode="direct",
                 )
             self._require_solving_prompt(self.store.load(identity))
-            self._recover_session_boundary(identity)
             with allocated_live_broker_directory(
                 paths.runtime
             ) as broker_directory_owner:
@@ -7190,7 +7281,9 @@ class ChallengeEngine:
                     broker_directory=broker_directory,
                     scaffold=scaffold,
                     headless=evaluation_headless,
+                    _session_owned=True,
                 )
+                prepared_for_postcondition = prepared
                 from ctf_os.sandbox.daemon import CapabilityAuthority
 
                 authority = CapabilityAuthority.from_file(
@@ -7236,11 +7329,13 @@ class ChallengeEngine:
                         },
                     )
                     if evaluation_headless:
-                        return self._run_thin_evaluation(
+                        thin_status = self._run_thin_evaluation(
                             identity,
                             prepared,
                             on_prepared=on_prepared,
                         )
+                        live_storage_postcondition_done = True
+                        return thin_status
                     if on_prepared is not None:
                         on_prepared(prepared)
                     latest_before_launch = self.store.load(identity)
@@ -7279,16 +7374,70 @@ class ChallengeEngine:
                             env=dict(prepared.environment),
                             check=False,
                         )
-                        if (
-                            time.monotonic()
-                            >= live_deadline_monotonic
-                        ):
-                            return 124
-                    return int(result.returncode)
+                    return_code = (
+                        124
+                        if time.monotonic() >= live_deadline_monotonic
+                        else int(result.returncode)
+                    )
+                    return return_code
         except FileNotFoundError as error:
             raise EngineError("Codex CLI was not found on PATH") from error
         finally:
-            lock.release()
+            active_error = sys.exception()
+            try:
+                if (
+                    prepared_for_postcondition is not None
+                    and not live_storage_postcondition_done
+                ):
+                    try:
+                        self._enforce_workspace_postcondition(
+                            identity,
+                            prepared_for_postcondition.working_directory,
+                            phase="Live session postcondition failed",
+                            include_challenge_quota=True,
+                        )
+                    except BaseException as postcondition_error:
+                        if active_error is None:
+                            raise
+                        if not isinstance(postcondition_error, Exception):
+                            postcondition_error.add_note(
+                                self._bounded_storage_validation_message(
+                                    "Live session primary failure",
+                                    active_error,
+                                    maximum_bytes=1024,
+                                )
+                            )
+                            raise
+                        if not isinstance(active_error, Exception):
+                            active_error.add_note(
+                                self._bounded_storage_validation_message(
+                                    "Live session postcondition also failed",
+                                    postcondition_error,
+                                    maximum_bytes=1024,
+                                )
+                            )
+                        else:
+                            primary_message = (
+                                self._bounded_storage_validation_message(
+                                    "Live session primary failure",
+                                    active_error,
+                                    maximum_bytes=900,
+                                )
+                            )
+                            postcondition_message = (
+                                self._bounded_storage_validation_message(
+                                    "Live session postcondition also failed",
+                                    postcondition_error,
+                                    maximum_bytes=900,
+                                )
+                            )
+                            raise EngineError(
+                                primary_message
+                                + "; "
+                                + postcondition_message
+                            ) from active_error
+            finally:
+                lock.release()
 
     def _model_for_role(self, role: Role) -> str:
         values = {
@@ -7615,13 +7764,69 @@ class ChallengeEngine:
             request=request,
             base_revision=state.revision,
         )
+        challenge_paths = self.store.challenge_paths(state.identity)
+        try:
+            return self._finish_model_invocation(
+                state,
+                role,
+                run_id=run_id,
+                instruction=instruction,
+                deadline_monotonic_seconds=deadline_monotonic_seconds,
+                deadline_epoch_seconds=deadline_epoch_seconds,
+                managed_workspace=managed_workspace,
+                resume_thread_id=resume_thread_id,
+                contract_version=contract_version,
+                reasoning_effort=reasoning_effort,
+                continuity_audit=continuity_audit,
+                paths=paths,
+                challenge_paths=challenge_paths,
+            )
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            for cleanup in (
+                lambda: _durable_unlink(
+                    challenge_paths.context_history / f"{run_id}.jsonl"
+                ),
+                lambda: _durable_unlink(paths.validation),
+                lambda: _durable_unlink(paths.result),
+                lambda: _durable_unlink(paths.request),
+                lambda: _durable_rmdir(paths.raw),
+                lambda: _durable_rmdir(paths.root),
+            ):
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                error.add_note(
+                    "unstarted model run cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+    def _finish_model_invocation(
+        self,
+        state: ChallengeState,
+        role: Role,
+        *,
+        run_id: str,
+        instruction: str,
+        deadline_monotonic_seconds: float,
+        deadline_epoch_seconds: float,
+        managed_workspace: bool,
+        resume_thread_id: str | None,
+        contract_version: int,
+        reasoning_effort: ReasoningEffort,
+        continuity_audit: dict[str, Any] | None,
+        paths: RunPaths,
+        challenge_paths: Any,
+    ) -> BatchInvocation:
         context = build_context_pack(
             state,
             get_adapter(state.category),
-            state_path=self.store.challenge_paths(state.identity).state,
+            state_path=challenge_paths.state,
             role=role.value,
         )
-        challenge_paths = self.store.challenge_paths(state.identity)
         archived_context = archive_context_pack(
             challenge_paths.context_history,
             run_id=run_id,
@@ -7637,7 +7842,12 @@ class ChallengeEngine:
         request_payload["context_sha256"] = context.sha256
         request_payload["context_path"] = context_path
         request_payload["context_size_bytes"] = archived_context.size_bytes
-        atomic_write_json(paths.request, request_payload)
+        request_document = canonical_json_bytes(request_payload)
+        if len(request_document) > MAX_RUN_DOCUMENT_BYTES:
+            raise EngineError(
+                "model run request exceeds its durable document limit"
+            )
+        atomic_write_bytes(paths.request, request_document)
         prompt = "\n\n".join(
             (
                 instruction,
@@ -7726,6 +7936,13 @@ class ChallengeEngine:
                 raise SessionAlreadyRunning(
                     f"another session already owns {identity.key}"
                 ) from error
+        self._enforce_storage_admission(
+            identity,
+            requested_bytes=(
+                self.config.runtime.work_tree_max_bytes
+                + self._model_run_storage_reservation_bytes()
+            ),
+        )
         state = self.store.load(identity)
         self._require_model_work_allowed(
             state,
@@ -7768,6 +7985,11 @@ class ChallengeEngine:
                 candidate,
             ),
             before_provider_start=before_provider_start,
+        )
+        result = self._batch_result_after_workspace_postcondition(
+            identity,
+            result,
+            include_challenge_quota=True,
         )
         if _reserved_run_id is not None:
             self._persist_reserved_run_terminal(identity, result)
@@ -7831,6 +8053,23 @@ class ChallengeEngine:
             raise EngineError(
                 f"unknown wave {wave!r}; choose discovery, attack, or proof"
             ) from error
+        writer_width = max(
+            1,
+            sum(
+                1
+                for role in roles
+                if ROLE_SPECS[role].may_write_artifacts
+            ),
+        )
+        self._enforce_storage_admission(
+            identity,
+            requested_bytes=(
+                writer_width
+                * self.config.runtime.work_tree_max_bytes
+                + len(roles)
+                * self._model_run_storage_reservation_bytes()
+            ),
+        )
         state = self.store.load(identity)
         self._require_model_work_allowed(
             state,
@@ -7873,8 +8112,18 @@ class ChallengeEngine:
             for role in roles
         )
         logical_wave = BatchWave.create(_run_id(wave), invocations)
+        terminal_results: dict[str, BatchResult] = {}
+
+        def terminalize_managed_result(result: BatchResult) -> None:
+            checked = self._batch_result_after_workspace_postcondition(
+                identity,
+                result,
+            )
+            terminal_results[result.invocation.run_id] = checked
+            self._persist_reserved_run_terminal(identity, checked)
+
         # All three logical sessions exist before any limiter slot is acquired.
-        results = BatchWaveRunner(self.batch_runner).run(
+        raw_results = BatchWaveRunner(self.batch_runner).run(
             logical_wave,
             on_flag=lambda candidate: self._print_codex_flag(
                 identity,
@@ -7895,16 +8144,44 @@ class ChallengeEngine:
                 else None
             ),
             on_invocation_complete=(
-                (
-                    lambda result: self._persist_reserved_run_terminal(
-                        identity,
-                        result,
-                    )
-                )
+                terminalize_managed_result
                 if _reserved_run_ids is not None
                 else None
             ),
         )
+        results = tuple(
+            (
+                terminal_results[result.invocation.run_id]
+                if _reserved_run_ids is not None
+                else self._batch_result_after_workspace_postcondition(
+                    identity,
+                    result,
+                )
+            )
+            for result in raw_results
+        )
+        try:
+            self._enforce_storage_admission(
+                identity,
+                requested_bytes=0,
+            )
+        except EngineError as error:
+            if not (
+                _managed_workspace
+                and _reserved_run_ids is not None
+                and self._managed_builder_publish_owns_storage_issues(
+                    identity,
+                    results,
+                )
+            ):
+                results = tuple(
+                    self._failed_batch_result_for_storage_error(
+                        result,
+                        error,
+                        phase="model wave challenge quota rejected",
+                    )
+                    for result in results
+                )
         commit_base = (
             self.store.load(identity)
             if _reserved_run_ids is not None
@@ -8080,6 +8357,20 @@ class ChallengeEngine:
         created_paths: list[Path] = []
         source_references: list[dict[str, Any]] = []
 
+        def admit_snapshot_source_size(source_size: int) -> None:
+            try:
+                self._enforce_storage_admission(
+                    state.identity,
+                    requested_bytes=source_size,
+                )
+            except EngineError as error:
+                raise SafeFileError(
+                    self._bounded_storage_validation_message(
+                        "reported artifact snapshot admission failed",
+                        error,
+                    )
+                ) from error
+
         def cleanup_created(cause: BaseException) -> None:
             errors: list[str] = []
             for created_path in created_paths:
@@ -8164,6 +8455,9 @@ class ChallengeEngine:
                             str(claimed).lower()
                             if claimed is not None
                             else None
+                        ),
+                        source_size_admission=(
+                            admit_snapshot_source_size
                         ),
                         mode=0o400,
                     )
@@ -9448,7 +9742,8 @@ class ChallengeEngine:
                                     ) = (
                                         self
                                         ._resolve_rev_stdin_inventory_binding(
-                                            base_state
+                                            base_state,
+                                            allow_source_snapshot_create=False,
                                         )
                                     )
                                     proof_argv = (
@@ -11707,6 +12002,9 @@ class ChallengeEngine:
                     ),
                     expected_sha256=artifact.sha256,
                     expected_size=artifact.size,
+                    source_size_admission=self._storage_source_size_admission(
+                        running.identity
+                    ),
                     mode=0o400,
                 )
                 if snapshot.path.read_bytes() != payload:
@@ -12926,6 +13224,9 @@ class ChallengeEngine:
                 ),
                 expected_sha256=recipe.source_sha256,
                 expected_size=recipe.source_size_bytes,
+                source_size_admission=self._storage_source_size_admission(
+                    state.identity
+                ),
                 mode=0o500,
             )
             return staging, challenge_root, snapshot
@@ -12960,6 +13261,9 @@ class ChallengeEngine:
                 maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
                 expected_sha256=recipe.payload_sha256,
                 expected_size=recipe.payload_size_bytes,
+                source_size_admission=self._storage_source_size_admission(
+                    state.identity
+                ),
                 mode=0o400,
             )
             empty_path = root / "empty.bin"
@@ -13023,6 +13327,9 @@ class ChallengeEngine:
                 maximum_bytes=maximum_bytes,
                 expected_sha256=reference.sha256,
                 expected_size=reference.size_bytes,
+                source_size_admission=self._storage_source_size_admission(
+                    state.identity
+                ),
                 mode=0o400,
             )
         except (OSError, SafeFileError, ValueError) as error:
@@ -13177,69 +13484,53 @@ class ChallengeEngine:
         ):
             raise EngineError("Pwn crash source changed before commit")
         paths = self.store.challenge_paths(state.identity)
-        with tempfile.TemporaryDirectory(
-            prefix=".pwn-crash-commit-guard-",
-            dir=paths.runtime,
-        ) as temporary_name:
-            temporary = Path(temporary_name)
-            copy_bounded_regular(
-                paths.root,
-                payload.path,
-                temporary / "canonical-payload.bin",
-                maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
-                expected_sha256=recipe.payload_sha256,
-                expected_size=recipe.payload_size_bytes,
-                mode=0o400,
+        read_bounded_regular(
+            paths.root,
+            payload.path,
+            maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+            expected_sha256=recipe.payload_sha256,
+            expected_size=recipe.payload_size_bytes,
+        )
+        read_bounded_regular(
+            workspace,
+            payload_input.source_locator,
+            maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
+            expected_sha256=recipe.payload_sha256,
+            expected_size=recipe.payload_size_bytes,
+        )
+        empty_sha256 = hashlib.sha256(b"").hexdigest()
+        read_bounded_regular(
+            workspace,
+            control_input.source_locator,
+            maximum_bytes=1,
+            expected_sha256=empty_sha256,
+            expected_size=0,
+        )
+        read_bounded_regular(
+            source_snapshot_root,
+            recipe.primary_elf_locator,
+            maximum_bytes=min(
+                PWN_CRASH_V1_MAX_SOURCE_BYTES,
+                self.store.max_artifact_bytes,
+            ),
+            expected_sha256=recipe.source_sha256,
+            expected_size=recipe.source_size_bytes,
+        )
+        capability_payload = read_bounded_regular(
+            paths.root,
+            capability_artifact.path,
+            maximum_bytes=16 * 1024,
+            expected_sha256=capability_artifact.sha256,
+            expected_size=capability_artifact.size,
+        )
+        if (
+            capability_payload != capability_attestation.canonical_bytes()
+            or capability_artifact.sha256
+            != capability_attestation.evidence_sha256
+        ):
+            raise EngineError(
+                "Pwn crash capability artifact changed before commit"
             )
-            copy_bounded_regular(
-                workspace,
-                payload_input.source_locator,
-                temporary / "staged-payload.bin",
-                maximum_bytes=PWN_CRASH_V1_MAX_INPUT_BYTES,
-                expected_sha256=recipe.payload_sha256,
-                expected_size=recipe.payload_size_bytes,
-                mode=0o400,
-            )
-            empty_sha256 = hashlib.sha256(b"").hexdigest()
-            copy_bounded_regular(
-                workspace,
-                control_input.source_locator,
-                temporary / "staged-empty.bin",
-                maximum_bytes=1,
-                expected_sha256=empty_sha256,
-                expected_size=0,
-                mode=0o400,
-            )
-            copy_bounded_regular(
-                source_snapshot_root,
-                recipe.primary_elf_locator,
-                temporary / "source.bin",
-                maximum_bytes=min(
-                    PWN_CRASH_V1_MAX_SOURCE_BYTES,
-                    self.store.max_artifact_bytes,
-                ),
-                expected_sha256=recipe.source_sha256,
-                expected_size=recipe.source_size_bytes,
-                mode=0o400,
-            )
-            capability_snapshot = copy_bounded_regular(
-                paths.root,
-                capability_artifact.path,
-                temporary / "capability-attestation.json",
-                maximum_bytes=16 * 1024,
-                expected_sha256=capability_artifact.sha256,
-                expected_size=capability_artifact.size,
-                mode=0o400,
-            )
-            if (
-                capability_snapshot.path.read_bytes()
-                != capability_attestation.canonical_bytes()
-                or capability_artifact.sha256
-                != capability_attestation.evidence_sha256
-            ):
-                raise EngineError(
-                    "Pwn crash capability artifact changed before commit"
-                )
         if len(attempts) != 6:
             raise EngineError("Pwn crash gate lacks six durable attempts")
         for ordinal, attempt in enumerate(attempts, start=1):
@@ -13326,55 +13617,53 @@ class ChallengeEngine:
                     "Pwn crash durable attempt request is unavailable"
                 )
             try:
-                with tempfile.TemporaryDirectory(
-                    prefix=f".pwn-crash-request-{ordinal}-",
-                    dir=paths.runtime,
-                ) as request_temporary:
-                    request_snapshot = copy_bounded_regular(
+                request_payload = read_bounded_regular_unbound(
+                    paths.root,
+                    attempt.run.request_path,
+                    maximum_bytes=256 * 1024,
+                )
+                if (
+                    hashlib.sha256(request_payload).hexdigest()
+                    != attempt.request_sha256
+                ):
+                    raise SafeFileError(
+                        "Pwn crash request digest changed"
+                    )
+                request_value = strict_json_loads(
+                    request_payload,
+                    max_bytes=256 * 1024,
+                )
+                for (
+                    stream,
+                    artifact,
+                    payload,
+                    maximum_bytes,
+                ) in (
+                    (
+                        "stdout",
+                        attempt.stdout_artifact,
+                        attempt.stdout_payload,
+                        PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
+                    ),
+                    (
+                        "stderr",
+                        attempt.stderr_artifact,
+                        attempt.stderr_payload,
+                        _PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES,
+                    ),
+                ):
+                    stream_payload = read_bounded_regular(
                         paths.root,
-                        attempt.run.request_path,
-                        Path(request_temporary) / "request.json",
-                        maximum_bytes=256 * 1024,
-                        expected_sha256=attempt.request_sha256,
-                        mode=0o400,
+                        artifact.path,
+                        maximum_bytes=maximum_bytes,
+                        expected_sha256=artifact.sha256,
+                        expected_size=artifact.size,
                     )
-                    request_value = strict_json_loads(
-                        request_snapshot.path.read_bytes(),
-                        max_bytes=256 * 1024,
-                    )
-                    for (
-                        stream,
-                        artifact,
-                        payload,
-                        maximum_bytes,
-                    ) in (
-                        (
-                            "stdout",
-                            attempt.stdout_artifact,
-                            attempt.stdout_payload,
-                            PWN_CRASH_V1_MAX_DOCUMENT_BYTES,
-                        ),
-                        (
-                            "stderr",
-                            attempt.stderr_artifact,
-                            attempt.stderr_payload,
-                            _PWN_CRASH_STDERR_ARTIFACT_MAX_BYTES,
-                        ),
-                    ):
-                        stream_snapshot = copy_bounded_regular(
-                            paths.root,
-                            artifact.path,
-                            Path(request_temporary) / f"{stream}.log",
-                            maximum_bytes=maximum_bytes,
-                            expected_sha256=artifact.sha256,
-                            expected_size=artifact.size,
-                            mode=0o400,
+                    if stream_payload != payload:
+                        raise EngineError(
+                            f"Pwn crash durable {stream} changed "
+                            "before commit"
                         )
-                        if stream_snapshot.path.read_bytes() != payload:
-                            raise EngineError(
-                                f"Pwn crash durable {stream} changed "
-                                "before commit"
-                            )
             except (
                 OSError,
                 SafeFileError,
@@ -13562,23 +13851,17 @@ class ChallengeEngine:
             )
         paths = self.store.challenge_paths(state.identity)
         try:
-            with tempfile.TemporaryDirectory(
-                prefix=".pwn-crash-recovery-read-",
-                dir=paths.runtime,
-            ) as temporary_name:
-                snapshot = copy_bounded_regular(
-                    paths.root,
-                    journal.relative_to(paths.root).as_posix(),
-                    Path(temporary_name) / "journal.json",
-                    maximum_bytes=(
-                        _PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES
-                    ),
-                    mode=0o400,
-                )
-                value = strict_json_loads(
-                    snapshot.path.read_bytes(),
-                    max_bytes=_PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES,
-                )
+            payload = read_bounded_regular_unbound(
+                paths.root,
+                journal.relative_to(paths.root).as_posix(),
+                maximum_bytes=(
+                    _PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES
+                ),
+            )
+            value = strict_json_loads(
+                payload,
+                max_bytes=_PWN_CRASH_RECOVERY_JOURNAL_MAX_BYTES,
+            )
         except (
             OSError,
             SafeFileError,
@@ -13637,11 +13920,7 @@ class ChallengeEngine:
             entries = os.scandir(paths.runs)
         except FileNotFoundError:
             return ()
-        with entries, tempfile.TemporaryDirectory(
-            prefix=".pwn-crash-recovery-scan-",
-            dir=paths.runtime,
-        ) as temporary_name:
-            temporary = Path(temporary_name)
+        with entries:
             for entry in entries:
                 scanned += 1
                 if scanned > 10_000:
@@ -13656,15 +13935,13 @@ class ChallengeEngine:
                         / entry.name
                         / "request.json"
                     ).as_posix()
-                    snapshot = copy_bounded_regular(
+                    payload = read_bounded_regular_unbound(
                         paths.root,
                         request_locator,
-                        temporary / f"{scanned:05d}.json",
                         maximum_bytes=256 * 1024,
-                        mode=0o400,
                     )
                     value = strict_json_loads(
-                        snapshot.path.read_bytes(),
+                        payload,
                         max_bytes=256 * 1024,
                     )
                 except (
@@ -14864,6 +15141,9 @@ class ChallengeEngine:
                     ),
                     expected_sha256=artifact.sha256,
                     expected_size=artifact.size,
+                    source_size_admission=self._storage_source_size_admission(
+                        running.identity
+                    ),
                     mode=0o400,
                 )
                 proof_inputs.append(
@@ -16029,6 +16309,9 @@ class ChallengeEngine:
                 maximum_bytes=PWN_RUNTIME_SNAPSHOT_V1_MAX_PAYLOAD_BYTES,
                 expected_sha256=recipe.payload_sha256,
                 expected_size=recipe.payload_size_bytes,
+                source_size_admission=self._storage_source_size_admission(
+                    running.identity
+                ),
                 mode=0o400,
             )
             proof_input = ProofInput(
@@ -17023,6 +17306,11 @@ class ChallengeEngine:
                         run_paths.request.relative_to(paths.root).as_posix(),
                         Path(issued_temporary) / "request.json",
                         maximum_bytes=256 * 1024,
+                        source_size_admission=(
+                            self._storage_source_size_admission(
+                                latest.identity
+                            )
+                        ),
                         mode=0o400,
                     )
                     request_sha256 = issued_request.sha256
@@ -17964,6 +18252,7 @@ class ChallengeEngine:
                 raise SessionAlreadyRunning(
                     f"another session already owns {identity.key}"
                 ) from error
+        self._enforce_storage_admission(identity)
         state = self.store.load(identity)
         if str(get_adapter(state.category).name) == "pwn":
             state = self._advance_pwn_runtime_snapshot_disclosures(
@@ -19103,6 +19392,12 @@ class ChallengeEngine:
                 )
                 artifact_records.append(pending_forensic_artifact)
                 try:
+                    self._enforce_storage_admission(
+                        identity,
+                        requested_bytes=len(
+                            forensic_index_outcome.canonical_bytes
+                        ),
+                    )
                     atomic_write_bytes(
                         forensic_path,
                         forensic_index_outcome.canonical_bytes,
@@ -20787,6 +21082,7 @@ class ChallengeEngine:
         needs_kvm: bool = False,
         expected_revision: int | None = None,
         _live_only: bool = False,
+        _experiment_id: str | None = None,
     ) -> tuple[ChallengeState, str]:
         """Register a typed/manual experiment before it can execute."""
 
@@ -20855,11 +21151,24 @@ class ChallengeEngine:
                 pinned_configuration_epoch = state.configuration_epoch
         else:
             canonical_target = None
-        experiment_id = _run_id("E-operator")
+        experiment_id = (
+            _run_id("E-operator")
+            if _experiment_id is None
+            else _experiment_id
+        )
+        if (
+            type(experiment_id) is not str
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", experiment_id) is None
+        ):
+            raise EngineError("experiment id is invalid")
 
         def apply(state: ChallengeState) -> None:
             if _live_only:
                 self._require_live_mutation_allowed(state)
+            if any(item.id == experiment_id for item in state.experiments):
+                raise EngineError(
+                    f"experiment id is already registered: {experiment_id}"
+                )
             known_hypotheses = {
                 hypothesis.id for hypothesis in state.hypotheses
             }
@@ -20942,6 +21251,781 @@ class ChallengeEngine:
             experiment_id,
         )
 
+    def _prepare_read_only_analysis_inputs(
+        self,
+        state: ChallengeState,
+        input_locators: Sequence[str],
+        *,
+        workspace: Path,
+    ) -> tuple[tuple[str, ...], int, int, int, int]:
+        """Validate explicit canonical-work inputs and calculate bounds."""
+
+        if isinstance(input_locators, (str, bytes)):
+            raise EngineError(
+                "read-only analysis inputs must be a locator sequence"
+            )
+        selected = tuple(input_locators)
+        if len(selected) > _ANALYSIS_MAX_INPUTS:
+            raise EngineError(
+                "read-only analysis has too many explicit inputs"
+            )
+        normalized: list[str] = []
+        seen: set[str] = set()
+        total_locator_bytes = 0
+        explicit_input_bytes = 0
+        for locator in selected:
+            if not isinstance(locator, str):
+                raise EngineError(
+                    "read-only analysis input locators must be strings"
+                )
+            try:
+                encoded_size = len(locator.encode("utf-8"))
+            except UnicodeError as error:
+                raise EngineError(
+                    "read-only analysis input locator is not valid Unicode"
+                ) from error
+            total_locator_bytes += encoded_size
+            if (
+                encoded_size > _ANALYSIS_MAX_INPUT_LOCATOR_BYTES
+                or total_locator_bytes
+                > _ANALYSIS_MAX_INPUT_LOCATORS_TOTAL_BYTES
+            ):
+                raise EngineError(
+                    "read-only analysis input locators exceed their bound"
+                )
+            try:
+                canonical = normalize_locator(locator)
+            except SafeFileError as error:
+                raise EngineError(
+                    f"invalid read-only analysis input locator: {locator}"
+                ) from error
+            if canonical in seen:
+                raise EngineError(
+                    "read-only analysis input locators must be unique"
+                )
+            seen.add(canonical)
+            source = workspace / canonical
+            try:
+                metadata = source.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SafeFileError(
+                        "analysis input is not a regular file"
+                    )
+                read_regular_prefix(
+                    workspace,
+                    canonical,
+                    maximum_prefix_bytes=1,
+                    expected_size=metadata.st_size,
+                )
+            except (OSError, SafeFileError, ValueError) as error:
+                raise EngineError(
+                    "read-only analysis input cannot be bound safely: "
+                    f"{canonical}"
+                ) from error
+            explicit_input_bytes += metadata.st_size
+            normalized.append(canonical)
+
+        stream_limit = min(
+            DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+            self.config.runtime.work_tree_max_bytes // 4,
+        )
+        private_control_limit = (
+            (2 * stream_limit)
+            + _ANALYSIS_RESULT_JSON_MAX_BYTES
+            + _ANALYSIS_PRIVATE_CONTROL_MAX_BYTES
+        )
+        maximum_input_bytes = (
+            self.config.runtime.work_tree_max_bytes
+            - private_control_limit
+        )
+        if maximum_input_bytes < 0 or explicit_input_bytes > maximum_input_bytes:
+            raise EngineError(
+                "read-only analysis explicit inputs exceed the private "
+                "work-tree bound"
+            )
+        # The locator-only sandbox contract deliberately does not trust this
+        # preflight size after admission.  A same-UID process could replace or
+        # grow a selected file before the descriptor-anchored private copy, so
+        # every isolated reader reserves the complete configured work-tree
+        # limit.  The observed input size above is only an early rejection.
+        work_tree_limit = self.config.runtime.work_tree_max_bytes
+        promoted_payload_limit = (
+            (2 * stream_limit) + _ANALYSIS_RESULT_JSON_MAX_BYTES
+        )
+        promotion_peak = 2 * (
+            promoted_payload_limit
+            + _ANALYSIS_CANONICAL_SIDECAR_MAX_BYTES
+        )
+        reservation_bytes = work_tree_limit + promotion_peak
+        if reservation_bytes > (
+            self.config.runtime.challenge_storage_quota_bytes
+        ):
+            raise EngineError(
+                "read-only analysis reservation exceeds the challenge "
+                "storage quota"
+            )
+        return (
+            tuple(normalized),
+            stream_limit,
+            promoted_payload_limit,
+            work_tree_limit,
+            reservation_bytes,
+        )
+
+    def _read_only_analysis_workspace(
+        self,
+        state: ChallengeState,
+    ) -> Path:
+        """Inspect the existing canonical work tree without creating it."""
+
+        workspace = self.store.challenge_paths(state.identity).artifacts / (
+            "workspace"
+        )
+        descriptor: int | None = None
+        try:
+            before = workspace.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise EngineError(
+                    "read-only analysis requires an existing canonical "
+                    "workspace directory"
+                )
+            flags = os.O_RDONLY | os.O_CLOEXEC
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(workspace, flags)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise EngineError(
+                    "read-only analysis canonical workspace changed while "
+                    "being inspected"
+                )
+        except FileNotFoundError as error:
+            raise EngineError(
+                "read-only analysis requires an existing canonical "
+                "workspace; initialize it with a writer operation first"
+            ) from error
+        except OSError as error:
+            raise EngineError(
+                "read-only analysis canonical workspace is unsafe"
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return workspace
+
+    @staticmethod
+    def _isolated_analysis_result_locator(
+        result: SandboxResult,
+        locator: str,
+        leaf: str,
+    ) -> str:
+        try:
+            normalized_run_id = normalize_locator(result.run_id)
+        except SafeFileError as error:
+            raise EngineError(
+                "isolated analysis returned an invalid run identity"
+            ) from error
+        if (
+            normalized_run_id != result.run_id
+            or len(PurePosixPath(normalized_run_id).parts) != 1
+        ):
+            raise EngineError(
+                "isolated analysis returned an invalid run identity"
+            )
+        expected = (
+            PurePosixPath(".ctf")
+            / "runs"
+            / normalized_run_id
+            / leaf
+        ).as_posix()
+        if not locator.startswith("/work/"):
+            raise EngineError(
+                "isolated analysis returned a non-work result locator"
+            )
+        raw_relative = locator.removeprefix("/work/")
+        try:
+            normalized = normalize_locator(raw_relative)
+        except SafeFileError as error:
+            raise EngineError(
+                "isolated analysis returned an unsafe result locator"
+            ) from error
+        if raw_relative != normalized or normalized != expected:
+            raise EngineError(
+                "isolated analysis result locator is not bound to its run"
+            )
+        return normalized
+
+    def _promote_isolated_analysis_result(
+        self,
+        identity: ChallengeIdentity,
+        lease: AnalysisLease,
+        result: SandboxResult,
+        *,
+        engine_run_id: str,
+        issued_timeout_seconds: int,
+        host_started_epoch: float,
+        host_finished_epoch: float,
+        host_started_monotonic: float,
+        host_finished_monotonic: float,
+        command_deadline_monotonic: float | None,
+        stream_limit: int,
+        promoted_payload_limit: int,
+    ) -> tuple[list[ArtifactReference], SandboxResult]:
+        """Promote and reparse the three exact private run documents."""
+
+        stdout_locator = self._isolated_analysis_result_locator(
+            result,
+            result.stdout_path,
+            "stdout.log",
+        )
+        stderr_locator = self._isolated_analysis_result_locator(
+            result,
+            result.stderr_path,
+            "stderr.log",
+        )
+        result_locator = (
+            PurePosixPath(".ctf")
+            / "runs"
+            / result.run_id
+            / "result.json"
+        ).as_posix()
+        paths = self.store.challenge_paths(identity)
+        promoted: list[ArtifactReference] = []
+        admitted_bytes = 0
+
+        def admit_promoted_source(source_size: int) -> None:
+            nonlocal admitted_bytes
+            projected = admitted_bytes + source_size
+            if projected > promoted_payload_limit:
+                raise SafeFileError(
+                    "isolated analysis promotion exceeds its reservation"
+                )
+            admitted_bytes = projected
+
+        specifications = (
+            ("stdout", stdout_locator, stream_limit, ".log"),
+            ("stderr", stderr_locator, stream_limit, ".log"),
+            (
+                "result",
+                result_locator,
+                _ANALYSIS_RESULT_JSON_MAX_BYTES,
+                ".json",
+            ),
+        )
+        try:
+            for stream_name, source_locator, maximum_bytes, suffix in (
+                specifications
+            ):
+                artifact_id = _record_id(
+                    "A",
+                    engine_run_id,
+                    f"analysis-{stream_name}",
+                )
+                destination = (
+                    paths.artifacts
+                    / "snapshots"
+                    / f"{artifact_id}{suffix}"
+                )
+                pending = ArtifactReference(
+                    id=artifact_id,
+                    path=destination.relative_to(paths.root).as_posix(),
+                    sha256="0" * 64,
+                    source_run_id=engine_run_id,
+                )
+                promoted.append(pending)
+                snapshot = copy_bounded_regular(
+                    lease.work_dir,
+                    source_locator,
+                    destination,
+                    maximum_bytes=maximum_bytes,
+                    source_size_admission=admit_promoted_source,
+                    mode=0o400,
+                )
+                promoted[-1] = ArtifactReference(
+                    id=artifact_id,
+                    path=snapshot.path.relative_to(paths.root).as_posix(),
+                    sha256=snapshot.sha256,
+                    source_run_id=engine_run_id,
+                    size=snapshot.size_bytes,
+                    extra={
+                        "analysis_id": lease.ref.analysis_id,
+                        "isolated_read_only": True,
+                        "source_locator": snapshot.source_locator,
+                        "stream": stream_name,
+                    },
+                )
+
+            result_artifact = promoted[-1]
+            payload = read_bounded_regular(
+                paths.root,
+                result_artifact.path,
+                maximum_bytes=_ANALYSIS_RESULT_JSON_MAX_BYTES,
+                expected_sha256=result_artifact.sha256,
+                expected_size=int(result_artifact.size or 0),
+            )
+            sidecar = strict_json_loads(
+                payload,
+                max_bytes=_ANALYSIS_RESULT_JSON_MAX_BYTES,
+            )
+            expected_keys = {
+                "schema_version",
+                "kind",
+                "run_id",
+                "status",
+                "exit_code",
+                "timed_out",
+                "timeout_seconds",
+                "started_at",
+                "finished_at",
+                "duration_ms",
+                "stdout_path",
+                "stderr_path",
+                "stdout_bytes",
+                "stderr_bytes",
+                "stdout_stored_bytes",
+                "stderr_stored_bytes",
+                "stdout_limit_bytes",
+                "stderr_limit_bytes",
+                "stdout_truncated",
+                "stderr_truncated",
+                "stdout_truncation_known",
+                "stderr_truncation_known",
+                "stdout_capture_complete",
+                "stderr_capture_complete",
+                "stdout_summary",
+                "stderr_summary",
+                "stdout_summary_truncated",
+                "stderr_summary_truncated",
+                "stdout_error",
+                "stderr_error",
+                "stream_capture_error",
+                "orchestration_error",
+            }
+            if type(sidecar) is not dict or set(sidecar) != expected_keys:
+                raise EngineError(
+                    "isolated analysis result sidecar has an unexpected "
+                    "schema"
+                )
+            if (
+                sidecar["schema_version"] != 1
+                or sidecar["kind"] != "run_result"
+                or type(sidecar["run_id"]) is not str
+                or re.fullmatch(r"run-[0-9]{8,}", sidecar["run_id"])
+                is None
+                or type(sidecar["status"]) is not str
+                or sidecar["status"]
+                not in {"completed", "failed", "timed_out"}
+                or type(sidecar["timed_out"]) is not bool
+                or type(sidecar["exit_code"]) is not int
+                or not -(2**31) <= sidecar["exit_code"] <= 2**31 - 1
+                or type(sidecar["timeout_seconds"]) is not int
+                or not 0 <= sidecar["timeout_seconds"] <= 604800
+                or type(sidecar["duration_ms"]) is not int
+                or sidecar["duration_ms"] < 0
+            ):
+                raise EngineError(
+                    "isolated analysis result sidecar has invalid run fields"
+                )
+            for name in (
+                "stdout_bytes",
+                "stderr_bytes",
+                "stdout_stored_bytes",
+                "stderr_stored_bytes",
+                "stdout_limit_bytes",
+                "stderr_limit_bytes",
+            ):
+                value = sidecar[name]
+                if type(value) is not int or value < 0:
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid stream "
+                        "sizes"
+                    )
+            for name in (
+                "stdout_truncation_known",
+                "stderr_truncation_known",
+                "stdout_capture_complete",
+                "stderr_capture_complete",
+                "stdout_summary_truncated",
+                "stderr_summary_truncated",
+            ):
+                if type(sidecar[name]) is not bool:
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid stream "
+                        "safety fields"
+                    )
+            for name in ("stdout_truncated", "stderr_truncated"):
+                if sidecar[name] is not None and type(sidecar[name]) is not bool:
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid stream "
+                        "truncation fields"
+                    )
+            for name in (
+                "stdout_error",
+                "stderr_error",
+                "stream_capture_error",
+                "orchestration_error",
+            ):
+                value = sidecar[name]
+                if value is not None and (
+                    type(value) is not str
+                    or len(value.encode("utf-8")) > 4096
+                ):
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid stream "
+                        "error fields"
+                    )
+            for name in (
+                "started_at",
+                "finished_at",
+                "stdout_path",
+                "stderr_path",
+            ):
+                value = sidecar[name]
+                if (
+                    type(value) is not str
+                    or not value
+                    or len(value.encode("utf-8")) > 4096
+                ):
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid text "
+                        "fields"
+                    )
+            timestamp_pattern = re.compile(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                r"(?:\.\d{1,6})?(?:Z|\+00:00)"
+            )
+            timestamps: dict[str, datetime] = {}
+            for name in ("started_at", "finished_at"):
+                value = sidecar[name]
+                if timestamp_pattern.fullmatch(value) is None:
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid "
+                        "timestamps"
+                    )
+                try:
+                    timestamps[name] = datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                except ValueError as error:
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid "
+                        "timestamps"
+                    ) from error
+            timestamp_duration_ms = (
+                timestamps["finished_at"] - timestamps["started_at"]
+            ).total_seconds() * 1000
+            if (
+                not 1
+                <= sidecar["timeout_seconds"]
+                <= issued_timeout_seconds
+                or timestamp_duration_ms < 0
+                or abs(timestamp_duration_ms - sidecar["duration_ms"]) > 2.0
+            ):
+                raise EngineError(
+                    "isolated analysis result sidecar is not bound to the "
+                    "issued timeout and duration"
+                )
+            if (
+                not math.isfinite(host_started_epoch)
+                or not math.isfinite(host_finished_epoch)
+                or host_started_epoch > host_finished_epoch
+                or not math.isfinite(host_started_monotonic)
+                or not math.isfinite(host_finished_monotonic)
+                or host_started_monotonic > host_finished_monotonic
+                or timestamps["started_at"].timestamp()
+                < (
+                    host_started_epoch
+                    - _ANALYSIS_CLOCK_WINDOW_SKEW_SECONDS
+                )
+                or timestamps["finished_at"].timestamp()
+                > (
+                    host_finished_epoch
+                    + _ANALYSIS_CLOCK_WINDOW_SKEW_SECONDS
+                )
+            ):
+                raise EngineError(
+                    "isolated analysis result sidecar timestamps are outside "
+                    "the host-observed execution window"
+                )
+            if command_deadline_monotonic is not None:
+                if (
+                    not math.isfinite(command_deadline_monotonic)
+                    or command_deadline_monotonic
+                    <= host_started_monotonic
+                ):
+                    raise EngineError(
+                        "isolated analysis command deadline is invalid"
+                    )
+                host_elapsed = (
+                    host_finished_monotonic - host_started_monotonic
+                )
+                reported_start_elapsed = (
+                    timestamps["started_at"].timestamp()
+                    - host_started_epoch
+                )
+                # The backend clamps after the call begins and before ctfwrap
+                # records started_at.  Use the latest start allowed by both
+                # the trusted host call window and the bounded clock skew, so
+                # slow initialization remains valid without accepting an
+                # arbitrary transport-only timeout reduction.
+                latest_plausible_start_elapsed = min(
+                    host_elapsed,
+                    max(
+                        0.0,
+                        reported_start_elapsed
+                        + _ANALYSIS_CLOCK_WINDOW_SKEW_SECONDS,
+                    ),
+                )
+                remaining_at_wrapper_start = (
+                    command_deadline_monotonic
+                    - host_started_monotonic
+                    - latest_plausible_start_elapsed
+                )
+                plausible_timeout_floor = max(
+                    1,
+                    int(
+                        min(
+                            float(issued_timeout_seconds),
+                            remaining_at_wrapper_start,
+                        )
+                    ),
+                )
+                if sidecar["timeout_seconds"] < plausible_timeout_floor:
+                    raise EngineError(
+                        "isolated analysis result sidecar timeout is outside "
+                        "the host-observed plausible clamp range"
+                    )
+            for name in ("stdout_summary", "stderr_summary"):
+                value = sidecar[name]
+                if (
+                    type(value) is not str
+                    or len(value.encode("utf-8")) > 65536
+                ):
+                    raise EngineError(
+                        "isolated analysis result sidecar has invalid stream "
+                        "summary"
+                    )
+            parsed = result_from_dict(sidecar)
+            self._isolated_analysis_result_locator(
+                parsed,
+                parsed.stdout_path,
+                "stdout.log",
+            )
+            self._isolated_analysis_result_locator(
+                parsed,
+                parsed.stderr_path,
+                "stderr.log",
+            )
+            expected_status = (
+                "timed_out"
+                if parsed.timed_out
+                else "completed"
+                if parsed.exit_code == 0
+                else "failed"
+            )
+            if (
+                result.proof_outputs
+                or parsed.proof_outputs
+                or parsed.timeout_seconds is None
+                or parsed.started_at is None
+                or parsed.finished_at is None
+                or parsed != result
+                or parsed.status != expected_status
+                or (parsed.timed_out and parsed.exit_code != 124)
+            ):
+                raise EngineError(
+                    "isolated analysis result sidecar does not match the "
+                    "sandbox transport or status contract"
+                )
+            return promoted, parsed
+        except BaseException as error:
+            try:
+                self._cleanup_uncommitted_artifacts(
+                    identity,
+                    promoted,
+                    cause=error,
+                )
+            except BaseException as cleanup_error:
+                if not isinstance(error, Exception):
+                    error.add_note(
+                        "isolated analysis promotion cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    raise error
+                raise
+            raise
+
+    def _require_exact_read_only_analysis_run_documents(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        engine_run_id: str,
+        expected_request_document: Mapping[str, object],
+        expected_result_document: Mapping[str, object],
+        expected_validation_document: Mapping[str, object],
+    ) -> None:
+        """Require the exact three bounded engine-authored run documents."""
+
+        paths = self.store.challenge_paths(identity)
+        run_paths = self.store.run_paths(identity, run_id=engine_run_id)
+        for label, document_path, expected_document in (
+            ("request", run_paths.request, expected_request_document),
+            ("result", run_paths.result, expected_result_document),
+            (
+                "validation",
+                run_paths.validation,
+                expected_validation_document,
+            ),
+        ):
+            expected_payload = canonical_json_bytes(
+                dict(expected_document)
+            )
+            try:
+                relative = document_path.relative_to(paths.root).as_posix()
+                observed_payload = read_bounded_regular(
+                    paths.root,
+                    relative,
+                    maximum_bytes=MAX_RUN_DOCUMENT_BYTES,
+                    expected_sha256=hashlib.sha256(
+                        expected_payload
+                    ).hexdigest(),
+                    expected_size=len(expected_payload),
+                )
+                observed_document = strict_json_loads(
+                    observed_payload,
+                    max_bytes=MAX_RUN_DOCUMENT_BYTES,
+                )
+            except (
+                OSError,
+                SafeFileError,
+                StrictJSONError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "read-only analysis physical run documents failed "
+                    f"exact {label} verification"
+                ) from error
+            if (
+                observed_payload != expected_payload
+                or observed_document != dict(expected_document)
+            ):
+                raise EngineError(
+                    "read-only analysis physical run documents have an "
+                    f"ambiguous {label} binding"
+                )
+
+    def _read_only_analysis_commit_is_durable(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        experiment_id: str,
+        expected_experiment_status: ExperimentStatus,
+        expected_experiment_result: Mapping[str, object],
+        engine_run_id: str,
+        run_base_revision: int,
+        expected_run_status: RunStatus,
+        expected_run_extra: Mapping[str, object],
+        expected_receipt: ExecutionReceipt,
+        promoted_artifacts: Sequence[ArtifactReference],
+        expected_request_document: Mapping[str, object],
+        expected_result_document: Mapping[str, object],
+        expected_validation_document: Mapping[str, object],
+    ) -> bool:
+        """Prove that a possibly interrupted final state replacement landed.
+
+        ``StateStore.update`` is a CALL-to-STORE boundary: a control-flow
+        exception can be raised by an injected caller after the atomic state
+        replacement completed but before the return value reached this frame.
+        A run id is the durable commit intent.  Its absence proves the final
+        commit did not land; its presence requires the complete evidence
+        binding below to match before promoted files are treated as owned by
+        canonical state.
+        """
+
+        canonical = self.store.load(identity, recover=False)
+        runs = [run for run in canonical.runs if run.id == engine_run_id]
+        if not runs:
+            return False
+        if len(runs) != 1:
+            raise EngineError(
+                "read-only analysis durable commit has duplicate run ids"
+            )
+
+        paths = self.store.challenge_paths(identity)
+        run_paths = self.store.run_paths(identity, run_id=engine_run_id)
+        run = runs[0]
+        if (
+            run.base_revision != run_base_revision
+            or run.status is not expected_run_status
+            or run.request_path
+            != run_paths.request.relative_to(paths.root).as_posix()
+            or run.result_path
+            != run_paths.result.relative_to(paths.root).as_posix()
+            or run.validation_path
+            != run_paths.validation.relative_to(paths.root).as_posix()
+            or run.role != "tool"
+            or run.origin is not RunOrigin.OPERATOR_TOOL
+            or run.extra != dict(expected_run_extra)
+        ):
+            raise EngineError(
+                "read-only analysis durable run binding is ambiguous"
+            )
+
+        self._require_exact_read_only_analysis_run_documents(
+            identity,
+            engine_run_id=engine_run_id,
+            expected_request_document=expected_request_document,
+            expected_result_document=expected_result_document,
+            expected_validation_document=expected_validation_document,
+        )
+
+        experiments = [
+            item
+            for item in canonical.experiments
+            if item.id == experiment_id
+        ]
+        expected_artifact_ids = [
+            artifact.id for artifact in promoted_artifacts
+        ]
+        if (
+            len(experiments) != 1
+            or experiments[0].status is not expected_experiment_status
+            or experiments[0].result != dict(expected_experiment_result)
+            or experiments[0].artifact_ids != expected_artifact_ids
+        ):
+            raise EngineError(
+                "read-only analysis durable experiment binding is ambiguous"
+            )
+
+        canonical_artifacts = {
+            artifact.id: artifact for artifact in canonical.artifacts
+        }
+        if len(canonical_artifacts) != len(canonical.artifacts):
+            raise EngineError(
+                "read-only analysis durable artifacts contain duplicate ids"
+            )
+        for expected in promoted_artifacts:
+            if canonical_artifacts.get(expected.id) != expected:
+                raise EngineError(
+                    "read-only analysis durable artifact binding is ambiguous"
+                )
+            validate_artifact(paths.root, expected)
+
+        receipts = [
+            receipt
+            for receipt in canonical.receipts
+            if receipt.id == expected_receipt.id
+        ]
+        if len(receipts) != 1 or receipts[0] != expected_receipt:
+            raise EngineError(
+                "read-only analysis durable receipt binding is ambiguous"
+            )
+        return True
+
     def run_tool_command(
         self,
         identity: ChallengeIdentity,
@@ -20955,10 +22039,37 @@ class ChallengeEngine:
         resource_class: str = "light",
         network_target: str | None = None,
         needs_kvm: bool = False,
+        read_only: bool = False,
+        input_locators: Sequence[str] = (),
         _session_owned: bool = False,
         _live_only: bool = False,
     ) -> ChallengeState:
         """Register and execute one foreground sandbox command."""
+
+        if not isinstance(read_only, bool):
+            raise EngineError("read_only must be a boolean")
+        if read_only:
+            if _session_owned or _live_only:
+                raise EngineError(
+                    "read_only_analysis_unavailable_in_live_session"
+                )
+            return self._run_read_only_tool_command(
+                identity,
+                command,
+                expected_observation=expected_observation,
+                keep_if=keep_if,
+                drop_if=drop_if,
+                hypothesis_ids=hypothesis_ids,
+                timeout_seconds=timeout_seconds,
+                resource_class=resource_class,
+                network_target=network_target,
+                needs_kvm=needs_kvm,
+                input_locators=input_locators,
+            )
+        if input_locators:
+            raise EngineError(
+                "input_locators require read_only=True"
+            )
 
         if not _session_owned:
             paths = self.store.challenge_paths(identity)
@@ -20985,6 +22096,8 @@ class ChallengeEngine:
                     resource_class=resource_class,
                     network_target=network_target,
                     needs_kvm=needs_kvm,
+                    read_only=False,
+                    input_locators=(),
                     _session_owned=True,
                     _live_only=_live_only,
                 )
@@ -21021,53 +22134,1486 @@ class ChallengeEngine:
             _live_only=_live_only,
         )
 
-    @staticmethod
-    def _background_job_record(
-        ref: JobRef,
+    def _run_read_only_tool_command(
+        self,
+        identity: ChallengeIdentity,
+        command: Sequence[str],
         *,
-        status: JobStatus | None = None,
-        command: Sequence[str] | None = None,
-        name: str | None = None,
-        resource_class: str | None = None,
-        resource_request: ResourceVector | None = None,
-        network_target: str | None = None,
+        expected_observation: str,
+        keep_if: str,
+        drop_if: str,
+        hypothesis_ids: Sequence[str],
+        timeout_seconds: int | None,
+        resource_class: str,
+        network_target: str | None,
+        needs_kvm: bool,
+        input_locators: Sequence[str],
+    ) -> ChallengeState:
+        """Execute one explicit analysis in a private concurrent reader."""
+
+        argv = tuple(command)
+        if not argv:
+            raise EngineError("experiment command cannot be empty")
+        configured_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.config.runtime.command_timeout_s
+        )
+        if (
+            isinstance(configured_timeout, bool)
+            or not isinstance(configured_timeout, int)
+            or not 1
+            <= configured_timeout
+            <= MAX_EXPERIMENT_TIMEOUT_SECONDS
+        ):
+            raise EngineError(
+                "experiment timeout must be an integer between 1 and "
+                f"{MAX_EXPERIMENT_TIMEOUT_SECONDS}"
+            )
+        if not isinstance(needs_kvm, bool):
+            raise EngineError("needs_kvm must be a boolean")
+        try:
+            ensure_foreground_command(argv)
+        except BackgroundJobUnsupported as error:
+            raise EngineError(str(error)) from error
+
+        preflight = self.store.load(identity)
+        if preflight.schema_version < STATE_SCHEMA_VERSION:
+            raise EngineError(
+                "read_only_analysis_requires_current_state_schema"
+            )
+        self._require_model_work_allowed(preflight)
+        self._remaining_budget_seconds(preflight)
+        workspace = self._read_only_analysis_workspace(preflight)
+        (
+            normalized_inputs,
+            stream_limit,
+            promoted_payload_limit,
+            work_tree_limit,
+            reservation_bytes,
+        ) = self._prepare_read_only_analysis_inputs(
+            preflight,
+            input_locators,
+            workspace=workspace,
+        )
+        target = (
+            NetworkTarget.parse(network_target)
+            if network_target is not None
+            else None
+        )
+        if target is not None:
+            self._network_policy(preflight).authorize(target)
+            self._wait_for_remote_command_start(preflight, target)
+        try:
+            resource_request = tool_profile(
+                resource_class,
+                needs_kvm=needs_kvm,
+                network=target is not None,
+            )
+            CommandSpec.create(
+                argv,
+                timeout_seconds=configured_timeout,
+                network_target=target,
+                resource_request=resource_request,
+            )
+        except (SandboxError, ValueError) as error:
+            raise EngineError(
+                f"invalid read-only analysis command: {error}"
+            ) from error
+
+        scope = ChallengeScope(
+            contest_id=preflight.contest_id,
+            category=preflight.category,
+            challenge_id=preflight.challenge_id,
+            challenge_dir=self.challenge_input(preflight.identity),
+            work_dir=workspace,
+        )
+        manager = AnalysisLeaseManager(
+            self.store,
+            identity,
+            scope_fingerprint=scope.fingerprint,
+            quota_bytes=(
+                self.config.runtime.challenge_storage_quota_bytes
+            ),
+            max_scan_entries=(
+                self.config.runtime.storage_scan_max_entries
+            ),
+            max_scan_bytes=self.config.runtime.storage_scan_max_bytes,
+            cleanup_max_entries=(
+                self.config.runtime.storage_scan_max_entries
+            ),
+            cleanup_max_bytes=reservation_bytes,
+        )
+        try:
+            analysis_root = manager.prepare_root()
+            client = self.sandbox(
+                preflight,
+                workspace_override=workspace,
+                analysis_root=analysis_root,
+            )
+            if client.scope_fingerprint != scope.fingerprint:
+                raise EngineError(
+                    "read-only analysis sandbox scope does not match the "
+                    "canonical challenge workspace"
+                )
+            manager.set_runtime_absence_probe(
+                client.cleanup_isolated_analysis
+            )
+        except (AnalysisLeaseError, SandboxError, OSError) as error:
+            raise EngineError(
+                f"read-only analysis boundary initialization failed: {error}"
+            ) from error
+
+        resource_lease = self.lease_broker.acquire(
+            resource_request,
+            timeout=self._budget_wait_timeout(
+                preflight,
+                self.config.resources.lease_wait_timeout_s,
+            ),
+            owner=f"{identity.key}:read-only-analysis",
+        )
+        if resource_lease is None:
+            raise EngineError(
+                "timed out waiting for host read-only analysis resources"
+            )
+
+        analysis_lease: AnalysisLease | None = None
+        experiment_id: str | None = None
+        engine_run_id: str | None = None
+        run_base_revision: int | None = None
+        promoted_artifacts: list[ArtifactReference] = []
+        expected_experiment_status: ExperimentStatus | None = None
+        expected_experiment_result: dict[str, object] | None = None
+        expected_run_status: RunStatus | None = None
+        expected_run_extra: dict[str, object] | None = None
+        expected_receipt: ExecutionReceipt | None = None
+        expected_request_document: dict[str, object] | None = None
+        expected_result_document: dict[str, object] | None = None
+        expected_validation_document: dict[str, object] | None = None
+        candidate_intent_values: tuple[str, ...] = ()
+        state_committed = False
+        lease_status = "failed"
+        lease_reason: str | None = "analysis_engine_failed"
+        suppressed_sandbox_error: SandboxError | None = None
+
+        try:
+            try:
+                analysis_lease = manager.acquire(
+                    reservation_bytes=reservation_bytes,
+                    work_tree_limit_bytes=work_tree_limit,
+                )
+            except AnalysisLeaseBusy as error:
+                raise SessionAlreadyRunning(str(error)) from error
+            except AnalysisLeaseError as error:
+                raise EngineError(str(error)) from error
+
+            # Own the id before crossing register_experiment's state-update
+            # return boundary.  If the durable update lands and a control-flow
+            # exception is raised before return, terminalization can still
+            # address the exact registered experiment.
+            experiment_id = _run_id("E-operator-analysis")
+            for attempt in range(16):
+                current = self.store.load(identity)
+                self._require_model_work_allowed(current)
+                try:
+                    _registered, registered_id = self.register_experiment(
+                        identity,
+                        command=argv,
+                        expected_observation=expected_observation,
+                        keep_if=keep_if,
+                        drop_if=drop_if,
+                        hypothesis_ids=hypothesis_ids,
+                        timeout_seconds=configured_timeout,
+                        resource_class=resource_class,
+                        network_target=network_target,
+                        needs_kvm=needs_kvm,
+                        expected_revision=current.revision,
+                        _experiment_id=experiment_id,
+                    )
+                    if registered_id != experiment_id:
+                        raise EngineError(
+                            "read-only analysis experiment id changed during "
+                            "registration"
+                        )
+                    break
+                except RevisionConflict:
+                    if attempt == 15:
+                        raise
+            if experiment_id is None:
+                raise EngineError(
+                    "could not register read-only analysis experiment"
+                )
+
+            def mark_running(current: ChallengeState) -> None:
+                self._require_model_work_allowed(current)
+                item = next(
+                    experiment
+                    for experiment in current.experiments
+                    if experiment.id == experiment_id
+                )
+                if item.status is not ExperimentStatus.REGISTERED:
+                    raise EngineError(
+                        "read-only analysis experiment is no longer "
+                        "registered"
+                    )
+                self._require_experiment_target_current(current, item)
+                item.status = ExperimentStatus.RUNNING
+                item.extra.update(
+                    {
+                        "analysis_id": analysis_lease.ref.analysis_id,
+                        "input_locators": list(normalized_inputs),
+                        "isolated_read_only": True,
+                        "storage_reservation_bytes": reservation_bytes,
+                        "work_tree_limit_bytes": work_tree_limit,
+                    }
+                )
+
+            running = self.store.update(identity, mark_running)
+            experiment = next(
+                item
+                for item in running.experiments
+                if item.id == experiment_id
+            )
+            (
+                command_timeout,
+                command_deadline_monotonic,
+            ) = self._budget_command_limits(
+                running,
+                experiment.timeout_seconds,
+            )
+            run_budget_deadline = running.budget.deadline_utc
+            engine_run_id = _run_id(
+                f"tool-analysis-{analysis_lease.ref.analysis_id}"
+            )
+            issued_request: dict[str, object] = {
+                "kind": "tool",
+                "experiment_id": experiment_id,
+                "argv": list(argv),
+                "resource_class": resource_class,
+                "resource_request": resource_request.as_dict(),
+                "lease_id": resource_lease.lease_id,
+                "analysis_id": analysis_lease.ref.analysis_id,
+                "isolated_read_only": True,
+                "input_locators": list(normalized_inputs),
+                "image": self.config.runtime.image,
+                "image_digest": self.config.runtime.image_digest,
+                "image_reference": (
+                    self.config.runtime.image_digest
+                    or self.config.runtime.image
+                ),
+                "network_target": network_target,
+                "configuration_epoch": running.configuration_epoch,
+                "storage_reservation_bytes": reservation_bytes,
+                "work_tree_limit_bytes": work_tree_limit,
+            }
+            run_paths = self.store.create_run(
+                identity,
+                run_id=engine_run_id,
+                request=issued_request,
+                base_revision=None,
+            )
+            challenge_paths = self.store.challenge_paths(identity)
+            request_relative = run_paths.request.relative_to(
+                challenge_paths.root
+            ).as_posix()
+            try:
+                request_value = strict_json_loads(
+                    read_bounded_regular_unbound(
+                        challenge_paths.root,
+                        request_relative,
+                        maximum_bytes=MAX_RUN_DOCUMENT_BYTES,
+                    ),
+                    max_bytes=MAX_RUN_DOCUMENT_BYTES,
+                )
+            except (
+                OSError,
+                SafeFileError,
+                StrictJSONError,
+                ValueError,
+            ) as error:
+                raise EngineError(
+                    "read-only analysis run request could not be verified"
+                ) from error
+            request_envelope = {
+                "schema_version": RUN_ENVELOPE_SCHEMA_VERSION,
+                "contest_id": identity.contest_id,
+                "category": identity.category,
+                "challenge_id": identity.challenge_id,
+                "run_id": engine_run_id,
+            }
+            if (
+                type(request_value) is not dict
+                or set(request_value)
+                != {
+                    *issued_request,
+                    *request_envelope,
+                    "base_revision",
+                    "created_at",
+                }
+                or any(
+                    request_value.get(key) != value
+                    for key, value in issued_request.items()
+                )
+                or any(
+                    request_value.get(key) != value
+                    for key, value in request_envelope.items()
+                )
+                or type(request_value.get("base_revision")) is not int
+                or request_value["base_revision"] < 0
+                or type(request_value.get("created_at")) is not str
+                or not request_value["created_at"]
+            ):
+                raise EngineError(
+                    "read-only analysis run request binding is invalid"
+                )
+            run_base_revision = int(request_value["base_revision"])
+            expected_request_document = copy.deepcopy(request_value)
+
+            runtime_id = client.isolated_analysis_runtime_id(
+                analysis_lease.ref
+            )
+            analysis_lease.bind_runtime(runtime_id)
+            host_started_monotonic = time.monotonic()
+            host_started_epoch = time.time()
+            result = client.run_isolated_analysis(
+                analysis_lease.ref,
+                CommandSpec.create(
+                    argv,
+                    timeout_seconds=command_timeout,
+                    deadline_monotonic_seconds=(
+                        command_deadline_monotonic
+                    ),
+                    environment={
+                        FLAG_PATTERNS_ENV: json.dumps(
+                            self.config.runtime.flag_patterns,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    },
+                    network_target=target,
+                    resource_request=resource_request,
+                ),
+                input_locators=normalized_inputs,
+            )
+            host_finished_epoch = time.time()
+            host_finished_monotonic = time.monotonic()
+            elapsed = host_finished_monotonic - host_started_monotonic
+            finished_epoch = host_finished_epoch
+            promoted_artifacts, result = (
+                self._promote_isolated_analysis_result(
+                    identity,
+                    analysis_lease,
+                    result,
+                    engine_run_id=engine_run_id,
+                    issued_timeout_seconds=command_timeout,
+                    host_started_epoch=host_started_epoch,
+                    host_finished_epoch=host_finished_epoch,
+                    host_started_monotonic=host_started_monotonic,
+                    host_finished_monotonic=host_finished_monotonic,
+                    command_deadline_monotonic=(
+                        command_deadline_monotonic
+                    ),
+                    stream_limit=stream_limit,
+                    promoted_payload_limit=promoted_payload_limit,
+                )
+            )
+            if result.exit_code == 0 and not result.timed_out:
+                self._require_before_hard_deadline(
+                    command_deadline_monotonic,
+                    "read-only analysis evidence promotion",
+                )
+
+            artifacts_by_stream = {
+                str(artifact.extra.get("stream")): artifact
+                for artifact in promoted_artifacts
+            }
+            stdout_artifact = artifacts_by_stream["stdout"]
+            stderr_artifact = artifacts_by_stream["stderr"]
+            result_artifact = artifacts_by_stream["result"]
+            receipt_stream_evidence: dict[
+                str, dict[str, object]
+            ] = {}
+            paths = self.store.challenge_paths(identity)
+            for stream_name, artifact in (
+                ("stdout", stdout_artifact),
+                ("stderr", stderr_artifact),
+            ):
+                receipt_stream_evidence[stream_name] = (
+                    summarize_stream_snapshot(
+                        paths.root / artifact.path,
+                        artifact_id=artifact.id,
+                        artifact_path=artifact.path,
+                        artifact_sha256=artifact.sha256,
+                        result=result,
+                        stream=stream_name,
+                    )
+                )
+            receipt_preview = build_receipt_preview(
+                exit_code=result.exit_code,
+                stdout_bytes=result.stdout_bytes,
+                stderr_bytes=result.stderr_bytes,
+                stdout_evidence=receipt_stream_evidence["stdout"],
+                stderr_evidence=receipt_stream_evidence["stderr"],
+            )
+
+            flag_policy = resolve_flag_format(
+                running,
+                self.config.runtime.flag_patterns,
+            )
+            detected_flags: list[DetectedFlag] = []
+
+            def receive_flag(detected: DetectedFlag) -> None:
+                if not candidate_value_is_valid(detected.value):
+                    return
+                self.store.record_candidate_intent(
+                    identity,
+                    value=detected.value,
+                    source=detected.source,
+                    source_run_id=engine_run_id,
+                    observed_at=detected.observed_at,
+                    tier=flag_policy.tier_for(detected.value),
+                    format_epoch=flag_policy.configuration_epoch,
+                )
+                detected_flags.append(detected)
+                self._on_tool_flag(identity, detected)
+
+            detector = FlagDetector(
+                flag_policy.patterns,
+                callback=receive_flag,
+                suppress_generic_code_noise=(
+                    flag_policy.source == "runtime"
+                ),
+            )
+            detector.scan_file(
+                paths.root / stdout_artifact.path,
+                source=f"tool:{engine_run_id}:stdout",
+                max_bytes=self.config.runtime.flag_scan_max_bytes,
+            )
+            detector.scan_file(
+                paths.root / stderr_artifact.path,
+                source=f"tool:{engine_run_id}:stderr",
+                max_bytes=self.config.runtime.flag_scan_max_bytes,
+            )
+
+            succeeded = result.exit_code == 0 and not result.timed_out
+            receipt_id = _record_id(
+                "RCPT",
+                engine_run_id,
+                "analysis-result",
+            )
+            commit_experiment_status = (
+                ExperimentStatus.COMPLETED
+                if succeeded and experiment.kind is ExperimentKind.PROBE
+                else ExperimentStatus.AWAITING_EVALUATION
+                if succeeded
+                else ExperimentStatus.FAILED
+            )
+            commit_experiment_result: dict[str, object] = {
+                "run_id": engine_run_id,
+                "receipt_id": receipt_id,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "analysis_id": analysis_lease.ref.analysis_id,
+                "isolated_read_only": True,
+            }
+            commit_run_status = (
+                RunStatus.COMPLETED
+                if succeeded
+                else RunStatus.TIMED_OUT
+                if result.timed_out
+                else RunStatus.FAILED
+            )
+            commit_run_extra: dict[str, object] = {
+                "analysis_id": analysis_lease.ref.analysis_id,
+                "experiment_id": experiment_id,
+                "input_locators": list(normalized_inputs),
+                "isolated_read_only": True,
+                "sandbox_run_id": result.run_id,
+                "wall_seconds": elapsed,
+            }
+            commit_receipt = ExecutionReceipt(
+                id=receipt_id,
+                experiment_id=experiment_id,
+                run_id=engine_run_id,
+                outcome=(
+                    ReceiptOutcome.SUCCEEDED
+                    if succeeded
+                    else ReceiptOutcome.TIMED_OUT
+                    if result.timed_out
+                    else ReceiptOutcome.FAILED
+                ),
+                exit_code=result.exit_code,
+                wall_seconds=elapsed,
+                stdout_artifact_id=stdout_artifact.id,
+                stderr_artifact_id=stderr_artifact.id,
+                stdout_bytes=result.stdout_bytes,
+                stderr_bytes=result.stderr_bytes,
+                stdout_lines=(
+                    result.stdout_summary.count("\n")
+                    + bool(result.stdout_summary)
+                ),
+                stderr_lines=(
+                    result.stderr_summary.count("\n")
+                    + bool(result.stderr_summary)
+                ),
+                preview=receipt_preview,
+                extra={
+                    "analysis_id": analysis_lease.ref.analysis_id,
+                    "input_locators": list(normalized_inputs),
+                    "isolated_read_only": True,
+                    "line_count_basis": "transport_summary_tail",
+                    "result_artifact_id": result_artifact.id,
+                    "stream_evidence": receipt_stream_evidence,
+                },
+            )
+            expected_experiment_status = commit_experiment_status
+            expected_experiment_result = commit_experiment_result
+            expected_run_status = commit_run_status
+            expected_run_extra = commit_run_extra
+            expected_receipt = commit_receipt
+            candidate_intent_values = tuple(
+                detected.value for detected in detected_flags
+            )
+            result_payload = {
+                "status": (
+                    "completed"
+                    if succeeded
+                    else "timed_out"
+                    if result.timed_out
+                    else "failed"
+                ),
+                "base_revision": run_base_revision,
+                "analysis_id": analysis_lease.ref.analysis_id,
+                "isolated_read_only": True,
+                "sandbox_run_id": result.run_id,
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "wall_seconds": elapsed,
+                "artifact_ids": [
+                    artifact.id for artifact in promoted_artifacts
+                ],
+            }
+            validation_payload = {
+                "ok": succeeded,
+                "base_revision": run_base_revision,
+                "errors": (
+                    []
+                    if succeeded
+                    else [
+                        "read-only analysis timed out"
+                        if result.timed_out
+                        else (
+                            "read-only analysis exited "
+                            f"{result.exit_code}"
+                        )
+                    ]
+                ),
+                "error_type": (
+                    None if succeeded else "ToolExecutionFailure"
+                ),
+                "run_id": engine_run_id,
+                "validated_at": utc_now(),
+            }
+            result_document: dict[str, object] = {
+                **result_payload,
+                "schema_version": WORKER_RESULT_SCHEMA_VERSION,
+                "contest_id": identity.contest_id,
+                "category": identity.category,
+                "challenge_id": identity.challenge_id,
+                "run_id": engine_run_id,
+            }
+            validation_document = copy.deepcopy(validation_payload)
+            self.store.write_run_result(
+                identity,
+                None,
+                None,
+                engine_run_id,
+                result_payload,
+            )
+            self.store.write_run_validation(
+                identity,
+                engine_run_id,
+                validation_payload,
+            )
+            expected_result_document = result_document
+            expected_validation_document = validation_document
+            self._require_exact_read_only_analysis_run_documents(
+                identity,
+                engine_run_id=engine_run_id,
+                expected_request_document=expected_request_document,
+                expected_result_document=expected_result_document,
+                expected_validation_document=(
+                    expected_validation_document
+                ),
+            )
+
+            def finish(current: ChallengeState) -> None:
+                if succeeded:
+                    self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        "read-only analysis state mutation",
+                    )
+                item = next(
+                    candidate
+                    for candidate in current.experiments
+                    if candidate.id == experiment_id
+                )
+                if (
+                    item.status is not ExperimentStatus.RUNNING
+                    or item.extra.get("analysis_id")
+                    != analysis_lease.ref.analysis_id
+                    or item.extra.get("isolated_read_only") is not True
+                ):
+                    raise EngineError(
+                        "read-only analysis experiment changed before commit"
+                    )
+                if any(run.id == engine_run_id for run in current.runs):
+                    raise EngineError(
+                        "read-only analysis run is already committed"
+                    )
+                if current.schema_version < STATE_SCHEMA_VERSION:
+                    raise EngineError(
+                        "read_only_analysis_requires_current_state_schema"
+                    )
+                item.status = commit_experiment_status
+                item.result = copy.deepcopy(commit_experiment_result)
+                item.artifact_ids = list(
+                    dict.fromkeys(
+                        [
+                            *item.artifact_ids,
+                            *(
+                                artifact.id
+                                for artifact in promoted_artifacts
+                            ),
+                        ]
+                    )
+                )
+                current.runs.append(
+                    RunReference(
+                        id=engine_run_id,
+                        base_revision=run_base_revision,
+                        status=(
+                            commit_run_status
+                        ),
+                        request_path=run_paths.request.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        result_path=run_paths.result.relative_to(
+                            paths.root
+                        ).as_posix(),
+                        validation_path=(
+                            run_paths.validation.relative_to(
+                                paths.root
+                            ).as_posix()
+                        ),
+                        role="tool",
+                        origin=RunOrigin.OPERATOR_TOOL,
+                        configuration_epoch=(
+                            current.configuration_epoch
+                            if current.schema_version
+                            >= STATE_SCHEMA_VERSION
+                            else None
+                        ),
+                        created_at=utc_now(),
+                        extra=copy.deepcopy(commit_run_extra),
+                    )
+                )
+                current.artifacts.extend(promoted_artifacts)
+                current.receipts.append(copy.deepcopy(commit_receipt))
+                existing_values = {
+                    candidate.value for candidate in current.candidates
+                }
+                for index, detected in enumerate(detected_flags, start=1):
+                    if detected.value in existing_values:
+                        continue
+                    current.candidates.append(
+                        FlagCandidate(
+                            id=_record_id(
+                                "C",
+                                engine_run_id,
+                                f"tool-{index}",
+                            ),
+                            value=detected.value,
+                            status=(
+                                CandidateStatus.OBSERVED_CANDIDATE
+                            ),
+                            source_run_id=engine_run_id,
+                            locator=detected.source,
+                            tier=flag_policy.tier_for(detected.value),
+                            format_epoch=(
+                                flag_policy.configuration_epoch
+                            ),
+                        )
+                    )
+                    existing_values.add(detected.value)
+                accounted_elapsed = elapsed
+                if current.budget.deadline_utc != run_budget_deadline:
+                    current_deadline = deadline_epoch(
+                        current.budget.deadline_utc
+                    )
+                    allocated = current.budget.allocated_seconds
+                    if current_deadline is None or allocated is None:
+                        accounted_elapsed = 0.0
+                    else:
+                        reset_epoch = current_deadline - allocated
+                        accounted_elapsed = min(
+                            elapsed,
+                            max(0.0, finished_epoch - reset_epoch),
+                        )
+                current.budget.spent_seconds += max(
+                    0,
+                    int(accounted_elapsed),
+                )
+
+            self.store.update(
+                identity,
+                finish,
+                commit_guard=(
+                    lambda: self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        "read-only analysis canonical commit",
+                    )
+                    if succeeded
+                    else None
+                ),
+                pre_replace_guard=(
+                    lambda: self._require_before_hard_deadline(
+                        command_deadline_monotonic,
+                        "read-only analysis canonical replacement",
+                    )
+                    if succeeded
+                    else None
+                ),
+            )
+            lease_status = "completed" if succeeded else "failed"
+            lease_reason = (
+                None
+                if succeeded
+                else "analysis_timed_out"
+                if result.timed_out
+                else "analysis_command_failed"
+            )
+            state_committed = True
+            promoted_artifacts.clear()
+            self.store.clear_candidate_intents(
+                identity,
+                candidate_intent_values,
+            )
+        except SandboxError as error:
+            suppressed_sandbox_error = error
+            lease_reason = "analysis_sandbox_failed"
+            if experiment_id is not None:
+                if engine_run_id is not None and run_base_revision is not None:
+                    self._record_tool_failure(
+                        identity,
+                        experiment_id,
+                        f"sandbox error: {error}",
+                        run_id=engine_run_id,
+                        base_revision=run_base_revision,
+                    )
+                else:
+                    self._finish_tool_failure(
+                        identity,
+                        experiment_id,
+                        f"sandbox error: {error}",
+                    )
+                state_committed = True
+        except BaseException as error:
+            if not state_committed:
+                lease_reason = "analysis_interrupted"
+            commit_inspection_uncertain = False
+            if (
+                experiment_id is not None
+                and analysis_lease is not None
+                and engine_run_id is not None
+                and run_base_revision is not None
+                and expected_experiment_status is not None
+                and expected_experiment_result is not None
+                and expected_run_status is not None
+                and expected_run_extra is not None
+                and expected_receipt is not None
+                and expected_request_document is not None
+                and expected_result_document is not None
+                and expected_validation_document is not None
+                and promoted_artifacts
+            ):
+                try:
+                    state_committed = (
+                        self._read_only_analysis_commit_is_durable(
+                            identity,
+                            experiment_id=experiment_id,
+                            expected_experiment_status=(
+                                expected_experiment_status
+                            ),
+                            expected_experiment_result=(
+                                expected_experiment_result
+                            ),
+                            engine_run_id=engine_run_id,
+                            run_base_revision=run_base_revision,
+                            expected_run_status=expected_run_status,
+                            expected_run_extra=expected_run_extra,
+                            expected_receipt=expected_receipt,
+                            promoted_artifacts=promoted_artifacts,
+                            expected_request_document=(
+                                expected_request_document
+                            ),
+                            expected_result_document=(
+                                expected_result_document
+                            ),
+                            expected_validation_document=(
+                                expected_validation_document
+                            ),
+                        )
+                    )
+                except BaseException as inspection_error:
+                    commit_inspection_uncertain = True
+                    error.add_note(
+                        "read-only analysis durable commit inspection failed: "
+                        f"{type(inspection_error).__name__}: "
+                        f"{inspection_error}"
+                    )
+                if state_committed:
+                    promoted_artifacts.clear()
+                    lease_status = (
+                        "completed"
+                        if expected_run_status is RunStatus.COMPLETED
+                        else "failed"
+                    )
+                    lease_reason = (
+                        None
+                        if expected_run_status is RunStatus.COMPLETED
+                        else "analysis_timed_out"
+                        if expected_run_status is RunStatus.TIMED_OUT
+                        else "analysis_command_failed"
+                    )
+                    try:
+                        self.store.clear_candidate_intents(
+                            identity,
+                            candidate_intent_values,
+                        )
+                    except BaseException as intent_error:
+                        error.add_note(
+                            "read-only analysis candidate intent cleanup "
+                            "failed after durable commit: "
+                            f"{type(intent_error).__name__}: {intent_error}"
+                        )
+
+            # create_run also has a durable return boundary.  Recover the
+            # exact engine-authored request so an interrupt after its atomic
+            # write produces a referenced failed run rather than an orphaned
+            # directory.
+            if (
+                not state_committed
+                and not commit_inspection_uncertain
+                and experiment_id is not None
+                and engine_run_id is not None
+                and run_base_revision is None
+                and analysis_lease is not None
+            ):
+                try:
+                    durable_request = self._failure_tool_request(
+                        identity,
+                        experiment_id,
+                        engine_run_id,
+                    )
+                    if (
+                        durable_request is not None
+                        and durable_request.get("isolated_read_only") is True
+                        and durable_request.get("analysis_id")
+                        == analysis_lease.ref.analysis_id
+                        and durable_request.get("input_locators")
+                        == list(normalized_inputs)
+                    ):
+                        run_base_revision = int(
+                            durable_request["base_revision"]
+                        )
+                except BaseException as request_error:
+                    error.add_note(
+                        "read-only analysis durable run request recovery "
+                        "failed: "
+                        f"{type(request_error).__name__}: {request_error}"
+                    )
+
+            if (
+                experiment_id is not None
+                and not state_committed
+                and not commit_inspection_uncertain
+            ):
+                try:
+                    if (
+                        engine_run_id is not None
+                        and run_base_revision is not None
+                    ):
+                        self._record_tool_failure(
+                            identity,
+                            experiment_id,
+                            (
+                                "read-only analysis interrupted: "
+                                f"{type(error).__name__}: {error}"
+                            ),
+                            run_id=engine_run_id,
+                            base_revision=run_base_revision,
+                        )
+                    else:
+                        self._finish_tool_failure(
+                            identity,
+                            experiment_id,
+                            (
+                                "read-only analysis interrupted: "
+                                f"{type(error).__name__}: {error}"
+                            ),
+                        )
+                except BaseException as terminal_error:
+                    error.add_note(
+                        "read-only analysis terminalization failed: "
+                        f"{terminal_error}"
+                    )
+            if (
+                promoted_artifacts
+                and not state_committed
+                and not commit_inspection_uncertain
+            ):
+                try:
+                    self._cleanup_uncommitted_artifacts(
+                        identity,
+                        promoted_artifacts,
+                        cause=error,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "read-only analysis artifact cleanup failed: "
+                        f"{cleanup_error}"
+                    )
+            raise
+        finally:
+            active_error = sys.exception()
+            cleanup_failure: BaseException | None = None
+
+            def remember_cleanup_failure(
+                error: BaseException,
+                *,
+                label: str,
+            ) -> None:
+                nonlocal cleanup_failure
+                if cleanup_failure is None:
+                    cleanup_failure = error
+                    return
+                if (
+                    not isinstance(error, Exception)
+                    and isinstance(cleanup_failure, Exception)
+                ):
+                    error.add_note(
+                        "an earlier read-only analysis cleanup also failed: "
+                        f"{cleanup_failure}"
+                    )
+                    cleanup_failure = error
+                    return
+                cleanup_failure.add_note(f"{label}: {error}")
+
+            if analysis_lease is not None:
+                try:
+                    client.cleanup_isolated_analysis(
+                        analysis_lease.ref
+                    )
+                except BaseException as error:
+                    remember_cleanup_failure(
+                        error,
+                        label="sandbox runtime cleanup failed",
+                    )
+                    try:
+                        analysis_lease.abandon(
+                            "analysis_runtime_cleanup_pending"
+                        )
+                    except BaseException as abandon_error:
+                        remember_cleanup_failure(
+                            abandon_error,
+                            label=(
+                                "analysis cleanup_pending persistence failed"
+                            ),
+                        )
+                else:
+                    try:
+                        analysis_lease.finalize(
+                            status=lease_status,
+                            reason_code=lease_reason,
+                            runtime_absent=True,
+                        )
+                    except BaseException as error:
+                        remember_cleanup_failure(
+                            error,
+                            label="analysis lease finalization failed",
+                        )
+                        try:
+                            analysis_lease.abandon(
+                                "analysis_finalize_failed"
+                            )
+                        except BaseException as abandon_error:
+                            remember_cleanup_failure(
+                                abandon_error,
+                                label="analysis finalize fallback failed",
+                            )
+            if not resource_lease.released:
+                try:
+                    resource_lease.release()
+                except BaseException as error:
+                    remember_cleanup_failure(
+                        error,
+                        label="host resource release also failed",
+                    )
+            if cleanup_failure is not None:
+                active_is_control = (
+                    active_error is not None
+                    and not isinstance(active_error, Exception)
+                )
+                cleanup_is_control = not isinstance(
+                    cleanup_failure,
+                    Exception,
+                )
+                if active_is_control:
+                    active_error.add_note(
+                        "read-only analysis cleanup failed: "
+                        f"{type(cleanup_failure).__name__}: "
+                        f"{cleanup_failure}"
+                    )
+                elif cleanup_is_control:
+                    if active_error is not None:
+                        cleanup_failure.add_note(
+                            "read-only analysis operation also failed: "
+                            f"{type(active_error).__name__}: {active_error}"
+                        )
+                    raise cleanup_failure
+                elif active_error is not None:
+                    active_error.add_note(
+                        "read-only analysis cleanup failed: "
+                        f"{cleanup_failure}"
+                    )
+                else:
+                    raise EngineError(
+                        "read-only analysis cleanup failed: "
+                        f"{cleanup_failure}"
+                    ) from cleanup_failure
+
+        if suppressed_sandbox_error is not None:
+            return self.store.load(identity)
+        return self.store.load(identity)
+
+    def _enforce_storage_admission(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        requested_bytes: int | None = None,
     ) -> dict[str, Any]:
-        value: dict[str, Any] = {
-            "schema_version": 1,
-            "job_id": ref.job_id,
-            "scope_fingerprint": ref.scope_fingerprint,
-            "runtime_id": ref.runtime_id,
-            "supervisor_id": ref.supervisor_id,
+        requested = (
+            self.config.runtime.work_tree_max_bytes
+            if requested_bytes is None
+            else requested_bytes
+        )
+        try:
+            return enforce_storage_quota(
+                self.store,
+                identity,
+                quota_bytes=(
+                    self.config.runtime.challenge_storage_quota_bytes
+                ),
+                max_entries=self.config.runtime.storage_scan_max_entries,
+                max_scan_bytes=self.config.runtime.storage_scan_max_bytes,
+                additional_bytes=requested,
+            )
+        except StorageQuotaError as error:
+            raise EngineError(str(error)) from error
+
+    def _model_run_storage_reservation_bytes(self) -> int:
+        """Return the enforced worst-case durable footprint of one model run."""
+
+        # Each request/result/validation replacement may briefly retain the
+        # old document beside its durable atomic temporary. StateStore hard
+        # caps every one of those documents at MAX_RUN_DOCUMENT_BYTES.
+        run_documents = 6 * MAX_RUN_DOCUMENT_BYTES
+        # Context archival briefly links its temporary and immutable names to
+        # the same inode; the bounded scanner accounts both directory entries.
+        context_archive = 2 * MAX_ARCHIVED_CONTEXT_BYTES
+        return (
+            self.batch_runner.durable_capture_max_bytes
+            + run_documents
+            + context_archive
+        )
+
+    def _storage_source_size_admission(
+        self,
+        identity: ChallengeIdentity,
+    ) -> Callable[[int], None]:
+        """Bind an accounted copy to its safely-opened exact source size."""
+
+        def admit(source_size: int) -> None:
+            self._enforce_storage_admission(
+                identity,
+                requested_bytes=source_size,
+            )
+
+        return admit
+
+    @staticmethod
+    def _bounded_storage_validation_message(
+        phase: str,
+        error: BaseException,
+        *,
+        maximum_bytes: int = 2048,
+    ) -> str:
+        message = f"{phase}: {type(error).__name__}: {error}"
+        encoded = message.encode("utf-8", errors="replace")
+        if len(encoded) <= maximum_bytes:
+            return message
+        suffix = b"..."
+        return (
+            encoded[: maximum_bytes - len(suffix)]
+            .decode("utf-8", errors="ignore")
+            + suffix.decode("ascii")
+        )
+
+    def _enforce_workspace_postcondition(
+        self,
+        identity: ChallengeIdentity,
+        workspace: Path,
+        *,
+        phase: str,
+        include_challenge_quota: bool,
+    ) -> None:
+        try:
+            measure_work_tree(
+                workspace,
+                maximum_bytes=self.config.runtime.work_tree_max_bytes,
+            )
+        except SafeFileError as error:
+            raise EngineError(
+                self._bounded_storage_validation_message(phase, error)
+            ) from error
+        if include_challenge_quota:
+            try:
+                self._enforce_storage_admission(
+                    identity,
+                    requested_bytes=0,
+                )
+            except EngineError as error:
+                raise EngineError(
+                    self._bounded_storage_validation_message(
+                        f"{phase} challenge quota",
+                        error,
+                    )
+                ) from error
+
+    def _batch_result_after_workspace_postcondition(
+        self,
+        identity: ChallengeIdentity,
+        result: BatchResult,
+        *,
+        force: bool = False,
+        include_challenge_quota: bool = False,
+    ) -> BatchResult:
+        if (
+            not force
+            and not include_challenge_quota
+            and not ROLE_SPECS[result.invocation.role].may_write_artifacts
+        ):
+            return result
+        try:
+            self._enforce_workspace_postcondition(
+                identity,
+                result.invocation.working_directory,
+                phase=(
+                    "model writable-workspace postcondition failed for "
+                    f"{result.invocation.role.value}"
+                ),
+                include_challenge_quota=include_challenge_quota,
+            )
+        except EngineError as error:
+            return self._failed_batch_result_for_storage_error(
+                result,
+                error,
+                phase="model result rejected",
+            )
+        return result
+
+    def _failed_batch_result_for_storage_error(
+        self,
+        result: BatchResult,
+        error: BaseException,
+        *,
+        phase: str,
+    ) -> BatchResult:
+        message = self._bounded_storage_validation_message(
+            phase,
+            error,
+        )
+        validation = ContractValidation(
+            False,
+            (f"$: {message}",),
+            None,
+        )
+        attempts = result.attempts
+        if attempts:
+            attempts = (
+                *attempts[:-1],
+                replace(
+                    attempts[-1],
+                    returncode=125,
+                    timed_out=False,
+                    validation=validation,
+                ),
+            )
+        failures = tuple(
+            failure
+            for failure in result.failures
+            if failure.kind != "workspace_storage_postcondition"
+        ) + (
+            ExecutionFailure(
+                "workspace_storage_postcondition",
+                message,
+                False,
+                "orchestrator.error",
+            ),
+        )
+        return replace(
+            result,
+            attempts=attempts,
+            output=None,
+            validation=validation,
+            failures=failures,
+        )
+
+    def _managed_builder_publish_owns_storage_issues(
+        self,
+        identity: ChallengeIdentity,
+        results: Sequence[BatchResult],
+    ) -> bool:
+        """Defer only exact unsafe publish sources to their typed validator.
+
+        Managed Builder publication already has a descriptor-anchored,
+        nonblocking source validator which projects model-controlled FIFO and
+        symlink failures into ``builder_publish_rejected``.  The challenge
+        quota postcheck still runs; this narrow handoff applies only when
+        every inventory issue is the exact proposed source or one of its
+        ancestors.  Any unrelated special file, hardlink, scan race, or byte
+        excess remains a terminal model-wave failure.
+        """
+
+        builder = next(
+            (
+                result
+                for result in results
+                if result.invocation.role is Role.BUILDER
+            ),
+            None,
+        )
+        if (
+            builder is None
+            or not builder.completed
+            or not builder.validation.valid
+            or not isinstance(builder.output, Mapping)
+        ):
+            return False
+        actions = builder.output.get("actions")
+        if not isinstance(actions, list):
+            return False
+        proposals: list[PurePosixPath] = []
+        for action in actions:
+            if (
+                not isinstance(action, Mapping)
+                or action.get("kind") != "write_artifact"
+            ):
+                continue
+            candidate = action.get("artifact_path")
+            if not isinstance(candidate, str):
+                continue
+            try:
+                normalized = normalize_locator(candidate)
+            except SafeFileError:
+                continue
+            proposals.append(PurePosixPath(normalized))
+        if not proposals:
+            return False
+        try:
+            report = storage_inventory(
+                self.store,
+                identity,
+                quota_bytes=(
+                    self.config.runtime.challenge_storage_quota_bytes
+                ),
+                max_entries=self.config.runtime.storage_scan_max_entries,
+                max_scan_bytes=(
+                    self.config.runtime.storage_scan_max_bytes
+                ),
+            )
+            quota = report["quota"]
+            issues = report["scan"]["issues"]
+            total_with_reservations = (
+                report["total_bytes"]
+                + quota["active_reservation_bytes"]
+            )
+        except Exception:
+            return False
+        if (
+            quota.get("status") != "indeterminate"
+            or total_with_reservations
+            > self.config.runtime.challenge_storage_quota_bytes
+            or not isinstance(issues, list)
+            or not issues
+        ):
+            return False
+        challenge_root = self.store.challenge_paths(identity).root
+        try:
+            workspace_relative = (
+                builder.invocation.working_directory.relative_to(
+                    challenge_root
+                )
+            ).as_posix()
+        except ValueError:
+            return False
+        workspace_prefix = workspace_relative + "/"
+        for issue in issues:
+            if (
+                not isinstance(issue, Mapping)
+                or issue.get("code")
+                not in {"special_file_forbidden", "symlink_forbidden"}
+                or not isinstance(issue.get("path"), str)
+                or not issue["path"].startswith(workspace_prefix)
+            ):
+                return False
+            issue_relative = PurePosixPath(
+                issue["path"][len(workspace_prefix) :]
+            )
+            if not any(
+                issue_relative == proposal
+                or proposal.parts[: len(issue_relative.parts)]
+                == issue_relative.parts
+                for proposal in proposals
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _background_job_intent(
+        supervisor_id: str,
+        *,
+        command: Sequence[str],
+        name: str | None,
+        resource_class: str,
+        resource_request: ResourceVector,
+        network_target: str | None,
+        work_tree_limit_bytes: int,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "supervisor_id": supervisor_id,
+            "job_id": None,
+            "scope_fingerprint": None,
+            "runtime_id": None,
+            "status": "launching",
+            "command": list(command),
+            "name": name,
+            "resource_class": resource_class,
+            "resource_request": resource_request.as_dict(),
+            "network_target": network_target,
+            "intent_created_at": utc_now(),
+            "work_tree_limit_bytes": work_tree_limit_bytes,
+            "storage_reservation_bytes": work_tree_limit_bytes,
+            "exit_code": None,
+            "reason_code": None,
+            "timed_out": False,
+            "cancelled": False,
+            "started_at": None,
+            "finished_at": None,
+            "observed_at": None,
         }
-        if command is not None:
+
+    @staticmethod
+    def _background_record_from_launch(
+        record: Mapping[str, object],
+        launch: BackgroundLaunchStatus,
+    ) -> dict[str, Any]:
+        value = dict(record)
+        if launch.ref is not None:
             value.update(
                 {
-                    "command": list(command),
-                    "name": name,
-                    "resource_class": resource_class,
-                    "resource_request": (
-                        resource_request.as_dict()
-                        if resource_request is not None
-                        else None
-                    ),
-                    "network_target": network_target,
-                    "launched_at": utc_now(),
+                    "job_id": launch.ref.job_id,
+                    "scope_fingerprint": launch.ref.scope_fingerprint,
+                    "runtime_id": launch.ref.runtime_id,
                 }
             )
+        status = launch.job_status
         if status is not None:
             value.update(
                 {
-                    "status": status.status.value,
                     "exit_code": status.exit_code,
+                    "reason_code": status.reason_code,
                     "timed_out": status.timed_out,
                     "cancelled": status.cancelled,
                     "started_at": status.started_at,
                     "finished_at": status.finished_at,
-                    "observed_at": utc_now(),
                 }
             )
+        if launch.state is BackgroundLaunchState.ACTIVE:
+            assert status is not None
+            value["status"] = status.status.value
+        elif launch.state is BackgroundLaunchState.PENDING:
+            if launch.ref is None:
+                value["status"] = "launching"
+            elif status is not None and status.status is JobState.LOST:
+                value["status"] = "lost"
+            elif status is not None and status.status in {
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.TIMED_OUT,
+                JobState.CANCELLED,
+            }:
+                value["status"] = "cleanup_pending"
+            else:
+                value["status"] = "starting"
         else:
-            value["status"] = "starting"
+            terminal_status = (
+                status.status.value
+                if status is not None
+                and status.status
+                in {
+                    JobState.COMPLETED,
+                    JobState.FAILED,
+                    JobState.TIMED_OUT,
+                    JobState.CANCELLED,
+                }
+                else "recovered"
+            )
+            value["status"] = terminal_status
+            value["storage_reservation_bytes"] = 0
+        value["observed_at"] = utc_now()
+        return value
+
+    @staticmethod
+    def _background_record_from_status(
+        record: Mapping[str, object],
+        status: JobStatus,
+    ) -> dict[str, Any]:
+        value = dict(record)
+        value.update(
+            {
+                "job_id": status.ref.job_id,
+                "scope_fingerprint": status.ref.scope_fingerprint,
+                "runtime_id": status.ref.runtime_id,
+                "exit_code": status.exit_code,
+                "reason_code": status.reason_code,
+                "timed_out": status.timed_out,
+                "cancelled": status.cancelled,
+                "started_at": status.started_at,
+                "finished_at": status.finished_at,
+                "observed_at": utc_now(),
+            }
+        )
+        if status.status in {JobState.STARTING, JobState.RUNNING}:
+            value["status"] = status.status.value
+        elif status.status is JobState.LOST:
+            value["status"] = "lost"
+        else:
+            # A terminal Docker observation is not proof that the trusted
+            # monitor removed the runtime and released its durable lease.
+            value["status"] = "cleanup_pending"
         return value
 
     @staticmethod
@@ -21146,6 +23692,18 @@ class ChallengeEngine:
         argv = tuple(command)
         if not argv:
             raise EngineError("background command cannot be empty")
+        if name is not None:
+            if (
+                not isinstance(name, str)
+                or not name
+                or len(name) > 200
+                or len(name.encode("utf-8")) > 1024
+                or any(ord(character) < 0x20 for character in name)
+            ):
+                raise EngineError(
+                    "background job name must be a bounded printable string"
+                )
+            validate_metadata_credentials(name)
         try:
             # The supervised command is foreground *inside* its ctf-bg
             # session. Nested detach/ctf-bg wrappers remain forbidden.
@@ -21180,64 +23738,121 @@ class ChallengeEngine:
             state,
             configured_timeout,
         )
+        supervisor_id = f"bg-{uuid.uuid4().hex}"
+        work_tree_limit = self.config.runtime.work_tree_max_bytes
+        spec = CommandSpec.create(
+            argv,
+            timeout_seconds=timeout,
+            deadline_monotonic_seconds=deadline,
+            environment={
+                FLAG_PATTERNS_ENV: json.dumps(
+                    self.config.runtime.flag_patterns,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            },
+            network_target=target,
+            resource_request=request,
+        )
+        self._enforce_storage_admission(
+            identity,
+            requested_bytes=work_tree_limit,
+        )
         client = self.sandbox(state)
+
+        def reserve(current: ChallengeState) -> None:
+            if _live_only:
+                self._require_live_mutation_allowed(current)
+            records = current.extra.setdefault("background_jobs", [])
+            if not isinstance(records, list) or len(records) >= 1024:
+                raise EngineError(
+                    "canonical background job history is invalid or full"
+                )
+            if any(
+                isinstance(item, Mapping)
+                and item.get("supervisor_id") == supervisor_id
+                for item in records
+            ):
+                raise EngineError(
+                    "background supervisor identity is already recorded"
+                )
+            records.append(
+                self._background_job_intent(
+                    supervisor_id,
+                    command=argv,
+                    name=name,
+                    resource_class=resource_class,
+                    resource_request=request,
+                    network_target=(
+                        target.as_text() if target is not None else None
+                    ),
+                    work_tree_limit_bytes=work_tree_limit,
+                )
+            )
+
+        intent_state = self.store.update(
+            identity,
+            reserve,
+            expected_revision=state.revision,
+        )
         ref: JobRef | None = None
         try:
             ref = client.start_job(
-                CommandSpec.create(
-                    argv,
-                    timeout_seconds=timeout,
-                    deadline_monotonic_seconds=deadline,
-                    environment={
-                        FLAG_PATTERNS_ENV: json.dumps(
-                            self.config.runtime.flag_patterns,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                    },
-                    network_target=target,
-                    resource_request=request,
-                ),
+                spec,
                 name=name,
+                supervisor_id=supervisor_id,
             )
             if (
                 ref.scope_fingerprint != client.scope_fingerprint
-                or ref.supervisor_id is None
+                or ref.supervisor_id != supervisor_id
             ):
                 raise EngineError(
                     "sandbox returned an unscoped background receipt"
                 )
 
-            def record(current: ChallengeState) -> None:
+            def bind(current: ChallengeState) -> None:
                 if _live_only:
                     self._require_live_mutation_allowed(current)
-                records = current.extra.setdefault("background_jobs", [])
-                if not isinstance(records, list) or len(records) >= 1024:
+                records = current.extra.get("background_jobs", [])
+                if not isinstance(records, list):
                     raise EngineError(
-                        "canonical background job history is invalid or full"
+                        "canonical background job history is invalid"
                     )
-                if any(
-                    isinstance(item, Mapping)
-                    and self._background_ref_matches_record(ref, item)
-                    for item in records
-                ):
+                matches = [
+                    index
+                    for index, item in enumerate(records)
+                    if isinstance(item, Mapping)
+                    and item.get("schema_version") == 2
+                    and item.get("supervisor_id") == supervisor_id
+                ]
+                if len(matches) != 1:
                     raise EngineError(
-                        "background receipt is already recorded"
+                        "background launch intent is missing or ambiguous"
                     )
-                records.append(
-                    self._background_job_record(
-                        ref,
-                        command=argv,
-                        name=name,
-                        resource_class=resource_class,
-                        resource_request=request,
-                        network_target=(
-                            target.as_text() if target is not None else None
-                        ),
+                record = dict(records[matches[0]])
+                if record.get("status") != "launching":
+                    raise EngineError(
+                        "background launch intent changed before binding"
                     )
+                record.update(
+                    {
+                        "job_id": ref.job_id,
+                        "scope_fingerprint": ref.scope_fingerprint,
+                        "runtime_id": ref.runtime_id,
+                        "status": "starting",
+                        "observed_at": utc_now(),
+                    }
                 )
+                records[matches[0]] = record
 
-            return self.store.update(identity, record), ref
+            return (
+                self.store.update(
+                    identity,
+                    bind,
+                    expected_revision=intent_state.revision,
+                ),
+                ref,
+            )
         except BaseException as error:
             if ref is not None:
                 try:
@@ -21247,6 +23862,47 @@ class ChallengeEngine:
                         "uncommitted background job cancellation failed: "
                         f"{cleanup_error}"
                     )
+            recover_launch = getattr(client, "recover_job_launch", None)
+            if callable(recover_launch):
+                try:
+                    launch = recover_launch(supervisor_id)
+
+                    def reconcile(current: ChallengeState) -> None:
+                        records = current.extra.get(
+                            "background_jobs",
+                            [],
+                        )
+                        if not isinstance(records, list):
+                            raise EngineError(
+                                "canonical background job history is invalid"
+                            )
+                        matches = [
+                            index
+                            for index, item in enumerate(records)
+                            if isinstance(item, Mapping)
+                            and item.get("schema_version") == 2
+                            and item.get("supervisor_id")
+                            == supervisor_id
+                        ]
+                        if len(matches) != 1:
+                            raise EngineError(
+                                "background launch intent is missing or "
+                                "ambiguous"
+                            )
+                        records[matches[0]] = (
+                            self._background_record_from_launch(
+                                records[matches[0]],
+                                launch,
+                            )
+                        )
+
+                    self.store.update(identity, reconcile)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "background launch reconciliation failed; "
+                        "reservation retained: "
+                        f"{cleanup_error}"
+                    )
             raise
 
     def _update_background_statuses(
@@ -21254,9 +23910,10 @@ class ChallengeEngine:
         identity: ChallengeIdentity,
         statuses: Sequence[JobStatus],
         *,
+        launches: Sequence[BackgroundLaunchStatus] = (),
         live_only: bool = False,
     ) -> ChallengeState:
-        if not statuses:
+        if not statuses and not launches:
             return self.store.read_snapshot(identity)
         by_ref = {
             (
@@ -21266,6 +23923,9 @@ class ChallengeEngine:
                 item.ref.supervisor_id,
             ): item
             for item in statuses
+        }
+        by_supervisor = {
+            item.supervisor_id: item for item in launches
         }
 
         def apply(state: ChallengeState) -> None:
@@ -21288,16 +23948,77 @@ class ChallengeEngine:
                     record.get("supervisor_id"),
                 )
                 status = by_ref.get(key)
-                if status is not None:
+                launch = by_supervisor.get(
+                    record.get("supervisor_id")
+                )
+                if (
+                    launch is not None
+                    and record.get("schema_version") == 2
+                ):
+                    records[index] = self._background_record_from_launch(
+                        record,
+                        launch,
+                    )
+                elif (
+                    status is not None
+                    and record.get("schema_version") == 2
+                ):
+                    records[index] = self._background_record_from_status(
+                        record,
+                        status,
+                    )
+                elif status is not None:
                     records[index] = {
                         **dict(record),
-                        **self._background_job_record(
-                            status.ref,
-                            status=status,
-                        ),
+                        "status": status.status.value,
+                        "exit_code": status.exit_code,
+                        "timed_out": status.timed_out,
+                        "cancelled": status.cancelled,
+                        "started_at": status.started_at,
+                        "finished_at": status.finished_at,
+                        "observed_at": utc_now(),
                     }
 
         return self.store.update(identity, apply)
+
+    def _recover_background_launch_intents(
+        self,
+        identity: ChallengeIdentity,
+    ) -> ChallengeState:
+        state = self.store.load(identity, recover=False)
+        records = state.extra.get("background_jobs", [])
+        if not isinstance(records, list):
+            return state
+        pending_ids = [
+            record.get("supervisor_id")
+            for record in records
+            if isinstance(record, Mapping)
+            and record.get("schema_version") == 2
+            and record.get("status")
+            in {
+                "launching",
+                "starting",
+                "running",
+                "lost",
+                "cleanup_pending",
+            }
+            and isinstance(record.get("supervisor_id"), str)
+        ]
+        if not pending_ids:
+            return state
+        client = self.sandbox(state)
+        recover_launch = getattr(client, "recover_job_launch", None)
+        if not callable(recover_launch):
+            return state
+        launches = tuple(
+            recover_launch(supervisor_id)
+            for supervisor_id in pending_ids
+        )
+        return self._update_background_statuses(
+            identity,
+            (),
+            launches=launches,
+        )
 
     def list_background_jobs(
         self,
@@ -21305,7 +24026,29 @@ class ChallengeEngine:
         *,
         recover: bool = False,
         _live_only: bool = False,
+        _session_owned: bool = False,
     ) -> tuple[ChallengeState, tuple[JobStatus, ...]]:
+        if recover and not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                lock = ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+            try:
+                self._recover_session_boundary(identity)
+                return self.list_background_jobs(
+                    identity,
+                    recover=True,
+                    _live_only=_live_only,
+                    _session_owned=True,
+                )
+            finally:
+                lock.release()
         state = self.store.read_snapshot(identity)
         client = self.sandbox(state)
         operation = getattr(
@@ -21316,15 +24059,15 @@ class ChallengeEngine:
         # Trusted injected test/embedding clients from the foreground-only API
         # generation have no operational supervisor namespace.
         statuses = tuple(operation()) if callable(operation) else ()
-        current = (
+        if recover:
             self._update_background_statuses(
                 identity,
                 statuses,
                 live_only=_live_only,
             )
-            if recover
-            else state
-        )
+            current = self._recover_background_launch_intents(identity)
+        else:
+            current = state
         return current, statuses
 
     def background_job_status(
@@ -21359,10 +24102,34 @@ class ChallengeEngine:
         *,
         grace_seconds: int = 3,
         _live_only: bool = False,
+        _session_owned: bool = False,
     ) -> tuple[ChallengeState, JobStatus]:
+        if not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                lock = ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+            try:
+                self._recover_session_boundary(identity)
+                return self.cancel_background_job(
+                    identity,
+                    ref,
+                    grace_seconds=grace_seconds,
+                    _live_only=_live_only,
+                    _session_owned=True,
+                )
+            finally:
+                lock.release()
         state = self.store.read_snapshot(identity)
         self._require_background_ref(state, ref)
-        status = self.sandbox(state).cancel_job(
+        client = self.sandbox(state)
+        status = client.cancel_job(
             ref,
             grace_seconds=grace_seconds,
         )
@@ -21371,6 +24138,18 @@ class ChallengeEngine:
             (status,),
             live_only=_live_only,
         )
+        recover_launch = getattr(client, "recover_job_launch", None)
+        if (
+            callable(recover_launch)
+            and ref.supervisor_id is not None
+        ):
+            launch = recover_launch(ref.supervisor_id)
+            current = self._update_background_statuses(
+                identity,
+                (),
+                launches=(launch,),
+                live_only=_live_only,
+            )
         return current, status
 
     def record_candidate(
@@ -21549,8 +24328,25 @@ class ChallengeEngine:
                 raise EngineError(
                     "sandbox returned an artifact from another challenge"
                 )
+            source_root = workspace_root or self._workspace(state)
+            # Validate the no-follow path binding before the quota scan so an
+            # unsafe locator cannot be disguised as an inventory failure.
+            # The full copy below still revalidates the complete hash.
+            read_regular_prefix(
+                source_root,
+                reference.locator,
+                maximum_prefix_bytes=1,
+                expected_size=reference.size_bytes,
+            )
+
+            def admit_open_source(source_size: int) -> None:
+                self._enforce_storage_admission(
+                    state.identity,
+                    requested_bytes=source_size,
+                )
+
             return copy_bounded_regular(
-                workspace_root or self._workspace(state),
+                source_root,
                 reference.locator,
                 destination,
                 maximum_bytes=min(
@@ -21559,6 +24355,7 @@ class ChallengeEngine:
                 ),
                 expected_sha256=reference.sha256,
                 expected_size=reference.size_bytes,
+                source_size_admission=admit_open_source,
                 mode=0o400,
             )
         except (OSError, SafeFileError, ValueError) as error:
@@ -21832,6 +24629,11 @@ class ChallengeEngine:
                             ),
                             expected_sha256=canonical_input.sha256,
                             expected_size=canonical_input.size,
+                            source_size_admission=(
+                                self._storage_source_size_admission(
+                                    state.identity
+                                )
+                            ),
                             mode=0o400,
                         )
                     except (OSError, SafeFileError, ValueError) as error:
@@ -21886,6 +24688,11 @@ class ChallengeEngine:
                     ),
                     expected_sha256=snapshot.sha256,
                     expected_size=snapshot.size_bytes,
+                    source_size_admission=(
+                        self._storage_source_size_admission(
+                            state.identity
+                        )
+                    ),
                     mode=0o400,
                 )
                 canonical_path = snapshot.path.relative_to(
@@ -21932,7 +24739,16 @@ class ChallengeEngine:
             if recipe_sha256 is not None:
                 manifest["recipe_sha256"] = recipe_sha256
             manifest_path = result_directory / "input-manifest.json"
-            atomic_write_json(manifest_path, manifest, mode=0o400)
+            manifest_payload = canonical_json_bytes(manifest)
+            self._enforce_storage_admission(
+                state.identity,
+                requested_bytes=len(manifest_payload),
+            )
+            atomic_write_bytes(
+                manifest_path,
+                manifest_payload,
+                mode=0o400,
+            )
             preparation = _ProofInputPreparation(
                 staging=staging,
                 prepared_inputs=tuple(prepared),
@@ -22109,9 +24925,15 @@ class ChallengeEngine:
                 f"Builder session owns {identity.key}"
             ) from error
         artifacts: list[ArtifactReference] = []
+        created_paths: list[Path] = []
+        owned_preissue_directory: Path | None = None
         committed = False
         try:
             self._recover_session_boundary(identity)
+            self._enforce_storage_admission(
+                identity,
+                requested_bytes=0,
+            )
             state = self.refresh_ingest(identity)
             expected_category = (
                 "crypto"
@@ -22175,11 +24997,25 @@ class ChallengeEngine:
             preissue_id = _run_id("oracle-preissue")
             issued_at = utc_now()
             issue_revision = state.revision + 1
-            directory = ensure_private_directory(
+            directory_path = (
                 paths.artifacts
                 / MANAGED_ORACLE_PREISSUE_PROTOCOL
                 / preissue_id
             )
+            try:
+                os.lstat(directory_path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise EngineError(
+                    "managed oracle preissue directory cannot be inspected"
+                ) from error
+            else:
+                raise EngineError(
+                    "managed oracle preissue directory already exists"
+                )
+            directory = ensure_private_directory(directory_path)
+            owned_preissue_directory = directory
             inputs: list[ManagedOraclePreissueInput] = []
             canonical_root = paths.root.resolve()
             for ordinal, (source_value, purpose) in enumerate(
@@ -22213,11 +25049,13 @@ class ChallengeEngine:
                         "managed oracle source must be an operator-only "
                         "regular host file outside the challenge root"
                     )
+                destination_path = directory / f"input-{ordinal:02d}.bin"
+                created_paths.append(destination_path)
                 try:
                     snapshot = copy_bounded_regular(
                         resolved_source.parent,
                         resolved_source.name,
-                        directory / f"input-{ordinal:02d}.bin",
+                        destination_path,
                         maximum_bytes=min(
                             DEFAULT_SNAPSHOT_MAX_BYTES,
                             self.store.max_artifact_bytes,
@@ -22226,6 +25064,9 @@ class ChallengeEngine:
                             0o500
                             if purpose == "transcript_peer"
                             else 0o400
+                        ),
+                        source_size_admission=(
+                            self._storage_source_size_admission(identity)
                         ),
                     )
                 except (OSError, SafeFileError, ValueError) as error:
@@ -22307,6 +25148,11 @@ class ChallengeEngine:
                     "managed oracle preissue metadata is invalid"
                 ) from error
             manifest_path = directory / "manifest.json"
+            created_paths.append(manifest_path)
+            self._enforce_storage_admission(
+                identity,
+                requested_bytes=len(manifest.canonical_bytes),
+            )
             atomic_write_bytes(
                 manifest_path,
                 manifest.canonical_bytes,
@@ -22398,18 +25244,50 @@ class ChallengeEngine:
             committed = True
             return result, dict(record)
         finally:
-            session_lock.release()
-            if not committed and artifacts:
-                # The primary exception path above performs canonical-aware
-                # cleanup.  This handles failures before the state update.
-                try:
-                    self._cleanup_uncommitted_artifacts(
-                        identity,
-                        tuple(artifacts),
+            active_error = sys.exception()
+            cleanup_errors: list[str] = []
+            try:
+                if not committed and artifacts:
+                    # The primary exception path above performs
+                    # canonical-aware cleanup. This handles failures before
+                    # the state update.
+                    try:
+                        self._cleanup_uncommitted_artifacts(
+                            identity,
+                            tuple(artifacts),
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(
+                            "artifact cleanup: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                if not committed:
+                    for created_path in reversed(created_paths):
+                        try:
+                            _durable_unlink(created_path)
+                        except BaseException as error:
+                            cleanup_errors.append(
+                                "owned file cleanup: "
+                                f"{type(error).__name__}: {error}"
+                            )
+                    if owned_preissue_directory is not None:
+                        try:
+                            _durable_rmdir(owned_preissue_directory)
+                        except BaseException as error:
+                            cleanup_errors.append(
+                                "owned directory cleanup: "
+                                f"{type(error).__name__}: {error}"
+                            )
+                if cleanup_errors:
+                    cleanup_failure = EngineError(
+                        "managed oracle preissue cleanup failed: "
+                        + "; ".join(cleanup_errors[:8])
                     )
-                except Exception:
-                    if sys.exception() is None:
-                        raise
+                    if active_error is None:
+                        raise cleanup_failure
+                    active_error.add_note(str(cleanup_failure))
+            finally:
+                session_lock.release()
 
     def _consume_managed_oracle_preissue(
         self,
@@ -22987,8 +25865,32 @@ class ChallengeEngine:
         *,
         source_run_id: str | None = None,
         _live_only: bool = False,
+        _session_owned: bool = False,
         _pending_snapshot_handoff: list[ArtifactReference] | None = None,
     ) -> tuple[ChallengeState, ArtifactReference]:
+        if not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                with ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ) as session_lock:
+                    session_lock.acquire()
+                    self._recover_session_boundary(identity)
+                    return self.register_workspace_artifact(
+                        identity,
+                        locator,
+                        source_run_id=source_run_id,
+                        _live_only=_live_only,
+                        _session_owned=True,
+                        _pending_snapshot_handoff=(
+                            _pending_snapshot_handoff
+                        ),
+                    )
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
         if _pending_snapshot_handoff is None:
             pending_snapshot_handoff: list[ArtifactReference] = []
             try:
@@ -22997,6 +25899,7 @@ class ChallengeEngine:
                     locator,
                     source_run_id=source_run_id,
                     _live_only=_live_only,
+                    _session_owned=True,
                     _pending_snapshot_handoff=pending_snapshot_handoff,
                 )
             except BaseException as registration_error:
@@ -23231,50 +26134,35 @@ class ChallengeEngine:
         candidate_bytes = candidate.encode("utf-8", errors="strict")
         selected_direct = False
         paths = self.store.challenge_paths(state.identity)
-        paths.runtime.mkdir(parents=True, exist_ok=True)
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix=".ctfos-rev-proof-stream-scan-",
-                dir=paths.runtime,
-            ) as temporary:
-                temporary_root = Path(temporary)
-                for stream in ("stdout", "stderr"):
-                    artifact = by_stream.get(stream)
-                    if (
-                        artifact is None
-                        or artifact.size is None
-                        or isinstance(artifact.size, bool)
-                        or not 0
-                        <= artifact.size
-                        <= REV_STDIN_PROOF_MAX_STREAM_BYTES
-                    ):
-                        scan_complete = False
-                        continue
-                    try:
-                        copied = copy_bounded_regular(
-                            paths.root,
-                            artifact.path,
-                            temporary_root / f"{stream}.bin",
-                            maximum_bytes=(
-                                REV_STDIN_PROOF_MAX_STREAM_BYTES
-                            ),
-                            expected_sha256=artifact.sha256,
-                            expected_size=artifact.size,
-                            mode=0o400,
-                        )
-                        raw = copied.path.read_bytes()
-                        selected_direct = (
-                            selected_direct or candidate_bytes in raw
-                        )
-                        detector.scan_file(
-                            copied.path,
-                            source=f"rev-proof:{stream}",
-                            max_bytes=max(1, copied.size_bytes),
-                        )
-                    except (OSError, SafeFileError, ValueError):
-                        scan_complete = False
-        except OSError:
-            scan_complete = False
+        for stream in ("stdout", "stderr"):
+            artifact = by_stream.get(stream)
+            if (
+                artifact is None
+                or artifact.size is None
+                or isinstance(artifact.size, bool)
+                or not 0
+                <= artifact.size
+                <= REV_STDIN_PROOF_MAX_STREAM_BYTES
+            ):
+                scan_complete = False
+                continue
+            try:
+                raw = read_bounded_regular(
+                    paths.root,
+                    artifact.path,
+                    maximum_bytes=REV_STDIN_PROOF_MAX_STREAM_BYTES,
+                    expected_sha256=artifact.sha256,
+                    expected_size=artifact.size,
+                )
+                selected_direct = (
+                    selected_direct or candidate_bytes in raw
+                )
+                detector.feed(
+                    raw.decode("utf-8", errors="replace"),
+                    source=f"rev-proof:{stream}",
+                )
+            except (OSError, SafeFileError, ValueError):
+                scan_complete = False
 
         values: list[str] = []
         seen: set[str] = set()
@@ -23561,7 +26449,11 @@ class ChallengeEngine:
                 raise EngineError(
                     "managed Rev proof experiment changed before execution"
                 )
-            self._require_managed_proof_recipe_current(current, recipe)
+            self._require_managed_proof_recipe_current(
+                current,
+                recipe,
+                allow_source_snapshot_create=False,
+            )
             current_candidate = next(
                 item
                 for item in current.candidates
@@ -23683,6 +26575,9 @@ class ChallengeEngine:
                 maximum_bytes=REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES,
                 expected_sha256=accepted_input_binding.sha256,
                 expected_size=accepted_input_binding.size,
+                source_size_admission=self._storage_source_size_admission(
+                    state.identity
+                ),
                 mode=0o400,
             )
             accepted_input = accepted_snapshot.path.read_bytes()
@@ -24245,6 +27140,7 @@ class ChallengeEngine:
                     self._require_managed_proof_recipe_current(
                         latest,
                         recipe,
+                        allow_source_snapshot_create=False,
                     )
                     latest.runs.append(run_reference)
                     latest.artifacts.extend(artifact_records)
@@ -24520,6 +27416,7 @@ class ChallengeEngine:
                 self._require_managed_proof_recipe_current(
                     latest,
                     recipe,
+                    allow_source_snapshot_create=False,
                 )
                 expected_run_ids = [
                     attempt.observation.run_id
@@ -24620,50 +27517,33 @@ class ChallengeEngine:
                         revalidate_external_pins=False,
                     )
                 try:
-                    with tempfile.TemporaryDirectory(
-                        prefix=".ctfos-rev-evaluation-guard-",
-                        dir=paths.runtime,
-                    ) as temporary:
-                        guarded_input = copy_bounded_regular(
-                            paths.root,
-                            accepted_artifact.path,
-                            Path(temporary) / "accepted-input.bin",
-                            maximum_bytes=(
-                                REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
-                            ),
-                            expected_sha256=accepted_artifact.sha256,
-                            expected_size=accepted_artifact.size,
-                            mode=0o400,
-                        )
-                        guarded_accepted_input = (
-                            guarded_input.path.read_bytes()
-                        )
-                        if guarded_accepted_input != accepted_input:
-                            raise ValueError(
-                                "accepted input bytes changed"
-                            )
-                        copied = copy_bounded_regular(
-                            paths.root,
-                            evaluation_artifact.path,
-                            Path(temporary) / "evaluation.json",
-                            maximum_bytes=(
+                    guarded_accepted_input = read_bounded_regular(
+                        paths.root,
+                        accepted_artifact.path,
+                        maximum_bytes=(
+                            REV_STDIN_PROOF_MAX_ACCEPTED_INPUT_BYTES
+                        ),
+                        expected_sha256=accepted_artifact.sha256,
+                        expected_size=accepted_artifact.size,
+                    )
+                    if guarded_accepted_input != accepted_input:
+                        raise ValueError("accepted input bytes changed")
+                    evaluation_payload = read_bounded_regular(
+                        paths.root,
+                        evaluation_artifact.path,
+                        maximum_bytes=REV_STDIN_PROOF_MAX_EVIDENCE_BYTES,
+                        expected_sha256=evaluation_artifact.sha256,
+                        expected_size=evaluation_artifact.size,
+                    )
+                    persisted = verify_rev_proof_evaluation(
+                        strict_json_loads(
+                            evaluation_payload,
+                            max_bytes=(
                                 REV_STDIN_PROOF_MAX_EVIDENCE_BYTES
                             ),
-                            expected_sha256=(
-                                evaluation_artifact.sha256
-                            ),
-                            expected_size=evaluation_artifact.size,
-                            mode=0o400,
-                        )
-                        persisted = verify_rev_proof_evaluation(
-                            strict_json_loads(
-                                copied.path.read_bytes(),
-                                max_bytes=(
-                                    REV_STDIN_PROOF_MAX_EVIDENCE_BYTES
-                                ),
-                            ),
-                            accepted_input=guarded_accepted_input,
-                        )
+                        ),
+                        accepted_input=guarded_accepted_input,
+                    )
                 except (
                     OSError,
                     SafeFileError,
@@ -24782,6 +27662,7 @@ class ChallengeEngine:
                     f"another session already owns {identity.key}"
                 ) from error
 
+        self._enforce_storage_admission(identity)
         state = self.refresh_ingest(identity)
         experiment = next(
             (
@@ -24897,6 +27778,7 @@ class ChallengeEngine:
             self._require_managed_proof_recipe_current(
                 current,
                 recipe,
+                allow_source_snapshot_create=False,
             )
             current_experiment.status = ExperimentStatus.RUNNING
 
@@ -25044,6 +27926,7 @@ class ChallengeEngine:
         try:
             if not _session_owned:
                 self._recover_session_boundary(identity)
+            self._enforce_storage_admission(identity)
             state = self.refresh_ingest(identity)
             if get_adapter(state.category).name != "misc":
                 raise EngineError(
@@ -25218,6 +28101,9 @@ class ChallengeEngine:
                     ),
                     expected_sha256=inventory_entry.sha256,
                     expected_size=inventory_entry.size,
+                    source_size_admission=(
+                        self._storage_source_size_admission(identity)
+                    ),
                     mode=0o400,
                 )
                 staged_source_locators.append(
@@ -27440,6 +30326,7 @@ class ChallengeEngine:
         try:
             if not _session_owned:
                 self._recover_session_boundary(identity)
+            self._enforce_storage_admission(identity)
             state = self.refresh_ingest(identity)
             if get_adapter(state.category).name != "crypto":
                 raise EngineError(
@@ -28565,6 +31452,7 @@ class ChallengeEngine:
         try:
             if not _session_owned:
                 self._recover_session_boundary(identity)
+            self._enforce_storage_admission(identity)
             state = self.refresh_ingest(identity)
             self._remaining_budget_seconds(state)
             if get_adapter(state.category).name == "crypto":
@@ -29738,6 +32626,7 @@ class ChallengeEngine:
                         self._require_managed_proof_recipe_current(
                             latest,
                             managed_recipe,
+                            allow_source_snapshot_create=False,
                         )
                     if (
                         latest.metadata.get("source_manifest_sha256")
@@ -30082,7 +32971,7 @@ class ChallengeEngine:
         )
 
         recover_data_transcript_attempts(self, identity)
-        initial = self.store.load(identity, recover=False)
+        initial = self._recover_background_launch_intents(identity)
         if str(get_adapter(initial.category).name) == "pwn":
             self._advance_pwn_runtime_snapshot_disclosures(identity)
         state = self._reconcile_candidate_intents_and_notify(identity)
@@ -30446,6 +33335,9 @@ class ChallengeEngine:
                     request_relative,
                     Path(temporary) / "request.json",
                     maximum_bytes=1024 * 1024,
+                    source_size_admission=(
+                        self._storage_source_size_admission(identity)
+                    ),
                     mode=0o400,
                 )
                 request = strict_json_loads(

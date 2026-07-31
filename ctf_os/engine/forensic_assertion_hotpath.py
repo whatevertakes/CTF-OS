@@ -63,6 +63,7 @@ from ctf_os.engine.forensic_index_execution import (
     ForensicIndexExecutionEvaluation,
     ForensicIndexExecutionVerdict,
 )
+from ctf_os.engine.hotpath_cleanup import HotPathCleanupTracker
 from ctf_os.models import (
     ArtifactReference,
     ChallengeIdentity,
@@ -86,7 +87,7 @@ from ctf_os.stages.ingest import inventory_challenge
 from ctf_os.store.atomic import (
     StrictJSONError,
     atomic_write_bytes,
-    atomic_write_json,
+    canonical_json_bytes as canonical_store_json_bytes,
     strict_json_loads,
 )
 
@@ -242,7 +243,12 @@ def _request_paths(run_id: str) -> _RequestPaths:
     )
 
 
-def _absolute_under(root: Path, relative: str) -> Path:
+def _absolute_under(
+    root: Path,
+    relative: str,
+    *,
+    create_parent: bool = True,
+) -> Path:
     if (
         type(relative) is not str
         or not relative
@@ -256,7 +262,8 @@ def _absolute_under(root: Path, relative: str) -> Path:
             "forensic_assertion_path_invalid"
         )
     destination = root.joinpath(*relative.split("/"))
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if create_parent:
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     return destination
 
 
@@ -1083,6 +1090,8 @@ def _projection_owned_ids(
 
 def _copy_workspace_capture(
     *,
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
     client: object,
     workspace: Path,
     locator: str,
@@ -1105,6 +1114,12 @@ def _copy_workspace_capture(
             maximum_bytes=maximum_bytes,
             expected_sha256=reference.sha256,
             expected_size=reference.size_bytes,
+            source_size_admission=lambda size: (
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=size,
+                )
+            ),
             mode=0o400,
         )
         return immutable.path.read_bytes()
@@ -1127,6 +1142,87 @@ def execute_forensic_assertion_hotpath(
 ) -> tuple[ChallengeState, ForensicAssertionExecutionEvaluation]:
     """Run one explicit assertion wave without candidate/proof authority."""
 
+    preissue_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=(
+            engine.config.runtime.challenge_storage_quota_bytes
+        ),
+    )
+    replay_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=engine.config.runtime.work_tree_max_bytes,
+    )
+    failure: BaseException | None = None
+    try:
+        return _execute_forensic_assertion_hotpath(
+            engine,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            hypothesis_ids=hypothesis_ids,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+            _preissue_cleanup=preissue_cleanup,
+            _replay_cleanup=replay_cleanup,
+        )
+    except BaseException as error:
+        failure = error
+        attempt_id = preissue_cleanup.attempt_id
+        if attempt_id is not None:
+            try:
+                current = engine.store.load(identity, recover=False)
+                attempts = current.extra.get(
+                    "forensic_assertion_preissues"
+                )
+                committed = (
+                    type(attempts) is dict and attempt_id in attempts
+                )
+            except BaseException as inspection_error:
+                error.add_note(
+                    "Forensic preissue cleanup was skipped because canonical "
+                    "state could not be inspected: "
+                    f"{type(inspection_error).__name__}"
+                )
+                committed = True
+            if not committed:
+                try:
+                    preissue_cleanup.cleanup(
+                        engine,
+                        identity,
+                        cause=error,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "Forensic preissue cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+        raise
+    finally:
+        try:
+            replay_cleanup.cleanup(
+                engine,
+                identity,
+                cause=failure,
+            )
+        except BaseException as cleanup_error:
+            if failure is None:
+                raise
+            failure.add_note(
+                "Forensic replay workspace cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
+def _execute_forensic_assertion_hotpath(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    operator_spec_locator: str,
+    hypothesis_ids: tuple[str, ...] = (),
+    timeout_seconds: int = 900,
+    _session_owned: bool = False,
+    _preissue_cleanup: HotPathCleanupTracker,
+    _replay_cleanup: HotPathCleanupTracker,
+) -> tuple[ChallengeState, ForensicAssertionExecutionEvaluation]:
     # Lazy imports avoid a module cycle when ChallengeEngine later exposes this
     # function as a convenience method.
     from ctf_os.engine.challenge import (
@@ -1149,17 +1245,20 @@ def execute_forensic_assertion_hotpath(
             ) from error
         try:
             engine._recover_session_boundary(identity)
-            return execute_forensic_assertion_hotpath(
+            return _execute_forensic_assertion_hotpath(
                 engine,
                 identity,
                 operator_spec_locator=operator_spec_locator,
                 hypothesis_ids=hypothesis_ids,
                 timeout_seconds=timeout_seconds,
                 _session_owned=True,
+                _preissue_cleanup=_preissue_cleanup,
+                _replay_cleanup=_replay_cleanup,
             )
         finally:
             lock.release()
 
+    engine._enforce_storage_admission(identity)
     state = engine.store.load(identity)
     if (
         state.category != "forensics"
@@ -1203,16 +1302,24 @@ def execute_forensic_assertion_hotpath(
 
     paths = engine.store.challenge_paths(identity)
     attempt_id = _new_id("forensic-assertion")
+    _preissue_cleanup.set_attempt_id(attempt_id)
     attempt_root = ensure_private_directory(
         paths.artifacts
         / "forensic-assertion-hotpath"
         / attempt_id
     )
+    _preissue_cleanup.track_tree(paths.root, attempt_root)
     initial_client = engine.sandbox(
         state,
         network_policy_override=NetworkPolicy.deny_all(),
     )
     operator_artifact_id = _new_id("A-forensic-operator")
+    _preissue_cleanup.track_file(
+        paths.root,
+        paths.root
+        / _artifact_path(operator_artifact_id, "operator_spec"),
+        artifact_id=operator_artifact_id,
+    )
     spec_snapshot = _snapshot_operator_spec(
         engine,
         state,
@@ -1327,6 +1434,21 @@ def execute_forensic_assertion_hotpath(
         state_ids.plan_artifact_id,
         "execution_plan",
     )
+    _preissue_cleanup.track_file(
+        paths.root,
+        paths.root / plan_path,
+        artifact_id=state_ids.plan_artifact_id,
+    )
+    request_documents = tuple(
+        request.canonical_bytes for request in execution_plan.requests
+    )
+    engine._enforce_storage_admission(
+        identity,
+        requested_bytes=(
+            len(plan_payload)
+            + sum(len(payload) for payload in request_documents)
+        ),
+    )
     atomic_write_bytes(
         _absolute_under(paths.root, plan_path),
         plan_payload,
@@ -1335,18 +1457,32 @@ def execute_forensic_assertion_hotpath(
     request_payloads: list[bytes] = []
     run_references: list[RunReference] = []
     request_references: list[ArtifactReference] = []
-    for request in execution_plan.requests:
-        payload = request.canonical_bytes
+    for request, payload in zip(
+        execution_plan.requests,
+        request_documents,
+        strict=True,
+    ):
         run_paths = _request_paths(request.run_id)
         if run_paths.request_path != request.request_path:
             raise EngineError(
                 "Forensic assertion request path derivation failed"
             )
-        atomic_write_bytes(
-            _absolute_under(paths.root, run_paths.request_path),
-            payload,
-            mode=0o400,
-        )
+        run_root = paths.runs / request.run_id
+        try:
+            atomic_write_bytes(
+                _absolute_under(paths.root, run_paths.request_path),
+                payload,
+                mode=0o400,
+            )
+        finally:
+            try:
+                _preissue_cleanup.track_tree(
+                    paths.root,
+                    run_root,
+                    run_id=request.run_id,
+                )
+            except FileNotFoundError:
+                pass
         request_payloads.append(payload)
         run_references.append(
             RunReference(
@@ -1479,6 +1615,7 @@ def execute_forensic_assertion_hotpath(
             ),
             start=1,
         ):
+            _replay_cleanup.cleanup(engine, identity)
             verify_external()
             latest = engine.store.load(identity, recover=False)
 
@@ -1543,6 +1680,10 @@ def execute_forensic_assertion_hotpath(
                 / request.run_id
                 / "work"
             )
+            _replay_cleanup.track_tree(
+                paths.root,
+                paths.runtime / "forensic-assertion-live" / attempt_id,
+            )
             if any(work.iterdir()):
                 raise ForensicAssertionHotPathError(
                     "forensic_assertion_workspace_not_fresh"
@@ -1554,6 +1695,10 @@ def execute_forensic_assertion_hotpath(
                 network_policy_override=NetworkPolicy.deny_all(),
             )
             client.initialize_workspace()
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=len(request_payload),
+            )
             atomic_write_bytes(
                 _absolute_under(work, request.request_path),
                 request_payload,
@@ -1583,27 +1728,54 @@ def execute_forensic_assertion_hotpath(
             )
             wall_seconds = time.monotonic() - started
             observed_output = _copy_workspace_capture(
+                engine=engine,
+                identity=identity,
                 client=client,
                 workspace=work,
                 locator=request.artifact_path,
                 destination=_absolute_under(
                     paths.root,
                     request.artifact_path,
+                    create_parent=False,
                 ),
                 maximum_bytes=FORENSIC_ASSERTION_MAX_ARTIFACT_BYTES,
             )
-            observed_document = _copy_workspace_capture(
-                client=client,
-                workspace=work,
-                locator=request.observation_path,
-                destination=_absolute_under(
-                    paths.root,
-                    request.observation_path,
-                ),
-                maximum_bytes=(
-                    FORENSIC_ASSERTION_OBSERVATION_DOCUMENT_MAX_BYTES
-                ),
-            )
+            try:
+                observed_document = _copy_workspace_capture(
+                    engine=engine,
+                    identity=identity,
+                    client=client,
+                    workspace=work,
+                    locator=request.observation_path,
+                    destination=_absolute_under(
+                        paths.root,
+                        request.observation_path,
+                        create_parent=False,
+                    ),
+                    maximum_bytes=(
+                        FORENSIC_ASSERTION_OBSERVATION_DOCUMENT_MAX_BYTES
+                    ),
+                )
+            except BaseException as capture_error:
+                try:
+                    engine._cleanup_uncommitted_artifacts(
+                        identity,
+                        (
+                            ArtifactReference(
+                                id=request.artifact_id,
+                                path=request.artifact_path,
+                                sha256=_sha256(observed_output),
+                                size=len(observed_output),
+                            ),
+                        ),
+                        cause=capture_error,
+                    )
+                except BaseException as cleanup_error:
+                    capture_error.add_note(
+                        "Forensic partial capture cleanup failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+                raise
             transport_document = observed_document
             transport_succeeded = (
                 result.status == "completed"
@@ -1629,43 +1801,57 @@ def execute_forensic_assertion_hotpath(
             )
             observation_wall_seconds[request.run_id] = wall_seconds
             result_paths = _request_paths(request.run_id)
-            atomic_write_json(
-                _absolute_under(paths.root, result_paths.result_path),
-                {
-                    "artifact": {
-                        "path": request.artifact_path,
-                        "sha256": _sha256(observed_output),
-                        "size_bytes": len(observed_output),
-                    },
-                    "observation": {
-                        "path": request.observation_path,
-                        "sha256": _sha256(observed_document),
-                        "size_bytes": len(observed_document),
-                    },
-                    "protocol": FORENSIC_ASSERTION_HOTPATH_PROTOCOL,
-                    "request_id": request.request_id,
-                    "run_id": request.run_id,
-                    "sandbox": {
-                        "duration_ms": result.duration_ms,
-                        "exit_code": result.exit_code,
-                        "status": result.status,
-                        "timed_out": result.timed_out,
-                    },
+            result_document = {
+                "artifact": {
+                    "path": request.artifact_path,
+                    "sha256": _sha256(observed_output),
+                    "size_bytes": len(observed_output),
                 },
+                "observation": {
+                    "path": request.observation_path,
+                    "sha256": _sha256(observed_document),
+                    "size_bytes": len(observed_document),
+                },
+                "protocol": FORENSIC_ASSERTION_HOTPATH_PROTOCOL,
+                "request_id": request.request_id,
+                "run_id": request.run_id,
+                "sandbox": {
+                    "duration_ms": result.duration_ms,
+                    "exit_code": result.exit_code,
+                    "status": result.status,
+                    "timed_out": result.timed_out,
+                },
+            }
+            result_payload = canonical_store_json_bytes(result_document)
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=len(result_payload),
+            )
+            atomic_write_bytes(
+                _absolute_under(paths.root, result_paths.result_path),
+                result_payload,
                 mode=0o400,
             )
-            atomic_write_json(
+            validation_document = {
+                "network": "none",
+                "ok": transport_succeeded,
+                "protocol": FORENSIC_ASSERTION_HOTPATH_PROTOCOL,
+                "request_sha256": request.request_sha256,
+                "workspace": "fresh",
+            }
+            validation_payload = canonical_store_json_bytes(
+                validation_document
+            )
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=len(validation_payload),
+            )
+            atomic_write_bytes(
                 _absolute_under(
                     paths.root,
                     result_paths.validation_path,
                 ),
-                {
-                    "network": "none",
-                    "ok": transport_succeeded,
-                    "protocol": FORENSIC_ASSERTION_HOTPATH_PROTOCOL,
-                    "request_sha256": request.request_sha256,
-                    "workspace": "fresh",
-                },
+                validation_payload,
                 mode=0o400,
             )
             verify_external()
@@ -1762,6 +1948,10 @@ def execute_forensic_assertion_hotpath(
         evaluation_path = _artifact_path(
             state_ids.evaluation_artifact_id,
             "execution_evaluation",
+        )
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(evaluation.canonical_bytes),
         )
         atomic_write_bytes(
             _absolute_under(paths.root, evaluation_path),

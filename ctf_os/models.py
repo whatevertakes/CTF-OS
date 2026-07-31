@@ -98,6 +98,9 @@ MAX_PROOF_POLICY_STRING_BYTES = 256
 MAX_PROOF_POLICY_NOTES_BYTES = 64 * 1024
 MAX_PROOF_DESTINATION_BYTES = 4096
 MAX_MANAGED_PROOF_INPUT_BYTES = 64 * 1024 * 1024
+MAX_BACKGROUND_JOBS = 1024
+MAX_ANALYSIS_LEASES = 1024
+MAX_STORAGE_RESERVATION_BYTES = 2**63 - 1
 MANAGED_SHELL_COMMAND_PROTOCOL = "posix_sh_lc_v1"
 MANAGED_SHELL_ARGV_PREFIX = ("/bin/sh", "-lc")
 
@@ -12889,6 +12892,767 @@ def _misc_transform_state_errors(
     return errors
 
 
+def _background_job_state_errors(state: "ChallengeState") -> list[str]:
+    """Validate canonical storage reservations for supervised jobs."""
+
+    raw = state.extra.get("background_jobs")
+    if raw is None:
+        return []
+    if type(raw) is not list:
+        return ["background_jobs must be an array"]
+    if len(raw) > MAX_BACKGROUND_JOBS:
+        return [
+            f"background_jobs exceeds {MAX_BACKGROUND_JOBS} records"
+        ]
+    errors: list[str] = []
+    seen_supervisors: set[str] = set()
+    seen_refs: set[tuple[object, object, object, object]] = set()
+    active = {
+        "launching",
+        "starting",
+        "running",
+        "lost",
+        "cleanup_pending",
+    }
+    terminal = {
+        "completed",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "recovered",
+    }
+    exact_keys = {
+        "schema_version",
+        "supervisor_id",
+        "job_id",
+        "scope_fingerprint",
+        "runtime_id",
+        "status",
+        "command",
+        "name",
+        "resource_class",
+        "resource_request",
+        "network_target",
+        "intent_created_at",
+        "work_tree_limit_bytes",
+        "storage_reservation_bytes",
+        "exit_code",
+        "reason_code",
+        "timed_out",
+        "cancelled",
+        "started_at",
+        "finished_at",
+        "observed_at",
+    }
+    ref_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    for index, record in enumerate(raw):
+        label = f"background_jobs[{index}]"
+        if type(record) is not dict:
+            errors.append(f"{label} must be an object")
+            continue
+        schema_version = record.get("schema_version")
+        # Schema v1 is read-compatible only. Storage admission treats any
+        # active v1 record as indeterminate until the engine migrates it.
+        if schema_version == 1:
+            supervisor_id = record.get("supervisor_id")
+            if (
+                supervisor_id is not None
+                and (
+                    type(supervisor_id) is not str
+                    or re.fullmatch(r"bg-[0-9a-f]{32}", supervisor_id)
+                    is None
+                )
+            ):
+                errors.append(
+                    f"{label} has invalid legacy supervisor identity"
+                )
+            continue
+        if schema_version != 2:
+            errors.append(f"{label} has unsupported schema_version")
+            continue
+        if set(record) != exact_keys:
+            errors.append(f"{label} does not have the exact v2 schema")
+            continue
+        supervisor_id = record["supervisor_id"]
+        if (
+            type(supervisor_id) is not str
+            or re.fullmatch(r"bg-[0-9a-f]{32}", supervisor_id) is None
+        ):
+            errors.append(f"{label} has invalid supervisor_id")
+        elif supervisor_id in seen_supervisors:
+            errors.append(f"{label} reuses supervisor_id")
+        else:
+            seen_supervisors.add(supervisor_id)
+        status = record["status"]
+        if type(status) is not str or status not in active | terminal:
+            errors.append(f"{label} has invalid status")
+            continue
+        limit = record["work_tree_limit_bytes"]
+        reservation = record["storage_reservation_bytes"]
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= MAX_STORAGE_RESERVATION_BYTES
+        ):
+            errors.append(f"{label} has invalid work_tree_limit_bytes")
+        if (
+            type(reservation) is not int
+            or not 0 <= reservation <= MAX_STORAGE_RESERVATION_BYTES
+        ):
+            errors.append(f"{label} has invalid storage_reservation_bytes")
+        elif (
+            status in active
+            and (
+                type(limit) is not int
+                or reservation != limit
+            )
+        ):
+            errors.append(
+                f"{label} active reservation must equal its work-tree limit"
+            )
+        elif status in terminal and reservation != 0:
+            errors.append(
+                f"{label} terminal reservation must be released"
+            )
+        ref_values = (
+            record["job_id"],
+            record["scope_fingerprint"],
+            record["runtime_id"],
+        )
+        all_null = all(item is None for item in ref_values)
+        all_bound = all(type(item) is str for item in ref_values)
+        if status == "launching" and not all_null:
+            errors.append(f"{label} launching record must be unbound")
+        elif status in {
+            "starting",
+            "running",
+            "lost",
+            "cleanup_pending",
+        } and not all_bound:
+            errors.append(f"{label} active record must bind an exact ref")
+        elif status in terminal and not (all_null or all_bound):
+            errors.append(f"{label} terminal ref must be wholly bound or null")
+        if all_bound:
+            job_id, scope_fingerprint, runtime_id = ref_values
+            if re.fullmatch(r"job-[0-9]{8}", job_id) is None:
+                errors.append(f"{label} has invalid job_id")
+            if re.fullmatch(r"[0-9a-f]{64}", scope_fingerprint) is None:
+                errors.append(f"{label} has invalid scope_fingerprint")
+            if ref_pattern.fullmatch(runtime_id) is None:
+                errors.append(f"{label} has invalid runtime_id")
+            ref_key = (
+                job_id,
+                scope_fingerprint,
+                runtime_id,
+                supervisor_id,
+            )
+            if ref_key in seen_refs:
+                errors.append(f"{label} reuses a job reference")
+            else:
+                seen_refs.add(ref_key)
+        command = record["command"]
+        if (
+            type(command) is not list
+            or not command
+            or len(command) > 4096
+            or any(
+                type(argument) is not str
+                or not argument
+                or "\x00" in argument
+                or len(argument.encode("utf-8")) > 1024 * 1024
+                for argument in command
+            )
+        ):
+            errors.append(f"{label} has invalid command")
+        name = record["name"]
+        if (
+            name is not None
+            and (
+                type(name) is not str
+                or not name
+                or len(name.encode("utf-8")) > 1024
+                or any(ord(character) < 0x20 for character in name)
+            )
+        ):
+            errors.append(f"{label} has invalid name")
+        if (
+            type(record["resource_class"]) is not str
+            or not record["resource_class"]
+            or len(record["resource_class"]) > 128
+        ):
+            errors.append(f"{label} has invalid resource_class")
+        resource = record["resource_request"]
+        if (
+            type(resource) is not dict
+            or set(resource)
+            != {"cpu", "memory_mib", "gpu", "kvm", "network"}
+            or any(type(value) is not int or value < 0 for value in resource.values())
+        ):
+            errors.append(f"{label} has invalid resource_request")
+        network_target = record["network_target"]
+        if (
+            network_target is not None
+            and (
+                type(network_target) is not str
+                or not network_target
+                or len(network_target.encode("utf-8")) > 4096
+            )
+        ):
+            errors.append(f"{label} has invalid network_target")
+        for timestamp in (
+            "intent_created_at",
+            "started_at",
+            "finished_at",
+            "observed_at",
+        ):
+            value = record[timestamp]
+            if (
+                (timestamp == "intent_created_at" and type(value) is not str)
+                or (
+                    timestamp != "intent_created_at"
+                    and value is not None
+                    and type(value) is not str
+                )
+            ):
+                errors.append(f"{label} has invalid {timestamp}")
+        if (
+            record["exit_code"] is not None
+            and type(record["exit_code"]) is not int
+        ):
+            errors.append(f"{label} has invalid exit_code")
+        reason_code = record["reason_code"]
+        if (
+            reason_code is not None
+            and (
+                type(reason_code) is not str
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code)
+                is None
+            )
+        ):
+            errors.append(f"{label} has invalid reason_code")
+        if type(record["timed_out"]) is not bool:
+            errors.append(f"{label} has invalid timed_out")
+        if type(record["cancelled"]) is not bool:
+            errors.append(f"{label} has invalid cancelled")
+    return errors
+
+
+def _analysis_lease_state_errors(state: "ChallengeState") -> list[str]:
+    """Validate durable reservations for isolated read-only analysis."""
+
+    raw = state.extra.get("analysis_leases")
+    if raw is None:
+        return []
+    if type(raw) is not list:
+        return ["analysis_leases must be an array"]
+    if len(raw) > MAX_ANALYSIS_LEASES:
+        return [
+            f"analysis_leases exceeds {MAX_ANALYSIS_LEASES} records"
+        ]
+
+    active = {"running", "cleanup_pending"}
+    terminal = {"completed", "failed", "recovered"}
+    exact_keys = {
+        "schema_version",
+        "analysis_id",
+        "scope_fingerprint",
+        "status",
+        "owner_pid",
+        "owner_start_ticks",
+        "owner_boot_id",
+        "root_device",
+        "root_inode",
+        "work_device",
+        "work_inode",
+        "base_revision",
+        "work_tree_limit_bytes",
+        "storage_reservation_bytes",
+        "runtime_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "observed_at",
+        "reason_code",
+    }
+    errors: list[str] = []
+    seen: set[str] = set()
+    for index, record in enumerate(raw):
+        label = f"analysis_leases[{index}]"
+        if type(record) is not dict:
+            errors.append(f"{label} must be an object")
+            continue
+        if set(record) != exact_keys:
+            errors.append(f"{label} does not have the exact v1 schema")
+            continue
+        if record["schema_version"] != 1:
+            errors.append(f"{label} has unsupported schema_version")
+        analysis_id = record["analysis_id"]
+        if (
+            type(analysis_id) is not str
+            or re.fullmatch(r"analysis-[0-9a-f]{32}", analysis_id) is None
+        ):
+            errors.append(f"{label} has invalid analysis_id")
+        elif analysis_id in seen:
+            errors.append(f"{label} reuses analysis_id")
+        else:
+            seen.add(analysis_id)
+        if (
+            type(record["scope_fingerprint"]) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{64}", record["scope_fingerprint"]
+            )
+            is None
+        ):
+            errors.append(f"{label} has invalid scope_fingerprint")
+        status = record["status"]
+        if type(status) is not str or status not in active | terminal:
+            errors.append(f"{label} has invalid status")
+            continue
+        for field in (
+            "owner_pid",
+            "owner_start_ticks",
+            "root_inode",
+            "work_inode",
+            "work_tree_limit_bytes",
+        ):
+            value = record[field]
+            if (
+                type(value) is not int
+                or value <= 0
+                or value > MAX_STORAGE_RESERVATION_BYTES
+            ):
+                errors.append(f"{label} has invalid {field}")
+        for field in ("root_device", "work_device", "base_revision"):
+            value = record[field]
+            if (
+                type(value) is not int
+                or value < 0
+                or value > MAX_STORAGE_RESERVATION_BYTES
+            ):
+                errors.append(f"{label} has invalid {field}")
+        if (
+            type(record["root_device"]) is int
+            and type(record["work_device"]) is int
+            and record["work_device"] != record["root_device"]
+        ):
+            errors.append(f"{label} work tree must share the lease device")
+        if (
+            type(record["owner_boot_id"]) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                r"[0-9a-f]{4}-[0-9a-f]{12}",
+                record["owner_boot_id"],
+            )
+            is None
+        ):
+            errors.append(f"{label} has invalid owner_boot_id")
+        reservation = record["storage_reservation_bytes"]
+        if (
+            type(reservation) is not int
+            or not 0 <= reservation <= MAX_STORAGE_RESERVATION_BYTES
+        ):
+            errors.append(
+                f"{label} has invalid storage_reservation_bytes"
+            )
+        elif status in active and (
+            reservation <= 0
+            or type(record["work_tree_limit_bytes"]) is not int
+            or reservation < record["work_tree_limit_bytes"]
+        ):
+            errors.append(
+                f"{label} active reservation must cover its work-tree limit"
+            )
+        elif status in terminal and reservation != 0:
+            errors.append(
+                f"{label} terminal reservation must be released"
+            )
+        for field in ("created_at", "started_at", "observed_at"):
+            if not _proof_binding_utc_timestamp(record[field]):
+                errors.append(f"{label} has invalid {field}")
+        finished_at = record["finished_at"]
+        if status in active:
+            if finished_at is not None:
+                errors.append(f"{label} active lease cannot be finished")
+        elif not _proof_binding_utc_timestamp(finished_at):
+            errors.append(f"{label} terminal lease requires finished_at")
+        reason_code = record["reason_code"]
+        if (
+            reason_code is not None
+            and (
+                type(reason_code) is not str
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason_code)
+                is None
+            )
+        ):
+            errors.append(f"{label} has invalid reason_code")
+        runtime_id = record["runtime_id"]
+        if (
+            runtime_id is not None
+            and (
+                type(runtime_id) is not str
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", runtime_id
+                )
+                is None
+            )
+        ):
+            errors.append(f"{label} has invalid runtime_id")
+    return errors
+
+
+def _isolated_read_only_locator_list(value: object) -> bool:
+    """Return whether a persisted isolated-analysis input list is canonical."""
+
+    if type(value) is not list or len(value) > 256:
+        return False
+    seen: set[str] = set()
+    total_bytes = 0
+    for locator in value:
+        if type(locator) is not str or "\x00" in locator or "\\" in locator:
+            return False
+        try:
+            encoded_size = len(locator.encode("utf-8"))
+        except UnicodeError:
+            return False
+        total_bytes += encoded_size
+        path = PurePosixPath(locator)
+        if (
+            not locator
+            or encoded_size > 4096
+            or total_bytes > 1024 * 1024
+            or path.is_absolute()
+            or path.as_posix() != locator
+            or any(part in {"", ".", ".."} for part in locator.split("/"))
+            or locator in seen
+        ):
+            return False
+        seen.add(locator)
+    return True
+
+
+def _isolated_read_only_state_errors(
+    state: "ChallengeState",
+    *,
+    artifacts: Mapping[str, ArtifactReference],
+    runs: Mapping[str, RunReference],
+    experiments: Mapping[str, Experiment],
+    receipts: Mapping[str, ExecutionReceipt],
+) -> list[str]:
+    """Validate the exact canonical graph for concurrent reader results.
+
+    A reader is committed as one experiment, one run, one receipt, and exactly
+    three immutable artifacts.  The repeated analysis metadata is intentional:
+    validation binds every copy so changing one otherwise-valid foreign id
+    cannot silently re-parent evidence.
+    """
+
+    marker = "isolated_read_only"
+    errors: list[str] = []
+    claimed_runs: set[str] = set()
+    claimed_receipts: set[str] = set()
+    claimed_artifacts: set[str] = set()
+    claimed_analysis_ids: set[str] = set()
+
+    raw_leases = state.extra.get("analysis_leases")
+    leases = {
+        record.get("analysis_id"): record
+        for record in raw_leases
+        if type(record) is dict and type(record.get("analysis_id")) is str
+    } if type(raw_leases) is list else {}
+
+    for collection_name, records in (
+        ("experiment", state.experiments),
+        ("run", state.runs),
+        ("receipt", state.receipts),
+        ("artifact", state.artifacts),
+    ):
+        for record in records:
+            if marker in record.extra and record.extra.get(marker) is not True:
+                errors.append(
+                    f"{collection_name} {record.id} has an invalid isolated "
+                    "read-only marker"
+                )
+
+    for experiment in state.experiments:
+        if experiment.extra.get(marker) is not True:
+            continue
+        label = f"isolated read-only experiment {experiment.id}"
+        analysis_id = experiment.extra.get("analysis_id")
+        input_locators = experiment.extra.get("input_locators")
+        reservation = experiment.extra.get("storage_reservation_bytes")
+        work_limit = experiment.extra.get("work_tree_limit_bytes")
+        if (
+            type(analysis_id) is not str
+            or re.fullmatch(r"analysis-[0-9a-f]{32}", analysis_id) is None
+        ):
+            errors.append(f"{label} has an invalid analysis_id")
+            continue
+        if analysis_id in claimed_analysis_ids:
+            errors.append(f"{label} reuses analysis_id {analysis_id}")
+        claimed_analysis_ids.add(analysis_id)
+        if not _isolated_read_only_locator_list(input_locators):
+            errors.append(f"{label} has invalid input_locators")
+        if (
+            type(work_limit) is not int
+            or work_limit <= 0
+            or type(reservation) is not int
+            or reservation < work_limit
+        ):
+            errors.append(f"{label} has an invalid storage reservation")
+
+        lease = leases.get(analysis_id)
+        if lease is None:
+            errors.append(f"{label} has no canonical analysis lease")
+        elif (
+            lease.get("work_tree_limit_bytes") != work_limit
+            or (
+                lease.get("status") in {"running", "cleanup_pending"}
+                and lease.get("storage_reservation_bytes") != reservation
+            )
+        ):
+            errors.append(f"{label} does not match its analysis lease")
+
+        result = experiment.result
+        if not isinstance(result, Mapping) or result.get(marker) is not True:
+            # Registration/running and pre-commit failure tombstones have no
+            # promoted evidence graph.  They still retain their lease binding.
+            if experiment.status not in {
+                ExperimentStatus.RUNNING,
+                ExperimentStatus.FAILED,
+            }:
+                errors.append(f"{label} lacks its canonical result graph")
+            continue
+        expected_result_keys = {
+            "run_id",
+            "receipt_id",
+            "exit_code",
+            "timed_out",
+            "analysis_id",
+            marker,
+        }
+        if set(result) != expected_result_keys:
+            errors.append(f"{label} result does not have the exact schema")
+        if result.get("analysis_id") != analysis_id:
+            errors.append(f"{label} result has a mismatched analysis_id")
+        if type(result.get("timed_out")) is not bool or type(
+            result.get("exit_code")
+        ) is not int:
+            errors.append(f"{label} result has invalid transport fields")
+
+        run_id = result.get("run_id")
+        receipt_id = result.get("receipt_id")
+        run = runs.get(run_id) if type(run_id) is str else None
+        receipt = receipts.get(receipt_id) if type(receipt_id) is str else None
+        if run is None:
+            errors.append(f"{label} references an invalid result run")
+            continue
+        if receipt is None:
+            errors.append(f"{label} references an invalid result receipt")
+            continue
+        if run.id in claimed_runs:
+            errors.append(f"isolated read-only run {run.id} is reused")
+        if receipt.id in claimed_receipts:
+            errors.append(f"isolated read-only receipt {receipt.id} is reused")
+        claimed_runs.add(run.id)
+        claimed_receipts.add(receipt.id)
+
+        expected_run_extra_keys = {
+            "analysis_id",
+            "experiment_id",
+            "input_locators",
+            marker,
+            "sandbox_run_id",
+            "wall_seconds",
+        }
+        if set(run.extra) != expected_run_extra_keys:
+            errors.append(
+                f"isolated read-only run {run.id} does not have the exact "
+                "metadata schema"
+            )
+        if (
+            run.extra.get(marker) is not True
+            or run.extra.get("analysis_id") != analysis_id
+            or run.extra.get("experiment_id") != experiment.id
+            or run.extra.get("input_locators") != input_locators
+            or run.origin is not RunOrigin.OPERATOR_TOOL
+            or run.role != "tool"
+            or run.request_path != f"runs/{run.id}/request.json"
+            or run.result_path != f"runs/{run.id}/result.json"
+            or run.validation_path != f"runs/{run.id}/validation.json"
+        ):
+            errors.append(
+                f"isolated read-only run {run.id} is not bound to {label}"
+            )
+        sandbox_run_id = run.extra.get("sandbox_run_id")
+        if (
+            type(sandbox_run_id) is not str
+            or re.fullmatch(r"run-[0-9]{8,}", sandbox_run_id) is None
+        ):
+            errors.append(
+                f"isolated read-only run {run.id} has an invalid sandbox run id"
+            )
+
+        expected_receipt_extra_keys = {
+            "analysis_id",
+            "input_locators",
+            marker,
+            "line_count_basis",
+            "result_artifact_id",
+            "stream_evidence",
+        }
+        if set(receipt.extra) != expected_receipt_extra_keys:
+            errors.append(
+                f"isolated read-only receipt {receipt.id} does not have the "
+                "exact metadata schema"
+            )
+        if (
+            receipt.extra.get(marker) is not True
+            or receipt.experiment_id != experiment.id
+            or receipt.run_id != run.id
+            or receipt.extra.get("analysis_id") != analysis_id
+            or receipt.extra.get("input_locators") != input_locators
+            or receipt.exit_code != result.get("exit_code")
+        ):
+            errors.append(
+                f"isolated read-only receipt {receipt.id} is not bound to "
+                f"{label}"
+            )
+        run_wall_seconds = run.extra.get("wall_seconds")
+        if (
+            type(run_wall_seconds) is not float
+            or not math.isfinite(run_wall_seconds)
+            or run_wall_seconds < 0
+            or type(receipt.wall_seconds) is not float
+            or receipt.wall_seconds != run_wall_seconds
+        ):
+            errors.append(
+                f"isolated read-only run {run.id} has a mismatched wall time"
+            )
+
+        artifact_ids = experiment.artifact_ids
+        if len(artifact_ids) != 3 or len(set(artifact_ids)) != 3:
+            errors.append(f"{label} must bind exactly three unique artifacts")
+        bound_artifacts = [artifacts.get(item) for item in artifact_ids]
+        if any(item is None for item in bound_artifacts):
+            errors.append(f"{label} references an invalid analysis artifact")
+            continue
+        stream_artifacts: dict[str, ArtifactReference] = {}
+        for artifact in bound_artifacts:
+            assert artifact is not None
+            expected_artifact_extra_keys = {
+                "analysis_id",
+                marker,
+                "source_locator",
+                "stream",
+            }
+            if set(artifact.extra) != expected_artifact_extra_keys:
+                errors.append(
+                    f"isolated read-only artifact {artifact.id} does not have "
+                    "the exact metadata schema"
+                )
+            stream = artifact.extra.get("stream")
+            if (
+                artifact.extra.get(marker) is not True
+                or artifact.extra.get("analysis_id") != analysis_id
+                or artifact.source_run_id != run.id
+                or stream not in {"stdout", "stderr", "result"}
+                or stream in stream_artifacts
+            ):
+                errors.append(
+                    f"isolated read-only artifact {artifact.id} is not "
+                    f"bound to {label}"
+                )
+                continue
+            stream_artifacts[stream] = artifact
+            claimed_artifacts.add(artifact.id)
+            leaf = "result.json" if stream == "result" else f"{stream}.log"
+            if artifact.extra.get("source_locator") != (
+                f".ctf/runs/{sandbox_run_id}/{leaf}"
+            ):
+                errors.append(
+                    f"isolated read-only artifact {artifact.id} has a "
+                    "mismatched source locator"
+                )
+            extension = "json" if stream == "result" else "log"
+            if artifact.path != (
+                f"artifacts/snapshots/{artifact.id}.{extension}"
+            ):
+                errors.append(
+                    f"isolated read-only artifact {artifact.id} has a "
+                    "mismatched canonical path"
+                )
+        if set(stream_artifacts) != {"stdout", "stderr", "result"}:
+            errors.append(f"{label} does not bind the three exact streams")
+            continue
+        if (
+            receipt.stdout_artifact_id != stream_artifacts["stdout"].id
+            or receipt.stderr_artifact_id != stream_artifacts["stderr"].id
+            or receipt.extra.get("result_artifact_id")
+            != stream_artifacts["result"].id
+        ):
+            errors.append(
+                f"isolated read-only receipt {receipt.id} has a mismatched "
+                "artifact chain"
+            )
+
+        timed_out = result.get("timed_out")
+        exit_code = result.get("exit_code")
+        expected_status = (
+            RunStatus.TIMED_OUT
+            if timed_out is True
+            else RunStatus.COMPLETED
+            if exit_code == 0
+            else RunStatus.FAILED
+        )
+        expected_outcome = (
+            ReceiptOutcome.TIMED_OUT
+            if timed_out is True
+            else ReceiptOutcome.SUCCEEDED
+            if exit_code == 0
+            else ReceiptOutcome.FAILED
+        )
+        expected_experiment_statuses = (
+            {ExperimentStatus.FAILED}
+            if expected_status is not RunStatus.COMPLETED
+            else {ExperimentStatus.COMPLETED}
+            if experiment.kind is ExperimentKind.PROBE
+            else {
+                ExperimentStatus.AWAITING_EVALUATION,
+                ExperimentStatus.KEPT,
+                ExperimentStatus.DROPPED,
+                ExperimentStatus.INCONCLUSIVE,
+            }
+        )
+        if run.status is not expected_status or receipt.outcome is not expected_outcome:
+            errors.append(f"{label} has inconsistent terminal transport status")
+        if experiment.status not in expected_experiment_statuses:
+            errors.append(f"{label} has an inconsistent terminal status")
+        if timed_out is True and exit_code != 124:
+            errors.append(f"{label} timeout does not bind exit code 124")
+
+    for run in state.runs:
+        if run.extra.get(marker) is True and run.id not in claimed_runs:
+            errors.append(f"isolated read-only run {run.id} is orphaned")
+    for receipt in state.receipts:
+        if receipt.extra.get(marker) is True and receipt.id not in claimed_receipts:
+            errors.append(f"isolated read-only receipt {receipt.id} is orphaned")
+    for artifact in state.artifacts:
+        if artifact.extra.get(marker) is True and artifact.id not in claimed_artifacts:
+            errors.append(f"isolated read-only artifact {artifact.id} is orphaned")
+
+    candidates_by_value: dict[str, list[FlagCandidate]] = {}
+    for candidate in state.candidates:
+        candidates_by_value.setdefault(candidate.value, []).append(candidate)
+    for value, matching in candidates_by_value.items():
+        if len(matching) > 1 and any(
+            candidate.source_run_id in claimed_runs for candidate in matching
+        ):
+            errors.append(
+                "isolated read-only candidate value is not unique: "
+                f"{value}"
+            )
+    return errors
+
+
 @dataclass
 class ChallengeState:
     contest_id: str
@@ -13890,6 +14654,20 @@ class ChallengeState:
                         f"managed proof experiment {experiment.id} requires "
                         f"state schema v{STATE_SCHEMA_VERSION}"
                     )
+
+        errors.extend(_background_job_state_errors(self))
+        errors.extend(_analysis_lease_state_errors(self))
+
+        if self.schema_version >= STATE_SCHEMA_VERSION:
+            errors.extend(
+                _isolated_read_only_state_errors(
+                    self,
+                    artifacts=artifacts,
+                    runs=runs,
+                    experiments=experiments,
+                    receipts=receipts,
+                )
+            )
 
         if self.schema_version >= STATE_SCHEMA_VERSION:
             if self.configuration_epoch < 0:

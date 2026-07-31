@@ -7,10 +7,12 @@ import json
 import math
 import os
 import queue
+import re
 import select
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -20,6 +22,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
+from ctf_os.credential_safety import (
+    CredentialSafetyError,
+    credential_byte_patterns,
+    host_credential_values,
+    model_process_environment,
+    payload_contains_credentials,
+    redact_credential_bytes,
+)
 from ctf_os.process import _popen_with_constructor_cleanup
 
 from .commands import BatchCommandBuilder, BatchInvocation, BuiltCommand
@@ -54,10 +64,183 @@ DEFAULT_RAW_JSONL_LIMIT_BYTES = 16 * 1024 * 1024
 DEFAULT_STDERR_LIMIT_BYTES = 1024 * 1024
 DEFAULT_STRUCTURED_OUTPUT_LIMIT_BYTES = 2 * 1024 * 1024
 DEFAULT_EVENT_LINE_LIMIT_BYTES = 1024 * 1024
+DEFAULT_OUTPUT_SCHEMA_LIMIT_BYTES = 1024 * 1024
+DEFAULT_CAPTURE_METADATA_LIMIT_BYTES = 64 * 1024
+DEFAULT_STRUCTURED_OUTPUT_DRAIN_GRACE_SECONDS = 1.0
 DEFAULT_FLAG_SCAN_CHUNK_CHARS = 64 * 1024
 DEFAULT_FLAG_SCAN_OVERLAP_CHARS = 1024
 DEFAULT_PROCESS_TERMINATE_GRACE_SECONDS = 0.5
 DEFAULT_PROCESS_DRAIN_GRACE_SECONDS = 1.0
+_CREDENTIAL_STREAM_OVERLAP_BYTES = 256
+_MIN_PARTIAL_CREDENTIAL_BYTES = 8
+_CREDENTIAL_OUTPUT_REJECTION_MESSAGE = (
+    "model process output contained a protected credential"
+)
+_PARTIAL_PROVIDER_CREDENTIAL_AT_END = re.compile(
+    rb"(?:"
+    rb"sk-(?:proj-)?[A-Za-z0-9_-]{4,}|"
+    rb"sk_(?:live|test)_[A-Za-z0-9]{4,}|"
+    rb"github_pat_[A-Za-z0-9_]{4,}|"
+    rb"gh[pousr]_[A-Za-z0-9]{4,}|"
+    rb"xox[baprs]-[A-Za-z0-9-]{4,}|"
+    rb"(?:AKIA|ASIA)[0-9A-Z]{4,}|"
+    rb"AIza[0-9A-Za-z_-]{4,}"
+    rb")\Z",
+    flags=re.IGNORECASE,
+)
+_ASCII_ALNUM_BYTES = (
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+_STREAM_PROVIDER_PREFIXES: tuple[tuple[bytes, bytes, int], ...] = (
+    (b"sk-", _ASCII_ALNUM_BYTES + b"_-", 16),
+    (b"sk-proj-", _ASCII_ALNUM_BYTES + b"_-", 16),
+    (b"sk_live_", _ASCII_ALNUM_BYTES, 16),
+    (b"sk_test_", _ASCII_ALNUM_BYTES, 16),
+    (b"github_pat_", _ASCII_ALNUM_BYTES + b"_", 20),
+    (b"ghp_", _ASCII_ALNUM_BYTES, 20),
+    (b"gho_", _ASCII_ALNUM_BYTES, 20),
+    (b"ghu_", _ASCII_ALNUM_BYTES, 20),
+    (b"ghs_", _ASCII_ALNUM_BYTES, 20),
+    (b"ghr_", _ASCII_ALNUM_BYTES, 20),
+    (b"xoxb-", _ASCII_ALNUM_BYTES + b"-", 16),
+    (b"xoxa-", _ASCII_ALNUM_BYTES + b"-", 16),
+    (b"xoxp-", _ASCII_ALNUM_BYTES + b"-", 16),
+    (b"xoxr-", _ASCII_ALNUM_BYTES + b"-", 16),
+    (b"xoxs-", _ASCII_ALNUM_BYTES + b"-", 16),
+    (b"AKIA", _ASCII_ALNUM_BYTES, 16),
+    (b"ASIA", _ASCII_ALNUM_BYTES, 16),
+    (b"AIza", _ASCII_ALNUM_BYTES + b"_-", 30),
+)
+
+
+def _model_command_environment(command: BuiltCommand) -> dict[str, str]:
+    """Resolve ``None`` to a minimal trusted model-CLI environment."""
+
+    return (
+        model_process_environment()
+        if command.environment is None
+        else dict(command.environment)
+    )
+
+
+def _model_command_credentials(
+    command: BuiltCommand,
+    *,
+    resolved_environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    protected = set(host_credential_values())
+    protected.update(
+        host_credential_values(
+            _model_command_environment(command)
+            if resolved_environment is None
+            else resolved_environment
+        )
+    )
+    return tuple(
+        sorted(protected, key=lambda value: (-len(value), value))
+    )
+
+
+def _redact_credential_text(
+    value: str,
+    credentials: Sequence[str],
+) -> tuple[str, bool]:
+    payload, count = redact_credential_bytes(
+        value.encode("utf-8", errors="replace"),
+        credentials,
+    )
+    return payload.decode("utf-8", errors="replace"), bool(count)
+
+
+def _credential_stream_overlap_bytes(
+    credentials: Sequence[str],
+) -> int:
+    patterns = credential_byte_patterns(credentials)
+    return max(
+        _CREDENTIAL_STREAM_OVERLAP_BYTES,
+        max((len(pattern) - 1 for pattern in patterns), default=0),
+    )
+
+
+def _incomplete_credential_suffix_bytes(
+    payload: bytes,
+    credentials: Sequence[str],
+) -> int:
+    """Return a credential-like suffix that may continue past a hard cap."""
+
+    longest = 0
+    for pattern in credential_byte_patterns(credentials):
+        maximum = min(len(payload), len(pattern) - 1)
+        for width in range(maximum, _MIN_PARTIAL_CREDENTIAL_BYTES - 1, -1):
+            if pattern.startswith(payload[-width:]):
+                longest = max(longest, width)
+                break
+    provider = _PARTIAL_PROVIDER_CREDENTIAL_AT_END.search(payload)
+    if provider is not None:
+        longest = max(longest, len(provider.group(0)))
+    return longest
+
+
+def _credential_stream_pending_bytes(
+    payload: bytes,
+    credentials: Sequence[str],
+) -> int:
+    """Hold only suffixes that can become a protected credential."""
+
+    longest = 0
+    for pattern in credential_byte_patterns(credentials):
+        maximum = min(len(payload), len(pattern) - 1)
+        for width in range(maximum, 0, -1):
+            if pattern.startswith(payload[-width:]):
+                longest = max(longest, width)
+                break
+    folded_payload = payload.lower()
+    for marker, alphabet, minimum_body in _STREAM_PROVIDER_PREFIXES:
+        folded_marker = marker.lower()
+        maximum_marker = min(len(payload), len(marker) - 1)
+        for width in range(maximum_marker, 0, -1):
+            if folded_marker.startswith(folded_payload[-width:]):
+                longest = max(longest, width)
+                break
+        start = folded_payload.rfind(folded_marker)
+        if start < 0:
+            continue
+        candidate = payload[start + len(marker) :]
+        if (
+            len(candidate) < minimum_body
+            and all(byte in alphabet for byte in candidate)
+        ):
+            longest = max(longest, len(payload) - start)
+    return longest
+
+
+def _redact_bounded_credential_capture(
+    payload: bytes,
+    credentials: Sequence[str],
+    *,
+    stored_limit_bytes: int,
+    capture_truncated: bool,
+) -> tuple[bytes, bool]:
+    """Audit across the cap boundary and return an equal-size safe prefix."""
+
+    overlap = _credential_stream_overlap_bytes(credentials)
+    audit_window = payload[: stored_limit_bytes + overlap]
+    stored = audit_window[:stored_limit_bytes]
+    safe_window, redactions = redact_credential_bytes(
+        audit_window,
+        credentials,
+    )
+    safe_stored = safe_window[: len(stored)]
+    boundary_width = (
+        _incomplete_credential_suffix_bytes(stored, credentials)
+        if capture_truncated and stored
+        else 0
+    )
+    if boundary_width:
+        safe_stored = (
+            safe_stored[:-boundary_width] + b"*" * boundary_width
+        )
+    return safe_stored, bool(redactions or boundary_width)
 
 
 def _bounded_exception_message(error: BaseException) -> str:
@@ -135,6 +318,7 @@ class ProcessOutcome:
     stdout_capture_complete: bool = True
     stderr_capture_complete: bool = True
     callback_error: str | None = None
+    credential_output_rejected: bool = False
 
 
 class ProcessExecutor(Protocol):
@@ -216,7 +400,7 @@ class _ProcessPumpControl:
 
 
 def _thread_definitely_unstarted(thread: threading.Thread) -> bool:
-    """Identify the CPython 3.13 state where no native owner was created."""
+    """Identify CPython states where no native stream owner was created."""
 
     try:
         if thread.ident is not None or thread.is_alive():
@@ -229,7 +413,36 @@ def _thread_definitely_unstarted(thread: threading.Thread) -> bool:
     # nonzero native identity inside _start_joinable_thread(), before
     # Thread._started/ident is set by bootstrap.  Any unknown implementation is
     # conservatively treated as a possibly delayed owner.
-    return type(native_ident) is int and native_ident == 0
+    if type(native_ident) is int:
+        return native_ident == 0
+
+    # CPython <=3.12 publishes the Thread in _limbo before calling
+    # _start_new_thread(), then sets _tstate_lock/_started from the native
+    # bootstrap.  Inspect all of those fields under the interpreter's own
+    # lock: absence from limbo plus pristine fields proves that start() failed
+    # before a native owner existed.  Unknown implementations remain pending.
+    limbo_lock = getattr(threading, "_active_limbo_lock", None)
+    limbo = getattr(threading, "_limbo", None)
+    started = getattr(thread, "_started", None)
+    if (
+        limbo_lock is None
+        or not isinstance(limbo, dict)
+        or started is None
+        or not callable(getattr(started, "is_set", None))
+        or not hasattr(thread, "_tstate_lock")
+    ):
+        return False
+    try:
+        with limbo_lock:
+            return bool(
+                thread not in limbo
+                and thread.ident is None
+                and not thread.is_alive()
+                and not started.is_set()
+                and getattr(thread, "_tstate_lock", None) is None
+            )
+    except BaseException:
+        return False
 
 
 class SubprocessExecutor:
@@ -859,6 +1072,11 @@ class SubprocessExecutor:
         owner_token: object,
     ) -> ProcessOutcome:
         started = time.monotonic()
+        process_environment = _model_command_environment(command)
+        protected_credentials = _model_command_credentials(
+            command,
+            resolved_environment=process_environment,
+        )
         pending_handoff: list[subprocess.Popen[bytes]] = []
         process: subprocess.Popen[bytes] | None = None
         pump_control = _ProcessPumpControl()
@@ -876,7 +1094,7 @@ class SubprocessExecutor:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=command.environment,
+                env=process_environment,
                 text=False,
                 bufsize=0,
                 start_new_session=True,
@@ -1079,6 +1297,7 @@ class SubprocessExecutor:
         )
         drain_deadline: float | None = None
         callback_error: str | None = None
+        credential_output_rejected = False
         callback_interrupt: BaseException | None = None
         flag_notification_failure: FlagNotificationError | None = None
         capture_complete: dict[str, bool] = {
@@ -1152,6 +1371,8 @@ class SubprocessExecutor:
                         on_stdout_line(chunk)
                     except BaseException as exc:
                         callback_error = _bounded_exception_message(exc)
+                        if isinstance(exc, CredentialSafetyError):
+                            credential_output_rejected = True
                         if isinstance(exc, FlagNotificationError):
                             flag_notification_failure = exc
                         elif not isinstance(exc, Exception):
@@ -1498,20 +1719,43 @@ class SubprocessExecutor:
             returncode = 125
         if returncode == 0 and callback_error is not None:
             returncode = 1
+        safe_stderr, stderr_redactions = _redact_bounded_credential_capture(
+            bytes(stderr_capture),
+            protected_credentials,
+            stored_limit_bytes=self.stderr_limit_bytes,
+            capture_truncated=(
+                stderr_bytes > len(stderr_capture)
+                or not capture_complete["stderr"]
+            ),
+        )
+        if callback_error is not None:
+            callback_error, callback_redacted = _redact_credential_text(
+                callback_error,
+                protected_credentials,
+            )
+            stderr_redactions = (
+                stderr_redactions or callback_redacted
+            )
+        if stderr_redactions:
+            credential_output_rejected = True
+            callback_error = _CREDENTIAL_OUTPUT_REJECTION_MESSAGE
+            if returncode == 0:
+                returncode = 1
         outcome = ProcessOutcome(
             returncode=returncode,
-            stderr=bytes(stderr_capture).decode("utf-8", errors="replace"),
+            stderr=safe_stderr.decode("utf-8", errors="replace"),
             duration_seconds=time.monotonic() - started,
             timed_out=timed_out,
             stderr_bytes=stderr_bytes,
             stderr_truncated=stderr_bytes > len(stderr_capture),
-            stderr_raw=bytes(stderr_capture),
+            stderr_raw=safe_stderr,
             stdout_capture_complete=(
                 capture_complete["stdout"]
                 and callback_error is None
             ),
             stderr_capture_complete=capture_complete["stderr"],
             callback_error=callback_error,
+            credential_output_rejected=credential_output_rejected,
         )
         return outcome
 
@@ -1577,13 +1821,12 @@ class BatchResult:
         return self.output is not None and self.output.get("status") == "refused"
 
 
-def _atomic_json(path: Path, value: object) -> None:
+def _atomic_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
+        with temporary.open("wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -1594,12 +1837,370 @@ def _atomic_json(path: Path, value: object) -> None:
             pass
 
 
+def _atomic_json(
+    path: Path,
+    value: object,
+    *,
+    maximum_bytes: int | None = None,
+) -> None:
+    payload = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if maximum_bytes is not None and len(payload) > maximum_bytes:
+        raise ValueError(
+            f"JSON document exceeds {maximum_bytes} byte limit"
+        )
+    _atomic_bytes(path, payload)
+
+
 @dataclass(frozen=True)
 class _OutputRead:
     validation: ContractValidation
     payload: str | None
     bytes: int | None
     oversized: bool
+    credential_rejected: bool = False
+
+
+@dataclass(frozen=True)
+class _PrivateOutputSnapshot:
+    prefix: bytes
+    bytes: int | None
+    capture_complete: bool
+    error: str | None
+
+
+class _PrivateStructuredOutputCapture:
+    """Drain one provider result through a metadata-only private FIFO.
+
+    The provider can open the named pipe but cannot create or replace entries
+    in its 0500 parent directory.  The drainer counts the complete stream while
+    retaining only the durable prefix.  A hard-killed owner can therefore
+    leave only a private directory and FIFO, never an unbounded regular file.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        attempt_number: int,
+        limit_bytes: int,
+        drain_grace_seconds: float = (
+            DEFAULT_STRUCTURED_OUTPUT_DRAIN_GRACE_SECONDS
+        ),
+    ) -> None:
+        self.directory = root / (
+            f"attempt-{attempt_number}-{uuid.uuid4().hex}.channel"
+        )
+        self.path = self.directory / "output.fifo"
+        self.limit_bytes = limit_bytes
+        self.drain_grace_seconds = drain_grace_seconds
+        self._read_fd: int | None = None
+        self._anchor_fd: int | None = None
+        self._thread: threading.Thread | None = None
+        self._cancel = threading.Event()
+        self._prefix = bytearray()
+        self._bytes = 0
+        self._capture_complete = False
+        self._error: str | None = None
+        self._snapshot: _PrivateOutputSnapshot | None = None
+        try:
+            self.directory.mkdir(mode=0o700)
+            os.mkfifo(self.path, 0o600)
+            metadata = self.path.lstat()
+            if (
+                not stat.S_ISFIFO(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise RuntimeError(
+                    "private structured output channel is unsafe"
+                )
+            flags = os.O_NONBLOCK | os.O_CLOEXEC
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            self._read_fd = os.open(self.path, os.O_RDONLY | flags)
+            self._anchor_fd = os.open(self.path, os.O_WRONLY | flags)
+            self.directory.chmod(0o500)
+            self._thread = threading.Thread(
+                target=self._drain,
+                name="ctfos-structured-output-drain",
+                daemon=True,
+            )
+            self._thread.start()
+        except BaseException as error:
+            self._cancel.set()
+            self._close_setup_descriptors(error)
+            self._remove_channel(error)
+            raise
+
+    def _drain(self) -> None:
+        descriptor = self._read_fd
+        assert descriptor is not None
+        try:
+            while True:
+                if self._cancel.is_set():
+                    self._error = (
+                        "structured output drain did not reach EOF"
+                    )
+                    return
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    try:
+                        select.select(
+                            (descriptor,),
+                            (),
+                            (),
+                            0.05,
+                        )
+                    except InterruptedError:
+                        continue
+                    continue
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    self._capture_complete = True
+                    return
+                self._bytes += len(chunk)
+                remaining = self.limit_bytes - len(self._prefix)
+                if remaining > 0:
+                    self._prefix.extend(chunk[:remaining])
+        except BaseException as error:
+            self._error = _bounded_exception_message(error)
+
+    def _close_setup_descriptors(self, cause: BaseException) -> None:
+        for attribute in ("_anchor_fd", "_read_fd"):
+            descriptor = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                cause.add_note(
+                    "structured output descriptor cleanup failed: "
+                    f"{_bounded_exception_message(cleanup_error)}"
+                )
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(self.drain_grace_seconds)
+
+    def _remove_channel(self, cause: BaseException | None = None) -> None:
+        cleanup_errors: list[BaseException] = []
+        try:
+            self.directory.chmod(0o700)
+        except FileNotFoundError:
+            return
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            self.path.unlink(missing_ok=True)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            self.directory.rmdir()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if not cleanup_errors:
+            return
+        if cause is not None:
+            for cleanup_error in cleanup_errors:
+                cause.add_note(
+                    "structured output channel cleanup failed: "
+                    f"{_bounded_exception_message(cleanup_error)}"
+                )
+            return
+        error = RuntimeError(
+            "structured output channel cleanup failed"
+        )
+        for cleanup_error in cleanup_errors:
+            error.add_note(_bounded_exception_message(cleanup_error))
+        raise error
+
+    def finish(self) -> _PrivateOutputSnapshot:
+        if self._snapshot is not None:
+            return self._snapshot
+        cleanup_errors: list[BaseException] = []
+        anchor = self._anchor_fd
+        self._anchor_fd = None
+        if anchor is not None:
+            try:
+                os.close(anchor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+                self._error = _bounded_exception_message(error)
+
+        thread = self._thread
+        if thread is not None:
+            thread.join(self.drain_grace_seconds)
+            if thread.is_alive():
+                self._cancel.set()
+                thread.join(self.drain_grace_seconds)
+            if thread.is_alive():
+                cleanup_errors.append(
+                    RuntimeError(
+                        "structured output drainer did not stop"
+                    )
+                )
+                self._error = (
+                    "structured output drainer did not stop"
+                )
+            elif not self._capture_complete and self._error is None:
+                self._error = (
+                    "structured output drain did not reach EOF"
+                )
+
+        descriptor = self._read_fd
+        self._read_fd = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                cleanup_errors.append(error)
+                self._error = _bounded_exception_message(error)
+
+        complete = self._capture_complete and not cleanup_errors
+        self._snapshot = _PrivateOutputSnapshot(
+            prefix=bytes(self._prefix),
+            bytes=self._bytes if complete else None,
+            capture_complete=complete,
+            error=self._error,
+        )
+        try:
+            self._remove_channel()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            primary = cleanup_errors[0]
+            for cleanup_error in cleanup_errors[1:]:
+                primary.add_note(
+                    _bounded_exception_message(cleanup_error)
+                )
+            raise primary
+        return self._snapshot
+
+    @property
+    def snapshot(self) -> _PrivateOutputSnapshot:
+        if self._snapshot is None:
+            raise RuntimeError(
+                "structured output capture has not been finalized"
+            )
+        return self._snapshot
+
+
+def _capture_output(
+    capture: _PrivateOutputSnapshot,
+    destination: Path,
+    role: Role,
+    limit_bytes: int,
+    *,
+    contract_version: int = 1,
+    protected_credentials: Sequence[str] = (),
+) -> _OutputRead:
+    """Install and validate one already-drained bounded provider prefix."""
+
+    destination.unlink(missing_ok=True)
+    if capture.bytes == 0 and capture.capture_complete:
+        # A zero-byte stream is indistinguishable from a provider that never
+        # opened the FIFO. Both are invalid and leave no durable output file.
+        return _OutputRead(
+            ContractValidation(
+                False,
+                (
+                    "$: output file was not created: "
+                    f"{destination}",
+                ),
+                None,
+            ),
+            None,
+            None,
+            False,
+        )
+    capture_truncated = (
+        not capture.capture_complete
+        or capture.bytes is None
+        or capture.bytes > len(capture.prefix)
+    )
+    safe_prefix, credential_rejected = (
+        _redact_bounded_credential_capture(
+            capture.prefix,
+            protected_credentials,
+            stored_limit_bytes=limit_bytes,
+            capture_truncated=capture_truncated,
+        )
+    )
+    if safe_prefix or capture.bytes is not None:
+        _atomic_bytes(destination, safe_prefix)
+    if credential_rejected:
+        return _OutputRead(
+            ContractValidation(
+                False,
+                (
+                    "$: model process output contained a protected "
+                    "credential",
+                ),
+                None,
+            ),
+            None,
+            capture.bytes,
+            bool(
+                capture.bytes is not None
+                and capture.bytes > limit_bytes
+            ),
+            True,
+        )
+    bounded = _read_output(
+        destination,
+        role,
+        limit_bytes,
+        contract_version=contract_version,
+    )
+    if not capture.capture_complete or capture.bytes is None:
+        safe_error = capture.error
+        if safe_error is not None:
+            safe_error, _ = _redact_credential_text(
+                safe_error,
+                protected_credentials,
+            )
+        return _OutputRead(
+            ContractValidation(
+                False,
+                (
+                    "$: structured output capture was incomplete"
+                    + (
+                        f": {safe_error}"
+                        if safe_error is not None
+                        else ""
+                    ),
+                ),
+                None,
+            ),
+            None,
+            None,
+            False,
+        )
+    if capture.bytes > limit_bytes:
+        return _OutputRead(
+            ContractValidation(
+                False,
+                (
+                    f"$: structured output exceeds {limit_bytes} byte limit "
+                    f"({capture.bytes} bytes)",
+                ),
+                None,
+            ),
+            None,
+            capture.bytes,
+            True,
+        )
+    return replace(bounded, bytes=capture.bytes)
 
 
 def _read_output(
@@ -1734,10 +2335,40 @@ def _read_output(
     )
 
 
-def _bounded_utf8(value: str, limit_bytes: int) -> tuple[bytes, int, bool]:
-    encoded = value.encode("utf-8", errors="replace")
-    stored = encoded[:limit_bytes]
-    return stored, len(encoded), len(encoded) > len(stored)
+class _CredentialStreamGuard:
+    """Withhold a bounded suffix so split credentials never reach callbacks."""
+
+    def __init__(self, credentials: Sequence[str]) -> None:
+        self.credentials = tuple(credentials)
+        self.pending = bytearray()
+        self.rejected = False
+
+    def feed(self, data: bytes, *, final: bool = False) -> bytes:
+        if self.rejected:
+            raise CredentialSafetyError(
+                "model process output credential rejection is final"
+            )
+        combined = bytes(self.pending) + data
+        if payload_contains_credentials(combined, self.credentials):
+            self.pending.clear()
+            self.rejected = True
+            raise CredentialSafetyError(
+                "model process output contained a protected credential"
+            )
+        if final:
+            self.pending.clear()
+            return combined
+        pending_bytes = _credential_stream_pending_bytes(
+            combined,
+            self.credentials,
+        )
+        emitted_bytes = len(combined) - pending_bytes
+        emitted = combined[:emitted_bytes]
+        self.pending[:] = combined[emitted_bytes:]
+        return emitted
+
+    def discard(self) -> None:
+        self.pending.clear()
 
 
 class _BatchStdoutCapture:
@@ -1752,6 +2383,7 @@ class _BatchStdoutCapture:
         event_line_limit_bytes: int,
         flag_scan_chunk_chars: int,
         flag_scan_overlap_chars: int,
+        protected_credentials: Sequence[str] = (),
     ) -> None:
         self.raw_handle = raw_handle
         self.accumulator = accumulator
@@ -1768,10 +2400,17 @@ class _BatchStdoutCapture:
         self._flag_tail = ""
         self._finished = False
         self._callback_failed = False
+        self._credential_guard = _CredentialStreamGuard(
+            protected_credentials
+        )
 
     @property
     def truncated(self) -> bool:
         return self.bytes > self.stored_bytes
+
+    @property
+    def credential_rejected(self) -> bool:
+        return self._credential_guard.rejected
 
     def feed(self, chunk: str | bytes) -> None:
         if self._finished:
@@ -1781,17 +2420,23 @@ class _BatchStdoutCapture:
             return
         try:
             self.bytes += len(data)
-            remaining = self.raw_limit_bytes - self.stored_bytes
-            stored = data[: max(0, remaining)]
-            if stored:
-                self.raw_handle.write(stored)
-                self.raw_handle.flush()
-                self.stored_bytes += len(stored)
-                self._feed_event_bytes(stored)
-            self._scan_text(self._decoder.decode(data, final=False))
+            safe = self._credential_guard.feed(data)
+            self._consume_safe(safe)
         except BaseException:
             self._callback_failed = True
             raise
+
+    def _consume_safe(self, data: bytes) -> None:
+        if not data:
+            return
+        remaining = self.raw_limit_bytes - self.stored_bytes
+        stored = data[: max(0, remaining)]
+        if stored:
+            self.raw_handle.write(stored)
+            self.raw_handle.flush()
+            self.stored_bytes += len(stored)
+            self._feed_event_bytes(stored)
+        self._scan_text(self._decoder.decode(data, final=False))
 
     def finish(self) -> None:
         if self._finished:
@@ -1800,10 +2445,14 @@ class _BatchStdoutCapture:
         primary_error: BaseException | None = None
         try:
             if self._callback_failed:
+                self._credential_guard.discard()
                 self._decoder.decode(b"", final=True)
                 self._line.clear()
                 self._line_oversized = False
             else:
+                self._consume_safe(
+                    self._credential_guard.feed(b"", final=True)
+                )
                 self._scan_text(self._decoder.decode(b"", final=True))
                 if not self.truncated and (
                     self._line or self._line_oversized
@@ -1876,14 +2525,21 @@ class _BatchAttemptCaptureOwner:
 
     def __init__(
         self,
-        raw_handle: BinaryIO,
+        raw_handle: BinaryIO | None = None,
+        structured_capture: _PrivateStructuredOutputCapture | None = None,
     ) -> None:
-        self._raw_handle: BinaryIO | None = raw_handle
+        self._raw_handle = raw_handle
+        self._structured_capture = structured_capture
         self.capture: _BatchStdoutCapture | None = None
         self.outcome: ProcessOutcome | None = None
 
     def __enter__(self) -> _BatchAttemptCaptureOwner:
         return self
+
+    def attach_raw_handle(self, raw_handle: BinaryIO) -> None:
+        if self._raw_handle is not None:
+            raise RuntimeError("batch raw stream ownership is already attached")
+        self._raw_handle = raw_handle
 
     def _record_ordinary_failure(
         self,
@@ -1894,7 +2550,12 @@ class _BatchAttemptCaptureOwner:
         outcome = self.outcome
         if outcome is None:
             raise error
-        detail = f"{stage}: {_bounded_exception_message(error)}"
+        credential_rejected = isinstance(error, CredentialSafetyError)
+        detail = (
+            _CREDENTIAL_OUTPUT_REJECTION_MESSAGE
+            if credential_rejected
+            else f"{stage}: {_bounded_exception_message(error)}"
+        )
         callback_error = outcome.callback_error
         if callback_error is None:
             callback_error = detail
@@ -1907,6 +2568,10 @@ class _BatchAttemptCaptureOwner:
             ),
             stdout_capture_complete=False,
             callback_error=callback_error,
+            credential_output_rejected=(
+                outcome.credential_output_rejected
+                or credential_rejected
+            ),
         )
 
     def __exit__(
@@ -1921,6 +2586,7 @@ class _BatchAttemptCaptureOwner:
         finish_error: BaseException | None = None
         close_error: BaseException | None = None
         sequencing_error: BaseException | None = None
+        structured_error: BaseException | None = None
         try:
             try:
                 if capture is not None:
@@ -1938,12 +2604,18 @@ class _BatchAttemptCaptureOwner:
             # control interruption in the finish->close handoff is now safe to
             # prioritize without risking a skipped close or an ABA re-close.
             sequencing_error = error
+        try:
+            if self._structured_capture is not None:
+                self._structured_capture.finish()
+        except BaseException as error:
+            structured_error = error
 
         primary_error = active_error
         for stage, cleanup_error in (
             ("batch stdout capture finalization", finish_error),
             ("batch stdout raw stream close", close_error),
             ("batch stdout cleanup sequencing", sequencing_error),
+            ("batch structured output finalization", structured_error),
         ):
             if cleanup_error is None:
                 continue
@@ -2066,6 +2738,22 @@ class BatchRunner:
             )
         )
 
+    @property
+    def durable_capture_max_bytes(self) -> int:
+        """Maximum durable bytes one invocation can add to its run tree."""
+
+        attempts = self.max_schema_retries + 1
+        return (
+            2 * DEFAULT_OUTPUT_SCHEMA_LIMIT_BYTES
+            + attempts
+            * (
+                self.raw_jsonl_limit_bytes
+                + self.stderr_limit_bytes
+                + self.structured_output_limit_bytes
+                + DEFAULT_CAPTURE_METADATA_LIMIT_BYTES
+            )
+        )
+
     def run(
         self,
         invocation: BatchInvocation,
@@ -2076,6 +2764,32 @@ class BatchRunner:
         session_created_at: float | None = None,
         _cancel_event: threading.Event | None = None,
         command_builder: CommandBuilder | None = None,
+    ) -> BatchResult:
+        with tempfile.TemporaryDirectory(
+            prefix="ctfos-batch-output-",
+        ) as temporary:
+            return self._run_with_private_output(
+                invocation,
+                on_event=on_event,
+                on_flag=on_flag,
+                before_provider_start=before_provider_start,
+                session_created_at=session_created_at,
+                _cancel_event=_cancel_event,
+                command_builder=command_builder,
+                _structured_output_root=Path(temporary),
+            )
+
+    def _run_with_private_output(
+        self,
+        invocation: BatchInvocation,
+        *,
+        on_event: Callable[[CodexEvent], None] | None = None,
+        on_flag: Callable[[FlagCandidate], None] | None = None,
+        before_provider_start: Callable[[], None] | None = None,
+        session_created_at: float | None = None,
+        _cancel_event: threading.Event | None = None,
+        command_builder: CommandBuilder | None = None,
+        _structured_output_root: Path,
     ) -> BatchResult:
         run_started_monotonic = time.monotonic()
         run_started_at = time.time()
@@ -2105,6 +2819,7 @@ class BatchRunner:
                 invocation.role,
                 contract_version=invocation.contract_version,
             ),
+            maximum_bytes=DEFAULT_OUTPUT_SCHEMA_LIMIT_BYTES,
         )
 
         if self.flag_patterns is not None:
@@ -2146,20 +2861,35 @@ class BatchRunner:
             output_path = output_directory / f"attempt-{attempt_number}-output.json"
             capture_metadata_path = raw_directory / f"attempt-{attempt_number}-capture.json"
             output_path.unlink(missing_ok=True)
-            command = (command_builder or self.command_builder).build(
-                invocation,
-                schema_path,
-                output_path,
-                resume_thread_id=resume_thread_id,
-                correction=correction,
+            provider_capture = _PrivateStructuredOutputCapture(
+                _structured_output_root,
+                attempt_number=attempt_number,
+                limit_bytes=self.structured_output_limit_bytes,
             )
+            provider_output_path = provider_capture.path
 
             outcome: ProcessOutcome | None = None
             terminal_failure_kind: str | None = None
             terminal_failure_message = ""
-            raw_handle = raw_path.open("wb")
-            capture_owner = _BatchAttemptCaptureOwner(raw_handle)
+            capture_owner = _BatchAttemptCaptureOwner(
+                structured_capture=provider_capture,
+            )
             with capture_owner:
+                command = (command_builder or self.command_builder).build(
+                    invocation,
+                    schema_path,
+                    provider_output_path,
+                    resume_thread_id=resume_thread_id,
+                    correction=correction,
+                )
+                if command.environment is None:
+                    command = replace(
+                        command,
+                        environment=model_process_environment(),
+                    )
+                protected_credentials = _model_command_credentials(command)
+                raw_handle = raw_path.open("wb")
+                capture_owner.attach_raw_handle(raw_handle)
                 stdout_capture = _BatchStdoutCapture(
                     raw_handle=raw_handle,
                     accumulator=accumulator,
@@ -2167,6 +2897,7 @@ class BatchRunner:
                     event_line_limit_bytes=self.event_line_limit_bytes,
                     flag_scan_chunk_chars=self.flag_scan_chunk_chars,
                     flag_scan_overlap_chars=self.flag_scan_overlap_chars,
+                    protected_credentials=protected_credentials,
                 )
                 capture_owner.capture = stdout_capture
 
@@ -2323,19 +3054,44 @@ class BatchRunner:
                     raise
                 except OSError as exc:
                     final_finished_at = time.time()
-                    message = f"{type(exc).__name__}: {exc}"
+                    message, credential_rejected = (
+                        _redact_credential_text(
+                            _bounded_exception_message(exc),
+                            protected_credentials,
+                        )
+                    )
+                    if credential_rejected:
+                        message = _CREDENTIAL_OUTPUT_REJECTION_MESSAGE
                     orchestration_failures.append(
                         ExecutionFailure(
-                            "process_launch",
+                            (
+                                "credential_output_rejected"
+                                if credential_rejected
+                                else "process_launch"
+                            ),
                             message,
                             False,
                             "orchestrator.error",
                         )
                     )
-                    outcome = ProcessOutcome(127, message, 0.0)
+                    outcome = ProcessOutcome(
+                        127,
+                        message,
+                        0.0,
+                        credential_output_rejected=credential_rejected,
+                    )
                 except Exception as exc:  # callbacks and injected runners are contained per role
                     final_finished_at = time.time()
-                    message = f"{type(exc).__name__}: {exc}"
+                    message, message_redacted = _redact_credential_text(
+                        _bounded_exception_message(exc),
+                        protected_credentials,
+                    )
+                    credential_rejected = (
+                        isinstance(exc, CredentialSafetyError)
+                        or message_redacted
+                    )
+                    if credential_rejected:
+                        message = _CREDENTIAL_OUTPUT_REJECTION_MESSAGE
                     outcome = ProcessOutcome(
                         1,
                         message,
@@ -2343,28 +3099,25 @@ class BatchRunner:
                         stdout_capture_complete=False,
                         stderr_capture_complete=False,
                         callback_error=message,
+                        credential_output_rejected=credential_rejected,
                     )
                 finally:
                     capture_owner.outcome = outcome
 
+            provider_snapshot = provider_capture.snapshot
             outcome = capture_owner.outcome
             if outcome is None:
                 raise RuntimeError(
                     "batch attempt completed without a process outcome"
                 )
             if outcome.stderr_raw is not None:
-                encoded_stderr_bytes = len(outcome.stderr_raw)
-                stderr_data = outcome.stderr_raw[: self.stderr_limit_bytes]
-                encoded_stderr_truncated = (
-                    len(outcome.stderr_raw) > len(stderr_data)
-                )
+                stderr_source = outcome.stderr_raw
             else:
-                (
-                    stderr_data,
-                    encoded_stderr_bytes,
-                    encoded_stderr_truncated,
-                ) = _bounded_utf8(outcome.stderr, self.stderr_limit_bytes)
-            stderr_path.write_bytes(stderr_data)
+                stderr_source = outcome.stderr.encode(
+                    "utf-8",
+                    errors="replace",
+                )
+            encoded_stderr_bytes = len(stderr_source)
             stderr_bytes = max(
                 encoded_stderr_bytes,
                 outcome.stderr_bytes
@@ -2373,9 +3126,61 @@ class BatchRunner:
             )
             stderr_truncated = (
                 outcome.stderr_truncated
-                or encoded_stderr_truncated
-                or stderr_bytes > len(stderr_data)
+                or stderr_bytes
+                > min(encoded_stderr_bytes, self.stderr_limit_bytes)
+                or not outcome.stderr_capture_complete
             )
+            stderr_data, stderr_credential_rejected = (
+                _redact_bounded_credential_capture(
+                    stderr_source,
+                    protected_credentials,
+                    stored_limit_bytes=self.stderr_limit_bytes,
+                    capture_truncated=stderr_truncated,
+                )
+            )
+            _atomic_bytes(stderr_path, stderr_data)
+            callback_error = outcome.callback_error
+            callback_credential_rejected = False
+            if callback_error is not None:
+                (
+                    callback_error,
+                    callback_credential_rejected,
+                ) = _redact_credential_text(
+                    callback_error,
+                    protected_credentials,
+                )
+            credential_output_rejected = (
+                outcome.credential_output_rejected
+                or stdout_capture.credential_rejected
+                or stderr_credential_rejected
+                or callback_credential_rejected
+            )
+            if credential_output_rejected:
+                callback_error = _CREDENTIAL_OUTPUT_REJECTION_MESSAGE
+            outcome = replace(
+                outcome,
+                returncode=(
+                    outcome.returncode
+                    if outcome.returncode != 0
+                    else 1
+                    if credential_output_rejected
+                    else 0
+                ),
+                callback_error=callback_error,
+                credential_output_rejected=credential_output_rejected,
+            )
+            if credential_output_rejected and not any(
+                failure.kind == "credential_output_rejected"
+                for failure in orchestration_failures
+            ):
+                orchestration_failures.append(
+                    ExecutionFailure(
+                        "credential_output_rejected",
+                        _CREDENTIAL_OUTPUT_REJECTION_MESSAGE,
+                        False,
+                        "orchestrator.error",
+                    )
+                )
             if terminal_failure_kind is not None:
                 orchestration_failures.append(
                     ExecutionFailure(
@@ -2388,6 +3193,7 @@ class BatchRunner:
             if (
                 terminal_failure_kind is None
                 and outcome.callback_error is not None
+                and not outcome.credential_output_rejected
             ):
                 orchestration_failures.append(
                     ExecutionFailure(
@@ -2437,15 +3243,50 @@ class BatchRunner:
                         "orchestrator.error",
                     )
                 )
-            output_read = _read_output(
+            output_read = _capture_output(
+                provider_snapshot,
                 output_path,
                 invocation.role,
                 self.structured_output_limit_bytes,
                 contract_version=invocation.contract_version,
+                protected_credentials=protected_credentials,
             )
+            if output_read.credential_rejected:
+                outcome = replace(
+                    outcome,
+                    returncode=(
+                        outcome.returncode
+                        if outcome.returncode != 0
+                        else 1
+                    ),
+                    callback_error=_CREDENTIAL_OUTPUT_REJECTION_MESSAGE,
+                    credential_output_rejected=True,
+                )
+                if not any(
+                    failure.kind == "credential_output_rejected"
+                    for failure in orchestration_failures
+                ):
+                    orchestration_failures.append(
+                        ExecutionFailure(
+                            "credential_output_rejected",
+                            _CREDENTIAL_OUTPUT_REJECTION_MESSAGE,
+                            False,
+                            "orchestrator.error",
+                        )
+                    )
             validation = output_read.validation
             raw_output = output_read.payload
-            if validation.value is not None:
+            if outcome.credential_output_rejected:
+                validation = ContractValidation(
+                    False,
+                    (
+                        "$: model process output contained a protected "
+                        "credential",
+                    ),
+                    None,
+                )
+                raw_output = None
+            elif validation.value is not None:
                 accumulator.scan_final(validation.value)
             elif raw_output is not None:
                 accumulator.scan_final(raw_output)
@@ -2468,6 +3309,9 @@ class BatchRunner:
                         "capture_complete": (
                             outcome.stdout_capture_complete
                         ),
+                        "credential_rejected": (
+                            stdout_capture.credential_rejected
+                        ),
                         "oversized_event_lines": stdout_capture.oversized_event_lines,
                     },
                     "stderr": {
@@ -2485,11 +3329,33 @@ class BatchRunner:
                         "capture_complete": (
                             outcome.stderr_capture_complete
                         ),
+                        "credential_rejected": (
+                            stderr_credential_rejected
+                        ),
                     },
                     "structured_output": {
                         "limit_bytes": self.structured_output_limit_bytes,
-                        "bytes": output_read.bytes,
+                        "bytes": provider_snapshot.bytes,
+                        "stored_bytes": len(provider_snapshot.prefix),
+                        "truncated": (
+                            (
+                                provider_snapshot.bytes
+                                > len(provider_snapshot.prefix)
+                            )
+                            if provider_snapshot.capture_complete
+                            and provider_snapshot.bytes is not None
+                            else None
+                        ),
+                        "truncation_known": (
+                            provider_snapshot.capture_complete
+                        ),
+                        "capture_complete": (
+                            provider_snapshot.capture_complete
+                        ),
                         "oversized": output_read.oversized,
+                        "credential_rejected": (
+                            output_read.credential_rejected
+                        ),
                     },
                     "event_accumulator": {
                         "event_limit": self.event_count_limit,
@@ -2507,6 +3373,7 @@ class BatchRunner:
                         "suppressed_matches": detector.suppressed_matches,
                     },
                 },
+                maximum_bytes=DEFAULT_CAPTURE_METADATA_LIMIT_BYTES,
             )
             if (
                 budget_deadline_monotonic is not None
@@ -2635,7 +3502,19 @@ class BatchRunner:
                 - now
             )
         created_at = session_created_at if session_created_at is not None else now
-        message = f"{type(error).__name__}: {error}"
+        message, credential_rejected = _redact_credential_text(
+            _bounded_exception_message(error),
+            host_credential_values(),
+        )
+        credential_rejected = (
+            credential_rejected
+            or isinstance(error, CredentialSafetyError)
+        )
+        if credential_rejected:
+            message = (
+                "model command or output was rejected by the credential "
+                "safety boundary"
+            )
         validation = ContractValidation(False, (f"$: orchestration failure: {message}",), None)
         return BatchResult(
             invocation=invocation,
@@ -2648,7 +3527,14 @@ class BatchRunner:
             usage=Usage(),
             failures=(
                 ExecutionFailure(
-                    "orchestration_error", message, False, "orchestrator.error"
+                    (
+                        "credential_safety_rejected"
+                        if credential_rejected
+                        else "orchestration_error"
+                    ),
+                    message,
+                    False,
+                    "orchestrator.error",
                 ),
             ),
             flag_candidates=(),

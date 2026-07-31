@@ -47,9 +47,12 @@ from ctf_os.sandbox.files import (
     copy_bounded_regular,
     measure_work_tree,
     read_bounded_regular,
+    read_bounded_regular_unbound,
     read_regular_prefix,
 )
 from ctf_os.sandbox.types import (
+    BackgroundLaunchState,
+    BackgroundLaunchStatus,
     BackgroundJobUnsupported,
     ChallengeScope,
     CommandSpec,
@@ -100,8 +103,19 @@ class _FakeClient:
             stderr_path="/work/.ctf/runs/run-00000001/stderr.log",
         )
 
-    def start_job(self, spec, *, name=None):
-        return JobRef("job-00000001", self._fingerprint)
+    def start_job(self, spec, *, name=None, supervisor_id=None):
+        del spec, name
+        return JobRef(
+            "job-00000001",
+            self._fingerprint,
+            supervisor_id=supervisor_id,
+        )
+
+    def recover_job_launch(self, supervisor_id):
+        return BackgroundLaunchStatus(
+            supervisor_id,
+            BackgroundLaunchState.ABSENT,
+        )
 
     def job_status(self, ref):
         raise AssertionError("cross-scope request reached backend")
@@ -3153,6 +3167,30 @@ class SandboxTests(unittest.TestCase):
                 expected_size=len(payload),
             )
 
+    def test_unbound_bounded_read_returns_stable_bytes_without_copy(
+        self,
+    ) -> None:
+        source_root = self.root / "unbound-bounded-read"
+        source_root.mkdir()
+        payload = b"derive the digest from these exact bytes"
+        (source_root / "source.bin").write_bytes(payload)
+
+        self.assertEqual(
+            read_bounded_regular_unbound(
+                source_root,
+                "source.bin",
+                maximum_bytes=len(payload),
+            ),
+            payload,
+        )
+        (source_root / "link.bin").symlink_to("source.bin")
+        with self.assertRaises(SafeFileError):
+            read_bounded_regular_unbound(
+                source_root,
+                "link.bin",
+                maximum_bytes=len(payload),
+            )
+
     def test_prefix_read_is_exact_bounded_and_nofollow(self) -> None:
         source_root = self.root / "prefix-read-source"
         nested = source_root / "nested"
@@ -3393,6 +3431,68 @@ class SandboxTests(unittest.TestCase):
             list(destination.parent.glob(".*.tmp")),
             [],
         )
+
+    def test_bounded_copy_admits_safely_opened_size_before_writing(
+        self,
+    ) -> None:
+        source_root = self.root / "admitted-copy-source"
+        source_root.mkdir()
+        payload = b"descriptor-bound snapshot"
+        source = source_root / "source.bin"
+        source.write_bytes(payload)
+        destination = self.root / "admitted-copy" / "snapshot.bin"
+        observed_sizes: list[int] = []
+
+        def admit(size: int) -> None:
+            observed_sizes.append(size)
+            self.assertFalse(destination.parent.exists())
+
+        copied = copy_bounded_regular(
+            source_root,
+            source.name,
+            destination,
+            source_size_admission=admit,
+        )
+
+        self.assertEqual(observed_sizes, [len(payload)])
+        self.assertEqual(copied.size_bytes, len(payload))
+        self.assertEqual(destination.read_bytes(), payload)
+
+    def test_bounded_copy_rejects_growth_before_extra_byte_is_written(
+        self,
+    ) -> None:
+        source_root = self.root / "admitted-growth-source"
+        source_root.mkdir()
+        source = source_root / "source.bin"
+        original = b"initial"
+        source.write_bytes(original)
+        destination = self.root / "admitted-growth" / "snapshot.bin"
+
+        def grow_after_admission(size: int) -> None:
+            self.assertEqual(size, len(original))
+            source.write_bytes(original + b"-growth")
+
+        with (
+            patch.object(
+                sandbox_files.os,
+                "write",
+                wraps=sandbox_files.os.write,
+            ) as writes,
+            self.assertRaisesRegex(
+                SafeFileError,
+                "grew beyond its admitted size",
+            ),
+        ):
+            copy_bounded_regular(
+                source_root,
+                source.name,
+                destination,
+                source_size_admission=grow_after_admission,
+            )
+
+        writes.assert_not_called()
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
 
     def test_bounded_copy_zero_write_fails_cleanly_and_recovers(
         self,
@@ -4243,6 +4343,96 @@ class SandboxTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
         self.assertFalse(socket_path.exists())
+
+    def test_unix_background_preallocated_identity_round_trip(
+        self,
+    ) -> None:
+        service = SandboxService(CapabilityAuthority(b"x" * 32))
+        service.register(_FakeClient(self.scope_a.fingerprint))
+        token = service.issue(self.scope_a.fingerprint)
+        socket_path = self.root / "runtime-background" / "ctfosd.sock"
+        server = UnixSandboxServer(socket_path, service)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        supervisor_id = "bg-" + "7" * 32
+        try:
+            client = UnixChallengeSandboxClient(
+                socket_path,
+                token,
+                self.scope_a.fingerprint,
+            )
+            ref = client.start_job(
+                CommandSpec(("sleep", "1")),
+                supervisor_id=supervisor_id,
+            )
+            self.assertEqual(ref.supervisor_id, supervisor_id)
+            recovered = client.recover_job_launch(supervisor_id)
+            self.assertIs(
+                recovered.state,
+                BackgroundLaunchState.ABSENT,
+            )
+            self.assertEqual(recovered.supervisor_id, supervisor_id)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+        self.assertFalse(socket_path.exists())
+
+    def test_daemon_rejects_malformed_or_mismatched_supervisor_identity(
+        self,
+    ) -> None:
+        class MismatchingClient(_FakeClient):
+            def start_job(
+                inner_self,
+                spec,
+                *,
+                name=None,
+                supervisor_id=None,
+            ):
+                del spec, name, supervisor_id
+                return JobRef(
+                    "job-00000001",
+                    inner_self.scope_fingerprint,
+                    supervisor_id="bg-" + "8" * 32,
+                )
+
+        service = SandboxService(CapabilityAuthority(b"x" * 32))
+        service.register(MismatchingClient(self.scope_a.fingerprint))
+        token = service.issue(self.scope_a.fingerprint)
+
+        for supervisor_id, expected in (
+            ("../escape", "invalid background supervisor identity"),
+            (
+                "bg-" + "7" * 32,
+                "another supervisor identity",
+            ),
+        ):
+            with self.subTest(supervisor_id=supervisor_id):
+                response = json.loads(
+                    service.handle_bytes(
+                        (
+                            json.dumps(
+                                {
+                                    "schema_version": 1,
+                                    "token": token,
+                                    "operation": "start_job",
+                                    "params": {
+                                        "command": {
+                                            "argv": ["sleep", "1"],
+                                        },
+                                        "supervisor_id": supervisor_id,
+                                    },
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                )
+                self.assertFalse(response["ok"])
+                self.assertIn(
+                    expected,
+                    response["error"]["message"],
+                )
 
     def test_unix_client_keeps_rpc_open_through_cleanup_grace(self) -> None:
         started = threading.Event()

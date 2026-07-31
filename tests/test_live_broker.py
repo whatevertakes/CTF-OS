@@ -50,7 +50,13 @@ from ctf_os.models import (
     ProgressMarker,
     Provenance,
 )
-from ctf_os.sandbox import ArtifactRef, SandboxResult
+from ctf_os.sandbox import (
+    ArtifactRef,
+    JobRef,
+    JobState,
+    JobStatus,
+    SandboxResult,
+)
 from ctf_os.sandbox.daemon import CapabilityAuthority
 from ctf_os.store import ChallengeLock
 
@@ -174,6 +180,62 @@ class LiveBrokerTests(unittest.TestCase):
                     self.identity,
                     timeout=timeout,  # type: ignore[arg-type]
                 )
+
+    def test_background_quota_reason_is_visible_in_list_and_status(
+        self,
+    ) -> None:
+        service, token = self._service()
+        state = self.engine.store.load(self.identity)
+        ref = JobRef(
+            "job-00000001",
+            "a" * 64,
+            supervisor_id="bg-" + "b" * 32,
+        )
+        status = JobStatus(
+            ref,
+            JobState.FAILED,
+            reason_code="work_tree_quota_exceeded",
+        )
+
+        def dispatch(params: dict[str, object]) -> object:
+            return service.dispatch(
+                {
+                    "schema_version": 1,
+                    "token": token,
+                    "identity": self.identity.to_dict(),
+                    "operation": "jobs",
+                    "params": params,
+                }
+            )
+
+        with patch.object(
+            self.engine,
+            "list_background_jobs",
+            return_value=(state, (status,)),
+        ):
+            listed = dispatch({"action": "list"})
+        self.assertEqual(
+            listed["jobs"][0]["reason_code"],  # type: ignore[index]
+            "work_tree_quota_exceeded",
+        )
+
+        with patch.object(
+            self.engine,
+            "background_job_status",
+            return_value=(state, status),
+        ):
+            observed = dispatch(
+                {
+                    "action": "status",
+                    "job_id": ref.job_id,
+                    "runtime_id": ref.runtime_id,
+                    "supervisor_id": ref.supervisor_id,
+                }
+            )
+        self.assertEqual(
+            observed["reason_code"],  # type: ignore[index]
+            "work_tree_quota_exceeded",
+        )
 
     def test_broker_reserves_operator_fact_and_abandoned_for_operator_paths(
         self,
@@ -2232,8 +2294,16 @@ class LiveBrokerTests(unittest.TestCase):
                             "request_id": request_id,
                             "token": token,
                             "identity": self.identity.to_dict(),
-                            "operation": "inspect",
-                            "params": {"section": "candidates"},
+                            # This test exercises the single mutation-lane
+                            # ownership handoff. ``inspect`` moved to the
+                            # bounded read lane, so use a real state mutation
+                            # instead of asserting mutation-lane state for a
+                            # read-only request.
+                            "operation": "agent.progress",
+                            "params": {
+                                "statement": "submit handoff ownership",
+                                "artifact_ids": [],
+                            },
                         }
                         try:
                             self._publish_mailbox_file(

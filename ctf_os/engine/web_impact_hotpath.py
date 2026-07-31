@@ -19,7 +19,7 @@ import secrets
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from urllib.parse import urlsplit
 
 from ctf_os.director.resources import ResourceVector
@@ -55,6 +55,7 @@ from ctf_os.engine.web_impact_execution import (
     parse_web_impact_operator_spec,
     plan_web_impact_execution,
 )
+from ctf_os.engine.hotpath_cleanup import HotPathCleanupTracker
 from ctf_os.engine.web_impact_state import (
     WEB_IMPACT_STATE_PROTOCOL,
     WebImpactStateIds,
@@ -497,8 +498,9 @@ def _copy_snapshot_to_workspace(
     state_root: Path,
     snapshot: _Snapshot,
     destination: Path,
+    *,
+    source_size_admission: Callable[[int], None],
 ) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         copy_bounded_regular(
             state_root,
@@ -507,6 +509,7 @@ def _copy_snapshot_to_workspace(
             maximum_bytes=WEB_IMPACT_MAX_ARTIFACT_BYTES,
             expected_sha256=snapshot.sha256,
             expected_size=snapshot.size_bytes,
+            source_size_admission=source_size_admission,
             mode=0o400,
         )
     except (OSError, SafeFileError, ValueError) as error:
@@ -880,6 +883,87 @@ def prove_web_impact(
 ) -> tuple[ChallengeState, WebImpactExecutionEvaluation]:
     """Execute one explicit Web impact proof without candidate authority."""
 
+    preissue_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=(
+            engine.config.runtime.challenge_storage_quota_bytes
+        ),
+    )
+    replay_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=engine.config.runtime.work_tree_max_bytes,
+    )
+    failure: BaseException | None = None
+    try:
+        return _prove_web_impact(
+            engine,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            driver_locator=driver_locator,
+            hypothesis_ids=hypothesis_ids,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+            _preissue_cleanup=preissue_cleanup,
+            _replay_cleanup=replay_cleanup,
+        )
+    except BaseException as error:
+        failure = error
+        attempt_id = preissue_cleanup.attempt_id
+        if attempt_id is not None:
+            try:
+                current = engine.store.load(identity, recover=False)
+                attempts = current.extra.get("web_impact_preissues")
+                committed = (
+                    type(attempts) is dict and attempt_id in attempts
+                )
+            except BaseException as inspection_error:
+                error.add_note(
+                    "Web impact preissue cleanup was skipped because canonical "
+                    "state could not be inspected: "
+                    f"{type(inspection_error).__name__}"
+                )
+                committed = True
+            if not committed:
+                try:
+                    preissue_cleanup.cleanup(
+                        engine,
+                        identity,
+                        cause=error,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "Web impact preissue cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+        raise
+    finally:
+        try:
+            replay_cleanup.cleanup(
+                engine,
+                identity,
+                cause=failure,
+            )
+        except BaseException as cleanup_error:
+            if failure is None:
+                raise
+            failure.add_note(
+                "Web impact replay workspace cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
+def _prove_web_impact(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    operator_spec_locator: str,
+    driver_locator: str,
+    hypothesis_ids: tuple[str, ...] = (),
+    timeout_seconds: int = 900,
+    _session_owned: bool = False,
+    _preissue_cleanup: HotPathCleanupTracker,
+    _replay_cleanup: HotPathCleanupTracker,
+) -> tuple[ChallengeState, WebImpactExecutionEvaluation]:
     # Import lazily to avoid a module cycle at ChallengeEngine definition time.
     from ctf_os.engine.challenge import (
         EngineError,
@@ -901,7 +985,7 @@ def prove_web_impact(
             ) from error
         try:
             engine._recover_session_boundary(identity)
-            return prove_web_impact(
+            return _prove_web_impact(
                 engine,
                 identity,
                 operator_spec_locator=operator_spec_locator,
@@ -909,10 +993,13 @@ def prove_web_impact(
                 hypothesis_ids=hypothesis_ids,
                 timeout_seconds=timeout_seconds,
                 _session_owned=True,
+                _preissue_cleanup=_preissue_cleanup,
+                _replay_cleanup=_replay_cleanup,
             )
         finally:
             lock.release()
 
+    engine._enforce_storage_admission(identity)
     state = engine.store.load(identity)
     if (
         state.category != "web"
@@ -941,18 +1028,25 @@ def prove_web_impact(
 
     paths = engine.store.challenge_paths(identity)
     attempt_id = _new_id("web-impact")
+    _preissue_cleanup.set_attempt_id(attempt_id)
     attempt_root = ensure_private_directory(
         paths.artifacts / "web-impact"
     )
     input_root = ensure_private_directory(
         attempt_root / "inputs" / attempt_id
     )
+    _preissue_cleanup.track_tree(paths.root, input_root)
     initial_client = engine.sandbox(
         state,
         network_policy_override=NetworkPolicy.deny_all(),
     )
     spec_artifact_id = _new_id("A-web-spec")
     driver_artifact_id = _new_id("A-web-driver")
+    _preissue_cleanup.track_file(
+        paths.root,
+        attempt_root / f"{spec_artifact_id}.json",
+        artifact_id=spec_artifact_id,
+    )
     spec_snapshot = _snapshot_workspace_input(
         engine,
         state,
@@ -1171,16 +1265,27 @@ def prove_web_impact(
     request_payloads: list[bytes] = []
     request_paths: list[str] = []
     for request in execution_plan.requests:
-        run_paths = engine.store.create_run(
-            identity,
-            request.run_id,
-            request={
-                "protocol": WEB_IMPACT_HOTPATH_PROTOCOL,
-                "web_impact_request": request.to_dict(),
-                "web_impact_request_sha256": request.request_sha256,
-            },
-            base_revision=state.revision,
-        )
+        run_root = paths.runs / request.run_id
+        try:
+            run_paths = engine.store.create_run(
+                identity,
+                request.run_id,
+                request={
+                    "protocol": WEB_IMPACT_HOTPATH_PROTOCOL,
+                    "web_impact_request": request.to_dict(),
+                    "web_impact_request_sha256": request.request_sha256,
+                },
+                base_revision=state.revision,
+            )
+        finally:
+            try:
+                _preissue_cleanup.track_tree(
+                    paths.root,
+                    run_root,
+                    run_id=request.run_id,
+                )
+            except FileNotFoundError:
+                pass
         request_payload = run_paths.request.read_bytes()
         payload = strict_json_loads(
             request_payload,
@@ -1321,6 +1426,7 @@ def prove_web_impact(
     transports: list[WebImpactReplayTransportObservation] = []
     replay_wall_seconds: dict[str, float] = {}
     created_capture_paths: list[Path] = []
+    graph_committed = False
     try:
         inputs_by_locator = _snapshot_by_locator(
             selected_input_snapshots
@@ -1333,6 +1439,7 @@ def prove_web_impact(
             selected_replay_ids,
             strict=True,
         ):
+            _replay_cleanup.cleanup(engine, identity)
             verify_preissue()
             latest = engine.store.load(identity, recover=False)
             if latest.configuration_epoch != state.configuration_epoch:
@@ -1353,6 +1460,10 @@ def prove_web_impact(
                 / attempt_id
                 / ids.run_id
                 / "work"
+            )
+            _replay_cleanup.track_tree(
+                paths.root,
+                paths.runtime / "web-impact-live" / attempt_id,
             )
             if any(work.iterdir()):
                 raise WebImpactHotPathError(
@@ -1413,6 +1524,12 @@ def prove_web_impact(
                         paths.root,
                         body_snapshot,
                         body_destination,
+                        source_size_admission=lambda size: (
+                            engine._enforce_storage_admission(
+                                identity,
+                                requested_bytes=size,
+                            )
+                        ),
                     )
                     body_path = (
                         "/work/web-impact-inputs/"
@@ -1432,6 +1549,10 @@ def prove_web_impact(
                     parents=True,
                     exist_ok=True,
                     mode=0o700,
+                )
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=len(request_capture),
                 )
                 atomic_write_bytes(
                     request_capture_path,
@@ -1688,6 +1809,10 @@ def prove_web_impact(
                 capture_root / f"{ids.trace_artifact_id}.bin"
             )
             created_capture_paths.append(trace_destination)
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=len(trace_payload),
+            )
             atomic_write_bytes(
                 trace_destination,
                 trace_payload,
@@ -1799,6 +1924,10 @@ def prove_web_impact(
                 engine.store.run_paths(identity, request.run_id).root
                 / "web-impact-receipt.json"
             )
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=len(receipt.canonical_bytes),
+            )
             atomic_write_bytes(
                 receipt_path,
                 receipt.canonical_bytes,
@@ -1863,16 +1992,26 @@ def prove_web_impact(
             attempt_root
             / f"{state_ids.evaluation_artifact_id}.json"
         )
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(execution_plan.canonical_bytes),
+        )
         atomic_write_bytes(
             plan_path,
             execution_plan.canonical_bytes,
             mode=0o400,
+        )
+        created_capture_paths.append(plan_path)
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(evaluation.canonical_bytes),
         )
         atomic_write_bytes(
             evaluation_path,
             evaluation.canonical_bytes,
             mode=0o400,
         )
+        created_capture_paths.append(evaluation_path)
         final_base = engine.store.load(identity, recover=False)
         projection_ids = state_ids
         if not evaluation.confirmed:
@@ -2060,9 +2199,37 @@ def prove_web_impact(
             expected_revision=final_base.revision,
             pre_replace_guard=verify_final,
         )
+        graph_committed = True
         validate_web_impact_state_graph(committed)
         return committed, evaluation
     except BaseException as error:
+        cleanup_artifacts: list[ArtifactReference] = []
+        for path in created_capture_paths:
+            try:
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(paths.root).as_posix()
+            except (OSError, ValueError):
+                continue
+            cleanup_artifacts.append(
+                ArtifactReference(
+                    id=path.stem,
+                    path=relative,
+                    sha256="0" * 64,
+                )
+            )
+        if cleanup_artifacts and not graph_committed:
+            try:
+                engine._cleanup_uncommitted_artifacts(
+                    identity,
+                    tuple(cleanup_artifacts),
+                    cause=error,
+                )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Web impact uncommitted artifact cleanup failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
         _terminalize(engine, identity, attempt_id, error)
         raise
 

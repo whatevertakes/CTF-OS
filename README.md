@@ -897,6 +897,56 @@ ctfos tool run \
   -- curl -i https://challenge.example/
 ```
 
+서로 독립적인 로컬 분석은 운영자가 standalone CLI에서 `--read-only`를
+명시했을 때만 동시에 실행할 수 있습니다. 여기서 read-only는 명령 자체가
+파일을 쓰지 않는다는 뜻이 아니라 **canonical challenge workspace를 직접
+mount하거나 수정하지 않는다**는 뜻입니다. 명령에 필요한 파일은 canonical
+`artifacts/workspace/` 기준 상대 locator를 `--input`으로 하나씩 선언합니다.
+locator는 반복할 수 있지만 argv에서 입력을 추론하거나 workspace 전체를 자동
+선택하지 않습니다.
+
+```sh
+ctfos tool run \
+  --contest 'Demo CTF' --category rev --challenge 'Example' \
+  --read-only \
+  --input samples/app.exe \
+  --input notes/known-prefix.bin \
+  -- rizin -A samples/app.exe
+```
+
+각 실행은 challenge-scoped private work tree로 선언된 regular file만 안전하게
+복사하고, 서로 다른 reader는 sandbox 실행 구간에서 겹칠 수 있습니다. 기존
+`ctfos tool run`은 계속 exclusive writer이며 reader가 살아 있는 동안 시작되지
+않습니다. 반대로 managed/Live session이나 active background job이 있으면 새
+reader도 fail-closed합니다. Live broker는 `read_only`/`input_locators` 필드를
+검증해 전달하지만 현재의 long-lived Live session에서는
+`read_only_analysis_unavailable_in_live_session`으로 명시적으로 거부합니다.
+따라서 실제 동시 분석은 standalone operator CLI 전용입니다.
+이 모드는 receipt와 typed run binding을 보존할 수 있는 현재 state schema에서만
+동작합니다. 아직 upgrade되지 않은 legacy state는 어떤 experiment, run, lease,
+private tree도 만들기 전에
+`read_only_analysis_requires_current_state_schema`로 거부합니다.
+
+reader admission은 locator의 사전 크기를 quota 근거로 신뢰하지 않고 private
+work-tree 상한 전체와 stdout/stderr/result promotion peak를 보수적으로
+예약합니다. 완료 후 private stdout, stderr, exact `result.json`을 immutable
+artifact로 승격합니다. sidecar는 transport 결과뿐 아니라 issued timeout을
+초과하지 않는 backend가 직접 결속한 실제 clamped timeout, strict UTC RFC
+3339 시작/종료 시각, duration, 그리고
+`status`/`exit_code`/`timed_out` 조합까지 일치할 때만 canonical state를 짧게
+commit합니다. wrapper 시작/종료 시각은 engine이 관측한 sandbox 호출 시간
+창도 벗어날 수 없습니다. final state replace 직후 operator interrupt가
+발생해도 exact run, receipt, artifact ID와 SHA-256 binding을 durable state에서
+다시 증명한 뒤에만
+승격 파일을 canonical evidence로 남깁니다. runtime/container 부재와 exact
+private-tree 삭제를 증명한 뒤에만 reservation을 0으로 반환합니다. 정리를
+증명할 수 없으면 명령은
+실패하고 lease는 `cleanup_pending`과 reservation을 유지합니다. read-only
+분석은 foreground one-shot만 지원하며 `tool start`로 우회할 수 없습니다.
+flag 후보는 mutable private stream을 tail하지 않습니다. sandbox credential
+audit와 immutable promotion이 끝난 직후, proof/evaluation 및 canonical state
+commit 전의 검증된 snapshot에서 탐지해 운영자에게 즉시 출력합니다.
+
 문제별 원격 요청에는 사전에 등록한 target을 `--target`으로 명시해야
 합니다.
 
@@ -933,14 +983,33 @@ summary tail로 따로 유지합니다. `stream-capture.json`, `result.json`과
 문제별 누적 `.ctfos` 저장소는 별도의 bounded inventory로 계측합니다.
 `runtime.challenge_storage_quota_bytes` 기본값은 64 GiB이며 문제 범위의
 `runs/`, `artifacts/`(가역 quarantine 포함), `proof/`, `runtime/`,
-`context/`, `knowledge/`, `exports/`를 모두 포함합니다. 이 중
+`context/`(`context/current.md` 제외), `knowledge/`, `exports/`를 모두
+포함합니다. 이 중
 `runtime/`, `context/`, `knowledge/`, `exports/`는 연속성·정본·운영자
 산출물을 보존하는 root이므로 항상 reachable/canonical이며 GC와 영구
 purge의 대상이 아닙니다. 문제 root의 `state.json`, `state.prev.json`,
 `events.jsonl` 같은 control file과 contest 공용 `submissions.jsonl`은 이
-quota에 포함되지 않습니다. scan은 기본 100,000 entry와 256 GiB
+quota에 포함되지 않습니다. `context/current.md`도 canonical state에서
+재생성되는 유일한 context control view라 quota에서는 제외하지만, scanner는
+nofollow/single-link/race 검증과 16 MiB hard cap을 계속 적용하고 제외 byte를
+inventory의 `control.quota_exempt_bytes`에 별도로 표시합니다. immutable
+`context/history/` run archive는 계속 quota에 포함됩니다. scan은 기본
+100,000 entry와 256 GiB
 관찰량에서 중단하며, symlink·special file·hardlink 또는 scan 한계 때문에
 exact total을 증명할 수 없으면 quota 판정을 fail-closed합니다.
+`ctfos export`는 session lock 아래 메모리에서 만든 JSON/Markdown의 실제
+atomic generation byte를 admission에 사용합니다. 다만 미완료 closure intent를
+먼저 복구해야 하는 export와 `ctfos close`의 assembling/ready recovery
+transaction은 쓰기 전에 최종 projection을 확정할 수 없으므로 문서별 16 MiB
+hard bound를 보수적으로 예약합니다. 따라서 quota 경계에서는 실제 최종 파일이
+더 작아도 거부될 수 있으며, 이 false reject는 recovery 파일을 quota 밖에 쓰는
+대신 선택한 fail-closed tradeoff입니다.
+실행 중인 background job은 각 job의 `work_tree_max_bytes`를 canonical
+state에 보수적인 admission reservation으로 더합니다. `LOST`나
+`cleanup_pending` 관측만으로 이 reservation을 해제하지 않으며, 신뢰
+supervisor가 exact runtime 제거와 lease 반환을 끝내 `ABSENT` 또는
+`RELEASED`를 증명한 뒤에만 0으로 전이합니다. 이는 동시 시작을 막는
+회계 상한이지 커널의 실시간 write 제한은 아닙니다.
 
 ```sh
 ctfos storage inventory 'Demo CTF' rev 'VM'
@@ -959,6 +1028,16 @@ ctfos storage purge 'Demo CTF' rev 'VM' QUARANTINE_ID \
 `ctfos gc`는 항상 가역 이동만 수행합니다. 영구 purge는 준비 manifest의
 identity, 파일 집합, digest와 confirmation을 다시 검증하며, 중단된 이동,
 복구 및 purge tombstone은 재실행 시 동일 문제 범위 안에서 조정됩니다.
+이동할 unreachable 파일이 없으면 `status=noop`,
+`reason=no_unreachable_files`, `quarantine_id=null`을 반환하며 data/control
+quarantine directory를 만들지 않습니다.
+quota가 이미 초과된 문제도 복구할 수 있도록 새 GC manifest와 purge progress는
+artifact data와 분리된 engine-owned `.storage-gc/<quarantine-id>/` control
+plane에 둡니다. 이 예외 저장소는 current-UID private directory,
+descriptor-relative nofollow 접근, single-link JSON, 문서별 16/32 MiB 제한과
+문제별 aggregate 256 MiB/2,048-entry hard cap을 모두 통과해야 합니다. 기존
+`artifacts/quarantine/<id>/manifest.json|purge.json` layout은 읽기·갱신
+fallback으로 유지합니다.
 
 도구 실행, flag callback, artifact scan 또는 결과 commit이 실패하면 해당
 실험은 canonical state에서 `FAILED`와 failed run으로 종결됩니다. 진단용
@@ -995,6 +1074,10 @@ sandbox interface에는 lease-bound start/status/log/cancel/recover가
 lease는 image job이 terminal status를 기록하고 그 exact runtime을 제거할
 때까지 유지됩니다. 일반 foreground 명령에서 `ctf-bg`, `setsid`, `nohup`,
 shell `&`를 우회 호출하는 경로는 계속 거부됩니다.
+supervisor는 terminal 관측 뒤 `/work`를 다시 계측하며 상한 초과를
+`FAILED` receipt로 남긴 다음 exact runtime 제거와 lease 반환을
+완료합니다. 이후 `status`, `list`, `recover`는 제거된 Docker runtime의
+`LOST` 관측으로 이 신뢰 terminal 실패를 덮어쓰지 않습니다.
 
 ```sh
 ctfos tool start \
@@ -1009,7 +1092,7 @@ launch 결과에는 `job_id`, scope fingerprint, runtime ID와 무작위
 
 ```sh
 # 모든 receipt를 조회하면서 죽은 host monitor를 fail-closed reconcile
-ctfos jobs 'Demo CTF' forensic Memory
+ctfos jobs 'Demo CTF' forensic Memory --recover
 
 # bounded tail
 ctfos jobs 'Demo CTF' forensic Memory \
@@ -1378,9 +1461,11 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
 - `work_tree_max_bytes`와 문제별 누적 storage quota는 커널 filesystem
   quota가 아닙니다. 한 명령이 실행 중에 상한을 일시 초과할 수 있으며,
   문제 root control file과 contest 공용 `submissions.jsonl`은 문제별
-  quota에 포함되지 않습니다. 보존 root인 `runtime/`, `context/`,
-  `knowledge/`, `exports/`의 byte는 quota에는 포함하지만 GC/purge에는
-  포함하지 않습니다. Work-tree와 누적 storage scan은 entry/byte 한계에서
+  quota에 포함되지 않습니다. bounded derived `context/current.md`와 hard-capped
+  `.storage-gc/` recovery metadata도 control-plane 예외이며, 보존 root인
+  `runtime/`, `context/`(`context/current.md` 제외), `knowledge/`,
+  `exports/`의 byte는 quota에는
+  포함하지만 GC/purge에는 포함하지 않습니다. Work-tree와 누적 storage scan은 entry/byte 한계에서
   즉시 중단하고 불완전한 계측을 통과로 해석하지 않습니다. GC는 자동
   retention이 아니라 운영자가 문제별로 명시하는 가역 quarantine입니다.
 - 자동 제출은 없습니다.

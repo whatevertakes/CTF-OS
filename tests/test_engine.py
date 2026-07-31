@@ -104,10 +104,12 @@ from ctf_os.scaffold_binding import (
     SCAFFOLD_LAUNCH_METADATA_KEY,
     parse_scaffold_launch_record,
 )
+from ctf_os.storage import storage_inventory
 from ctf_os.store import (
     ArtifactValidationError,
     ChallengeLock,
     RevisionConflict,
+    StateStore,
     WorkerResultValidationError,
     sha256_file,
 )
@@ -2176,7 +2178,11 @@ class EngineTests(unittest.TestCase):
             == "inventory_observation"
         )
         stdout_copies: list[tuple[str | None, int | None]] = []
+        bounded_reads: list[
+            tuple[str, str | None, int | None]
+        ] = []
         original_copy = challenge_module.copy_bounded_regular
+        original_read = challenge_module.read_bounded_regular
 
         def observing_copy(*args, **kwargs):
             copied = original_copy(*args, **kwargs)
@@ -2190,11 +2196,27 @@ class EngineTests(unittest.TestCase):
                 )
             return copied
 
+        def observing_read(*args, **kwargs):
+            payload = original_read(*args, **kwargs)
+            bounded_reads.append(
+                (
+                    str(args[1]),
+                    kwargs.get("expected_sha256"),
+                    kwargs.get("expected_size"),
+                )
+            )
+            return payload
+
         with (
             mock.patch.object(
                 challenge_module,
                 "copy_bounded_regular",
                 side_effect=observing_copy,
+            ),
+            mock.patch.object(
+                challenge_module,
+                "read_bounded_regular",
+                side_effect=observing_read,
             ),
             mock.patch.object(
                 challenge_module,
@@ -2321,31 +2343,23 @@ class EngineTests(unittest.TestCase):
             persisted_validation["partial_oracle"],
             semantic,
         )
-        self.assertEqual(len(stdout_copies), 2)
+        # Commit revalidation is read-only: writer callbacks must never make
+        # quota-accounted validation copies while the state lock is held.
+        self.assertEqual(stdout_copies, [])
         # Public execution refreshes ingest once before the run; the oracle
         # adds exactly one full inventory at commit, not one per phase.
         self.assertEqual(live_inventory.call_count, 2)
-        self.assertTrue(
-            all(
-                sha256 == fact.extra["partial_oracle_result"][
-                    "result"
-                ]["source_sha256"]
-                or sha256
-                == next(
-                    artifact.sha256
-                    for artifact in state.artifacts
-                    if artifact.id == fact.artifact_id
-                )
-                for sha256, _size in stdout_copies
-            )
-        )
         stdout_artifact = next(
             artifact
             for artifact in state.artifacts
             if artifact.id == fact.artifact_id
         )
         self.assertEqual(
-            stdout_copies,
+            [
+                (sha256, size)
+                for locator, sha256, size in bounded_reads
+                if locator == stdout_artifact.path
+            ],
             [
                 (stdout_artifact.sha256, stdout_artifact.size),
                 (stdout_artifact.sha256, stdout_artifact.size),
@@ -4307,6 +4321,266 @@ class EngineTests(unittest.TestCase):
             (prepared.working_directory / "AGENTS.md").is_file()
         )
 
+    def test_live_prepare_storage_admission_precedes_sandbox_and_files(
+        self,
+    ) -> None:
+        sandbox_calls = 0
+
+        def sandbox_factory(state, work, policy):
+            nonlocal sandbox_calls
+            del state, policy
+            sandbox_calls += 1
+            return FakeSandbox(work)
+
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=sandbox_factory,
+        )
+        state = engine.add_challenge(self.identity, prompt="solve")
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=1,
+            ),
+        )
+        workspace = (
+            engine.store.challenge_paths(state.identity).artifacts
+            / "workspace"
+        )
+
+        with self.assertRaisesRegex(EngineError, "storage quota"):
+            engine.prepare_live_session(self.identity)
+
+        self.assertEqual(sandbox_calls, 0)
+        self.assertFalse((workspace / "SESSION.md").exists())
+        self.assertFalse((workspace / "AGENTS.md").exists())
+
+    def test_public_live_prepare_obeys_the_challenge_session_lock(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        state = engine.add_challenge(self.identity, prompt="solve")
+        lock = ChallengeLock(
+            engine.store.challenge_paths(state.identity).runtime
+            / "session.lock",
+            timeout=0,
+        ).acquire()
+        try:
+            with self.assertRaises(SessionAlreadyRunning):
+                engine.prepare_live_session(self.identity)
+        finally:
+            lock.release()
+
+    def test_live_launch_admits_before_prompt_mutation(self) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        original = engine.add_challenge(
+            self.identity,
+            prompt="original prompt",
+        )
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=1,
+            ),
+        )
+        runner_calls = 0
+
+        def runner(*args, **kwargs):
+            nonlocal runner_calls
+            del args, kwargs
+            runner_calls += 1
+            return mock.Mock(returncode=0)
+
+        with self.assertRaisesRegex(EngineError, "storage quota"):
+            engine.launch_live(
+                self.identity,
+                prompt="must not be committed",
+                runner=runner,
+            )
+
+        self.assertEqual(runner_calls, 0)
+        self.assertEqual(
+            engine.store.load(self.identity).prompt,
+            original.prompt,
+        )
+
+    def test_live_launch_rejects_oversized_workspace_after_runner(
+        self,
+    ) -> None:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                work_tree_max_bytes=1024 * 1024,
+            ),
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+        runner_calls = 0
+
+        def runner(*args, **kwargs):
+            nonlocal runner_calls
+            del args
+            runner_calls += 1
+            workspace = Path(kwargs["cwd"])
+            with (workspace / "oversized-live.bin").open("wb") as handle:
+                handle.truncate(2 * 1024 * 1024)
+            return mock.Mock(returncode=0)
+
+        with self.assertRaisesRegex(
+            EngineError,
+            "Live session postcondition failed",
+        ):
+            engine.launch_live(self.identity, runner=runner)
+
+        self.assertEqual(runner_calls, 1)
+
+    def test_live_launch_preserves_runner_error_when_storage_is_valid(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        engine.add_challenge(self.identity, prompt="solve")
+        primary = OSError("runner transport failed")
+
+        def runner(*args, **kwargs):
+            del args, kwargs
+            raise primary
+
+        with self.assertRaises(OSError) as caught:
+            engine.launch_live(self.identity, runner=runner)
+
+        self.assertIs(caught.exception, primary)
+
+    def test_live_launch_chains_runner_and_storage_failures_boundedly(
+        self,
+    ) -> None:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                work_tree_max_bytes=1024 * 1024,
+            ),
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+        primary = OSError("runner failed: " + "x" * 5_000)
+
+        def runner(*args, **kwargs):
+            del args
+            workspace = Path(kwargs["cwd"])
+            with (workspace / "oversized-live.bin").open("wb") as handle:
+                handle.truncate(2 * 1024 * 1024)
+            raise primary
+
+        with self.assertRaises(EngineError) as caught:
+            engine.launch_live(self.identity, runner=runner)
+
+        message = str(caught.exception)
+        self.assertIn("Live session primary failure: OSError", message)
+        self.assertIn("Live session postcondition also failed", message)
+        self.assertLessEqual(len(message.encode("utf-8")), 1_802)
+        self.assertIs(caught.exception.__cause__, primary)
+
+    def test_live_launch_checks_storage_after_file_not_found(self) -> None:
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                work_tree_max_bytes=1024 * 1024,
+            ),
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+
+        def runner(*args, **kwargs):
+            del args
+            workspace = Path(kwargs["cwd"])
+            with (workspace / "oversized-live.bin").open("wb") as handle:
+                handle.truncate(2 * 1024 * 1024)
+            raise FileNotFoundError("codex")
+
+        with self.assertRaises(EngineError) as caught:
+            engine.launch_live(self.identity, runner=runner)
+
+        message = str(caught.exception)
+        self.assertIn("Codex CLI was not found on PATH", message)
+        self.assertIn("Live session postcondition also failed", message)
+
+    def test_live_launch_preserves_control_error_and_notes_storage_failure(
+        self,
+    ) -> None:
+        class StopLive(BaseException):
+            pass
+
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                work_tree_max_bytes=1024 * 1024,
+            ),
+        )
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=RoleExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+        primary = StopLive("operator interrupt")
+
+        def runner(*args, **kwargs):
+            del args
+            workspace = Path(kwargs["cwd"])
+            with (workspace / "oversized-live.bin").open("wb") as handle:
+                handle.truncate(2 * 1024 * 1024)
+            raise primary
+
+        with self.assertRaises(StopLive) as caught:
+            engine.launch_live(self.identity, runner=runner)
+
+        self.assertIs(caught.exception, primary)
+        notes = getattr(primary, "__notes__", [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Live session postcondition also failed", notes[0])
+        self.assertLessEqual(len(notes[0].encode("utf-8")), 1_024)
+
     def test_live_prepare_requires_prompt_before_any_runtime_setup(
         self,
     ) -> None:
@@ -4658,6 +4932,250 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(
             state.candidates[0].status,
             CandidateStatus.OBSERVED_CANDIDATE,
+        )
+
+    def test_wave_storage_admission_precedes_provider_and_keeps_width(
+        self,
+    ) -> None:
+        executor = RoleExecutor()
+        engine = self.engine_with_executor(executor)
+        engine.add_challenge(self.identity, prompt="solve")
+        real_admission = engine._enforce_storage_admission
+        nonzero_requests: list[int] = []
+
+        def observe_admission(identity, *, requested_bytes=None):
+            if requested_bytes:
+                self.assertEqual(executor.roles, [])
+                nonzero_requests.append(requested_bytes)
+            return real_admission(
+                identity,
+                requested_bytes=requested_bytes,
+            )
+
+        with mock.patch.object(
+            engine,
+            "_enforce_storage_admission",
+            side_effect=observe_admission,
+        ):
+            outcome = engine.run_wave(self.identity, "attack")
+
+        self.assertEqual(
+            nonzero_requests,
+            [
+                2 * engine.config.runtime.work_tree_max_bytes
+                + 3 * engine._model_run_storage_reservation_bytes()
+            ],
+        )
+        self.assertEqual(len(outcome.results), 3)
+        self.assertCountEqual(
+            executor.roles,
+            [Role.BUILDER, Role.FALSIFIER, Role.REPRODUCER],
+        )
+        self.assertEqual(executor.max_active, 1)
+
+    def test_read_only_wave_still_reserves_one_work_tree(self) -> None:
+        executor = RoleExecutor()
+        engine = self.engine_with_executor(executor)
+        engine.add_challenge(self.identity, prompt="solve")
+        real_admission = engine._enforce_storage_admission
+        nonzero_requests: list[int] = []
+
+        def observe_admission(identity, *, requested_bytes=None):
+            if requested_bytes:
+                self.assertEqual(executor.roles, [])
+                nonzero_requests.append(requested_bytes)
+            return real_admission(
+                identity,
+                requested_bytes=requested_bytes,
+            )
+
+        with mock.patch.object(
+            engine,
+            "_enforce_storage_admission",
+            side_effect=observe_admission,
+        ):
+            engine.run_wave(self.identity, "discovery")
+
+        self.assertEqual(
+            nonzero_requests,
+            [
+                engine.config.runtime.work_tree_max_bytes
+                + 3 * engine._model_run_storage_reservation_bytes()
+            ],
+        )
+        self.assertCountEqual(
+            executor.roles,
+            [Role.RECON, Role.SPECIALIST, Role.EXTRACTOR],
+        )
+
+    def test_wave_quota_rejects_before_run_files_or_provider(self) -> None:
+        executor = RoleExecutor()
+        engine = self.engine_with_executor(executor)
+        state = engine.add_challenge(self.identity, prompt="solve")
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=1,
+            ),
+        )
+
+        with self.assertRaisesRegex(EngineError, "storage quota"):
+            engine.run_wave(self.identity, "discovery")
+
+        self.assertEqual(executor.roles, [])
+        runs = engine.store.challenge_paths(state.identity).runs
+        self.assertEqual(list(runs.iterdir()), [])
+
+    def test_role_capture_reservation_rejects_before_run_or_provider(
+        self,
+    ) -> None:
+        executor = RoleExecutor()
+        engine = self.engine_with_executor(executor)
+        state = engine.add_challenge(self.identity, prompt="solve")
+        required = (
+            engine.config.runtime.work_tree_max_bytes
+            + engine._model_run_storage_reservation_bytes()
+        )
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=required - 1,
+            ),
+        )
+
+        with self.assertRaisesRegex(EngineError, "storage quota"):
+            engine.run_role(
+                self.identity,
+                Role.RECON,
+                instruction="inspect",
+            )
+
+        self.assertEqual(executor.roles, [])
+        runs = engine.store.challenge_paths(state.identity).runs
+        self.assertEqual(list(runs.iterdir()), [])
+
+    def test_invocation_setup_failure_cleans_run_and_context_archive(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        state = engine.add_challenge(self.identity, prompt="solve")
+        paths = engine.store.challenge_paths(state.identity)
+
+        with (
+            mock.patch(
+                "ctf_os.engine.challenge.atomic_write_bytes",
+                side_effect=OSError("injected request rewrite failure"),
+            ),
+            self.assertRaisesRegex(
+                OSError,
+                "injected request rewrite failure",
+            ),
+        ):
+            engine._make_invocation(
+                state,
+                Role.RECON,
+                prefix="cleanup",
+                instruction="inspect",
+                deadline_monotonic_seconds=time.monotonic() + 60,
+                deadline_epoch_seconds=time.time() + 60,
+            )
+
+        self.assertEqual(list(paths.runs.iterdir()), [])
+        self.assertEqual(list(paths.context_history.iterdir()), [])
+
+    def test_writable_model_overflow_is_failed_without_promotion(
+        self,
+    ) -> None:
+        class OversizedBuilderExecutor(RoleExecutor):
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                role = _role_for(command)
+                if role is not Role.BUILDER:
+                    return super().run(
+                        command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        on_stdout_line=on_stdout_line,
+                    )
+                payload = _payload(role)
+                source = Path(cwd) / "oversized-builder.bin"
+                with source.open("wb") as handle:
+                    handle.truncate(128 * 1024)
+                payload["artifacts"] = [
+                    {
+                        "path": source.name,
+                        "sha256": hashlib.sha256(
+                            source.read_bytes()
+                        ).hexdigest(),
+                        "purpose": "must not be promoted",
+                    }
+                ]
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        config = load_config(self.root)
+        config = replace(
+            config,
+            runtime=replace(
+                config.runtime,
+                work_tree_max_bytes=64 * 1024,
+            ),
+        )
+        executor = OversizedBuilderExecutor()
+        engine = ChallengeEngine(
+            self.root,
+            config=config,
+            batch_runner=BatchRunner(
+                process_executor=executor,
+                limiter=FifoModelCallLimiter(1),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine.add_challenge(self.identity, prompt="solve")
+
+        outcome = engine.run_wave(self.identity, "attack")
+
+        builder_result = next(
+            result
+            for result in outcome.results
+            if result.invocation.role is Role.BUILDER
+        )
+        state = engine.store.load(self.identity)
+        builder_run = next(
+            run for run in state.runs if run.role == Role.BUILDER.value
+        )
+        validation = json.loads(
+            engine.store.run_paths(
+                self.identity,
+                run_id=builder_run.id,
+            ).validation.read_text(encoding="utf-8")
+        )
+        self.assertFalse(builder_result.completed)
+        self.assertIsNone(builder_result.output)
+        self.assertIs(builder_run.status, RunStatus.FAILED)
+        self.assertFalse(validation["ok"])
+        self.assertIn("writable-workspace", validation["errors"][0])
+        self.assertLessEqual(
+            len(validation["errors"][0].encode("utf-8")),
+            2051,
+        )
+        self.assertFalse(
+            any(
+                artifact.source_run_id == builder_run.id
+                for artifact in state.artifacts
+            )
         )
 
     def test_queued_wave_yields_to_a_concurrent_operator_solution(
@@ -5869,6 +6387,98 @@ class EngineTests(unittest.TestCase):
             snapshots,
         )
 
+    def test_batch_duplicate_artifacts_recheck_quota_per_snapshot(
+        self,
+    ) -> None:
+        engine_holder: dict[str, ChallengeEngine] = {}
+
+        class DuplicateArtifactExecutor(RoleExecutor):
+            def run(
+                inner_self,
+                command,
+                *,
+                cwd,
+                timeout,
+                on_stdout_line,
+            ):
+                role = _role_for(command)
+                if role is not Role.BUILDER:
+                    return super().run(
+                        command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        on_stdout_line=on_stdout_line,
+                    )
+                content = b"D" * (16 * 1024)
+                source = Path(cwd) / "duplicate.bin"
+                source.write_bytes(content)
+                payload = _payload(role)
+                reported = {
+                    "path": source.name,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "purpose": "duplicate amplification regression",
+                }
+                payload["artifacts"] = [dict(reported), dict(reported)]
+                _output_path(command).write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                engine = engine_holder["engine"]
+                observed = storage_inventory(
+                    engine.store,
+                    self.identity,
+                    quota_bytes=1 << 40,
+                )["total_bytes"]
+                engine.config = replace(
+                    engine.config,
+                    runtime=replace(
+                        engine.config.runtime,
+                        challenge_storage_quota_bytes=(
+                            observed + 2 * len(content) - 1
+                        ),
+                    ),
+                )
+                return ProcessOutcome(0, "", 0.01)
+
+        engine = ChallengeEngine(
+            self.root,
+            batch_runner=BatchRunner(
+                process_executor=DuplicateArtifactExecutor(),
+                max_schema_retries=0,
+            ),
+            sandbox_factory=lambda state, work, policy: FakeSandbox(work),
+        )
+        engine_holder["engine"] = engine
+        engine.add_challenge(self.identity, prompt="solve")
+
+        result = engine.run_role(
+            self.identity,
+            Role.BUILDER,
+            instruction="produce duplicate evidence",
+        )
+
+        state = engine.store.load(self.identity)
+        run = next(item for item in state.runs if item.id == result.invocation.run_id)
+        self.assertIs(run.status, RunStatus.INVALID)
+        self.assertIn(
+            "snapshot admission failed",
+            str(run.extra["normalization_error"]),
+        )
+        self.assertFalse(
+            any(
+                artifact.source_run_id == run.id
+                for artifact in state.artifacts
+            )
+        )
+        snapshots = (
+            engine.store.challenge_paths(self.identity).artifacts
+            / "snapshots"
+        )
+        self.assertEqual(
+            list(snapshots.glob("*.bin")) if snapshots.exists() else [],
+            [],
+        )
+
     def test_batch_artifact_cap_failure_cleans_only_the_new_wave_snapshot(
         self,
     ) -> None:
@@ -5911,12 +6521,14 @@ class EngineTests(unittest.TestCase):
             config,
             runtime=replace(
                 config.runtime,
-                work_tree_max_bytes=24,
+                work_tree_max_bytes=64 * 1024,
             ),
         )
+        store = StateStore(self.root, max_artifact_bytes=24)
         engine = ChallengeEngine(
             self.root,
             config=config,
+            store=store,
             batch_runner=BatchRunner(
                 process_executor=BuilderArtifactExecutor(),
                 max_schema_retries=0,
@@ -5961,6 +6573,10 @@ class EngineTests(unittest.TestCase):
         self,
     ) -> None:
         class BuilderArtifactExecutor(RoleExecutor):
+            def __init__(inner_self) -> None:
+                super().__init__()
+                inner_self.symlink_target: Path | None = None
+
             def run(
                 inner_self,
                 command,
@@ -5979,8 +6595,12 @@ class EngineTests(unittest.TestCase):
                     )
                 payload = _payload(role)
                 source = Path(cwd) / "solve.py"
-                content = b"trusted builder output\n"
-                source.write_bytes(content)
+                if inner_self.symlink_target is None:
+                    content = b"trusted builder output\n"
+                    source.write_bytes(content)
+                else:
+                    source.symlink_to(inner_self.symlink_target)
+                    content = inner_self.symlink_target.read_bytes()
                 payload["artifacts"] = [
                     {
                         "path": "solve.py",
@@ -5998,7 +6618,8 @@ class EngineTests(unittest.TestCase):
             copy_bounded_regular as safe_copy,
         )
 
-        engine = self.engine_with_executor(BuilderArtifactExecutor())
+        executor = BuilderArtifactExecutor()
+        engine = self.engine_with_executor(executor)
         engine.add_challenge(self.identity, prompt="solve")
 
         def mutate_before_copy(
@@ -6044,19 +6665,23 @@ class EngineTests(unittest.TestCase):
         source.unlink()
         outside = self.root / "outside-worker-artifact"
         outside.write_bytes(b"outside")
-        source.symlink_to(outside)
+        executor.symlink_target = outside
         engine.run_wave(self.identity, "attack")
         state = engine.store.load(self.identity)
         builder_runs = [
             run for run in state.runs if run.role == Role.BUILDER.value
         ]
         self.assertEqual(len(builder_runs), 2)
-        self.assertTrue(
-            all(run.status is RunStatus.INVALID for run in builder_runs)
+        self.assertEqual(
+            [run.status for run in builder_runs],
+            [RunStatus.INVALID, RunStatus.FAILED],
         )
         self.assertIn(
-            "safely",
-            str(builder_runs[-1].extra["normalization_error"]).lower(),
+            "workspace_storage_postcondition",
+            {
+                failure["kind"]
+                for failure in builder_runs[-1].extra["failures"]
+            },
         )
         self.assertTrue(source.is_symlink())
 
@@ -10862,6 +11487,50 @@ class EngineTests(unittest.TestCase):
                 self.identity,
                 "unsafe-directory/secret.txt",
             )
+
+    def test_workspace_artifact_quota_rejects_before_snapshot_copy(
+        self,
+    ) -> None:
+        engine = self.engine_with_executor(RoleExecutor())
+        state = engine.add_challenge(self.identity, prompt="solve")
+        paths = engine.store.challenge_paths(state.identity)
+        workspace = paths.artifacts / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        payload = b"quota-bound-workspace-artifact"
+        (workspace / "bounded.bin").write_bytes(payload)
+        observed = storage_inventory(
+            engine.store,
+            self.identity,
+            quota_bytes=1 << 40,
+        )["total_bytes"]
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=(
+                    observed + len(payload) - 1
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            EngineError,
+            "would be exceeded",
+        ):
+            engine.register_workspace_artifact(
+                self.identity,
+                "bounded.bin",
+            )
+
+        snapshots = paths.artifacts / "snapshots"
+        self.assertEqual(
+            list(snapshots.iterdir()) if snapshots.exists() else [],
+            [],
+        )
+        self.assertEqual(
+            engine.store.load(self.identity).artifacts,
+            [],
+        )
 
     def test_workspace_artifact_registration_rejects_hash_copy_race(
         self,

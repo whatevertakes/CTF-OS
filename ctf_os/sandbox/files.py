@@ -702,6 +702,79 @@ def read_bounded_regular(
         )
 
 
+def read_bounded_regular_unbound(
+    root: Path,
+    locator: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    """Read one stable bounded regular file without a prior digest binding.
+
+    This is the read-only counterpart to :func:`copy_bounded_regular` for
+    callers that must derive a digest from the current exact bytes.  It uses
+    the same no-follow descriptor walk and mutation-sensitive before/after
+    checks, but creates no destination and therefore requires no storage
+    admission.
+    """
+
+    _validate_maximum_bytes(maximum_bytes)
+    source_descriptor: int | None = None
+    owned_source_descriptors: _OwnedDescriptors = {}
+    payload = bytearray()
+    try:
+        source_descriptor, before, _normalized = _open_relative_regular(
+            root,
+            locator,
+            maximum_bytes=maximum_bytes,
+            owned_source_descriptors=owned_source_descriptors,
+        )
+        while True:
+            remaining = maximum_bytes - len(payload)
+            block = os.read(
+                source_descriptor,
+                min(_COPY_CHUNK_BYTES, remaining + 1),
+            )
+            if not block:
+                break
+            if len(payload) + len(block) > maximum_bytes:
+                raise SafeFileError(
+                    "bounded source grew beyond its size limit"
+                )
+            payload.extend(block)
+
+        after = os.fstat(source_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            len(payload) != before.st_size
+            or any(
+                getattr(after, field) != getattr(before, field)
+                for field in stable_fields
+            )
+        ):
+            raise SafeFileError("bounded source changed while reading")
+        return bytes(payload)
+    except OSError as error:
+        raise SafeFileError("bounded source read failed") from error
+    finally:
+        active_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        try:
+            _close_owned_descriptors(owned_source_descriptors)
+        except BaseException as error:
+            cleanup_errors.append(("source descriptor", error))
+        _resolve_cleanup_errors(
+            active_error,
+            cleanup_errors,
+            context="unbound bounded source read",
+        )
+
+
 def read_regular_prefix(
     root: Path,
     locator: str,
@@ -795,6 +868,8 @@ def copy_bounded_regular(
     maximum_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
     expected_sha256: str | None = None,
     expected_size: int | None = None,
+    source_size_admission: Callable[[int], None] | None = None,
+    require_single_link: bool = False,
     mode: int = 0o400,
 ) -> ImmutableFile:
     """Atomically install one immutable copy from a safely opened source.
@@ -821,11 +896,17 @@ def copy_bounded_regular(
         or expected_size > maximum_bytes
     ):
         raise ValueError("expected_size is outside the copy bound")
+    if source_size_admission is not None and not callable(
+        source_size_admission
+    ):
+        raise ValueError("source_size_admission must be callable")
+    if not isinstance(require_single_link, bool):
+        raise ValueError("require_single_link must be a boolean")
 
     target = Path(destination)
     if target.name in {"", ".", ".."} or target.parent == target:
         raise SafeFileError("snapshot destination is invalid")
-    destination_parent = ensure_private_directory(target.parent)
+    destination_parent = target.parent
     directory_flags = os.O_RDONLY | os.O_CLOEXEC
     directory_flags |= getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -845,6 +926,12 @@ def copy_bounded_regular(
             maximum_bytes=maximum_bytes,
             owned_source_descriptors=owned_source_descriptors,
         )
+        if require_single_link and before.st_nlink != 1:
+            raise SafeFileError("snapshot source is hard-linked")
+        admitted_source_size = before.st_size
+        if source_size_admission is not None:
+            source_size_admission(admitted_source_size)
+        destination_parent = ensure_private_directory(destination_parent)
         destination_directory = _track_descriptor(
             owned_destination_descriptors,
             os.open(destination_parent, directory_flags),
@@ -864,9 +951,14 @@ def copy_bounded_regular(
             block = os.read(source_descriptor, _COPY_CHUNK_BYTES)
             if not block:
                 break
-            total += len(block)
-            if total > maximum_bytes:
+            next_total = total + len(block)
+            if next_total > maximum_bytes:
                 raise SafeFileError("snapshot source grew beyond its size limit")
+            if next_total > admitted_source_size:
+                raise SafeFileError(
+                    "snapshot source grew beyond its admitted size"
+                )
+            total = next_total
             digest.update(block)
             view = memoryview(block)
             while view:
@@ -881,6 +973,7 @@ def copy_bounded_regular(
         stable_fields = (
             "st_dev",
             "st_ino",
+            "st_nlink",
             "st_size",
             "st_mtime_ns",
             "st_ctime_ns",

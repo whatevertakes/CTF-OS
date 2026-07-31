@@ -240,7 +240,15 @@ def _write_exact_run_sidecars(
     run_paths = engine.store.run_paths(identity, issue.run_id)
     result_bytes = _canonical_bytes(result_document)
     validation_bytes = _canonical_bytes(validation_document)
+    engine._enforce_storage_admission(
+        identity,
+        requested_bytes=len(result_bytes),
+    )
     atomic_write_bytes(run_paths.result, result_bytes, mode=0o400)
+    engine._enforce_storage_admission(
+        identity,
+        requested_bytes=len(validation_bytes),
+    )
     atomic_write_bytes(
         run_paths.validation,
         validation_bytes,
@@ -1393,6 +1401,8 @@ def _read_unbound_stable_regular(
 
 def _artifact_from_bytes(
     *,
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
     artifact_id: str,
     destination: Path,
     root: Path,
@@ -1403,6 +1413,10 @@ def _artifact_from_bytes(
     phase: str | None = None,
     ordinal: int | None = None,
 ) -> ArtifactReference:
+    engine._enforce_storage_admission(
+        identity,
+        requested_bytes=len(payload),
+    )
     ensure_private_directory(destination.parent)
     atomic_write_bytes(destination, payload, mode=0o400)
     return ArtifactReference(
@@ -1674,6 +1688,7 @@ def prove_data_transcript(
         finally:
             session_lock.release()
 
+    engine._enforce_storage_admission(identity)
     state = engine.refresh_ingest(identity)
     try:
         category = get_adapter(state.category).name
@@ -2122,7 +2137,7 @@ def prove_data_transcript(
         private_workspace, proof_root = (
             engine._open_managed_oracle_proof_workspace(consumed_state)
         )
-        input_root = ensure_private_directory(proof_root / "inputs")
+        input_root = proof_root / "inputs"
         copy_bounded_regular(
             paths.root,
             peer_artifact.path,
@@ -2130,6 +2145,12 @@ def prove_data_transcript(
             maximum_bytes=max(1, int(peer_artifact.size or 0)),
             expected_sha256=peer_artifact.sha256,
             expected_size=int(peer_artifact.size or 0),
+            source_size_admission=lambda size: (
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=size,
+                )
+            ),
             mode=0o500,
         )
         copy_bounded_regular(
@@ -2139,7 +2160,17 @@ def prove_data_transcript(
             maximum_bytes=max(1, int(peer_data_artifact.size or 0)),
             expected_sha256=peer_data_artifact.sha256,
             expected_size=int(peer_data_artifact.size or 0),
+            source_size_admission=lambda size: (
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=size,
+                )
+            ),
             mode=0o400,
+        )
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(recipe.canonical_bytes),
         )
         atomic_write_bytes(
             input_root / "recipe.json",
@@ -2800,8 +2831,14 @@ def prove_data_transcript(
                     for index in range(4)
                 ),
             )
-            durable_artifacts = tuple(
-                _artifact_from_bytes(
+            durable_artifact_values: list[ArtifactReference] = []
+            for index, (payload, kind) in enumerate(
+                payload_kinds,
+                start=1,
+            ):
+                artifact = _artifact_from_bytes(
+                    engine=engine,
+                    identity=identity,
                     artifact_id=issue.artifact_ids[index - 1],
                     destination=(
                         captures_root
@@ -2818,12 +2855,9 @@ def prove_data_transcript(
                     phase=issue.phase,
                     ordinal=issue.ordinal,
                 )
-                for index, (payload, kind) in enumerate(
-                    payload_kinds,
-                    start=1,
-                )
-            )
-            pending_artifacts.extend(durable_artifacts)
+                durable_artifact_values.append(artifact)
+                pending_artifacts.append(artifact)
+            durable_artifacts = tuple(durable_artifact_values)
             result_document = {
                 "artifact_sha256": {
                     artifact.extra["kind"]: artifact.sha256
@@ -2925,6 +2959,8 @@ def prove_data_transcript(
         ):
             _fail("data_transcript_evaluation_noncanonical")
         evaluation_artifact = _artifact_from_bytes(
+            engine=engine,
+            identity=identity,
             artifact_id=evaluation_artifact_id,
             destination=attempt_root / "evaluation.json",
             root=paths.root,

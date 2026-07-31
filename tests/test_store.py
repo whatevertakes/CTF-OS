@@ -285,6 +285,7 @@ class AtomicWriteTests(unittest.TestCase):
             )
 from ctf_os.store import (
     MAX_CANONICAL_STATE_BYTES,
+    MAX_RUN_DOCUMENT_BYTES,
     ArtifactValidationError,
     CorruptStateError,
     FileLock,
@@ -292,6 +293,7 @@ from ctf_os.store import (
     RevisionConflict,
     StateNotFound,
     StateStore,
+    StateStoreError,
     WorkerResultValidationError,
     validate_artifact,
 )
@@ -997,6 +999,64 @@ class StateStoreTests(unittest.TestCase):
         validation = json.loads(run.validation.read_text(encoding="utf-8"))
         self.assertFalse(validation["ok"])
         self.assertEqual(validation["error_type"], "RevisionConflict")
+
+    def test_run_documents_are_hard_bounded_without_creation_or_replace(
+        self,
+    ) -> None:
+        self.create()
+        oversized = "x" * (MAX_RUN_DOCUMENT_BYTES + 1)
+        rejected_paths = self.store.run_paths(
+            self.identity,
+            run_id="oversized-request",
+        )
+        with self.assertRaisesRegex(
+            StateStoreError,
+            "run request exceeds",
+        ):
+            self.store.create_run(
+                self.identity,
+                "oversized-request",
+                request={"payload": oversized},
+            )
+        self.assertFalse(rejected_paths.root.exists())
+
+        run = self.store.create_run(
+            self.identity,
+            "bounded-documents",
+            request={"role": "observer"},
+        )
+        self.store.write_run_result(
+            self.identity,
+            "bounded-documents",
+            {"status": "old"},
+        )
+        self.store.write_run_validation(
+            self.identity,
+            "bounded-documents",
+            {"ok": True},
+        )
+        result_before = run.result.read_bytes()
+        validation_before = run.validation.read_bytes()
+        with self.assertRaisesRegex(
+            StateStoreError,
+            "run result exceeds",
+        ):
+            self.store.write_run_result(
+                self.identity,
+                "bounded-documents",
+                {"payload": oversized},
+            )
+        with self.assertRaisesRegex(
+            StateStoreError,
+            "run validation exceeds",
+        ):
+            self.store.write_run_validation(
+                self.identity,
+                "bounded-documents",
+                {"payload": oversized},
+            )
+        self.assertEqual(run.result.read_bytes(), result_before)
+        self.assertEqual(run.validation.read_bytes(), validation_before)
 
     def test_current_and_board_views_are_derived_from_state(self) -> None:
         state = self.create()

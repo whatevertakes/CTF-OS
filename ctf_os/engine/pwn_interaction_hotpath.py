@@ -38,6 +38,7 @@ from ctf_os.contracts.pwn_interaction_v1 import (
 )
 from ctf_os.director.resources import ResourceVector
 from ctf_os.engine.flags import FlagDetector
+from ctf_os.engine.hotpath_cleanup import HotPathCleanupTracker
 from ctf_os.flag_formats import resolve_flag_format
 from ctf_os.models import (
     ArtifactReference,
@@ -331,6 +332,8 @@ def _read_unbound_stable_regular(
 
 def _artifact_from_bytes(
     *,
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
     artifact_id: str,
     destination: Path,
     root: Path,
@@ -341,6 +344,10 @@ def _artifact_from_bytes(
     phase: str | None = None,
     ordinal: int | None = None,
 ) -> ArtifactReference:
+    engine._enforce_storage_admission(
+        identity,
+        requested_bytes=len(payload),
+    )
     ensure_private_directory(destination.parent)
     atomic_write_bytes(destination, payload, mode=0o400)
     return ArtifactReference(
@@ -760,6 +767,63 @@ def prove_pwn_interaction(
 ) -> tuple[ChallengeState, PwnInteractionEvaluation]:
     """Execute one pre-issued dynamic Pwn exploit interaction matrix."""
 
+    preissue_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=(
+            engine.config.runtime.challenge_storage_quota_bytes
+        ),
+    )
+    try:
+        return _prove_pwn_interaction(
+            engine,
+            identity,
+            parent_experiment_id=parent_experiment_id,
+            recipe_locator=recipe_locator,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+            _preissue_cleanup=preissue_cleanup,
+        )
+    except BaseException as error:
+        attempt_id = preissue_cleanup.attempt_id
+        if attempt_id is not None:
+            try:
+                current = engine.store.load(identity, recover=False)
+                attempts = current.extra.get(PWN_INTERACTION_STATE_KEY)
+                committed = (
+                    type(attempts) is dict and attempt_id in attempts
+                )
+            except BaseException as inspection_error:
+                error.add_note(
+                    "Pwn interaction preissue cleanup was skipped because "
+                    "canonical state could not be inspected: "
+                    f"{type(inspection_error).__name__}"
+                )
+                committed = True
+            if not committed:
+                try:
+                    preissue_cleanup.cleanup(
+                        engine,
+                        identity,
+                        cause=error,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "Pwn interaction preissue cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+        raise
+
+
+def _prove_pwn_interaction(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    parent_experiment_id: str,
+    recipe_locator: str,
+    timeout_seconds: int = PWN_INTERACTION_DEFAULT_TIMEOUT_SECONDS,
+    _session_owned: bool = False,
+    _preissue_cleanup: HotPathCleanupTracker,
+) -> tuple[ChallengeState, PwnInteractionEvaluation]:
     from ctf_os.engine.challenge import EngineError, SessionAlreadyRunning
     from ctf_os.engine.pwn_exploit_effect_hotpath import (
         _prepare_source_snapshot,
@@ -786,17 +850,19 @@ def prove_pwn_interaction(
             ) from error
         try:
             engine._recover_session_boundary(identity)
-            return prove_pwn_interaction(
+            return _prove_pwn_interaction(
                 engine,
                 identity,
                 parent_experiment_id=parent_experiment_id,
                 recipe_locator=recipe_locator,
                 timeout_seconds=timeout_seconds,
                 _session_owned=True,
+                _preissue_cleanup=_preissue_cleanup,
             )
         finally:
             lock.release()
 
+    engine._enforce_storage_admission(identity)
     if (
         type(parent_experiment_id) is not str
         or not parent_experiment_id
@@ -856,6 +922,7 @@ def prove_pwn_interaction(
     state, recipe_artifact = engine.register_workspace_artifact(
         identity,
         recipe_locator,
+        _session_owned=True,
     )
     recipe_bytes = _read_artifact(
         engine.store.challenge_paths(identity).root,
@@ -898,6 +965,7 @@ def prove_pwn_interaction(
     )
     paths = engine.store.challenge_paths(identity)
     attempt_id = _new_id("pwn-interaction")
+    _preissue_cleanup.set_attempt_id(attempt_id)
     experiment_id = _new_id("E-pwn-interaction")
     result_artifact_id = _new_id("A-pwn-interaction-result")
     fact_id = _new_id("F-pwn-interaction")
@@ -905,6 +973,7 @@ def prove_pwn_interaction(
     attempt_root = ensure_private_directory(
         paths.artifacts / "pwn-interaction" / attempt_id
     )
+    _preissue_cleanup.track_tree(paths.root, attempt_root)
     preissue_path = attempt_root / "preissue.json"
     captures_root = ensure_private_directory(
         attempt_root / "captures"
@@ -1017,6 +1086,8 @@ def prove_pwn_interaction(
     preissue_bytes = _canonical_bytes(preissue_document)
     preissue_sha256 = _sha256(preissue_bytes)
     preissue_artifact = _artifact_from_bytes(
+        engine=engine,
+        identity=identity,
         artifact_id=preissue_artifact_id,
         destination=preissue_path,
         root=paths.root,
@@ -1099,12 +1170,23 @@ def prove_pwn_interaction(
                 "sandbox_method": "run_clean_proof",
             },
         }
-        run_paths = engine.store.create_run(
-            identity,
-            issue.run_id,
-            request=request,
-            base_revision=base_revision,
-        )
+        run_root = paths.runs / issue.run_id
+        try:
+            run_paths = engine.store.create_run(
+                identity,
+                issue.run_id,
+                request=request,
+                base_revision=base_revision,
+            )
+        finally:
+            try:
+                _preissue_cleanup.track_tree(
+                    paths.root,
+                    run_root,
+                    run_id=issue.run_id,
+                )
+            except FileNotFoundError:
+                pass
         payload = run_paths.request.read_bytes()
         run_request_bytes[issue.run_id] = payload
         run_request_paths[issue.run_id] = (
@@ -1272,6 +1354,7 @@ def prove_pwn_interaction(
     source_staging: tempfile.TemporaryDirectory[str] | None = None
     lease = None
     captures: list[_ReplayCapture] = []
+    incomplete_capture_artifacts: list[ArtifactReference] = []
 
     def verify_completed_captures() -> None:
         for capture in captures:
@@ -1457,6 +1540,10 @@ def prove_pwn_interaction(
         proof_root = Path(private_workspace.name)
         recipe_input = proof_root / "inputs" / "recipe.json"
         ensure_private_directory(recipe_input.parent)
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(recipe.canonical_bytes),
+        )
         atomic_write_bytes(
             recipe_input,
             recipe.canonical_bytes,
@@ -1703,6 +1790,8 @@ def prove_pwn_interaction(
             ) in enumerate(artifact_payloads, start=1):
                 durable.append(
                     _artifact_from_bytes(
+                        engine=engine,
+                        identity=identity,
                         artifact_id=artifact_id,
                         destination=(
                             captures_root
@@ -1717,6 +1806,7 @@ def prove_pwn_interaction(
                         ordinal=issue.ordinal,
                     )
                 )
+                incomplete_capture_artifacts.append(durable[-1])
             result_document = {
                 "artifact_sha256": {
                     item.extra["kind"]: item.sha256
@@ -1808,6 +1898,7 @@ def prove_pwn_interaction(
                     wall_seconds=wall_seconds,
                 )
             )
+            incomplete_capture_artifacts.clear()
 
         binding = PwnInteractionExpectedBinding(
             configuration_epoch=configuration_epoch,
@@ -1841,6 +1932,8 @@ def prove_pwn_interaction(
                 "pwn_interaction_evaluation_noncanonical"
             )
         evaluation_artifact = _artifact_from_bytes(
+            engine=engine,
+            identity=identity,
             artifact_id=result_artifact_id,
             destination=attempt_root / "evaluation.json",
             root=paths.root,
@@ -2192,11 +2285,22 @@ def prove_pwn_interaction(
             except PwnInteractionHotPathError:
                 observed_payload = None
             if observed_payload != expected_payload:
-                atomic_write_bytes(
-                    paths.root / bound_artifact.path,
-                    expected_payload,
-                    mode=0o400,
-                )
+                try:
+                    engine._enforce_storage_admission(
+                        identity,
+                        requested_bytes=len(expected_payload),
+                    )
+                    atomic_write_bytes(
+                        paths.root / bound_artifact.path,
+                        expected_payload,
+                        mode=0o400,
+                    )
+                except BaseException as restoration_write_error:
+                    failure.add_note(
+                        "Pwn interaction immutable snapshot restoration "
+                        "write failed: "
+                        f"{type(restoration_write_error).__name__}"
+                    )
                 if (
                     _read_artifact(
                         paths.root,
@@ -2227,11 +2331,22 @@ def prove_pwn_interaction(
                 except PwnInteractionHotPathError:
                     observed_payload = None
                 if observed_payload != expected_payload:
-                    atomic_write_bytes(
-                        paths.root / artifact.path,
-                        expected_payload,
-                        mode=0o400,
-                    )
+                    try:
+                        engine._enforce_storage_admission(
+                            identity,
+                            requested_bytes=len(expected_payload),
+                        )
+                        atomic_write_bytes(
+                            paths.root / artifact.path,
+                            expected_payload,
+                            mode=0o400,
+                        )
+                    except BaseException as restoration_write_error:
+                        failure.add_note(
+                            "Pwn interaction capture restoration write "
+                            "failed: "
+                            f"{type(restoration_write_error).__name__}"
+                        )
             for locator, expected_payload in (
                 (capture.result_path, capture.result_bytes),
                 (capture.validation_path, capture.validation_bytes),
@@ -2247,11 +2362,22 @@ def prove_pwn_interaction(
                 except (OSError, SafeFileError, ValueError):
                     observed_payload = None
                 if observed_payload != expected_payload:
-                    atomic_write_bytes(
-                        paths.root / locator,
-                        expected_payload,
-                        mode=0o400,
-                    )
+                    try:
+                        engine._enforce_storage_admission(
+                            identity,
+                            requested_bytes=len(expected_payload),
+                        )
+                        atomic_write_bytes(
+                            paths.root / locator,
+                            expected_payload,
+                            mode=0o400,
+                        )
+                    except BaseException as restoration_write_error:
+                        failure.add_note(
+                            "Pwn interaction sidecar restoration write "
+                            "failed: "
+                            f"{type(restoration_write_error).__name__}"
+                        )
         try:
             verify_completed_captures()
         except PwnInteractionHotPathError as restoration_error:
@@ -2278,17 +2404,39 @@ def prove_pwn_interaction(
             "terminal": True,
         }
         failure_bytes = _canonical_bytes(failure_document)
-        failure_artifact = _artifact_from_bytes(
-            artifact_id=result_artifact_id,
-            destination=attempt_root / "failure.json",
-            root=paths.root,
-            payload=failure_bytes,
-            run_id=(
-                captures[-1].issue.run_id if captures else None
-            ),
-            kind="evaluation",
-            attempt_id=attempt_id,
-        )
+        if incomplete_capture_artifacts:
+            try:
+                engine._cleanup_uncommitted_artifacts(
+                    identity,
+                    tuple(incomplete_capture_artifacts),
+                    cause=failure,
+                )
+                incomplete_capture_artifacts.clear()
+            except BaseException as cleanup_error:
+                failure.add_note(
+                    "Pwn interaction partial capture cleanup failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+        try:
+            failure_artifact = _artifact_from_bytes(
+                engine=engine,
+                identity=identity,
+                artifact_id=result_artifact_id,
+                destination=attempt_root / "failure.json",
+                root=paths.root,
+                payload=failure_bytes,
+                run_id=(
+                    captures[-1].issue.run_id if captures else None
+                ),
+                kind="evaluation",
+                attempt_id=attempt_id,
+            )
+        except BaseException as failure_artifact_error:
+            failure.add_note(
+                "Pwn interaction failure artifact persistence failed: "
+                f"{type(failure_artifact_error).__name__}"
+            )
+            raise failure
         captured_by_run = {
             item.issue.run_id: item for item in captures
         }

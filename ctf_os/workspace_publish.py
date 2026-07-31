@@ -9,7 +9,11 @@ import stat
 import uuid
 from pathlib import Path, PurePosixPath
 
-from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.engine.challenge import (
+    ChallengeEngine,
+    EngineError,
+    SessionAlreadyRunning,
+)
 from ctf_os.managed_continuity import (
     THREAD_CONTINUITY_RUN_KEY,
     lane_path_identity_sha256,
@@ -22,8 +26,12 @@ from ctf_os.models import (
     RunStatus,
     WorkspacePublish,
 )
-from ctf_os.store.atomic import atomic_write_json, read_json
-from ctf_os.store.locks import FileLock
+from ctf_os.store.atomic import (
+    atomic_write_json,
+    canonical_json_bytes,
+    read_json,
+)
+from ctf_os.store.locks import ChallengeLock, FileLock, LockTimeout
 
 
 MAX_PUBLISH_BYTES = 256 * 1024 * 1024
@@ -334,6 +342,28 @@ def _publish_builder_file_locked(
             builder_source=True,
         )
         os.lseek(source_descriptor, 0, os.SEEK_SET)
+        publish_id = f"WP-{uuid.uuid4().hex[:20]}"
+        record = WorkspacePublish(
+            id=publish_id,
+            run_id=run_id,
+            staged_path=source_relative.as_posix(),
+            destination=destination_relative.as_posix(),
+            sha256=digest,
+            base_sha256=base_sha256,
+            base_workspace_revision=base_workspace_revision,
+            status="prepared",
+            extra={"size": size},
+        )
+        # Reserve the complete canonical copy plus the simultaneously durable
+        # intent generation before creating a destination directory, intent,
+        # temporary file, or canonical state mutation.  An overwrite remains
+        # conservatively charged at its full new size.
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=(
+                size + len(canonical_json_bytes(record.to_dict()))
+            ),
+        )
         canonical_root = paths.artifacts / "workspace"
         parent_descriptor = _canonical_parent_descriptor(
             canonical_root,
@@ -353,7 +383,6 @@ def _publish_builder_file_locked(
             f".{destination_relative.name}."
             f"{uuid.uuid4().hex}.publish"
         )
-        publish_id = f"WP-{uuid.uuid4().hex[:20]}"
         intent = (
             paths.runtime
             / "workspace-publish-intents"
@@ -361,17 +390,6 @@ def _publish_builder_file_locked(
         )
         if source_metadata.st_dev != os.fstat(parent_descriptor).st_dev:
             raise EngineError("workspace publish must remain on one filesystem")
-        record = WorkspacePublish(
-            id=publish_id,
-            run_id=run_id,
-            staged_path=source_relative.as_posix(),
-            destination=destination_relative.as_posix(),
-            sha256=digest,
-            base_sha256=base_sha256,
-            base_workspace_revision=base_workspace_revision,
-            status="prepared",
-            extra={"size": size},
-        )
         atomic_write_json(intent, record.to_dict())
         target_descriptor = os.open(
             temporary_name,
@@ -463,10 +481,35 @@ def publish_builder_file(
     destination: str,
     base_workspace_revision: int,
     base_sha256: str | None,
+    _session_owned: bool = False,
 ) -> WorkspacePublish:
     """Atomically promote one Builder-created file after optimistic checks."""
 
     paths = engine.store.challenge_paths(identity)
+    if not _session_owned:
+        session_lock = ChallengeLock(
+            paths.runtime / "session.lock",
+            timeout=0,
+        )
+        try:
+            session_lock.acquire()
+        except LockTimeout as error:
+            raise SessionAlreadyRunning(
+                f"another session already owns {identity.key}"
+            ) from error
+        try:
+            return publish_builder_file(
+                engine,
+                identity,
+                run_id=run_id,
+                staged_path=staged_path,
+                destination=destination,
+                base_workspace_revision=base_workspace_revision,
+                base_sha256=base_sha256,
+                _session_owned=True,
+            )
+        finally:
+            session_lock.release()
     with FileLock(paths.runtime / "workspace-publish.lock") as publish_lock:
         publish_lock.acquire()
         return _publish_builder_file_locked(

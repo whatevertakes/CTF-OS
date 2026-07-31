@@ -516,6 +516,8 @@ def _run_live_broker_command(
                     "resource_class": args.profile,
                     "network_target": args.target,
                     "needs_kvm": args.kvm,
+                    "read_only": args.read_only,
+                    "input_locators": list(args.input),
                 },
             )
         )
@@ -1539,6 +1541,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="이 실행에 /dev/kvm lease와 장치 연결을 요구",
     )
     tool_run.add_argument("--timeout", type=int)
+    tool_run.add_argument(
+        "--read-only",
+        action="store_true",
+        help=(
+            "standalone operator mode에서 명시 입력만 private work tree로 "
+            "복사해 동시 분석"
+        ),
+    )
+    tool_run.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        metavar="LOCATOR",
+        help=(
+            "--read-only 분석에 복사할 canonical workspace 상대 경로 "
+            "(반복 가능)"
+        ),
+    )
     tool_run.add_argument("--expected", default="bounded command result")
     tool_run.add_argument(
         "--keep-if", default="the result advances the active goal"
@@ -1788,6 +1808,7 @@ def _job_status_value(status: Any) -> dict[str, object]:
         "cancelled": status.cancelled,
         "started_at": status.started_at,
         "finished_at": status.finished_at,
+        "reason_code": status.reason_code,
     }
 
 
@@ -2118,7 +2139,14 @@ def main(
 
         if args.command == "knowledge":
             identity = _identity(args)
-            store = KnowledgeStore(engine.store)
+            store = KnowledgeStore(
+                engine.store,
+                quota_bytes=(
+                    config.runtime.challenge_storage_quota_bytes
+                ),
+                max_scan_entries=config.runtime.storage_scan_max_entries,
+                max_scan_bytes=config.runtime.storage_scan_max_bytes,
+            )
             if args.knowledge_command == "add":
                 record = store.add(
                     identity,
@@ -2951,6 +2979,8 @@ def main(
                 resource_class=args.profile,
                 network_target=args.target,
                 needs_kvm=args.kvm,
+                read_only=args.read_only,
+                input_locators=args.input,
             )
             _print_latest_tool_result(state)
             return 0

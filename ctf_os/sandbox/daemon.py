@@ -19,14 +19,18 @@ from typing import Any
 from .client import (
     MAX_RPC_BYTES,
     ChallengeSandboxClient,
+    background_launch_to_dict,
     command_from_dict,
     ref_from_dict,
     ref_to_dict,
 )
 from .types import (
+    JOB_SUPERVISOR_ID,
+    AnalysisLeaseRef,
     ProofInput,
     ProofOutput,
     SandboxError,
+    SandboxResult,
     ScopeError,
     validate_deadline_monotonic_seconds,
 )
@@ -286,6 +290,16 @@ def _status_with_ref_dict(status: object) -> dict[str, Any]:
     return value
 
 
+def _sandbox_result_dict(result: SandboxResult) -> dict[str, Any]:
+    """Encode optional control metadata only when the backend supplied it."""
+
+    value = asdict(result)
+    for name in ("timeout_seconds", "started_at", "finished_at"):
+        if value.get(name) is None:
+            value.pop(name, None)
+    return value
+
+
 class SandboxService:
     """Dispatch a narrow operation set after capability and scope checks."""
 
@@ -331,9 +345,64 @@ class SandboxService:
             )
             return {"initialized": True}
         if operation == "run":
-            return asdict(client.run(command_from_dict(params.get("command"))))
+            return _sandbox_result_dict(
+                client.run(command_from_dict(params.get("command")))
+            )
+        if operation == "isolated_analysis_runtime_id":
+            if set(params) != {"lease"}:
+                raise SandboxError(
+                    "isolated_analysis_runtime_id requires one lease reference"
+                )
+            lease = AnalysisLeaseRef.from_mapping(params["lease"])
+            if lease.scope_fingerprint != scope:
+                raise ScopeError(
+                    "analysis lease belongs to another challenge"
+                )
+            return client.isolated_analysis_runtime_id(lease)
+        if operation == "run_isolated_analysis":
+            if set(params) != {
+                "command",
+                "input_locators",
+                "lease",
+            }:
+                raise SandboxError(
+                    "run_isolated_analysis has an invalid parameter schema"
+                )
+            lease = AnalysisLeaseRef.from_mapping(params["lease"])
+            if lease.scope_fingerprint != scope:
+                raise ScopeError(
+                    "analysis lease belongs to another challenge"
+                )
+            inputs = params["input_locators"]
+            if type(inputs) is not list or any(
+                type(item) is not str for item in inputs
+            ):
+                raise ValueError(
+                    "input_locators must be an array of strings"
+                )
+            return _sandbox_result_dict(
+                client.run_isolated_analysis(
+                    lease,
+                    command_from_dict(params["command"]),
+                    input_locators=tuple(inputs),
+                )
+            )
+        if operation == "cleanup_isolated_analysis":
+            if set(params) != {"lease"}:
+                raise SandboxError(
+                    "cleanup_isolated_analysis requires one lease reference"
+                )
+            lease = AnalysisLeaseRef.from_mapping(params["lease"])
+            if lease.scope_fingerprint != scope:
+                raise ScopeError(
+                    "analysis lease belongs to another challenge"
+                )
+            client.cleanup_isolated_analysis(lease)
+            return {"runtime_absent": True}
         if operation == "start_job":
-            unexpected = set(params).difference({"command", "name"})
+            unexpected = set(params).difference(
+                {"command", "name", "supervisor_id"}
+            )
             if unexpected:
                 raise SandboxError(
                     f"unexpected start_job params: {sorted(unexpected)}"
@@ -341,9 +410,23 @@ class SandboxService:
             name = params.get("name")
             if name is not None and not isinstance(name, str):
                 raise ValueError("background job name must be a string")
-            ref = client.start_job(
-                command_from_dict(params.get("command")),
-                name=name,
+            supervisor_id = params.get("supervisor_id")
+            if supervisor_id is not None and (
+                type(supervisor_id) is not str
+                or not JOB_SUPERVISOR_ID.fullmatch(supervisor_id)
+            ):
+                raise ValueError(
+                    "invalid background supervisor identity"
+                )
+            command = command_from_dict(params.get("command"))
+            ref = (
+                client.start_job(command, name=name)
+                if supervisor_id is None
+                else client.start_job(
+                    command,
+                    name=name,
+                    supervisor_id=supervisor_id,
+                )
             )
             if ref.scope_fingerprint != scope:
                 raise ScopeError(
@@ -353,6 +436,13 @@ class SandboxService:
                 raise SandboxError(
                     "sandbox returned a background job without a lease "
                     "supervisor receipt"
+                )
+            if (
+                supervisor_id is not None
+                and ref.supervisor_id != supervisor_id
+            ):
+                raise SandboxError(
+                    "sandbox returned another supervisor identity"
                 )
             return ref_to_dict(ref)
 
@@ -389,6 +479,33 @@ class SandboxService:
                 else client.recover_jobs()
             )
             return [_status_with_ref_dict(status) for status in statuses]
+
+        if operation == "recover_job_launch":
+            if set(params) != {"supervisor_id"}:
+                raise SandboxError(
+                    "recover_job_launch requires one supervisor identity"
+                )
+            supervisor_id = params["supervisor_id"]
+            if (
+                type(supervisor_id) is not str
+                or not JOB_SUPERVISOR_ID.fullmatch(supervisor_id)
+            ):
+                raise ValueError(
+                    "invalid background supervisor identity"
+                )
+            launch = client.recover_job_launch(supervisor_id)
+            if launch.supervisor_id != supervisor_id:
+                raise SandboxError(
+                    "sandbox recovered another supervisor identity"
+                )
+            if (
+                launch.ref is not None
+                and launch.ref.scope_fingerprint != scope
+            ):
+                raise ScopeError(
+                    "job recovery returned another challenge scope"
+                )
+            return background_launch_to_dict(launch)
 
         if operation == "register_artifact":
             return asdict(
@@ -437,7 +554,7 @@ class SandboxService:
                     input_locators=inputs,
                     proof_inputs=proof_inputs,
                 )
-            return asdict(result)
+            return _sandbox_result_dict(result)
         raise SandboxError(f"unsupported sandbox operation: {operation!r}")
 
     def handle_bytes(self, data: bytes) -> bytes:

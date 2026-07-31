@@ -336,6 +336,34 @@ class BuilderPublishRecoveryTests(unittest.TestCase):
             ordinal=1,
         )
 
+    def test_unreported_symlink_remains_a_wave_storage_failure(self):
+        outside = self.root / "unreported-outside"
+        outside.mkdir()
+        engine, _orchestrator, state = self.run_one(
+            BuilderPublishExecutor(
+                proposals=(),
+                symlink_escape=("unreported", outside),
+            )
+        )
+
+        capsule = state.checkpoints[-1].failure_capsule
+        self.assertIsNotNone(capsule)
+        assert capsule is not None
+        self.assertEqual(capsule.reason_code, "analysis_wave_invalid")
+        wave = state.waves[-1]
+        builder = next(
+            run
+            for run in state.runs
+            if run.id == wave.role_run_ids[Role.BUILDER.value]
+        )
+        self.assertIs(builder.status, RunStatus.FAILED)
+        self.assertTrue(
+            any(
+                failure["kind"] == "workspace_storage_postcondition"
+                for failure in builder.extra["failures"]
+            )
+        )
+
     def test_oversize_sparse_source_is_rejected_pre_intent(self):
         relative = "large/result.bin"
         engine, _orchestrator, state = self.run_one(

@@ -8,7 +8,11 @@ from .client import (
 from .docker import DockerLimits, DockerSandboxBackend
 from .supervisor import BackgroundJobSupervisor
 from .types import (
+    AnalysisLeaseRef,
+    AnalysisRuntimeCleanupPending,
     ArtifactRef,
+    BackgroundLaunchState,
+    BackgroundLaunchStatus,
     BackgroundJobUnsupported,
     ChallengeScope,
     CommandSpec,
@@ -28,7 +32,11 @@ from .types import (
 )
 
 __all__ = [
+    "AnalysisLeaseRef",
+    "AnalysisRuntimeCleanupPending",
     "ArtifactRef",
+    "BackgroundLaunchState",
+    "BackgroundLaunchStatus",
     "BackgroundJobUnsupported",
     "BackgroundJobSupervisor",
     "ChallengeSandboxClient",

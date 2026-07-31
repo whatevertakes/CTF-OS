@@ -5,6 +5,7 @@ import hashlib
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import ctf_os.engine.forensic_assertion_hotpath as hotpath
 from ctf_os.engine.forensic_assertion_execution import (
@@ -531,6 +532,13 @@ class ForensicAssertionHotPathTests(unittest.TestCase):
         )
         attempt = self._assertion_attempt(state)
         self.assertEqual(attempt["status"], "completed")
+        self.assertFalse(
+            (
+                self.engine.store.challenge_paths(self.identity).runtime
+                / "forensic-assertion-live"
+                / attempt["attempt_id"]
+            ).exists()
+        )
         self.assertEqual(
             attempt["terminal"]["reason_code"],
             "forensic_assertion_confirmed",
@@ -736,6 +744,49 @@ class ForensicAssertionHotPathTests(unittest.TestCase):
         self.assertNotIn(
             "forensic_assertion_preissues",
             state.extra,
+        )
+
+    def test_preissue_commit_failure_removes_attempt_files_and_runs(self) -> None:
+        paths = self.engine.store.challenge_paths(self.identity)
+        before_files = {
+            path.relative_to(paths.root).as_posix()
+            for path in paths.root.rglob("*")
+            if path.is_file()
+        }
+        before_runs = {path.name for path in paths.runs.iterdir()}
+        original_update = self.engine.store.update
+
+        def reject_preissue(*args, **kwargs):
+            apply = args[1]
+            if getattr(apply, "__name__", "") == "commit_preissue":
+                raise RuntimeError("synthetic preissue commit failure")
+            return original_update(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                self.engine.store,
+                "update",
+                side_effect=reject_preissue,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic preissue commit failure",
+            ),
+        ):
+            self._execute()
+        after_files = {
+            path.relative_to(paths.root).as_posix()
+            for path in paths.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(
+            {path.name for path in paths.runs.iterdir()},
+            before_runs,
+        )
+        self.assertNotIn(
+            "forensic_assertion_preissues",
+            self.engine.store.load(self.identity).extra,
         )
 
 

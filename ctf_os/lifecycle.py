@@ -9,7 +9,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ctf_os.engine.challenge import ChallengeEngine, EngineError
+from ctf_os.engine.challenge import (
+    ChallengeEngine,
+    EngineError,
+    SessionAlreadyRunning,
+)
 from ctf_os.models import (
     ACTIVE_HYPOTHESIS_STATUSES,
     ChallengeIdentity,
@@ -23,16 +27,191 @@ from ctf_os.models import (
 )
 from ctf_os.sandbox.files import copy_bounded_regular
 from ctf_os.schema import STATE_SCHEMA_VERSION
-from ctf_os.store import sha256_file
+from ctf_os.store import (
+    MAX_CANONICAL_STATE_BYTES,
+    ChallengeLock,
+    LockTimeout,
+    sha256_file,
+)
 from ctf_os.store.atomic import (
     atomic_write_json,
     atomic_write_text,
+    canonical_json_bytes,
     read_json,
 )
 from ctf_os.store.locks import FileLock
+from ctf_os.store.views import render_current_markdown
 
 
 MAX_PORTABLE_CLOSURE_BYTES = 64 * 1024 * 1024
+def _acquire_session_lock(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+) -> ChallengeLock:
+    paths = engine.store.challenge_paths(identity)
+    lock = ChallengeLock(paths.runtime / "session.lock", timeout=0)
+    try:
+        lock.acquire()
+    except LockTimeout as error:
+        raise SessionAlreadyRunning(
+            f"another session already owns {identity.key}"
+        ) from error
+    return lock
+
+
+def _closure_admission_reservation(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    portability: str,
+) -> int:
+    """Bound every accounted closure write before recovery or assembly.
+
+    Two canonical-state-sized documents cover the simultaneously live
+    assembling and ready intent generations.  A portable package additionally
+    reserves the exact copied evidence bytes and one state-sized manifest.
+    The hard state bound is deliberately conservative, but makes the
+    reservation independent of JSON formatting and artifact-count growth.
+    """
+
+    current = engine.store.load(identity)
+    replace_automatic = (
+        current.closure is not None
+        and current.closure.completeness
+        is ClosureCompleteness.INCOMPLETE
+        and current.closure.extra.get("automatic_incomplete") is True
+    )
+    if current.closure is not None and not replace_automatic:
+        return 0
+    requested = 2 * MAX_CANONICAL_STATE_BYTES
+    if portability == "portable":
+        portable_ready, artifact_bytes = _portable_artifacts(
+            engine,
+            identity,
+        )
+        if portable_ready:
+            requested += artifact_bytes + MAX_CANONICAL_STATE_BYTES
+    return requested
+
+
+def _export_admission_reservation(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    include_closure: bool,
+    redacted: bool,
+) -> int:
+    """Reserve exact planned payloads, or hard bounds during recovery."""
+
+    state = engine.store.load(identity)
+    intent_root = _closure_intent_root(engine, identity)
+    if intent_root.is_dir() and any(intent_root.glob("CLOSE-*.json")):
+        # Reconciliation can install a ready closure before projection.  Its
+        # exact post-recovery state is deliberately not predicted by this
+        # read-only preflight, so use the documented hard bounds only for this
+        # exceptional recovery path.
+        requested = 2 * MAX_CANONICAL_STATE_BYTES
+        if include_closure:
+            requested += 2 * MAX_CANONICAL_STATE_BYTES
+        return requested
+    projection = _export_projection(
+        state,
+        include_closure=include_closure,
+        redacted=redacted,
+    )
+    payload, summary, closure_payload, closure_manifest = projection
+    documents = [payload]
+    if closure_payload is not None:
+        documents.append(closure_payload)
+    if closure_manifest is not None:
+        documents.append(closure_manifest)
+    # These are the complete atomic temporary generations that may coexist
+    # with prior exports. Existing export bytes are already in the inventory.
+    return len(summary.encode("utf-8")) + sum(
+        len(canonical_json_bytes(document)) for document in documents
+    )
+
+
+def _export_projection(
+    state: Any,
+    *,
+    include_closure: bool,
+    redacted: bool,
+) -> tuple[
+    dict[str, Any],
+    str,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    """Build and hard-bound every accounted export document in memory."""
+
+    payload = copy.deepcopy(state.to_dict())
+    if redacted:
+        for candidate in payload.get("candidates", []):
+            candidate["value"] = "[REDACTED]"
+        payload["submissions"] = [
+            {
+                **item,
+                "response": (
+                    "[REDACTED]"
+                    if item.get("response") is not None
+                    else None
+                ),
+            }
+            for item in payload.get("submissions", [])
+        ]
+    summary = render_current_markdown(state)
+    if redacted:
+        for candidate in sorted(
+            state.candidates,
+            key=lambda item: len(item.value),
+            reverse=True,
+        ):
+            summary = summary.replace(candidate.value, "[REDACTED]")
+    closure_payload: dict[str, Any] | None = None
+    closure_manifest: dict[str, Any] | None = None
+    if include_closure:
+        if state.closure is None:
+            raise EngineError("closure has not been recorded")
+        closure_payload = state.closure.to_dict()
+        closure_manifest = {
+            "schema_version": 1,
+            "closure_id": state.closure.id,
+            "portability": state.closure.portability,
+            "state_revision": state.revision,
+            "redacted": redacted,
+            "portable_package_path": (
+                state.closure.extra.get("package_path")
+                if not redacted
+                else None
+            ),
+            "portable_package_manifest_sha256": (
+                state.closure.extra.get("package_manifest_sha256")
+                if not redacted
+                else None
+            ),
+            "artifact_paths": [
+                item.path
+                for item in state.artifacts
+                if item.id
+                in {
+                    *state.closure.source_artifact_ids,
+                    *state.closure.solver_artifact_ids,
+                    *state.closure.report_artifact_ids,
+                }
+            ],
+        }
+    documents = [payload]
+    if closure_payload is not None:
+        documents.append(closure_payload)
+    if closure_manifest is not None:
+        documents.append(closure_manifest)
+    if any(
+        len(canonical_json_bytes(value)) > MAX_CANONICAL_STATE_BYTES
+        for value in documents
+    ) or len(summary.encode("utf-8")) > MAX_CANONICAL_STATE_BYTES:
+        raise EngineError("export projection exceeds its reserved byte bound")
+    return payload, summary, closure_payload, closure_manifest
 
 
 def _closure_intent_root(
@@ -284,6 +463,7 @@ def _build_portable_bundle(
     *,
     closure_id: str,
     expected_state_revision: int,
+    expected_copy_bytes: int,
 ) -> tuple[str, str]:
     """Copy all source and evidence bytes into one bounded immutable bundle."""
 
@@ -295,6 +475,20 @@ def _build_portable_bundle(
     bundle.mkdir(parents=True, exist_ok=False, mode=0o700)
     copied: list[dict[str, Any]] = []
     remaining = MAX_PORTABLE_CLOSURE_BYTES
+    remaining_admission = expected_copy_bytes
+
+    def source_admission(expected_size: int):
+        def admit(actual_size: int) -> None:
+            if actual_size != expected_size:
+                raise EngineError(
+                    "portable closure source size changed before copy"
+                )
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=remaining_admission,
+            )
+
+        return admit
 
     for index, source in enumerate(state.source_inventory):
         if source.size > remaining:
@@ -307,8 +501,10 @@ def _build_portable_bundle(
             maximum_bytes=max(1, remaining),
             expected_sha256=source.sha256,
             expected_size=source.size,
+            source_size_admission=source_admission(source.size),
         )
         remaining -= snapshot.size_bytes
+        remaining_admission -= snapshot.size_bytes
         copied.append(
             {
                 "kind": "challenge_source",
@@ -326,6 +522,11 @@ def _build_portable_bundle(
         seen_paths.add(artifact.path)
         if artifact.size is not None and artifact.size > remaining:
             raise EngineError("portable closure exceeds byte limit")
+        expected_size = (
+            artifact.size
+            if artifact.size is not None
+            else (paths.root / artifact.path).stat(follow_symlinks=False).st_size
+        )
         destination = bundle / "evidence" / f"{index:06d}.bin"
         snapshot = copy_bounded_regular(
             paths.root,
@@ -334,8 +535,10 @@ def _build_portable_bundle(
             maximum_bytes=max(1, remaining),
             expected_sha256=artifact.sha256,
             expected_size=artifact.size,
+            source_size_admission=source_admission(expected_size),
         )
         remaining -= snapshot.size_bytes
+        remaining_admission -= snapshot.size_bytes
         copied.append(
             {
                 "kind": "artifact",
@@ -347,6 +550,8 @@ def _build_portable_bundle(
             }
         )
 
+    if remaining_admission != 0:
+        raise EngineError("portable closure reservation did not match copied bytes")
     manifest_path = bundle / "manifest.json"
     atomic_write_json(
         manifest_path,
@@ -400,6 +605,7 @@ def _close_challenge_locked(
         engine,
         identity,
     ) / f"{closure_id}.json"
+    portable_ready, artifact_bytes = _portable_artifacts(engine, identity)
     atomic_write_json(
         intent,
         {
@@ -412,7 +618,6 @@ def _close_challenge_locked(
             "created_at": utc_now(),
         },
     )
-    portable_ready, artifact_bytes = _portable_artifacts(engine, identity)
     package_path: str | None = None
     package_manifest_sha256: str | None = None
     if portability == "portable" and portable_ready:
@@ -422,6 +627,7 @@ def _close_challenge_locked(
                 identity,
                 closure_id=closure_id,
                 expected_state_revision=current.revision,
+                expected_copy_bytes=artifact_bytes,
             )
         except (EngineError, OSError, ValueError) as error:
             portable_ready = False
@@ -553,7 +759,30 @@ def close_challenge(
     identity: ChallengeIdentity,
     *,
     portability: str = "referential",
+    _session_owned: bool = False,
 ) -> Any:
+    if portability not in {"portable", "referential"}:
+        raise EngineError("closure portability must be portable or referential")
+    if not _session_owned:
+        session_lock = _acquire_session_lock(engine, identity)
+        try:
+            requested = _closure_admission_reservation(
+                engine,
+                identity,
+                portability=portability,
+            )
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=requested,
+            )
+            return close_challenge(
+                engine,
+                identity,
+                portability=portability,
+                _session_owned=True,
+            )
+        finally:
+            session_lock.release()
     paths = engine.store.challenge_paths(identity)
     with FileLock(paths.runtime / "closure.lock") as closure_lock:
         closure_lock.acquire()
@@ -570,71 +799,45 @@ def export_challenge(
     *,
     include_closure: bool = False,
     redacted: bool = False,
+    _session_owned: bool = False,
 ) -> Path:
+    if not _session_owned:
+        session_lock = _acquire_session_lock(engine, identity)
+        try:
+            requested = _export_admission_reservation(
+                engine,
+                identity,
+                include_closure=include_closure,
+                redacted=redacted,
+            )
+            engine._enforce_storage_admission(
+                identity,
+                requested_bytes=requested,
+            )
+            return export_challenge(
+                engine,
+                identity,
+                include_closure=include_closure,
+                redacted=redacted,
+                _session_owned=True,
+            )
+        finally:
+            session_lock.release()
     state = _reconcile_closure_intents(engine, identity)
     paths = engine.store.challenge_paths(identity)
+    payload, summary, closure_payload, closure_manifest = _export_projection(
+        state,
+        include_closure=include_closure,
+        redacted=redacted,
+    )
     engine.store.refresh_views(identity)
-    payload = copy.deepcopy(state.to_dict())
-    if redacted:
-        for candidate in payload.get("candidates", []):
-            candidate["value"] = "[REDACTED]"
-        payload["submissions"] = [
-            {
-                **item,
-                "response": "[REDACTED]"
-                if item.get("response") is not None
-                else None,
-            }
-            for item in payload.get("submissions", [])
-        ]
     atomic_write_json(paths.exports / "state.json", payload)
-    summary = paths.current_context.read_text(encoding="utf-8")
-    if redacted:
-        for candidate in sorted(
-            state.candidates,
-            key=lambda item: len(item.value),
-            reverse=True,
-        ):
-            summary = summary.replace(candidate.value, "[REDACTED]")
     atomic_write_text(paths.exports / "summary.md", summary)
-    if include_closure:
-        if state.closure is None:
-            raise EngineError("closure has not been recorded")
-        atomic_write_json(
-            paths.exports / "closure.json",
-            state.closure.to_dict(),
-        )
+    if closure_payload is not None and closure_manifest is not None:
+        atomic_write_json(paths.exports / "closure.json", closure_payload)
         atomic_write_json(
             paths.exports / "closure-manifest.json",
-            {
-                "schema_version": 1,
-                "closure_id": state.closure.id,
-                "portability": state.closure.portability,
-                "state_revision": state.revision,
-                "redacted": redacted,
-                "portable_package_path": (
-                    state.closure.extra.get("package_path")
-                    if not redacted
-                    else None
-                ),
-                "portable_package_manifest_sha256": (
-                    state.closure.extra.get(
-                        "package_manifest_sha256"
-                    )
-                    if not redacted
-                    else None
-                ),
-                "artifact_paths": [
-                    item.path
-                    for item in state.artifacts
-                    if item.id
-                    in {
-                        *state.closure.source_artifact_ids,
-                        *state.closure.solver_artifact_ids,
-                        *state.closure.report_artifact_ids,
-                    }
-                ],
-            },
+            closure_manifest,
         )
     return paths.exports
 

@@ -926,6 +926,7 @@ class LiveBrokerService:
                 _string(params, "locator", maximum_bytes=4096),
                 source_run_id=None,
                 _live_only=True,
+                _session_owned=True,
             )
             del state
             return {
@@ -980,6 +981,14 @@ class LiveBrokerService:
                     params, "network_target", required=False, maximum_bytes=4096
                 ),
                 needs_kvm=_boolean(params, "needs_kvm"),
+                read_only=_boolean(params, "read_only"),
+                input_locators=_string_list(
+                    params,
+                    "input_locators",
+                    maximum_items=256,
+                    maximum_item_bytes=4096,
+                    maximum_total_bytes=1024 * 1024,
+                ),
                 _session_owned=True,
                 _live_only=True,
             )
@@ -1080,6 +1089,7 @@ class LiveBrokerService:
                             "cancelled": status.cancelled,
                             "started_at": status.started_at,
                             "finished_at": status.finished_at,
+                            "reason_code": status.reason_code,
                         }
                         for status in statuses
                     ],
@@ -1167,6 +1177,7 @@ class LiveBrokerService:
                 "cancelled": status.cancelled,
                 "started_at": status.started_at,
                 "finished_at": status.finished_at,
+                "reason_code": status.reason_code,
             }
 
         if operation == "inspect":

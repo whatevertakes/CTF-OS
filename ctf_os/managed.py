@@ -2576,6 +2576,11 @@ class ManagedOrchestrator:
                     "managed data transcript recipe changed"
                 )
 
+        # The managed session already owns the challenge lock. Admission must
+        # precede the RUNNING transition so a quota rejection creates no
+        # canonical execution intent and no sandbox side effect.
+        self.engine._enforce_storage_admission(identity)
+
         def mark_running(state: ChallengeState) -> None:
             target = next(
                 item
@@ -3127,6 +3132,7 @@ class ManagedOrchestrator:
                         identity,
                         relative,
                     ),
+                    _session_owned=True,
                 )
             except WorkspacePublishProposalRejected as error:
                 rejection = BuilderPublishRejection(

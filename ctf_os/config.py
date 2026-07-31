@@ -392,7 +392,8 @@ work_tree_max_bytes = 17179869184
 # Cumulative logical bytes below runs/, artifacts/ (including quarantine/),
 # proof/, runtime/, context/, knowledge/, and exports/. Preserved roots count
 # toward admission but never enter GC/purge. Incomplete bounded scans fail
-# closed unless an active supervised writer has a conservative byte reserve.
+# closed. Active supervised writers also contribute a conservative admission
+# reservation; this is not a live filesystem quota.
 challenge_storage_quota_bytes = 68719476736
 storage_scan_max_entries = 100000
 storage_scan_max_bytes = 274877906944

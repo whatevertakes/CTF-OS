@@ -27,9 +27,20 @@ from ctf_os.sandbox.files import (
     copy_bounded_regular,
     ensure_private_directory,
 )
-from ctf_os.store.atomic import atomic_write_json, atomic_write_text
+from ctf_os.storage import (
+    DEFAULT_CHALLENGE_STORAGE_QUOTA_BYTES,
+    DEFAULT_STORAGE_SCAN_MAX_BYTES,
+    DEFAULT_STORAGE_SCAN_MAX_ENTRIES,
+    StorageQuotaError,
+    enforce_storage_quota,
+)
+from ctf_os.store.atomic import (
+    atomic_write_json,
+    atomic_write_text,
+    canonical_json_bytes,
+)
 from ctf_os.store.files import StateStore
-from ctf_os.store.locks import FileLock
+from ctf_os.store.locks import ChallengeLock, FileLock, LockTimeout
 
 MAX_KNOWLEDGE_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_KNOWLEDGE_DOCUMENTS = 256
@@ -306,7 +317,10 @@ def _extract_text(snapshot: ImmutableFile, original_suffix: str) -> str | None:
         raise KnowledgeError(
             "text knowledge documents must be valid UTF-8"
         ) from error
-    return text.replace("\x00", "�")
+    normalized = text.replace("\x00", "�")
+    if len(normalized.encode("utf-8")) > MAX_EXTRACTED_TEXT_BYTES:
+        raise KnowledgeError("extracted knowledge text exceeds 2 MiB")
+    return normalized
 
 
 def _verified_bytes(
@@ -430,8 +444,18 @@ def _context_excerpt(
 class KnowledgeStore:
     """Immutable, challenge-scoped local research storage."""
 
-    def __init__(self, state_store: StateStore) -> None:
+    def __init__(
+        self,
+        state_store: StateStore,
+        *,
+        quota_bytes: int = DEFAULT_CHALLENGE_STORAGE_QUOTA_BYTES,
+        max_scan_entries: int = DEFAULT_STORAGE_SCAN_MAX_ENTRIES,
+        max_scan_bytes: int = DEFAULT_STORAGE_SCAN_MAX_BYTES,
+    ) -> None:
         self.state_store = state_store
+        self.quota_bytes = quota_bytes
+        self.max_scan_entries = max_scan_entries
+        self.max_scan_bytes = max_scan_bytes
 
     def _root(self, identity: ChallengeIdentity) -> Path:
         return ensure_private_directory(
@@ -479,6 +503,7 @@ class KnowledgeStore:
         title: str | None = None,
         expected_sha256: str | None = None,
         content_kind: str = "full_text",
+        _session_owned: bool = False,
     ) -> KnowledgeRecord:
         self.state_store.load(identity)
         public_source = _validate_source_url(source_url)
@@ -497,20 +522,130 @@ class KnowledgeStore:
         if content_kind not in {"full_text", "source", "notes"}:
             raise KnowledgeError("unsupported knowledge content kind")
 
-        root = self._root(identity)
-        documents = ensure_private_directory(root / "documents")
-        text_root = ensure_private_directory(root / "text")
+        if not _session_owned:
+            paths = self.state_store.challenge_paths(identity)
+            session_lock = ChallengeLock(
+                paths.runtime / "session.lock",
+                timeout=0,
+            )
+            try:
+                session_lock.acquire()
+            except LockTimeout as error:
+                raise KnowledgeError(
+                    f"another session already owns {identity.key}"
+                ) from error
+            try:
+                return self.add(
+                    identity,
+                    source,
+                    source_url=public_source,
+                    title=selected_title,
+                    expected_sha256=expected_sha256,
+                    content_kind=content_kind,
+                    _session_owned=True,
+                )
+            finally:
+                session_lock.release()
+
+        root = self._read_root(identity)
+        documents = root / "documents"
+        text_root = root / "text"
         record_id = f"K-{uuid.uuid4().hex}"
+        added_at = utc_now()
         destination = documents / f"{record_id}.bin"
         text_destination = text_root / f"{record_id}.txt"
+        write_lock = FileLock(root / ".lock")
         try:
             try:
+                write_lock.acquire()
+                records = _load_index(root)
+                if len(records) >= MAX_KNOWLEDGE_DOCUMENTS:
+                    raise KnowledgeError(
+                        "challenge already has the maximum knowledge documents"
+                    )
+
+                text_expected = source.suffix.lower() in _TEXT_SUFFIXES
+
+                def reservation_record(source_size: int) -> KnowledgeRecord:
+                    if text_expected and source_size > MAX_EXTRACTED_TEXT_BYTES:
+                        raise KnowledgeError(
+                            "text knowledge source exceeds 2 MiB"
+                        )
+                    projected = KnowledgeRecord(
+                        id=record_id,
+                        title=selected_title,
+                        source_url=public_source,
+                        sha256="0" * 64,
+                        size_bytes=source_size,
+                        document_path=f"documents/{record_id}.bin",
+                        text_path=(
+                            f"text/{record_id}.txt"
+                            if text_expected
+                            else None
+                        ),
+                        text_sha256=("0" * 64 if text_expected else None),
+                        text_size_bytes=(
+                            MAX_EXTRACTED_TEXT_BYTES
+                            if text_expected
+                            else None
+                        ),
+                        added_at=added_at,
+                        content_kind=content_kind,
+                    )
+                    _validate_record(projected)
+                    return projected
+
+                def admit_source_size(source_size: int) -> None:
+                    projected = reservation_record(source_size)
+                    projected_index = canonical_json_bytes(
+                        {
+                            "schema_version": 1,
+                            "documents": [
+                                item.to_dict()
+                                for item in (*records, projected)
+                            ],
+                        }
+                    )
+                    if len(projected_index) > MAX_INDEX_BYTES:
+                        raise KnowledgeError(
+                            "knowledge index exceeds its byte limit"
+                        )
+                    requested = (
+                        source_size
+                        + (
+                            MAX_EXTRACTED_TEXT_BYTES
+                            if text_expected
+                            else 0
+                        )
+                        # The atomic index replacement temporarily coexists
+                        # with the complete previous index, so reserve the
+                        # whole projected generation rather than only delta.
+                        + len(projected_index)
+                    )
+                    try:
+                        enforce_storage_quota(
+                            self.state_store,
+                            identity,
+                            quota_bytes=self.quota_bytes,
+                            max_entries=self.max_scan_entries,
+                            max_scan_bytes=self.max_scan_bytes,
+                            additional_bytes=requested,
+                        )
+                    except StorageQuotaError as error:
+                        raise KnowledgeError(str(error)) from error
+
+                # This ordinary preflight avoids entering the copy primitive
+                # when the current size already cannot fit.  The callback
+                # repeats admission against the descriptor-bound fstat before
+                # the helper creates the destination directory or temp file.
+                admit_source_size(before.st_size)
                 snapshot = copy_bounded_regular(
                     source.parent.resolve(strict=True),
                     source.name,
                     destination,
                     maximum_bytes=MAX_KNOWLEDGE_DOCUMENT_BYTES,
                     expected_sha256=expected_sha256,
+                    source_size_admission=admit_source_size,
                     mode=0o400,
                 )
             except (OSError, SafeFileError) as error:
@@ -535,53 +670,36 @@ class KnowledgeStore:
                 text_path=text_path,
                 text_sha256=text_sha256,
                 text_size_bytes=text_size_bytes,
-                added_at=utc_now(),
+                added_at=added_at,
                 content_kind=content_kind,
             )
             _validate_record(record)
-            write_lock = FileLock(root / ".lock")
-            try:
-                # Install the caller-side cleanup guard before acquire().
-                # A BaseException at FileLock.acquire's return handoff must
-                # not leave this exact lock held through verification below.
-                write_lock.acquire()
-                records = _load_index(root)
-                if len(records) >= MAX_KNOWLEDGE_DOCUMENTS:
-                    raise KnowledgeError(
-                        "challenge already has the maximum knowledge documents"
-                    )
-                duplicate = next(
-                    (
-                        item
-                        for item in records
-                        if item.sha256 == record.sha256
-                        and item.source_url == record.source_url
-                    ),
-                    None,
-                )
-                if duplicate is not None:
-                    destination.unlink(missing_ok=True)
-                    if text_path is not None:
-                        (root / text_path).unlink(missing_ok=True)
-                    return duplicate
-                _write_index(root, (*records, record))
-            finally:
-                active_error = sys.exception()
-                try:
-                    write_lock.release()
-                except BaseException as release_error:
-                    if (
-                        active_error is not None
-                        and not isinstance(active_error, Exception)
-                    ):
-                        active_error.add_note(
-                            "knowledge write lock release failed: "
-                            f"{release_error}"
-                        )
-                    else:
-                        raise
+            duplicate = next(
+                (
+                    item
+                    for item in records
+                    if item.sha256 == record.sha256
+                    and item.source_url == record.source_url
+                ),
+                None,
+            )
+            if duplicate is not None:
+                destination.unlink(missing_ok=True)
+                if text_path is not None:
+                    (root / text_path).unlink(missing_ok=True)
+                return duplicate
+            _write_index(root, (*records, record))
             return record
         except BaseException as add_error:
+            # Verification must never recursively acquire the knowledge lock
+            # while this writer still owns it.
+            try:
+                write_lock.release()
+            except BaseException as release_error:
+                add_error.add_note(
+                    "knowledge write lock release failed before verification: "
+                    f"{release_error}"
+                )
             try:
                 with FileLock(
                     root / ".lock",
@@ -625,6 +743,21 @@ class KnowledgeStore:
                     raise cleanup_failure from add_error
                 add_error.add_note(str(cleanup_failure))
             raise
+        finally:
+            active_error = sys.exception()
+            try:
+                write_lock.release()
+            except BaseException as release_error:
+                if (
+                    active_error is not None
+                    and not isinstance(active_error, Exception)
+                ):
+                    active_error.add_note(
+                        "knowledge write lock release failed: "
+                        f"{release_error}"
+                    )
+                else:
+                    raise
 
     def _search_results(
         self,

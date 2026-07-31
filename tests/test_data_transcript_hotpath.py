@@ -364,6 +364,7 @@ class _Engine:
         mutate_recipe_on_probe: bool = False,
         create_run_fail_at: int | None = None,
         fail_preissue_publish_once: bool = False,
+        reject_exact_admission_at: int | None = None,
     ) -> None:
         self.store = _Store(root, state)
         self.store.create_run_fail_at = create_run_fail_at
@@ -379,18 +380,38 @@ class _Engine:
         self._capability_probe_accepts_timeout = False
         self.lease_broker = _LeaseBroker()
         self.events: list[str] = []
+        self.storage_admissions: list[int | None] = []
         self.sandbox_client: _Sandbox | None = None
         self.incoming = root / "incoming"
         self.incoming.mkdir()
         (self.incoming / "challenge.txt").write_text(
             "immutable input", encoding="utf-8"
         )
+
         self.incomplete = incomplete
         self.reuse_identity = reuse_identity
         self.image_drift_after_first = image_drift_after_first
         self.revision_drift_after_first = revision_drift_after_first
         self.mutate_recipe_on_probe = mutate_recipe_on_probe
         self.probe_calls = 0
+        self.reject_exact_admission_at = reject_exact_admission_at
+        self.exact_admission_calls = 0
+
+    def _enforce_storage_admission(
+        self,
+        _identity,
+        *,
+        requested_bytes: int | None = None,
+    ):
+        self.storage_admissions.append(requested_bytes)
+        if requested_bytes is not None:
+            self.exact_admission_calls += 1
+            if (
+                self.reject_exact_admission_at
+                == self.exact_admission_calls
+            ):
+                raise RuntimeError("challenge storage quota exceeded")
+        return {}
 
     def refresh_ingest(self, identity):
         return self.store.load(identity)
@@ -592,7 +613,11 @@ class _Engine:
     def _cleanup_uncommitted_artifacts(
         self, _identity, artifacts, *, cause
     ):
-        del artifacts, cause
+        del cause
+        for artifact in artifacts:
+            path = self.store.paths.root / artifact.path
+            path.chmod(0o600)
+            path.unlink()
 
 
 def _evaluation(expected_binding):
@@ -769,6 +794,7 @@ class DataTranscriptHotPathTests(unittest.TestCase):
         mutate_recipe_on_probe: bool = False,
         create_run_fail_at: int | None = None,
         fail_preissue_publish_once: bool = False,
+        reject_exact_admission_at: int | None = None,
         category: str = "crypto",
     ) -> _Engine:
         state = copy.deepcopy(self.state)
@@ -786,6 +812,7 @@ class DataTranscriptHotPathTests(unittest.TestCase):
             mutate_recipe_on_probe=mutate_recipe_on_probe,
             create_run_fail_at=create_run_fail_at,
             fail_preissue_publish_once=fail_preissue_publish_once,
+            reject_exact_admission_at=reject_exact_admission_at,
         )
         recipe_bytes = _recipe(self.reset)
         recipe_snapshot = (
@@ -940,6 +967,15 @@ class DataTranscriptHotPathTests(unittest.TestCase):
             engine.events.index("sandbox"),
         )
         self.assertEqual(engine.events.count("run"), 6)
+        self.assertEqual(engine.storage_admissions[0], None)
+        self.assertIn(len(RAW_SECRET), engine.storage_admissions)
+        self.assertTrue(
+            all(
+                value is None or value >= 0
+                for value in engine.storage_admissions
+            )
+        )
+
         self.assertIsNotNone(engine.sandbox_client)
         assert engine.sandbox_client is not None
         self.assertEqual(len(engine.sandbox_client.calls), 6)
@@ -1041,6 +1077,23 @@ class DataTranscriptHotPathTests(unittest.TestCase):
             experiment.result["evaluation_sha256"],
             journal["evaluation_sha256"],
         )
+
+    def test_mid_capture_quota_reject_cleans_partial_artifacts(self):
+        engine = self._engine(reject_exact_admission_at=6)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "storage quota exceeded",
+        ):
+            self._run(engine)
+
+        capture_files = list(
+            engine.store.paths.artifacts.glob(
+                "data-transcript/*/captures/*"
+            )
+        )
+        self.assertEqual(capture_files, [])
+        self.assertGreater(engine.exact_admission_calls, 6)
 
     def test_category_mismatch_rejects_before_consume_or_execution(self):
         engine = self._engine(category="forensic")

@@ -518,6 +518,29 @@ class ForensicIndexExecutionTests(unittest.TestCase):
                     "stdout_capture_incomplete",
                 )
 
+    def test_structured_stream_evidence_v2_is_accepted(self) -> None:
+        receipt = copy.deepcopy(self.inputs["receipt"])
+        evidence = receipt.extra["stream_evidence"]["stdout"]
+        evidence["schema_version"] = 2
+        evidence["structured_summary"] = {
+            "bytes_analyzed": evidence["stored_bytes"],
+            "details_omitted": False,
+            "kind": "json",
+            "scope": "complete_stream",
+            "top_level": "object",
+            "version": 1,
+        }
+        self.assertEqual(
+            self._evaluate(receipt=receipt).reason_code,
+            "complete_executed_evidence_index",
+        )
+
+        evidence["structured_summary"] = "invalid"
+        self.assertEqual(
+            self._evaluate(receipt=receipt).reason_code,
+            "stdout_capture_incomplete",
+        )
+
     def test_stdout_payload_is_bound_to_artifact_hash_and_size(self) -> None:
         result = self._evaluate(
             stdout_payload=self.inputs["stdout_payload"] + b"x",

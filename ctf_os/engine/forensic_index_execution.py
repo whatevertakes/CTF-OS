@@ -125,7 +125,7 @@ _SOURCE_BINDING_KEYS = frozenset(
 _RESOURCE_KEYS = frozenset(
     {"cpu", "gpu", "kvm", "memory_mib", "network"}
 )
-_STREAM_EVIDENCE_KEYS = frozenset(
+_STREAM_EVIDENCE_V1_KEYS = frozenset(
     {
         "artifact_id",
         "binary_sample_omitted",
@@ -149,6 +149,9 @@ _STREAM_EVIDENCE_KEYS = frozenset(
         "truncated",
         "truncation_known",
     }
+)
+_STREAM_EVIDENCE_V2_KEYS = frozenset(
+    {*_STREAM_EVIDENCE_V1_KEYS, "structured_summary"}
 )
 _ALLOWED_RUN_ORIGINS = frozenset(
     {RunOrigin.MANAGED_TOOL, RunOrigin.OPERATOR_TOOL}
@@ -769,7 +772,23 @@ def _stdout_capture_valid(
     if type(streams) is not dict or "stdout" not in streams:
         return False
     evidence = streams.get("stdout")
-    if type(evidence) is not dict or set(evidence) != _STREAM_EVIDENCE_KEYS:
+    if type(evidence) is not dict:
+        return False
+    evidence_schema = evidence.get("schema_version")
+    if (
+        evidence_schema == 1
+        and set(evidence) != _STREAM_EVIDENCE_V1_KEYS
+    ):
+        return False
+    if (
+        evidence_schema == 2
+        and (
+            set(evidence) != _STREAM_EVIDENCE_V2_KEYS
+            or type(evidence.get("structured_summary")) is not dict
+        )
+    ):
+        return False
+    if evidence_schema not in {1, 2}:
         return False
     try:
         encoded_evidence = json.dumps(
@@ -862,7 +881,7 @@ def _stdout_capture_valid(
     ):
         return False
     return (
-        evidence.get("schema_version") == 1
+        evidence.get("schema_version") in {1, 2}
         and evidence.get("stream") == "stdout"
         and evidence.get("artifact_id") == artifact.id
         and evidence.get("path") == artifact.path

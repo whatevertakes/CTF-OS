@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 
+from ctf_os.credential_safety import validate_command_credentials
 from ctf_os.director.resources import ResourceVector
 from ctf_os.sandbox.files import (
     DEFAULT_SNAPSHOT_MAX_BYTES,
@@ -24,6 +25,8 @@ from ctf_os.sandbox.files import (
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 JOB_ID = re.compile(r"^job-[0-9]{8}$")
 JOB_SUPERVISOR_ID = re.compile(r"^bg-[0-9a-f]{32}$")
+ANALYSIS_ID = re.compile(r"^analysis-[0-9a-f]{32}$")
+SCOPE_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 
 def validate_deadline_monotonic_seconds(
@@ -59,6 +62,10 @@ class NetworkDenied(SandboxError):
 
 class BackgroundJobUnsupported(SandboxError):
     """A background start was requested without a lease supervisor."""
+
+
+class AnalysisRuntimeCleanupPending(SandboxError):
+    """An isolated-analysis container could not be proven absent."""
 
 
 _BACKGROUND_STARTERS = frozenset(
@@ -1516,6 +1523,7 @@ class CommandSpec:
             )
         if total_environment_bytes > 1024 * 1024:
             raise ValueError("environment exceeds 1 MiB")
+        validate_command_credentials(self.argv, environment)
         request = self.resource_request
         if not isinstance(request, ResourceVector):
             raise ValueError("resource_request must be a ResourceVector")
@@ -1582,6 +1590,13 @@ class SandboxResult:
     # this empty.  Each reference points into the durable challenge-scoped
     # ``work/proof/clean-*`` tree and is content-addressed during promotion.
     proof_outputs: tuple[ArtifactRef, ...] = ()
+    # Newer ctfwrap transports retain the exact backend-clamped timeout and
+    # wrapper clock window.  They remain optional at the end for positional
+    # compatibility with older injected clients; evidence-sensitive callers
+    # can require them explicitly.
+    timeout_seconds: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 def sandbox_result_from_mapping(
@@ -1590,6 +1605,7 @@ def sandbox_result_from_mapping(
     stdout_path: str | None = None,
     stderr_path: str | None = None,
     proof_outputs: tuple[ArtifactRef, ...] | None = None,
+    bound_timeout_seconds: int | None = None,
 ) -> SandboxResult:
     """Decode one backward-compatible ``ctfwrap`` result mapping.
 
@@ -1626,9 +1642,35 @@ def sandbox_result_from_mapping(
         raw = value.get(name)
         if raw is None:
             return None
-        if not isinstance(raw, str):
+        if not isinstance(raw, str) or len(raw.encode("utf-8")) > 4096:
             raise ValueError(f"{name} must be a string or null")
         return raw
+
+    raw_timeout_seconds = value.get("timeout_seconds")
+    if raw_timeout_seconds is None:
+        decoded_timeout_seconds = None
+    elif (
+        type(raw_timeout_seconds) is not int
+        or not 1 <= raw_timeout_seconds <= 604800
+    ):
+        raise ValueError(
+            "timeout_seconds must be a bounded positive integer or null"
+        )
+    else:
+        decoded_timeout_seconds = raw_timeout_seconds
+    if bound_timeout_seconds is not None:
+        if (
+            type(bound_timeout_seconds) is not int
+            or not 1 <= bound_timeout_seconds <= 604800
+        ):
+            raise ValueError(
+                "bound_timeout_seconds must be a bounded positive integer"
+            )
+        if decoded_timeout_seconds != bound_timeout_seconds:
+            raise ValueError(
+                "timeout_seconds does not match the backend command timeout"
+            )
+        decoded_timeout_seconds = bound_timeout_seconds
 
     selected_stdout_path = (
         stdout_path if stdout_path is not None else str(value["stdout_path"])
@@ -1726,6 +1768,9 @@ def sandbox_result_from_mapping(
         stream_capture_error=optional_text("stream_capture_error"),
         orchestration_error=optional_text("orchestration_error"),
         proof_outputs=selected_proof_outputs,
+        timeout_seconds=decoded_timeout_seconds,
+        started_at=optional_text("started_at"),
+        finished_at=optional_text("finished_at"),
     )
 
 
@@ -1852,6 +1897,52 @@ class ProofOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalysisLeaseRef:
+    """Path-free identity of one engine-admitted analysis scratch lease."""
+
+    analysis_id: str
+    scope_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.analysis_id) is not str
+            or ANALYSIS_ID.fullmatch(self.analysis_id) is None
+        ):
+            raise ValueError("invalid analysis lease identity")
+        if (
+            type(self.scope_fingerprint) is not str
+            or SCOPE_FINGERPRINT.fullmatch(self.scope_fingerprint) is None
+        ):
+            raise ValueError("invalid analysis scope fingerprint")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "analysis_id": self.analysis_id,
+            "scope_fingerprint": self.scope_fingerprint,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> AnalysisLeaseRef:
+        if type(value) is not dict or set(value) != {
+            "analysis_id",
+            "scope_fingerprint",
+        }:
+            raise ValueError(
+                "analysis lease reference has an invalid schema"
+            )
+        analysis_id = value["analysis_id"]
+        scope_fingerprint = value["scope_fingerprint"]
+        if type(analysis_id) is not str or type(scope_fingerprint) is not str:
+            raise ValueError(
+                "analysis lease reference fields have invalid types"
+            )
+        return cls(
+            analysis_id=analysis_id,
+            scope_fingerprint=scope_fingerprint,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class JobRef:
     job_id: str
     scope_fingerprint: str
@@ -1894,6 +1985,93 @@ class JobStatus:
     cancelled: bool = False
     started_at: str | None = None
     finished_at: str | None = None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.reason_code is not None
+            and (
+                type(self.reason_code) is not str
+                or re.fullmatch(
+                    r"[a-z][a-z0-9_]{0,63}",
+                    self.reason_code,
+                )
+                is None
+            )
+        ):
+            raise ValueError("invalid sandbox job reason code")
+
+
+class BackgroundLaunchState(str, Enum):
+    """Reservation-relevant state of one preallocated supervisor launch."""
+
+    ABSENT = "absent"
+    PENDING = "pending"
+    ACTIVE = "active"
+    RELEASED = "released"
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundLaunchStatus:
+    """Exact recovery result for one engine-preallocated supervisor identity."""
+
+    supervisor_id: str
+    state: BackgroundLaunchState
+    ref: JobRef | None = None
+    job_status: JobStatus | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not BackgroundLaunchState:
+            raise ValueError("invalid background launch state")
+        if (
+            type(self.supervisor_id) is not str
+            or not JOB_SUPERVISOR_ID.fullmatch(self.supervisor_id)
+        ):
+            raise ValueError("invalid background supervisor identity")
+        if (
+            self.ref is not None
+            and self.ref.supervisor_id != self.supervisor_id
+        ):
+            raise ValueError(
+                "background launch reference has another supervisor identity"
+            )
+        if self.job_status is not None and (
+            self.ref is None or self.job_status.ref != self.ref
+        ):
+            raise ValueError(
+                "background launch status does not match its reference"
+            )
+        if self.state is BackgroundLaunchState.ABSENT and (
+            self.ref is not None or self.job_status is not None
+        ):
+            raise ValueError("absent background launch cannot have a job")
+        if self.state is BackgroundLaunchState.ACTIVE:
+            if self.ref is None or self.job_status is None:
+                raise ValueError(
+                    "active background launch requires an exact job status"
+                )
+            if self.job_status.status not in {
+                JobState.STARTING,
+                JobState.RUNNING,
+            }:
+                raise ValueError(
+                    "active background launch has a terminal job status"
+                )
+        if (
+            self.state is BackgroundLaunchState.RELEASED
+            and self.job_status is not None
+            and self.job_status.status
+            not in {
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.TIMED_OUT,
+                JobState.CANCELLED,
+                JobState.LOST,
+            }
+        ):
+            raise ValueError(
+                "released background launch has a non-terminal job status"
+            )
 
 
 @dataclass(frozen=True, slots=True)

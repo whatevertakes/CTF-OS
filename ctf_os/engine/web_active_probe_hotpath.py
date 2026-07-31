@@ -37,6 +37,7 @@ from ctf_os.engine.web_impact_driver import (
     validate_route_payload,
     web_impact_target_binding_sha256,
 )
+from ctf_os.engine.hotpath_cleanup import HotPathCleanupTracker
 from ctf_os.engine.web_impact_hotpath import (
     _all_state_ids,
     _artifact_bytes,
@@ -537,6 +538,89 @@ def prove_web_active_probe(
 ) -> tuple[ChallengeState, dict[str, object]]:
     """Execute one exact race/OOB vulnerable3-control3 matrix."""
 
+    preissue_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=(
+            engine.config.runtime.challenge_storage_quota_bytes
+        ),
+    )
+    replay_cleanup = HotPathCleanupTracker(
+        maximum_entries=engine.config.runtime.storage_scan_max_entries,
+        maximum_bytes=engine.config.runtime.work_tree_max_bytes,
+    )
+    failure: BaseException | None = None
+    try:
+        return _prove_web_active_probe(
+            engine,
+            identity,
+            operator_spec_locator=operator_spec_locator,
+            driver_locator=driver_locator,
+            hypothesis_ids=hypothesis_ids,
+            timeout_seconds=timeout_seconds,
+            _session_owned=_session_owned,
+            _preissue_cleanup=preissue_cleanup,
+            _replay_cleanup=replay_cleanup,
+        )
+    except BaseException as error:
+        failure = error
+        attempt_id = preissue_cleanup.attempt_id
+        if attempt_id is not None:
+            try:
+                current = engine.store.load(identity, recover=False)
+                attempts = current.extra.get(
+                    WEB_ACTIVE_PROBE_PREISSUES_KEY
+                )
+                committed = (
+                    type(attempts) is dict and attempt_id in attempts
+                )
+            except BaseException as inspection_error:
+                error.add_note(
+                    "Web active-probe preissue cleanup was skipped because "
+                    "canonical state could not be inspected: "
+                    f"{type(inspection_error).__name__}"
+                )
+                committed = True
+            if not committed:
+                try:
+                    preissue_cleanup.cleanup(
+                        engine,
+                        identity,
+                        cause=error,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "Web active-probe preissue cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+        raise
+    finally:
+        try:
+            replay_cleanup.cleanup(
+                engine,
+                identity,
+                cause=failure,
+            )
+        except BaseException as cleanup_error:
+            if failure is None:
+                raise
+            failure.add_note(
+                "Web active-probe replay workspace cleanup failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
+def _prove_web_active_probe(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+    *,
+    operator_spec_locator: str,
+    driver_locator: str,
+    hypothesis_ids: tuple[str, ...] = (),
+    timeout_seconds: int = 900,
+    _session_owned: bool = False,
+    _preissue_cleanup: HotPathCleanupTracker,
+    _replay_cleanup: HotPathCleanupTracker,
+) -> tuple[ChallengeState, dict[str, object]]:
     from ctf_os.engine.challenge import (
         EngineError,
         SessionAlreadyRunning,
@@ -557,7 +641,7 @@ def prove_web_active_probe(
             ) from error
         try:
             engine._recover_session_boundary(identity)
-            return prove_web_active_probe(
+            return _prove_web_active_probe(
                 engine,
                 identity,
                 operator_spec_locator=operator_spec_locator,
@@ -565,10 +649,13 @@ def prove_web_active_probe(
                 hypothesis_ids=hypothesis_ids,
                 timeout_seconds=timeout_seconds,
                 _session_owned=True,
+                _preissue_cleanup=_preissue_cleanup,
+                _replay_cleanup=_replay_cleanup,
             )
         finally:
             lock.release()
 
+    engine._enforce_storage_admission(identity)
     state = engine.store.load(identity)
     validate_web_active_probe_state_graph(state)
     if (
@@ -596,9 +683,11 @@ def prove_web_active_probe(
         )
     paths = engine.store.challenge_paths(identity)
     attempt_id = _new_id("web-active")
+    _preissue_cleanup.set_attempt_id(attempt_id)
     root = ensure_private_directory(
         paths.artifacts / "web-active" / attempt_id
     )
+    _preissue_cleanup.track_tree(paths.root, root)
     input_root = ensure_private_directory(root / "inputs")
     capture_root = ensure_private_directory(root / "captures")
     initial_client = engine.sandbox(
@@ -769,12 +858,23 @@ def prove_web_active_probe(
             target_id=target.id,
             target_binding=_target_binding(target),
         )
-        run_paths = engine.store.create_run(
-            identity,
-            issued.issue.run_id,
-            request=document,
-            base_revision=state.revision,
-        )
+        run_root = paths.runs / issued.issue.run_id
+        try:
+            run_paths = engine.store.create_run(
+                identity,
+                issued.issue.run_id,
+                request=document,
+                base_revision=state.revision,
+            )
+        finally:
+            try:
+                _preissue_cleanup.track_tree(
+                    paths.root,
+                    run_root,
+                    run_id=issued.issue.run_id,
+                )
+            except FileNotFoundError:
+                pass
         payload = run_paths.request.read_bytes()
         request_bindings.append(
             {
@@ -979,12 +1079,14 @@ def prove_web_active_probe(
     runs: list[RunReference] = []
     receipts: list[ExecutionReceipt] = []
     artifacts: list[ArtifactReference] = []
+    uncommitted_artifacts: list[ArtifactReference] = []
     try:
         for issued, request_binding in zip(
             issues,
             request_bindings,
             strict=True,
         ):
+            _replay_cleanup.cleanup(engine, identity)
             verify_preissue()
             issue = issued.issue
             target_record = (
@@ -1001,6 +1103,10 @@ def prove_web_active_probe(
                 / "web-active-live"
                 / attempt_id
                 / issue.run_id
+            )
+            _replay_cleanup.track_tree(
+                paths.root,
+                paths.runtime / "web-active-live" / attempt_id,
             )
             if any(workspace.iterdir()):
                 raise WebActiveProbeHotPathError(
@@ -1063,6 +1169,12 @@ def prove_web_active_probe(
                         paths.root,
                         snapshots_by_locator[step.body.locator],
                         destination,
+                        source_size_admission=lambda size: (
+                            engine._enforce_storage_admission(
+                                identity,
+                                requested_bytes=size,
+                            )
+                        ),
                     )
                     body_path = (
                         f"/work/{destination.name}"
@@ -1147,6 +1259,7 @@ def prove_web_active_probe(
                     role="web_active_probe_setup_response",
                 )
                 setup_references.append(reference)
+                uncommitted_artifacts.append(reference)
                 setup_manifest.append(
                     {
                         "artifact_id": reference.id,
@@ -1175,6 +1288,12 @@ def prove_web_active_probe(
                     driver.probe.body.locator
                 ],
                 probe_body_destination,
+                source_size_admission=lambda size: (
+                    engine._enforce_storage_admission(
+                        identity,
+                        requested_bytes=size,
+                    )
+                ),
             )
             active_timeout = min(
                 driver.probe.timeout_seconds,
@@ -1277,6 +1396,7 @@ def prove_web_active_probe(
                     role="web_active_probe_output",
                 )
                 output_references.append(reference)
+                uncommitted_artifacts.append(reference)
             if spec["mode"] == "race":
                 responses = report["responses"]
                 for response, reference in zip(
@@ -1357,6 +1477,9 @@ def prove_web_active_probe(
                 payload=persisted_timeline,
                 run_id=issue.run_id,
                 role="web_active_probe_timeline",
+            )
+            uncommitted_artifacts.extend(
+                (report_reference, timeline_reference)
             )
             lineage_after = private_web_cookie_lineage_sha256(
                 scope,
@@ -1565,6 +1688,10 @@ def prove_web_active_probe(
         )
         evaluation_payload = _canonical_bytes(evaluation)
         evaluation_path = root / "evaluation.json"
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(evaluation_payload),
+        )
         atomic_write_bytes(
             evaluation_path,
             evaluation_payload,
@@ -1578,6 +1705,7 @@ def prove_web_active_probe(
             run_id=runs[-1].id,
             role="web_active_probe_evaluation",
         )
+        uncommitted_artifacts.append(evaluation_reference)
         shared_artifacts = [
             _snapshot_artifact_reference(spec_snapshot),
             _snapshot_artifact_reference(driver_snapshot),
@@ -1759,8 +1887,21 @@ def prove_web_active_probe(
             pre_replace_guard=verify_final,
         )
         validate_web_active_probe_state_graph(committed_final)
+        uncommitted_artifacts.clear()
         return committed_final, evaluation
     except BaseException as error:
+        if uncommitted_artifacts:
+            try:
+                engine._cleanup_uncommitted_artifacts(
+                    identity,
+                    tuple(uncommitted_artifacts),
+                    cause=error,
+                )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Web active-probe uncommitted artifact cleanup failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
         _terminalize(engine, identity, attempt_id, error)
         raise
 

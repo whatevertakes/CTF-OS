@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from ctf_os.engine.challenge import ChallengeEngine
 from ctf_os.models import ArtifactReference, ChallengeIdentity
 from ctf_os.storage import (
     StorageError,
@@ -41,6 +42,58 @@ class StorageTests(unittest.TestCase):
         destination.write_bytes(payload)
         destination.chmod(0o600)
         return destination
+
+    def gc_control(self, quarantine_id: str) -> Path:
+        return (
+            self.store.challenge_paths(self.identity).root
+            / ".storage-gc"
+            / quarantine_id
+        )
+
+    @staticmethod
+    def background_record(
+        *,
+        status: str = "running",
+        reservation: int = 10,
+    ) -> dict[str, object]:
+        terminal = status in {
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+            "recovered",
+        }
+        return {
+            "schema_version": 2,
+            "supervisor_id": "bg-" + "1" * 32,
+            "job_id": "job-00000001",
+            "scope_fingerprint": "2" * 64,
+            "runtime_id": "none",
+            "status": status,
+            "command": ["true"],
+            "name": None,
+            "resource_class": "light",
+            "resource_request": {
+                "cpu": 1,
+                "memory_mib": 1,
+                "gpu": 0,
+                "kvm": 0,
+                "network": 0,
+            },
+            "network_target": None,
+            "intent_created_at": "2026-07-31T00:00:00+00:00",
+            "work_tree_limit_bytes": 10,
+            "storage_reservation_bytes": (
+                0 if terminal else reservation
+            ),
+            "exit_code": 0 if terminal else None,
+            "reason_code": None,
+            "timed_out": status == "timed_out",
+            "cancelled": status == "cancelled",
+            "started_at": None,
+            "finished_at": None,
+            "observed_at": None,
+        }
 
     def test_inventory_uses_one_canonical_state_revision(self) -> None:
         with mock.patch.object(
@@ -168,6 +221,49 @@ class StorageTests(unittest.TestCase):
                 item["storage_class"] == "quarantine"
                 for item in detached["files"]
             )
+        )
+
+    def test_current_context_is_bounded_exempt_but_history_is_accounted(
+        self,
+    ) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        before = storage_inventory(self.store, self.identity)
+        engine = ChallengeEngine(self.root)
+        engine.update_prompt(
+            self.identity,
+            "operator prompt " + ("x" * 20_000),
+        )
+        after_prompt = storage_inventory(self.store, self.identity)
+        self.assertEqual(after_prompt["total_bytes"], before["total_bytes"])
+        self.assertGreater(
+            after_prompt["control"]["quota_exempt_bytes"],
+            before["control"]["quota_exempt_bytes"],
+        )
+        self.assertNotIn(
+            "context/current.md",
+            {item["path"] for item in after_prompt["files"]},
+        )
+        self.assertEqual(
+            after_prompt["quota"]["observed_physical_bytes"],
+            after_prompt["total_bytes"]
+            + after_prompt["control"]["quota_exempt_bytes"],
+        )
+
+        history = paths.context_history / "run.jsonl"
+        history.write_bytes(b"immutable model context\n")
+        after_history = storage_inventory(self.store, self.identity)
+        self.assertEqual(
+            after_history["total_bytes"] - after_prompt["total_bytes"],
+            history.stat().st_size,
+        )
+
+        with paths.current_context.open("r+b") as stream:
+            stream.truncate(16 * 1024 * 1024 + 1)
+        oversized = storage_inventory(self.store, self.identity)
+        self.assertFalse(oversized["scan_complete"])
+        self.assertIn(
+            "derived_control_file_exceeds_limit",
+            {item["code"] for item in oversized["scan"]["issues"]},
         )
 
     def test_preserved_roots_count_toward_quota_but_never_enter_gc(
@@ -322,6 +418,112 @@ class StorageTests(unittest.TestCase):
                     self.identity,
                     additional_bytes=invalid,
                 )
+
+    def test_active_reservations_share_the_inventory_state_snapshot(
+        self,
+    ) -> None:
+        def add_active(state) -> None:
+            state.extra["background_jobs"] = [
+                self.background_record()
+            ]
+
+        self.store.update(self.identity, add_active)
+        report = storage_inventory(self.store, self.identity)
+        physical = report["total_bytes"]
+        self.assertEqual(
+            report["quota"]["active_reservation_bytes"],
+            10,
+        )
+        self.assertEqual(
+            report["quota"]["conservative_projected_bytes"],
+            physical + 10,
+        )
+        self.assertFalse(report["quota"]["exact"])
+        admitted = enforce_storage_quota(
+            self.store,
+            self.identity,
+            quota_bytes=physical + 14,
+            additional_bytes=4,
+        )
+        self.assertEqual(
+            admitted["quota"]["requested_bytes"],
+            4,
+        )
+        with self.assertRaisesRegex(
+            StorageQuotaError,
+            "requested write",
+        ):
+            enforce_storage_quota(
+                self.store,
+                self.identity,
+                quota_bytes=physical + 14,
+                additional_bytes=5,
+            )
+
+        def release(state) -> None:
+            state.extra["background_jobs"] = [
+                self.background_record(status="completed")
+            ]
+
+        self.store.update(self.identity, release)
+        released = storage_inventory(self.store, self.identity)
+        self.assertEqual(
+            released["quota"]["active_reservation_bytes"],
+            0,
+        )
+        self.assertTrue(released["quota"]["exact"])
+
+    def test_legacy_active_background_record_fails_admission_closed(
+        self,
+    ) -> None:
+        def add_legacy(state) -> None:
+            state.extra["background_jobs"] = [
+                {
+                    "schema_version": 1,
+                    "supervisor_id": "bg-" + "1" * 32,
+                    "status": "running",
+                }
+            ]
+
+        self.store.update(self.identity, add_legacy)
+        report = storage_inventory(self.store, self.identity)
+        self.assertEqual(report["quota"]["status"], "indeterminate")
+        self.assertIn(
+            "background_reservation_indeterminate",
+            {item["code"] for item in report["scan"]["issues"]},
+        )
+        with self.assertRaisesRegex(StorageQuotaError, "cannot be proven"):
+            enforce_storage_quota(self.store, self.identity)
+
+    def test_scan_rechecks_an_early_closed_subtree(self) -> None:
+        self.orphan("artifacts/trigger.bin", b"trigger")
+        paths = self.store.challenge_paths(self.identity)
+        real_storage_class = __import__(
+            "ctf_os.storage",
+            fromlist=["_storage_class"],
+        )._storage_class
+        injected = False
+
+        def inject_after_runs(relative, reachable, prefixes):
+            nonlocal injected
+            if not injected and relative == "artifacts/trigger.bin":
+                injected = True
+                late = paths.runs / "late.bin"
+                late.write_bytes(b"late")
+                late.chmod(0o600)
+            return real_storage_class(relative, reachable, prefixes)
+
+        with mock.patch(
+            "ctf_os.storage._storage_class",
+            side_effect=inject_after_runs,
+        ):
+            report = storage_inventory(self.store, self.identity)
+        self.assertTrue(injected)
+        self.assertFalse(report["scan_complete"])
+        self.assertIn(
+            "directory_changed_during_scan",
+            {item["code"] for item in report["scan"]["issues"]},
+        )
 
     def test_quota_admission_retries_only_transient_scan_changes(
         self,
@@ -527,8 +729,9 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(purged["permanent_delete_performed"])
         self.assertFalse(first.exists())
         self.assertFalse(second.exists())
-        self.assertTrue((quarantine_root / "manifest.json").is_file())
-        self.assertTrue((quarantine_root / "purge.json").is_file())
+        control_root = self.gc_control(quarantine_id)
+        self.assertTrue((control_root / "manifest.json").is_file())
+        self.assertTrue((control_root / "purge.json").is_file())
         self.assertFalse(
             any(
                 path.is_file()
@@ -555,6 +758,323 @@ class StorageTests(unittest.TestCase):
             quarantine_id,
         )
         self.assertEqual(status["status"], "purged")
+
+    def test_gc_control_plane_recovers_an_already_exceeded_quota(self) -> None:
+        baseline = storage_inventory(self.store, self.identity)["total_bytes"]
+        orphan = self.orphan(
+            "artifacts/orphan/quota-recovery.bin",
+            b"R" * 8192,
+        )
+        quota = baseline + orphan.stat().st_size - 1
+        exceeded = storage_inventory(
+            self.store,
+            self.identity,
+            quota_bytes=quota,
+        )
+        self.assertEqual(exceeded["quota"]["status"], "exceeded")
+
+        quarantined = quarantine_unreachable(self.store, self.identity)
+        after_quarantine = storage_inventory(
+            self.store,
+            self.identity,
+            quota_bytes=quota,
+        )
+        self.assertEqual(
+            after_quarantine["total_bytes"],
+            exceeded["total_bytes"],
+        )
+        control = self.gc_control(quarantined["quarantine_id"])
+        self.assertTrue((control / "manifest.json").is_file())
+        self.assertGreater(
+            after_quarantine["control"]["gc_recovery_bytes"],
+            0,
+        )
+        self.assertEqual(
+            after_quarantine["quota"]["observed_physical_bytes"],
+            after_quarantine["total_bytes"]
+            + after_quarantine["control"]["quota_exempt_bytes"],
+        )
+        self.assertNotIn(
+            ".storage-gc",
+            {item["path"].split("/", 1)[0] for item in after_quarantine["files"]},
+        )
+
+        prepared = prepare_quarantine_purge(
+            self.store,
+            self.identity,
+            quarantined["quarantine_id"],
+        )
+        self.assertTrue((control / "purge.json").is_file())
+        purge_quarantine(
+            self.store,
+            self.identity,
+            quarantined["quarantine_id"],
+            manifest_sha256=prepared["manifest_sha256"],
+            confirmation=prepared["confirmation"],
+        )
+        recovered = storage_inventory(
+            self.store,
+            self.identity,
+            quota_bytes=quota,
+        )
+        self.assertEqual(recovered["quota"]["status"], "within")
+        self.assertLess(recovered["total_bytes"], exceeded["total_bytes"])
+
+    def test_gc_control_plane_cap_and_legacy_fallback_fail_closed(self) -> None:
+        from ctf_os import storage as storage_module
+
+        orphan = self.orphan(
+            "artifacts/orphan/control-cap.bin",
+            b"control-cap",
+        )
+        with (
+            mock.patch.object(storage_module, "MAX_GC_CONTROL_BYTES", 1),
+            self.assertRaisesRegex(StorageError, "control byte cap"),
+        ):
+            quarantine_unreachable(self.store, self.identity)
+        self.assertEqual(orphan.read_bytes(), b"control-cap")
+        paths = self.store.challenge_paths(self.identity)
+        self.assertEqual(
+            list((paths.artifacts / "quarantine").iterdir()),
+            [],
+        )
+        self.assertEqual(
+            list((paths.root / ".storage-gc").iterdir()),
+            [],
+        )
+
+        # A failed first publish must not consume one control-plane entry per
+        # retry and eventually deadlock GC at its bounded entry cap.
+        for _attempt in range(3):
+            with (
+                mock.patch.object(storage_module, "MAX_GC_CONTROL_BYTES", 1),
+                self.assertRaisesRegex(StorageError, "control byte cap"),
+            ):
+                quarantine_unreachable(self.store, self.identity)
+        self.assertEqual(
+            list((paths.artifacts / "quarantine").iterdir()),
+            [],
+        )
+        self.assertEqual(
+            list((paths.root / ".storage-gc").iterdir()),
+            [],
+        )
+
+        quarantined = quarantine_unreachable(self.store, self.identity)
+        quarantine_id = quarantined["quarantine_id"]
+        data_root = (
+            self.store.challenge_paths(self.identity).artifacts
+            / "quarantine"
+            / quarantine_id
+        )
+        control_root = self.gc_control(quarantine_id)
+        (control_root / "manifest.json").replace(
+            data_root / "manifest.json"
+        )
+        control_root.rmdir()
+        prepared = prepare_quarantine_purge(
+            self.store,
+            self.identity,
+            quarantine_id,
+        )
+        self.assertTrue((data_root / "purge.json").is_file())
+        self.assertEqual(prepared["status"], "prepared")
+
+        outside = self.root / "legacy-manifest-hardlink"
+        os.link(data_root / "manifest.json", outside)
+        with self.assertRaisesRegex(StorageError, "unsafe"):
+            prepare_quarantine_purge(
+                self.store,
+                self.identity,
+                quarantine_id,
+            )
+        plane = self.store.challenge_paths(self.identity).root / ".storage-gc"
+        plane.chmod(0o755)
+        unsafe_control = storage_inventory(self.store, self.identity)
+        self.assertFalse(unsafe_control["scan_complete"])
+        self.assertIn(
+            "gc_control_integrity_failed",
+            {item["code"] for item in unsafe_control["scan"]["issues"]},
+        )
+
+    def test_pre_manifest_interrupt_removes_partial_transaction(self) -> None:
+        from ctf_os import storage as storage_module
+
+        orphan = self.orphan(
+            "artifacts/orphan/pre-manifest.bin",
+            b"must remain reachable after the interruption",
+        )
+        paths = self.store.challenge_paths(self.identity)
+        real_open_directory_at = storage_module._open_directory_at
+
+        def interrupt_after_files_mkdir(
+            directory_fd,
+            name,
+            *,
+            create=False,
+        ):
+            descriptor = real_open_directory_at(
+                directory_fd,
+                name,
+                create=create,
+            )
+            if name == "files" and create:
+                os.close(descriptor)
+                raise KeyboardInterrupt(
+                    "synthetic pre-manifest interruption"
+                )
+            return descriptor
+
+        with (
+            mock.patch.object(
+                storage_module,
+                "_open_directory_at",
+                side_effect=interrupt_after_files_mkdir,
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic pre-manifest interruption",
+            ),
+        ):
+            quarantine_unreachable(self.store, self.identity)
+
+        self.assertEqual(
+            orphan.read_bytes(),
+            b"must remain reachable after the interruption",
+        )
+        for plane in (
+            paths.artifacts / "quarantine",
+            paths.root / ".storage-gc",
+        ):
+            self.assertEqual(
+                tuple(plane.iterdir()) if plane.exists() else (),
+                (),
+            )
+
+    def test_gc_recovers_exact_crash_orphan_before_noop(self) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        quarantine_id = "Q-" + "a" * 32
+        data_plane = paths.artifacts / "quarantine"
+        data_plane.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data_plane.chmod(0o700)
+        data_root = data_plane / quarantine_id
+        data_files = data_root / "files"
+        data_files.mkdir(mode=0o700, parents=True)
+        data_root.chmod(0o700)
+        control_plane = paths.root / ".storage-gc"
+        control_plane.mkdir(mode=0o700)
+        control_root = control_plane / quarantine_id
+        control_root.mkdir(mode=0o700)
+        temporary = control_root / (
+            ".manifest.json." + "b" * 32 + ".tmp"
+        )
+        temporary.write_bytes(b"interrupted initial manifest")
+        temporary.chmod(0o600)
+
+        result = quarantine_unreachable(self.store, self.identity)
+
+        self.assertEqual(result["status"], "noop")
+        self.assertEqual(result["reason"], "no_unreachable_files")
+        self.assertFalse((data_plane / quarantine_id).exists())
+        self.assertFalse(control_root.exists())
+
+    def test_gc_control_entry_admission_precedes_transaction_mkdir(self) -> None:
+        from ctf_os import storage as storage_module
+
+        orphan = self.orphan(
+            "artifacts/orphan/control-entry-cap.bin",
+            b"entry-cap",
+        )
+        paths = self.store.challenge_paths(self.identity)
+        with (
+            mock.patch.object(storage_module, "MAX_GC_CONTROL_ENTRIES", 1),
+            self.assertRaisesRegex(StorageError, "control entry cap"),
+        ):
+            quarantine_unreachable(self.store, self.identity)
+
+        self.assertEqual(orphan.read_bytes(), b"entry-cap")
+        for plane in (
+            paths.artifacts / "quarantine",
+            paths.root / ".storage-gc",
+        ):
+            self.assertEqual(
+                tuple(plane.iterdir()) if plane.exists() else (),
+                (),
+            )
+
+    def test_gc_recovery_uses_one_global_control_entry_budget(self) -> None:
+        from ctf_os import storage as storage_module
+
+        paths = self.store.challenge_paths(self.identity)
+        quarantine_id = "Q-" + "c" * 32
+        control_root = paths.root / ".storage-gc" / quarantine_id
+        control_root.mkdir(mode=0o700, parents=True)
+        (paths.root / ".storage-gc").chmod(0o700)
+        temporary = control_root / (
+            ".manifest.json." + "d" * 32 + ".tmp"
+        )
+        temporary.write_bytes(b"bounded recovery")
+        temporary.chmod(0o600)
+
+        with (
+            mock.patch.object(storage_module, "MAX_GC_CONTROL_ENTRIES", 1),
+            self.assertRaisesRegex(StorageError, "entry limit"),
+        ):
+            quarantine_unreachable(self.store, self.identity)
+
+        self.assertEqual(temporary.read_bytes(), b"bounded recovery")
+
+    def test_gc_recovery_never_removes_unknown_unpublished_data(self) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        quarantine_id = "Q-" + "e" * 32
+        data_root = paths.artifacts / "quarantine" / quarantine_id
+        data_root.mkdir(mode=0o700, parents=True)
+        (paths.artifacts / "quarantine").chmod(0o700)
+        unknown = data_root / "operator-note.bin"
+        unknown.write_bytes(b"preserve unknown data")
+        unknown.chmod(0o600)
+        control_root = paths.root / ".storage-gc" / quarantine_id
+        control_root.mkdir(mode=0o700, parents=True)
+        (paths.root / ".storage-gc").chmod(0o700)
+
+        with self.assertRaisesRegex(StorageError, "unknown entry"):
+            quarantine_unreachable(self.store, self.identity)
+
+        self.assertEqual(unknown.read_bytes(), b"preserve unknown data")
+        self.assertTrue(control_root.is_dir())
+
+    def test_empty_gc_is_bounded_idempotent_noop(self) -> None:
+        paths = self.store.challenge_paths(self.identity)
+        data_plane = paths.artifacts / "quarantine"
+        control_plane = paths.root / ".storage-gc"
+        data_before = (
+            tuple(data_plane.iterdir()) if data_plane.exists() else ()
+        )
+        control_before = (
+            tuple(control_plane.iterdir())
+            if control_plane.exists()
+            else ()
+        )
+
+        for _attempt in range(8):
+            result = quarantine_unreachable(self.store, self.identity)
+            self.assertEqual(result["status"], "noop")
+            self.assertEqual(result["reason"], "no_unreachable_files")
+            self.assertIsNone(result["quarantine_id"])
+            self.assertEqual(result["files"], [])
+
+        self.assertEqual(
+            tuple(data_plane.iterdir()) if data_plane.exists() else (),
+            data_before,
+        )
+        self.assertEqual(
+            (
+                tuple(control_plane.iterdir())
+                if control_plane.exists()
+                else ()
+            ),
+            control_before,
+        )
 
     def test_purge_recovers_crash_after_unlink(self) -> None:
         self.orphan("artifacts/orphan/one.bin", b"one")
@@ -614,7 +1134,10 @@ class StorageTests(unittest.TestCase):
         self.orphan("artifacts/orphan/traversal.bin", b"payload")
         quarantined = quarantine_unreachable(self.store, self.identity)
         root = paths.artifacts / "quarantine" / quarantined["quarantine_id"]
-        manifest_path = root / "manifest.json"
+        manifest_path = (
+            self.gc_control(quarantined["quarantine_id"])
+            / "manifest.json"
+        )
         manifest = read_json(manifest_path)
         original_path = manifest["files"][0]["path"]
         manifest["files"][0]["path"] = "../outside"
@@ -636,7 +1159,10 @@ class StorageTests(unittest.TestCase):
             / "quarantine"
             / symlinked["quarantine_id"]
         )
-        symlink_manifest = read_json(symlink_root / "manifest.json")
+        symlink_manifest = read_json(
+            self.gc_control(symlinked["quarantine_id"])
+            / "manifest.json"
+        )
         relative = Path(symlink_manifest["files"][0]["path"])
         detached = symlink_root / "files" / relative
         detached.unlink()
@@ -658,7 +1184,10 @@ class StorageTests(unittest.TestCase):
             / "quarantine"
             / hardlinked["quarantine_id"]
         )
-        hardlink_manifest = read_json(hardlink_root / "manifest.json")
+        hardlink_manifest = read_json(
+            self.gc_control(hardlinked["quarantine_id"])
+            / "manifest.json"
+        )
         relative = Path(hardlink_manifest["files"][0]["path"])
         os.link(
             hardlink_root / "files" / relative,
@@ -676,7 +1205,10 @@ class StorageTests(unittest.TestCase):
         self.orphan("artifacts/orphan/exact.bin", b"exact")
         quarantined = quarantine_unreachable(self.store, self.identity)
         root = paths.artifacts / "quarantine" / quarantined["quarantine_id"]
-        manifest_path = root / "manifest.json"
+        manifest_path = (
+            self.gc_control(quarantined["quarantine_id"])
+            / "manifest.json"
+        )
         manifest = read_json(manifest_path)
         manifest["identity"]["challenge_id"] = "different"
         atomic_write_json(manifest_path, manifest)
@@ -709,7 +1241,10 @@ class StorageTests(unittest.TestCase):
             self.identity,
             quarantined["quarantine_id"],
         )
-        manifest = read_json(root / "manifest.json")
+        manifest = read_json(
+            self.gc_control(quarantined["quarantine_id"])
+            / "manifest.json"
+        )
         relative = Path(manifest["files"][0]["path"])
         external_link = self.root / "late-hardlink"
         os.link(root / "files" / relative, external_link)
@@ -806,7 +1341,10 @@ class StorageTests(unittest.TestCase):
             / "quarantine"
             / quarantined["quarantine_id"]
         )
-        manifest_path = quarantine_root / "manifest.json"
+        manifest_path = (
+            self.gc_control(quarantined["quarantine_id"])
+            / "manifest.json"
+        )
         manifest = read_json(manifest_path)
         manifest["status"] = "moving"
         atomic_write_json(manifest_path, manifest)
@@ -882,7 +1420,10 @@ class StorageTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            read_json(quarantine_root / "purge.json")["status"],
+            read_json(
+                self.gc_control(quarantined["quarantine_id"])
+                / "purge.json"
+            )["status"],
             "faulted",
         )
         self.assertEqual(external.read_bytes(), b"do not misreport")

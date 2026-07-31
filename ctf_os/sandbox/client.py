@@ -23,7 +23,12 @@ from .files import (
     measure_work_tree,
 )
 from .types import (
+    JOB_SUPERVISOR_ID,
+    AnalysisLeaseRef,
+    AnalysisRuntimeCleanupPending,
     ArtifactRef,
+    BackgroundLaunchState,
+    BackgroundLaunchStatus,
     BackgroundJobUnsupported,
     ChallengeScope,
     CommandSpec,
@@ -46,6 +51,15 @@ if TYPE_CHECKING:
     from .supervisor import BackgroundJobSupervisor
 
 MAX_RPC_BYTES = 1024 * 1024
+
+
+def _validate_supervisor_id(value: object) -> str:
+    if (
+        type(value) is not str
+        or not JOB_SUPERVISOR_ID.fullmatch(value)
+    ):
+        raise ValueError("invalid background supervisor identity")
+    return value
 
 
 def _validate_cancel_grace_seconds(grace_seconds: int) -> int:
@@ -73,7 +87,31 @@ class ChallengeSandboxClient(Protocol):
 
     def run(self, spec: CommandSpec) -> SandboxResult: ...
 
-    def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef: ...
+    def isolated_analysis_runtime_id(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> str: ...
+
+    def run_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+        spec: CommandSpec,
+        *,
+        input_locators: Sequence[str] = (),
+    ) -> SandboxResult: ...
+
+    def cleanup_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> None: ...
+
+    def start_job(
+        self,
+        spec: CommandSpec,
+        *,
+        name: str | None = None,
+        supervisor_id: str | None = None,
+    ) -> JobRef: ...
 
     def job_status(self, ref: JobRef) -> JobStatus: ...
 
@@ -84,6 +122,11 @@ class ChallengeSandboxClient(Protocol):
     def list_jobs(self) -> tuple[JobStatus, ...]: ...
 
     def recover_jobs(self) -> tuple[JobStatus, ...]: ...
+
+    def recover_job_launch(
+        self,
+        supervisor_id: str,
+    ) -> BackgroundLaunchStatus: ...
 
     def register_artifact(
         self,
@@ -193,6 +236,7 @@ class LocalChallengeSandboxClient:
         scope: ChallengeScope,
         *,
         backend: DockerSandboxBackend | None = None,
+        analysis_root: Path | None = None,
         image: str = "ctf-os:core",
         image_digest: str | None = None,
         network_policy: NetworkPolicy | None = None,
@@ -201,9 +245,20 @@ class LocalChallengeSandboxClient:
     ) -> None:
         if backend is not None and backend.scope != scope:
             raise ScopeError("sandbox backend belongs to another challenge scope")
+        if backend is not None and analysis_root is not None:
+            configured = getattr(backend, "analysis_root", None)
+            try:
+                requested = Path(analysis_root).expanduser().resolve(strict=True)
+            except OSError as error:
+                raise ScopeError("analysis root is unavailable") from error
+            if configured != requested:
+                raise ScopeError(
+                    "sandbox backend has another trusted analysis root"
+                )
         self.scope = scope
         self.backend = backend or DockerSandboxBackend(
             scope,
+            analysis_root=analysis_root,
             image=image,
             image_digest=image_digest,
             network_policy=network_policy,
@@ -231,16 +286,66 @@ class LocalChallengeSandboxClient:
     def run(self, spec: CommandSpec) -> SandboxResult:
         return self.backend.run(spec)
 
-    def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef:
+    def _check_analysis_ref(self, lease: AnalysisLeaseRef) -> None:
+        if type(lease) is not AnalysisLeaseRef:
+            raise TypeError("lease must be an AnalysisLeaseRef")
+        if lease.scope_fingerprint != self.scope.fingerprint:
+            raise ScopeError("analysis lease belongs to another challenge")
+
+    def isolated_analysis_runtime_id(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> str:
+        self._check_analysis_ref(lease)
+        return self.backend.isolated_analysis_runtime_id(lease)
+
+    def run_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+        spec: CommandSpec,
+        *,
+        input_locators: Sequence[str] = (),
+    ) -> SandboxResult:
+        self._check_analysis_ref(lease)
+        return self.backend.run_isolated_analysis(
+            lease,
+            spec,
+            input_locators=input_locators,
+        )
+
+    def cleanup_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> None:
+        self._check_analysis_ref(lease)
+        self.backend.cleanup_isolated_analysis(lease)
+
+    def start_job(
+        self,
+        spec: CommandSpec,
+        *,
+        name: str | None = None,
+        supervisor_id: str | None = None,
+    ) -> JobRef:
         if self.job_supervisor is None:
             raise BackgroundJobUnsupported(
                 "background job start requires a configured lease supervisor"
+            )
+        if supervisor_id is not None:
+            supervisor_id = _validate_supervisor_id(supervisor_id)
+        if supervisor_id is None:
+            return self.job_supervisor.start(
+                self.backend,
+                spec,
+                name=name,
+                owner=f"{self.scope.qualified_id}:background",
             )
         return self.job_supervisor.start(
             self.backend,
             spec,
             name=name,
             owner=f"{self.scope.qualified_id}:background",
+            supervisor_id=supervisor_id,
         )
 
     def job_status(self, ref: JobRef) -> JobStatus:
@@ -293,6 +398,20 @@ class LocalChallengeSandboxClient:
         if self.job_supervisor is None:
             return ()
         return self.job_supervisor.recover(self.backend)
+
+    def recover_job_launch(
+        self,
+        supervisor_id: str,
+    ) -> BackgroundLaunchStatus:
+        if self.job_supervisor is None:
+            raise BackgroundJobUnsupported(
+                "background launch recovery requires its lease supervisor"
+            )
+        supervisor_id = _validate_supervisor_id(supervisor_id)
+        return self.job_supervisor.recover_launch(
+            self.backend,
+            supervisor_id,
+        )
 
     def register_artifact(
         self,
@@ -462,6 +581,133 @@ def ref_from_dict(value: object) -> JobRef:
     )
 
 
+def background_launch_to_dict(
+    launch: BackgroundLaunchStatus,
+) -> dict[str, object]:
+    status = launch.job_status
+    return {
+        "schema_version": 1,
+        "supervisor_id": launch.supervisor_id,
+        "state": launch.state.value,
+        "ref": ref_to_dict(launch.ref) if launch.ref is not None else None,
+        "job_status": (
+            {
+                "status": status.status.value,
+                "exit_code": status.exit_code,
+                "timed_out": status.timed_out,
+                "cancelled": status.cancelled,
+                "started_at": status.started_at,
+                "finished_at": status.finished_at,
+                "reason_code": status.reason_code,
+            }
+            if status is not None
+            else None
+        ),
+    }
+
+
+def background_launch_from_dict(
+    value: object,
+) -> BackgroundLaunchStatus:
+    if (
+        type(value) is not dict
+        or set(value)
+        != {
+            "schema_version",
+            "supervisor_id",
+            "state",
+            "ref",
+            "job_status",
+        }
+        or value.get("schema_version") != 1
+    ):
+        raise SandboxError("invalid background launch recovery response")
+    try:
+        state = BackgroundLaunchState(value.get("state"))
+        supervisor_id = value.get("supervisor_id")
+        ref_value = value.get("ref")
+        ref = None if ref_value is None else ref_from_dict(ref_value)
+        status_value = value.get("job_status")
+        status = None
+        if status_value is not None:
+            if (
+                type(status_value) is not dict
+                or frozenset(status_value)
+                not in {
+                    frozenset(
+                        {
+                            "status",
+                            "exit_code",
+                            "timed_out",
+                            "cancelled",
+                            "started_at",
+                            "finished_at",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "status",
+                            "exit_code",
+                            "timed_out",
+                            "cancelled",
+                            "started_at",
+                            "finished_at",
+                            "reason_code",
+                        }
+                    ),
+                }
+                or not {
+                    "status",
+                    "exit_code",
+                    "timed_out",
+                    "cancelled",
+                    "started_at",
+                    "finished_at",
+                }.issubset(status_value)
+                or ref is None
+                or type(status_value["timed_out"]) is not bool
+                or type(status_value["cancelled"]) is not bool
+                or (
+                    status_value["exit_code"] is not None
+                    and (
+                        type(status_value["exit_code"]) is not int
+                        or not -(2**31)
+                        <= status_value["exit_code"]
+                        <= 2**31 - 1
+                    )
+                )
+                or (
+                    status_value["started_at"] is not None
+                    and type(status_value["started_at"]) is not str
+                )
+                or (
+                    status_value["finished_at"] is not None
+                    and type(status_value["finished_at"]) is not str
+                )
+            ):
+                raise ValueError("invalid background job status")
+            status = JobStatus(
+                ref=ref,
+                status=JobState(status_value["status"]),
+                exit_code=status_value["exit_code"],
+                timed_out=status_value["timed_out"],
+                cancelled=status_value["cancelled"],
+                started_at=status_value["started_at"],
+                finished_at=status_value["finished_at"],
+                reason_code=status_value.get("reason_code"),
+            )
+        return BackgroundLaunchStatus(
+            supervisor_id=supervisor_id,  # type: ignore[arg-type]
+            state=state,
+            ref=ref,
+            job_status=status,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SandboxError(
+            "invalid background launch recovery response"
+        ) from error
+
+
 def result_from_dict(value: object) -> SandboxResult:
     if not isinstance(value, dict):
         raise SandboxError("sandbox result must be an object")
@@ -590,17 +836,26 @@ class UnixChallengeSandboxClient:
             raise SandboxError("sandbox daemon returned an unsupported response")
         if not response.get("ok"):
             error = response.get("error", {})
+            code = error.get("code") if isinstance(error, dict) else None
             message = (
                 str(error.get("message", "sandbox operation failed"))
                 if isinstance(error, dict)
                 else "sandbox operation failed"
             )
+            if code == "AnalysisRuntimeCleanupPending":
+                raise AnalysisRuntimeCleanupPending(message)
             raise SandboxError(message)
         return response.get("result")
 
     def _check_ref(self, ref: JobRef) -> None:
         if ref.scope_fingerprint != self.scope_fingerprint:
             raise ScopeError("job reference belongs to another challenge")
+
+    def _check_analysis_ref(self, lease: AnalysisLeaseRef) -> None:
+        if type(lease) is not AnalysisLeaseRef:
+            raise TypeError("lease must be an AnalysisLeaseRef")
+        if lease.scope_fingerprint != self.scope_fingerprint:
+            raise ScopeError("analysis lease belongs to another challenge")
 
     @staticmethod
     def _rpc_deadline(
@@ -652,7 +907,86 @@ class UnixChallengeSandboxClient:
             )
         )
 
-    def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef:
+    def isolated_analysis_runtime_id(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> str:
+        self._check_analysis_ref(lease)
+        value = self._call(
+            "isolated_analysis_runtime_id",
+            {"lease": lease.as_dict()},
+        )
+        expected = (
+            f"ctfos-analysis-{self.scope_fingerprint[:12]}-"
+            f"{lease.analysis_id.removeprefix('analysis-')[:20]}-run"
+        )
+        if type(value) is not str or value != expected:
+            raise SandboxError(
+                "sandbox returned another isolated-analysis runtime identity"
+            )
+        return value
+
+    def run_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+        spec: CommandSpec,
+        *,
+        input_locators: Sequence[str] = (),
+    ) -> SandboxResult:
+        self._check_analysis_ref(lease)
+        if (
+            isinstance(input_locators, (str, bytes, bytearray))
+            or not isinstance(input_locators, Sequence)
+            or len(input_locators) > 256
+        ):
+            raise ValueError("input_locators must be an array of strings")
+        input_values = tuple(input_locators)
+        if any(type(locator) is not str for locator in input_values):
+            raise ValueError("input_locators must be an array of strings")
+        fallback = (
+            spec.timeout_seconds + 150 if spec.timeout_seconds else 604800 + 150
+        )
+        rpc_deadline = self._rpc_deadline(
+            spec.deadline_monotonic_seconds,
+            fallback,
+            150,
+        )
+        return result_from_dict(
+            self._call(
+                "run_isolated_analysis",
+                {
+                    "lease": lease.as_dict(),
+                    "command": command_to_dict(spec),
+                    "input_locators": list(input_values),
+                },
+                rpc_deadline_monotonic=rpc_deadline,
+            )
+        )
+
+    def cleanup_isolated_analysis(
+        self,
+        lease: AnalysisLeaseRef,
+    ) -> None:
+        self._check_analysis_ref(lease)
+        value = self._call(
+            "cleanup_isolated_analysis",
+            {"lease": lease.as_dict()},
+            timeout=90,
+        )
+        if value != {"runtime_absent": True}:
+            raise AnalysisRuntimeCleanupPending(
+                "sandbox returned an invalid analysis cleanup receipt"
+            )
+
+    def start_job(
+        self,
+        spec: CommandSpec,
+        *,
+        name: str | None = None,
+        supervisor_id: str | None = None,
+    ) -> JobRef:
+        if supervisor_id is not None:
+            supervisor_id = _validate_supervisor_id(supervisor_id)
         fallback = max(self.rpc_timeout, 330.0)
         rpc_deadline = self._rpc_deadline(
             spec.deadline_monotonic_seconds,
@@ -664,10 +998,19 @@ class UnixChallengeSandboxClient:
             {
                 "command": command_to_dict(spec),
                 "name": name,
+                "supervisor_id": supervisor_id,
             },
             rpc_deadline_monotonic=rpc_deadline,
         )
-        return ref_from_dict(value)
+        ref = ref_from_dict(value)
+        if (
+            supervisor_id is not None
+            and ref.supervisor_id != supervisor_id
+        ):
+            raise SandboxError(
+                "background launch returned another supervisor identity"
+            )
+        return ref
 
     def job_status(self, ref: JobRef) -> JobStatus:
         self._check_ref(ref)
@@ -682,6 +1025,7 @@ class UnixChallengeSandboxClient:
             cancelled=bool(value.get("cancelled", False)),
             started_at=value.get("started_at"),
             finished_at=value.get("finished_at"),
+            reason_code=value.get("reason_code"),
         )
 
     def job_log(self, ref: JobRef, *, tail_bytes: int = 8192) -> JobLog:
@@ -720,6 +1064,7 @@ class UnixChallengeSandboxClient:
             cancelled=bool(value.get("cancelled", False)),
             started_at=value.get("started_at"),
             finished_at=value.get("finished_at"),
+            reason_code=value.get("reason_code"),
         )
 
     def list_jobs(self) -> tuple[JobStatus, ...]:
@@ -742,6 +1087,7 @@ class UnixChallengeSandboxClient:
                     cancelled=bool(item.get("cancelled", False)),
                     started_at=item.get("started_at"),
                     finished_at=item.get("finished_at"),
+                    reason_code=item.get("reason_code"),
                 )
             )
         return tuple(statuses)
@@ -766,9 +1112,34 @@ class UnixChallengeSandboxClient:
                     cancelled=bool(item.get("cancelled", False)),
                     started_at=item.get("started_at"),
                     finished_at=item.get("finished_at"),
+                    reason_code=item.get("reason_code"),
                 )
             )
         return tuple(statuses)
+
+    def recover_job_launch(
+        self,
+        supervisor_id: str,
+    ) -> BackgroundLaunchStatus:
+        supervisor_id = _validate_supervisor_id(supervisor_id)
+        launch = background_launch_from_dict(
+            self._call(
+                "recover_job_launch",
+                {"supervisor_id": supervisor_id},
+            )
+        )
+        if launch.supervisor_id != supervisor_id:
+            raise SandboxError(
+                "background recovery returned another supervisor identity"
+            )
+        if (
+            launch.ref is not None
+            and launch.ref.scope_fingerprint != self.scope_fingerprint
+        ):
+            raise ScopeError(
+                "background recovery returned another challenge scope"
+            )
+        return launch
 
     def register_artifact(
         self,

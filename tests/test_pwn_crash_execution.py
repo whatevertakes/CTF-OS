@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import struct
 import tempfile
 import unittest
@@ -642,6 +643,83 @@ class PwnCrashExecutionTests(unittest.TestCase):
             )
         )
         state.validate()
+
+    @unittest.skipUnless(
+        hasattr(signal, "setitimer"),
+        "requires a bounded POSIX interval timer",
+    )
+    def test_commit_guards_never_reenter_storage_admission(self):
+        coordinator = _SandboxCoordinator(self._confirming_statuses())
+        engine, experiment_id, _artifact_path, _payload = self._fixture(
+            coordinator
+        )
+        original_update = engine.store.update
+        original_admission = engine._enforce_storage_admission
+        inside_writer_callback = False
+        external_admissions = 0
+
+        def wrap_callback(callback):
+            def wrapped(*args, **kwargs):
+                nonlocal inside_writer_callback
+                previous = inside_writer_callback
+                inside_writer_callback = True
+                try:
+                    return callback(*args, **kwargs)
+                finally:
+                    inside_writer_callback = previous
+
+            wrapped.__name__ = getattr(callback, "__name__", "wrapped")
+            return wrapped
+
+        def monitored_update(*args, **kwargs):
+            positional = list(args)
+            if len(positional) >= 2 and callable(positional[1]):
+                positional[1] = wrap_callback(positional[1])
+            for name in ("commit_guard", "pre_replace_guard"):
+                callback = kwargs.get(name)
+                if callback is not None:
+                    kwargs[name] = wrap_callback(callback)
+            return original_update(*positional, **kwargs)
+
+        def monitored_admission(*args, **kwargs):
+            nonlocal external_admissions
+            if inside_writer_callback:
+                raise AssertionError(
+                    "storage admission reentered from a state writer callback"
+                )
+            external_admissions += 1
+            return original_admission(*args, **kwargs)
+
+        def expired(_signum, _frame):
+            raise AssertionError(
+                "Pwn crash execution exceeded the deadlock timeout"
+            )
+
+        previous_handler = signal.signal(signal.SIGALRM, expired)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 5.0)
+            with (
+                patch.object(
+                    engine.store,
+                    "update",
+                    side_effect=monitored_update,
+                ),
+                patch.object(
+                    engine,
+                    "_enforce_storage_admission",
+                    side_effect=monitored_admission,
+                ),
+            ):
+                final = self._execute(engine, experiment_id)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+        self.assertGreater(external_admissions, 0)
+        experiment = next(
+            item for item in final.experiments if item.id == experiment_id
+        )
+        self.assertIs(experiment.status, ExperimentStatus.KEPT)
 
     def test_session_recovery_removes_only_exact_hard_death_orphans(self):
         coordinator = _SandboxCoordinator(self._confirming_statuses())

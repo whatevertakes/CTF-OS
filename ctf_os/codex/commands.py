@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 
+from ctf_os.credential_safety import (
+    validate_metadata_credentials,
+    validate_trusted_model_command_credentials,
+)
 from ctf_os.store.atomic import canonical_json_bytes
 
 from .contracts import (
@@ -128,6 +132,7 @@ class BatchInvocation:
             raise ValueError("run_id must be a non-empty path component")
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
+        validate_metadata_credentials(self.prompt)
         if self.reasoning_effort is not None and not isinstance(
             self.reasoning_effort, ReasoningEffort
         ):
@@ -194,6 +199,9 @@ class BuiltCommand:
     )
 
     def __post_init__(self) -> None:
+        validate_trusted_model_command_credentials(self.argv)
+        if self.stdin:
+            validate_metadata_credentials(self.stdin)
         if self.environment is None:
             return
         copied: dict[str, str] = {}
@@ -319,6 +327,7 @@ class LiveSession:
             raise ValueError("session_key must not be empty")
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
+        validate_metadata_credentials(self.prompt)
         if "\x00" in self.prompt:
             raise ValueError("Live prompt must not contain NUL")
         if len(self.prompt.encode("utf-8")) > 8192:

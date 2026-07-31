@@ -9,12 +9,17 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from ctf_os.director.resources import ResourceVector
-from ctf_os.engine.challenge import ChallengeEngine
+from ctf_os.engine.challenge import (
+    ChallengeEngine,
+    EngineError,
+    SessionAlreadyRunning,
+)
 from ctf_os.models import ChallengeIdentity
 from ctf_os.sandbox.docker import DockerSandboxBackend
 from ctf_os.sandbox.egress import (
@@ -31,6 +36,7 @@ from ctf_os.sandbox.types import (
     ScopeError,
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
+from ctf_os.store import ChallengeLock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -416,6 +422,61 @@ class RestrictedEgressEngineTests(unittest.TestCase):
             checked.targets[-1].last_preflight["remote_request_performed"],
             True,
         )
+
+    def test_network_smoke_admits_before_lease_or_remote_sandbox(self) -> None:
+        sandbox_calls = 0
+
+        def sandbox_factory(_state, _work, _policy):
+            nonlocal sandbox_calls
+            sandbox_calls += 1
+            raise AssertionError("quota rejection must precede sandbox setup")
+
+        engine = self._configured_engine(sandbox_factory)
+        state = engine.store.load(self.identity)
+        target = state.targets[-1]
+        engine.config = replace(
+            engine.config,
+            runtime=replace(
+                engine.config.runtime,
+                challenge_storage_quota_bytes=1,
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                engine.lease_broker,
+                "acquire",
+                wraps=engine.lease_broker.acquire,
+            ) as acquire,
+            self.assertRaisesRegex(EngineError, "storage quota"),
+        ):
+            engine.smoke_network_target(
+                self.identity,
+                target.id,
+                modes=("dns",),
+            )
+
+        acquire.assert_not_called()
+        self.assertEqual(sandbox_calls, 0)
+
+    def test_network_smoke_obeys_the_challenge_session_lock(self) -> None:
+        engine = self._configured_engine()
+        state = engine.store.load(self.identity)
+        target = state.targets[-1]
+        lock = ChallengeLock(
+            engine.store.challenge_paths(self.identity).runtime
+            / "session.lock",
+            timeout=0,
+        ).acquire()
+        try:
+            with self.assertRaises(SessionAlreadyRunning):
+                engine.smoke_network_target(
+                    self.identity,
+                    target.id,
+                    modes=("dns",),
+                )
+        finally:
+            lock.release()
 
 
 class RestrictedProxyProtocolTests(unittest.TestCase):

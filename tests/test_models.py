@@ -2033,6 +2033,74 @@ class ModelTests(unittest.TestCase):
                 ):
                     loaded.validate()
 
+    def test_background_storage_reservation_schema_is_exact(self) -> None:
+        state = new_challenge_state(
+            ChallengeIdentity("Demo", "forensic", "Memory")
+        )
+        record = {
+            "schema_version": 2,
+            "supervisor_id": "bg-" + "1" * 32,
+            "job_id": "job-00000001",
+            "scope_fingerprint": "2" * 64,
+            "runtime_id": "none",
+            "status": "lost",
+            "command": ["volatility3", "windows.pslist"],
+            "name": "memory",
+            "resource_class": "heavy",
+            "resource_request": {
+                "cpu": 1,
+                "memory_mib": 2048,
+                "gpu": 0,
+                "kvm": 0,
+                "network": 0,
+            },
+            "network_target": None,
+            "intent_created_at": "2026-07-31T00:00:00+00:00",
+            "work_tree_limit_bytes": 1024,
+            "storage_reservation_bytes": 1024,
+            "exit_code": None,
+            "reason_code": None,
+            "timed_out": False,
+            "cancelled": False,
+            "started_at": None,
+            "finished_at": None,
+            "observed_at": None,
+        }
+        state.extra["background_jobs"] = [record]
+        state.validate()
+
+        mutations = {
+            "active_zero": lambda item: item.update(
+                storage_reservation_bytes=0
+            ),
+            "terminal_nonzero": lambda item: item.update(
+                status="completed"
+            ),
+            "bool_limit": lambda item: item.update(
+                work_tree_limit_bytes=True,
+                storage_reservation_bytes=True,
+            ),
+            "extra_key": lambda item: item.update(untrusted=True),
+            "partial_ref": lambda item: item.update(runtime_id=None),
+            "invalid_reason_code": lambda item: item.update(
+                reason_code="Unbounded Reason"
+            ),
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name):
+                hostile = copy.deepcopy(state)
+                mutation(hostile.extra["background_jobs"][0])
+                with self.assertRaises(ModelValidationError):
+                    hostile.validate()
+
+        duplicate = copy.deepcopy(state)
+        duplicate.extra["background_jobs"].append(copy.deepcopy(record))
+        with self.assertRaisesRegex(
+            ModelValidationError,
+            "reuses supervisor_id",
+        ):
+            duplicate.validate()
+
 
 class PwnDisclosureEnvelopeModelTests(unittest.TestCase):
     """State-only lifecycle tests over one canonical completed snapshot."""

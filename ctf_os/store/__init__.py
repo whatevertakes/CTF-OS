@@ -3,6 +3,7 @@
 from ctf_os.store.files import (
     DEFAULT_MAX_ARTIFACT_BYTES,
     MAX_CANONICAL_STATE_BYTES,
+    MAX_RUN_DOCUMENT_BYTES,
     ArtifactValidationError,
     ChallengePaths,
     ContestPaths,
@@ -40,6 +41,7 @@ __all__ = [
     "InvalidIdentity",
     "LockTimeout",
     "MAX_CANONICAL_STATE_BYTES",
+    "MAX_RUN_DOCUMENT_BYTES",
     "MigrationInProgress",
     "RevisionConflict",
     "RunPaths",

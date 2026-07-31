@@ -24,7 +24,7 @@ import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from ctf_os.adapters import get_adapter
 from ctf_os.contracts.rev_runtime_v1 import (
@@ -73,7 +73,6 @@ from ctf_os.sandbox.files import (
     SafeFileError,
     copy_bounded_regular,
     ensure_private_directory,
-    ensure_relative_directory,
     normalize_locator,
     read_bounded_regular,
 )
@@ -182,6 +181,7 @@ def _file_binding(
     path: Path,
     *,
     maximum_bytes: int,
+    source_size_admission: Callable[[int], None],
 ) -> tuple[str, int]:
     relative = path.relative_to(root).as_posix()
     with tempfile.TemporaryDirectory(
@@ -193,6 +193,7 @@ def _file_binding(
             relative,
             Path(temporary) / "bound.bin",
             maximum_bytes=maximum_bytes,
+            source_size_admission=source_size_admission,
             mode=0o400,
         )
     return immutable.sha256, immutable.size_bytes
@@ -373,6 +374,10 @@ def _snapshot_operator_input(
     finally:
         os.close(descriptor)
 
+    engine._enforce_storage_admission(
+        state.identity,
+        requested_bytes=len(immutable_payload),
+    )
     atomic_write_bytes(destination, immutable_payload, mode=0o400)
     challenge_root = engine.store.challenge_paths(state.identity).root
     relative = destination.relative_to(challenge_root).as_posix()
@@ -405,6 +410,8 @@ def _snapshot_operator_input(
 
 
 def _snapshot_proof_stream(
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
     client: object,
     *,
     workspace_root: Path,
@@ -429,6 +436,12 @@ def _snapshot_proof_stream(
             maximum_bytes=REV_ACCEPTANCE_MAX_STREAM_BYTES,
             expected_sha256=reference.sha256,
             expected_size=reference.size_bytes,
+            source_size_admission=lambda size: (
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=size,
+                )
+            ),
             mode=0o400,
         )
     except RevRuntimeProofError:
@@ -535,12 +548,6 @@ def _build_source_snapshot(
     ensure_private_directory(challenge_root)
     try:
         for item in _runtime_files(spec):
-            parent = PurePosixPath(item.path).parent
-            if parent != PurePosixPath("."):
-                ensure_relative_directory(
-                    challenge_root,
-                    parent.as_posix(),
-                )
             copy_bounded_regular(
                 incoming,
                 item.path,
@@ -548,6 +555,12 @@ def _build_source_snapshot(
                 maximum_bytes=REV_RUNTIME_V1_MAX_FILE_BYTES,
                 expected_sha256=item.sha256,
                 expected_size=item.size_bytes,
+                source_size_admission=lambda size: (
+                    engine._enforce_storage_admission(
+                        state.identity,
+                        requested_bytes=size,
+                    )
+                ),
                 mode=0o500,
             )
         _verify_source_snapshot(challenge_root, spec)
@@ -1596,6 +1609,7 @@ def prove_rev_runtime_accepted_input(
 
     try:
         engine._recover_session_boundary(identity)
+        engine._enforce_storage_admission(identity)
         state = engine.refresh_ingest(identity)
         engine._remaining_budget_seconds(state)
         image_digest = engine.config.runtime.image_digest
@@ -1812,6 +1826,10 @@ def prove_rev_runtime_accepted_input(
                     runtime_spec,
                     challenge_root,
                 )
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=len(runtime_spec.canonical_bytes),
+                )
                 atomic_write_bytes(
                     proof_workspace / "runtime-spec.json",
                     runtime_spec.canonical_bytes,
@@ -1871,6 +1889,10 @@ def prove_rev_runtime_accepted_input(
                     attempt_path = (
                         inputs_directory
                         / f"attempt-{planned.ordinal:02d}.bin"
+                    )
+                    engine._enforce_storage_admission(
+                        identity,
+                        requested_bytes=len(planned.payload),
                     )
                     atomic_write_bytes(
                         attempt_path,
@@ -2007,8 +2029,9 @@ def prove_rev_runtime_accepted_input(
                                 source_run_id=run_id,
                             )
                         )
-                        ensure_private_directory(destination.parent)
                         immutable = _snapshot_proof_stream(
+                            engine,
+                            identity,
                             proof_client,
                             workspace_root=proof_workspace,
                             locator=locator,
@@ -2106,16 +2129,34 @@ def prove_rev_runtime_accepted_input(
                         paths.root,
                         run_paths.request,
                         maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                        source_size_admission=lambda size: (
+                            engine._enforce_storage_admission(
+                                identity,
+                                requested_bytes=size,
+                            )
+                        ),
                     )
                     result_sha256, result_size = _file_binding(
                         paths.root,
                         durable_result,
                         maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                        source_size_admission=lambda size: (
+                            engine._enforce_storage_admission(
+                                identity,
+                                requested_bytes=size,
+                            )
+                        ),
                     )
                     validation_sha256, validation_size = _file_binding(
                         paths.root,
                         validation_path,
                         maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                        source_size_admission=lambda size: (
+                            engine._enforce_storage_admission(
+                                identity,
+                                requested_bytes=size,
+                            )
+                        ),
                     )
                     record = {
                         "observation": copy.deepcopy(observation),
@@ -2230,6 +2271,10 @@ def prove_rev_runtime_accepted_input(
                 sha256="0" * 64,
                 source_run_id=run_records[-1].run.id,
             )
+        )
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(evaluation_payload),
         )
         atomic_write_bytes(
             evaluation_path,

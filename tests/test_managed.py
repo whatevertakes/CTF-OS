@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import signal
 import shlex
 import tempfile
 import threading
@@ -1580,6 +1581,123 @@ class ManagedV2Tests(unittest.TestCase):
             ),
         )
         state.validate()
+
+    @unittest.skipUnless(
+        hasattr(signal, "setitimer"),
+        "requires a bounded POSIX interval timer",
+    )
+    def test_rev_writer_callbacks_never_reenter_storage_admission(self):
+        observations: dict[str, int] = {}
+
+        def proof_execution_hook(engine, execute_proof):
+            original_update = engine.store.update
+            original_admission = engine._enforce_storage_admission
+            original_prepare = engine._prepare_rev_adapter_source_snapshot
+            inside_writer_callback = False
+            external_admissions = 0
+
+            def wrap_callback(callback):
+                def wrapped(*args, **kwargs):
+                    nonlocal inside_writer_callback
+                    previous = inside_writer_callback
+                    inside_writer_callback = True
+                    try:
+                        return callback(*args, **kwargs)
+                    finally:
+                        inside_writer_callback = previous
+
+                wrapped.__name__ = getattr(
+                    callback,
+                    "__name__",
+                    "wrapped",
+                )
+                return wrapped
+
+            def monitored_update(*args, **kwargs):
+                positional = list(args)
+                for index in (1, 3):
+                    if (
+                        len(positional) > index
+                        and callable(positional[index])
+                    ):
+                        positional[index] = wrap_callback(
+                            positional[index]
+                        )
+                        break
+                callback = kwargs.get("mutator")
+                if callback is not None:
+                    kwargs["mutator"] = wrap_callback(callback)
+                for name in ("commit_guard", "pre_replace_guard"):
+                    callback = kwargs.get(name)
+                    if callback is not None:
+                        kwargs[name] = wrap_callback(callback)
+                return original_update(*positional, **kwargs)
+
+            def monitored_admission(*args, **kwargs):
+                nonlocal external_admissions
+                if inside_writer_callback:
+                    raise AssertionError(
+                        "storage admission reentered from a state writer "
+                        "callback"
+                    )
+                external_admissions += 1
+                return original_admission(*args, **kwargs)
+
+            def monitored_prepare(*args, **kwargs):
+                if (
+                    inside_writer_callback
+                    and kwargs.get("allow_create") is not False
+                ):
+                    raise AssertionError(
+                        "Rev source snapshot creation was allowed under "
+                        "the state writer lock"
+                    )
+                return original_prepare(*args, **kwargs)
+
+            def expired(_signum, _frame):
+                raise AssertionError(
+                    "Rev proof execution exceeded the deadlock timeout"
+                )
+
+            previous_handler = signal.signal(signal.SIGALRM, expired)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 10.0)
+                with (
+                    mock.patch.object(
+                        engine.store,
+                        "update",
+                        side_effect=monitored_update,
+                    ),
+                    mock.patch.object(
+                        engine,
+                        "_enforce_storage_admission",
+                        side_effect=monitored_admission,
+                    ),
+                    mock.patch.object(
+                        engine,
+                        "_prepare_rev_adapter_source_snapshot",
+                        side_effect=monitored_prepare,
+                    ),
+                ):
+                    committed = execute_proof()
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, previous_handler)
+            observations["external_admissions"] = external_admissions
+            return committed
+
+        state, proof_experiment, _candidate, sandbox, _accepted = (
+            self.run_managed_rev_proof_fixture(
+                proof_execution_hook=proof_execution_hook,
+            )
+        )
+        self.assertGreater(observations["external_admissions"], 0)
+        self.assertIs(
+            proof_experiment.status,
+            ExperimentStatus.COMPLETED,
+        )
+        self.assertEqual(sandbox.proof_calls, 6)
+        self.assertIs(state.status, ChallengeStatus.READY_TO_SUBMIT)
 
     def test_rev_managed_stdin_semantic_falsification_completes(self):
         state, proof_experiment, candidate, sandbox, _accepted = (

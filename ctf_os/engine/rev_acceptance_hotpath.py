@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 
 from ctf_os.adapters import get_adapter
 from ctf_os.director.resources import tool_profile
@@ -116,6 +116,7 @@ def _file_binding(
     path: Path,
     *,
     maximum_bytes: int,
+    source_size_admission: Callable[[int], None],
 ) -> tuple[str, int]:
     relative = path.relative_to(root).as_posix()
     with tempfile.TemporaryDirectory(
@@ -127,6 +128,7 @@ def _file_binding(
             relative,
             Path(temporary) / "bound.bin",
             maximum_bytes=maximum_bytes,
+            source_size_admission=source_size_admission,
             mode=0o400,
         )
     return immutable.sha256, immutable.size_bytes
@@ -274,6 +276,7 @@ def execute_rev_acceptance_hotpath(
     try:
         if not _session_owned:
             engine._recover_session_boundary(identity)
+        engine._enforce_storage_admission(identity)
         state = engine.refresh_ingest(identity)
         engine._remaining_budget_seconds(state)
         if (
@@ -494,6 +497,10 @@ def execute_rev_acceptance_hotpath(
                 payload_path = staging / (
                     f"attempt-{planned.ordinal:02d}.bin"
                 )
+                engine._enforce_storage_admission(
+                    identity,
+                    requested_bytes=len(planned.payload),
+                )
                 atomic_write_bytes(payload_path, planned.payload, mode=0o400)
                 proof_input = ProofInput(
                     source_locator=payload_path.relative_to(
@@ -582,11 +589,6 @@ def execute_rev_acceptance_hotpath(
                             source_run_id=run_id,
                         )
                     )
-                    destination.parent.mkdir(
-                        parents=True,
-                        exist_ok=True,
-                        mode=0o700,
-                    )
                     immutable = engine._snapshot_workspace_file(
                         state,
                         client,
@@ -667,16 +669,34 @@ def execute_rev_acceptance_hotpath(
                     paths.root,
                     run_paths.request,
                     maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                    source_size_admission=lambda size: (
+                        engine._enforce_storage_admission(
+                            identity,
+                            requested_bytes=size,
+                        )
+                    ),
                 )
                 result_sha256, result_size = _file_binding(
                     paths.root,
                     result_path,
                     maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                    source_size_admission=lambda size: (
+                        engine._enforce_storage_admission(
+                            identity,
+                            requested_bytes=size,
+                        )
+                    ),
                 )
                 validation_sha256, validation_size = _file_binding(
                     paths.root,
                     validation_path,
                     maximum_bytes=REV_ACCEPTANCE_MAX_EVIDENCE_BYTES,
+                    source_size_admission=lambda size: (
+                        engine._enforce_storage_admission(
+                            identity,
+                            requested_bytes=size,
+                        )
+                    ),
                 )
                 record = {
                     "observation": observation,
@@ -780,6 +800,10 @@ def execute_rev_acceptance_hotpath(
                 sha256="0" * 64,
                 source_run_id=run_records[-1].run.id,
             )
+        )
+        engine._enforce_storage_admission(
+            identity,
+            requested_bytes=len(evaluation_payload),
         )
         atomic_write_bytes(evaluation_path, evaluation_payload, mode=0o400)
         final_run_id = run_records[-1].run.id

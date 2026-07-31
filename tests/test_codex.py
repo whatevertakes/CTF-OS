@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -178,6 +179,40 @@ def _stop_test_process(process: multiprocessing.Process) -> None:
     process.join(timeout=2)
 
 
+def _structured_output_sigkill_worker(
+    temporary_root: str,
+    ready_event,
+) -> None:
+    """Leave a killed BatchRunner's private channel for parent inspection."""
+
+    tempfile.tempdir = temporary_root
+
+    class BlockingStructuredOutputExecutor:
+        def run(self, command, *, cwd, timeout, on_stdout_line):
+            del cwd, timeout, on_stdout_line
+            with _output_path(command).open("wb", buffering=0) as handle:
+                handle.write(b"x" * 4096)
+                ready_event.set()
+                while True:
+                    time.sleep(1)
+
+    working_directory = Path(temporary_root) / "sigkill-work"
+    working_directory.mkdir(mode=0o700)
+    BatchRunner(
+        process_executor=BlockingStructuredOutputExecutor(),
+        max_schema_retries=0,
+        structured_output_limit_bytes=256,
+    ).run(
+        BatchInvocation(
+            "structured-output-sigkill",
+            Role.RECON,
+            "inspect",
+            working_directory,
+            working_directory / "run",
+        )
+    )
+
+
 def _wait_file_limiter_state(
     state_path: Path,
     *,
@@ -259,7 +294,10 @@ class SelectiveFailureExecutor:
     def run(self, command, *, cwd, timeout, on_stdout_line):
         del cwd, timeout
         output_path = _output_path(command)
-        if "run-2" in str(output_path):
+        # The provider result is a private FIFO and intentionally carries no
+        # durable run-tree path.  The schema argument remains scoped to the
+        # invocation and is the stable discriminator for this launch test.
+        if any("run-2" in argument for argument in command.argv):
             raise OSError("synthetic launch failure")
         on_stdout_line(
             json.dumps(
@@ -3332,9 +3370,66 @@ class BatchRunnerTests(unittest.TestCase):
             self.assertEqual(metadata["stderr"]["stored_bytes"], 12)
             self.assertTrue(metadata["stderr"]["truncated"])
 
+    def test_runner_streams_structured_output_through_private_fifo(self) -> None:
+        class InspectingExecutor:
+            def __init__(self) -> None:
+                self.provider_path: Path | None = None
+                self.provider_mode: int | None = None
+                self.parent_mode: int | None = None
+                self.payload = json.dumps(
+                    valid_payload(Role.RECON)
+                ).encode("utf-8")
+
+            def run(self, command, *, cwd, timeout, on_stdout_line):
+                del cwd, timeout, on_stdout_line
+                path = _output_path(command)
+                self.provider_path = path
+                self.provider_mode = path.lstat().st_mode
+                self.parent_mode = path.parent.stat().st_mode
+                path.write_bytes(self.payload)
+                return ProcessOutcome(0, "", 0.0)
+
+        executor = InspectingExecutor()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = BatchRunner(
+                process_executor=executor,
+                max_schema_retries=0,
+            ).run(
+                BatchInvocation(
+                    "fifo-result",
+                    Role.RECON,
+                    "inspect",
+                    root,
+                    root / "run",
+                )
+            )
+
+            attempt = result.attempts[0]
+            metadata = json.loads(
+                attempt.capture_metadata_path.read_text(encoding="utf-8")
+            )["structured_output"]
+            self.assertTrue(result.success, result.validation.errors)
+            self.assertIsNotNone(executor.provider_mode)
+            self.assertTrue(stat.S_ISFIFO(executor.provider_mode or 0))
+            self.assertEqual(
+                stat.S_IMODE(executor.parent_mode or 0),
+                0o500,
+            )
+            self.assertEqual(attempt.output_path.read_bytes(), executor.payload)
+            self.assertEqual(attempt.output_bytes, len(executor.payload))
+            self.assertEqual(metadata["bytes"], len(executor.payload))
+            self.assertEqual(metadata["stored_bytes"], len(executor.payload))
+            self.assertFalse(metadata["truncated"])
+            self.assertTrue(metadata["truncation_known"])
+            self.assertTrue(metadata["capture_complete"])
+            self.assertIsNotNone(executor.provider_path)
+            self.assertFalse(executor.provider_path.parent.exists())
+
     def test_runner_rejects_oversized_structured_output_without_reading_it(self) -> None:
         output = valid_payload(Role.RECON)
         output["summary"] = "z" * 4096
+        encoded_output = json.dumps(output).encode("utf-8")
         executor = ScriptedExecutor([([], output, 0)])
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3354,9 +3449,232 @@ class BatchRunnerTests(unittest.TestCase):
             )
             self.assertFalse(result.success)
             self.assertTrue(attempt.output_oversized)
-            self.assertGreater(attempt.output_bytes or 0, 256)
+            self.assertEqual(attempt.output_bytes, len(encoded_output))
             self.assertIn("exceeds 256 byte limit", result.validation.errors[0])
             self.assertTrue(metadata["structured_output"]["oversized"])
+            self.assertEqual(
+                metadata["structured_output"]["bytes"],
+                len(encoded_output),
+            )
+            self.assertEqual(
+                metadata["structured_output"]["stored_bytes"],
+                256,
+            )
+            self.assertTrue(metadata["structured_output"]["truncated"])
+            self.assertTrue(
+                metadata["structured_output"]["truncation_known"]
+            )
+            self.assertTrue(
+                metadata["structured_output"]["capture_complete"]
+            )
+            self.assertEqual(attempt.output_path.stat().st_size, 256)
+            provider_path = Path(
+                attempt.command[
+                    attempt.command.index("--output-last-message") + 1
+                ]
+            )
+            self.assertNotEqual(provider_path, attempt.output_path)
+            self.assertFalse(provider_path.parent.exists())
+
+    def test_runner_handles_provider_that_emits_no_structured_output(self) -> None:
+        class NoOutputExecutor:
+            def __init__(self) -> None:
+                self.provider_path: Path | None = None
+
+            def run(self, command, *, cwd, timeout, on_stdout_line):
+                del cwd, timeout, on_stdout_line
+                self.provider_path = _output_path(command)
+                return ProcessOutcome(0, "", 0.0)
+
+        executor = NoOutputExecutor()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = BatchRunner(
+                process_executor=executor,
+                max_schema_retries=0,
+            ).run(
+                BatchInvocation(
+                    "no-structured-output",
+                    Role.RECON,
+                    "inspect",
+                    root,
+                    root / "run",
+                )
+            )
+
+            attempt = result.attempts[0]
+            metadata = json.loads(
+                attempt.capture_metadata_path.read_text(encoding="utf-8")
+            )["structured_output"]
+            self.assertFalse(result.success)
+            self.assertIn(
+                "output file was not created",
+                result.validation.errors[0],
+            )
+            self.assertIsNone(attempt.output_bytes)
+            self.assertFalse(attempt.output_path.exists())
+            self.assertEqual(metadata["bytes"], 0)
+            self.assertEqual(metadata["stored_bytes"], 0)
+            self.assertFalse(metadata["truncated"])
+            self.assertTrue(metadata["truncation_known"])
+            self.assertTrue(metadata["capture_complete"])
+            self.assertFalse(metadata["oversized"])
+            self.assertIsNotNone(executor.provider_path)
+            self.assertFalse(executor.provider_path.parent.exists())
+
+    def test_private_fifo_parent_blocks_atomic_replacement(self) -> None:
+        class AtomicReplaceExecutor:
+            def __init__(self) -> None:
+                self.provider_path: Path | None = None
+                self.sibling_create_blocked = False
+                self.atomic_replace_blocked = False
+
+            def run(self, command, *, cwd, timeout, on_stdout_line):
+                del timeout, on_stdout_line
+                path = _output_path(command)
+                self.provider_path = path
+                try:
+                    (path.parent / "replacement.tmp").write_bytes(b"x")
+                except PermissionError:
+                    self.sibling_create_blocked = True
+                replacement = Path(cwd) / "provider-replacement.json"
+                replacement.write_text(
+                    json.dumps(valid_payload(Role.RECON)),
+                    encoding="utf-8",
+                )
+                try:
+                    os.replace(replacement, path)
+                except PermissionError:
+                    self.atomic_replace_blocked = True
+                return ProcessOutcome(0, "", 0.0)
+
+        executor = AtomicReplaceExecutor()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = BatchRunner(
+                process_executor=executor,
+                max_schema_retries=0,
+            ).run(
+                BatchInvocation(
+                    "atomic-replace-blocked",
+                    Role.RECON,
+                    "inspect",
+                    root,
+                    root / "run",
+                )
+            )
+
+            self.assertFalse(result.success)
+            self.assertTrue(executor.sibling_create_blocked)
+            self.assertTrue(executor.atomic_replace_blocked)
+            self.assertIsNotNone(executor.provider_path)
+            self.assertFalse(executor.provider_path.parent.exists())
+
+    def test_private_fifo_is_removed_after_control_interrupt(self) -> None:
+        interruption = KeyboardInterrupt("synthetic provider interruption")
+
+        class InterruptingExecutor:
+            def __init__(self) -> None:
+                self.provider_path: Path | None = None
+
+            def run(self, command, *, cwd, timeout, on_stdout_line):
+                del cwd, timeout, on_stdout_line
+                path = _output_path(command)
+                self.provider_path = path
+                path.write_text(
+                    json.dumps(valid_payload(Role.RECON)),
+                    encoding="utf-8",
+                )
+                raise interruption
+
+        executor = InterruptingExecutor()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                BatchRunner(
+                    process_executor=executor,
+                    max_schema_retries=0,
+                ).run(
+                    BatchInvocation(
+                        "structured-output-interrupt",
+                        Role.RECON,
+                        "inspect",
+                        root,
+                        root / "run",
+                    )
+                )
+
+            self.assertIs(caught.exception, interruption)
+            self.assertIsNotNone(executor.provider_path)
+            self.assertFalse(executor.provider_path.parent.exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX SIGKILL and FIFOs")
+    def test_sigkill_leaves_only_recoverable_fifo_metadata(self) -> None:
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = context.Event()
+            process = context.Process(
+                target=_structured_output_sigkill_worker,
+                args=(temporary, ready),
+            )
+            capture_roots: list[Path] = []
+            try:
+                process.start()
+                self.assertTrue(
+                    ready.wait(timeout=5),
+                    "provider did not begin writing to its FIFO",
+                )
+                os.kill(process.pid, signal.SIGKILL)
+                process.join(timeout=5)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, -signal.SIGKILL)
+
+                capture_roots = list(root.glob("ctfos-batch-output-*"))
+                self.assertEqual(len(capture_roots), 1)
+                entries = list(capture_roots[0].rglob("*"))
+                regular_files = [
+                    path
+                    for path in entries
+                    if stat.S_ISREG(path.lstat().st_mode)
+                ]
+                fifos = [
+                    path
+                    for path in entries
+                    if stat.S_ISFIFO(path.lstat().st_mode)
+                ]
+                directories = [
+                    path
+                    for path in entries
+                    if stat.S_ISDIR(path.lstat().st_mode)
+                ]
+                self.assertEqual(regular_files, [])
+                self.assertEqual(len(fifos), 1)
+                self.assertEqual(fifos[0].name, "output.fifo")
+                self.assertEqual(fifos[0].lstat().st_size, 0)
+                self.assertEqual(len(directories), 1)
+                channel = directories[0]
+                self.assertTrue(channel.name.startswith("attempt-1-"))
+                self.assertTrue(channel.name.endswith(".channel"))
+                token = channel.name[len("attempt-1-") : -len(".channel")]
+                self.assertEqual(len(token), 32)
+                int(token, 16)
+            finally:
+                _stop_test_process(process)
+                for capture_root in capture_roots:
+                    directories = sorted(
+                        (
+                            path
+                            for path in capture_root.rglob("*")
+                            if path.is_dir()
+                        ),
+                        key=lambda path: len(path.parts),
+                        reverse=True,
+                    )
+                    for directory in directories:
+                        directory.chmod(0o700)
+                    capture_root.chmod(0o700)
+                    shutil.rmtree(capture_root)
 
     def test_incomplete_pipe_capture_is_explicit_and_fails_the_attempt(
         self,

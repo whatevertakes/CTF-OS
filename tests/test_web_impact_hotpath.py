@@ -514,6 +514,13 @@ class WebImpactHotPathTests(unittest.TestCase):
         )
         self.assertEqual(attempt["status"], "completed")
         self.assertEqual(len(attempt["replays"]), 3)
+        self.assertFalse(
+            (
+                self.engine.store.challenge_paths(self.identity).runtime
+                / "web-impact-live"
+                / attempt["attempt_id"]
+            ).exists()
+        )
         self.assertTrue(
             all(
                 policy.enforcement == "proxy"
@@ -540,6 +547,46 @@ class WebImpactHotPathTests(unittest.TestCase):
                 self.driver_payload.rstrip(b"\n") + b" \n",
                 operator_spec_payload=self.operator_payload,
             )
+
+    def test_preissue_commit_failure_removes_attempt_tree_and_runs(self):
+        paths = self.engine.store.challenge_paths(self.identity)
+        attempt_family = paths.artifacts / "web-impact"
+        before_files = {
+            path.relative_to(attempt_family).as_posix()
+            for path in attempt_family.rglob("*")
+            if path.is_file()
+        } if attempt_family.exists() else set()
+        before_runs = {path.name for path in paths.runs.iterdir()}
+        original_update = self.engine.store.update
+
+        def reject_preissue(*args, **kwargs):
+            apply = args[1]
+            if getattr(apply, "__name__", "") == "commit_preissue":
+                raise RuntimeError("synthetic preissue commit failure")
+            return original_update(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                self.engine.store,
+                "update",
+                side_effect=reject_preissue,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic preissue commit failure",
+            ),
+        ):
+            self._prove()
+        after_files = {
+            path.relative_to(attempt_family).as_posix()
+            for path in attempt_family.rglob("*")
+            if path.is_file()
+        } if attempt_family.exists() else set()
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(
+            {path.name for path in paths.runs.iterdir()},
+            before_runs,
+        )
 
     def test_cli_exposes_explicit_spec_driver_and_timeout(self):
         parsed = cli.build_parser().parse_args(

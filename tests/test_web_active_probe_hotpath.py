@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from ctf_os import cli
 from ctf_os.config import load_config
@@ -380,6 +381,16 @@ class WebActiveProbeHotPathTests(unittest.TestCase):
         self.assertTrue(query["confirmed"])
         self.assertEqual(query["replay_count"], 6)
         self.assertFalse(query["raw_output_returned"])
+        attempt_id = next(
+            reversed(state.extra["web_active_probe_preissues"])
+        )
+        self.assertFalse(
+            (
+                self.engine.store.challenge_paths(self.identity).runtime
+                / "web-active-live"
+                / attempt_id
+            ).exists()
+        )
 
     def test_rehashed_semantic_tamper_and_physical_tamper_reject(self):
         state, _evaluation = self._prove()
@@ -408,6 +419,46 @@ class WebActiveProbeHotPathTests(unittest.TestCase):
         path.chmod(0o400)
         with self.assertRaises(Exception):
             self.engine.query_web_active_probe(self.identity)
+
+    def test_preissue_commit_failure_removes_attempt_tree_and_runs(self):
+        paths = self.engine.store.challenge_paths(self.identity)
+        attempt_family = paths.artifacts / "web-active"
+        before_files = {
+            path.relative_to(attempt_family).as_posix()
+            for path in attempt_family.rglob("*")
+            if path.is_file()
+        } if attempt_family.exists() else set()
+        before_runs = {path.name for path in paths.runs.iterdir()}
+        original_update = self.engine.store.update
+
+        def reject_preissue(*args, **kwargs):
+            apply = args[1]
+            if getattr(apply, "__name__", "") == "commit_preissue":
+                raise RuntimeError("synthetic preissue commit failure")
+            return original_update(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                self.engine.store,
+                "update",
+                side_effect=reject_preissue,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic preissue commit failure",
+            ),
+        ):
+            self._prove()
+        after_files = {
+            path.relative_to(attempt_family).as_posix()
+            for path in attempt_family.rglob("*")
+            if path.is_file()
+        } if attempt_family.exists() else set()
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(
+            {path.name for path in paths.runs.iterdir()},
+            before_runs,
+        )
 
     def test_cli_exposes_exact_active_probe_arguments(self):
         parsed = cli.build_parser().parse_args(

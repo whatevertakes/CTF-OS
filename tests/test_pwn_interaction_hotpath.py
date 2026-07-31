@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ctf_os import cli
 from ctf_os.capabilities import REQUIRED_MANAGED_ATTESTATIONS
@@ -517,6 +518,58 @@ class PwnInteractionHotPathTests(unittest.TestCase):
                 fixture.identity,
                 attempt,
             )
+
+    def test_preissue_commit_failure_removes_attempt_tree_and_runs(self):
+        fixture, engine, _coordinator, parent_id = self._fixture()
+        paths = engine.store.challenge_paths(fixture.identity)
+        attempt_family = paths.artifacts / "pwn-interaction"
+
+        def files_below(root: Path) -> set[str]:
+            if not root.exists():
+                return set()
+            return {
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+        before_files = files_below(attempt_family)
+        before_runs = {path.name for path in paths.runs.iterdir()}
+        original_update = engine.store.update
+
+        def reject_preissue(*args, **kwargs):
+            apply = args[1]
+            if getattr(apply, "__name__", "") == "commit_preissue":
+                raise RuntimeError("synthetic preissue commit failure")
+            return original_update(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                engine.store,
+                "update",
+                side_effect=reject_preissue,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic preissue commit failure",
+            ),
+        ):
+            engine.prove_pwn_interaction(
+                fixture.identity,
+                parent_experiment_id=parent_id,
+                recipe_locator="interaction.json",
+                _session_owned=True,
+            )
+
+        self.assertEqual(files_below(attempt_family), before_files)
+        self.assertEqual(
+            {path.name for path in paths.runs.iterdir()},
+            before_runs,
+        )
+        self.assertNotIn(
+            PWN_INTERACTION_STATE_KEY,
+            engine.store.load(fixture.identity).extra,
+        )
 
     def test_partial_failure_terminalizes_full_matrix_without_authority(self):
         fixture, engine, coordinator, parent_id = self._fixture()

@@ -162,7 +162,20 @@ _CANDIDATE_SOURCE_LIMIT_BYTES = 4096
 _SUBMISSION_LEDGER_RECOVERY_LIMIT_BYTES = 16 * 1024 * 1024
 _SUBMISSION_INTENT_RECOVERY_LIMIT_BYTES = 16 * 1024 * 1024
 MAX_CANONICAL_STATE_BYTES = 16 * 1024 * 1024
+MAX_RUN_DOCUMENT_BYTES = MAX_CANONICAL_STATE_BYTES
 DEFAULT_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024 * 1024
+
+
+def _run_document_bytes(value: Any, *, label: str) -> bytes:
+    try:
+        payload = canonical_json_bytes(value)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise StateStoreError(f"{label} is not valid bounded JSON") from error
+    if len(payload) > MAX_RUN_DOCUMENT_BYTES:
+        raise StateStoreError(
+            f"{label} exceeds {MAX_RUN_DOCUMENT_BYTES} byte limit"
+        )
+    return payload
 
 
 def _validate_component(value: str, label: str) -> str:
@@ -1773,14 +1786,6 @@ class StateStore:
         base = state.revision if base_revision is None else base_revision
         if base != state.revision:
             raise RevisionConflict(base, state.revision)
-        paths = self.run_paths(identity, run_id=run_id)
-        try:
-            paths.root.mkdir(parents=True, exist_ok=False)
-        except FileExistsError as error:
-            raise StateAlreadyExists(
-                f"run already exists: {identity.key}/{run_id}"
-            ) from error
-        paths.raw.mkdir()
         payload = dict(request or {})
         payload.update(
             {
@@ -1793,7 +1798,34 @@ class StateStore:
                 "created_at": payload.get("created_at", utc_now()),
             }
         )
-        atomic_write_json(paths.request, payload)
+        document = _run_document_bytes(payload, label="run request")
+        paths = self.run_paths(identity, run_id=run_id)
+        try:
+            paths.root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as error:
+            raise StateAlreadyExists(
+                f"run already exists: {identity.key}/{run_id}"
+            ) from error
+        try:
+            paths.raw.mkdir()
+            atomic_write_bytes(paths.request, document)
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            for path, directory in (
+                (paths.request, False),
+                (paths.raw, True),
+                (paths.root, True),
+            ):
+                try:
+                    path.rmdir() if directory else path.unlink(missing_ok=True)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                error.add_note(
+                    "run creation cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
         return paths
 
     def write_run_result(
@@ -1830,7 +1862,10 @@ class StateStore:
         payload.setdefault("category", identity.category)
         payload.setdefault("challenge_id", identity.challenge_id)
         payload.setdefault("run_id", run_id)
-        atomic_write_json(paths.result, payload)
+        atomic_write_bytes(
+            paths.result,
+            _run_document_bytes(payload, label="run result"),
+        )
         return paths.result
 
     def write_run_validation(
@@ -1864,7 +1899,10 @@ class StateStore:
         payload = dict(validation)
         payload.setdefault("run_id", run_id)
         payload.setdefault("validated_at", utc_now())
-        atomic_write_json(paths.validation, payload)
+        atomic_write_bytes(
+            paths.validation,
+            _run_document_bytes(payload, label="run validation"),
+        )
         return paths.validation
 
     def validate_worker_result(
