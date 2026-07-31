@@ -20,16 +20,14 @@ if SPEC is None or SPEC.loader is None:
 release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 class MiscModalityReleaseTests(unittest.TestCase):
     def test_release_proof_is_three_way_pinned_and_networkless(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(
-            release.RELEASE_IMAGE_DIGEST,
-            "sha256:"
-            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
-        )
+        self.assertIn("validate_image_digest", source)
+        self.assertNotIn("RELEASE_IMAGE_DIGEST", source)
         self.assertEqual(
             release.PROBE_IDS,
             ("typed_inventory", "primary_magic", "primary_strings"),
@@ -53,7 +51,7 @@ class MiscModalityReleaseTests(unittest.TestCase):
                 sys.executable,
                 str(SCRIPT),
                 "--image-digest",
-                release.RELEASE_IMAGE_DIGEST,
+                IMAGE_DIGEST,
             ),
             cwd=REPOSITORY,
             stdin=subprocess.DEVNULL,

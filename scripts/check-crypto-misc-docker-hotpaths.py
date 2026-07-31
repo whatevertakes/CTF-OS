@@ -49,10 +49,6 @@ from ctf_os.sandbox.files import read_bounded_regular
 from ctf_os.schema import STATE_SCHEMA_VERSION
 
 
-RELEASE_IMAGE_DIGEST = (
-    "sha256:"
-    "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9"
-)
 CRYPTO_CANDIDATE = "KCTF{docker-crypto-metamorphic-hotpath}"
 
 
@@ -1650,10 +1646,6 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
 
 def main() -> int:
     image_digest = validate_image_digest(_parse_args().image_digest)
-    if image_digest != RELEASE_IMAGE_DIGEST:
-        raise AssertionError(
-            "release smoke requires the repository-pinned image digest"
-        )
     readiness = inspect_pinned_capabilities(image_digest)
     if readiness.get("ok") is not True:
         raise AssertionError(

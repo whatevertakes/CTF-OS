@@ -32,6 +32,9 @@ SPEC.loader.exec_module(release)
 
 
 _SHA = "a" * 64
+IMAGE_DIGEST = "sha256:" + "b" * 64
+
+
 def _valid_child_summary(seed: int = 1) -> dict[str, object]:
     records: list[dict[str, object]] = []
     role_counts = (
@@ -157,7 +160,7 @@ def _valid_child_summary(seed: int = 1) -> dict[str, object]:
             "emit_sentinel_address": "0x0000000000401234",
             "source_sha256": _SHA,
         },
-        "image_digest": release.RELEASE_IMAGE_DIGEST,
+        "image_digest": IMAGE_DIGEST,
         "network": "none",
         "ok": True,
         "setup_boundary": "test fixture boundary",
@@ -176,16 +179,13 @@ def _subprocess_writer(payload: bytes):
 
 
 class PwnDependencyHotPathReleaseTests(unittest.TestCase):
-    def test_release_gate_is_pinned_three_way_parallel_and_bounded(
+    def test_release_gate_is_exact_image_three_way_parallel_and_bounded(
         self,
     ) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(release.REPETITIONS, 3)
-        self.assertEqual(
-            release.RELEASE_IMAGE_DIGEST,
-            "sha256:"
-            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
-        )
+        self.assertIn("validate_image_digest", source)
+        self.assertNotIn("RELEASE_IMAGE_DIGEST", source)
         self.assertIn("ThreadPoolExecutor", source)
         self.assertIn("TemporaryFile", source)
         self.assertIn("strict_json_loads", source)
@@ -213,7 +213,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
         self.assertIs(
             release._validate_child_summary(
                 value,
-                digest=release.RELEASE_IMAGE_DIGEST,
+                digest=IMAGE_DIGEST,
                 index=1,
             ),
             value,
@@ -229,7 +229,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
             "run",
             side_effect=_subprocess_writer(payload),
         ):
-            parsed = release._one(1, release.RELEASE_IMAGE_DIGEST)
+            parsed = release._one(1, IMAGE_DIGEST)
         self.assertEqual(parsed, value)
 
     def test_false_effect_authority_is_rejected(self) -> None:
@@ -238,7 +238,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             release._validate_child_summary(
                 value,
-                digest=release.RELEASE_IMAGE_DIGEST,
+                digest=IMAGE_DIGEST,
                 index=1,
             )
 
@@ -263,7 +263,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     release._validate_child_summary(
                         value,
-                        digest=release.RELEASE_IMAGE_DIGEST,
+                        digest=IMAGE_DIGEST,
                         index=1,
                     )
 
@@ -278,7 +278,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             release._validate_child_summary(
                 value,
-                digest=release.RELEASE_IMAGE_DIGEST,
+                digest=IMAGE_DIGEST,
                 index=1,
             )
 
@@ -297,7 +297,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     release._validate_child_summary(
                         value,
-                        digest=release.RELEASE_IMAGE_DIGEST,
+                        digest=IMAGE_DIGEST,
                         index=1,
                     )
 
@@ -326,7 +326,7 @@ class PwnDependencyHotPathReleaseTests(unittest.TestCase):
                     ):
                         release._one(
                             1,
-                            release.RELEASE_IMAGE_DIGEST,
+                            IMAGE_DIGEST,
                         )
 
     def test_capture_byte_limit_is_enforced(self) -> None:

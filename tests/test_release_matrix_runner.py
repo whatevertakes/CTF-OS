@@ -412,6 +412,130 @@ class ReleaseMatrixRunnerTests(unittest.TestCase):
             all(item["script"].startswith("scripts/check-") for item in tasks)
         )
 
+    def test_matrix_requires_the_exact_configured_image_pin(self) -> None:
+        configured = mock.Mock(
+            runtime=mock.Mock(image_digest=IMAGE_DIGEST)
+        )
+        with mock.patch.object(
+            release,
+            "load_config",
+            return_value=configured,
+        ):
+            self.assertEqual(
+                release._require_configured_image_digest(IMAGE_DIGEST),
+                IMAGE_DIGEST,
+            )
+
+        configured.runtime.image_digest = None
+        with mock.patch.object(
+            release,
+            "load_config",
+            return_value=configured,
+        ), self.assertRaisesRegex(
+            release.ReleaseMatrixError,
+            "pin-image",
+        ):
+            release._require_configured_image_digest(IMAGE_DIGEST)
+
+        configured.runtime.image_digest = "sha256:" + "c" * 64
+        with mock.patch.object(
+            release,
+            "load_config",
+            return_value=configured,
+        ), self.assertRaisesRegex(
+            release.ReleaseMatrixError,
+            "does not match",
+        ):
+            release._require_configured_image_digest(IMAGE_DIGEST)
+
+        with mock.patch.object(
+            release,
+            "load_config",
+            side_effect=release.ConfigError("bad config"),
+        ), self.assertRaisesRegex(
+            release.ReleaseMatrixError,
+            "could not load",
+        ):
+            release._require_configured_image_digest(IMAGE_DIGEST)
+
+    def test_run_matrix_refuses_bad_pin_before_source_or_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="release-matrix-pin-preflight-"
+        ) as temporary:
+            output = Path(temporary) / "must-not-exist"
+            arguments = release._parse_args(
+                [
+                    "--image-digest",
+                    IMAGE_DIGEST,
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            with mock.patch.object(
+                release,
+                "_require_configured_image_digest",
+                side_effect=release.ReleaseMatrixError("pin mismatch"),
+            ), mock.patch.object(
+                release,
+                "_source_snapshot",
+            ) as source_snapshot:
+                with self.assertRaisesRegex(
+                    release.ReleaseMatrixError,
+                    "pin mismatch",
+                ):
+                    release.run_matrix(arguments)
+            source_snapshot.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_run_matrix_marks_postflight_pin_drift_unstable(self) -> None:
+        source = {
+            "clean": True,
+            "commit": "a" * 40,
+            "scripts": {},
+        }
+        image = {
+            "digest": IMAGE_DIGEST,
+            "inspected_id": IMAGE_DIGEST,
+        }
+        with tempfile.TemporaryDirectory(
+            prefix="release-matrix-pin-postflight-"
+        ) as temporary:
+            output = Path(temporary) / "artifacts"
+            arguments = release._parse_args(
+                [
+                    "--image-digest",
+                    IMAGE_DIGEST,
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            with mock.patch.object(
+                release,
+                "RELEASE_TASKS",
+                (),
+            ), mock.patch.object(
+                release,
+                "_require_configured_image_digest",
+                side_effect=[IMAGE_DIGEST, "sha256:" + "c" * 64],
+            ), mock.patch.object(
+                release,
+                "_source_snapshot",
+                return_value=source,
+            ), mock.patch.object(
+                release,
+                "_inspect_image",
+                return_value=image,
+            ):
+                _, report = release.run_matrix(arguments)
+            self.assertFalse(report["ok"])
+            self.assertFalse(
+                report["policy"]["source_and_image_stable"]
+            )
+            self.assertEqual(
+                report["policy"]["stability_error"],
+                "source_or_image_changed",
+            )
+
     def test_capture_is_bounded_but_hashes_the_complete_stream(self) -> None:
         payload = b"prefix\n" + (b"x" * 1_000) + b"\nsummary\n"
         capture = release._BoundedCapture(limit_bytes=128)

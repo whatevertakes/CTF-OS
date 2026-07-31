@@ -26,6 +26,7 @@ if SPEC is None or SPEC.loader is None:
 release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 class ForensicAssertionHotPathReleaseTests(unittest.TestCase):
@@ -116,11 +117,8 @@ class ForensicAssertionHotPathReleaseTests(unittest.TestCase):
         self,
     ) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(
-            release.RELEASE_IMAGE_DIGEST,
-            "sha256:"
-            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
-        )
+        self.assertIn("validate_image_digest", source)
+        self.assertNotIn("RELEASE_IMAGE_DIGEST", source)
         self.assertEqual(release.POSITIVE_REPETITIONS, 3)
         self.assertIn("engine._sandbox_factory = None", source)
         self.assertIn("engine.prove_forensic_assertion(", source)
@@ -227,7 +225,7 @@ class ForensicAssertionHotPathReleaseTests(unittest.TestCase):
                             "forensics",
                             "hostile-sidecar",
                         ),
-                        release.RELEASE_IMAGE_DIGEST,
+                        IMAGE_DIGEST,
                         b"CTFOS_PRIVATE_RANGE_hostile_sidecar",
                     )
         finally:
@@ -272,7 +270,7 @@ class ForensicAssertionHotPathReleaseTests(unittest.TestCase):
                             "forensics",
                             "hostile-artifact",
                         ),
-                        release.RELEASE_IMAGE_DIGEST,
+                        IMAGE_DIGEST,
                         b"CTFOS_PRIVATE_RANGE_hostile_artifact",
                     )
         finally:
@@ -288,7 +286,7 @@ class ForensicAssertionHotPathReleaseTests(unittest.TestCase):
                 sys.executable,
                 str(SCRIPT),
                 "--image-digest",
-                release.RELEASE_IMAGE_DIGEST,
+                IMAGE_DIGEST,
             ),
             cwd=REPOSITORY,
             stdin=subprocess.DEVNULL,

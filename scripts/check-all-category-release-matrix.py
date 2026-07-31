@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import BinaryIO, Sequence
 
+from ctf_os.config import ConfigError, load_config
+
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 PROTOCOL = "ctfos.all_category_release_matrix.v1"
@@ -265,6 +267,25 @@ def _inspect_image(image_digest: str) -> dict[str, str]:
             "Docker inspection did not resolve to the requested exact image ID"
         )
     return {"digest": image_digest, "inspected_id": inspected}
+
+
+def _require_configured_image_digest(image_digest: str) -> str:
+    try:
+        configured = load_config(REPOSITORY).runtime.image_digest
+    except (ConfigError, OSError) as error:
+        raise ReleaseMatrixError(
+            "could not load the configured release image digest"
+        ) from error
+    if configured is None:
+        raise ReleaseMatrixError(
+            "release matrix requires runtime.image_digest; run ctfos "
+            "pin-image first"
+        )
+    if configured != image_digest:
+        raise ReleaseMatrixError(
+            "release matrix image digest does not match the configured pin"
+        )
+    return configured
 
 
 class _BoundedCapture:
@@ -1495,6 +1516,9 @@ def _new_artifact_root(requested: Path | None) -> Path:
 
 
 def run_matrix(arguments: argparse.Namespace) -> tuple[Path, dict[str, object]]:
+    configured_before = _require_configured_image_digest(
+        arguments.image_digest
+    )
     source_before = _source_snapshot()
     image_before = _inspect_image(arguments.image_digest)
     artifact_root = _new_artifact_root(arguments.output_dir)
@@ -1543,9 +1567,13 @@ def run_matrix(arguments: argparse.Namespace) -> tuple[Path, dict[str, object]]:
     try:
         source_after = _source_snapshot()
         image_after = _inspect_image(arguments.image_digest)
+        configured_after = _require_configured_image_digest(
+            arguments.image_digest
+        )
         stable = (
             source_after == source_before
             and image_after == image_before
+            and configured_after == configured_before
         )
         if not stable:
             stability_error = "source_or_image_changed"

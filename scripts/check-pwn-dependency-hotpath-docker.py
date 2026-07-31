@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ctf_os.images import validate_image_digest
 from ctf_os.store.atomic import StrictJSONError, strict_json_loads
 
 
@@ -22,10 +23,6 @@ SINGLE_PROOF = (
     REPOSITORY
     / "scripts"
     / "check-pwn-exploit-effect-hotpath-docker.py"
-)
-RELEASE_IMAGE_DIGEST = (
-    "sha256:"
-    "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9"
 )
 REPETITIONS = 3
 MAX_CHILD_STDOUT_BYTES = 2 * 1024 * 1024
@@ -548,11 +545,7 @@ def _one(index: int, digest: str) -> dict[str, object]:
 
 
 def main() -> int:
-    digest = _parse_args().image_digest
-    if digest != RELEASE_IMAGE_DIGEST:
-        raise AssertionError(
-            "Pwn dependency release proof refuses a different image digest"
-        )
+    digest = validate_image_digest(_parse_args().image_digest)
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=REPETITIONS,
         thread_name_prefix="pwn-dependency-release",

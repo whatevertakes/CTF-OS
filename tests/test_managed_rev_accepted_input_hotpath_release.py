@@ -24,6 +24,7 @@ if SPEC is None or SPEC.loader is None:
 release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
@@ -31,11 +32,8 @@ class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
         self,
     ) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(
-            release.RELEASE_IMAGE_DIGEST,
-            "sha256:"
-            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
-        )
+        self.assertIn("validate_image_digest", source)
+        self.assertNotIn("RELEASE_IMAGE_DIGEST", source)
         self.assertIn("ManagedOrchestrator(engine).run_cycle(", source)
         self.assertIn('"kind": "rev_accepted_input"', source)
         self.assertIn('network_default="none"', source)
@@ -82,7 +80,7 @@ class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
         sys.argv = [
             str(SCRIPT),
             "--image-digest",
-            release.RELEASE_IMAGE_DIGEST,
+            IMAGE_DIGEST,
         ]
         try:
             with self.assertRaisesRegex(
@@ -123,7 +121,7 @@ class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
         sys.argv = [
             str(SCRIPT),
             "--image-digest",
-            release.RELEASE_IMAGE_DIGEST,
+            IMAGE_DIGEST,
         ]
         try:
             with self.assertRaises((OSError, ValueError)):
@@ -142,7 +140,7 @@ class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
                 sys.executable,
                 str(SCRIPT),
                 "--image-digest",
-                release.RELEASE_IMAGE_DIGEST,
+                IMAGE_DIGEST,
             ),
             cwd=REPOSITORY,
             stdin=subprocess.DEVNULL,
@@ -172,7 +170,7 @@ class ManagedRevAcceptedInputReleaseTests(unittest.TestCase):
         self.assertEqual(summary["network"], "none")
         self.assertEqual(
             summary["image_digest"],
-            release.RELEASE_IMAGE_DIGEST,
+            IMAGE_DIGEST,
         )
 
 

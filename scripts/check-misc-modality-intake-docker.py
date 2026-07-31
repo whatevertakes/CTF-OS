@@ -36,10 +36,6 @@ from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.store.atomic import read_json, strict_json_loads
 
 
-RELEASE_IMAGE_DIGEST = (
-    "sha256:"
-    "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9"
-)
 PROBE_IDS = ("typed_inventory", "primary_magic", "primary_strings")
 PRINTABLE_MARKER = b"CTFOS-MISC-PROTOCOL-MARKER SEND LENGTH PAYLOAD"
 
@@ -121,8 +117,6 @@ def _artifact_payload(engine: ChallengeEngine, state, artifact_id: str) -> bytes
 
 def main() -> int:
     image_digest = validate_image_digest(_parse_args().image_digest)
-    if image_digest != RELEASE_IMAGE_DIGEST:
-        raise ValueError("Misc modality release proof requires the pinned image")
 
     with tempfile.TemporaryDirectory(
         prefix="ctfos-misc-modality-release-"

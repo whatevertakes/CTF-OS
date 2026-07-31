@@ -33,10 +33,7 @@ from tests.test_rev_acceptance import (
 )
 
 
-IMAGE_DIGEST = (
-    "sha256:"
-    "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9"
-)
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 def _managed_spec() -> dict[str, object]:

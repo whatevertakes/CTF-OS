@@ -29,18 +29,16 @@ if SPEC is None or SPEC.loader is None:
 release = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
+IMAGE_DIGEST = "sha256:" + "a" * 64
 
 
 class CryptoMiscHotPathReleaseTests(unittest.TestCase):
-    def test_release_proof_is_public_hard_pinned_and_networkless(
+    def test_release_proof_is_public_exact_image_and_networkless(
         self,
     ) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(
-            release.RELEASE_IMAGE_DIGEST,
-            "sha256:"
-            "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9",
-        )
+        self.assertIn("validate_image_digest", source)
+        self.assertNotIn("RELEASE_IMAGE_DIGEST", source)
         self.assertIn(
             "engine.preissue_managed_crypto_oracle(",
             source,
@@ -69,7 +67,7 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
         source_manifest = "a" * 64
         solver_sha256 = "b" * 64
         runtime_fingerprint_sha256 = "c" * 64
-        image_digest = release.RELEASE_IMAGE_DIGEST
+        image_digest = IMAGE_DIGEST
         configuration_epoch = 4
         run_ids = [f"crypto-run-{ordinal}" for ordinal in range(1, 7)]
         candidate = SimpleNamespace(
@@ -517,7 +515,7 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
                 ):
                     release._misc(
                         Path(temporary),
-                        release.RELEASE_IMAGE_DIGEST,
+                        IMAGE_DIGEST,
                     )
         finally:
             release._execute_managed_builder_action = original
@@ -551,7 +549,7 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
                 with self.assertRaises((OSError, ValueError)):
                     release._misc(
                         Path(temporary),
-                        release.RELEASE_IMAGE_DIGEST,
+                        IMAGE_DIGEST,
                     )
         finally:
             release._execute_managed_builder_action = original
@@ -566,7 +564,7 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
                 sys.executable,
                 str(SCRIPT),
                 "--image-digest",
-                release.RELEASE_IMAGE_DIGEST,
+                IMAGE_DIGEST,
             ),
             cwd=REPOSITORY,
             stdin=subprocess.DEVNULL,

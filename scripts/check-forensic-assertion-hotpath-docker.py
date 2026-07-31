@@ -90,10 +90,6 @@ PERL_FIXTURE_SOURCE = (
     / "fixtures"
     / "forensic_assertion_perl_tool.pl"
 )
-RELEASE_IMAGE_DIGEST = (
-    "sha256:"
-    "514ab5c51489f9bb66dccb4b5f2c4c86eac64711b89083e3a4ff50eb19910be9"
-)
 FIXTURE_DESTINATION = "forensic_assertion_tool.py"
 PERL_FIXTURE_DESTINATION = "forensic_assertion_perl_tool.pl"
 TOOL_PROTOCOL = "ctfos.release.forensic.assertion.tool.v1"
@@ -142,10 +138,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-digest",
         required=True,
-        help=(
-            "must be the exact release image digest "
-            f"{RELEASE_IMAGE_DIGEST}"
-        ),
+        help="exact local release image ID supplied by the matrix",
     )
     return parser.parse_args()
 
@@ -1440,8 +1433,6 @@ def _run_release(
 
 def main() -> int:
     supplied = validate_image_digest(_parse_args().image_digest)
-    if supplied != RELEASE_IMAGE_DIGEST:
-        raise AssertionError("release proof refuses a different image digest")
     capabilities = inspect_pinned_capabilities(supplied)
     if capabilities.get("ok") is not True:
         raise AssertionError(
