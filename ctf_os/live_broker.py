@@ -57,6 +57,7 @@ MAX_MAILBOX_SCAN_ENTRIES = 4096
 MAX_LIVE_SESSION_REQUESTS = 16384
 MAX_LIVE_OPERATION_SECONDS = 8 * 60 * 60
 MAX_LIVE_CLIENT_GRACE_SECONDS = 180
+MAX_CONCURRENT_READ_ONLY_OPERATIONS = 8
 LIVE_BROKER_DIRECTORY_ENV = "CTFOS_LIVE_BROKER_DIR"
 LIVE_SCOPE_CAPABILITY_ENV = "CTFOS_SCOPE_CAPABILITY"
 LIVE_SESSION_ENV = "CTFOS_LIVE_SESSION"
@@ -585,6 +586,35 @@ class LiveBrokerService:
             "knowledge.read",
         }
     )
+    _READ_ONLY_OPERATIONS = frozenset(
+        {
+            "inspect",
+            "knowledge.search",
+            "knowledge.read",
+        }
+    )
+
+    @classmethod
+    def is_read_only_operation(cls, operation: object) -> bool:
+        """Return whether an operation changes no canonical or host state."""
+
+        return (
+            isinstance(operation, str)
+            and operation in cls._READ_ONLY_OPERATIONS
+        )
+
+    @classmethod
+    def is_read_only_request(
+        cls,
+        operation: object,
+        params: object,
+    ) -> bool:
+        if cls.is_read_only_operation(operation):
+            return True
+        if operation != "jobs" or not isinstance(params, Mapping):
+            return False
+        action = params.get("action", "list")
+        return action in {"list", "status", "log"}
 
     def __init__(
         self,
@@ -659,6 +689,11 @@ class LiveBrokerService:
 
     def dispatch(self, request: object) -> object:
         operation, params = self._authorize(request)
+        # Canonical state is atomically replaced, and knowledge readers use a
+        # shared file lock. These operations need no long-operation writer
+        # lane and must remain available while a tool or state mutation runs.
+        if self.is_read_only_request(operation, params):
+            return self._dispatch_authorized(operation, params)
         # A plausible flag must remain durable and visible even while a bounded
         # tool command is still running. StateStore serializes the short state
         # commit itself; the long-operation gate is intentionally not held.
@@ -1018,7 +1053,7 @@ class LiveBrokerService:
                     )
                 state, statuses = self.engine.list_background_jobs(
                     identity,
-                    recover=True,
+                    recover=action == "recover",
                     _live_only=True,
                 )
                 return {
@@ -1049,7 +1084,7 @@ class LiveBrokerService:
                         for status in statuses
                     ],
                 }
-            state = self.engine.store.load(identity)
+            state = self.engine.store.read_snapshot(identity)
             sandbox = self.engine.sandbox(state)
             ref = JobRef(
                 job_id=_string(
@@ -1156,7 +1191,7 @@ class LiveBrokerService:
                 maximum=MAX_INSPECT_PAGE_ITEMS,
             )
             return inspect_state(
-                self.engine.store.load(identity),
+                self.engine.store.read_snapshot(identity),
                 section,
                 offset=offset,
                 limit=limit,
@@ -1475,6 +1510,33 @@ def _read_mailbox_file(directory_fd: int, name: str) -> bytes:
         os.close(descriptor)
 
 
+class _ReadLanePermit:
+    """Finalizer-safe ownership of one admitted read-only operation."""
+
+    def __init__(self, server: LiveBrokerServer) -> None:
+        self._server = server
+        self._active = False
+
+    def activate(self) -> None:
+        if self._active:
+            raise RuntimeError("Live broker read permit is already active")
+        self._active = True
+
+    def release(self) -> None:
+        if not self._active:
+            return
+        # Consume local ownership first. The server-side decrement is one
+        # exact lock transaction and must never be attempted twice.
+        self._active = False
+        self._server._release_read_lane()
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except BaseException:
+            pass
+
+
 class _BackgroundRequestDispatch:
     """Arbitrate one claimed request between submitter and worker.
 
@@ -1490,11 +1552,18 @@ class _BackgroundRequestDispatch:
         processing: str,
         request_id: str,
         request: object,
+        *,
+        release_lane: Callable[[], None] | None = None,
     ) -> None:
         self._server = server
         self._processing = processing
         self._request_id = request_id
         self._request = request
+        self._release_lane = (
+            release_lane
+            if release_lane is not None
+            else server._operation_idle.set
+        )
         self._state_lock = threading.Lock()
         self._state = "pending"
 
@@ -1565,7 +1634,7 @@ class _BackgroundRequestDispatch:
                     self._state = "finished"
                     release_lane = True
             if release_lane:
-                self._server._operation_idle.set()
+                self._release_lane()
 
 
 class LiveBrokerServer:
@@ -1586,15 +1655,43 @@ class LiveBrokerServer:
         self._accepted_request_ids: set[str] = set()
         self._terminal_error: LiveBrokerError | None = None
         self._terminal_lock = threading.Lock()
-        # Keep all non-flag operations ordered on one bounded lane. This does
-        # not change the three logical model roles; it only prevents an
-        # unbounded host-side request queue. The watcher remains free to commit
-        # agent.flag requests while that lane is occupied.
+        # Mutations stay ordered on one bounded lane. Read-only snapshots have
+        # separate bounded admission and may overlap that writer and each
+        # other. This does not change the three logical model roles or create
+        # a scheduler/priority queue. The watcher also remains free to commit
+        # agent.flag requests while a long mutation is occupied.
         self._operation_idle = threading.Event()
         self._operation_idle.set()
+        self._read_state_lock = threading.Lock()
+        self._active_reads = 0
+        self._reads_idle = threading.Event()
+        self._reads_idle.set()
         self._deferred_operation_names: set[str] = set()
         self._operation_executor: ThreadPoolExecutor | None = None
         self._thread: threading.Thread | None = None
+
+    def _reserve_read_lane(self) -> _ReadLanePermit | None:
+        """Reserve one bounded reader without waiting for the writer lane."""
+
+        permit = _ReadLanePermit(self)
+        with self._read_state_lock:
+            if self._active_reads >= MAX_CONCURRENT_READ_ONLY_OPERATIONS:
+                return None
+            # Arm the caller/finalizer cleanup before publishing the count.
+            # An interruption between these lines may attempt a harmless
+            # underflow release, but cannot strand a published reservation.
+            permit.activate()
+            self._active_reads += 1
+            self._reads_idle.clear()
+            return permit
+
+    def _release_read_lane(self) -> None:
+        with self._read_state_lock:
+            if self._active_reads <= 0:
+                raise RuntimeError("Live broker read lane is not reserved")
+            self._active_reads -= 1
+            if self._active_reads == 0:
+                self._reads_idle.set()
 
     @staticmethod
     def _retry_lifecycle_step(
@@ -1670,6 +1767,35 @@ class LiveBrokerServer:
         if primary_error is not None:
             primary_error.add_note(
                 "Live broker operation drain completed after "
+                f"{failures} interruption"
+                + ("" if failures == 1 else "s")
+            )
+        return primary_error
+
+    def _drain_read_lanes(self) -> BaseException | None:
+        """Wait until every admitted read-only snapshot has returned."""
+
+        primary_error: BaseException | None = None
+        failures = 0
+        while not self._reads_idle.is_set():
+            try:
+                self._reads_idle.wait()
+            except BaseException as error:
+                failures += 1
+                if primary_error is None:
+                    primary_error = error
+                else:
+                    primary_error = _prefer_control_error(
+                        primary_error,
+                        error,
+                        label=(
+                            "Live broker read-only operation drain "
+                            "was interrupted"
+                        ),
+                    )
+        if primary_error is not None:
+            primary_error.add_note(
+                "Live broker read-only drain completed after "
                 f"{failures} interruption"
                 + ("" if failures == 1 else "s")
             )
@@ -1799,6 +1925,9 @@ class LiveBrokerServer:
         drain_error = self._drain_operation_lane()
         if drain_error is not None:
             errors.append(("operation drain", drain_error))
+        read_drain_error = self._drain_read_lanes()
+        if read_drain_error is not None:
+            errors.append(("read-only operation drain", read_drain_error))
         if (
             write_closing_status
             and self._directory_fd is not None
@@ -1998,7 +2127,7 @@ class LiveBrokerServer:
         handed_off = False
         cleanup_attempted = False
         claim_may_exist = False
-        operation_lane_reserved = False
+        release_reserved_lane: Callable[[], None] | None = None
         dispatch: _BackgroundRequestDispatch | None = None
         try:
             # Set cleanup intent before rename. An interrupt can be delivered
@@ -2026,7 +2155,15 @@ class LiveBrokerServer:
                     )
                 operation = request.get("operation")
                 is_flag = operation == "agent.flag"
-                if not is_flag and not self._operation_idle.is_set():
+                is_read = self.service.is_read_only_request(
+                    operation,
+                    request.get("params", {}),
+                )
+                if (
+                    not is_flag
+                    and not is_read
+                    and not self._operation_idle.is_set()
+                ):
                     os.rename(
                         processing,
                         name,
@@ -2036,6 +2173,18 @@ class LiveBrokerServer:
                     self._deferred_operation_names.add(name)
                     handed_off = True
                     return
+                if is_read:
+                    read_permit = self._reserve_read_lane()
+                    if read_permit is None:
+                        os.rename(
+                            processing,
+                            name,
+                            src_dir_fd=self._directory_fd,
+                            dst_dir_fd=self._directory_fd,
+                        )
+                        handed_off = True
+                        return
+                    release_reserved_lane = read_permit.release
                 self._reserve_request_id(request_id)
                 if is_flag:
                     self._dispatch_claimed(
@@ -2050,28 +2199,31 @@ class LiveBrokerServer:
                 # control interruption lands before the dispatch handoff is
                 # resolved, the outer finally either cancels the still-pending
                 # callable or recognizes that the worker already owns it.
-                operation_lane_reserved = True
-                self._operation_idle.clear()
+                if not is_read:
+                    self._operation_idle.clear()
+                    release_reserved_lane = self._operation_idle.set
+                assert release_reserved_lane is not None
                 dispatch = _BackgroundRequestDispatch(
                     self,
                     processing,
                     request_id,
                     request,
+                    release_lane=release_reserved_lane,
                 )
                 try:
                     assert self._operation_executor is not None
                     self._operation_executor.submit(dispatch)
                 except BaseException:
                     if dispatch.cancel_before_worker_start():
-                        self._operation_idle.set()
-                        operation_lane_reserved = False
+                        release_reserved_lane()
+                        release_reserved_lane = None
                     else:
                         # The worker already owns processing and its lane.
                         handed_off = True
-                        operation_lane_reserved = False
+                        release_reserved_lane = None
                     raise
                 handed_off = True
-                operation_lane_reserved = False
+                release_reserved_lane = None
                 return
             except (
                 UnicodeError,
@@ -2092,7 +2244,7 @@ class LiveBrokerServer:
             handed_off = True
             self._write_response(request_id, response)
         finally:
-            if operation_lane_reserved and not handed_off:
+            if release_reserved_lane is not None and not handed_off:
                 if (
                     dispatch is not None
                     and not dispatch.cancel_before_worker_start()
@@ -2101,7 +2253,7 @@ class LiveBrokerServer:
                     # worker already owns the exact claimed request.
                     handed_off = True
                 else:
-                    self._operation_idle.set()
+                    release_reserved_lane()
             if (
                 claim_may_exist
                 and not handed_off
@@ -2185,7 +2337,10 @@ class LiveBrokerServer:
             )
             pending_directory_fds.clear()
             self._operation_executor = ThreadPoolExecutor(
-                max_workers=1,
+                # One mutation lane plus a bounded set of independent
+                # read-only snapshots. Admission below prevents an unbounded
+                # executor queue.
+                max_workers=1 + MAX_CONCURRENT_READ_ONLY_OPERATIONS,
                 thread_name_prefix=(
                     "ctfos-live-operation-"
                     f"{self.service.expected_scope[:12]}"

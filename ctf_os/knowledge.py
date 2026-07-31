@@ -438,9 +438,35 @@ class KnowledgeStore:
             self.state_store.challenge_paths(identity).knowledge
         )
 
+    def _read_root(self, identity: ChallengeIdentity) -> Path:
+        """Resolve the existing knowledge root without creating/chmodding it."""
+
+        root = self.state_store.challenge_paths(identity).knowledge
+        try:
+            metadata = root.stat(follow_symlinks=False)
+        except OSError as error:
+            raise KnowledgeError(
+                "challenge knowledge directory is unavailable"
+            ) from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or root.is_symlink()
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise KnowledgeError(
+                "challenge knowledge directory is not a trusted directory"
+            )
+        return root
+
     def list(self, identity: ChallengeIdentity) -> tuple[KnowledgeRecord, ...]:
-        root = self._root(identity)
-        with FileLock(root / ".lock", shared=True) as read_lock:
+        root = self._read_root(identity)
+        if not (root / "index.json").exists():
+            return ()
+        with FileLock(
+            root / ".lock",
+            shared=True,
+            create=False,
+        ) as read_lock:
             read_lock.acquire()
             return _load_index(root)
 
@@ -619,12 +645,18 @@ class KnowledgeStore:
             or not 1 <= limit <= MAX_KNOWLEDGE_SEARCH_RESULTS
         ):
             raise KnowledgeError("knowledge search limit must be between 1 and 50")
-        root = self._root(identity)
+        root = self._read_root(identity)
         tokens = _query_tokens(query)
         if not tokens:
             raise KnowledgeError("knowledge query has no searchable tokens")
         results: list[tuple[KnowledgeRecord, float, str, int]] = []
-        with FileLock(root / ".lock", shared=True) as search_lock:
+        if not (root / "index.json").exists():
+            return ()
+        with FileLock(
+            root / ".lock",
+            shared=True,
+            create=False,
+        ) as search_lock:
             search_lock.acquire()
             for record in _load_index(root):
                 text = _verified_text(root, record) or ""
@@ -720,8 +752,14 @@ class KnowledgeStore:
                 "knowledge read max_bytes must be between 1 and 65536"
             )
 
-        root = self._root(identity)
-        with FileLock(root / ".lock", shared=True) as read_lock:
+        root = self._read_root(identity)
+        if not (root / "index.json").exists():
+            raise KnowledgeError("knowledge document does not exist")
+        with FileLock(
+            root / ".lock",
+            shared=True,
+            create=False,
+        ) as read_lock:
             read_lock.acquire()
             record = next(
                 (

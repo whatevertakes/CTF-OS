@@ -21244,6 +21244,8 @@ class ChallengeEngine:
         *,
         live_only: bool = False,
     ) -> ChallengeState:
+        if not statuses:
+            return self.store.read_snapshot(identity)
         by_ref = {
             (
                 item.ref.job_id,
@@ -21289,10 +21291,10 @@ class ChallengeEngine:
         self,
         identity: ChallengeIdentity,
         *,
-        recover: bool = True,
+        recover: bool = False,
         _live_only: bool = False,
     ) -> tuple[ChallengeState, tuple[JobStatus, ...]]:
-        state = self.store.load(identity)
+        state = self.store.read_snapshot(identity)
         client = self.sandbox(state)
         operation = getattr(
             client,
@@ -21302,10 +21304,14 @@ class ChallengeEngine:
         # Trusted injected test/embedding clients from the foreground-only API
         # generation have no operational supervisor namespace.
         statuses = tuple(operation()) if callable(operation) else ()
-        current = self._update_background_statuses(
-            identity,
-            statuses,
-            live_only=_live_only,
+        current = (
+            self._update_background_statuses(
+                identity,
+                statuses,
+                live_only=_live_only,
+            )
+            if recover
+            else state
         )
         return current, statuses
 
@@ -21316,15 +21322,12 @@ class ChallengeEngine:
         *,
         _live_only: bool = False,
     ) -> tuple[ChallengeState, JobStatus]:
-        state = self.store.load(identity)
+        state = self.store.read_snapshot(identity)
         self._require_background_ref(state, ref)
         status = self.sandbox(state).job_status(ref)
-        current = self._update_background_statuses(
-            identity,
-            (status,),
-            live_only=_live_only,
-        )
-        return current, status
+        # A status observation does not replace state.json. Explicit
+        # cancel/recover operations own canonical status recording.
+        return state, status
 
     def background_job_log(
         self,
@@ -21333,7 +21336,7 @@ class ChallengeEngine:
         *,
         tail_bytes: int = 8192,
     ) -> JobLog:
-        state = self.store.load(identity)
+        state = self.store.read_snapshot(identity)
         self._require_background_ref(state, ref)
         return self.sandbox(state).job_log(ref, tail_bytes=tail_bytes)
 
@@ -21345,7 +21348,7 @@ class ChallengeEngine:
         grace_seconds: int = 3,
         _live_only: bool = False,
     ) -> tuple[ChallengeState, JobStatus]:
-        state = self.store.load(identity)
+        state = self.store.read_snapshot(identity)
         self._require_background_ref(state, ref)
         status = self.sandbox(state).cancel_job(
             ref,

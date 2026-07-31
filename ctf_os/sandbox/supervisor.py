@@ -812,10 +812,13 @@ class BackgroundJobSupervisor:
         backend: DockerSandboxBackend,
         ref: JobRef,
     ) -> JobStatus:
-        recovered = self.recover(backend, ref)
-        if len(recovered) != 1:
-            raise SandboxError("background status recovery was ambiguous")
-        return recovered[0]
+        self._require_exact_receipt(backend, ref)
+        try:
+            return backend.job_status(ref)
+        except SandboxError:
+            # Status is observational. Explicit recover/cancel owns any
+            # container removal and durable-lease retirement.
+            return JobStatus(ref, JobState.LOST)
 
     def log(
         self,
@@ -847,7 +850,39 @@ class BackgroundJobSupervisor:
         self,
         backend: DockerSandboxBackend,
     ) -> tuple[JobStatus, ...]:
-        return self.recover(backend)
+        statuses: list[JobStatus] = []
+        scope_root = self._scope_root(backend.scope.fingerprint)
+        for index, directory in enumerate(
+            sorted(scope_root.iterdir()),
+            start=1,
+        ):
+            if index > 1000:
+                raise SandboxError(
+                    "background receipt count exceeds the listing bound"
+                )
+            if (
+                not directory.is_dir()
+                or directory.is_symlink()
+                or not JOB_SUPERVISOR_ID.fullmatch(directory.name)
+            ):
+                continue
+            receipt_path = directory / _RECEIPT_NAME
+            if not receipt_path.exists():
+                continue
+            receipt = _read_private_json(receipt_path)
+            if receipt.get("ref") is None:
+                continue
+            current_ref = _ref_from_value(receipt["ref"])
+            self._require_exact_receipt(
+                backend,
+                current_ref,
+                receipt=receipt,
+            )
+            try:
+                statuses.append(backend.job_status(current_ref))
+            except SandboxError:
+                statuses.append(JobStatus(current_ref, JobState.LOST))
+        return tuple(statuses)
 
 
 def _worker_receipt(

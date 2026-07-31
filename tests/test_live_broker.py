@@ -402,7 +402,6 @@ class LiveBrokerTests(unittest.TestCase):
                     "needs_kvm": False,
                 },
             ),
-            ("jobs", {}),
         )
 
         sandbox = next(iter(self.clients.values()))
@@ -447,6 +446,14 @@ class LiveBrokerTests(unittest.TestCase):
                     {"query": "nothing indexed", "limit": 1},
                 )
                 self.assertEqual(searched["results"], [])
+                jobs = dispatch("jobs", {"action": "list"})
+                self.assertEqual(jobs["jobs"], [])
+                self.assertEqual(
+                    self.engine.store.read_snapshot(
+                        self.identity
+                    ).revision,
+                    blocked.revision,
+                )
                 flag = f"KCTF{{blocked_{status.value.lower()}}}"
                 captured = dispatch(
                     "agent.flag",

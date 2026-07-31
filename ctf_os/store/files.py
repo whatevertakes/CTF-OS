@@ -213,8 +213,19 @@ def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def _read_bounded_regular(path: Path, *, maximum_bytes: int) -> bytes:
-    """Read one stable regular file without following a terminal symlink."""
+def _read_bounded_regular(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    allow_atomic_replacement: bool = False,
+) -> bytes:
+    """Read one stable regular file without following a terminal symlink.
+
+    An atomic pathname replacement can change the opened old inode's ctime
+    when its final directory link is removed without changing any byte visible
+    through this descriptor. Snapshot readers may explicitly tolerate only
+    that metadata transition; size and mtime stability remain mandatory.
+    """
 
     flags = os.O_RDONLY | os.O_CLOEXEC
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -243,19 +254,26 @@ def _read_bounded_regular(path: Path, *, maximum_bytes: int) -> bytes:
             raise CorruptStateError(
                 f"state exceeds {maximum_bytes} bytes: {path}"
             )
-        if (
+        stable_before = (
             before.st_dev,
             before.st_ino,
             before.st_size,
             before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
+        )
+        stable_after = (
             after.st_dev,
             after.st_ino,
             after.st_size,
             after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) or total != after.st_size:
+        )
+        if (
+            stable_before != stable_after
+            or (
+                not allow_atomic_replacement
+                and before.st_ctime_ns != after.st_ctime_ns
+            )
+            or total != after.st_size
+        ):
             raise CorruptStateError(f"state changed while being read: {path}")
         return b"".join(chunks)
     finally:
@@ -703,6 +721,57 @@ class StateStore:
             return self._recover(identity, current_error)
 
     load_state = load
+
+    def read_snapshot(
+        self,
+        contest: str | ChallengeIdentity | ChallengeState,
+        category: str | None = None,
+        challenge_id: str | None = None,
+    ) -> ChallengeState:
+        """Read one atomic canonical image without locks or repair writes.
+
+        ``state.json`` is installed by atomic replacement, and
+        :func:`_read_bounded_regular` keeps the opened inode stable for the
+        complete bounded read.  A reader therefore observes either the old or
+        the new complete revision while remaining concurrent with both other
+        readers and a writer preparing its next replacement.
+
+        Unlike :meth:`load`, this method never invokes recovery.  Corruption or
+        a missing state is reported to the caller and cannot turn a nominally
+        read-only analysis into a state/event/view mutation.
+        """
+
+        identity = _identity(contest, category, challenge_id)
+        path = self.challenge_paths(identity).state
+        try:
+            payload = _read_bounded_regular(
+                path,
+                maximum_bytes=MAX_CANONICAL_STATE_BYTES,
+                allow_atomic_replacement=True,
+            )
+            return self._decode_state(
+                payload,
+                path,
+                expected=identity,
+            )
+        except FileNotFoundError as error:
+            raise StateNotFound(
+                f"challenge state does not exist: {identity.key}"
+            ) from error
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            CorruptStateError,
+        ) as error:
+            raise CorruptStateError(
+                f"invalid state.json snapshot for {identity.key}: {error}"
+            ) from error
+
+    # Explicit aliases keep read-only call sites self-documenting.
+    snapshot = read_snapshot
+    load_snapshot = read_snapshot
 
     @staticmethod
     def candidate_intent_value_is_valid(value: object) -> bool:
@@ -2024,6 +2093,35 @@ class StateStore:
                 else:
                     raise
 
+    def read_board_snapshot(self, contest_id: str) -> list[dict[str, Any]]:
+        """Project one contest board without locks, repair, or view writes."""
+
+        contest = self.contest_paths(contest_id)
+        entries: list[dict[str, Any]] = []
+        if not contest.challenges.is_dir():
+            return entries
+        for state_path in sorted(
+            contest.challenges.glob("*/*/state.json")
+        ):
+            try:
+                payload = _read_bounded_regular(
+                    state_path,
+                    maximum_bytes=MAX_CANONICAL_STATE_BYTES,
+                    allow_atomic_replacement=True,
+                )
+                state = self._decode_state(payload, state_path)
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                CorruptStateError,
+            ):
+                continue
+            if state.contest_id == contest_id:
+                entries.append(board_entry(state))
+        return entries
+
     def _refresh_challenge_view_best_effort(
         self, state: ChallengeState, paths: ChallengePaths
     ) -> None:
@@ -2110,7 +2208,9 @@ class StateStore:
         category: str | None = None,
         challenge_id: str | None = None,
     ) -> dict[str, Any]:
-        return board_entry(self.load(contest, category, challenge_id))
+        return board_entry(
+            self.read_snapshot(contest, category, challenge_id)
+        )
 
     @staticmethod
     def _submission_intent_sort_key(

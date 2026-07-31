@@ -329,7 +329,7 @@ def _verify_session_scope(
         claimed_scope = authority.verify(token)
     except CapabilityError as error:
         raise CLIError(f"만료되었거나 잘못된 세션 capability: {error}") from error
-    state = engine.store.load(identity)
+    state = engine.store.read_snapshot(identity)
     actual_scope = engine.sandbox(state).scope_fingerprint
     if claimed_scope != actual_scope:
         raise CLIError(
@@ -1578,7 +1578,7 @@ def _status_once(
         )
     payload: dict[str, object] = {}
     for contest_id in contests:
-        payload[contest_id] = engine.store.refresh_board(contest_id)
+        payload[contest_id] = engine.store.read_board_snapshot(contest_id)
     if as_json:
         _print_json(payload)
         return
@@ -1661,7 +1661,7 @@ def _job_ref_from_args(
         raise CLIError(
             "--job-id와 --supervisor-id를 함께 지정해야 합니다."
         )
-    state = engine.store.load(identity)
+    state = engine.store.read_snapshot(identity)
     return JobRef(
         job_id=args.job_id,
         scope_fingerprint=engine.sandbox(state).scope_fingerprint,
@@ -1909,7 +1909,7 @@ def main(
         if args.command == "target":
             identity = _identity(args)
             if args.target_command == "list":
-                state = engine.store.load(identity)
+                state = engine.store.read_snapshot(identity)
                 _print_json(
                     {
                         "primary_target_id": state.primary_target_id,
@@ -2222,7 +2222,7 @@ def main(
             return 0
 
         if args.command == "inspect":
-            state = engine.store.load(_identity(args))
+            state = engine.store.read_snapshot(_identity(args))
             _print_json(
                 _inspect_value(
                     state,
@@ -2612,7 +2612,7 @@ def main(
                     )
                 _state, statuses = engine.list_background_jobs(
                     identity,
-                    recover=True,
+                    recover=args.recover,
                 )
                 _print_json(
                     {

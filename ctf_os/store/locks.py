@@ -30,6 +30,7 @@ class FileLock:
         timeout: float | None = None,
         poll_interval: float = 0.05,
         shared: bool = False,
+        create: bool = True,
     ) -> None:
         if timeout is not None and (
             isinstance(timeout, bool)
@@ -49,10 +50,13 @@ class FileLock:
             raise ValueError(
                 "poll_interval must be a finite positive number"
             )
+        if not isinstance(create, bool):
+            raise ValueError("create must be a boolean")
         self.path = Path(path)
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.shared = shared
+        self.create = create
         self._descriptor: int | None = None
         self._context_entered = False
         self._context_used = False
@@ -78,11 +82,10 @@ class FileLock:
         descriptor: int | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = os.open(
-                self.path,
-                os.O_CREAT | os.O_RDWR,
-                0o600,
-            )
+            flags = os.O_RDWR
+            if self.create:
+                flags |= os.O_CREAT
+            descriptor = os.open(self.path, flags, 0o600)
             operation = (
                 fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
             )
