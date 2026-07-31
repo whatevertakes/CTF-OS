@@ -35,6 +35,7 @@ from ctf_os.models import (
     CandidateStatus,
     ChallengeIdentity,
     FlagCandidate,
+    RunOrigin,
     RunStatus,
 )
 from ctf_os.sandbox.files import read_bounded_regular
@@ -109,7 +110,125 @@ _CRYPTO_PROOF_RESULT_KEYS = frozenset(
         "total_attempts",
     }
 )
+_CRYPTO_BINDING_KEYS = frozenset(
+    {
+        "artifact_id",
+        "evaluation",
+        "evaluation_sha256",
+        "oracle_authority",
+        "oracle_preissue_id",
+        "passed",
+        "plan_sha256",
+        "proof_result",
+        "protocol",
+        "run_ids",
+    }
+)
+_CRYPTO_EVALUATION_KEYS = frozenset(
+    {
+        "candidate_sha256",
+        "failure_codes",
+        "observations",
+        "oracle_artifact_sha256",
+        "passed",
+        "plan",
+        "protocol",
+        "runtime_fingerprint_sha256",
+        "schema_version",
+        "solver_artifact_sha256",
+        "source_manifest_sha256",
+    }
+)
+_CRYPTO_PLAN_KEYS = frozenset({"attempts", "cases", "protocol"})
+_CRYPTO_ATTEMPT_KEYS = frozenset(
+    {
+        "case_id",
+        "expected_output_sha256",
+        "expected_output_size_bytes",
+        "mutation_id",
+        "ordinal",
+        "parameters_sha256",
+        "parameters_size_bytes",
+    }
+)
+_CRYPTO_OBSERVATION_KEYS = frozenset(
+    {
+        "capture_complete",
+        "capture_error_present",
+        "case_id",
+        "clean_workspace",
+        "ctfwrap_exit_code",
+        "mutation_id",
+        "oracle_artifact_sha256",
+        "orchestration_status",
+        "ordinal",
+        "parameters_sha256",
+        "parameters_size_bytes",
+        "result_artifact_id",
+        "result_artifact_sha256",
+        "result_artifact_size_bytes",
+        "run_id",
+        "runner_exit_code",
+        "runtime_fingerprint_sha256",
+        "solver_artifact_sha256",
+        "source_manifest_sha256",
+        "target_exit_code",
+        "timed_out",
+        "truncated",
+        "truncation_known",
+    }
+)
+_CRYPTO_REQUEST_KEYS = frozenset(
+    {
+        "attempt",
+        "base_revision",
+        "candidate_id",
+        "category",
+        "challenge_id",
+        "command",
+        "configuration_epoch",
+        "contest_id",
+        "created_at",
+        "image_reference",
+        "kind",
+        "network_target",
+        "oracle_artifact_sha256",
+        "plan_sha256",
+        "protocol",
+        "runtime_fingerprint_sha256",
+        "run_id",
+        "schema_version",
+        "solver_sha256",
+        "source_manifest_sha256",
+    }
+)
+_CRYPTO_RESULT_KEYS = frozenset(
+    {
+        "artifacts",
+        "category",
+        "challenge_id",
+        "contest_id",
+        "duration_ms",
+        "exit_code",
+        "observation",
+        "run_id",
+        "schema_version",
+        "status",
+        "timed_out",
+    }
+)
+_CRYPTO_VALIDATION_KEYS = frozenset(
+    {
+        "attempt_ordinal",
+        "ok",
+        "plan_sha256",
+        "protocol",
+        "run_id",
+        "validated_at",
+    }
+)
 _CRYPTO_RUN_DOCUMENT_MAX_BYTES = 1_048_576
+_CRYPTO_STREAM_MAX_BYTES = 1_048_576
 
 
 def _parse_args() -> argparse.Namespace:
@@ -338,28 +457,108 @@ def _validated_crypto_execution(
     *,
     challenge_root: Path,
     image_digest: str,
+    runtime: str,
 ) -> tuple[list[object], int]:
-    """Cross-check the claimed ProofResult against six physical runs."""
+    """Cross-check state commitments against six physical executions."""
 
-    if type(binding) is not dict:
+    if runtime not in {"python", "sage"}:
+        raise AssertionError("Crypto release runtime is invalid")
+    if (
+        type(binding) is not dict
+        or frozenset(binding) != _CRYPTO_BINDING_KEYS
+    ):
         raise AssertionError("Crypto proof binding is absent")
     proof_result = binding.get("proof_result")
     run_ids = binding.get("run_ids")
+    evaluation = binding.get("evaluation")
+    plan = (
+        evaluation.get("plan")
+        if type(evaluation) is dict
+        else None
+    )
+    attempts = plan.get("attempts") if type(plan) is dict else None
+    observations = (
+        evaluation.get("observations")
+        if type(evaluation) is dict
+        else None
+    )
+    source_manifest_sha256 = final.metadata.get(
+        "source_manifest_sha256"
+    )
     if (
         type(proof_result) is not dict
         or frozenset(proof_result) != _CRYPTO_PROOF_RESULT_KEYS
+        or type(evaluation) is not dict
+        or frozenset(evaluation) != _CRYPTO_EVALUATION_KEYS
+        or type(plan) is not dict
+        or frozenset(plan) != _CRYPTO_PLAN_KEYS
+        or plan.get("protocol") != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+        or type(attempts) is not list
+        or len(attempts) != 6
+        or any(
+            type(attempt) is not dict
+            or frozenset(attempt) != _CRYPTO_ATTEMPT_KEYS
+            for attempt in attempts
+        )
+        or type(observations) is not list
+        or len(observations) != 6
+        or any(
+            type(observation) is not dict
+            or frozenset(observation) != _CRYPTO_OBSERVATION_KEYS
+            for observation in observations
+        )
         or type(run_ids) is not list
         or len(run_ids) != 6
         or len(set(run_ids)) != 6
         or any(type(run_id) is not str or not run_id for run_id in run_ids)
         or list(candidate.proof_run_ids) != run_ids
         or proof_result.get("run_ids") != run_ids
+        or binding.get("passed") is not True
+        or binding.get("protocol")
+        != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+        or binding.get("oracle_authority")
+        != MANAGED_ORACLE_PREISSUE_PROTOCOL
+        or evaluation.get("passed") is not True
+        or evaluation.get("failure_codes") != []
+        or evaluation.get("protocol")
+        != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+        or evaluation.get("schema_version") != 1
+        or evaluation.get("candidate_sha256")
+        != hashlib.sha256(candidate.value.encode("utf-8")).hexdigest()
+        or evaluation.get("source_manifest_sha256")
+        != source_manifest_sha256
+        or binding.get("evaluation_sha256")
+        != hashlib.sha256(
+            (
+                json.dumps(
+                    evaluation,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        or binding.get("plan_sha256")
+        != hashlib.sha256(
+            (
+                json.dumps(
+                    plan,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
         or proof_result.get("passed") is not True
         or proof_result.get("candidate") != candidate.value
         or proof_result.get("policy_mode")
         != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
         or proof_result.get("source_manifest_sha256")
-        != final.metadata.get("source_manifest_sha256")
+        != source_manifest_sha256
         or proof_result.get("successful_attempts") != 6
         or proof_result.get("required_attempts") != 6
         or proof_result.get("total_attempts") != 6
@@ -376,14 +575,45 @@ def _validated_crypto_execution(
         raise AssertionError("Crypto physical proof runs are incomplete")
     runs = [runs_by_id[run_id] for run_id in run_ids]
     plan_sha256 = binding.get("plan_sha256")
+    configuration_epoch = final.configuration_epoch
+    expected_command = (
+        [
+            "python3",
+            "/work/oracle/solver.py",
+            "/work/oracle/parameters.json",
+        ]
+        if runtime == "python"
+        else [
+            "sage",
+            "/work/oracle/solver.sage",
+            "/work/oracle/parameters.json",
+        ]
+    )
+    artifacts = list(final.artifacts)
+    if len({item.id for item in artifacts}) != len(artifacts):
+        raise AssertionError("Crypto state contains duplicate artifact IDs")
+    successful_attempts = 0
     for ordinal, run in enumerate(runs, start=1):
+        expected_attempt = attempts[ordinal - 1]
+        committed_observation = observations[ordinal - 1]
+        expected_run_extra = {
+            "attempt_ordinal": ordinal,
+            "crypto_metamorphic_protocol": (
+                CRYPTO_METAMORPHIC_PROOF_PROTOCOL
+            ),
+            "observation": committed_observation,
+            "plan_sha256": plan_sha256,
+        }
         if (
             run.status is not RunStatus.COMPLETED
+            or run.origin is not RunOrigin.PROOF
+            or run.configuration_epoch != configuration_epoch
             or run.role != "crypto_metamorphic_proof"
-            or run.extra.get("crypto_metamorphic_protocol")
-            != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
-            or run.extra.get("plan_sha256") != plan_sha256
-            or run.extra.get("attempt_ordinal") != ordinal
+            or run.request_path != f"runs/{run.id}/request.json"
+            or run.result_path != f"runs/{run.id}/result.json"
+            or run.validation_path
+            != f"runs/{run.id}/validation.json"
+            or run.extra != expected_run_extra
         ):
             raise AssertionError(
                 f"Crypto physical run {ordinal} is not completed and bound"
@@ -406,30 +636,51 @@ def _validated_crypto_execution(
         attempt = request.get("attempt")
         observation = result.get("observation")
         if (
-            request.get("kind") != "crypto_metamorphic_proof"
+            frozenset(request) != _CRYPTO_REQUEST_KEYS
+            or request.get("base_revision") != run.base_revision
+            or request.get("contest_id") != final.contest_id
+            or request.get("category") != final.category
+            or request.get("challenge_id") != final.challenge_id
+            or request.get("run_id") != run.id
+            or request.get("schema_version") != 1
+            or type(request.get("created_at")) is not str
+            or not request.get("created_at")
+            or request.get("kind") != "crypto_metamorphic_proof"
             or request.get("candidate_id") != candidate.id
             or request.get("protocol")
             != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
             or request.get("plan_sha256") != plan_sha256
+            or request.get("command") != expected_command
             or request.get("network_target") is not None
             or request.get("image_reference") != image_digest
             or request.get("source_manifest_sha256")
-            != final.metadata.get("source_manifest_sha256")
-            or type(attempt) is not dict
-            or attempt.get("ordinal") != ordinal
+            != source_manifest_sha256
+            or request.get("solver_sha256")
+            != evaluation.get("solver_artifact_sha256")
+            or request.get("runtime_fingerprint_sha256")
+            != evaluation.get("runtime_fingerprint_sha256")
+            or request.get("oracle_artifact_sha256")
+            != evaluation.get("oracle_artifact_sha256")
+            or request.get("configuration_epoch")
+            != configuration_epoch
+            or attempt != expected_attempt
+            or frozenset(result) != _CRYPTO_RESULT_KEYS
+            or result.get("contest_id") != final.contest_id
+            or result.get("category") != final.category
+            or result.get("challenge_id") != final.challenge_id
+            or result.get("run_id") != run.id
+            or result.get("schema_version") != 1
             or result.get("status") != "completed"
             or result.get("exit_code") != 0
             or result.get("timed_out") is not False
-            or type(observation) is not dict
-            or observation.get("run_id") != run.id
-            or observation.get("ordinal") != ordinal
-            or observation.get("capture_complete") is not True
-            or observation.get("truncation_known") is not True
-            or observation.get("truncated") is not False
-            or observation.get("timed_out") is not False
-            or observation.get("orchestration_status") != "completed"
-            or observation.get("runner_exit_code") != 0
-            or observation.get("ctfwrap_exit_code") != 0
+            or type(result.get("duration_ms")) is not int
+            or result.get("duration_ms", -1) < 0
+            or observation != committed_observation
+            or observation != run.extra.get("observation")
+            or frozenset(validation) != _CRYPTO_VALIDATION_KEYS
+            or validation.get("run_id") != run.id
+            or type(validation.get("validated_at")) is not str
+            or not validation.get("validated_at")
             or validation.get("ok") is not True
             or validation.get("protocol")
             != CRYPTO_METAMORPHIC_PROOF_PROTOCOL
@@ -439,7 +690,128 @@ def _validated_crypto_execution(
             raise AssertionError(
                 f"Crypto physical run {ordinal} evidence is not successful"
             )
-    return runs, int(proof_result["successful_attempts"])
+
+        assert isinstance(observation, dict)
+        if (
+            observation.get("run_id") != run.id
+            or observation.get("ordinal") != ordinal
+            or any(
+                observation.get(field) != expected_attempt.get(field)
+                for field in (
+                    "case_id",
+                    "mutation_id",
+                    "parameters_sha256",
+                    "parameters_size_bytes",
+                )
+            )
+            or observation.get("source_manifest_sha256")
+            != source_manifest_sha256
+            or observation.get("solver_artifact_sha256")
+            != evaluation.get("solver_artifact_sha256")
+            or observation.get("runtime_fingerprint_sha256")
+            != evaluation.get("runtime_fingerprint_sha256")
+            or observation.get("oracle_artifact_sha256")
+            != evaluation.get("oracle_artifact_sha256")
+            or observation.get("clean_workspace") is not True
+            or observation.get("target_exit_code") != 0
+            or observation.get("runner_exit_code") != 0
+            or observation.get("ctfwrap_exit_code") != 0
+            or observation.get("timed_out") is not False
+            or observation.get("orchestration_status") != "completed"
+            or observation.get("capture_complete") is not True
+            or observation.get("capture_error_present") is not False
+            or observation.get("truncation_known") is not True
+            or observation.get("truncated") is not False
+        ):
+            raise AssertionError(
+                f"Crypto physical run {ordinal} provenance is not successful"
+            )
+
+        linked = [
+            artifact
+            for artifact in artifacts
+            if artifact.source_run_id == run.id
+        ]
+        streams = {
+            artifact.extra.get("stream"): artifact
+            for artifact in linked
+            if artifact.extra.get("stream") in {"stdout", "stderr"}
+        }
+        expected_stream_extra = {
+            stream: {
+                "attempt_ordinal": ordinal,
+                "context_visibility": "engine_private",
+                "kind": "crypto_metamorphic_stream",
+                "plan_sha256": plan_sha256,
+                "protocol": CRYPTO_METAMORPHIC_PROOF_PROTOCOL,
+                "stream": stream,
+            }
+            for stream in ("stdout", "stderr")
+        }
+        if (
+            len(linked) != 2
+            or len(streams) != 2
+            or set(streams) != {"stdout", "stderr"}
+            or any(
+                artifact.extra != expected_stream_extra[stream]
+                or type(artifact.size) is not int
+                or artifact.size < 0
+                or artifact.size > _CRYPTO_STREAM_MAX_BYTES
+                for stream, artifact in streams.items()
+            )
+            or result.get("artifacts")
+            != [
+                streams["stdout"].to_dict(),
+                streams["stderr"].to_dict(),
+            ]
+        ):
+            raise AssertionError(
+                f"Crypto physical run {ordinal} stream graph is not exact"
+            )
+
+        for stream in ("stdout", "stderr"):
+            artifact = streams[stream]
+            try:
+                read_bounded_regular(
+                    challenge_root,
+                    artifact.path,
+                    maximum_bytes=_CRYPTO_STREAM_MAX_BYTES,
+                    expected_sha256=artifact.sha256,
+                    expected_size=artifact.size,
+                )
+            except (OSError, ValueError) as error:
+                raise AssertionError(
+                    f"Crypto physical run {ordinal} {stream} artifact "
+                    "does not match state"
+                ) from error
+
+        stdout = streams["stdout"]
+        if (
+            observation.get("result_artifact_id") != stdout.id
+            or observation.get("result_artifact_sha256") != stdout.sha256
+            or observation.get("result_artifact_size_bytes") != stdout.size
+            or stdout.sha256
+            != expected_attempt.get("expected_output_sha256")
+            or stdout.size
+            != expected_attempt.get("expected_output_size_bytes")
+        ):
+            raise AssertionError(
+                f"Crypto physical run {ordinal} stdout is not the "
+                "planned result"
+            )
+        successful_attempts += 1
+
+    if (
+        successful_attempts != 6
+        or proof_result.get("successful_attempts")
+        != successful_attempts
+        or proof_result.get("run_ids")
+        != [observation["run_id"] for observation in observations]
+    ):
+        raise AssertionError(
+            "Crypto ProofResult contradicts physical execution"
+        )
+    return runs, successful_attempts
 
 
 def _crypto(
@@ -508,7 +880,7 @@ def _crypto(
         value=CRYPTO_CANDIDATE,
     )
 
-    final, experiment = _execute_managed_builder_action(
+    committed, experiment = _execute_managed_builder_action(
         engine,
         identity,
         action={
@@ -521,6 +893,22 @@ def _crypto(
             "runtime": runtime,
         },
         payloads=payloads,
+    )
+    committed_revision = committed.revision
+    experiment_id = experiment.id
+    final = engine.store.load(identity, recover=False)
+    final.validate()
+    verified_artifacts = engine.store.verify_artifacts(identity)
+    if (
+        final.revision != committed_revision
+        or set(verified_artifacts)
+        != {artifact.id for artifact in final.artifacts}
+    ):
+        raise AssertionError(
+            "Crypto StateStore reload or physical artifact validation failed"
+        )
+    experiment = next(
+        item for item in final.experiments if item.id == experiment_id
     )
     candidate = next(
         item
@@ -535,6 +923,7 @@ def _crypto(
         binding,
         challenge_root=challenge_root,
         image_digest=image_digest,
+        runtime=runtime,
     )
     preissue_state = final.extra[MANAGED_ORACLE_PREISSUE_STATE_KEY][
         preissue["preissue_id"]
