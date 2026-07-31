@@ -474,26 +474,25 @@ def web_impact_target_binding_sha256(target: TargetRecord) -> str:
         or type(target.endpoint) is not str
         or not target.endpoint
         or target.status is not TargetStatus.ACTIVE
-        or target.enforcement != "proxy"
+        or target.enforcement not in {"proxy", "builtin"}
         or type(target.docker_network) is not str
         or not target.docker_network
         or type(target.generation) is not int
         or target.generation < 1
     ):
         raise WebImpactDriverError("target_record_invalid")
-    return _sha256(
-        _canonical_json_bytes(
-            {
-                "docker_network": target.docker_network,
-                "endpoint": target.endpoint,
-                "enforcement": target.enforcement,
-                "generation": target.generation,
-                "id": target.id,
-                "protocol": WEB_IMPACT_TARGET_BINDING_PROTOCOL,
-                "status": target.status.value,
-            }
-        )
-    )
+    document = {
+        "docker_network": target.docker_network,
+        "endpoint": target.endpoint,
+        "enforcement": target.enforcement,
+        "generation": target.generation,
+        "id": target.id,
+        "protocol": WEB_IMPACT_TARGET_BINDING_PROTOCOL,
+        "status": target.status.value,
+    }
+    if target.enforcement == "builtin":
+        document["builtin_egress"] = target.extra.get("builtin_egress")
+    return _sha256(_canonical_json_bytes(document))
 
 
 def validate_route_payload(payload: bytes) -> str:

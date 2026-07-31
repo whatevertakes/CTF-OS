@@ -29,7 +29,7 @@ jq -e '
 ctf-capabilities --json >"${test_root}/managed-capabilities.json"
 jq -e '
     .schema_version == 2
-    and (.capabilities | length == 12)
+    and (.capabilities | length == 32)
     and all(.capabilities[]; .available == true)
     and all(
         .capabilities[]
@@ -42,6 +42,7 @@ jq -e '
             .name == "rev_inventory_v2"
             or .name == "rev_safe_output"
             or .name == "rev_stdin_exec"
+            or .name == "forensic_evidence_index_v1"
         );
         .attestation.schema_version == 1
         and (.attestation.contract_id | type == "string")
@@ -50,14 +51,16 @@ jq -e '
             .attestation.path
             | startswith("/opt/ctf-templates/pwn/")
               or startswith("/opt/ctf-templates/rev/")
+              or startswith("/opt/ctf-templates/forensic/")
         )
         and (.attestation.sha256 | test("^[0-9a-f]{64}$"))
     )
 ' "${test_root}/managed-capabilities.json" >/dev/null
 
 required_tools=(
-    bkcrack crypto-python ctf-browser ctf-web-probe evtxexport fls
-    frida-trace hash_extender
+    bkcrack cryptominisat5 crypto-python ctf-browser ctf-egress-proxy
+    ctf-network-smoke ctf-web-probe
+    evtxexport ewfinfo ewfverify fls frida-trace hash_extender
     msoffcrypto-tool pahole pdfimages playwright pw-python qemu-img
     qemu-system-aarch64 rabin2 ropr sage-python uncompyle6 unsquashfs
     wasm2wat web-python wine wine64
@@ -84,17 +87,55 @@ import gf2bv
 import h2
 import h2spacex
 import lxml
+import pysat
 import scapy
 import websockets
 from gf2bv import LinearSystem
+from pysat.solvers import Solver
 
 assert importlib.metadata.version("h2spacex") == "1.2.2"
+assert importlib.metadata.version("python-sat") == "1.9.dev7"
 assert scapy.__version__ == "2.7.0"
 system = LinearSystem([1, 1])
 a, b = system.gens()
 solutions = list(system.solve_all([a ^ b ^ 1]))
 assert solutions
+for solver_name in ("cadical300", "kissat404"):
+    with Solver(name=solver_name, bootstrap_with=[[1], [-1, 2]]) as solver:
+        assert solver.solve()
+    with Solver(name=solver_name, bootstrap_with=[[1], [-1]]) as solver:
+        assert not solver.solve()
 PY
+
+set +e
+printf 'p cnf 2 2\n1 0\n-1 2 0\n' \
+    | cryptominisat5 --verb 0 >"${test_root}/cryptominisat.out"
+cryptominisat_status=$?
+set -e
+[[ "${cryptominisat_status}" -eq 10 ]]
+grep -Fx 's SATISFIABLE' "${test_root}/cryptominisat.out" >/dev/null
+
+fls -V | grep -F 'The Sleuth Kit ver' >/dev/null
+ewfinfo -V | grep -F 'ewfinfo 20140814' >/dev/null
+tshark --version | grep -F 'TShark (Wireshark)' >/dev/null
+zeek --version | grep -F 'zeek version' >/dev/null
+tesseract --version | grep -F 'tesseract 5.' >/dev/null
+tesseract --list-langs >"${test_root}/tesseract-langs.txt"
+grep -Fx 'kor' "${test_root}/tesseract-langs.txt" >/dev/null
+grep -Fx 'kor_vert' "${test_root}/tesseract-langs.txt" >/dev/null
+hwp5txt --version | grep -F 'hwp5txt ' >/dev/null
+stegseek --version | grep -F 'StegSeek ' >/dev/null
+zsteg --help | grep -F 'Usage: zsteg ' >/dev/null
+ffmpeg -version | grep -F 'ffmpeg version ' >/dev/null
+sox --version | grep -F 'SoX v' >/dev/null
+zbarimg --version | grep -E '^[0-9]+[.]' >/dev/null
+vol --help | grep -F 'usage: vol ' >/dev/null
+
+for symbol_archive in windows linux mac; do
+    archive="/opt/volatility3/symbols/${symbol_archive}.zip"
+    [[ -s "${archive}" ]]
+    [[ "$(od -An -tx1 -N4 "${archive}" | tr -d ' \n')" == "504b0304" ]]
+done
 
 [[ "$(readlink -f /usr/local/lib/ctf-cuda/libnvrtc.so)" == \
     */site-packages/nvidia/cu13/lib/libnvrtc.so.13 ]]
@@ -289,8 +330,9 @@ assert_noarg_exit_2() {
 }
 
 for tool in \
-    crypto-python ctf-browser ctf-web-probe pw-python qemu-system-mips \
-    qemu-system-x86_64 sage-python web-python wine wine64
+    crypto-python ctf-browser ctf-egress-proxy ctf-network-smoke \
+    ctf-web-probe pw-python qemu-system-mips qemu-system-x86_64 \
+    sage-python web-python wine wine64
 do
     assert_noarg_exit_2 "${tool}"
 done

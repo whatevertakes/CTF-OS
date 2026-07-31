@@ -410,6 +410,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       yasm libomp-dev libopenblas-dev msolve libm4ri-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# PySAT publishes the original solver implementations with its wheel.  Exercise
+# both a satisfiable and an unsatisfiable instance for the exact CaDiCaL and
+# Kissat backends that the capability contract exposes.
+ARG PYTHON_SAT_VER=1.9.dev7
+RUN VIRTUAL_ENV=/opt/venvs/main uv pip install \
+      "python-sat==${PYTHON_SAT_VER}" \
+ && /opt/venvs/main/bin/python -c \
+      'import importlib.metadata as m; assert m.version("python-sat") == "1.9.dev7"' \
+ && /opt/venvs/main/bin/python -c \
+      'from pysat.solvers import Solver; s=Solver(name="cadical300", bootstrap_with=[[1],[-1,2]]); assert s.solve() and s.get_model(); s.delete(); s=Solver(name="cadical300", bootstrap_with=[[1],[-1]]); assert not s.solve(); s.delete()' \
+ && /opt/venvs/main/bin/python -c \
+      'from pysat.solvers import Solver; s=Solver(name="kissat404", bootstrap_with=[[1],[-1,2]]); assert s.solve() and s.get_model(); s.delete(); s=Solver(name="kissat404", bootstrap_with=[[1],[-1]]); assert not s.solve(); s.delete()'
+
+# CryptoMiniSat official release binary.  The GitHub release API reports this
+# checksum for the static Linux amd64 asset; verify it before installation and
+# solve a real DIMACS instance instead of treating --version as readiness.
+ARG CRYPTOMINISAT_VER=5.14.7
+ARG CRYPTOMINISAT_SHA256=536d4cb03bbd2b4cbcca6230ed30e2aa844f170b5bbcfb0a0d7adb4852cf3ab7
+RUN set -eux; \
+    archive=/tmp/cryptominisat.tar.gz; \
+    curl -fsSL --retry 3 -o "${archive}" \
+      "https://github.com/msoos/cryptominisat/releases/download/release/v${CRYPTOMINISAT_VER}/cryptominisat5-v${CRYPTOMINISAT_VER}-linux-amd64.tar.gz"; \
+    echo "${CRYPTOMINISAT_SHA256}  ${archive}" | sha256sum -c -; \
+    tar -xzf "${archive}" -C /usr/local/bin cryptominisat5; \
+    chmod 0755 /usr/local/bin/cryptominisat5; \
+    cryptominisat5 --version | grep -F \
+      "CryptoMiniSat version ${CRYPTOMINISAT_VER}"; \
+    if printf 'p cnf 2 2\n1 0\n-1 2 0\n' \
+        | cryptominisat5 --verb 0 >/tmp/cryptominisat-smoke.log; then \
+      solver_status=0; \
+    else \
+      solver_status=$?; \
+    fi; \
+    test "${solver_status}" -eq 10; \
+    grep -Fx 's SATISFIABLE' /tmp/cryptominisat-smoke.log; \
+    rm -f "${archive}" /tmp/cryptominisat-smoke.log
+
 # flatter — 대형 격자 축약
 ARG FLATTER_REF=d2b8026f29b4a69e987b15d4b240f8a5053275d3
 RUN git init /tmp/flatter \
@@ -516,7 +553,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-kor tesseract-ocr-kor-vert \
       fonts-nanum fonts-nanum-coding \
       libreoffice-writer libreoffice-calc libreoffice-impress \
-      flex libabsl-dev libre2-dev libxml2-utils libewf-dev \
+      flex libabsl-dev libre2-dev libxml2-utils libewf-dev ewf-tools \
  && rm -rf /var/lib/apt/lists/*
 
 # bulk_extractor 는 Ubuntu 24.04 패키지가 없어 공식 안정 릴리스를 소스 빌드한다.
@@ -874,7 +911,7 @@ RUN rm -rf /root/.cache /root/.cargo/registry /root/.cargo/git \
  && /opt/mamba/envs/sage/bin/python -c \
       'import cuso; from Crypto.Util.number import long_to_bytes' \
  && /opt/venvs/main/bin/python -c \
-      'import bs4, cysignals, fpylll, gf2bv, h2, h2spacex, lxml, websockets' \
+      'import bs4, cysignals, fpylll, gf2bv, h2, h2spacex, lxml, pysat, websockets' \
  && cargo --version >/dev/null \
  && /usr/local/bin/ml-python -c 'import torch; print(torch.__version__)' \
  && john --list=build-info >/dev/null \
@@ -884,7 +921,8 @@ RUN rm -rf /root/.cache /root/.cargo/registry /root/.cargo/git \
       php -m | grep -Fxi "${extension}" >/dev/null; \
     done \
  && command -v \
-      bkcrack crypto-python evtxexport fls fsstat hash_extender icat \
+      bkcrack cryptominisat5 crypto-python evtxexport ewfinfo ewfverify \
+      fls fsstat hash_extender icat \
       minimodem msoffcrypto-tool multimon-ng objdump oleobj pahole \
       pdfdetach pdfimages pydisasm pw-python qemu-img \
       qemu-system-aarch64 qemu-system-mips qpdf rabin2 radiff2 \
@@ -896,8 +934,8 @@ RUN rm -rf /root/.cache /root/.cargo/registry /root/.cargo/git \
 
 # 래퍼·인덱스·잡 시스템 (별도 산출물)
 #   ctfwrap, ctf-bg, ctf-jobs, ctf-log, ctf-kill, ctf-idle, ctf-tools,
-#   ctf-flag, ctf-browser, ctf-web-probe, ktext, ghidra-decompile,
-#   entrypoint.sh
+#   ctf-flag, ctf-browser, ctf-web-probe, ctf-egress-proxy,
+#   ctf-network-smoke, ktext, ghidra-decompile, entrypoint.sh
 COPY scripts/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/ctf* /usr/local/bin/ktext /usr/local/bin/ghidra-decompile \
              /usr/local/bin/entrypoint.sh /usr/local/bin/gen-manifest.sh
@@ -917,14 +955,14 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
       and (.failed | type == "array" and length == 0) \
       and (.tools | type == "array" and length > 0) \
       and all(.tools[]; .available == true and (.path | startswith("/"))) \
-      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ctf-web-probe", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
+      and ((["ctfwrap", "ctf-bg", "ctf-jobs", "ctf-log", "ctf-kill", "ctf-idle", "ctf-tools", "ctf-flag", "ctf-browser", "ctf-web-probe", "ctf-egress-proxy", "ctf-network-smoke", "ktext", "ghidra-decompile"] - [.tools[].name]) | length == 0)' \
       /tools/manifest.json >/dev/null \
  && python3 /usr/local/bin/ctf-tools --render-md > /tools/TOOLS.md \
  && python3 /usr/local/bin/ctf-tools --json --info ctfwrap \
       | jq -e '.found == true and .tool.available == true' >/dev/null \
  && /usr/local/bin/ctf-capabilities --json \
       | jq -e '.schema_version == 2 \
-          and (.capabilities | length == 12) \
+          and (.capabilities | length == 32) \
           and all(.capabilities[]; .available == true) \
           and ([.capabilities[] \
               | select(.name == "pwn_crash_v1" \
@@ -933,8 +971,9 @@ RUN /usr/bin/python3 /opt/ctf-templates/forensic/evidence_index.py \
                   or .name == "pwn_interaction_v1" \
                   or .name == "rev_inventory_v2" \
                   or .name == "rev_safe_output" \
-                  or .name == "rev_stdin_exec") \
-              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1])' >/dev/null \
+                  or .name == "rev_stdin_exec" \
+                  or .name == "forensic_evidence_index_v1") \
+              | .attestation.schema_version] == [1, 1, 1, 1, 1, 1, 1, 1])' >/dev/null \
  && rm -f /tools/failed.txt
 
 # 실행 환경

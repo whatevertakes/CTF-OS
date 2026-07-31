@@ -6,6 +6,7 @@ from .client import (
     UnixChallengeSandboxClient,
 )
 from .docker import DockerLimits, DockerSandboxBackend
+from .supervisor import BackgroundJobSupervisor
 from .types import (
     ArtifactRef,
     BackgroundJobUnsupported,
@@ -29,6 +30,7 @@ from .types import (
 __all__ = [
     "ArtifactRef",
     "BackgroundJobUnsupported",
+    "BackgroundJobSupervisor",
     "ChallengeSandboxClient",
     "ChallengeScope",
     "CommandSpec",

@@ -42,6 +42,7 @@ from ctf_os.models import (
     Provenance,
 )
 from ctf_os.sandbox.daemon import CapabilityAuthority, CapabilityError
+from ctf_os.sandbox.types import JobRef
 
 if TYPE_CHECKING:
     from ctf_os.engine.challenge import ChallengeEngine
@@ -569,6 +570,7 @@ class LiveBrokerService:
             "agent.progress",
             "agent.transition",
             "tool.run",
+            "tool.start",
             "jobs",
             "inspect",
             "knowledge.search",
@@ -948,18 +950,189 @@ class LiveBrokerService:
             )
             return _latest_experiment(state)
 
-        if operation == "jobs":
-            state = self.engine.run_tool_command(
+        if operation == "tool.start":
+            state, ref = self.engine.start_background_job(
                 identity,
-                ("ctf-jobs", "--json"),
-                expected_observation="bounded background job list",
-                keep_if="a running/completed job changes the active goal",
-                drop_if="there are no relevant jobs",
-                timeout_seconds=self._operation_timeout({}),
+                _string_list(params, "command"),
+                name=_string(
+                    params,
+                    "name",
+                    required=False,
+                    maximum_bytes=1024,
+                ),
+                timeout_seconds=self._operation_timeout(params),
+                resource_class=_string(
+                    params,
+                    "resource_class",
+                    maximum_bytes=64,
+                ),
+                network_target=_string(
+                    params,
+                    "network_target",
+                    required=False,
+                    maximum_bytes=4096,
+                ),
+                needs_kvm=_boolean(params, "needs_kvm"),
                 _session_owned=True,
                 _live_only=True,
             )
-            return _latest_experiment(state)
+            return {
+                "schema_version": 1,
+                "kind": "background_job_launch",
+                "state_revision": state.revision,
+                "ref": {
+                    "job_id": ref.job_id,
+                    "scope_fingerprint": ref.scope_fingerprint,
+                    "runtime_id": ref.runtime_id,
+                    "supervisor_id": ref.supervisor_id,
+                },
+            }
+
+        if operation == "jobs":
+            action = _string(
+                params,
+                "action",
+                required=False,
+                maximum_bytes=32,
+            ) or "list"
+            if action not in {
+                "list",
+                "recover",
+                "status",
+                "log",
+                "cancel",
+            }:
+                raise LiveBrokerError("invalid jobs action")
+            if action in {"list", "recover"}:
+                unexpected = set(params).difference(
+                    {
+                        "action",
+                        "runtime_id",
+                        "tail_bytes",
+                        "grace_seconds",
+                    }
+                )
+                if unexpected:
+                    raise LiveBrokerError(
+                        f"unexpected jobs params: {sorted(unexpected)}"
+                    )
+                state, statuses = self.engine.list_background_jobs(
+                    identity,
+                    recover=True,
+                    _live_only=True,
+                )
+                return {
+                    "schema_version": 1,
+                    "kind": "supervised_job_list",
+                    "experiment_id": None,
+                    "state_revision": state.revision,
+                    "count": len(statuses),
+                    "jobs": [
+                        {
+                            "ref": {
+                                "job_id": status.ref.job_id,
+                                "scope_fingerprint": (
+                                    status.ref.scope_fingerprint
+                                ),
+                                "runtime_id": status.ref.runtime_id,
+                                "supervisor_id": (
+                                    status.ref.supervisor_id
+                                ),
+                            },
+                            "status": status.status.value,
+                            "exit_code": status.exit_code,
+                            "timed_out": status.timed_out,
+                            "cancelled": status.cancelled,
+                            "started_at": status.started_at,
+                            "finished_at": status.finished_at,
+                        }
+                        for status in statuses
+                    ],
+                }
+            state = self.engine.store.load(identity)
+            sandbox = self.engine.sandbox(state)
+            ref = JobRef(
+                job_id=_string(
+                    params,
+                    "job_id",
+                    maximum_bytes=32,
+                ),
+                scope_fingerprint=sandbox.scope_fingerprint,
+                runtime_id=_string(
+                    params,
+                    "runtime_id",
+                    maximum_bytes=128,
+                ),
+                supervisor_id=_string(
+                    params,
+                    "supervisor_id",
+                    maximum_bytes=64,
+                ),
+            )
+            if action == "log":
+                tail_bytes = _optional_bounded_int(
+                    params,
+                    "tail_bytes",
+                    minimum=0,
+                    maximum=1024 * 1024,
+                )
+                log = self.engine.background_job_log(
+                    identity,
+                    ref,
+                    tail_bytes=8192 if tail_bytes is None else tail_bytes,
+                )
+                return {
+                    "schema_version": 1,
+                    "kind": "supervised_job_log",
+                    "ref": {
+                        "job_id": ref.job_id,
+                        "scope_fingerprint": ref.scope_fingerprint,
+                        "runtime_id": ref.runtime_id,
+                        "supervisor_id": ref.supervisor_id,
+                    },
+                    "stdout": log.stdout,
+                    "stderr": log.stderr,
+                    "stdout_bytes": log.stdout_bytes,
+                    "stderr_bytes": log.stderr_bytes,
+                    "stdout_truncated": log.stdout_truncated,
+                    "stderr_truncated": log.stderr_truncated,
+                }
+            if action == "cancel":
+                grace = _optional_bounded_int(
+                    params,
+                    "grace_seconds",
+                    minimum=0,
+                    maximum=30,
+                )
+                current, status = self.engine.cancel_background_job(
+                    identity,
+                    ref,
+                    grace_seconds=3 if grace is None else grace,
+                    _live_only=True,
+                )
+            else:
+                current, status = self.engine.background_job_status(
+                    identity,
+                    ref,
+                    _live_only=True,
+                )
+            return {
+                "schema_version": 1,
+                "kind": "supervised_job_status",
+                "state_revision": current.revision,
+                "ref": {
+                    "job_id": ref.job_id,
+                    "scope_fingerprint": ref.scope_fingerprint,
+                    "runtime_id": ref.runtime_id,
+                    "supervisor_id": ref.supervisor_id,
+                },
+                "status": status.status.value,
+                "exit_code": status.exit_code,
+                "timed_out": status.timed_out,
+                "cancelled": status.cancelled,
+                "started_at": status.started_at,
+                "finished_at": status.finished_at,
+            }
 
         if operation == "inspect":
             section = _string(params, "section", maximum_bytes=64)

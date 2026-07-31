@@ -1045,6 +1045,7 @@ class CommandTests(unittest.TestCase):
                     "agent.artifact",
                     "agent.progress",
                     "agent.transition",
+                    "tool.start",
                     "tool.run",
                     "jobs",
                     "inspect",

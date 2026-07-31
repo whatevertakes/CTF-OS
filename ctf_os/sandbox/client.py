@@ -11,7 +11,7 @@ import stat
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from ctf_os.director.resources import ResourceVector
 
@@ -41,6 +41,9 @@ from .types import (
     sandbox_result_from_mapping,
     validate_deadline_monotonic_seconds,
 )
+
+if TYPE_CHECKING:
+    from .supervisor import BackgroundJobSupervisor
 
 MAX_RPC_BYTES = 1024 * 1024
 
@@ -77,6 +80,10 @@ class ChallengeSandboxClient(Protocol):
     def job_log(self, ref: JobRef, *, tail_bytes: int = 8192) -> JobLog: ...
 
     def cancel_job(self, ref: JobRef, *, grace_seconds: int = 3) -> JobStatus: ...
+
+    def list_jobs(self) -> tuple[JobStatus, ...]: ...
+
+    def recover_jobs(self) -> tuple[JobStatus, ...]: ...
 
     def register_artifact(
         self,
@@ -190,6 +197,7 @@ class LocalChallengeSandboxClient:
         image_digest: str | None = None,
         network_policy: NetworkPolicy | None = None,
         limits: DockerLimits | None = None,
+        job_supervisor: BackgroundJobSupervisor | None = None,
     ) -> None:
         if backend is not None and backend.scope != scope:
             raise ScopeError("sandbox backend belongs to another challenge scope")
@@ -201,6 +209,7 @@ class LocalChallengeSandboxClient:
             network_policy=network_policy,
             limits=limits,
         )
+        self.job_supervisor = job_supervisor
 
     @property
     def scope_fingerprint(self) -> str:
@@ -223,25 +232,67 @@ class LocalChallengeSandboxClient:
         return self.backend.run(spec)
 
     def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef:
-        del spec, name
-        raise BackgroundJobUnsupported(
-            "background job start is disabled until a lease supervisor exists"
+        if self.job_supervisor is None:
+            raise BackgroundJobUnsupported(
+                "background job start requires a configured lease supervisor"
+            )
+        return self.job_supervisor.start(
+            self.backend,
+            spec,
+            name=name,
+            owner=f"{self.scope.qualified_id}:background",
         )
 
     def job_status(self, ref: JobRef) -> JobStatus:
         self._check_ref(ref)
+        if ref.supervisor_id is not None:
+            if self.job_supervisor is None:
+                raise BackgroundJobUnsupported(
+                    "supervised job status requires its lease supervisor"
+                )
+            return self.job_supervisor.status(self.backend, ref)
         return self.backend.job_status(ref)
 
     def job_log(self, ref: JobRef, *, tail_bytes: int = 8192) -> JobLog:
         self._check_ref(ref)
+        if ref.supervisor_id is not None:
+            if self.job_supervisor is None:
+                raise BackgroundJobUnsupported(
+                    "supervised job logs require its lease supervisor"
+                )
+            return self.job_supervisor.log(
+                self.backend,
+                ref,
+                tail_bytes=tail_bytes,
+            )
         return self.backend.job_log(ref, tail_bytes=tail_bytes)
 
     def cancel_job(self, ref: JobRef, *, grace_seconds: int = 3) -> JobStatus:
         self._check_ref(ref)
+        if ref.supervisor_id is not None:
+            if self.job_supervisor is None:
+                raise BackgroundJobUnsupported(
+                    "supervised job cancellation requires its lease supervisor"
+                )
+            return self.job_supervisor.cancel(
+                self.backend,
+                ref,
+                grace_seconds=_validate_cancel_grace_seconds(grace_seconds),
+            )
         return self.backend.cancel_job(
             ref,
             grace_seconds=_validate_cancel_grace_seconds(grace_seconds),
         )
+
+    def list_jobs(self) -> tuple[JobStatus, ...]:
+        if self.job_supervisor is None:
+            return ()
+        return self.job_supervisor.list(self.backend)
+
+    def recover_jobs(self) -> tuple[JobStatus, ...]:
+        if self.job_supervisor is None:
+            return ()
+        return self.job_supervisor.recover(self.backend)
 
     def register_artifact(
         self,
@@ -390,11 +441,14 @@ def command_from_dict(value: object) -> CommandSpec:
 
 
 def ref_to_dict(ref: JobRef) -> dict[str, str]:
-    return {
+    value = {
         "job_id": ref.job_id,
         "scope_fingerprint": ref.scope_fingerprint,
         "runtime_id": ref.runtime_id,
     }
+    if ref.supervisor_id is not None:
+        value["supervisor_id"] = ref.supervisor_id
+    return value
 
 
 def ref_from_dict(value: object) -> JobRef:
@@ -404,6 +458,7 @@ def ref_from_dict(value: object) -> JobRef:
         job_id=value.get("job_id"),
         scope_fingerprint=value.get("scope_fingerprint"),
         runtime_id=value.get("runtime_id", "none"),
+        supervisor_id=value.get("supervisor_id"),
     )
 
 
@@ -598,10 +653,21 @@ class UnixChallengeSandboxClient:
         )
 
     def start_job(self, spec: CommandSpec, *, name: str | None = None) -> JobRef:
-        del spec, name
-        raise BackgroundJobUnsupported(
-            "background job start is disabled until a lease supervisor exists"
+        fallback = max(self.rpc_timeout, 330.0)
+        rpc_deadline = self._rpc_deadline(
+            spec.deadline_monotonic_seconds,
+            fallback,
+            65,
         )
+        value = self._call(
+            "start_job",
+            {
+                "command": command_to_dict(spec),
+                "name": name,
+            },
+            rpc_deadline_monotonic=rpc_deadline,
+        )
+        return ref_from_dict(value)
 
     def job_status(self, ref: JobRef) -> JobStatus:
         self._check_ref(ref)
@@ -655,6 +721,54 @@ class UnixChallengeSandboxClient:
             started_at=value.get("started_at"),
             finished_at=value.get("finished_at"),
         )
+
+    def list_jobs(self) -> tuple[JobStatus, ...]:
+        value = self._call("list_jobs", {})
+        if not isinstance(value, list):
+            raise SandboxError("invalid sandbox job list response")
+        statuses: list[JobStatus] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise SandboxError("invalid sandbox job list response")
+            ref = ref_from_dict(item.get("ref"))
+            if ref.scope_fingerprint != self.scope_fingerprint:
+                raise ScopeError("job list returned another challenge scope")
+            statuses.append(
+                JobStatus(
+                    ref=ref,
+                    status=JobState(item["status"]),
+                    exit_code=item.get("exit_code"),
+                    timed_out=bool(item.get("timed_out", False)),
+                    cancelled=bool(item.get("cancelled", False)),
+                    started_at=item.get("started_at"),
+                    finished_at=item.get("finished_at"),
+                )
+            )
+        return tuple(statuses)
+
+    def recover_jobs(self) -> tuple[JobStatus, ...]:
+        value = self._call("recover_jobs", {})
+        if not isinstance(value, list):
+            raise SandboxError("invalid sandbox recovery response")
+        statuses: list[JobStatus] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise SandboxError("invalid sandbox recovery response")
+            ref = ref_from_dict(item.get("ref"))
+            if ref.scope_fingerprint != self.scope_fingerprint:
+                raise ScopeError("job recovery returned another challenge scope")
+            statuses.append(
+                JobStatus(
+                    ref=ref,
+                    status=JobState(item["status"]),
+                    exit_code=item.get("exit_code"),
+                    timed_out=bool(item.get("timed_out", False)),
+                    cancelled=bool(item.get("cancelled", False)),
+                    started_at=item.get("started_at"),
+                    finished_at=item.get("finished_at"),
+                )
+            )
+        return tuple(statuses)
 
     def register_artifact(
         self,

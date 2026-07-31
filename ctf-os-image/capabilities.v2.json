@@ -26,6 +26,24 @@
       "module": "ortools"
     },
     {
+      "name": "pysat_cadical300",
+      "kind": "pysat_solver",
+      "command": "/opt/venvs/main/bin/python",
+      "solver": "cadical300"
+    },
+    {
+      "name": "pysat_kissat404",
+      "kind": "pysat_solver",
+      "command": "/opt/venvs/main/bin/python",
+      "solver": "kissat404"
+    },
+    {
+      "name": "cryptominisat5",
+      "kind": "dimacs_solver",
+      "command": "/usr/local/bin/cryptominisat5",
+      "arguments": ["--verb", "0"]
+    },
+    {
       "name": "angr_python",
       "kind": "python_module",
       "command": "/opt/venvs/angr/bin/python",
@@ -93,6 +111,138 @@
       "contract_id": "ctfos.rev.stdin_exec",
       "contract_version": 1,
       "sha256": "036edb158461aa32c6688a7f33f3d523f593202409b62377288c8c8e54b45610"
+    },
+    {
+      "name": "forensic_evidence_index_v1",
+      "kind": "file_sha256",
+      "path": "/opt/ctf-templates/forensic/evidence_index.py",
+      "attestation_schema_version": 1,
+      "contract_id": "ctfos.forensic.evidence_index",
+      "contract_version": 1,
+      "sha256": "a2d84dc83fb041413b667b1164bbe3f93c7ab1b7db5485d9156f1b51f92eddf2"
+    },
+    {
+      "name": "forensic_assertion_python3",
+      "kind": "command",
+      "command": "/usr/bin/python3",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "forensic_assertion_perl",
+      "kind": "command",
+      "command": "/usr/bin/perl",
+      "arguments": ["-v"]
+    },
+    {
+      "name": "forensic_volatility3",
+      "kind": "command",
+      "command": "/usr/local/bin/vol",
+      "arguments": ["--help"]
+    },
+    {
+      "name": "forensic_volatility_symbols",
+      "kind": "regular_file_set",
+      "files": [
+        {
+          "path": "/opt/volatility3/symbols/windows.zip",
+          "minimum_bytes": 1000000,
+          "magic_hex": "504b0304"
+        },
+        {
+          "path": "/opt/volatility3/symbols/linux.zip",
+          "minimum_bytes": 1000000,
+          "magic_hex": "504b0304"
+        },
+        {
+          "path": "/opt/volatility3/symbols/mac.zip",
+          "minimum_bytes": 1000000,
+          "magic_hex": "504b0304"
+        }
+      ]
+    },
+    {
+      "name": "forensic_sleuthkit",
+      "kind": "command",
+      "command": "/usr/bin/fls",
+      "arguments": ["-V"]
+    },
+    {
+      "name": "forensic_ewf",
+      "kind": "command",
+      "command": "/usr/bin/ewfinfo",
+      "arguments": ["-V"]
+    },
+    {
+      "name": "forensic_tshark",
+      "kind": "command",
+      "command": "/usr/bin/tshark",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "forensic_zeek",
+      "kind": "command",
+      "command": "/opt/zeek/bin/zeek",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "forensic_tesseract",
+      "kind": "command",
+      "command": "/usr/bin/tesseract",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "forensic_ocr_korean",
+      "kind": "regular_file_set",
+      "files": [
+        {
+          "path": "/usr/share/tesseract-ocr/5/tessdata/eng.traineddata",
+          "minimum_bytes": 1000
+        },
+        {
+          "path": "/usr/share/tesseract-ocr/5/tessdata/kor.traineddata",
+          "minimum_bytes": 1000
+        },
+        {
+          "path": "/usr/share/tesseract-ocr/5/tessdata/kor_vert.traineddata",
+          "minimum_bytes": 1000
+        }
+      ]
+    },
+    {
+      "name": "forensic_hwp",
+      "kind": "command",
+      "command": "/usr/local/bin/hwp5txt",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "misc_stegseek",
+      "kind": "command",
+      "command": "/usr/local/bin/stegseek",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "misc_zsteg",
+      "kind": "command",
+      "command": "/usr/local/bin/zsteg",
+      "arguments": ["--help"]
+    },
+    {
+      "name": "misc_ffmpeg",
+      "kind": "command",
+      "command": "/usr/bin/ffmpeg",
+      "arguments": ["-version"]
+    },
+    {
+      "name": "misc_sox",
+      "kind": "command",
+      "command": "/usr/bin/sox",
+      "arguments": ["--version"]
+    },
+    {
+      "name": "misc_zbar",
+      "kind": "command",
+      "command": "/usr/bin/zbarimg",
+      "arguments": ["--version"]
     }
   ]
 }

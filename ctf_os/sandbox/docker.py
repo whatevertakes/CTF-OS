@@ -54,10 +54,12 @@ from .files import (
     measure_work_tree,
     normalize_locator,
 )
+from .egress import RestrictedEgressBoundary
 from .types import (
     BackgroundJobUnsupported,
     ChallengeScope,
     CommandSpec,
+    JOB_SUPERVISOR_ID,
     JobLog,
     JobRef,
     JobState,
@@ -477,6 +479,36 @@ class DockerSandboxBackend:
     def _runtime_id(self, network: str) -> str:
         return network
 
+    def _authorized_runtime(
+        self,
+        spec: CommandSpec,
+    ) -> tuple[str, Mapping[str, str]]:
+        """Resolve one command to a directly enforced Docker network.
+
+        External ``proxy`` policies already name an operator-restricted
+        network.  A ``builtin`` policy instead provisions a scope-specific
+        internal network and injects only the proxy coordinates; the
+        challenge container is never attached to the upstream network.
+        """
+
+        network = self.network_policy.authorize(spec.network_target)
+        if (
+            spec.network_target is None
+            or self.network_policy.enforcement != "builtin"
+        ):
+            return network, {}
+        boundary = RestrictedEgressBoundary(
+            self.scope,
+            self.network_policy,
+            image=self.image,
+            image_digest=self.image_digest,
+            runner=self.runner,
+            docker=self.docker,
+        )
+        with self._start_lock:
+            runtime = boundary.ensure()
+        return runtime.network, runtime.environment
+
     def _container_name(self, runtime_id: str) -> str:
         import hashlib
 
@@ -495,12 +527,23 @@ class DockerSandboxBackend:
         command: Sequence[str] = ("ctf-idle", "--serve"),
         remove: bool = False,
         limits: DockerLimits | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> list[str]:
         """Build the only Docker ``run`` shape exposed by this backend."""
 
         actual_work = (work_dir or self.scope.work_dir).resolve()
         actual_limits = limits or self.limits
         container_name = name or self._container_name(self._runtime_id(network))
+        extra_labels = dict(labels or {})
+        for label_name, label_value in extra_labels.items():
+            if (
+                not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", label_name)
+                or not isinstance(label_value, str)
+                or not label_value
+                or len(label_value.encode("utf-8")) > 256
+                or any(ord(character) < 0x20 for character in label_value)
+            ):
+                raise SandboxError("invalid trusted Docker job label")
         argv = [
             self.docker,
             "run",
@@ -534,6 +577,8 @@ class DockerSandboxBackend:
             "--cap-drop",
             "ALL",
         ]
+        for label_name, label_value in sorted(extra_labels.items()):
+            argv.extend(["--label", f"{label_name}={label_value}"])
         if actual_limits.run_as_host_user:
             argv.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         argv.extend(
@@ -1020,7 +1065,7 @@ class DockerSandboxBackend:
             spec.deadline_monotonic_seconds
         )
         ensure_foreground_command(spec.argv)
-        network = self.network_policy.authorize(spec.network_target)
+        network, boundary_environment = self._authorized_runtime(spec)
         if bool(spec.resource_request.network) != (network != "none"):
             raise SandboxError(
                 "leased network resource does not match authorized network mode"
@@ -1078,6 +1123,7 @@ class DockerSandboxBackend:
             else spec.argv
         )
         execution_environment = dict(spec.environment)
+        execution_environment.update(boundary_environment)
         with self._work_tree_guard(
             self.scope.work_dir,
             operation="sandbox command",
@@ -1129,14 +1175,14 @@ class DockerSandboxBackend:
                     value = self._exec_json(
                         container,
                         command,
-                        environment=spec.environment,
+                        environment=execution_environment,
                         timeout=control_timeout,
                     )
                 else:
                     value = self._run_one_shot_json(
                         network=network,
                         command=command,
-                        environment=spec.environment,
+                        environment=execution_environment,
                         timeout=control_timeout,
                         limits=execution_limits,
                         private_web_session_root=private_web_session_root,
@@ -1240,6 +1286,469 @@ class DockerSandboxBackend:
             "the resource lease for the complete job lifetime"
         )
 
+    def _supervised_container_name(self, supervisor_id: str) -> str:
+        """Return the one exact Docker runtime owned by a host supervisor."""
+
+        if not JOB_SUPERVISOR_ID.fullmatch(supervisor_id):
+            raise ScopeError("invalid background supervisor identity")
+        return (
+            f"ctfos-job-{self.scope.fingerprint[:12]}-"
+            f"{supervisor_id.removeprefix('bg-')[:20]}"
+        )
+
+    def _verify_supervised_container(
+        self,
+        details: Mapping[str, Any],
+        *,
+        runtime_id: str,
+        supervisor_id: str,
+    ) -> bool:
+        running = self._verify_container(details, runtime_id)
+        labels = details.get("Config", {}).get("Labels", {})
+        if (
+            not isinstance(labels, dict)
+            or labels.get("ctfos.supervisor") != supervisor_id
+        ):
+            raise ScopeError(
+                "sandbox job container belongs to another supervisor"
+            )
+        return running
+
+    def _start_supervised_job(
+        self,
+        spec: CommandSpec,
+        *,
+        supervisor_id: str,
+        name: str | None = None,
+    ) -> JobRef:
+        """Trusted host-supervisor entrypoint for one durable background job.
+
+        This method is intentionally private.  Untrusted callers use
+        ``ChallengeSandboxClient.start_job``; that client first transfers
+        ownership to the host supervisor which holds the matching resource
+        lease until the job is terminal.
+        """
+
+        if not JOB_SUPERVISOR_ID.fullmatch(supervisor_id):
+            raise ScopeError("invalid background supervisor identity")
+        if name is not None and (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 200
+            or len(name.encode("utf-8")) > 1024
+            or any(ord(character) < 0x20 for character in name)
+        ):
+            raise ValueError(
+                "background job name must be a bounded printable string"
+            )
+        ensure_foreground_command(spec.argv)
+        deadline_monotonic = self._anchor_hard_deadline(
+            spec.deadline_monotonic_seconds
+        )
+        network, boundary_environment = self._authorized_runtime(spec)
+        if bool(spec.resource_request.network) != (network != "none"):
+            raise SandboxError(
+                "leased network resource does not match authorized network mode"
+            )
+        try:
+            web_session = prepare_web_session_command(
+                category=self.scope.category,
+                argv=spec.argv,
+                environment=spec.environment,
+            )
+        except WebPrivateStateError as error:
+            raise SandboxError(str(error)) from error
+        if web_session is not None:
+            raise SandboxError(
+                "persistent Web identity helpers are unavailable to "
+                "background jobs"
+            )
+        execution_limits = self._execution_limits(spec.resource_request)
+        self.check_work_tree(phase="background job preflight")
+        timeout_seconds = self._effective_command_timeout(
+            spec,
+            deadline_monotonic,
+            operation="background job launch",
+        )
+        container_name = self._supervised_container_name(supervisor_id)
+        if self._inspect(container_name) is not None:
+            raise SandboxError(
+                "background supervisor runtime already exists"
+            )
+        create_argv = self.build_container_argv(
+            network=network,
+            name=container_name,
+            limits=execution_limits,
+            labels={"ctfos.supervisor": supervisor_id},
+        )
+        created = self._capture(
+            create_argv,
+            timeout=self._clamp_hard_deadline_timeout(
+                deadline_monotonic,
+                120,
+                operation="background job container creation",
+            ),
+            timeout_cleanup_container=None,
+        )
+        if created.returncode != 0:
+            raise SandboxError(
+                "could not create background job container: "
+                + self._bounded(created.stderr, 4096).strip()
+            )
+        launched = False
+        try:
+            details = self._inspect(
+                container_name,
+                timeout=self._clamp_hard_deadline_timeout(
+                    deadline_monotonic,
+                    30,
+                    operation="background job container inspection",
+                ),
+            )
+            if details is None or not self._verify_supervised_container(
+                details,
+                runtime_id=network,
+                supervisor_id=supervisor_id,
+            ):
+                raise SandboxError(
+                    "created background job container failed scope verification"
+                )
+            command = [
+                "ctf-bg",
+                "--json",
+                "--timeout",
+                str(timeout_seconds),
+            ]
+            if name is not None:
+                command.extend(["--name", name])
+            command.extend(("--", *spec.argv))
+            execution_environment = dict(spec.environment)
+            execution_environment.update(boundary_environment)
+            value = self._exec_json(
+                container_name,
+                command,
+                environment=execution_environment,
+                timeout=self._clamp_hard_deadline_timeout(
+                    deadline_monotonic,
+                    45,
+                    operation="background job start receipt",
+                ),
+            )
+            if value.get("kind") != "job_launch":
+                raise SandboxError("ctf-bg returned the wrong result kind")
+            ref = JobRef(
+                job_id=str(value["job_id"]),
+                scope_fingerprint=self.scope.fingerprint,
+                runtime_id=network,
+                supervisor_id=supervisor_id,
+            )
+            launched = True
+            return ref
+        except (KeyError, TypeError, ValueError) as error:
+            raise SandboxError("ctf-bg returned an invalid launch receipt") from error
+        finally:
+            if not launched:
+                cleanup_error = self._remove_supervised_runtime(
+                    supervisor_id,
+                    runtime_id=network,
+                    missing_ok=True,
+                )
+                if cleanup_error is not None and sys.exception() is not None:
+                    sys.exception().add_note(
+                        "background runtime cleanup failed: "
+                        f"{cleanup_error}"
+                    )
+
+    def _remove_supervised_runtime(
+        self,
+        supervisor_id: str,
+        *,
+        runtime_id: str | None,
+        missing_ok: bool = False,
+    ) -> str | None:
+        """Force-remove only the exact labelled runtime for one supervisor."""
+
+        name = self._supervised_container_name(supervisor_id)
+        details = self._inspect(name)
+        if details is None:
+            # ``docker inspect`` deliberately has a simple optional return
+            # contract used elsewhere, so a nonzero status alone cannot prove
+            # absence here: daemon/API failures are also nonzero.  Independently
+            # attest that no container carries this exact trusted supervisor
+            # label before allowing a durable lease to be released.
+            attestation = self._capture(
+                [
+                    self.docker,
+                    "container",
+                    "ls",
+                    "--all",
+                    "--filter",
+                    f"label=ctfos.supervisor={supervisor_id}",
+                    "--format",
+                    "{{.Names}}\t{{.ID}}",
+                ],
+                timeout=30,
+            )
+            if attestation.returncode != 0:
+                detail = self._bounded(
+                    attestation.stderr or attestation.stdout,
+                    4096,
+                ).strip()
+                return (
+                    "background runtime absence attestation failed"
+                    + (f": {detail}" if detail else "")
+                )
+            output = attestation.stdout or ""
+            if len(output.encode("utf-8", errors="replace")) > 64 * 1024:
+                return (
+                    "background runtime absence attestation exceeded "
+                    "the control-output bound"
+                )
+            if output.strip():
+                return (
+                    "background runtime still has an exact supervisor label "
+                    "but could not be inspected"
+                )
+            return None if missing_ok else "background runtime is missing"
+        if runtime_id is None:
+            labels = details.get("Config", {}).get("Labels", {})
+            if not isinstance(labels, Mapping):
+                raise ScopeError(
+                    "background runtime has no trusted labels"
+                )
+            observed_runtime = labels.get("ctfos.network")
+            if not isinstance(observed_runtime, str):
+                raise ScopeError(
+                    "background runtime has no network identity"
+                )
+            runtime_id = observed_runtime
+        self._verify_supervised_container(
+            details,
+            runtime_id=runtime_id,
+            supervisor_id=supervisor_id,
+        )
+        result = self._capture(
+            [self.docker, "container", "rm", "--force", name],
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return (
+                self._bounded(result.stderr or result.stdout, 4096).strip()
+                or f"docker rm exited with status {result.returncode}"
+            )
+        return None
+
+    def _supervised_container_for_ref(
+        self,
+        ref: JobRef,
+    ) -> str | None:
+        self._validate_supervised_ref(ref)
+        assert ref.supervisor_id is not None
+        name = self._supervised_container_name(ref.supervisor_id)
+        details = self._inspect(name)
+        if details is None:
+            return None
+        if not self._verify_supervised_container(
+            details,
+            runtime_id=ref.runtime_id,
+            supervisor_id=ref.supervisor_id,
+        ):
+            return None
+        return name
+
+    def _validate_supervised_ref(self, ref: JobRef) -> None:
+        if ref.scope_fingerprint != self.scope.fingerprint:
+            raise ScopeError("job reference belongs to another challenge")
+        if ref.supervisor_id is None:
+            raise ScopeError("job reference has no supervisor receipt")
+        allowed_runtime = ref.runtime_id in {
+            "none",
+            self.network_policy.docker_network,
+        }
+        if (
+            self.network_policy.enforcement == "builtin"
+            and re.fullmatch(
+                r"ctfos-bnd-[0-9a-f]{12}-[0-9a-f]{10}",
+                ref.runtime_id,
+            )
+        ):
+            allowed_runtime = True
+        if not allowed_runtime:
+            raise ScopeError("job reference uses an unauthorized runtime")
+
+    @staticmethod
+    def _job_status_from_value(
+        ref: JobRef,
+        value: Mapping[str, object],
+    ) -> JobStatus:
+        try:
+            state = JobState(str(value["status"]))
+            return JobStatus(
+                ref=ref,
+                status=state,
+                exit_code=(
+                    int(value["exit_code"])
+                    if value.get("exit_code") is not None
+                    else None
+                ),
+                timed_out=(
+                    state is JobState.TIMED_OUT
+                    or bool(value.get("timed_out", False))
+                ),
+                cancelled=(
+                    state is JobState.CANCELLED
+                    or bool(value.get("cancelled", False))
+                ),
+                started_at=(
+                    str(value["started_at"])
+                    if value.get("started_at") is not None
+                    else None
+                ),
+                finished_at=(
+                    str(value["finished_at"])
+                    if value.get("finished_at") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise SandboxError("ctf-jobs returned an invalid status") from error
+
+    def _read_supervised_status(self, ref: JobRef) -> JobStatus:
+        """Read a terminal status after its dedicated container is removed."""
+
+        self._validate_supervised_ref(ref)
+        locator = f".ctf/jobs/{ref.job_id}/status.json"
+        payload = self._read_scoped_job_file(locator, maximum_bytes=1024 * 1024)
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SandboxError("sandbox job status is invalid") from error
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("job_id") != ref.job_id
+        ):
+            raise SandboxError("sandbox job status has the wrong identity")
+        status = self._job_status_from_value(ref, value)
+        if status.status in {JobState.STARTING, JobState.RUNNING}:
+            return JobStatus(
+                ref=ref,
+                status=JobState.LOST,
+                exit_code=status.exit_code,
+                started_at=status.started_at,
+                finished_at=status.finished_at,
+            )
+        return status
+
+    def _read_scoped_job_file(
+        self,
+        locator: str,
+        *,
+        maximum_bytes: int,
+        tail_bytes: int | None = None,
+    ) -> bytes:
+        """Descriptor-walk one bounded job file without following symlinks."""
+
+        components = Path(locator).parts
+        if (
+            not components
+            or components[:2] != (".ctf", "jobs")
+            or any(part in {"", ".", ".."} for part in components)
+        ):
+            raise ScopeError("invalid sandbox job file locator")
+        owned: list[int] = []
+        try:
+            current = os.open(
+                self.scope.work_dir,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            owned.append(current)
+            for component in components[:-1]:
+                current = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current,
+                )
+                owned.append(current)
+            descriptor = os.open(
+                components[-1],
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current,
+            )
+            owned.append(descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > maximum_bytes
+            ):
+                raise SandboxError("sandbox job file exceeds its bound")
+            if tail_bytes is not None:
+                os.lseek(
+                    descriptor,
+                    max(0, opened.st_size - tail_bytes),
+                    os.SEEK_SET,
+                )
+                remaining = tail_bytes
+            else:
+                remaining = maximum_bytes
+            payload = bytearray()
+            while remaining > 0:
+                block = os.read(descriptor, min(64 * 1024, remaining))
+                if not block:
+                    break
+                payload.extend(block)
+                remaining -= len(block)
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                raise SandboxError("sandbox job file changed while reading")
+            if (
+                tail_bytes is None
+                and (after.st_size, after.st_mtime_ns)
+                != (opened.st_size, opened.st_mtime_ns)
+            ):
+                raise SandboxError("sandbox job file changed while reading")
+            return bytes(payload)
+        except FileNotFoundError as error:
+            raise SandboxError(f"unknown sandbox job: {locator}") from error
+        except OSError as error:
+            raise SandboxError("sandbox job file could not be read safely") from error
+        finally:
+            for descriptor in reversed(owned):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _supervised_job_status(self, ref: JobRef) -> JobStatus:
+        container = self._supervised_container_for_ref(ref)
+        if container is None:
+            return self._read_supervised_status(ref)
+        value = self._exec_json(
+            container,
+            ["ctf-jobs", "--json", ref.job_id],
+            timeout=30,
+        )
+        if value.get("kind") != "job_list":
+            raise SandboxError("ctf-jobs returned the wrong result kind")
+        jobs = value.get("jobs")
+        if not isinstance(jobs, list) or len(jobs) != 1:
+            raise SandboxError(f"unknown sandbox job: {ref.job_id}")
+        if not isinstance(jobs[0], dict):
+            raise SandboxError("ctf-jobs returned an invalid status")
+        return self._job_status_from_value(ref, jobs[0])
+
     def _container_for_ref(self, ref: JobRef) -> str:
         if ref.scope_fingerprint != self.scope.fingerprint:
             raise ScopeError("job reference belongs to another challenge")
@@ -1277,6 +1786,8 @@ class DockerSandboxBackend:
         return True
 
     def job_status(self, ref: JobRef) -> JobStatus:
+        if ref.supervisor_id is not None:
+            return self._supervised_job_status(ref)
         container = self._container_for_ref(ref)
         value = self._exec_json(
             container,
@@ -1327,6 +1838,31 @@ class DockerSandboxBackend:
             or not 0 <= tail_bytes <= 1024 * 1024
         ):
             raise ValueError("tail_bytes must be between 0 and 1048576")
+        if ref.supervisor_id is not None:
+            self._validate_supervised_ref(ref)
+            stdout_locator = f".ctf/jobs/{ref.job_id}/stdout.log"
+            stderr_locator = f".ctf/jobs/{ref.job_id}/stderr.log"
+            stdout_payload = self._read_scoped_job_file(
+                stdout_locator,
+                maximum_bytes=self.limits.work_tree_max_bytes,
+                tail_bytes=tail_bytes,
+            )
+            stderr_payload = self._read_scoped_job_file(
+                stderr_locator,
+                maximum_bytes=self.limits.work_tree_max_bytes,
+                tail_bytes=tail_bytes,
+            )
+            stdout_size = self._scoped_job_file_size(stdout_locator)
+            stderr_size = self._scoped_job_file_size(stderr_locator)
+            return JobLog(
+                ref=ref,
+                stdout=stdout_payload.decode("utf-8", errors="replace"),
+                stderr=stderr_payload.decode("utf-8", errors="replace"),
+                stdout_bytes=stdout_size,
+                stderr_bytes=stderr_size,
+                stdout_truncated=stdout_size > len(stdout_payload),
+                stderr_truncated=stderr_size > len(stderr_payload),
+            )
         container = self._container_for_ref(ref)
         value = self._exec_json(
             container,
@@ -1366,7 +1902,15 @@ class DockerSandboxBackend:
             or not 0 <= grace_seconds <= 30
         ):
             raise ValueError("grace_seconds must be between 0 and 30")
-        container = self._container_for_ref(ref)
+        if ref.supervisor_id is not None:
+            status = self._supervised_job_status(ref)
+            if status.status not in {JobState.STARTING, JobState.RUNNING}:
+                return status
+            container = self._supervised_container_for_ref(ref)
+            if container is None:
+                return self._read_supervised_status(ref)
+        else:
+            container = self._container_for_ref(ref)
         self._exec_json(
             container,
             [
@@ -1379,6 +1923,61 @@ class DockerSandboxBackend:
             timeout=grace_seconds + 15,
         )
         return self.job_status(ref)
+
+    def _scoped_job_file_size(self, locator: str) -> int:
+        """Safely obtain one regular job-file size for bounded tail reads."""
+
+        components = Path(locator).parts
+        if (
+            not components
+            or components[:2] != (".ctf", "jobs")
+            or any(part in {"", ".", ".."} for part in components)
+        ):
+            raise ScopeError("invalid sandbox job file locator")
+        owned: list[int] = []
+        try:
+            current = os.open(
+                self.scope.work_dir,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            owned.append(current)
+            for component in components[:-1]:
+                current = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current,
+                )
+                owned.append(current)
+            descriptor = os.open(
+                components[-1],
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current,
+            )
+            owned.append(descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > self.limits.work_tree_max_bytes
+            ):
+                raise SandboxError("sandbox job log exceeds the work-tree bound")
+            return opened.st_size
+        except (FileNotFoundError, OSError) as error:
+            raise SandboxError("sandbox job log is unavailable") from error
+        finally:
+            for descriptor in reversed(owned):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     @staticmethod
     def _remove_exact_directory(
@@ -1495,7 +2094,7 @@ class DockerSandboxBackend:
                 "clean proof output sources and names must be unique and "
                 "must not alias proof inputs"
             )
-        network = self.network_policy.authorize(spec.network_target)
+        network, boundary_environment = self._authorized_runtime(spec)
         if bool(spec.resource_request.network) != (network != "none"):
             raise SandboxError(
                 "leased network resource does not match authorized network mode"
@@ -1726,8 +2325,10 @@ class DockerSandboxBackend:
                 # fresh argv insertion immediately before the image.
                 image_index = argv.index(self.image_reference)
                 environment_args: list[str] = []
+                proof_environment = dict(spec.environment)
+                proof_environment.update(boundary_environment)
                 for name, environment_value in sorted(
-                    spec.environment.items()
+                    proof_environment.items()
                 ):
                     environment_args.extend(
                         ["--env", f"{name}={environment_value}"]

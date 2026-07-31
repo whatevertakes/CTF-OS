@@ -1,8 +1,9 @@
 """Cross-process FIFO-ish resource leases backed by ``flock``.
 
-Each live lease owns a locked file descriptor.  Process exit closes that
-descriptor, so the next broker operation can reclaim the record without lease
-expiry guesses.  A short global mutex protects allocation bookkeeping only.
+Ordinary live leases own a locked file descriptor and are reclaimed on process
+exit. Durable sandbox-job leases retain their reservation after monitor death
+until exact runtime recovery explicitly retires the bound record. A short
+global mutex protects allocation bookkeeping only.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import sys
@@ -65,6 +67,7 @@ class LeaseRecord:
     requested: ResourceVector
     acquired_at: str
     pid: int
+    durable: bool = False
 
     @property
     def partial(self) -> bool:
@@ -606,6 +609,9 @@ class LeaseBroker:
 
     def _record_from_json(self, value: dict[str, Any]) -> LeaseRecord:
         try:
+            durable = value.get("durable", False)
+            if not isinstance(durable, bool):
+                raise ValueError("durable must be a boolean")
             return LeaseRecord(
                 lease_id=str(value["lease_id"]),
                 owner=str(value["owner"]),
@@ -613,6 +619,7 @@ class LeaseBroker:
                 requested=ResourceVector.from_mapping(value["requested"]),
                 acquired_at=str(value["acquired_at"]),
                 pid=int(value["pid"]),
+                durable=durable,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise LeaseError("invalid persisted lease record") from error
@@ -636,6 +643,20 @@ class LeaseBroker:
                     record = self._record_from_json(self._load_json(metadata_path))
                     if record.lease_id != lease_id:
                         raise LeaseError("lease record identity does not match filename")
+                    live.append(record)
+                    continue
+                record = self._record_from_json(
+                    self._load_json(metadata_path)
+                )
+                if record.lease_id != lease_id:
+                    raise LeaseError(
+                        "lease record identity does not match filename"
+                    )
+                if record.durable:
+                    # A durable job lease remains a reservation after its host
+                    # monitor dies. Recovery must first contain/remove the
+                    # exact sandbox runtime, then explicitly retire this
+                    # orphan record.
                     live.append(record)
                     continue
                 metadata_path.unlink(missing_ok=True)
@@ -741,6 +762,7 @@ class LeaseBroker:
         granted: ResourceVector,
         owner: str,
         *,
+        durable: bool = False,
         pending_handoff: list[Lease] | None = None,
     ) -> Lease:
         lease_id = f"lease-{secrets.token_hex(16)}"
@@ -759,19 +781,22 @@ class LeaseBroker:
                 requested=request,
                 acquired_at=self._now(),
                 pid=os.getpid(),
+                durable=durable,
             )
-            self._atomic_json(
-                metadata_path,
-                {
-                    "schema_version": 1,
-                    "lease_id": record.lease_id,
-                    "owner": record.owner,
-                    "resources": record.resources.as_dict(),
-                    "requested": record.requested.as_dict(),
-                    "acquired_at": record.acquired_at,
-                    "pid": record.pid,
-                },
-            )
+            persisted_record: dict[str, object] = {
+                "schema_version": 1,
+                "lease_id": record.lease_id,
+                "owner": record.owner,
+                "resources": record.resources.as_dict(),
+                "requested": record.requested.as_dict(),
+                "acquired_at": record.acquired_at,
+                "pid": record.pid,
+            }
+            # Preserve the historical ordinary-lease document byte shape.
+            # Only background-job reservations need the explicit marker.
+            if record.durable:
+                persisted_record["durable"] = True
+            self._atomic_json(metadata_path, persisted_record)
             # Store a resource-free, finalizer-safe owner before activating
             # descriptor ownership.  A constructor CALL -> STORE interruption
             # cannot re-enter release() while this mutex is already held.
@@ -846,6 +871,7 @@ class LeaseBroker:
         *,
         allow_partial: bool = False,
         owner: str | None = None,
+        durable: bool = False,
     ) -> Lease | None:
         """Acquire resources, waiting in per-overlap FIFO order.
 
@@ -858,6 +884,8 @@ class LeaseBroker:
         )
         if request.is_empty():
             raise ValueError("resource request must not be empty")
+        if not isinstance(durable, bool):
+            raise ValueError("durable must be a boolean")
         if timeout is not None and (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -937,6 +965,7 @@ class LeaseBroker:
                                 request,
                                 granted,
                                 owner_value,
+                                durable=durable,
                                 pending_handoff=pending_leases,
                             )
                             self._ticket_path(ticket_id).unlink(missing_ok=True)
@@ -1117,6 +1146,81 @@ class LeaseBroker:
                 raise primary_error
 
         self._with_mutex(release_locked)
+
+    def release_orphaned_durable(
+        self,
+        lease_id: str,
+        *,
+        owner: str,
+        missing_ok: bool = False,
+    ) -> LeaseRecord | None:
+        """Retire one dead durable lease after external containment.
+
+        The caller must first stop and remove the exact resource consumer.
+        A still-locked record is never retired, and both lease ID and owner
+        must match the persisted receipt.
+        """
+
+        if (
+            not isinstance(lease_id, str)
+            or re.fullmatch(r"lease-[0-9a-f]{32}", lease_id) is None
+            or not isinstance(owner, str)
+            or not owner
+            or len(owner) > 256
+            or any(ord(character) < 0x20 for character in owner)
+            or not isinstance(missing_ok, bool)
+        ):
+            raise ValueError("invalid durable lease recovery binding")
+
+        def release_locked() -> LeaseRecord | None:
+            lock_path, metadata_path = self._lease_paths(lease_id)
+            try:
+                lock_fd = self._safe_open(lock_path, os.O_RDWR)
+            except FileNotFoundError:
+                if missing_ok and not metadata_path.exists():
+                    return None
+                raise LeaseOwnershipError(
+                    "durable lease record is missing"
+                ) from None
+            try:
+                try:
+                    fcntl.flock(
+                        lock_fd,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError as error:
+                    raise LeaseOwnershipError(
+                        "durable lease monitor is still live"
+                    ) from error
+                try:
+                    record = self._record_from_json(
+                        self._load_json(metadata_path)
+                    )
+                except FileNotFoundError:
+                    if missing_ok:
+                        lock_path.unlink(missing_ok=True)
+                        return None
+                    raise LeaseOwnershipError(
+                        "durable lease metadata is missing"
+                    ) from None
+                if (
+                    record.lease_id != lease_id
+                    or record.owner != owner
+                    or not record.durable
+                ):
+                    raise LeaseOwnershipError(
+                        "durable lease recovery binding changed"
+                    )
+                metadata_path.unlink()
+                lock_path.unlink()
+                return record
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+
+        return self._with_mutex(release_locked)
 
     def status(self) -> BrokerStatus:
         def inspect() -> BrokerStatus:

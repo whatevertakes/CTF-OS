@@ -63,6 +63,12 @@ required_dockerfile_tokens = {
     "binaryen",
     "hash_extender",
     "bkcrack",
+    "python-sat==${PYTHON_SAT_VER}",
+    "cadical300",
+    "kissat404",
+    "CRYPTOMINISAT_VER=5.14.7",
+    "536d4cb03bbd2b4cbcca6230ed30e2aa844f170b5bbcfb0a0d7adb4852cf3ab7",
+    "ewf-tools",
     "qemu-system-mips.real",
     "qemu-system-x86_64.real",
     "/usr/local/lib/ctf-cuda",
@@ -90,9 +96,14 @@ catalog_names = {row[1] for row in catalog_rows}
 required_catalog_names = {
     "bkcrack",
     "crypto-python",
+    "cryptominisat5",
     "ctf-browser",
+    "ctf-egress-proxy",
+    "ctf-network-smoke",
     "ctf-web-probe",
     "evtxexport",
+    "ewfinfo",
+    "ewfverify",
     "fls",
     "frida-trace",
     "hash_extender",
@@ -134,7 +145,7 @@ assert (
 ast.parse(managed_probe_source, filename="scripts/ctf-capabilities")
 ast.parse(sqlite_wrapper_source, filename="scripts/ctf-sqlite-readonly")
 assert managed_manifest["schema_version"] == 2
-assert len(managed_manifest["capabilities"]) == 12
+assert len(managed_manifest["capabilities"]) == 32
 assert {
     item["name"] for item in managed_manifest["capabilities"]
 } == {
@@ -142,6 +153,9 @@ assert {
     "sqlite_readonly",
     "z3",
     "ortools",
+    "pysat_cadical300",
+    "pysat_kissat404",
+    "cryptominisat5",
     "angr_python",
     "pwn_crash_v1",
     "pwn_runtime_snapshot_v1",
@@ -150,6 +164,23 @@ assert {
     "rev_inventory_v2",
     "rev_safe_output",
     "rev_stdin_exec",
+    "forensic_evidence_index_v1",
+    "forensic_assertion_python3",
+    "forensic_assertion_perl",
+    "forensic_volatility3",
+    "forensic_volatility_symbols",
+    "forensic_sleuthkit",
+    "forensic_ewf",
+    "forensic_tshark",
+    "forensic_zeek",
+    "forensic_tesseract",
+    "forensic_ocr_korean",
+    "forensic_hwp",
+    "misc_stegseek",
+    "misc_zsteg",
+    "misc_ffmpeg",
+    "misc_sox",
+    "misc_zbar",
 }
 managed_attestations = {
     item["name"]: item
@@ -163,6 +194,7 @@ managed_attestations = {
         "rev_inventory_v2",
         "rev_safe_output",
         "rev_stdin_exec",
+        "forensic_evidence_index_v1",
     }
 }
 expected_managed_attestations = {
@@ -210,6 +242,14 @@ expected_managed_attestations = {
         "contract_id": "ctfos.rev.safe_output",
         "contract_version": 1,
     },
+    "forensic_evidence_index_v1": {
+        "path": "/opt/ctf-templates/forensic/evidence_index.py",
+        "source": (
+            REPO_ROOT / "templates" / "forensic" / "evidence_index.py"
+        ),
+        "contract_id": "ctfos.forensic.evidence_index",
+        "contract_version": 1,
+    },
 }
 probe_namespace = runpy.run_path(
     str(REPO_ROOT / "scripts" / "ctf-capabilities"),
@@ -251,12 +291,45 @@ with tempfile.TemporaryDirectory() as temporary:
         != changed_record["sha256"]
     )
 assert "COPY capabilities.v2.json /tools/capabilities.json" in dockerfile
-assert "(.capabilities | length == 12)" in dockerfile
+assert "(.capabilities | length == 32)" in dockerfile
 assert 'or .name == "pwn_runtime_snapshot_v1"' in dockerfile
 assert 'or .name == "pwn_exploit_effect_v1"' in dockerfile
 assert 'or .name == "pwn_interaction_v1"' in dockerfile
+assert 'or .name == "forensic_evidence_index_v1"' in dockerfile
 assert "--network" not in managed_probe_source
 assert "mode=ro&immutable=1" in sqlite_wrapper_source
 assert "PRAGMA query_only=ON" in sqlite_wrapper_source
+
+probe_regular_file_set = probe_namespace["_probe_regular_file_set"]
+with tempfile.TemporaryDirectory() as temporary:
+    asset = pathlib.Path(temporary) / "asset.zip"
+    asset.write_bytes(b"PK\x03\x04" + (b"A" * 4096))
+    observation = probe_regular_file_set(
+        "fixture_assets",
+        {
+            "files": [
+                {
+                    "path": str(asset),
+                    "minimum_bytes": 4096,
+                    "magic_hex": "504b0304",
+                }
+            ]
+        },
+    )
+    assert observation == {"name": "fixture_assets", "available": True}
+    asset.write_bytes(b"BAD!" + (b"A" * 4096))
+    observation = probe_regular_file_set(
+        "fixture_assets",
+        {
+            "files": [
+                {
+                    "path": str(asset),
+                    "minimum_bytes": 4096,
+                    "magic_hex": "504b0304",
+                }
+            ]
+        },
+    )
+    assert observation == {"name": "fixture_assets", "available": False}
 
 print("capability contract: ok")

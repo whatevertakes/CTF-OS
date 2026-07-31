@@ -23,6 +23,7 @@ from ctf_os.sandbox.files import (
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 JOB_ID = re.compile(r"^job-[0-9]{8}$")
+JOB_SUPERVISOR_ID = re.compile(r"^bg-[0-9a-f]{32}$")
 
 
 def validate_deadline_monotonic_seconds(
@@ -1338,18 +1339,38 @@ class NetworkPolicy:
 
     Docker's built-in bridge cannot enforce a destination allowlist.  This
     contract therefore requires both a declared target and an explicit
-    allowlist before selecting the configured network.  Deployments requiring
-    adversarial destination enforcement should set ``enforcement`` to
-    ``"proxy"`` and provide a separately restricted Docker network/proxy.
+    allowlist before selecting the configured network.  ``proxy`` denotes an
+    operator-managed restricted network.  ``builtin`` causes the Docker
+    backend to place the challenge container on a challenge-scoped internal
+    network whose only egress member is CTF-OS's exact-allowlist proxy.
     """
 
     allow_targets: tuple[NetworkTarget, ...] = ()
     docker_network: str = "none"
     enforcement: str = "deny"
+    http_requests_per_second: float = 2.0
+    http_burst: int = 4
 
     def __post_init__(self) -> None:
-        if self.enforcement not in {"deny", "declared", "proxy"}:
-            raise ValueError("network enforcement must be deny, declared, or proxy")
+        if self.enforcement not in {"deny", "declared", "proxy", "builtin"}:
+            raise ValueError(
+                "network enforcement must be deny, declared, proxy, or builtin"
+            )
+        if (
+            isinstance(self.http_requests_per_second, bool)
+            or not isinstance(self.http_requests_per_second, (int, float))
+            or not math.isfinite(float(self.http_requests_per_second))
+            or not 0 < float(self.http_requests_per_second) <= 1000
+        ):
+            raise ValueError(
+                "http_requests_per_second must be finite and between 0 and 1000"
+            )
+        if (
+            isinstance(self.http_burst, bool)
+            or not isinstance(self.http_burst, int)
+            or not 1 <= self.http_burst <= 10000
+        ):
+            raise ValueError("http_burst must be between 1 and 10000")
         if self.allow_targets:
             if self.docker_network == "none":
                 raise ValueError("an allowlist requires an explicit Docker network")
@@ -1363,6 +1384,21 @@ class NetworkPolicy:
                 raise ValueError(
                     "proxy enforcement requires a dedicated restricted "
                     "Docker network"
+                )
+            if (
+                self.enforcement == "builtin"
+                and self.docker_network in {"host", "none"}
+            ):
+                raise ValueError(
+                    "builtin enforcement requires a non-host upstream "
+                    "Docker network"
+                )
+            if self.enforcement == "builtin" and any(
+                target.port is None for target in self.allow_targets
+            ):
+                raise ValueError(
+                    "builtin enforcement requires an explicit port for every "
+                    "allowed target"
                 )
         elif self.docker_network != "none":
             raise ValueError("network without an allowlist is not permitted")
@@ -1380,6 +1416,8 @@ class NetworkPolicy:
         *,
         docker_network: str,
         enforcement: str = "declared",
+        http_requests_per_second: float = 2.0,
+        http_burst: int = 4,
     ) -> NetworkPolicy:
         parsed = tuple(
             target if isinstance(target, NetworkTarget) else NetworkTarget.parse(target)
@@ -1387,19 +1425,31 @@ class NetworkPolicy:
         )
         if not parsed:
             raise ValueError("at least one network target is required")
-        return cls(parsed, docker_network, enforcement)
+        return cls(
+            parsed,
+            docker_network,
+            enforcement,
+            http_requests_per_second,
+            http_burst,
+        )
 
     def authorize(self, target: NetworkTarget | None) -> str:
         if target is None:
             return "none"
         if not any(allowed.matches(target) for allowed in self.allow_targets):
             raise NetworkDenied(f"network target is not allowed: {target.as_text()}")
-        if self.enforcement != "proxy":
+        if self.enforcement not in {"proxy", "builtin"}:
             raise NetworkDenied(
                 "declared target metadata is not an egress boundary; configure "
-                "an externally restricted proxy Docker network and select "
-                "enforcement=proxy"
+                "builtin enforcement or an externally restricted proxy Docker "
+                "network"
             )
+        if self.enforcement == "builtin":
+            # This deliberately is not a valid Docker network name.  Only the
+            # Docker backend may replace it with an attested scope-internal
+            # runtime.  An alternate/buggy backend therefore fails closed
+            # instead of attaching the challenge directly to the upstream.
+            return ":ctfos-builtin:"
         return self.docker_network
 
 
@@ -1806,6 +1856,7 @@ class JobRef:
     job_id: str
     scope_fingerprint: str
     runtime_id: str = "none"
+    supervisor_id: str | None = None
 
     def __post_init__(self) -> None:
         if not JOB_ID.fullmatch(self.job_id):
@@ -1814,6 +1865,11 @@ class JobRef:
             raise ValueError("invalid scope fingerprint")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.runtime_id):
             raise ValueError("invalid sandbox runtime id")
+        if (
+            self.supervisor_id is not None
+            and not JOB_SUPERVISOR_ID.fullmatch(self.supervisor_id)
+        ):
+            raise ValueError("invalid sandbox job supervisor id")
 
 
 class JobState(str, Enum):

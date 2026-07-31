@@ -244,7 +244,7 @@ def _target_for_id(
         or type(target) is not TargetRecord
         or target.status is not TargetStatus.ACTIVE
         or engine._target_is_expired(target)
-        or target.enforcement != "proxy"
+        or target.enforcement not in {"proxy", "builtin"}
     ):
         raise WebImpactHotPathError(
             "web_impact_target_not_active_proxy_allowlisted"
@@ -1346,11 +1346,7 @@ def prove_web_impact(
             )
             assert target_record is not None
             target = NetworkTarget.parse(target_record.endpoint)
-            policy = NetworkPolicy.allow(
-                (target,),
-                docker_network=target_record.docker_network,
-                enforcement="proxy",
-            )
+            policy = engine._network_policy_for_target(target_record)
             work = ensure_private_directory(
                 paths.runtime
                 / "web-impact-live"

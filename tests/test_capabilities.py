@@ -6,31 +6,26 @@ import unittest
 from pathlib import Path
 
 from ctf_os.capabilities import (
+    CATEGORY_MANAGED_CAPABILITIES,
+    CORE_MANAGED_CAPABILITIES,
     CapabilityError,
     REQUIRED_MANAGED_ATTESTATIONS,
     REQUIRED_MANAGED_CAPABILITIES,
     inspect_pinned_capabilities,
     normalize_capability_manifest,
+    required_managed_capabilities_for_category,
 )
 
 
 DIGEST = "sha256:" + "c" * 64
-GENERIC_CAPABILITIES = (
-    "convert",
-    "sqlite_readonly",
-    "z3",
-    "ortools",
-    "angr_python",
-)
-
-
 def capability_payload(
     *,
     excluded_attestations: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     records: list[dict[str, object]] = [
         {"name": name, "available": True}
-        for name in GENERIC_CAPABILITIES
+        for name in REQUIRED_MANAGED_CAPABILITIES
+        if name not in REQUIRED_MANAGED_ATTESTATIONS
     ]
     records.extend(
         {
@@ -46,7 +41,7 @@ def capability_payload(
 
 class CapabilityTests(unittest.TestCase):
     def test_host_attestations_match_vendored_v2_manifest(self):
-        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 12)
+        self.assertEqual(len(REQUIRED_MANAGED_CAPABILITIES), 32)
         manifest = json.loads(
             (
                 Path(__file__).resolve().parents[1]
@@ -76,6 +71,31 @@ class CapabilityTests(unittest.TestCase):
                 "sha256": record["sha256"],
             }
         self.assertEqual(observed, REQUIRED_MANAGED_ATTESTATIONS)
+
+    def test_category_requirements_are_explicit_alias_aware_and_union_to_doctor(
+        self,
+    ):
+        self.assertEqual(
+            required_managed_capabilities_for_category("forensics"),
+            CORE_MANAGED_CAPABILITIES
+            | CATEGORY_MANAGED_CAPABILITIES["forensic"],
+        )
+        self.assertEqual(
+            required_managed_capabilities_for_category("stego"),
+            CORE_MANAGED_CAPABILITIES
+            | CATEGORY_MANAGED_CAPABILITIES["misc"],
+        )
+        self.assertEqual(
+            REQUIRED_MANAGED_CAPABILITIES,
+            CORE_MANAGED_CAPABILITIES.union(
+                *CATEGORY_MANAGED_CAPABILITIES.values()
+            ),
+        )
+        with self.assertRaisesRegex(
+            CapabilityError,
+            "unsupported managed category",
+        ):
+            required_managed_capabilities_for_category("mobile")
 
     def test_v1_and_v2_manifests_normalize_without_silent_omission(self):
         self.assertEqual(
@@ -208,6 +228,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",
@@ -368,6 +389,12 @@ class CapabilityTests(unittest.TestCase):
             if item["name"] == "pwn_interaction_v1"
         )
         interaction["attestation"]["sha256"] = "e" * 64
+        forensic_index = next(
+            item
+            for item in records
+            if item["name"] == "forensic_evidence_index_v1"
+        )
+        forensic_index["attestation"]["sha256"] = "d" * 64
 
         def runner(argv, **kwargs):
             del kwargs
@@ -383,6 +410,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             report["missing"],
             [
+                "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",
@@ -395,6 +423,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(
             set(report["attestation_errors"]),
             {
+                "forensic_evidence_index_v1",
                 "pwn_crash_v1",
                 "pwn_exploit_effect_v1",
                 "pwn_interaction_v1",

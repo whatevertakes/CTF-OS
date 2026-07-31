@@ -362,8 +362,9 @@ max_standard_jobs = 2
 max_gpu_jobs = 1
 lease_wait_timeout_s = 300.0
 # Spaces CTF-OS command starts targeting the same normalized hostname.
-# This is not an HTTP request limiter; requests inside one command require an
-# external restricted proxy/firewall. Set 0 to explicitly disable spacing.
+# This is not an HTTP request limiter; it is independent of the built-in
+# target's proxy transaction token bucket.
+# External proxy mode must provide its own request limiter. Set 0 to disable.
 remote_command_min_interval_s = 1.0
 
 [runtime]

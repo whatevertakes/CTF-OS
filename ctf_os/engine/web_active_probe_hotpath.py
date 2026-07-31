@@ -995,11 +995,7 @@ def prove_web_active_probe(
             network_target = NetworkTarget.parse(
                 target_record.endpoint
             )
-            policy = NetworkPolicy.allow(
-                (network_target,),
-                docker_network=target_record.docker_network,
-                enforcement="proxy",
-            )
+            policy = engine._network_policy_for_target(target_record)
             workspace = ensure_private_directory(
                 paths.runtime
                 / "web-active-live"

@@ -353,13 +353,13 @@ state와 Docker sandbox를 소유합니다. Live Codex에는
 `mcp_servers={}`로 지운 뒤, required local stdio MCP인 `ctfos_live` 하나만
 등록합니다. MCP server는 PATH의 같은 이름 파일을 실행하지 않고 현재
 CTF-OS Python의 검증된 절대 경로와 `-I -m ctf_os.live_mcp`로 시작합니다.
-Live의 유일한 state/challenge-execution MCP는 다음 열네 canonical
+Live의 유일한 state/challenge-execution MCP는 다음 열다섯 canonical
 operation만 제공합니다.
 
 ```text
 agent.flag  agent.fact  agent.goal  agent.hypothesis
 agent.experiment  agent.evaluate  agent.artifact
-agent.progress  agent.transition  tool.run  jobs  inspect
+agent.progress  agent.transition  tool.start  tool.run  jobs  inspect
 knowledge.search  knowledge.read
 ```
 
@@ -371,7 +371,7 @@ keep/drop/inconclusive 판정을 거칩니다. proof·submission 상태는 여�
 
 Codex 0.145의 실제 production-model mock Responses request를 캡처한
 검증에서는 external app, web/network, `request_plugin_install`,
-`exec_command`/`write_stdin`/shell tool이 0개였습니다. 열네 개는 전체
+`exec_command`/`write_stdin`/shell tool이 0개였습니다. 열다섯 개는 전체
 built-in tool 수가 아니라 `ctfos_live`가 제공하는 canonical
 state/challenge-execution operation 수입니다. 별도로 남는 built-in에는
 `exec`, `wait`, `apply_patch`, native collaboration, `tool_search`,
@@ -750,8 +750,60 @@ ctfos target revoke 'Demo CTF' web 'Example' TARGET_ID \
 모드는 대상 metadata만 보존하며, Docker 기본 `bridge`가 목적지 allowlist를
 커널에서 강제하지 못하므로 원격 command는 fail-closed로 거부됩니다.
 
-원격 문제를 실행하려면 운영자가 별도의 목적지 제한 proxy/network를 먼저
-구성하고 그 network를 `proxy` enforcement로 등록해야 합니다.
+원격 문제는 내장 경계(`builtin`) 또는 운영자가 준비한 외부 제한
+proxy/network(`proxy`) 중 하나를 명시적으로 선택해야 합니다. 권장 기본은
+내장 경계입니다.
+
+```sh
+ctfos target add \
+  'Demo CTF' web 'Example' \
+  'https://challenge.example:443' \
+  --enforcement builtin \
+  --docker-network bridge \
+  --http-rate 2.0 \
+  --http-burst 4
+```
+
+`builtin`은 문제 scope와 정책 digest로 이름이 정해지는 Docker
+`--internal` network를 만들고, 풀이 컨테이너는 그 network에만 연결합니다.
+별도 최소권한 proxy 컨테이너만 internal network와 지정한 upstream network에
+이중 연결됩니다. proxy는 internal interface에만 listen하며 정확한
+hostname/port allowlist 외 목적지를 HTTP forward/CONNECT와 SOCKS5 모두에서
+거부합니다. 풀이 컨테이너에는 고정된 `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`가 주입되고 직접 egress route는 없습니다. Built-in target은
+wildcard port를 허용하지 않으므로 endpoint에 포트를 반드시 적어야 합니다.
+scheme도 경계에 포함되어 HTTP/WS는 forward proxy, HTTPS/WSS는 CONNECT,
+scheme 없는 raw TCP와 `tcp://`만 SOCKS5를 사용할 수 있습니다.
+
+proxy 컨테이너는 target별 token bucket을 유지합니다. 일반 HTTP와 `ws`
+handshake는 실제 요청마다 토큰을 소비하므로 한 command가 여러 요청을 보내도
+각각 계수됩니다. TLS를 종단하지 않는 보안 경계이므로 `HTTPS`/`wss`의
+암호화된 tunnel 내부 요청은 볼 수 없고 CONNECT transaction 하나가 토큰
+하나를 소비합니다. HTTPS 내부 요청까지 개별 계수해야 하는 대회에서는
+운영자가 승인한 TLS-terminating proxy를 `proxy` 모드로 제공해야 합니다.
+
+원격 트래픽 없는 lifecycle 검사와 실제 smoke는 분리되어 있습니다.
+
+```sh
+# 상태/만료만 검사하며 원격 요청을 하지 않음
+ctfos target check 'Demo CTF' web 'Example' TARGET_ID
+
+# 사람이 명시한 protocol만 built-in 경계 안에서 실제 검사
+ctfos target smoke 'Demo CTF' web 'Example' TARGET_ID \
+  --mode dns --mode tcp --mode tls
+
+# WebSocket endpoint인 경우
+ctfos target smoke 'Demo CTF' web 'Example' TARGET_ID \
+  --mode websocket --path /socket
+```
+
+smoke helper는 DNS control resolution, SOCKS5 TCP connect, HTTP CONNECT 뒤의
+인증서 검증 TLS handshake, RFC 6455 Upgrade를 각각 bounded JSON으로
+기록합니다. target은 먼저 primary로 선택되어 있어야 하며 이 명령만 실제
+원격 요청을 수행합니다.
+
+기존 외부 경계를 사용하는 경우에는 목적지 제한 proxy/network를 먼저
+구성하고 그 network를 `proxy` enforcement로 등록합니다.
 
 ```sh
 ctfos add-target \
@@ -761,13 +813,11 @@ ctfos add-target \
   --enforcement proxy
 ```
 
-CTF-OS는 proxy나 방화벽 규칙을 자동으로 생성하지 않습니다. 다만
-CTF-OS가 시작하는 network tool/proof command는 정규화한 hostname별 공용
-FIFO에서 기본 1초 간격으로 시작합니다. 값은
+외부 `proxy` 모드의 방화벽 규칙과 request 제한은 운영자 책임입니다.
+두 enforcement 모두 CTF-OS가 시작하는 network tool/proof command를
+정규화한 hostname별 공용 FIFO에서 기본 1초 간격으로 시작합니다. 값은
 `resources.remote_command_min_interval_s`이며 `0`은 명시적 비활성화입니다.
-이것은 **command-start spacing**이지 HTTP 요청 횟수/rate token bucket이
-아닙니다. 한 command 안에서 발생하는 여러 요청은 세지 못하므로 실제 대회
-rate와 목적지 제한은 외부 restricted proxy/firewall에서 강제해야 합니다.
+이 FIFO는 token bucket과 독립적인 **command-start spacing**입니다.
 
 ## 상태, pause와 여러 세션
 
@@ -908,16 +958,46 @@ ctfos tool run \
 ```
 
 이미지에는 `ctf-bg`, `ctf-jobs`, `ctf-log`, `ctf-kill` primitive가 있고
-sandbox interface에도 start/status/log/cancel 메서드가 있습니다. 그러나
-현재 Local/Unix/daemon/Docker 경로의 `start_job`은 전체 job lifetime 동안
-host lease를 쥐는 supervisor가 없으므로 Docker/RPC 실행 전에 명시적으로
-거부합니다. foreground 명령에서 `ctf-bg`나 detach shell을 우회 호출하는
-것도 거부합니다.
+sandbox interface에는 lease-bound start/status/log/cancel/recover가
+연결되어 있습니다. `ctfos tool start`는 신뢰 host supervisor를 먼저
+분리하고, supervisor가 기존 global `LeaseBroker`의 전체 vector를 얻은
+뒤에만 해당 job 전용 label·resource-limit Docker runtime을 만듭니다.
+lease는 image job이 terminal status를 기록하고 그 exact runtime을 제거할
+때까지 유지됩니다. 일반 foreground 명령에서 `ctf-bg`, `setsid`, `nohup`,
+shell `&`를 우회 호출하는 경로는 계속 거부됩니다.
 
-status/log/cancel은 이미 존재하는 scoped persistent job reference만 다룰 수
-있습니다. `ctfos jobs`는 제한된 조회 편의 기능이며, 조회할 runtime이 없다고
-새 persistent idle container를 만들지는 않습니다. 새 background job을
-시작하는 완전한 operator lifecycle은 구현되지 않았습니다.
+```sh
+ctfos tool start \
+  --contest 'Demo CTF' --category forensic --challenge Memory \
+  --profile heavy --timeout 14400 --name volatility-scan \
+  -- volatility3 -f memory.raw windows.pslist
+```
+
+launch 결과에는 `job_id`, scope fingerprint, runtime ID와 무작위
+`supervisor_id`가 함께 나옵니다. 이후 작업은 이 exact receipt tuple을
+사용합니다.
+
+```sh
+# 모든 receipt를 조회하면서 죽은 host monitor를 fail-closed reconcile
+ctfos jobs 'Demo CTF' forensic Memory
+
+# bounded tail
+ctfos jobs 'Demo CTF' forensic Memory \
+  --job-id job-00000001 --supervisor-id bg-0123456789abcdef0123456789abcdef \
+  --log --tail-bytes 16384
+
+# TERM/KILL 취소
+ctfos jobs 'Demo CTF' forensic Memory \
+  --job-id job-00000001 --supervisor-id bg-0123456789abcdef0123456789abcdef \
+  --cancel --grace 3
+```
+
+Local client, capability-authenticated Unix daemon, attached Live broker/MCP가
+같은 typed lifecycle을 사용합니다. host supervisor가 비정상 종료한
+receipt는 다음 start/list/status/recover 경계에서 해당 exact container
+job을 먼저 취소·제거한 후 stale flock metadata를 회수합니다. raw stdout와
+stderr는 `/work/.ctf/jobs/JOB_ID`의 bounded log API로만 읽으며 supervisor
+receipt에는 command output을 복제하지 않습니다.
 
 ## 후보 플래그, proof, 사람 제출
 
@@ -1140,8 +1220,11 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
 - `declared` + Docker bridge 원격 실행은 fail-closed로 거부됩니다.
 - `proxy`는 외부에서 제한된 proxy/network를 실제로 준비했을 때만
   강제 경로가 됩니다.
+- `builtin`은 internal Docker network와 exact-allowlist proxy를 직접
+  provision/attest합니다. Docker daemon과 upstream network 자체를 장악한
+  동일 host 권한의 공격자를 막는 경계는 아닙니다.
 - Live의 유일한 state/challenge-execution MCP는 required `ctfos_live`의
-  열네 canonical operation입니다. Private mailbox path와 capability는 MCP subprocess env에만
+  열다섯 canonical operation입니다. Private mailbox path와 capability는 MCP subprocess env에만
   있고 model-visible local execution fallback은 없습니다. 부모가 canonical
   state와 Docker를 소유합니다. 다만 Codex 0.145에서 config로 제거할 수 없는
   `view_image`가 model request에 남습니다. 이는 read-only local utility이고
@@ -1161,16 +1244,21 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   운용 경로가 아닙니다. 같은 Unix UID가 raw Docker socket이나 capability
   secret을 읽지 못하게 하는 OS 경계도 제공하지 않으므로 현재 capability는
   협력적 scope 경계입니다.
-- 대상 hostname별 command-start FIFO 간격은 있지만 HTTP request/token
-  bucket limiter는 없습니다. 한 command 내부의 요청 속도와 실제 egress는
-  외부 restricted proxy/firewall 책임입니다.
+- 대상 hostname별 command-start FIFO와 별도로 `builtin` proxy는 일반
+  HTTP/request 및 CONNECT transaction을 target별 token bucket으로
+  제한합니다. TLS tunnel을 MITM하지 않으므로 재사용된 CONNECT 내부의
+  개별 HTTPS 요청은 볼 수 없으며, 그 수준의 제한은 외부 TLS-terminating
+  `proxy` 정책 책임입니다.
 - 8시간 예산은 Live/Batch/tool/proof의 대기와 실행에 발급 시점의 불변
   hard deadline으로 적용됩니다. `budget-reset`은 이미 발급된 `D`를
   연장하거나 단축·취소하지 않으므로 새 경계가 필요하면 기존 작업을
   중단하고 재시작/resume해야 합니다.
-- background 시작은 lease supervisor가 없어 명시적으로 비활성화돼
-  있습니다. image primitive와 조회 interface의 존재를 background
-  orchestration 완료로 해석하면 안 됩니다.
+- background 시작은 challenge별 trusted host supervisor와 durable
+  `LeaseBroker` reservation을 사용합니다. monitor가 죽어도 capacity를
+  자동 재사용하지 않으며, 다음 start/list/status/recover가 exact
+  supervisor label runtime을 제거한 뒤에만 orphan lease를 회수합니다.
+  Docker control plane이 absence를 증명하지 못하면 `cleanup_pending`으로
+  lease를 계속 잡습니다.
 - 정상 timeout·cancel과 첫 `Ctrl-C`/`SystemExit`은 direct/wave Codex와
   Live TUI의 exact process group을 TERM→KILL→wait/reap하고, Docker
   daemon의 exact generated foreground container도 강제 정리합니다. 첫
@@ -1180,12 +1268,14 @@ register/maps capture 3회와 descendant, shared-mm, re-exec 차단을 서로
   제거하며, 최종 state commit 뒤 인터럽트는 canonical evidence를
   보존합니다. 복구 중 들어오는 **두 번째 독립 control signal**,
   `SIGKILL`, 전원 단절은 이 보장 밖이라 container가 남을 수 있습니다.
-  확인할 prefix는 `ctfos-run-`, `ctfos-init-`, `ctfos-proof-init-`,
-  `ctfos-proof-`이고 이름은 `<prefix><scope fingerprint 첫 12
+  foreground에서 확인할 prefix는 `ctfos-run-`, `ctfos-init-`,
+  `ctfos-proof-init-`, `ctfos-proof-`이고 이름은
+  `<prefix><scope fingerprint 첫 12
   hex>-<random 12 hex>`입니다. PID-backed limiter/lease는 죽은 holder를
   회수하므로 재개 전에 exact orphan process/container를 확인·종료해야
-  합니다. Persistent guardian/supervisor는 과설계를 피하기 위해 범위에
-  넣지 않았습니다.
+  합니다. 이 foreground 경로는 persistent guardian 대신 one-shot
+  container 수명 경계를 사용합니다. background runtime은 별도의
+  `ctfos-job-` exact-name supervisor/recovery 경로를 사용합니다.
 - Live `Popen` 생성은 main-thread control exception과 분리된 owner가
   CPython 3.13의 `_fork_exec` 반환→`self.pid` 게시 경계를 끝까지 소유합니다.
   정상 종료한 leader가 같은 process group의 background descendant를

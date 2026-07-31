@@ -18,22 +18,90 @@ from ctf_os.images import validate_image_digest
 from ctf_os.store.atomic import StrictJSONError, strict_json_loads
 
 
-REQUIRED_MANAGED_CAPABILITIES = frozenset(
+CORE_MANAGED_CAPABILITIES = frozenset(
     {
         "convert",
         "sqlite_readonly",
-        "z3",
-        "ortools",
-        "angr_python",
-        "pwn_crash_v1",
-        "pwn_runtime_snapshot_v1",
-        "pwn_exploit_effect_v1",
-        "pwn_interaction_v1",
-        "rev_inventory_v2",
-        "rev_safe_output",
-        "rev_stdin_exec",
     }
 )
+CATEGORY_MANAGED_CAPABILITIES: dict[str, frozenset[str]] = {
+    "web": frozenset(),
+    "pwn": frozenset(
+        {
+            "angr_python",
+            "z3",
+            "pwn_crash_v1",
+            "pwn_runtime_snapshot_v1",
+            "pwn_exploit_effect_v1",
+            "pwn_interaction_v1",
+        }
+    ),
+    "rev": frozenset(
+        {
+            "angr_python",
+            "z3",
+            "rev_inventory_v2",
+            "rev_safe_output",
+            "rev_stdin_exec",
+        }
+    ),
+    "crypto": frozenset(
+        {
+            "z3",
+            "ortools",
+            "pysat_cadical300",
+            "pysat_kissat404",
+            "cryptominisat5",
+        }
+    ),
+    "forensic": frozenset(
+        {
+            "forensic_evidence_index_v1",
+            "forensic_assertion_python3",
+            "forensic_assertion_perl",
+            "forensic_volatility3",
+            "forensic_volatility_symbols",
+            "forensic_sleuthkit",
+            "forensic_ewf",
+            "forensic_tshark",
+            "forensic_zeek",
+            "forensic_tesseract",
+            "forensic_ocr_korean",
+            "forensic_hwp",
+        }
+    ),
+    "misc": frozenset(
+        {
+            "z3",
+            "ortools",
+            "misc_stegseek",
+            "misc_zsteg",
+            "misc_ffmpeg",
+            "misc_sox",
+            "misc_zbar",
+        }
+    ),
+}
+REQUIRED_MANAGED_CAPABILITIES = frozenset(
+    CORE_MANAGED_CAPABILITIES.union(
+        *CATEGORY_MANAGED_CAPABILITIES.values()
+    )
+)
+_CATEGORY_ALIASES = {
+    "binary": "pwn",
+    "binary-exploitation": "pwn",
+    "re": "rev",
+    "reversing": "rev",
+    "reverse": "rev",
+    "cryptography": "crypto",
+    "forensics": "forensic",
+    "dfir": "forensic",
+    "web-security": "web",
+    "stego": "misc",
+    "jail": "misc",
+    "ppc": "misc",
+    "custom-protocol": "misc",
+}
 REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
     "pwn_crash_v1": {
         "schema_version": 1,
@@ -105,6 +173,16 @@ REQUIRED_MANAGED_ATTESTATIONS: dict[str, dict[str, object]] = {
             "f593202409b62377288c8c8e54b45610"
         ),
     },
+    "forensic_evidence_index_v1": {
+        "schema_version": 1,
+        "contract_id": "ctfos.forensic.evidence_index",
+        "contract_version": 1,
+        "path": "/opt/ctf-templates/forensic/evidence_index.py",
+        "sha256": (
+            "a2d84dc83fb041413b667b1164bbe3f9"
+            "3c7ab1b7db5485d9156f1b51f92eddf2"
+        ),
+    },
 }
 MAX_CAPABILITY_OUTPUT_BYTES = 256 * 1024
 Runner = Callable[..., subprocess.CompletedProcess[bytes]]
@@ -113,6 +191,21 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 class CapabilityError(RuntimeError):
     """A pinned image did not provide a valid capability contract."""
+
+
+def required_managed_capabilities_for_category(
+    category: str,
+) -> frozenset[str]:
+    """Return the fail-closed capability set for one challenge category."""
+
+    if not isinstance(category, str) or not category.strip():
+        raise CapabilityError("managed category must be a non-empty string")
+    normalized = category.strip().casefold()
+    normalized = _CATEGORY_ALIASES.get(normalized, normalized)
+    category_capabilities = CATEGORY_MANAGED_CAPABILITIES.get(normalized)
+    if category_capabilities is None:
+        raise CapabilityError(f"unsupported managed category: {category!r}")
+    return frozenset(CORE_MANAGED_CAPABILITIES | category_capabilities)
 
 
 def normalize_capability_manifest(raw: object) -> dict[str, bool]:
@@ -296,10 +389,13 @@ def inspect_pinned_capabilities(
 
 
 __all__ = [
+    "CATEGORY_MANAGED_CAPABILITIES",
     "CapabilityError",
+    "CORE_MANAGED_CAPABILITIES",
     "MAX_CAPABILITY_OUTPUT_BYTES",
     "REQUIRED_MANAGED_ATTESTATIONS",
     "REQUIRED_MANAGED_CAPABILITIES",
     "inspect_pinned_capabilities",
     "normalize_capability_manifest",
+    "required_managed_capabilities_for_category",
 ]

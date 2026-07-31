@@ -2,6 +2,7 @@
 
 초기 검증일: 2026-07-27 (Asia/Seoul)
 Managed Rev 재빌드 검증일: 2026-07-30 (Asia/Seoul)
+SAT/카테고리 preflight 검증일: 2026-07-31 (Asia/Seoul)
 
 GitHub 항목은 각 저장소의 `GET /repos/{owner}/{repo}/releases/latest` 응답에서
 `draft=false`, `prerelease=false`인 릴리스와 실제 자산명을 확인했다. 아래 직접
@@ -73,6 +74,20 @@ GoReSym 3.4는 기존의 버전 포함 tarball 대신 `GoReSym-linux.zip`을 배
 `cuso`와 `gf2bv`는 각각 `sage-python`과 `crypto-python`으로 노출한다.
 Playwright는 전체 Chromium 대신 headless shell만 설치하고 `playwright`,
 `pw-python`, 제한형 `ctf-browser` 진입점을 함께 제공한다.
+
+## SAT solver 보강
+
+| 항목 | 고정 버전/자산 | 실제 확인 |
+|---|---|---|
+| PySAT | PyPI `python-sat==1.9.dev7` | CPython 3.12 manylinux wheel 설치 후 `cadical300`과 `kissat404` 각각 SAT/UNSAT 인스턴스 해결 |
+| CaDiCaL | PySAT 동봉 `rel-3.0.0` | `Solver(name="cadical300")` 생성, 모델 반환과 모순 판정 확인 |
+| Kissat | PySAT 동봉 `rel-4.0.4` | `Solver(name="kissat404")` 생성, 모델 반환과 모순 판정 확인. upstream 최신 릴리스도 `rel-4.0.4` |
+| CryptoMiniSat | 공식 `release/v5.14.7` Linux amd64 정적 자산, SHA-256 `536d4cb03bbd2b4cbcca6230ed30e2aa844f170b5bbcfb0a0d7adb4852cf3ab7` | GitHub release API의 자산 digest와 로컬 다운로드 해시 일치, `--version` 5.14.7, DIMACS SAT 결과와 종료 코드 10 확인 |
+
+PySAT의 두 backend는 import 성공만으로 준비 완료로 보지 않고 capability
+probe마다 작은 SAT/UNSAT 쌍을 실제로 푼다. CryptoMiniSat도 `--version` 대신
+고정 DIMACS를 stdin으로 풀어 `s SATISFIABLE`과 표준 SAT 종료 코드 10을 함께
+검사한다.
 
 ## PyTorch CUDA 채널
 
@@ -225,6 +240,7 @@ Volatility CLI도 `/opt/volatility3/symbols`를 자동 탐색하지 않으므로
 | `bulk-extractor` | 없음 | apt 설치 불가 | 공식 안정 릴리스 `v2.1.1`을 재귀 서브모듈과 함께 소스 빌드하고 `bulk_extractor -V` 검사 |
 | `gobuster` | `3.6.0-1ubuntu0.24.04.3` | 설치 가능 | 오타가 있던 폴백을 제거하고 `gobuster` 직접 설치 |
 | `dcfldd` | `1.9.1-1ubuntu2` | 설치 가능 | 기존 apt 목록 유지 |
+| `ewf-tools` | `20140814-1build3` | 설치 가능 | E01/EWF 무결성·메타데이터 도구를 설치하고 `ewfinfo -V` capability smoke 추가 |
 | `peepdf-3` | 없음 | apt 설치 불가 | 기존처럼 PyPI에서 설치. PyPI `5.3.0`은 Python `>=3.9` 요구 |
 
 ### GCC multilib와 cross compiler

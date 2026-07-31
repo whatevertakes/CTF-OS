@@ -147,6 +147,22 @@ def _experiment_properties() -> dict[str, object]:
     }
 
 
+def _background_properties() -> dict[str, object]:
+    properties = _experiment_properties()
+    for name in (
+        "expected_observation",
+        "keep_if",
+        "drop_if",
+        "hypothesis_ids",
+    ):
+        properties.pop(name)
+    properties["name"] = _string_schema(
+        "Optional bounded operator-facing job name.",
+        maximum=200,
+    )
+    return properties
+
+
 _OUTPUT_SCHEMA = _object_schema({"result": {}})
 _TOOLS: tuple[dict[str, object], ...] = (
     {
@@ -453,13 +469,60 @@ _TOOLS: tuple[dict[str, object], ...] = (
         },
     },
     {
-        "name": "jobs",
-        "title": "Inspect scoped jobs",
+        "name": "tool.start",
+        "title": "Start supervised sandbox job",
         "description": (
-            "Run the scoped ctf-jobs query inside the challenge sandbox and "
-            "record the query experiment."
+            "Start a long-running command in a dedicated challenge-scoped "
+            "runtime. A trusted host supervisor holds the complete resource "
+            "lease until terminal cleanup."
         ),
-        "inputSchema": _object_schema({}),
+        "inputSchema": _object_schema(
+            _background_properties(),
+            ("command", "resource_class"),
+        ),
+        "outputSchema": _OUTPUT_SCHEMA,
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+        },
+    },
+    {
+        "name": "jobs",
+        "title": "Control supervised scoped jobs",
+        "description": (
+            "List/recover jobs, or read status/log/cancel one exact "
+            "receipt-bound job reference."
+        ),
+        "inputSchema": _object_schema(
+            {
+                "action": _string_schema(
+                    "Job operation.",
+                    enum=["list", "recover", "status", "log", "cancel"],
+                    maximum=32,
+                ),
+                "job_id": _string_schema("Exact image job ID.", maximum=32),
+                "supervisor_id": _string_schema(
+                    "Exact host launch receipt ID.",
+                    maximum=64,
+                ),
+                "runtime_id": _string_schema(
+                    "Exact receipt runtime ID.",
+                    maximum=128,
+                ),
+                "tail_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1024 * 1024,
+                },
+                "grace_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30,
+                },
+            },
+            (),
+        ),
         "outputSchema": _OUTPUT_SCHEMA,
         "annotations": {
             "readOnlyHint": False,

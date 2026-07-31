@@ -76,7 +76,7 @@ from ctf_os.promotion_bundles import (
     freeze_promotion_manifest,
     prepare_promotion_session,
 )
-from ctf_os.sandbox import NetworkTarget, SandboxError
+from ctf_os.sandbox import JobRef, NetworkTarget, SandboxError
 from ctf_os.scaffold_binding import (
     ScaffoldBindingError,
     solve_mode_arm,
@@ -401,12 +401,46 @@ def _run_live_broker_command(
         return 0
 
     if args.command == "jobs":
-        result = _broker_dict(client.call("jobs", identity))
+        params: dict[str, object] = {
+            "runtime_id": args.runtime_id,
+            "tail_bytes": args.tail_bytes,
+            "grace_seconds": args.grace,
+        }
+        if args.job_id is not None:
+            params["job_id"] = args.job_id
+        if args.supervisor_id is not None:
+            params["supervisor_id"] = args.supervisor_id
+        if args.log:
+            params["action"] = "log"
+        elif args.cancel:
+            params["action"] = "cancel"
+        elif args.job_id is not None:
+            params["action"] = "status"
+        else:
+            params["action"] = "recover" if args.recover else "list"
+        result = _broker_dict(client.call("jobs", identity, params))
         _print_json(result)
         return 0
 
     if args.command == "tool":
         command = _strip_remainder(args.tool_argv)
+        if args.tool_command == "start":
+            result = _broker_dict(
+                client.call(
+                    "tool.start",
+                    identity,
+                    {
+                        "command": list(command),
+                        "name": args.name,
+                        "timeout_seconds": args.timeout,
+                        "resource_class": args.profile,
+                        "network_target": args.target,
+                        "needs_kvm": args.kvm,
+                    },
+                )
+            )
+            _print_json(result)
+            return 0
         result = _broker_dict(
             client.call(
                 "tool.run",
@@ -708,8 +742,12 @@ def build_parser() -> argparse.ArgumentParser:
     target.add_argument("target")
     target.add_argument("--docker-network", default="bridge")
     target.add_argument(
-        "--enforcement", choices=("declared", "proxy"), default="declared"
+        "--enforcement",
+        choices=("declared", "proxy", "builtin"),
+        default="declared",
     )
+    target.add_argument("--http-rate", type=float, default=2.0)
+    target.add_argument("--http-burst", type=int, default=4)
 
     typed_target = commands.add_parser(
         "target", help="typed challenge target lifecycle"
@@ -725,8 +763,12 @@ def build_parser() -> argparse.ArgumentParser:
     target_add.add_argument("--purpose", default="challenge remote")
     target_add.add_argument("--docker-network", default="bridge")
     target_add.add_argument(
-        "--enforcement", choices=("declared", "proxy"), default="declared"
+        "--enforcement",
+        choices=("declared", "proxy", "builtin"),
+        default="declared",
     )
+    target_add.add_argument("--http-rate", type=float, default=2.0)
+    target_add.add_argument("--http-burst", type=int, default=4)
     target_add.add_argument("--expires-at")
     target_select = typed_target_commands.add_parser("select")
     _identity_values(target_select)
@@ -734,6 +776,20 @@ def build_parser() -> argparse.ArgumentParser:
     target_check = typed_target_commands.add_parser("check")
     _identity_values(target_check)
     target_check.add_argument("target_id")
+    target_smoke = typed_target_commands.add_parser(
+        "smoke",
+        help="built-in boundary를 통한 명시적 원격 preflight",
+    )
+    _identity_values(target_smoke)
+    target_smoke.add_argument("target_id")
+    target_smoke.add_argument(
+        "--mode",
+        action="append",
+        choices=("dns", "tcp", "tls", "websocket"),
+        required=True,
+    )
+    target_smoke.add_argument("--path", default="/")
+    target_smoke.add_argument("--timeout", type=int, default=10)
     target_replace = typed_target_commands.add_parser("replace")
     _identity_values(target_replace)
     target_replace.add_argument("target_id")
@@ -1319,6 +1375,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     jobs = commands.add_parser("jobs", help="문제 container job 상태 조회")
     _identity_values(jobs)
+    jobs.add_argument("--job-id")
+    jobs.add_argument("--supervisor-id")
+    jobs.add_argument("--runtime-id", default="none")
+    jobs.add_argument("--log", action="store_true")
+    jobs.add_argument("--cancel", action="store_true")
+    jobs.add_argument("--recover", action="store_true")
+    jobs.add_argument("--tail-bytes", type=int, default=8192)
+    jobs.add_argument("--grace", type=int, default=3)
 
     tool = commands.add_parser("tool", help="challenge-scoped sandbox 도구")
     tool_commands = tool.add_subparsers(dest="tool_command", required=True)
@@ -1345,6 +1409,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tool_run.add_argument("--hypothesis", action="append", default=[])
     tool_run.add_argument("tool_argv", nargs=argparse.REMAINDER)
+    tool_start = tool_commands.add_parser(
+        "start",
+        help="lease-bound challenge background job 시작",
+    )
+    _scope_options(tool_start)
+    tool_start.add_argument(
+        "--profile",
+        choices=("light", "standard", "heavy", "gpu"),
+        default="light",
+    )
+    tool_start.add_argument("--target")
+    tool_start.add_argument("--kvm", action="store_true")
+    tool_start.add_argument("--timeout", type=int)
+    tool_start.add_argument("--name")
+    tool_start.add_argument("tool_argv", nargs=argparse.REMAINDER)
 
     agent = commands.add_parser(
         "agent", help="Live/Batch가 쓰는 구조화 상태 제안"
@@ -1553,6 +1632,41 @@ def _print_latest_tool_result(state: Any) -> None:
             "result": experiment.result,
             "artifact_ids": experiment.artifact_ids,
         }
+    )
+
+
+def _job_status_value(status: Any) -> dict[str, object]:
+    return {
+        "ref": {
+            "job_id": status.ref.job_id,
+            "scope_fingerprint": status.ref.scope_fingerprint,
+            "runtime_id": status.ref.runtime_id,
+            "supervisor_id": status.ref.supervisor_id,
+        },
+        "status": status.status.value,
+        "exit_code": status.exit_code,
+        "timed_out": status.timed_out,
+        "cancelled": status.cancelled,
+        "started_at": status.started_at,
+        "finished_at": status.finished_at,
+    }
+
+
+def _job_ref_from_args(
+    args: argparse.Namespace,
+    engine: ChallengeEngine,
+    identity: ChallengeIdentity,
+) -> JobRef:
+    if not args.job_id or not args.supervisor_id:
+        raise CLIError(
+            "--job-id와 --supervisor-id를 함께 지정해야 합니다."
+        )
+    state = engine.store.load(identity)
+    return JobRef(
+        job_id=args.job_id,
+        scope_fingerprint=engine.sandbox(state).scope_fingerprint,
+        runtime_id=args.runtime_id,
+        supervisor_id=args.supervisor_id,
     )
 
 
@@ -1783,6 +1897,8 @@ def main(
                 args.target,
                 docker_network=args.docker_network,
                 enforcement=args.enforcement,
+                http_requests_per_second=args.http_rate,
+                http_burst=args.http_burst,
             )
             print(
                 f"허용 대상 추가: {NetworkTarget.parse(args.target).as_text()} "
@@ -1810,6 +1926,8 @@ def main(
                     args.endpoint,
                     docker_network=args.docker_network,
                     enforcement=args.enforcement,
+                    http_requests_per_second=args.http_rate,
+                    http_burst=args.http_burst,
                     purpose=args.purpose,
                     expires_at=args.expires_at,
                 )
@@ -1822,6 +1940,14 @@ def main(
                 state = engine.check_network_target(
                     identity,
                     args.target_id,
+                )
+            elif args.target_command == "smoke":
+                state = engine.smoke_network_target(
+                    identity,
+                    args.target_id,
+                    modes=args.mode,
+                    path=args.path,
+                    timeout_seconds=args.timeout,
                 )
             elif args.target_command == "replace":
                 state = engine.replace_network_target(
@@ -2478,19 +2604,95 @@ def main(
         if args.command == "jobs":
             identity = _identity(args)
             _verify_session_scope(identity, engine)
-            state = engine.run_tool_command(
-                identity,
-                ("ctf-jobs", "--json"),
-                expected_observation="bounded background job list",
-                keep_if="a running/completed job changes the active goal",
-                drop_if="there are no relevant jobs",
-            )
-            _print_latest_tool_result(state)
+            if args.job_id is None:
+                if args.log or args.cancel:
+                    raise CLIError(
+                        "--log/--cancel에는 --job-id와 "
+                        "--supervisor-id가 필요합니다."
+                    )
+                _state, statuses = engine.list_background_jobs(
+                    identity,
+                    recover=True,
+                )
+                _print_json(
+                    {
+                        "schema_version": 1,
+                        "kind": "supervised_job_list",
+                        "experiment_id": None,
+                        "count": len(statuses),
+                        "jobs": [
+                            _job_status_value(status)
+                            for status in statuses
+                        ],
+                    }
+                )
+                return 0
+            ref = _job_ref_from_args(args, engine, identity)
+            if args.log:
+                log = engine.background_job_log(
+                    identity,
+                    ref,
+                    tail_bytes=args.tail_bytes,
+                )
+                _print_json(
+                    {
+                        "schema_version": 1,
+                        "kind": "supervised_job_log",
+                        "ref": _job_status_value(
+                            engine.background_job_status(
+                                identity,
+                                ref,
+                            )[1]
+                        )["ref"],
+                        "stdout": log.stdout,
+                        "stderr": log.stderr,
+                        "stdout_bytes": log.stdout_bytes,
+                        "stderr_bytes": log.stderr_bytes,
+                        "stdout_truncated": log.stdout_truncated,
+                        "stderr_truncated": log.stderr_truncated,
+                    }
+                )
+                return 0
+            if args.cancel:
+                _state, status = engine.cancel_background_job(
+                    identity,
+                    ref,
+                    grace_seconds=args.grace,
+                )
+            else:
+                _state, status = engine.background_job_status(
+                    identity,
+                    ref,
+                )
+            _print_json(_job_status_value(status))
             return 0
 
         if args.command == "tool":
             identity = _scoped_identity(args, engine)
             command = _strip_remainder(args.tool_argv)
+            if args.tool_command == "start":
+                _state, ref = engine.start_background_job(
+                    identity,
+                    command,
+                    name=args.name,
+                    timeout_seconds=args.timeout,
+                    resource_class=args.profile,
+                    network_target=args.target,
+                    needs_kvm=args.kvm,
+                )
+                _print_json(
+                    {
+                        "schema_version": 1,
+                        "kind": "background_job_launch",
+                        "ref": {
+                            "job_id": ref.job_id,
+                            "scope_fingerprint": ref.scope_fingerprint,
+                            "runtime_id": ref.runtime_id,
+                            "supervisor_id": ref.supervisor_id,
+                        },
+                    }
+                )
+                return 0
             state = engine.run_tool_command(
                 identity,
                 command,

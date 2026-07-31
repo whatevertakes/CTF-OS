@@ -3,7 +3,8 @@
 This module is deliberately not an HTTP request limiter or token bucket.  It
 can only space CTF-OS sandbox command starts for the same normalized hostname.
 If one command sends several requests, request-level enforcement belongs in an
-explicit egress proxy/firewall outside this limiter.
+explicit egress proxy/firewall outside this limiter, including CTF-OS's
+challenge-scoped built-in proxy.
 """
 
 from __future__ import annotations

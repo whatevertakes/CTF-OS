@@ -21,6 +21,7 @@ from .client import (
     ChallengeSandboxClient,
     command_from_dict,
     ref_from_dict,
+    ref_to_dict,
 )
 from .types import (
     ProofInput,
@@ -279,6 +280,12 @@ def _status_dict(status: object) -> dict[str, Any]:
     return value
 
 
+def _status_with_ref_dict(status: object) -> dict[str, Any]:
+    value = _status_dict(status)
+    value["ref"] = ref_to_dict(status.ref)
+    return value
+
+
 class SandboxService:
     """Dispatch a narrow operation set after capability and scope checks."""
 
@@ -326,9 +333,28 @@ class SandboxService:
         if operation == "run":
             return asdict(client.run(command_from_dict(params.get("command"))))
         if operation == "start_job":
-            raise SandboxError(
-                "background job start is disabled until a lease supervisor exists"
+            unexpected = set(params).difference({"command", "name"})
+            if unexpected:
+                raise SandboxError(
+                    f"unexpected start_job params: {sorted(unexpected)}"
+                )
+            name = params.get("name")
+            if name is not None and not isinstance(name, str):
+                raise ValueError("background job name must be a string")
+            ref = client.start_job(
+                command_from_dict(params.get("command")),
+                name=name,
             )
+            if ref.scope_fingerprint != scope:
+                raise ScopeError(
+                    "sandbox returned a job from another challenge"
+                )
+            if ref.supervisor_id is None:
+                raise SandboxError(
+                    "sandbox returned a background job without a lease "
+                    "supervisor receipt"
+                )
+            return ref_to_dict(ref)
 
         if operation in {"job_status", "job_log", "cancel_job"}:
             ref = ref_from_dict(params.get("ref"))
@@ -351,6 +377,18 @@ class SandboxService:
                     grace_seconds=params.get("grace_seconds", 3),
                 )
             )
+
+        if operation in {"list_jobs", "recover_jobs"}:
+            if params:
+                raise SandboxError(
+                    f"{operation} does not accept parameters"
+                )
+            statuses = (
+                client.list_jobs()
+                if operation == "list_jobs"
+                else client.recover_jobs()
+            )
+            return [_status_with_ref_dict(status) for status in statuses]
 
         if operation == "register_artifact":
             return asdict(

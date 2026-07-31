@@ -376,11 +376,15 @@ from ctf_os.remote_limiter import (
     RemoteLimiterStateError,
 )
 from ctf_os.sandbox import (
+    BackgroundJobSupervisor,
     BackgroundJobUnsupported,
     ChallengeSandboxClient,
     ChallengeScope,
     CommandSpec,
     DockerLimits,
+    JobLog,
+    JobRef,
+    JobStatus,
     LocalChallengeSandboxClient,
     NetworkPolicy,
     NetworkTarget,
@@ -1993,6 +1997,13 @@ class ChallengeEngine:
             self.config.state_root / "runtime" / "tool-leases",
             limits,
         )
+        self.background_job_supervisor = BackgroundJobSupervisor(
+            self.config.state_root / "runtime" / "background-jobs",
+            self.lease_broker,
+            lease_wait_timeout=(
+                self.config.resources.lease_wait_timeout_s
+            ),
+        )
         self.remote_command_limiter = RemoteCommandStartLimiter(
             self.config.state_root / "runtime",
             self.config.resources.remote_command_min_interval_s,
@@ -3150,6 +3161,8 @@ class ChallengeEngine:
         *,
         docker_network: str = "bridge",
         enforcement: str = "declared",
+        http_requests_per_second: float = 2.0,
+        http_burst: int = 4,
         purpose: str = "challenge remote",
         expires_at: str | None = None,
     ) -> ChallengeState:
@@ -3159,6 +3172,8 @@ class ChallengeEngine:
             (parsed,),
             docker_network=docker_network,
             enforcement=enforcement,
+            http_requests_per_second=http_requests_per_second,
+            http_burst=http_burst,
         )
 
         def apply(state: ChallengeState) -> None:
@@ -3191,6 +3206,19 @@ class ChallengeEngine:
                         generation=generation,
                         provenance="operator",
                         expires_at=expires_at,
+                        extra=(
+                            {
+                                "builtin_egress": {
+                                    "http_burst": http_burst,
+                                    "http_requests_per_second": (
+                                        http_requests_per_second
+                                    ),
+                                    "schema_version": 1,
+                                }
+                            }
+                            if enforcement == "builtin"
+                            else {}
+                        ),
                     )
                 )
                 state.configuration_epoch += 1
@@ -3207,6 +3235,11 @@ class ChallengeEngine:
                 targets.append(canonical)
             state.metadata["docker_network"] = docker_network
             state.metadata["network_enforcement"] = enforcement
+            if enforcement == "builtin":
+                state.metadata["network_http_requests_per_second"] = (
+                    http_requests_per_second
+                )
+                state.metadata["network_http_burst"] = http_burst
 
         return self.store.update(identity, apply)
 
@@ -3370,7 +3403,7 @@ class ChallengeEngine:
                 generation=generation,
                 provenance="operator_replace",
                 expires_at=expires_at,
-                extra={"replaces": old.id},
+                extra={**old.extra, "replaces": old.id},
             )
             state.targets.append(replacement)
             if state.primary_target_id == old.id:
@@ -3414,6 +3447,233 @@ class ChallengeEngine:
                 ),
                 "generation": target.generation,
                 "remote_request_performed": False,
+            }
+
+        return self.store.update(identity, apply)
+
+    def smoke_network_target(
+        self,
+        identity: ChallengeIdentity,
+        target_id: str,
+        *,
+        modes: Sequence[str],
+        path: str = "/",
+        timeout_seconds: int = 10,
+    ) -> ChallengeState:
+        """Run explicit remote preflight through the built-in boundary.
+
+        This is intentionally separate from ``target check``: inspecting target
+        lifecycle never performs network traffic.  The caller must name every
+        desired protocol and the target must already be the selected primary.
+        """
+
+        normalized_modes = tuple(modes)
+        allowed_modes = {"dns", "tcp", "tls", "websocket"}
+        if (
+            not normalized_modes
+            or len(normalized_modes) > len(allowed_modes)
+            or len(set(normalized_modes)) != len(normalized_modes)
+            or any(mode not in allowed_modes for mode in normalized_modes)
+        ):
+            raise EngineError(
+                "network smoke modes must be unique DNS/TCP/TLS/WebSocket values"
+            )
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or not 1 <= timeout_seconds <= 60
+        ):
+            raise EngineError(
+                "network smoke timeout must be between 1 and 60 seconds"
+            )
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or "\r" in path
+            or "\n" in path
+            or len(path.encode("utf-8")) > 4096
+        ):
+            raise EngineError(
+                "network smoke WebSocket path must be a bounded absolute path"
+            )
+        state = self.store.load(identity)
+        target = next(
+            (item for item in state.targets if item.id == target_id),
+            None,
+        )
+        if (
+            target is None
+            or target.status is not TargetStatus.ACTIVE
+            or self._target_is_expired(target)
+        ):
+            raise EngineError(
+                "network smoke target is unavailable, revoked, or expired"
+            )
+        if state.primary_target_id != target.id:
+            raise EngineError(
+                "network smoke target must be explicitly selected first"
+            )
+        if target.enforcement != "builtin":
+            raise EngineError(
+                "deterministic network smoke requires builtin enforcement"
+            )
+        parsed = NetworkTarget.parse(target.endpoint)
+        policy = self._network_policy_for_target(target)
+        policy.authorize(parsed)
+        pinned_revision = state.revision
+        pinned_epoch = state.configuration_epoch
+        pinned_generation = target.generation
+        request = tool_profile("light", network=True)
+        lease = self.lease_broker.acquire(
+            request,
+            timeout=self._budget_wait_timeout(
+                state,
+                self.config.resources.lease_wait_timeout_s,
+            ),
+            owner=f"{identity.key}:{target.id}:network-smoke",
+        )
+        if lease is None:
+            raise EngineError(
+                "timed out waiting for network smoke resources"
+            )
+        result: SandboxResult | None = None
+        local_error: str | None = None
+        try:
+            latest = self.store.load(identity)
+            current = next(
+                (item for item in latest.targets if item.id == target.id),
+                None,
+            )
+            if (
+                latest.revision != pinned_revision
+                or latest.configuration_epoch != pinned_epoch
+                or latest.primary_target_id != target.id
+                or current is None
+                or current.generation != pinned_generation
+                or current.status is not TargetStatus.ACTIVE
+                or current.enforcement != "builtin"
+                or self._target_is_expired(current)
+            ):
+                raise EngineError(
+                    "target or configuration changed before network smoke"
+                )
+            self._wait_for_remote_command_start(latest, parsed)
+            latest = self.store.load(identity)
+            current = next(
+                (item for item in latest.targets if item.id == target.id),
+                None,
+            )
+            if (
+                latest.revision != pinned_revision
+                or latest.configuration_epoch != pinned_epoch
+                or latest.primary_target_id != target.id
+                or current is None
+                or current.generation != pinned_generation
+                or current.status is not TargetStatus.ACTIVE
+                or current.enforcement != "builtin"
+                or self._target_is_expired(current)
+            ):
+                raise EngineError(
+                    "target or configuration changed during network smoke wait"
+                )
+            argv = [
+                "ctf-network-smoke",
+                "--target",
+                parsed.as_text(),
+                "--path",
+                path,
+                "--timeout",
+                str(timeout_seconds),
+            ]
+            for mode in normalized_modes:
+                argv.extend(["--mode", mode])
+            try:
+                result = self.sandbox(
+                    latest,
+                    network_policy_override=policy,
+                ).run(
+                    CommandSpec(
+                        tuple(argv),
+                        timeout_seconds=min(
+                            4 * timeout_seconds + 5,
+                            245,
+                        ),
+                        summary_bytes=16 * 1024,
+                        network_target=parsed,
+                        resource_request=request,
+                        deadline_monotonic_seconds=(
+                            self._budget_hard_deadline_monotonic(
+                                latest,
+                                min(4 * timeout_seconds + 20, 260),
+                            )
+                        ),
+                    )
+                )
+            except SandboxError as error:
+                local_error = type(error).__name__
+        finally:
+            lease.release()
+
+        document: dict[str, Any] | None = None
+        if result is not None:
+            try:
+                parsed_document = json.loads(result.stdout_summary)
+            except (json.JSONDecodeError, TypeError):
+                parsed_document = None
+            if (
+                isinstance(parsed_document, dict)
+                and parsed_document.get("protocol")
+                == "ctfos.network.smoke.v1"
+                and parsed_document.get("target") == parsed.as_text()
+                and isinstance(parsed_document.get("checks"), list)
+            ):
+                document = parsed_document
+
+        def apply(current_state: ChallengeState) -> None:
+            current = next(
+                (
+                    item
+                    for item in current_state.targets
+                    if item.id == target.id
+                ),
+                None,
+            )
+            if (
+                current_state.configuration_epoch != pinned_epoch
+                or current_state.primary_target_id != target.id
+                or current is None
+                or current.generation != pinned_generation
+                or current.status is not TargetStatus.ACTIVE
+                or current.enforcement != "builtin"
+            ):
+                raise EngineError(
+                    "target or configuration changed before smoke result commit"
+                )
+            current.last_preflight = {
+                "checked_at": utc_now(),
+                "generation": current.generation,
+                "modes": list(normalized_modes),
+                "ok": (
+                    result is not None
+                    and result.exit_code == 0
+                    and result.timed_out is False
+                    and document is not None
+                    and document.get("ok") is True
+                ),
+                "remote_request_performed": True,
+                "result": (
+                    document
+                    if document is not None
+                    else {
+                        "error": (
+                            local_error
+                            or "network_smoke_output_invalid"
+                        ),
+                        "ok": False,
+                        "protocol": "ctfos.network.smoke.v1",
+                    }
+                ),
+                "run_id": result.run_id if result is not None else None,
             }
 
         return self.store.update(identity, apply)
@@ -4153,6 +4413,39 @@ class ChallengeEngine:
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
+    @staticmethod
+    def _network_policy_for_target(target: TargetRecord) -> NetworkPolicy:
+        rate: object = 2.0
+        burst: object = 4
+        if target.enforcement == "builtin":
+            boundary = target.extra.get("builtin_egress")
+            if not isinstance(boundary, Mapping) or set(boundary) != {
+                "http_burst",
+                "http_requests_per_second",
+                "schema_version",
+            }:
+                raise EngineError(
+                    "builtin target is missing its exact egress rate policy"
+                )
+            if boundary.get("schema_version") != 1:
+                raise EngineError(
+                    "builtin target has an unsupported egress policy"
+                )
+            rate = boundary.get("http_requests_per_second")
+            burst = boundary.get("http_burst")
+        try:
+            return NetworkPolicy.allow(
+                (NetworkTarget.parse(target.endpoint),),
+                docker_network=target.docker_network,
+                enforcement=target.enforcement,
+                http_requests_per_second=rate,  # type: ignore[arg-type]
+                http_burst=burst,  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError) as error:
+            raise EngineError(
+                f"target has an invalid network policy: {error}"
+            ) from error
+
     def _network_policy(self, state: ChallengeState) -> NetworkPolicy:
         if state.schema_version >= STATE_SCHEMA_VERSION:
             if state.primary_target_id is None:
@@ -4173,11 +4466,7 @@ class ChallengeEngine:
                 raise EngineError(
                     "selected target is unavailable, revoked, or expired"
                 )
-            return NetworkPolicy.allow(
-                (NetworkTarget.parse(target.endpoint),),
-                docker_network=target.docker_network,
-                enforcement=target.enforcement,
-            )
+            return self._network_policy_for_target(target)
         targets = state.metadata.get("network_targets", [])
         if not targets:
             return NetworkPolicy.deny_all()
@@ -4193,6 +4482,11 @@ class ChallengeEngine:
             enforcement=str(
                 state.metadata.get("network_enforcement", "declared")
             ),
+            http_requests_per_second=state.metadata.get(
+                "network_http_requests_per_second",
+                2.0,
+            ),
+            http_burst=state.metadata.get("network_http_burst", 4),
         )
 
     def _managed_proof_policy_snapshot(
@@ -4513,7 +4807,7 @@ class ChallengeEngine:
                 or target.generation
                 != recipe.network_target_generation
                 or target.endpoint != recipe.network_endpoint
-                or target.enforcement != "proxy"
+                or target.enforcement not in {"proxy", "builtin"}
             ):
                 raise EngineError(
                     "managed proof target, generation, or configuration "
@@ -5995,6 +6289,7 @@ class ChallengeEngine:
                     self.config.runtime.work_tree_max_bytes
                 )
             ),
+            job_supervisor=self.background_job_supervisor,
         )
 
     def _managed_action_workspace(
@@ -9061,7 +9356,8 @@ class ChallengeEngine:
                                         != target_generation
                                         or target.endpoint
                                         != source_target_endpoint
-                                        or target.enforcement != "proxy"
+                                        or target.enforcement
+                                        not in {"proxy", "builtin"}
                                         or source_experiment.extra.get(
                                             "configuration_epoch"
                                         )
@@ -9422,7 +9718,8 @@ class ChallengeEngine:
                                     or self._target_is_expired(target)
                                     or target.generation
                                     != target_generation
-                                    or target.enforcement != "proxy"
+                                    or target.enforcement
+                                    not in {"proxy", "builtin"}
                                 ):
                                     reject_model_item(
                                         "rejected_actions",
@@ -20711,6 +21008,355 @@ class ChallengeEngine:
             experiment_ids=(experiment_id,),
             _live_only=_live_only,
         )
+
+    @staticmethod
+    def _background_job_record(
+        ref: JobRef,
+        *,
+        status: JobStatus | None = None,
+        command: Sequence[str] | None = None,
+        name: str | None = None,
+        resource_class: str | None = None,
+        resource_request: ResourceVector | None = None,
+        network_target: str | None = None,
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "schema_version": 1,
+            "job_id": ref.job_id,
+            "scope_fingerprint": ref.scope_fingerprint,
+            "runtime_id": ref.runtime_id,
+            "supervisor_id": ref.supervisor_id,
+        }
+        if command is not None:
+            value.update(
+                {
+                    "command": list(command),
+                    "name": name,
+                    "resource_class": resource_class,
+                    "resource_request": (
+                        resource_request.as_dict()
+                        if resource_request is not None
+                        else None
+                    ),
+                    "network_target": network_target,
+                    "launched_at": utc_now(),
+                }
+            )
+        if status is not None:
+            value.update(
+                {
+                    "status": status.status.value,
+                    "exit_code": status.exit_code,
+                    "timed_out": status.timed_out,
+                    "cancelled": status.cancelled,
+                    "started_at": status.started_at,
+                    "finished_at": status.finished_at,
+                    "observed_at": utc_now(),
+                }
+            )
+        else:
+            value["status"] = "starting"
+        return value
+
+    @staticmethod
+    def _background_ref_matches_record(
+        ref: JobRef,
+        record: Mapping[str, object],
+    ) -> bool:
+        return (
+            record.get("job_id") == ref.job_id
+            and record.get("scope_fingerprint") == ref.scope_fingerprint
+            and record.get("runtime_id") == ref.runtime_id
+            and record.get("supervisor_id") == ref.supervisor_id
+        )
+
+    def _require_background_ref(
+        self,
+        state: ChallengeState,
+        ref: JobRef,
+    ) -> None:
+        records = state.extra.get("background_jobs", [])
+        if not isinstance(records, list) or not any(
+            isinstance(record, Mapping)
+            and self._background_ref_matches_record(ref, record)
+            for record in records
+        ):
+            raise EngineError(
+                "background job reference is not recorded in canonical state"
+            )
+
+    def start_background_job(
+        self,
+        identity: ChallengeIdentity,
+        command: Sequence[str],
+        *,
+        name: str | None = None,
+        timeout_seconds: int | None = None,
+        resource_class: str = "light",
+        network_target: str | None = None,
+        needs_kvm: bool = False,
+        _session_owned: bool = False,
+        _live_only: bool = False,
+    ) -> tuple[ChallengeState, JobRef]:
+        """Launch one lease-bound job and record its exact receipt in state."""
+
+        if not _session_owned:
+            paths = self.store.challenge_paths(identity)
+            try:
+                lock = ChallengeLock(
+                    paths.runtime / "session.lock",
+                    timeout=0,
+                ).acquire()
+            except LockTimeout as error:
+                raise SessionAlreadyRunning(
+                    f"another session already owns {identity.key}"
+                ) from error
+            try:
+                self._recover_session_boundary(identity)
+                return self.start_background_job(
+                    identity,
+                    command,
+                    name=name,
+                    timeout_seconds=timeout_seconds,
+                    resource_class=resource_class,
+                    network_target=network_target,
+                    needs_kvm=needs_kvm,
+                    _session_owned=True,
+                    _live_only=_live_only,
+                )
+            finally:
+                lock.release()
+
+        state = self.store.load(identity)
+        self._require_model_work_allowed(state)
+        if _live_only:
+            self._require_live_mutation_allowed(state)
+        argv = tuple(command)
+        if not argv:
+            raise EngineError("background command cannot be empty")
+        try:
+            # The supervised command is foreground *inside* its ctf-bg
+            # session. Nested detach/ctf-bg wrappers remain forbidden.
+            ensure_foreground_command(argv)
+        except BackgroundJobUnsupported as error:
+            raise EngineError(str(error)) from error
+        configured_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self.config.runtime.command_timeout_s
+        )
+        if (
+            isinstance(configured_timeout, bool)
+            or not isinstance(configured_timeout, int)
+            or not 1 <= configured_timeout <= 604800
+        ):
+            raise EngineError(
+                "background timeout must be between 1 and 604800 seconds"
+            )
+        target = (
+            NetworkTarget.parse(network_target)
+            if network_target is not None
+            else None
+        )
+        self._network_policy(state).authorize(target)
+        request = tool_profile(
+            resource_class,
+            needs_kvm=needs_kvm,
+            network=target is not None,
+        )
+        timeout, deadline = self._budget_command_limits(
+            state,
+            configured_timeout,
+        )
+        client = self.sandbox(state)
+        ref: JobRef | None = None
+        try:
+            ref = client.start_job(
+                CommandSpec.create(
+                    argv,
+                    timeout_seconds=timeout,
+                    deadline_monotonic_seconds=deadline,
+                    environment={
+                        FLAG_PATTERNS_ENV: json.dumps(
+                            self.config.runtime.flag_patterns,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    },
+                    network_target=target,
+                    resource_request=request,
+                ),
+                name=name,
+            )
+            if (
+                ref.scope_fingerprint != client.scope_fingerprint
+                or ref.supervisor_id is None
+            ):
+                raise EngineError(
+                    "sandbox returned an unscoped background receipt"
+                )
+
+            def record(current: ChallengeState) -> None:
+                if _live_only:
+                    self._require_live_mutation_allowed(current)
+                records = current.extra.setdefault("background_jobs", [])
+                if not isinstance(records, list) or len(records) >= 1024:
+                    raise EngineError(
+                        "canonical background job history is invalid or full"
+                    )
+                if any(
+                    isinstance(item, Mapping)
+                    and self._background_ref_matches_record(ref, item)
+                    for item in records
+                ):
+                    raise EngineError(
+                        "background receipt is already recorded"
+                    )
+                records.append(
+                    self._background_job_record(
+                        ref,
+                        command=argv,
+                        name=name,
+                        resource_class=resource_class,
+                        resource_request=request,
+                        network_target=(
+                            target.as_text() if target is not None else None
+                        ),
+                    )
+                )
+
+            return self.store.update(identity, record), ref
+        except BaseException as error:
+            if ref is not None:
+                try:
+                    client.cancel_job(ref, grace_seconds=0)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "uncommitted background job cancellation failed: "
+                        f"{cleanup_error}"
+                    )
+            raise
+
+    def _update_background_statuses(
+        self,
+        identity: ChallengeIdentity,
+        statuses: Sequence[JobStatus],
+        *,
+        live_only: bool = False,
+    ) -> ChallengeState:
+        by_ref = {
+            (
+                item.ref.job_id,
+                item.ref.scope_fingerprint,
+                item.ref.runtime_id,
+                item.ref.supervisor_id,
+            ): item
+            for item in statuses
+        }
+
+        def apply(state: ChallengeState) -> None:
+            if live_only:
+                self._require_live_mutation_allowed(state)
+            records = state.extra.get("background_jobs", [])
+            if not isinstance(records, list):
+                raise EngineError(
+                    "canonical background job history is invalid"
+                )
+            for index, record in enumerate(records):
+                if not isinstance(record, Mapping):
+                    raise EngineError(
+                        "canonical background job record is invalid"
+                    )
+                key = (
+                    record.get("job_id"),
+                    record.get("scope_fingerprint"),
+                    record.get("runtime_id"),
+                    record.get("supervisor_id"),
+                )
+                status = by_ref.get(key)
+                if status is not None:
+                    records[index] = {
+                        **dict(record),
+                        **self._background_job_record(
+                            status.ref,
+                            status=status,
+                        ),
+                    }
+
+        return self.store.update(identity, apply)
+
+    def list_background_jobs(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        recover: bool = True,
+        _live_only: bool = False,
+    ) -> tuple[ChallengeState, tuple[JobStatus, ...]]:
+        state = self.store.load(identity)
+        client = self.sandbox(state)
+        operation = getattr(
+            client,
+            "recover_jobs" if recover else "list_jobs",
+            None,
+        )
+        # Trusted injected test/embedding clients from the foreground-only API
+        # generation have no operational supervisor namespace.
+        statuses = tuple(operation()) if callable(operation) else ()
+        current = self._update_background_statuses(
+            identity,
+            statuses,
+            live_only=_live_only,
+        )
+        return current, statuses
+
+    def background_job_status(
+        self,
+        identity: ChallengeIdentity,
+        ref: JobRef,
+        *,
+        _live_only: bool = False,
+    ) -> tuple[ChallengeState, JobStatus]:
+        state = self.store.load(identity)
+        self._require_background_ref(state, ref)
+        status = self.sandbox(state).job_status(ref)
+        current = self._update_background_statuses(
+            identity,
+            (status,),
+            live_only=_live_only,
+        )
+        return current, status
+
+    def background_job_log(
+        self,
+        identity: ChallengeIdentity,
+        ref: JobRef,
+        *,
+        tail_bytes: int = 8192,
+    ) -> JobLog:
+        state = self.store.load(identity)
+        self._require_background_ref(state, ref)
+        return self.sandbox(state).job_log(ref, tail_bytes=tail_bytes)
+
+    def cancel_background_job(
+        self,
+        identity: ChallengeIdentity,
+        ref: JobRef,
+        *,
+        grace_seconds: int = 3,
+        _live_only: bool = False,
+    ) -> tuple[ChallengeState, JobStatus]:
+        state = self.store.load(identity)
+        self._require_background_ref(state, ref)
+        status = self.sandbox(state).cancel_job(
+            ref,
+            grace_seconds=grace_seconds,
+        )
+        current = self._update_background_statuses(
+            identity,
+            (status,),
+            live_only=_live_only,
+        )
+        return current, status
 
     def record_candidate(
         self,

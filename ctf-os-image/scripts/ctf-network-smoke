@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Deterministic DNS/TCP/TLS/WebSocket checks through built-in egress."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import math
+import os
+import socket
+import ssl
+import struct
+import time
+from dataclasses import dataclass
+from urllib.parse import quote, urlsplit
+
+MAX_RESPONSE_BYTES = 1024 * 1024
+WEBSOCKET_KEY = base64.b64encode(b"ctfos-smoke-v1!!").decode("ascii")
+
+
+class SmokeError(Exception):
+    """A stable smoke failure without remote-controlled text."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class Target:
+    text: str
+    host: str
+    port: int
+    scheme: str | None
+
+    @classmethod
+    def parse(cls, value: str) -> Target:
+        parsed = urlsplit(value) if "://" in value else urlsplit(f"target://{value}")
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise SmokeError("target_invalid")
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise SmokeError("target_invalid") from error
+        if port is None:
+            raise SmokeError("target_port_required")
+        scheme = parsed.scheme if "://" in value else None
+        if scheme not in {None, "http", "https", "tcp", "ws", "wss"}:
+            raise SmokeError("target_scheme_unsupported")
+        host = parsed.hostname.lower().rstrip(".")
+        return cls(value, host, port, scheme)
+
+    @property
+    def authority(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
+
+
+def endpoint_from_environment(name: str, schemes: set[str]) -> tuple[str, int]:
+    value = os.environ.get(name, "")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in schemes
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SmokeError(f"{name.lower()}_invalid")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise SmokeError(f"{name.lower()}_invalid") from error
+    if port is None:
+        raise SmokeError(f"{name.lower()}_invalid")
+    return parsed.hostname, port
+
+
+def read_header(connection: socket.socket) -> tuple[bytes, bytes]:
+    payload = bytearray()
+    while b"\r\n\r\n" not in payload:
+        block = connection.recv(4096)
+        if not block:
+            raise SmokeError("proxy_response_incomplete")
+        payload.extend(block)
+        if len(payload) > MAX_RESPONSE_BYTES:
+            raise SmokeError("proxy_response_too_large")
+    header, remainder = bytes(payload).split(b"\r\n\r\n", 1)
+    return header + b"\r\n\r\n", remainder
+
+
+def parse_status(header: bytes) -> tuple[int, dict[str, str]]:
+    try:
+        lines = header[:-4].decode("iso-8859-1").split("\r\n")
+        parts = lines[0].split(" ", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            raise ValueError
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            name, value = line.split(":", 1)
+            key = name.strip().lower()
+            headers[key] = value.strip()
+        return int(parts[1]), headers
+    except (UnicodeError, ValueError) as error:
+        raise SmokeError("proxy_response_invalid") from error
+
+
+def recv_exact(connection: socket.socket, count: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < count:
+        block = connection.recv(count - len(payload))
+        if not block:
+            raise SmokeError("proxy_response_incomplete")
+        payload.extend(block)
+    return bytes(payload)
+
+
+def http_connect(target: Target, timeout: float) -> socket.socket:
+    proxy_host, proxy_port = endpoint_from_environment(
+        "HTTPS_PROXY",
+        {"http"},
+    )
+    try:
+        connection = socket.create_connection(
+            (proxy_host, proxy_port),
+            timeout=timeout,
+        )
+        connection.sendall(
+            (
+                f"CONNECT {target.authority} HTTP/1.1\r\n"
+                f"Host: {target.authority}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+        )
+        status, _headers = parse_status(read_header(connection)[0])
+        if status != 200:
+            connection.close()
+            raise SmokeError(f"proxy_connect_status_{status}")
+        return connection
+    except SmokeError:
+        raise
+    except (OSError, TimeoutError) as error:
+        raise SmokeError("proxy_connect_failed") from error
+
+
+def socks_connect(target: Target, timeout: float) -> socket.socket:
+    proxy_host, proxy_port = endpoint_from_environment(
+        "ALL_PROXY",
+        {"socks5h"},
+    )
+    try:
+        connection = socket.create_connection(
+            (proxy_host, proxy_port),
+            timeout=timeout,
+        )
+        connection.sendall(b"\x05\x01\x00")
+        if recv_exact(connection, 2) != b"\x05\x00":
+            raise SmokeError("socks_negotiation_failed")
+        encoded_host = target.host.encode("idna")
+        if len(encoded_host) > 255:
+            raise SmokeError("target_invalid")
+        connection.sendall(
+            b"\x05\x01\x00\x03"
+            + bytes((len(encoded_host),))
+            + encoded_host
+            + struct.pack("!H", target.port)
+        )
+        reply = recv_exact(connection, 4)
+        if reply[:2] != b"\x05\x00":
+            raise SmokeError(f"socks_connect_status_{reply[1]}")
+        address_type = reply[3]
+        if address_type == 1:
+            remaining = 4 + 2
+        elif address_type == 4:
+            remaining = 16 + 2
+        elif address_type == 3:
+            length = recv_exact(connection, 1)
+            remaining = length[0] + 2
+        else:
+            raise SmokeError("socks_reply_invalid")
+        recv_exact(connection, remaining)
+        return connection
+    except SmokeError:
+        try:
+            connection.close()
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except (OSError, TimeoutError, UnicodeError) as error:
+        try:
+            connection.close()
+        except (OSError, UnboundLocalError):
+            pass
+        raise SmokeError("socks_connect_failed") from error
+
+
+def dns_check(target: Target, timeout: float) -> dict[str, object]:
+    host, port = endpoint_from_environment(
+        "CTFOS_EGRESS_CONTROL",
+        {"http"},
+    )
+    path = "/v1/resolve?target=" + quote(target.text, safe="")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as connection:
+            connection.sendall(
+                (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+            )
+            header, remainder = read_header(connection)
+            status, headers = parse_status(header)
+            length_text = headers.get("content-length")
+            if length_text is None or not length_text.isdigit():
+                raise SmokeError("dns_response_invalid")
+            length = int(length_text)
+            if length > MAX_RESPONSE_BYTES:
+                raise SmokeError("dns_response_too_large")
+            payload = bytearray(remainder)
+            while len(payload) < length:
+                block = connection.recv(min(64 * 1024, length - len(payload)))
+                if not block:
+                    raise SmokeError("dns_response_incomplete")
+                payload.extend(block)
+        if status != 200:
+            raise SmokeError(f"dns_status_{status}")
+        document = json.loads(bytes(payload).decode("ascii"))
+        if not isinstance(document, dict) or document.get("ok") is not True:
+            raise SmokeError("dns_response_invalid")
+        addresses = document.get("addresses")
+        if not isinstance(addresses, list) or not addresses:
+            raise SmokeError("dns_response_invalid")
+        families = sorted(
+            {
+                item.get("family")
+                for item in addresses
+                if isinstance(item, dict) and item.get("family") in {"ipv4", "ipv6"}
+            }
+        )
+        return {
+            "address_count": len(addresses),
+            "families": families,
+        }
+    except SmokeError:
+        raise
+    except (OSError, TimeoutError, UnicodeError, json.JSONDecodeError) as error:
+        raise SmokeError("dns_check_failed") from error
+
+
+def tcp_check(target: Target, timeout: float) -> dict[str, object]:
+    started = time.monotonic()
+    with socks_connect(target, timeout):
+        pass
+    return {"connect_ms": max(0, round((time.monotonic() - started) * 1000))}
+
+
+def tls_connection(
+    target: Target,
+    timeout: float,
+) -> ssl.SSLSocket:
+    transport = http_connect(target, timeout)
+    try:
+        context = ssl.create_default_context()
+        return context.wrap_socket(
+            transport,
+            server_hostname=target.host,
+        )
+    except (OSError, ssl.SSLError) as error:
+        transport.close()
+        raise SmokeError("tls_handshake_failed") from error
+
+
+def tls_check(target: Target, timeout: float) -> dict[str, object]:
+    with tls_connection(target, timeout) as connection:
+        certificate = connection.getpeercert(binary_form=True)
+        cipher = connection.cipher()
+        return {
+            "certificate_sha256": hashlib.sha256(certificate).hexdigest(),
+            "cipher": cipher[0] if cipher else None,
+            "tls_version": connection.version(),
+        }
+
+
+def websocket_check(
+    target: Target,
+    timeout: float,
+    path: str,
+) -> dict[str, object]:
+    if (
+        not path.startswith("/")
+        or "\r" in path
+        or "\n" in path
+        or len(path.encode("utf-8")) > 4096
+    ):
+        raise SmokeError("websocket_path_invalid")
+    secure = target.scheme in {"https", "wss"}
+    if secure:
+        connection: socket.socket = tls_connection(target, timeout)
+        request_target = path
+    else:
+        proxy_host, proxy_port = endpoint_from_environment(
+            "HTTP_PROXY",
+            {"http"},
+        )
+        try:
+            connection = socket.create_connection(
+                (proxy_host, proxy_port),
+                timeout=timeout,
+            )
+        except (OSError, TimeoutError) as error:
+            raise SmokeError("websocket_proxy_connect_failed") from error
+        request_target = f"ws://{target.authority}{path}"
+    expected_accept = base64.b64encode(
+        hashlib.sha1(
+            (WEBSOCKET_KEY + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        ).digest()
+    ).decode("ascii")
+    try:
+        connection.sendall(
+            (
+                f"GET {request_target} HTTP/1.1\r\n"
+                f"Host: {target.authority}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {WEBSOCKET_KEY}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            ).encode("ascii")
+        )
+        status, headers = parse_status(read_header(connection)[0])
+        if status != 101:
+            raise SmokeError(f"websocket_status_{status}")
+        if (
+            headers.get("upgrade", "").lower() != "websocket"
+            or headers.get("sec-websocket-accept") != expected_accept
+        ):
+            raise SmokeError("websocket_handshake_invalid")
+        return {"status": 101, "tls": secure}
+    finally:
+        connection.close()
+
+
+def run_check(
+    mode: str,
+    target: Target,
+    timeout: float,
+    path: str,
+) -> dict[str, object]:
+    started = time.monotonic()
+    try:
+        detail = {
+            "dns": lambda: dns_check(target, timeout),
+            "tcp": lambda: tcp_check(target, timeout),
+            "tls": lambda: tls_check(target, timeout),
+            "websocket": lambda: websocket_check(
+                target,
+                timeout,
+                path,
+            ),
+        }[mode]()
+    except SmokeError as error:
+        return {
+            "code": error.code,
+            "duration_ms": max(
+                0,
+                round((time.monotonic() - started) * 1000),
+            ),
+            "mode": mode,
+            "ok": False,
+        }
+    return {
+        "detail": detail,
+        "duration_ms": max(
+            0,
+            round((time.monotonic() - started) * 1000),
+        ),
+        "mode": mode,
+        "ok": True,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ctf-network-smoke")
+    parser.add_argument("--target", required=True)
+    parser.add_argument(
+        "--mode",
+        action="append",
+        choices=("dns", "tcp", "tls", "websocket"),
+        required=True,
+    )
+    parser.add_argument("--path", default="/")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    args = parser.parse_args()
+    if (
+        not math.isfinite(args.timeout)
+        or not 0 < args.timeout <= 60
+        or len(args.mode) > 4
+        or len(set(args.mode)) != len(args.mode)
+    ):
+        parser.error("timeout or mode set is invalid")
+    try:
+        target = Target.parse(args.target)
+    except SmokeError as error:
+        document = {
+            "checks": [],
+            "error": error.code,
+            "ok": False,
+            "protocol": "ctfos.network.smoke.v1",
+            "target": args.target,
+        }
+        print(
+            json.dumps(
+                document,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
+    checks = [run_check(mode, target, args.timeout, args.path) for mode in args.mode]
+    document = {
+        "checks": checks,
+        "ok": all(check["ok"] is True for check in checks),
+        "protocol": "ctfos.network.smoke.v1",
+        "target": target.text,
+    }
+    print(
+        json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0 if document["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

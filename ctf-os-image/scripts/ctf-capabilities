@@ -17,16 +17,35 @@ from typing import Any
 MANIFEST = Path("/tools/capabilities.json")
 MAX_BYTES = 256 * 1024
 MAX_ATTESTED_FILE_BYTES = 4 * 1024 * 1024
+MAX_ASSET_FILES = 16
+MAX_ASSET_MINIMUM_BYTES = 1024**4
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAGIC_HEX = re.compile(r"^(?:[0-9a-f]{2}){1,64}$")
+_PYSAT_SOLVERS = frozenset({"cadical300", "kissat404"})
 
 
 class CapabilityProbeError(RuntimeError):
     pass
 
 
+def _probe_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "HOME": "/tmp",
+            "XDG_CACHE_HOME": "/tmp/ctf-capability-cache",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    return environment
+
+
 def _load() -> dict[str, Any]:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise CapabilityProbeError("O_NOFOLLOW support is required")
+    flags |= nofollow
     descriptor = os.open(MANIFEST, flags)
     try:
         metadata = os.fstat(descriptor)
@@ -63,6 +82,8 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
         raise CapabilityProbeError("capability requires name")
     if kind == "file_sha256":
         return _probe_file_sha256(name, record)
+    if kind == "regular_file_set":
+        return _probe_regular_file_set(name, record)
 
     command = record.get("command")
     if not isinstance(command, str):
@@ -87,6 +108,48 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
             "-c",
             "import importlib; importlib.import_module(" + repr(module) + ")",
         ]
+    elif kind == "pysat_solver":
+        solver = record.get("solver")
+        if solver not in _PYSAT_SOLVERS:
+            raise CapabilityProbeError(f"invalid PySAT solver for {name}")
+        argv = [
+            command,
+            "-c",
+            (
+                "from pysat.solvers import Solver\n"
+                f"s=Solver(name={solver!r},bootstrap_with=[[1],[-1,2]])\n"
+                "assert s.solve() and s.get_model()\n"
+                "s.delete()\n"
+                f"s=Solver(name={solver!r},bootstrap_with=[[1],[-1]])\n"
+                "assert not s.solve()\n"
+                "s.delete()\n"
+            ),
+        ]
+    elif kind == "dimacs_solver":
+        arguments = record.get("arguments", [])
+        if not isinstance(arguments, list) or not all(
+            isinstance(value, str) for value in arguments
+        ):
+            raise CapabilityProbeError(f"invalid arguments for {name}")
+        try:
+            result = subprocess.run(
+                [command, *arguments],
+                input=b"p cnf 2 2\n1 0\n-1 2 0\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=_probe_environment(),
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {"name": name, "available": False}
+        return {
+            "name": name,
+            "available": (
+                result.returncode == 10
+                and b"s SATISFIABLE" in (result.stdout or b"")[:65536]
+            ),
+        }
     else:
         raise CapabilityProbeError(f"invalid capability kind for {name}")
     try:
@@ -95,12 +158,97 @@ def _probe(record: dict[str, Any]) -> dict[str, Any]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=_probe_environment(),
             check=False,
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"name": name, "available": False}
     return {"name": name, "available": result.returncode == 0}
+
+
+def _probe_regular_file_set(
+    name: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    files = record.get("files")
+    if (
+        not isinstance(files, list)
+        or not files
+        or len(files) > MAX_ASSET_FILES
+    ):
+        raise CapabilityProbeError(f"invalid asset file set for {name}")
+    available = True
+    for item in files:
+        if not isinstance(item, dict):
+            raise CapabilityProbeError(f"invalid asset file for {name}")
+        path = item.get("path")
+        minimum_bytes = item.get("minimum_bytes")
+        magic_hex = item.get("magic_hex")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or "\x00" in path
+            or ".." in Path(path).parts
+            or type(minimum_bytes) is not int
+            or not 1 <= minimum_bytes <= MAX_ASSET_MINIMUM_BYTES
+            or (
+                magic_hex is not None
+                and (
+                    not isinstance(magic_hex, str)
+                    or _MAGIC_HEX.fullmatch(magic_hex) is None
+                )
+            )
+        ):
+            raise CapabilityProbeError(f"invalid asset file for {name}")
+        magic = bytes.fromhex(magic_hex) if magic_hex is not None else b""
+        if not _stable_regular_file_prefix(path, minimum_bytes, magic):
+            available = False
+    return {"name": name, "available": available}
+
+
+def _stable_regular_file_prefix(
+    path: str,
+    minimum_bytes: int,
+    magic: bytes,
+) -> bool:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        return False
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags | nofollow)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink < 1
+            or before.st_size < minimum_bytes
+            or os.read(descriptor, len(magic)) != magic
+        ):
+            return False
+        after = os.fstat(descriptor)
+        identity = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        return all(
+            getattr(before, field) == getattr(after, field)
+            for field in identity
+        )
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _probe_file_sha256(

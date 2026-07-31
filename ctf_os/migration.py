@@ -310,6 +310,9 @@ def migrate_state_document(
 
     legacy_targets = state.metadata.get("network_targets", [])
     if isinstance(legacy_targets, list):
+        legacy_enforcement = str(
+            state.metadata.get("network_enforcement", "declared")
+        )
         for endpoint in legacy_targets:
             if not isinstance(endpoint, str):
                 continue
@@ -318,9 +321,7 @@ def migrate_state_document(
                     id=_legacy_target_id(endpoint, 1),
                     endpoint=endpoint,
                     status=TargetStatus.ACTIVE,
-                    enforcement=str(
-                        state.metadata.get("network_enforcement", "declared")
-                    ),
+                    enforcement=legacy_enforcement,
                     docker_network=str(
                         state.metadata.get("docker_network", "bridge")
                     ),
@@ -328,6 +329,25 @@ def migrate_state_document(
                     generation=1,
                     provenance="v1 metadata",
                     created_at=state.created_at,
+                    extra=(
+                        {
+                            "builtin_egress": {
+                                "http_burst": state.metadata.get(
+                                    "network_http_burst",
+                                    4,
+                                ),
+                                "http_requests_per_second": (
+                                    state.metadata.get(
+                                        "network_http_requests_per_second",
+                                        2.0,
+                                    )
+                                ),
+                                "schema_version": 1,
+                            }
+                        }
+                        if legacy_enforcement == "builtin"
+                        else {}
+                    ),
                 )
             )
 

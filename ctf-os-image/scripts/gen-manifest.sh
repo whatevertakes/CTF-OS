@@ -38,7 +38,8 @@ crypto|age|age|Modern file encryption utility||encryption
 crypto|bitlocker2john|bitlocker2john|Extract BitLocker hashes for John the Ripper||password,converter
 crypto|cado-nfs|cado-nfs|Number field sieve factorization suite|cado|factorization
 crypto|ciphey|ciphey|Automatic classical cipher and encoding detector|ares|decoder,cipher
-crypto|crypto-python|crypto-python|Python runtime with fpylll and gf2bv|fpylll,gf2bv|lattice,bitvector
+crypto|cryptominisat5|cryptominisat5|CryptoMiniSat SAT solver with native XOR reasoning|cms,cryptominisat|sat,xor
+crypto|crypto-python|crypto-python|Python runtime with fpylll gf2bv and PySAT CaDiCaL and Kissat backends|fpylll,gf2bv,pysat,cadical,kissat|lattice,bitvector,sat
 crypto|ecm|ecm|Elliptic-curve integer factorization||factorization
 crypto|flatter|flatter|Fast lattice reduction for large matrices||lattice
 crypto|gp|gp|PARI/GP computer algebra shell|pari-gp|math
@@ -67,6 +68,8 @@ forensic|dcfldd|dcfldd|Forensic disk imaging with hashing support||disk,imaging
 forensic|dwarf2json|dwarf2json|Generate Volatility symbol data from DWARF||memory,symbols
 forensic|evtxexport|evtxexport|Export Windows EVTX records as XML||windows,event-log
 forensic|evtxinfo|evtxinfo|Inspect Windows EVTX file metadata||windows,event-log
+forensic|ewfinfo|ewfinfo|Inspect Expert Witness Format evidence metadata||disk,e01,ewf
+forensic|ewfverify|ewfverify|Verify Expert Witness Format evidence integrity||disk,e01,ewf
 forensic|exiftool|exiftool|Metadata extraction and editing||metadata
 forensic|ffind|ffind|Find filesystem names that reference an inode||disk,sleuthkit
 forensic|fls|fls|List deleted and allocated filesystem names||disk,sleuthkit
@@ -128,6 +131,8 @@ orchestration|ctf-idle|ctf-idle|Signal-aware idle PID 1 and orphan process reape
 orchestration|ctf-jobs|ctf-jobs|List managed background jobs||job
 orchestration|ctf-kill|ctf-kill|Terminate a managed background job||job
 orchestration|ctf-log|ctf-log|Read bounded managed-job logs||job,log
+orchestration|ctf-egress-proxy|ctf-egress-proxy|Challenge-scoped exact-allowlist HTTP and SOCKS egress proxy||network,proxy,allowlist
+orchestration|ctf-network-smoke|ctf-network-smoke|Bounded DNS TCP TLS and WebSocket boundary preflight||network,preflight
 orchestration|ctf-tools|ctf-tools|Query the installed tool manifest||manifest
 orchestration|ctfwrap|ctfwrap|Run a bounded foreground command with artifacts||runner
 orchestration|ghidra-decompile|ghidra-decompile|Run headless Ghidra and export C decompilation||rev,decompiler

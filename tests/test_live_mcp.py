@@ -122,6 +122,7 @@ class LiveMCPTests(unittest.TestCase):
                 "agent.progress",
                 "agent.transition",
                 "tool.run",
+                "tool.start",
                 "jobs",
                 "inspect",
                 "knowledge.search",

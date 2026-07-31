@@ -43,6 +43,7 @@ _LIVE_MCP_TOOLS = (
     "agent.artifact",
     "agent.progress",
     "agent.transition",
+    "tool.start",
     "tool.run",
     "jobs",
     "inspect",

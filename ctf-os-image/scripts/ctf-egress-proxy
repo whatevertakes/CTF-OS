@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Exact-allowlist HTTP CONNECT/forward and SOCKS5 proxy for CTF-OS.
+
+This process is useful only inside the dual-homed boundary container created by
+the host engine.  It binds to the internal-network interface, never to the
+upstream interface.  It intentionally supports no dynamic reconfiguration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fcntl
+import ipaddress
+import json
+import math
+import os
+import selectors
+import signal
+import socket
+import socketserver
+import struct
+import threading
+import time
+from http import HTTPStatus
+from urllib.parse import parse_qs, urlsplit
+
+MAX_HEADER_BYTES = 64 * 1024
+MAX_LINE_BYTES = 16 * 1024
+MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+CONNECT_TIMEOUT_SECONDS = 10
+CLIENT_TIMEOUT_SECONDS = 30
+TUNNEL_IDLE_SECONDS = 120
+TUNNEL_LIFETIME_SECONDS = 15 * 60
+
+
+class ProxyError(Exception):
+    """A stable client-visible proxy rejection."""
+
+    def __init__(self, status: int, code: str) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+
+
+@dataclasses.dataclass(frozen=True)
+class Target:
+    host: str
+    port: int | None
+    scheme: str | None
+
+    @classmethod
+    def parse(cls, value: str) -> Target:
+        if not isinstance(value, str) or len(value.encode("utf-8")) > 4096:
+            raise ValueError("invalid target")
+        if "://" in value:
+            parsed = urlsplit(value)
+            if (
+                not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("invalid target")
+            try:
+                port = parsed.port
+            except ValueError as error:
+                raise ValueError("invalid target") from error
+            return cls._validated(parsed.hostname, port, parsed.scheme)
+        if value.startswith("["):
+            parsed = urlsplit(f"target://{value}")
+            if not parsed.hostname:
+                raise ValueError("invalid target")
+            try:
+                port = parsed.port
+            except ValueError as error:
+                raise ValueError("invalid target") from error
+            return cls._validated(parsed.hostname, port, None)
+        if value.count(":") == 1:
+            host, possible_port = value.rsplit(":", 1)
+            if possible_port.isdigit():
+                return cls._validated(host, int(possible_port), None)
+        return cls._validated(value, None, None)
+
+    @classmethod
+    def _validated(
+        cls,
+        raw_host: str,
+        port: int | None,
+        scheme: str | None,
+    ) -> Target:
+        host = raw_host.strip().lower().rstrip(".")
+        try:
+            host = ipaddress.ip_address(host).compressed
+        except ValueError:
+            try:
+                host = host.encode("idna").decode("ascii")
+            except UnicodeError as error:
+                raise ValueError("invalid target host") from error
+            labels = host.split(".")
+            if (
+                not host
+                or len(host) > 253
+                or any(
+                    not label
+                    or len(label) > 63
+                    or not label[0].isalnum()
+                    or not label[-1].isalnum()
+                    or any(
+                        not (character.isalnum() or character == "-")
+                        for character in label
+                    )
+                    for label in labels
+                )
+            ):
+                raise ValueError("invalid target host")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("invalid target port")
+        normalized_scheme = scheme.lower() if scheme is not None else None
+        if normalized_scheme is not None and normalized_scheme not in {
+            "http",
+            "https",
+            "tcp",
+            "ws",
+            "wss",
+        }:
+            raise ValueError("unsupported target scheme")
+        return cls(host, port, normalized_scheme)
+
+    @property
+    def effective_port(self) -> int | None:
+        if self.port is not None:
+            return self.port
+        return {
+            "http": 80,
+            "https": 443,
+            "ws": 80,
+            "wss": 443,
+        }.get(self.scheme or "")
+
+    @property
+    def key(self) -> tuple[str, int]:
+        port = self.effective_port
+        if port is None:
+            raise ValueError("target has no effective port")
+        return self.host, port
+
+    def matches(
+        self,
+        host: str,
+        port: int,
+        scheme: str | None = None,
+    ) -> bool:
+        if self.host != host or (
+            self.effective_port is not None and self.effective_port != port
+        ):
+            return False
+        if scheme is None:
+            return True
+        declared_scheme = self.scheme or "tcp"
+        compatible = {
+            ("http", "ws"),
+            ("ws", "http"),
+            ("https", "wss"),
+            ("wss", "https"),
+        }
+        return (
+            declared_scheme == scheme
+            or (declared_scheme, scheme) in compatible
+        )
+
+    def as_text(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        value = f"{host}:{self.port}" if self.port is not None else host
+        return f"{self.scheme}://{value}" if self.scheme else value
+
+
+class TokenBucket:
+    def __init__(self, rate: float, capacity: int) -> None:
+        self.rate = rate
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> tuple[bool, float]:
+        with self._lock:
+            now = time.monotonic()
+            self.tokens = min(
+                self.capacity,
+                self.tokens + max(0.0, now - self.updated) * self.rate,
+            )
+            self.updated = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True, 0.0
+            return False, (1 - self.tokens) / self.rate
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "capacity": int(self.capacity),
+                "rate_per_second": self.rate,
+                "tokens": round(self.tokens, 6),
+            }
+
+
+class Policy:
+    def __init__(self, targets: list[Target], rate: float, burst: int) -> None:
+        if not targets:
+            raise ValueError("at least one target is required")
+        keys = [target.as_text() for target in targets]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate target")
+        if len({target.key for target in targets}) != len(targets):
+            raise ValueError("targets must have distinct host/port pairs")
+        self.targets = tuple(targets)
+        self.buckets = {target.key: TokenBucket(rate, burst) for target in targets}
+
+    @staticmethod
+    def normalize_host(value: str) -> str:
+        return Target._validated(value, 1, None).host
+
+    def authorize(
+        self,
+        raw_host: str,
+        port: int,
+        scheme: str | None = None,
+    ) -> Target:
+        try:
+            host = self.normalize_host(raw_host)
+        except ValueError as error:
+            raise ProxyError(400, "target_invalid") from error
+        matching = [
+            target for target in self.targets if target.matches(host, port, scheme)
+        ]
+        if len(matching) != 1:
+            raise ProxyError(403, "target_not_allowed")
+        return matching[0]
+
+    def charge(self, target: Target) -> None:
+        allowed, retry_after = self.buckets[target.key].consume()
+        if not allowed:
+            error = ProxyError(429, "http_rate_limited")
+            error.retry_after = retry_after  # type: ignore[attr-defined]
+            raise error
+
+
+def interface_ipv4(name: str) -> str:
+    if not name or len(name.encode("ascii", errors="strict")) > 15 or "\x00" in name:
+        raise ValueError("invalid interface")
+    request = struct.pack("256s", name.encode("ascii"))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as descriptor:
+        response = fcntl.ioctl(descriptor.fileno(), 0x8915, request)
+    return socket.inet_ntoa(response[20:24])
+
+
+def parse_authority(value: str, default_port: int | None = None) -> tuple[str, int]:
+    if not value or len(value.encode("utf-8")) > 4096:
+        raise ProxyError(400, "authority_invalid")
+    parsed = urlsplit(f"target://{value}")
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProxyError(400, "authority_invalid")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ProxyError(400, "authority_invalid") from error
+    if port is None:
+        port = default_port
+    if port is None or not 1 <= port <= 65535:
+        raise ProxyError(400, "authority_invalid")
+    return parsed.hostname, port
+
+
+def read_header(stream) -> bytes:
+    payload = bytearray()
+    while b"\r\n\r\n" not in payload:
+        block = stream.read(1)
+        if not block:
+            raise ProxyError(400, "header_incomplete")
+        payload.extend(block)
+        if len(payload) > MAX_HEADER_BYTES:
+            raise ProxyError(431, "header_too_large")
+    return bytes(payload)
+
+
+def parse_header(payload: bytes) -> tuple[str, str, str, list[tuple[str, str]]]:
+    try:
+        lines = payload[:-4].decode("iso-8859-1").split("\r\n")
+    except UnicodeError as error:
+        raise ProxyError(400, "header_invalid") from error
+    if not lines or len(lines[0].encode("iso-8859-1")) > MAX_LINE_BYTES:
+        raise ProxyError(400, "request_line_invalid")
+    parts = lines[0].split(" ")
+    if len(parts) != 3:
+        raise ProxyError(400, "request_line_invalid")
+    method, target, version = parts
+    if (
+        not method.isascii()
+        or not method
+        or not method.isupper()
+        or version not in {"HTTP/1.0", "HTTP/1.1"}
+    ):
+        raise ProxyError(400, "request_line_invalid")
+    headers: list[tuple[str, str]] = []
+    for line in lines[1:]:
+        if not line or line[0] in " \t" or ":" not in line:
+            raise ProxyError(400, "header_invalid")
+        name, value = line.split(":", 1)
+        normalized_name = name.strip().lower()
+        normalized_value = value.strip()
+        if (
+            not normalized_name
+            or any(
+                character not in "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz"
+                for character in normalized_name
+            )
+            or "\x00" in normalized_value
+            or "\r" in normalized_value
+            or "\n" in normalized_value
+        ):
+            raise ProxyError(400, "header_invalid")
+        headers.append((normalized_name, normalized_value))
+    return method, target, version, headers
+
+
+def one_header(headers: list[tuple[str, str]], name: str) -> str | None:
+    values = [value for key, value in headers if key == name]
+    if len(values) > 1:
+        raise ProxyError(400, f"{name}_ambiguous")
+    return values[0] if values else None
+
+
+def connect_target(host: str, port: int) -> socket.socket:
+    try:
+        return socket.create_connection(
+            (host, port),
+            timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+    except (OSError, TimeoutError) as error:
+        raise ProxyError(502, "upstream_connect_failed") from error
+
+
+def relay(left: socket.socket, right: socket.socket) -> None:
+    selector = selectors.DefaultSelector()
+    selector.register(left, selectors.EVENT_READ, right)
+    selector.register(right, selectors.EVENT_READ, left)
+    started = last_activity = time.monotonic()
+    try:
+        while True:
+            now = time.monotonic()
+            if (
+                now - started >= TUNNEL_LIFETIME_SECONDS
+                or now - last_activity >= TUNNEL_IDLE_SECONDS
+            ):
+                return
+            events = selector.select(
+                min(
+                    1.0,
+                    TUNNEL_IDLE_SECONDS - (now - last_activity),
+                    TUNNEL_LIFETIME_SECONDS - (now - started),
+                )
+            )
+            if not events:
+                continue
+            for key, _mask in events:
+                source = key.fileobj
+                destination = key.data
+                block = source.recv(64 * 1024)
+                if not block:
+                    return
+                destination.sendall(block)
+                last_activity = time.monotonic()
+    finally:
+        selector.close()
+
+
+def copy_exact(source, destination: socket.socket, count: int) -> None:
+    remaining = count
+    while remaining:
+        block = source.read(min(64 * 1024, remaining))
+        if not block:
+            raise ProxyError(400, "request_body_incomplete")
+        destination.sendall(block)
+        remaining -= len(block)
+
+
+def copy_chunked(source, destination: socket.socket) -> None:
+    total = 0
+    while True:
+        line = source.readline(MAX_LINE_BYTES + 1)
+        if not line.endswith(b"\r\n") or len(line) > MAX_LINE_BYTES:
+            raise ProxyError(400, "chunk_header_invalid")
+        destination.sendall(line)
+        try:
+            size = int(line[:-2].split(b";", 1)[0], 16)
+        except ValueError as error:
+            raise ProxyError(400, "chunk_header_invalid") from error
+        if size < 0 or total + size > MAX_REQUEST_BODY_BYTES:
+            raise ProxyError(413, "request_body_too_large")
+        if size:
+            copy_exact(source, destination, size)
+            delimiter = source.read(2)
+            if delimiter != b"\r\n":
+                raise ProxyError(400, "chunk_body_invalid")
+            destination.sendall(delimiter)
+            total += size
+            continue
+        trailer_bytes = 0
+        while True:
+            trailer = source.readline(MAX_LINE_BYTES + 1)
+            if not trailer.endswith(b"\r\n") or len(trailer) > MAX_LINE_BYTES:
+                raise ProxyError(400, "chunk_trailer_invalid")
+            trailer_bytes += len(trailer)
+            if trailer_bytes > MAX_HEADER_BYTES:
+                raise ProxyError(431, "chunk_trailer_too_large")
+            destination.sendall(trailer)
+            if trailer == b"\r\n":
+                return
+
+
+class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    block_on_close = True
+
+
+class PolicyTCPServer(ThreadingTCPServer):
+    def __init__(self, address, handler, policy: Policy) -> None:
+        self.policy = policy
+        super().__init__(address, handler)
+
+
+class HTTPProxyHandler(socketserver.StreamRequestHandler):
+    server: PolicyTCPServer
+
+    def _error(self, error: ProxyError) -> None:
+        phrase = HTTPStatus(error.status).phrase
+        body = (
+            json.dumps(
+                {"error": error.code, "ok": False},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        extra = b""
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            extra = (f"Retry-After: {max(1, math.ceil(retry_after))}\r\n").encode(
+                "ascii"
+            )
+        response = (
+            (
+                f"HTTP/1.1 {error.status} {phrase}\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+            ).encode("ascii")
+            + extra
+            + b"\r\n"
+            + body
+        )
+        try:
+            self.connection.sendall(response)
+        except OSError:
+            pass
+
+    def handle(self) -> None:
+        self.connection.settimeout(CLIENT_TIMEOUT_SECONDS)
+        upstream: socket.socket | None = None
+        try:
+            method, raw_target, version, headers = parse_header(read_header(self.rfile))
+            if method == "CONNECT":
+                host, port = parse_authority(raw_target)
+                # CONNECT is only the HTTPS/WSS transport.  It must not turn
+                # an HTTP-only or raw-TCP allowlist entry into an opaque
+                # tunnel that bypasses request metering.
+                target = self.server.policy.authorize(host, port, "https")
+                self.server.policy.charge(target)
+                upstream = connect_target(target.host, port)
+                self.connection.sendall(
+                    b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n"
+                )
+                relay(self.connection, upstream)
+                return
+
+            parsed = urlsplit(raw_target)
+            if (
+                parsed.scheme not in {"http", "ws"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+            ):
+                raise ProxyError(400, "absolute_uri_required")
+            try:
+                port = parsed.port or 80
+            except ValueError as error:
+                raise ProxyError(400, "absolute_uri_invalid") from error
+            scheme = "ws" if parsed.scheme == "ws" else "http"
+            target = self.server.policy.authorize(
+                parsed.hostname,
+                port,
+                scheme,
+            )
+            host_header = one_header(headers, "host")
+            if host_header is None:
+                raise ProxyError(400, "host_required")
+            header_host, header_port = parse_authority(host_header, port)
+            if (
+                self.server.policy.normalize_host(header_host) != target.host
+                or header_port != port
+            ):
+                raise ProxyError(400, "host_target_mismatch")
+            if one_header(headers, "expect") is not None:
+                raise ProxyError(417, "expect_not_supported")
+            content_length_text = one_header(headers, "content-length")
+            transfer_encoding = one_header(headers, "transfer-encoding")
+            if content_length_text is not None and transfer_encoding is not None:
+                raise ProxyError(400, "request_framing_ambiguous")
+            content_length = 0
+            if content_length_text is not None:
+                try:
+                    content_length = int(content_length_text, 10)
+                except ValueError as error:
+                    raise ProxyError(400, "content_length_invalid") from error
+                if not 0 <= content_length <= MAX_REQUEST_BODY_BYTES:
+                    raise ProxyError(413, "request_body_too_large")
+            if transfer_encoding is not None and transfer_encoding.lower() != "chunked":
+                raise ProxyError(501, "transfer_encoding_not_supported")
+
+            self.server.policy.charge(target)
+            upstream = connect_target(target.host, port)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            upgrade = (one_header(headers, "upgrade") or "").lower() == "websocket"
+            outbound_headers: list[tuple[str, str]] = []
+            for name, value in headers:
+                if name in {
+                    "proxy-authorization",
+                    "proxy-connection",
+                    "connection",
+                }:
+                    continue
+                outbound_headers.append((name, value))
+            outbound_headers.append(("connection", "Upgrade" if upgrade else "close"))
+            request = (
+                f"{method} {path} {version}\r\n"
+                + "".join(f"{name}: {value}\r\n" for name, value in outbound_headers)
+                + "\r\n"
+            ).encode("iso-8859-1")
+            upstream.sendall(request)
+            if transfer_encoding is not None:
+                copy_chunked(self.rfile, upstream)
+            elif content_length:
+                copy_exact(self.rfile, upstream, content_length)
+            if upgrade:
+                relay(self.connection, upstream)
+                return
+            try:
+                upstream.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            while True:
+                block = upstream.recv(64 * 1024)
+                if not block:
+                    return
+                self.connection.sendall(block)
+        except ProxyError as error:
+            self._error(error)
+        except (OSError, TimeoutError):
+            self._error(ProxyError(502, "proxy_transport_failed"))
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+class SocksProxyHandler(socketserver.StreamRequestHandler):
+    server: PolicyTCPServer
+
+    def _reply(self, code: int) -> None:
+        self.connection.sendall(bytes((5, code, 0, 1, 0, 0, 0, 0, 0, 0)))
+
+    def _read_exact(self, count: int) -> bytes:
+        payload = self.rfile.read(count)
+        if len(payload) != count:
+            raise ProxyError(400, "socks_request_incomplete")
+        return payload
+
+    def handle(self) -> None:
+        self.connection.settimeout(CLIENT_TIMEOUT_SECONDS)
+        upstream: socket.socket | None = None
+        try:
+            version, method_count = self._read_exact(2)
+            methods = self._read_exact(method_count)
+            if version != 5 or 0 not in methods:
+                self.connection.sendall(b"\x05\xff")
+                return
+            self.connection.sendall(b"\x05\x00")
+            version, command, reserved, address_type = self._read_exact(4)
+            if version != 5 or command != 1 or reserved != 0:
+                self._reply(7)
+                return
+            if address_type == 1:
+                host = socket.inet_ntop(socket.AF_INET, self._read_exact(4))
+            elif address_type == 4:
+                host = socket.inet_ntop(socket.AF_INET6, self._read_exact(16))
+            elif address_type == 3:
+                length = self._read_exact(1)[0]
+                if not length:
+                    raise ProxyError(400, "socks_host_invalid")
+                host = self._read_exact(length).decode("idna")
+            else:
+                self._reply(8)
+                return
+            port = struct.unpack("!H", self._read_exact(2))[0]
+            # SOCKS is reserved for explicitly raw TCP targets.  Otherwise a
+            # client could bypass the HTTP forward-proxy token bucket.
+            target = self.server.policy.authorize(host, port, "tcp")
+            upstream = connect_target(target.host, port)
+            self._reply(0)
+            relay(self.connection, upstream)
+        except ProxyError:
+            try:
+                self._reply(2)
+            except OSError:
+                pass
+        except (OSError, TimeoutError, UnicodeError):
+            try:
+                self._reply(1)
+            except OSError:
+                pass
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+class ControlHandler(socketserver.StreamRequestHandler):
+    server: PolicyTCPServer
+
+    def _response(
+        self,
+        status: int,
+        document: dict[str, object],
+    ) -> None:
+        payload = (
+            json.dumps(
+                document,
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        self.connection.sendall(
+            (
+                f"HTTP/1.1 {status} {HTTPStatus(status).phrase}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            + payload
+        )
+
+    def handle(self) -> None:
+        self.connection.settimeout(CLIENT_TIMEOUT_SECONDS)
+        try:
+            method, raw_target, _version, _headers = parse_header(
+                read_header(self.rfile)
+            )
+            if method != "GET":
+                raise ProxyError(405, "method_not_allowed")
+            parsed = urlsplit(raw_target)
+            if parsed.scheme or parsed.netloc or parsed.fragment:
+                raise ProxyError(400, "control_target_invalid")
+            if parsed.path == "/healthz":
+                self._response(
+                    200,
+                    {"ok": True, "protocol": "ctfos.egress.health.v1"},
+                )
+                return
+            query = parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+            values = query.get("target", [])
+            if set(query) != {"target"} or len(values) != 1:
+                raise ProxyError(400, "target_query_invalid")
+            requested = Target.parse(values[0])
+            target = self.server.policy.authorize(
+                requested.host,
+                requested.effective_port or 0,
+                requested.scheme,
+            )
+            if parsed.path == "/v1/resolve":
+                try:
+                    addresses = socket.getaddrinfo(
+                        target.host,
+                        target.effective_port,
+                        type=socket.SOCK_STREAM,
+                    )
+                except socket.gaierror as error:
+                    raise ProxyError(502, "dns_resolution_failed") from error
+                normalized = sorted(
+                    {
+                        (
+                            "ipv6" if family == socket.AF_INET6 else "ipv4",
+                            str(sockaddr[0]),
+                        )
+                        for family, _kind, _protocol, _name, sockaddr in addresses
+                        if family in {socket.AF_INET, socket.AF_INET6}
+                    }
+                )
+                self._response(
+                    200,
+                    {
+                        "addresses": [
+                            {"address": address, "family": family}
+                            for family, address in normalized
+                        ],
+                        "ok": bool(normalized),
+                        "protocol": "ctfos.egress.dns.v1",
+                        "target": target.as_text(),
+                    },
+                )
+                return
+            if parsed.path == "/v1/bucket":
+                self._response(
+                    200,
+                    {
+                        "bucket": self.server.policy.buckets[target.key].snapshot(),
+                        "ok": True,
+                        "protocol": "ctfos.egress.bucket.v1",
+                        "target": target.as_text(),
+                    },
+                )
+                return
+            raise ProxyError(404, "control_path_unknown")
+        except (ProxyError, ValueError) as error:
+            if isinstance(error, ProxyError):
+                status, code = error.status, error.code
+            else:
+                status, code = 400, "target_invalid"
+            self._response(status, {"error": code, "ok": False})
+        except (OSError, TimeoutError):
+            pass
+
+
+def healthcheck(args: argparse.Namespace) -> int:
+    try:
+        address = interface_ipv4(args.listen_interface)
+        with socket.create_connection(
+            (address, args.control_port),
+            timeout=2,
+        ) as connection:
+            connection.sendall(
+                b"GET /healthz HTTP/1.1\r\nHost: boundary\r\nConnection: close\r\n\r\n"
+            )
+            response = connection.recv(4096)
+    except (OSError, ValueError):
+        return 1
+    return 0 if response.startswith(b"HTTP/1.1 200 ") else 1
+
+
+def serve(args: argparse.Namespace) -> int:
+    try:
+        address = interface_ipv4(args.listen_interface)
+        policy = Policy(
+            [Target.parse(value) for value in args.allow_target],
+            args.http_rate,
+            args.http_burst,
+        )
+        servers = [
+            PolicyTCPServer(
+                (address, args.http_port),
+                HTTPProxyHandler,
+                policy,
+            ),
+            PolicyTCPServer(
+                (address, args.socks_port),
+                SocksProxyHandler,
+                policy,
+            ),
+            PolicyTCPServer(
+                (address, args.control_port),
+                ControlHandler,
+                policy,
+            ),
+        ]
+    except (OSError, ValueError) as error:
+        print(f"ctf-egress-proxy: startup failed: {error}", file=os.sys.stderr)
+        return 1
+    stopping = threading.Event()
+
+    def stop(_signum, _frame) -> None:
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True) for server in servers
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        while not stopping.wait(0.2):
+            if not all(thread.is_alive() for thread in threads):
+                return 1
+    finally:
+        for server in servers:
+            server.shutdown()
+        for server in servers:
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(prog="ctf-egress-proxy")
+    commands = value.add_subparsers(dest="command", required=True)
+    server = commands.add_parser("serve")
+    server.add_argument("--listen-interface", required=True)
+    server.add_argument("--http-port", type=int, required=True)
+    server.add_argument("--socks-port", type=int, required=True)
+    server.add_argument("--control-port", type=int, required=True)
+    server.add_argument("--allow-target", action="append", default=[])
+    server.add_argument("--http-rate", type=float, required=True)
+    server.add_argument("--http-burst", type=int, required=True)
+    check = commands.add_parser("healthcheck")
+    check.add_argument("--listen-interface", required=True)
+    check.add_argument("--control-port", type=int, required=True)
+    return value
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "healthcheck":
+        return healthcheck(args)
+    if (
+        not math.isfinite(args.http_rate)
+        or not 0 < args.http_rate <= 1000
+        or not 1 <= args.http_burst <= 10000
+        or any(
+            not 1 <= value <= 65535
+            for value in (
+                args.http_port,
+                args.socks_port,
+                args.control_port,
+            )
+        )
+        or len(
+            {
+                args.http_port,
+                args.socks_port,
+                args.control_port,
+            }
+        )
+        != 3
+    ):
+        parser().error("invalid proxy limits or ports")
+    return serve(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

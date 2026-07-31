@@ -22,6 +22,9 @@ from ctf_os.codex import (
     ProcessOutcome,
     Role,
 )
+from ctf_os.capabilities import (
+    required_managed_capabilities_for_category,
+)
 from ctf_os.config import load_config
 from ctf_os.engine.challenge import (
     ChallengeEngine,
@@ -729,6 +732,42 @@ class ManagedV2Tests(unittest.TestCase):
             self.identity,
             prompt="solve this one challenge",
             state_schema_version=STATE_SCHEMA_VERSION,
+        )
+
+    def test_preflight_passes_category_requirements_to_production_probe(self):
+        engine = self.engine(ProbeRoleExecutor())
+        self.add_v2(engine)
+        calls = []
+
+        def probe(digest, *, required):
+            calls.append((digest, required))
+            return {
+                "ok": True,
+                "schema_version": 2,
+                "required": sorted(required),
+                "available": sorted(required),
+                "missing": [],
+            }
+
+        with mock.patch.object(
+            managed_module,
+            "inspect_pinned_capabilities",
+            probe,
+        ):
+            report = ManagedOrchestrator(
+                engine,
+                capability_probe=probe,
+            ).preflight(self.identity)
+
+        self.assertTrue(report.ok, report.issues)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    IMAGE_DIGEST,
+                    required_managed_capabilities_for_category("rev"),
+                )
+            ],
         )
 
     def seed_managed_remote_action(

@@ -27,6 +27,7 @@ from ctf_os.budget import (
 from ctf_os.capabilities import (
     CapabilityError,
     inspect_pinned_capabilities,
+    required_managed_capabilities_for_category,
 )
 from ctf_os.codex import Role
 from ctf_os.codex.contracts import (
@@ -726,7 +727,7 @@ class ManagedOrchestrator:
                 issues.append(
                     "selected target is revoked, expired, or inactive"
                 )
-            elif primary.enforcement != "proxy":
+            elif primary.enforcement not in {"proxy", "builtin"}:
                 issues.append(
                     "managed remote work requires a destination-enforcing "
                     "proxy target"
@@ -775,19 +776,46 @@ class ManagedOrchestrator:
         if digest is None:
             issues.append("managed mode requires a pinned runtime.image_digest")
         elif probe_image:
+            category_issue: str | None = None
             try:
-                capability = dict(self.capability_probe(digest))
+                if self.capability_probe is inspect_pinned_capabilities:
+                    try:
+                        required = (
+                            required_managed_capabilities_for_category(
+                                state.category
+                            )
+                        )
+                    except CapabilityError as error:
+                        category_issue = str(error)
+                        capability = {
+                            "ok": False,
+                            "error": category_issue,
+                        }
+                    else:
+                        capability = dict(
+                            self.capability_probe(
+                                digest,
+                                required=required,
+                            )
+                        )
+                else:
+                    capability = dict(self.capability_probe(digest))
             except (CapabilityError, EngineError, OSError, ValueError) as error:
                 capability = {"ok": False, "error": str(error)}
             checks["capabilities"] = capability
             if capability.get("ok") is not True:
-                missing = capability.get("missing")
-                suffix = (
-                    ": " + ", ".join(str(item) for item in missing)
-                    if isinstance(missing, list) and missing
-                    else ""
-                )
-                issues.append("pinned image lacks managed capabilities" + suffix)
+                if category_issue is not None:
+                    issues.append(category_issue)
+                else:
+                    missing = capability.get("missing")
+                    suffix = (
+                        ": " + ", ".join(str(item) for item in missing)
+                        if isinstance(missing, list) and missing
+                        else ""
+                    )
+                    issues.append(
+                        "pinned image lacks managed capabilities" + suffix
+                    )
 
         return PreflightReport(
             ok=not issues,
@@ -871,7 +899,7 @@ class ManagedOrchestrator:
                 primary is not None
                 and primary.status is TargetStatus.ACTIVE
                 and not self.engine._target_is_expired(primary)
-                and primary.enforcement == "proxy"
+                and primary.enforcement in {"proxy", "builtin"}
             )
             else None
         )
@@ -915,7 +943,8 @@ class ManagedOrchestrator:
                     and not self.engine._target_is_expired(
                         canonical_primary
                     )
-                    and canonical_primary.enforcement == "proxy"
+                    and canonical_primary.enforcement
+                    in {"proxy", "builtin"}
                 )
                 else None
             )
