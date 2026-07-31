@@ -28,6 +28,13 @@ from ctf_os.engine.managed_oracle_preissue import (
     MANAGED_ORACLE_PREISSUE_PROTOCOL,
     MANAGED_ORACLE_PREISSUE_STATE_KEY,
 )
+from ctf_os.engine.misc_transform import (
+    MISC_TRANSFORM_MAX_EVIDENCE_BYTES,
+    MISC_TRANSFORM_MAX_OUTPUT_BYTES,
+    MISC_TRANSFORM_MAX_STREAM_BYTES,
+    MISC_TRANSFORM_PROTOCOL,
+    misc_transform_canonical_json_bytes,
+)
 from ctf_os.images import validate_image_digest
 from ctf_os.managed import ManagedOrchestrator
 from ctf_os.models import (
@@ -229,6 +236,76 @@ _CRYPTO_VALIDATION_KEYS = frozenset(
 )
 _CRYPTO_RUN_DOCUMENT_MAX_BYTES = 1_048_576
 _CRYPTO_STREAM_MAX_BYTES = 1_048_576
+_MISC_RUN_DOCUMENT_MAX_BYTES = 1_048_576
+_MISC_BINDING_KEYS = frozenset(
+    {
+        "artifact_id",
+        "automatic_submission_authorized",
+        "candidate_sha256",
+        "evaluation",
+        "evaluation_sha256",
+        "misc_evaluation_id",
+        "oracle_authority",
+        "oracle_control_run_ids",
+        "oracle_control_status",
+        "oracle_negative_control_passed",
+        "oracle_preissue_id",
+        "passed",
+        "plan_sha256",
+        "protocol",
+        "run_ids",
+        "source_manifest_sha256",
+    }
+)
+_MISC_REQUEST_COMMON_KEYS = frozenset(
+    {
+        "base_revision",
+        "candidate_id",
+        "category",
+        "challenge_id",
+        "command",
+        "contest_id",
+        "created_at",
+        "image_reference",
+        "kind",
+        "misc_evaluation_id",
+        "network_target",
+        "ordinal",
+        "phase",
+        "plan_sha256",
+        "protocol",
+        "run_id",
+        "schema_version",
+        "source_manifest_sha256",
+    }
+)
+_MISC_RESULT_COMMON_KEYS = frozenset(
+    {
+        "artifacts",
+        "category",
+        "challenge_id",
+        "contest_id",
+        "exit_code",
+        "ordinal",
+        "phase",
+        "plan_sha256",
+        "run_id",
+        "schema_version",
+        "status",
+        "timed_out",
+    }
+)
+_MISC_VALIDATION_KEYS = frozenset(
+    {
+        "ok",
+        "ordinal",
+        "phase",
+        "plan_sha256",
+        "protocol",
+        "run_id",
+        "validated_at",
+    }
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -448,6 +525,407 @@ def _read_crypto_run_document(
     if type(value) is not dict:
         raise AssertionError(f"Crypto {label} is not an object")
     return value
+
+
+def _read_misc_run_document(
+    challenge_root: Path,
+    locator: str | None,
+    *,
+    label: str,
+) -> dict[str, object]:
+    if type(locator) is not str or not locator:
+        raise AssertionError(f"Misc {label} path is absent")
+    try:
+        relative = Path(locator)
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("run document path is not canonical")
+        target = challenge_root.joinpath(*relative.parts)
+        metadata = target.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size < 0
+            or metadata.st_size > _MISC_RUN_DOCUMENT_MAX_BYTES
+        ):
+            raise ValueError("run document is not a bounded regular file")
+        observed = target.read_bytes()
+        if len(observed) != metadata.st_size:
+            raise ValueError("run document changed during inventory")
+        payload = read_bounded_regular(
+            challenge_root,
+            locator,
+            maximum_bytes=_MISC_RUN_DOCUMENT_MAX_BYTES,
+            expected_sha256=hashlib.sha256(observed).hexdigest(),
+            expected_size=len(observed),
+        )
+        value = json.loads(payload)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise AssertionError(
+            f"Misc {label} is not a bounded canonical JSON document"
+        ) from error
+    if type(value) is not dict:
+        raise AssertionError(f"Misc {label} is not an object")
+    return value
+
+
+def _validated_misc_execution(
+    final,
+    candidate,
+    binding: object,
+    *,
+    challenge_root: Path,
+    image_digest: str,
+) -> tuple[list[object], dict[str, int]]:
+    """Re-derive the release result from five physical Misc executions."""
+
+    if (
+        type(binding) is not dict
+        or frozenset(binding) != _MISC_BINDING_KEYS
+        or binding.get("protocol") != MISC_TRANSFORM_PROTOCOL
+        or binding.get("oracle_authority")
+        != MANAGED_ORACLE_PREISSUE_PROTOCOL
+        or binding.get("passed") is not True
+        or binding.get("automatic_submission_authorized") is not False
+        or binding.get("oracle_control_status") != "passed"
+        or binding.get("oracle_negative_control_passed") is not True
+        or binding.get("candidate_sha256")
+        != hashlib.sha256(candidate.value.encode("utf-8")).hexdigest()
+        or binding.get("source_manifest_sha256")
+        != final.metadata.get("source_manifest_sha256")
+    ):
+        raise AssertionError("Misc managed proof binding is absent")
+    evaluation = binding.get("evaluation")
+    logical_run_ids = binding.get("run_ids")
+    control_run_ids = binding.get("oracle_control_run_ids")
+    evaluation_id = binding.get("misc_evaluation_id")
+    plan_sha256 = binding.get("plan_sha256")
+    preissue_id = binding.get("oracle_preissue_id")
+    if (
+        type(evaluation) is not dict
+        or evaluation.get("protocol") != MISC_TRANSFORM_PROTOCOL
+        or evaluation.get("passed") is not True
+        or evaluation.get("failure_codes") != []
+        or evaluation.get("plan_sha256") != plan_sha256
+        or type(logical_run_ids) is not list
+        or len(logical_run_ids) != 4
+        or len(set(logical_run_ids)) != 4
+        or type(control_run_ids) is not list
+        or len(control_run_ids) != 1
+        or len(set(control_run_ids)) != 1
+        or set(logical_run_ids) & set(control_run_ids)
+        or any(
+            type(run_id) is not str or not run_id
+            for run_id in [*logical_run_ids, *control_run_ids]
+        )
+        or type(evaluation_id) is not str
+        or not evaluation_id
+        or type(plan_sha256) is not str
+        or type(preissue_id) is not str
+        or not preissue_id
+    ):
+        raise AssertionError("Misc evaluation graph is incomplete")
+
+    canonical_evaluation = misc_transform_canonical_json_bytes(evaluation)
+    if (
+        binding.get("evaluation_sha256")
+        != hashlib.sha256(canonical_evaluation).hexdigest()
+    ):
+        raise AssertionError("Misc evaluation commitment is inconsistent")
+    artifacts_by_id = {item.id: item for item in final.artifacts}
+    if len(artifacts_by_id) != len(final.artifacts):
+        raise AssertionError("Misc state contains duplicate artifact IDs")
+    evaluation_artifact = artifacts_by_id.get(binding.get("artifact_id"))
+    if (
+        evaluation_artifact is None
+        or evaluation_artifact.sha256
+        != binding.get("evaluation_sha256")
+        or evaluation_artifact.size != len(canonical_evaluation)
+    ):
+        raise AssertionError("Misc evaluation artifact is not bound")
+    try:
+        observed_evaluation = read_bounded_regular(
+            challenge_root,
+            evaluation_artifact.path,
+            maximum_bytes=MISC_TRANSFORM_MAX_EVIDENCE_BYTES,
+            expected_sha256=evaluation_artifact.sha256,
+            expected_size=evaluation_artifact.size,
+        )
+    except (OSError, ValueError) as error:
+        raise AssertionError(
+            "Misc evaluation artifact does not match state"
+        ) from error
+    if observed_evaluation != canonical_evaluation:
+        raise AssertionError("Misc physical evaluation changed")
+
+    selected_ids = set(logical_run_ids) | set(control_run_ids)
+    physical_runs = [item for item in final.runs if item.id in selected_ids]
+    phases = [item.extra.get("phase") for item in physical_runs]
+    if (
+        len(physical_runs) != 5
+        or phases
+        != ["transform", "oracle-control", "reverse", "reverse", "reverse"]
+        or [item.id for item in physical_runs if item.extra.get("phase") != "oracle-control"]
+        != logical_run_ids
+        or [item.id for item in physical_runs if item.extra.get("phase") == "oracle-control"]
+        != control_run_ids
+    ):
+        raise AssertionError("Misc physical run matrix is incomplete")
+
+    expected_transform_command = [
+        "/usr/bin/python3",
+        "/work/tool/transform.py",
+        "/work/inputs/001.bin",
+    ]
+    expected_verifier_command = [
+        "/usr/bin/python3",
+        "/work/oracle/verifier.py",
+        "/work/candidate/candidate.bin",
+        "/work/sources/001.bin",
+    ]
+    counts = {"transform": 0, "oracle-control": 0, "reverse": 0}
+    for run in physical_runs:
+        phase = run.extra.get("phase")
+        ordinal = run.extra.get("ordinal")
+        if (
+            phase not in counts
+            or type(ordinal) is not int
+            or run.status is not RunStatus.COMPLETED
+            or run.origin is not RunOrigin.PROOF
+            or run.configuration_epoch != final.configuration_epoch
+            or run.role != "misc_transform"
+            or run.request_path != f"runs/{run.id}/request.json"
+            or run.result_path != f"runs/{run.id}/result.json"
+            or run.validation_path != f"runs/{run.id}/validation.json"
+            or run.extra.get("misc_transform_protocol")
+            != MISC_TRANSFORM_PROTOCOL
+            or run.extra.get("misc_evaluation_id") != evaluation_id
+            or run.extra.get("plan_sha256") != plan_sha256
+        ):
+            raise AssertionError(
+                f"Misc physical {phase!s} run is not state-bound"
+            )
+        request = _read_misc_run_document(
+            challenge_root,
+            run.request_path,
+            label=f"{phase} request",
+        )
+        result = _read_misc_run_document(
+            challenge_root,
+            run.result_path,
+            label=f"{phase} result",
+        )
+        validation = _read_misc_run_document(
+            challenge_root,
+            run.validation_path,
+            label=f"{phase} validation",
+        )
+        phase_request_keys = {
+            "transform": {"step_id"},
+            "oracle-control": {
+                "negative_control_sha256",
+                "oracle_authority",
+                "oracle_preissue_id",
+                "verifier_id",
+            },
+            "reverse": {
+                "oracle_authority",
+                "oracle_preissue_id",
+                "verifier_id",
+            },
+        }[phase]
+        phase_result_keys = {
+            "transform": {"output_artifact", "step_id"},
+            "oracle-control": {"negative_control_rejected"},
+            "reverse": {"verifier_accepts"},
+        }[phase]
+        if (
+            frozenset(request)
+            != _MISC_REQUEST_COMMON_KEYS | phase_request_keys
+            or request.get("base_revision") != run.base_revision
+            or request.get("candidate_id") != candidate.id
+            or request.get("contest_id") != final.contest_id
+            or request.get("category") != final.category
+            or request.get("challenge_id") != final.challenge_id
+            or request.get("run_id") != run.id
+            or request.get("schema_version") != 1
+            or type(request.get("created_at")) is not str
+            or not request.get("created_at")
+            or request.get("kind") != "misc_transform"
+            or request.get("protocol") != MISC_TRANSFORM_PROTOCOL
+            or request.get("misc_evaluation_id") != evaluation_id
+            or request.get("plan_sha256") != plan_sha256
+            or request.get("phase") != phase
+            or request.get("ordinal") != ordinal
+            or request.get("network_target") is not None
+            or request.get("source_manifest_sha256")
+            != binding.get("source_manifest_sha256")
+            or request.get("image_reference") != image_digest
+            or request.get("command")
+            != (
+                expected_transform_command
+                if phase == "transform"
+                else expected_verifier_command
+            )
+            or frozenset(result)
+            != _MISC_RESULT_COMMON_KEYS | phase_result_keys
+            or result.get("contest_id") != final.contest_id
+            or result.get("category") != final.category
+            or result.get("challenge_id") != final.challenge_id
+            or result.get("run_id") != run.id
+            or result.get("schema_version") != 1
+            or result.get("phase") != phase
+            or result.get("ordinal") != ordinal
+            or result.get("plan_sha256") != plan_sha256
+            or result.get("timed_out") is not False
+            or frozenset(validation) != _MISC_VALIDATION_KEYS
+            or validation.get("run_id") != run.id
+            or type(validation.get("validated_at")) is not str
+            or not validation.get("validated_at")
+            or validation.get("ok") is not True
+            or validation.get("phase") != phase
+            or validation.get("ordinal") != ordinal
+            or validation.get("protocol") != MISC_TRANSFORM_PROTOCOL
+            or validation.get("plan_sha256") != plan_sha256
+        ):
+            raise AssertionError(
+                f"Misc physical {phase} evidence is not exact"
+            )
+
+        record = run.extra.get("misc_transform_record")
+        if phase == "transform":
+            if (
+                request.get("step_id") != run.extra.get("step_id")
+                or result.get("step_id") != run.extra.get("step_id")
+                or result.get("status") != "completed"
+                or result.get("exit_code") != 0
+                or type(record) is not dict
+                or record.get("run_id") != run.id
+                or record.get("accepted") is not True
+                or record.get("clean_workspace") is not True
+                or record.get("network_denied") is not True
+                or record.get("target_exit_code") != 0
+                or record.get("runner_exit_code") != 0
+                or record.get("ctfwrap_exit_code") != 0
+                or record.get("timed_out") is not False
+                or record.get("orchestration_status") != "completed"
+                or result.get("output_artifact")
+                != record.get("output_artifact")
+            ):
+                raise AssertionError(
+                    "Misc physical transform did not produce the bound node"
+                )
+            expected_artifact_ids = [
+                record["stdout"]["artifact_id"],
+                record["stderr"]["artifact_id"],
+                record["output_artifact"]["artifact_id"],
+            ]
+        elif phase == "oracle-control":
+            if (
+                request.get("oracle_authority")
+                != MANAGED_ORACLE_PREISSUE_PROTOCOL
+                or request.get("oracle_preissue_id") != preissue_id
+                or request.get("verifier_id") != run.extra.get("verifier_id")
+                or type(request.get("negative_control_sha256")) is not str
+                or len(request["negative_control_sha256"]) != 64
+                or result.get("status") != "failed"
+                or type(result.get("exit_code")) is not int
+                or result.get("exit_code") == 0
+                or result.get("negative_control_rejected") is not True
+                or run.extra.get("negative_control_rejected") is not True
+            ):
+                raise AssertionError(
+                    "Misc physical negative control was not rejected"
+                )
+            control_streams = {
+                artifact.extra.get("stream"): artifact.id
+                for artifact in final.artifacts
+                if artifact.source_run_id == run.id
+                and artifact.extra.get("kind") == "misc_transform_stream"
+            }
+            if set(control_streams) != {"stdout", "stderr"}:
+                raise AssertionError(
+                    "Misc physical negative-control streams are incomplete"
+                )
+            expected_artifact_ids = [
+                control_streams["stdout"],
+                control_streams["stderr"],
+            ]
+        else:
+            if (
+                request.get("oracle_authority")
+                != MANAGED_ORACLE_PREISSUE_PROTOCOL
+                or request.get("oracle_preissue_id") != preissue_id
+                or request.get("verifier_id") != run.extra.get("verifier_id")
+                or result.get("status") != "completed"
+                or result.get("exit_code") != 0
+                or result.get("verifier_accepts") is not True
+                or type(record) is not dict
+                or record.get("run_id") != run.id
+                or record.get("accepted") is not True
+                or record.get("clean_workspace") is not True
+                or record.get("network_denied") is not True
+                or record.get("target_exit_code") != 0
+                or record.get("runner_exit_code") != 0
+                or record.get("ctfwrap_exit_code") != 0
+                or record.get("timed_out") is not False
+                or record.get("orchestration_status") != "completed"
+            ):
+                raise AssertionError(
+                    "Misc physical reverse oracle did not accept"
+                )
+            expected_artifact_ids = [
+                record["stdout"]["artifact_id"],
+                record["stderr"]["artifact_id"],
+                record["result_artifact"]["artifact_id"],
+            ]
+
+        result_artifacts = result.get("artifacts")
+        if (
+            type(result_artifacts) is not list
+            or len(result_artifacts) != len(expected_artifact_ids)
+            or any(
+                type(reference) is not dict
+                or reference.get("id") != artifact_id
+                or artifact_id not in artifacts_by_id
+                or reference != artifacts_by_id[artifact_id].to_dict()
+                or artifacts_by_id[artifact_id].source_run_id != run.id
+                for reference, artifact_id in zip(
+                    result_artifacts,
+                    expected_artifact_ids,
+                    strict=True,
+                )
+            )
+        ):
+            raise AssertionError(
+                f"Misc physical {phase} artifact graph is not exact"
+            )
+        for artifact_id in expected_artifact_ids:
+            artifact = artifacts_by_id[artifact_id]
+            maximum = (
+                MISC_TRANSFORM_MAX_STREAM_BYTES
+                if artifact.extra.get("kind") == "misc_transform_stream"
+                else MISC_TRANSFORM_MAX_OUTPUT_BYTES
+            )
+            try:
+                read_bounded_regular(
+                    challenge_root,
+                    artifact.path,
+                    maximum_bytes=maximum,
+                    expected_sha256=artifact.sha256,
+                    expected_size=artifact.size,
+                )
+            except (OSError, ValueError) as error:
+                raise AssertionError(
+                    f"Misc physical {phase} artifact does not match state"
+                ) from error
+        counts[phase] += 1
+
+    if counts != {"transform": 1, "oracle-control": 1, "reverse": 3}:
+        raise AssertionError("Misc physical execution counts are incomplete")
+    return physical_runs, counts
 
 
 def _validated_crypto_execution(
@@ -1037,7 +1515,7 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         value=MISC_CANDIDATE,
     )
 
-    final, experiment = _execute_managed_builder_action(
+    committed, experiment = _execute_managed_builder_action(
         engine,
         identity,
         action={
@@ -1049,6 +1527,22 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         },
         payloads=payloads,
         extra_write_locators=("transform.py",),
+    )
+    committed_revision = committed.revision
+    experiment_id = experiment.id
+    final = engine.store.load(identity, recover=False)
+    final.validate()
+    verified_artifacts = engine.store.verify_artifacts(identity)
+    if (
+        final.revision != committed_revision
+        or set(verified_artifacts)
+        != {artifact.id for artifact in final.artifacts}
+    ):
+        raise AssertionError(
+            "Misc StateStore reload or physical artifact validation failed"
+        )
+    experiment = next(
+        item for item in final.experiments if item.id == experiment_id
     )
     candidate = next(
         item
@@ -1066,11 +1560,14 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         if isinstance(binding, dict)
         else None
     )
-    physical_runs = [
-        item
-        for item in final.runs
-        if item.extra.get("misc_evaluation_id") == evaluation_id
-    ]
+    challenge_root = engine.store.challenge_paths(identity).root
+    physical_runs, physical_counts = _validated_misc_execution(
+        final,
+        candidate,
+        binding,
+        challenge_root=challenge_root,
+        image_digest=image_digest,
+    )
     control_run_ids = (
         binding.get("oracle_control_run_ids")
         if isinstance(binding, dict)
@@ -1083,27 +1580,6 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         item.extra.get("phase")
         for item in physical_runs
     ]
-    physical_details: list[dict[str, object]] = []
-    challenge_root = engine.store.challenge_paths(identity).root
-    for item in physical_runs:
-        result_payload: dict[str, object] = {}
-        if item.result_path:
-            loaded = json.loads(
-                (challenge_root / item.result_path).read_text(
-                    encoding="utf-8"
-                )
-            )
-            if isinstance(loaded, dict):
-                result_payload = loaded
-        physical_details.append(
-            {
-                "exit_code": result_payload.get("exit_code"),
-                "phase": item.extra.get("phase"),
-                "run_status": item.status.value,
-                "sandbox_status": result_payload.get("status"),
-                "timed_out": result_payload.get("timed_out"),
-            }
-        )
     checks = {
         "binding": isinstance(binding, dict),
         "binding_passed": (
@@ -1134,9 +1610,9 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
             and len(run_ids) == 4
         ),
         "physical_runs": len(physical_runs) == 5,
-        "transform_runs": phases.count("transform") == 1,
-        "control_runs": phases.count("oracle-control") == 1,
-        "reverse_runs": phases.count("reverse") == 3,
+        "transform_runs": physical_counts["transform"] == 1,
+        "control_runs": physical_counts["oracle-control"] == 1,
+        "reverse_runs": physical_counts["reverse"] == 3,
         "preissue_consumed": (
             preissue_state.get("status") == "consumed"
             and bool(preissue_state.get("consumed_by_builder_run_id"))
@@ -1151,7 +1627,7 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
                 {
                     "checks": checks,
                     "logical_run_ids": run_ids,
-                    "physical_runs": physical_details,
+                    "physical_phases": phases,
                 },
                 sort_keys=True,
             )
@@ -1167,8 +1643,8 @@ def _misc(root: Path, image_digest: str) -> dict[str, object]:
         "runs": len(physical_runs),
         "submissions": len(final.submissions),
         "transform_evidence_passed": binding["passed"],
-        "transform_runs": 1,
-        "verification_runs": 3,
+        "transform_runs": physical_counts["transform"],
+        "verification_runs": physical_counts["reverse"],
     }
 
 

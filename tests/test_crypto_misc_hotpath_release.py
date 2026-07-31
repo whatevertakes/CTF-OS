@@ -480,6 +480,86 @@ class CryptoMiscHotPathReleaseTests(unittest.TestCase):
         os.environ.get("CTFOS_RUN_CRYPTO_MISC_DOCKER") == "1",
         "set CTFOS_RUN_CRYPTO_MISC_DOCKER=1 for the real Docker gate",
     )
+    def test_misc_gate_rejects_postcommit_sidecar_rewrite(self) -> None:
+        original = release._execute_managed_builder_action
+
+        def hostile(engine, identity, **kwargs):
+            final, experiment = original(engine, identity, **kwargs)
+            challenge_root = engine.store.challenge_paths(identity).root
+            for run in final.runs:
+                if run.extra.get("misc_evaluation_id") is None:
+                    continue
+                result_path = challenge_root / run.result_path
+                result_path.chmod(0o600)
+                result = json.loads(
+                    result_path.read_text(encoding="utf-8")
+                )
+                result.update(
+                    {
+                        "exit_code": 99,
+                        "status": "failed",
+                        "timed_out": True,
+                    }
+                )
+                result_path.write_text(
+                    json.dumps(result, sort_keys=True),
+                    encoding="utf-8",
+                )
+                result_path.chmod(0o400)
+            return final, experiment
+
+        release._execute_managed_builder_action = hostile
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "Misc physical",
+                ):
+                    release._misc(
+                        Path(temporary),
+                        release.RELEASE_IMAGE_DIGEST,
+                    )
+        finally:
+            release._execute_managed_builder_action = original
+
+    @unittest.skipUnless(
+        os.environ.get("CTFOS_RUN_CRYPTO_MISC_DOCKER") == "1",
+        "set CTFOS_RUN_CRYPTO_MISC_DOCKER=1 for the real Docker gate",
+    )
+    def test_misc_gate_rejects_postcommit_artifact_deletion(self) -> None:
+        original = release._execute_managed_builder_action
+
+        def hostile(engine, identity, **kwargs):
+            final, experiment = original(engine, identity, **kwargs)
+            candidate = next(
+                item
+                for item in final.candidates
+                if item.id == "C-misc-docker"
+            )
+            binding = candidate.extra["misc_transform_evidence"]
+            artifact = next(
+                item
+                for item in final.artifacts
+                if item.id == binding["artifact_id"]
+            )
+            (engine.store.challenge_paths(identity).root / artifact.path).unlink()
+            return final, experiment
+
+        release._execute_managed_builder_action = hostile
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaises((OSError, ValueError)):
+                    release._misc(
+                        Path(temporary),
+                        release.RELEASE_IMAGE_DIGEST,
+                    )
+        finally:
+            release._execute_managed_builder_action = original
+
+    @unittest.skipUnless(
+        os.environ.get("CTFOS_RUN_CRYPTO_MISC_DOCKER") == "1",
+        "set CTFOS_RUN_CRYPTO_MISC_DOCKER=1 for the real Docker gate",
+    )
     def test_real_docker_release_gate(self) -> None:
         completed = subprocess.run(
             (
