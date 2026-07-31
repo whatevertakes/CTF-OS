@@ -138,8 +138,19 @@ class ProbeRoleExecutor:
         self.roles: list[Role] = []
         self.prompts: list[tuple[Role, str]] = []
 
+    def _prepare_output_payload(
+        self,
+        *,
+        command,
+        cwd,
+        role: Role,
+        payload: dict[str, object],
+    ) -> None:
+        """Allow test executors to prepare one payload before it is written."""
+        del command, cwd, role, payload
+
     def run(self, command, *, cwd, timeout, on_stdout_line):
-        del cwd, timeout
+        del timeout
         role = _role_for(command)
         with self.lock:
             self.active += 1
@@ -164,7 +175,9 @@ class ProbeRoleExecutor:
             contract_version = output_schema["properties"][
                 "schema_version"
             ]["enum"][0]
-            current_run_id = _output_path(command).parent.name
+            current_run_id = Path(
+                command.argv[schema_index + 1]
+            ).parent.name
             if contract_version == 2:
                 payload["schema_version"] = 2
                 if role is Role.CAPTAIN:
@@ -327,6 +340,12 @@ class ProbeRoleExecutor:
                     }
                 ]
             time.sleep(0.01)
+            self._prepare_output_payload(
+                command=command,
+                cwd=cwd,
+                role=role,
+                payload=payload,
+            )
             _output_path(command).write_text(
                 json.dumps(payload),
                 encoding="utf-8",

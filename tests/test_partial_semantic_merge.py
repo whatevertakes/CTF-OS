@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -28,7 +27,6 @@ from ctf_os.schema import STATE_SCHEMA_VERSION
 from tests.test_engine import (
     FakeSandbox,
     RoleExecutor,
-    _output_path,
     _role_for,
 )
 from tests.test_managed import IMAGE_DIGEST, ProbeRoleExecutor
@@ -49,47 +47,50 @@ class EvidenceProbeRoleExecutor(ProbeRoleExecutor):
             role if role in self.invalid_roles else None
         )
         try:
-            outcome = super().run(
+            return super().run(
                 command,
                 cwd=cwd,
                 timeout=timeout,
                 on_stdout_line=on_stdout_line,
             )
-            if role in self.invalid_roles or role is Role.CAPTAIN:
-                return outcome
-
-            output_path = _output_path(command)
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-            payload["hypotheses"] = [
-                {
-                    "id": f"{role.value}-hypothesis",
-                    "claim": f"{role.value} has independent wave evidence",
-                    "evidence": ["obs-1"],
-                    "unknowns": ["whether the behavior survives replay"],
-                    "experiment": "replay one bounded input",
-                    "success_oracle": "the same observation is reproduced",
-                    "falsifier": "the replay does not reproduce it",
-                }
-            ]
-            if role is Role.BUILDER:
-                artifact_path = Path(cwd) / "sibling-evidence.bin"
-                artifact_path.write_bytes(self.artifact_payload)
-                payload["artifacts"] = [
-                    {
-                        "path": artifact_path.name,
-                        "sha256": hashlib.sha256(
-                            self.artifact_payload
-                        ).hexdigest(),
-                        "purpose": "bounded sibling evidence",
-                    }
-                ]
-            output_path.write_text(
-                json.dumps(payload),
-                encoding="utf-8",
-            )
-            return outcome
         finally:
             self.invalid_role = None
+
+    def _prepare_output_payload(
+        self,
+        *,
+        command,
+        cwd,
+        role: Role,
+        payload: dict[str, object],
+    ) -> None:
+        del command
+        if role in self.invalid_roles or role is Role.CAPTAIN:
+            return
+
+        payload["hypotheses"] = [
+            {
+                "id": f"{role.value}-hypothesis",
+                "claim": f"{role.value} has independent wave evidence",
+                "evidence": ["obs-1"],
+                "unknowns": ["whether the behavior survives replay"],
+                "experiment": "replay one bounded input",
+                "success_oracle": "the same observation is reproduced",
+                "falsifier": "the replay does not reproduce it",
+            }
+        ]
+        if role is Role.BUILDER:
+            artifact_path = Path(cwd) / "sibling-evidence.bin"
+            artifact_path.write_bytes(self.artifact_payload)
+            payload["artifacts"] = [
+                {
+                    "path": artifact_path.name,
+                    "sha256": hashlib.sha256(
+                        self.artifact_payload
+                    ).hexdigest(),
+                    "purpose": "bounded sibling evidence",
+                }
+            ]
 
 
 class PartialSemanticMergeTests(unittest.TestCase):

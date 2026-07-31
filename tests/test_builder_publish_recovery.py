@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import json
 import os
 import tempfile
 import unittest
@@ -23,7 +22,7 @@ from ctf_os.models import (
 )
 from ctf_os.schema import STATE_SCHEMA_VERSION
 from ctf_os.workspace_publish import MAX_PUBLISH_BYTES
-from tests.test_engine import FakeSandbox, _output_path, _role_for
+from tests.test_engine import FakeSandbox
 from tests.test_managed import IMAGE_DIGEST, ProbeRoleExecutor
 
 
@@ -42,21 +41,21 @@ class BuilderPublishExecutor(ProbeRoleExecutor):
         self.fifo_paths = frozenset(fifo_paths)
         self.sparse_sizes = dict(sparse_sizes or {})
 
-    def run(self, command, *, cwd, timeout, on_stdout_line):
-        outcome = super().run(
-            command,
-            cwd=cwd,
-            timeout=timeout,
-            on_stdout_line=on_stdout_line,
-        )
-        if _role_for(command) is not Role.BUILDER:
-            return outcome
+    def _prepare_output_payload(
+        self,
+        *,
+        command,
+        cwd,
+        role: Role,
+        payload: dict[str, object],
+    ) -> None:
+        del command
+        if role is not Role.BUILDER:
+            return
         workspace = Path(cwd)
         if self.symlink_escape is not None:
             name, destination = self.symlink_escape
             os.symlink(destination, workspace / name)
-        payload_path = _output_path(command)
-        payload = json.loads(payload_path.read_text(encoding="utf-8"))
         for relative, content in self.proposals:
             payload["actions"].append(
                 {
@@ -89,8 +88,6 @@ class BuilderPublishExecutor(ProbeRoleExecutor):
                 target = workspace / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content)
-        payload_path.write_text(json.dumps(payload), encoding="utf-8")
-        return outcome
 
 
 class BuilderPublishRecoveryTests(unittest.TestCase):
