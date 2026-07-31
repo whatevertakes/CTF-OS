@@ -3951,11 +3951,38 @@ class ManagedV2Tests(unittest.TestCase):
             sandbox_factory=sandbox_factory,
         )
         self.add_v2(engine)
+        captain_context_states = []
+        original_context_builder = challenge_module.build_context_pack
 
-        state = ManagedOrchestrator(
-            engine,
-            capability_probe=self.capability,
-        ).run_cycle(self.identity)
+        def capture_captain_context(state, *args, **kwargs):
+            if kwargs.get("role") == Role.CAPTAIN.value:
+                captain_context_states.append(copy.deepcopy(state))
+            return original_context_builder(state, *args, **kwargs)
+
+        with mock.patch.object(
+            challenge_module,
+            "build_context_pack",
+            side_effect=capture_captain_context,
+        ):
+            state = ManagedOrchestrator(
+                engine,
+                capability_probe=self.capability,
+            ).run_cycle(self.identity)
+        self.assertEqual(len(captain_context_states), 1)
+        self.assertEqual(engine._managed_storage_admissions, {})
+
+        managed_receipts = [
+            receipt
+            for receipt in state.receipts
+            if receipt.experiment_id.startswith("E-MR-")
+        ]
+        self.assertEqual(len(managed_receipts), 3)
+        self.assertTrue(
+            all(
+                receipt.outcome.value == "succeeded"
+                for receipt in managed_receipts
+            )
+        )
 
         captain_prompts = [
             prompt
@@ -4057,8 +4084,8 @@ class ManagedV2Tests(unittest.TestCase):
         )
 
         pressure = build_context_pack(
-            state,
-            get_adapter(state.category),
+            captain_context_states[0],
+            get_adapter(captain_context_states[0].category),
             state_path=paths.state,
             max_chars=4096,
         )
@@ -4074,6 +4101,13 @@ class ManagedV2Tests(unittest.TestCase):
             if item.get("kind") == "recent_execution_receipt"
         ]
         self.assertTrue(pressure_receipts)
+        self.assertTrue(
+            {item["id"] for item in pressure_receipts} <= recent_ids
+        )
+        self.assertEqual(
+            pressure_receipts[0]["id"],
+            captain_context_states[0].receipts[-1].id,
+        )
         newest_stdout = pressure_receipts[0]["streams"]["stdout"]
         self.assertIn(
             ReceiptCanarySandbox.canary,
@@ -4749,6 +4783,7 @@ class ManagedV2Tests(unittest.TestCase):
             engine,
             capability_probe=self.capability,
         ).run_cycle(self.identity)
+        self.assertEqual(engine._managed_storage_admissions, {})
         selected = set(state.cycles[0].selected_action_ids)
         failed = {
             item.id

@@ -4340,6 +4340,13 @@ class ManagedOrchestrator:
             )
             lanes.setdefault(str(role), []).append(experiment_id)
 
+        storage_admission = (
+            self.engine._admit_managed_tool_action_batch_storage(
+                identity,
+                experiment_ids=selected,
+            )
+        )
+
         def execute_lane(experiment_ids: Sequence[str]) -> None:
             for experiment_id in experiment_ids:
                 self.engine.execute_registered_experiments(
@@ -4352,33 +4359,41 @@ class ManagedOrchestrator:
                     # Per-action governor commits can race other lanes and
                     # freeze a valid wave at an intermediate revision.
                     _record_stall=False,
+                    # The entire bounded lane set was conservatively admitted
+                    # before any parallel action writer started.
+                    _storage_admission=storage_admission,
                 )
 
-        if len(lanes) == 1:
-            execute_lane(next(iter(lanes.values())))
-        else:
-            errors: list[BaseException] = []
-            with ThreadPoolExecutor(
-                max_workers=len(lanes),
-                thread_name_prefix="ctfos-managed-tool",
-            ) as executor:
-                futures = [
-                    executor.submit(execute_lane, tuple(experiment_ids))
-                    for experiment_ids in lanes.values()
-                ]
-                for future in futures:
-                    try:
-                        future.result()
-                    except BaseException as error:
-                        errors.append(error)
-            if errors:
-                primary = errors[0]
-                for additional in errors[1:]:
-                    primary.add_note(
-                        "additional managed tool lane failed: "
-                        f"{type(additional).__name__}: {additional}"
-                    )
-                raise primary
+        try:
+            if len(lanes) == 1:
+                execute_lane(next(iter(lanes.values())))
+            else:
+                errors: list[BaseException] = []
+                with ThreadPoolExecutor(
+                    max_workers=len(lanes),
+                    thread_name_prefix="ctfos-managed-tool",
+                ) as executor:
+                    futures = [
+                        executor.submit(execute_lane, tuple(experiment_ids))
+                        for experiment_ids in lanes.values()
+                    ]
+                    for future in futures:
+                        try:
+                            future.result()
+                        except BaseException as error:
+                            errors.append(error)
+                if errors:
+                    primary = errors[0]
+                    for additional in errors[1:]:
+                        primary.add_note(
+                            "additional managed tool lane failed: "
+                            f"{type(additional).__name__}: {additional}"
+                        )
+                    raise primary
+        finally:
+            self.engine._release_managed_tool_action_batch_storage(
+                storage_admission
+            )
         completed = self.engine.store.load(identity)
         return (
             self.engine._record_stall_if_needed(completed)

@@ -1009,6 +1009,13 @@ inventory의 `control.quota_exempt_bytes`에 별도로 표시합니다. immutabl
 100,000 entry와 256 GiB
 관찰량에서 중단하며, symlink·special file·hardlink 또는 scan 한계 때문에
 exact total을 증명할 수 없으면 quota 판정을 fail-closed합니다.
+managed shell action wave는 이 mutable inventory를 lane마다 다시 읽지 않습니다.
+exclusive challenge session lock 아래 선택된 모든 action의 `/work` 상한, bounded
+stdout/stderr snapshot, Rev source snapshot, Forensic evaluation과 capped run 문서를
+합산해 **lane 시작 전에 한 번** admission하고, exact challenge·experiment 집합에
+결속된 engine-private capability가 살아 있는 동안에만 개별 copy의 재scan을
+생략합니다. capability는 성공·부분 실패·interruption 모두에서 wave 종료 시
+해제되며 sandbox lane 수 자체를 줄이거나 직렬화하지 않습니다.
 `ctfos export`는 session lock 아래 메모리에서 만든 JSON/Markdown의 실제
 atomic generation byte를 admission에 사용합니다. 다만 미완료 closure intent를
 먼저 복구해야 하는 export와 `ctfos close`의 assembling/ready recovery

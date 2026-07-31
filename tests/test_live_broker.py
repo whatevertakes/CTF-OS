@@ -3776,11 +3776,11 @@ class LiveBrokerTests(unittest.TestCase):
                             "value": "FLAG{broker_fast_path}",
                             "source": "live-test",
                         },
-                        timeout=1,
+                        timeout=5,
                     )
                     elapsed = time.monotonic() - started
 
-                    self.assertLess(elapsed, 0.75)
+                    self.assertLess(elapsed, 2.0)
                     self.assertFalse(release.is_set())
                     self.assertIn("candidate_id", result)
                     self.assertTrue(

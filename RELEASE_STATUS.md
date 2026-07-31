@@ -77,6 +77,10 @@ pin을 통과해야 한다. flag처럼 보이는 문자열은 후보일 뿐 자�
   benchmark는 없다.
 - 실행 image는 exact local ID로 고정되지만 rebuild는 아직 hermetic하지 않고
   SBOM, signature, SLSA/CI-backed release attestation도 없다.
+- foreground managed action wave의 aggregate storage admission capability는 exact
+  challenge·experiment와 현재 process/session 수명에 결속되며 durable background
+  lease가 아니다. foreground container는 one-shot supervisor 경로를 따르고,
+  process 중단 뒤 남은 실제 byte는 다음 bounded inventory가 다시 계산한다.
 - local Pwn/Web gate는 remote libc, WAF/CDN/TLS, latency와 reliability를
   증명하지 않는다.
 - first-class managed category는 Web, Pwn, Rev, Crypto, Forensic, Misc다. AI/ML,

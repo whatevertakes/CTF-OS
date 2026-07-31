@@ -151,7 +151,6 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
         self,
     ) -> None:
         matrix = _matrix()
-        digest = matrix["release_image_digest"]
         scripts = {
             REPOSITORY / item["docker_script"]
             for item in matrix["categories"]
@@ -169,7 +168,11 @@ class ManagedCategoryHotPathReleaseTests(unittest.TestCase):
         )
         for script in scripts:
             source = script.read_text(encoding="utf-8")
-            self.assertIn(digest.removeprefix("sha256:"), source)
+            self.assertIn('"--image-digest"', source)
+            self.assertRegex(
+                source,
+                r"validate_image_digest\(_parse_args\(\)\.image_digest\)",
+            )
             self.assertNotIn("FakeSandbox", source)
             self.assertNotIn("submit_candidate", source)
             self.assertNotIn("record_manual_submission", source)

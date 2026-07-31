@@ -557,6 +557,15 @@ class WaveOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class _ManagedToolBatchStorageAdmission:
+    nonce: str
+    identity_key: str
+    experiment_ids: frozenset[str]
+    base_revision: int
+    requested_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PwnDisclosureCanonicalInputs:
     """Typed state and artifact bindings for one disclosure reduction."""
 
@@ -2067,6 +2076,11 @@ class ChallengeEngine:
         )
         self._printed_flags: set[tuple[str, str, str, str]] = set()
         self._flag_lock = threading.Lock()
+        self._managed_storage_admission_lock = threading.Lock()
+        self._managed_storage_admissions: dict[
+            str,
+            _ManagedToolBatchStorageAdmission,
+        ] = {}
 
     def identity(
         self, contest: str, category: str, challenge: str
@@ -5227,6 +5241,7 @@ class ChallengeEngine:
         experiment: Experiment,
         *,
         allow_create: bool = True,
+        storage_pre_admitted: bool = False,
     ) -> tuple[Path, ImmutableFile] | None:
         """Install and verify the exact bytes mounted for one Rev seed."""
 
@@ -5352,8 +5367,10 @@ class ChallengeEngine:
                                 expected_sha256=expected_sha256,
                                 expected_size=expected_size,
                                 source_size_admission=(
-                                    self._storage_source_size_admission(
-                                        state.identity
+                                    None
+                                    if storage_pre_admitted
+                                    else self._storage_source_size_admission(
+                                        state.identity,
                                     )
                                 ),
                                 mode=_REV_SOURCE_SNAPSHOT_FILE_MODE,
@@ -18210,6 +18227,7 @@ class ChallengeEngine:
         _pending_artifact_handoff: list[ArtifactReference] | None = None,
         _pending_tool_context: dict[str, Any] | None = None,
         _record_stall: bool = True,
+        _storage_admission: _ManagedToolBatchStorageAdmission | None = None,
     ) -> ChallengeState:
         """Execute already-registered local commands through the sandbox.
 
@@ -18232,6 +18250,7 @@ class ChallengeEngine:
                     _pending_artifact_handoff=pending_artifact_handoff,
                     _pending_tool_context=pending_tool_context,
                     _record_stall=_record_stall,
+                    _storage_admission=_storage_admission,
                 )
             except BaseException as execution_error:
                 if pending_tool_context:
@@ -18246,6 +18265,9 @@ class ChallengeEngine:
                         error=execution_error,
                         _live_only=bool(
                             pending_tool_context.get("live_only", False)
+                        ),
+                        storage_pre_admitted=(
+                            _storage_admission is not None
                         ),
                     )
                 else:
@@ -18289,12 +18311,21 @@ class ChallengeEngine:
                         ),
                         _pending_tool_context=_pending_tool_context,
                         _record_stall=_record_stall,
+                        _storage_admission=_storage_admission,
                     )
             except LockTimeout as error:
                 raise SessionAlreadyRunning(
                     f"another session already owns {identity.key}"
                 ) from error
-        self._enforce_storage_admission(identity)
+        if _storage_admission is not None:
+            self._require_managed_tool_batch_storage_admission(
+                identity,
+                experiment_ids,
+                _storage_admission,
+            )
+        _storage_pre_admitted = _storage_admission is not None
+        if not _storage_pre_admitted:
+            self._enforce_storage_admission(identity)
         state = self.store.load(identity)
         if str(get_adapter(state.category).name) == "pwn":
             state = self._advance_pwn_runtime_snapshot_disclosures(
@@ -18697,6 +18728,7 @@ class ChallengeEngine:
                     self._prepare_rev_adapter_source_snapshot(
                         running,
                         experiment,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 )
                 challenge_dir_override = (
@@ -18844,6 +18876,7 @@ class ChallengeEngine:
                         failure_reason,
                         run_id=engine_run_id,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 except BaseException as terminal_error:
                     error.add_note(
@@ -18920,6 +18953,7 @@ class ChallengeEngine:
                     run_id=engine_run_id,
                     base_revision=run_base_revision,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 raise
             except Exception as error:
@@ -18930,6 +18964,7 @@ class ChallengeEngine:
                     run_id=engine_run_id,
                     base_revision=run_base_revision,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 continue
             except BaseException as error:
@@ -18945,6 +18980,7 @@ class ChallengeEngine:
                         run_id=engine_run_id,
                         base_revision=run_base_revision,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 except BaseException as terminal_error:
                     error.add_note(
@@ -18969,6 +19005,9 @@ class ChallengeEngine:
                                 run_id=engine_run_id,
                                 base_revision=run_base_revision,
                                 _live_only=_live_only,
+                                storage_pre_admitted=(
+                                    _storage_pre_admitted
+                                ),
                             )
                             raise
                         try:
@@ -18979,6 +19018,9 @@ class ChallengeEngine:
                                 run_id=engine_run_id,
                                 base_revision=run_base_revision,
                                 _live_only=_live_only,
+                                storage_pre_admitted=(
+                                    _storage_pre_admitted
+                                ),
                             )
                         except BaseException as terminal_error:
                             interrupted.add_note(
@@ -19002,6 +19044,7 @@ class ChallengeEngine:
                     run_id=engine_run_id,
                     base_revision=run_base_revision,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 continue
             except BaseException as error:
@@ -19013,6 +19056,7 @@ class ChallengeEngine:
                     artifacts=(),
                     error=error,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 raise
             _pending_tool_context.update(
@@ -19058,6 +19102,7 @@ class ChallengeEngine:
                         relative_locator,
                         snapshot_destination,
                         workspace_root=execution_workspace,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 except (EngineError, SandboxError) as error:
                     self._cleanup_uncommitted_artifacts(
@@ -19076,6 +19121,7 @@ class ChallengeEngine:
                         artifacts=(*artifact_records, pending_artifact),
                         error=error,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
                 if snapshot is None:
@@ -19112,6 +19158,7 @@ class ChallengeEngine:
                             run_id=engine_run_id,
                             base_revision=run_base_revision,
                             _live_only=_live_only,
+                            storage_pre_admitted=_storage_pre_admitted,
                         )
                     finally:
                         self._cleanup_uncommitted_artifacts(
@@ -19132,6 +19179,7 @@ class ChallengeEngine:
                         artifacts=artifact_records,
                         error=error,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
             if (
@@ -19149,6 +19197,7 @@ class ChallengeEngine:
                         run_id=engine_run_id,
                         base_revision=run_base_revision,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 finally:
                     self._cleanup_uncommitted_artifacts(
@@ -19211,6 +19260,7 @@ class ChallengeEngine:
                             run_id=engine_run_id,
                             base_revision=run_base_revision,
                             _live_only=_live_only,
+                            storage_pre_admitted=_storage_pre_admitted,
                         )
                     finally:
                         self._cleanup_uncommitted_artifacts(
@@ -19230,6 +19280,7 @@ class ChallengeEngine:
                         artifacts=artifact_records,
                         error=error,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
             if (
@@ -19251,6 +19302,7 @@ class ChallengeEngine:
                             run_id=engine_run_id,
                             base_revision=run_base_revision,
                             _live_only=_live_only,
+                            storage_pre_admitted=_storage_pre_admitted,
                         )
                     finally:
                         self._cleanup_uncommitted_artifacts(
@@ -19434,12 +19486,13 @@ class ChallengeEngine:
                 )
                 artifact_records.append(pending_forensic_artifact)
                 try:
-                    self._enforce_storage_admission(
-                        identity,
-                        requested_bytes=len(
-                            forensic_index_outcome.canonical_bytes
-                        ),
-                    )
+                    if not _storage_pre_admitted:
+                        self._enforce_storage_admission(
+                            identity,
+                            requested_bytes=len(
+                                forensic_index_outcome.canonical_bytes
+                            ),
+                        )
                     atomic_write_bytes(
                         forensic_path,
                         forensic_index_outcome.canonical_bytes,
@@ -19454,6 +19507,7 @@ class ChallengeEngine:
                         artifacts=artifact_records,
                         error=error,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
                 forensic_evaluation_artifact = ArtifactReference(
@@ -19534,6 +19588,7 @@ class ChallengeEngine:
                         f"tool result persistence failed: {error}",
                         run_id=engine_run_id,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     self._cleanup_uncommitted_artifacts(
                         identity,
@@ -19550,6 +19605,7 @@ class ChallengeEngine:
                         artifacts=artifact_records,
                         error=error,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                     raise
             if artifact_notification_failed:
@@ -19571,6 +19627,7 @@ class ChallengeEngine:
                             run_id=engine_run_id,
                             base_revision=run_base_revision,
                             _live_only=_live_only,
+                            storage_pre_admitted=_storage_pre_admitted,
                         )
                     finally:
                         self._cleanup_uncommitted_artifacts(
@@ -20274,6 +20331,7 @@ class ChallengeEngine:
                         run_id=engine_run_id,
                         base_revision=run_base_revision,
                         _live_only=_live_only,
+                        storage_pre_admitted=_storage_pre_admitted,
                     )
                 finally:
                     self._cleanup_uncommitted_artifacts(
@@ -20310,6 +20368,7 @@ class ChallengeEngine:
                     failure_reason,
                     run_id=engine_run_id,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 self._cleanup_uncommitted_artifacts(
                     identity,
@@ -20326,6 +20385,7 @@ class ChallengeEngine:
                     artifacts=artifact_records,
                     error=update_error,
                     _live_only=_live_only,
+                    storage_pre_admitted=_storage_pre_admitted,
                 )
                 raise
             artifact_records.clear()
@@ -23264,6 +23324,109 @@ class ChallengeEngine:
         except StorageQuotaError as error:
             raise EngineError(str(error)) from error
 
+    def _admit_managed_tool_action_batch_storage(
+        self,
+        identity: ChallengeIdentity,
+        *,
+        experiment_ids: Sequence[str],
+    ) -> _ManagedToolBatchStorageAdmission:
+        """Admit one bounded parallel action batch before its writers start.
+
+        The managed session holds the exclusive challenge-session lock across
+        this check and the complete action batch.  A single conservative
+        admission therefore covers every lane without rescanning mutable
+        sibling work trees while they are running.  Stream snapshots are
+        separately bounded by Docker and run documents are hard-capped by the
+        store.
+        """
+
+        normalized_ids = frozenset(experiment_ids)
+        if (
+            not normalized_ids
+            or len(normalized_ids) != len(experiment_ids)
+            or any(not value for value in normalized_ids)
+        ):
+            raise ValueError("experiment_ids must be unique non-empty strings")
+        work_tree_limit = self.config.runtime.work_tree_max_bytes
+        per_stream_limit = min(
+            DEFAULT_STREAM_CAPTURE_MAX_BYTES,
+            work_tree_limit // 4,
+        )
+        per_action_bytes = (
+            work_tree_limit
+            + 2 * per_stream_limit
+            + 6 * MAX_RUN_DOCUMENT_BYTES
+        )
+        current = self.store.load(identity, recover=False)
+        identity_key = identity.key
+        registered = {
+            item.id: item
+            for item in current.experiments
+            if item.status is ExperimentStatus.REGISTERED
+        }
+        if not normalized_ids <= set(registered):
+            raise EngineError(
+                "managed storage admission includes an unavailable experiment"
+            )
+        requested_bytes = len(normalized_ids) * per_action_bytes
+        for experiment_id in normalized_ids:
+            experiment = registered[experiment_id]
+            if (
+                experiment.extra.get("adapter_seed") is True
+                and experiment.extra.get("adapter_name") == "reversing"
+            ):
+                requested_bytes += REV_INVENTORY_V2_MAX_SOURCE_BYTES
+            if self._is_forensic_index_experiment(current, experiment):
+                requested_bytes += FORENSIC_INDEX_MAX_BYTES
+        with self._managed_storage_admission_lock:
+            if any(
+                item.identity_key == identity_key
+                for item in self._managed_storage_admissions.values()
+            ):
+                raise EngineError("a managed storage admission is already active")
+            self._enforce_storage_admission(
+                identity,
+                requested_bytes=requested_bytes,
+            )
+            admission = _ManagedToolBatchStorageAdmission(
+                nonce=uuid.uuid4().hex,
+                identity_key=identity_key,
+                experiment_ids=normalized_ids,
+                base_revision=current.revision,
+                requested_bytes=requested_bytes,
+            )
+            self._managed_storage_admissions[admission.nonce] = admission
+        return admission
+
+    def _require_managed_tool_batch_storage_admission(
+        self,
+        identity: ChallengeIdentity,
+        experiment_ids: Sequence[str] | None,
+        admission: _ManagedToolBatchStorageAdmission,
+    ) -> None:
+        selected = frozenset(experiment_ids or ())
+        current = self.store.load(identity, recover=False)
+        with self._managed_storage_admission_lock:
+            active = self._managed_storage_admissions.get(admission.nonce)
+        if (
+            active != admission
+            or admission.identity_key != identity.key
+            or current.revision < admission.base_revision
+            or not selected
+            or not selected <= admission.experiment_ids
+        ):
+            raise EngineError("managed storage admission is invalid or stale")
+
+    def _release_managed_tool_action_batch_storage(
+        self,
+        admission: _ManagedToolBatchStorageAdmission,
+    ) -> None:
+        with self._managed_storage_admission_lock:
+            active = self._managed_storage_admissions.get(admission.nonce)
+            if active != admission:
+                raise EngineError("managed storage admission release is stale")
+            del self._managed_storage_admissions[admission.nonce]
+
     def _model_run_storage_reservation_bytes(self) -> int:
         """Return the enforced worst-case durable footprint of one model run."""
 
@@ -24355,6 +24518,7 @@ class ChallengeEngine:
         destination: Path,
         *,
         workspace_root: Path | None = None,
+        storage_pre_admitted: bool = False,
     ) -> ImmutableFile:
         """Copy one model-writable file into canonical immutable evidence."""
 
@@ -24397,7 +24561,9 @@ class ChallengeEngine:
                 ),
                 expected_sha256=reference.sha256,
                 expected_size=reference.size_bytes,
-                source_size_admission=admit_open_source,
+                source_size_admission=(
+                    None if storage_pre_admitted else admit_open_source
+                ),
                 mode=0o400,
             )
         except (OSError, SafeFileError, ValueError) as error:
@@ -33256,6 +33422,7 @@ class ChallengeEngine:
         artifacts: Sequence[ArtifactReference],
         error: BaseException,
         _live_only: bool = False,
+        storage_pre_admitted: bool = False,
     ) -> None:
         """Terminalize a normal interruption without deleting committed evidence."""
 
@@ -33289,6 +33456,7 @@ class ChallengeEngine:
                     run_id=run_id,
                     base_revision=base_revision,
                     _live_only=_live_only,
+                    storage_pre_admitted=storage_pre_admitted,
                 )
             except BaseException as terminal_error:
                 error.add_note(
@@ -33313,6 +33481,7 @@ class ChallengeEngine:
         run_id: str,
         base_revision: int,
         _live_only: bool = False,
+        storage_pre_admitted: bool = False,
     ) -> ChallengeState:
         """Persist diagnostics without allowing that write to strand RUNNING."""
 
@@ -33348,6 +33517,7 @@ class ChallengeEngine:
             reason,
             run_id=run_id,
             _live_only=_live_only,
+            storage_pre_admitted=storage_pre_admitted,
         )
         if write_error is not None:
             raise write_error
@@ -33358,6 +33528,8 @@ class ChallengeEngine:
         identity: ChallengeIdentity,
         experiment_id: str,
         run_id: str,
+        *,
+        storage_pre_admitted: bool = False,
     ) -> dict[str, Any] | None:
         """Read one exact durable tool request for failure terminalization."""
 
@@ -33378,7 +33550,9 @@ class ChallengeEngine:
                     Path(temporary) / "request.json",
                     maximum_bytes=1024 * 1024,
                     source_size_admission=(
-                        self._storage_source_size_admission(identity)
+                        None
+                        if storage_pre_admitted
+                        else self._storage_source_size_admission(identity)
                     ),
                     mode=0o400,
                 )
@@ -33470,6 +33644,7 @@ class ChallengeEngine:
         *,
         run_id: str | None = None,
         _live_only: bool = False,
+        storage_pre_admitted: bool = False,
     ) -> ChallengeState:
         bounded_reason = str(reason)[:4096]
         failure_request = (
@@ -33477,6 +33652,7 @@ class ChallengeEngine:
                 identity,
                 experiment_id,
                 run_id,
+                storage_pre_admitted=storage_pre_admitted,
             )
             if run_id is not None
             else None
